@@ -154,6 +154,7 @@ def plot_track(DS:list,no):
     ax.legend(fontsize=18)
 
 def convert_date(date):
+    '''转换META数据中的日期格式'''
     t0 = np.datetime64('1950-01-01')
     date = t0 + date
     date = pd.to_datetime(date)
