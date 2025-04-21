@@ -253,3 +253,26 @@ def convert_date(date):
     date = t0 + date
     date = pd.to_datetime(date)
     return date
+
+def plot_vertical(DS: list, no: int):
+    cmap = plt.cm.coolwarm
+    argo_data_filtered = filtered_float_data(DS, no)
+
+    for idx,platform in argo_data_filtered.groupby("Platform_number"):
+        num_profiles = platform['Profile_number'].nunique()
+        idxx_values = platform['Profile_number'].unique()
+        min_idxx = min(idxx_values)
+        max_idxx = max(idxx_values)
+
+
+        for idxx,rows in platform.groupby("Profile_number"):
+            normalized_idxx = (idxx - min_idxx) / (max_idxx - min_idxx)
+            color = cmap(normalized_idxx)
+            obs_date=pd.Timestamp(year=int(rows.iloc[0]['Year']), month=int(rows.iloc[0]['Month']), day=int(rows.iloc[0]['Day']))
+            plt.plot(rows["DO_mol_kg"], rows["Depth_m"], label=obs_date.strftime("%Y-%m-%d"), color=color, alpha=0.7)
+        plt.title(f"Platform Number: {idx}")
+        plt.xlabel("DO_mol/kg")
+        plt.ylabel("Depth/m")
+        plt.gca().invert_yaxis()
+        # plt.legend()
+        plt.show()
