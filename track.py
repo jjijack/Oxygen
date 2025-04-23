@@ -254,25 +254,110 @@ def convert_date(date):
     date = pd.to_datetime(date)
     return date
 
-def plot_vertical(DS: list, no: int):
+def plot_vertical(DS: list, no: int, save_fig: bool = False):
     cmap = plt.cm.coolwarm
     argo_data_filtered = filtered_float_data(DS, no)
 
     for idx,platform in argo_data_filtered.groupby("Platform_number"):
-        num_profiles = platform['Profile_number'].nunique()
+        # num_profiles = platform['Profile_number'].nunique()
         idxx_values = platform['Profile_number'].unique()
         min_idxx = min(idxx_values)
         max_idxx = max(idxx_values)
 
 
+        fig = plt.figure(figsize=(30, 20))
         for idxx,rows in platform.groupby("Profile_number"):
             normalized_idxx = (idxx - min_idxx) / (max_idxx - min_idxx)
             color = cmap(normalized_idxx)
             obs_date=pd.Timestamp(year=int(rows.iloc[0]['Year']), month=int(rows.iloc[0]['Month']), day=int(rows.iloc[0]['Day']))
             plt.plot(rows["DO_mol_kg"], rows["Depth_m"], label=obs_date.strftime("%Y-%m-%d"), color=color, alpha=0.7)
-        plt.title(f"Platform Number: {idx}")
-        plt.xlabel("DO_mol/kg")
-        plt.ylabel("Depth/m")
+            
+        plt.title(f"Platform Number: {idx}", fontsize=20)
+        plt.xlabel("DO_mol/kg", fontsize=20)
+        plt.ylabel("Depth/m", fontsize=20)
+        plt.tick_params(axis='both', which='major', labelsize=16)
         plt.gca().invert_yaxis()
         # plt.legend()
+
+        # 保存图片
+        if save_fig:
+            output_dir = "plot_vertical"
+            os.makedirs(output_dir, exist_ok=True)
+            plt.savefig(os.path.join(output_dir, f"vertical_profile_platform_{idx}.png"), dpi=300, bbox_inches='tight')
+
         plt.show()
+        plt.close(fig)
+        
+def plot_relative_position(DS: list, no: int, save_fig: bool = False):
+    wanted_track = find_track(DS, no)
+    argo_data_filtered = filtered_float_data(DS, no)
+
+    for idx, platform in argo_data_filtered.groupby("Platform_number"):
+                
+        needed_data = platform.groupby("Profile_number").apply(lambda group: group.iloc[0])
+        needed_data.index.name = None
+
+        dates = pd.to_datetime({'year': needed_data["Year"],
+                                'month': needed_data["Month"],
+                                'day': needed_data["Day"]})
+        # 计算每个dates在wanted_track中的idx_track
+        track_dates = convert_date([t[1] for t in wanted_track])
+        idx_track_list = []
+        for d in dates:
+            # 找到与d匹配的track日期索引
+            matches = np.where(track_dates == d)[0]
+            if len(matches) > 0:
+                idx_track_list.append(matches[0])
+            else:
+                idx_track_list.append(None)  # 若无匹配则填None
+
+        # 构建needed_track_data，每行为中心点经度，中心点纬度，半径
+        needed_track_data = []
+        for idx_track in idx_track_list:
+            if idx_track is not None:
+                needed_track_data.append([
+                    wanted_track[idx_track][2],  # center_lon
+                    wanted_track[idx_track][3],  # center_lat
+                    wanted_track[idx_track][8]   # radius
+                ])
+            else:
+                needed_track_data.append([None, None, None]) 
+
+        # 绘制每个浮标相对单位圆涡旋的位置
+        fig, ax = plt.subplots(figsize=(30, 20))
+        # ax.set_title(f'Track {no} - Platform {idx}', fontsize=20)
+        ax.set_title(f'Platform Number: {idx}', fontsize=20)
+        ax.set_xlabel('Longitude', fontsize=20)
+        ax.set_ylabel('Latitude', fontsize=20)
+        cmap = plt.cm.coolwarm  # 使用渐变色
+
+        for i, (index, row) in enumerate(needed_data.iterrows()):
+            center_lon, center_lat, radius = needed_track_data[i]
+            if None in (center_lon, center_lat, radius):
+                continue  # 跳过没有匹配track的点
+            # 计算相对位置（单位圆）
+            rel_x = (row['Longitude'] - center_lon) / (radius / 111320)
+            rel_y = (row['Latitude'] - center_lat) / (radius / 111320)
+            # 颜色映射
+            normalized_idx = (index - needed_data.index.min()) / (needed_data.index.max() - needed_data.index.min() + 1e-8)
+            color = cmap(normalized_idx)
+            ax.scatter(rel_x, rel_y, color=color, s=300, label=pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day'])).strftime("%Y-%m-%d"))
+            # 绘制顺序
+            # ax.text(rel_x, rel_y, pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day'])).strftime("%Y-%m-%d"), fontsize=12, color='black', ha='center', va='center')
+            ax.text(rel_x, rel_y, i+1, weight='bold', fontsize=7, color='black', ha='center', va='center')
+            
+
+        # 绘制单位圆
+        circle = plt.Circle((0, 0), 1, color='gray', fill=False, linestyle='--', linewidth=2, label='Unit Eddy')
+        ax.add_patch(circle)
+        ax.set_aspect('equal')
+        # ax.legend(fontsize=14)
+
+        # 保存图片
+        if save_fig:
+            output_dir = "plot_relative_position"
+            os.makedirs(output_dir, exist_ok=True)
+            plt.savefig(os.path.join(output_dir, f"relative_position_platform_{idx}.png"), dpi=300, bbox_inches='tight')
+        
+        plt.show()
+        plt.close(fig)
