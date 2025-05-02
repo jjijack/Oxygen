@@ -254,7 +254,7 @@ def convert_date(date):
     date = pd.to_datetime(date)
     return date
 
-def plot_vertical(DS: list, no: int, save_fig: bool = False):
+def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False):
     cmap = plt.cm.coolwarm
     argo_data_filtered = filtered_float_data(DS, no)
 
@@ -285,10 +285,11 @@ def plot_vertical(DS: list, no: int, save_fig: bool = False):
             os.makedirs(output_dir, exist_ok=True)
             plt.savefig(os.path.join(output_dir, f"vertical_profile_platform_{idx}.png"), dpi=300, bbox_inches='tight')
 
-        plt.show()
+        if show_fig:
+            plt.show()
         plt.close(fig)
         
-def plot_relative_position(DS: list, no: int, save_fig: bool = False):
+def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: bool = False):
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
 
@@ -359,5 +360,6 @@ def plot_relative_position(DS: list, no: int, save_fig: bool = False):
             os.makedirs(output_dir, exist_ok=True)
             plt.savefig(os.path.join(output_dir, f"relative_position_platform_{idx}.png"), dpi=300, bbox_inches='tight')
         
-        plt.show()
+        if show_fig:
+            plt.show()
         plt.close(fig)
