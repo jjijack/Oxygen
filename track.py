@@ -254,25 +254,73 @@ def convert_date(date):
     date = pd.to_datetime(date)
     return date
 
-def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False):
-    cmap = plt.cm.coolwarm
+def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance'):
+    '''
+    根据涡旋轨迹和浮标数据，绘制浮标的垂直剖面图。
+
+    参数:
+        DS (list): 涡旋轨迹数据集。
+        no (int): 涡旋编号。
+        show_fig (bool): 是否显示图片，默认False。
+        save_fig (bool): 是否保存图片，默认False。
+        color_mode (str): 颜色模式，可选'distance'（按距离着色）或'time'（按时间着色）。
+
+    功能:
+        对每个浮标平台，按Profile_number分组，绘制DO_mol_kg随深度变化的曲线。
+        曲线颜色可根据浮标与涡旋中心的相对距离或采样时间变化。
+        支持图片保存与显示。
+    '''
+    wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
 
+    callers_local_vars = inspect.currentframe().f_back.f_locals.items()     #加入会导致调试卡顿
+    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
+    if ds_names:
+        ds_names = ds_names[0].upper()
+    else:
+        raise ValueError("UNKNOWN VARIABLE")
+    
     for idx,platform in argo_data_filtered.groupby("Platform_number"):
-        # num_profiles = platform['Profile_number'].nunique()
         idxx_values = platform['Profile_number'].unique()
         min_idxx = min(idxx_values)
         max_idxx = max(idxx_values)
-
+        
 
         fig = plt.figure(figsize=(30, 20))
+        cmap = plt.cm.coolwarm
         for idxx,rows in platform.groupby("Profile_number"):
-            normalized_idxx = (idxx - min_idxx) / (max_idxx - min_idxx)
-            color = cmap(normalized_idxx)
+            if color_mode == 'distance':
+                needed_data = rows.iloc[0]
+                date = pd.Timestamp(year=int(rows.iloc[0]['Year']),
+                                    month=int(rows.iloc[0]['Month']),
+                                    day=int(rows.iloc[0]['Day']))
+                track_date = convert_date([t[1] for t in wanted_track])
+                idx_track = np.where(track_date == date)[0]
+                
+                if len(idx_track) > 0:
+                    idx_track = idx_track[0]
+                    center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
+                    rel_x = (needed_data['Longitude'] - center_lon) / (radius / 111320)
+                    rel_y = (needed_data['Latitude'] - center_lat) / (radius / 111320)
+                    distance = np.sqrt(rel_x**2 + rel_y**2)
+                    normalized_distance = (distance - 0) / (1 - 0 + 1e-8)
+                    color = cmap(1-normalized_distance)
+                else:
+                    print(f"Date {date} not found in track data.")
+            elif color_mode == 'time':
+                normalized_idxx = (idxx - min_idxx) / (max_idxx - min_idxx)
+                color = cmap(normalized_idxx)
             obs_date=pd.Timestamp(year=int(rows.iloc[0]['Year']), month=int(rows.iloc[0]['Month']), day=int(rows.iloc[0]['Day']))
             plt.plot(rows["DO_mol_kg"], rows["Depth_m"], label=obs_date.strftime("%Y-%m-%d"), color=color, alpha=0.7)
             
-        plt.title(f"Platform Number: {idx}", fontsize=20)
+        date_start = pd.Timestamp(year=int(platform.iloc[0]['Year']),
+                                    month=int(platform.iloc[0]['Month']),
+                                    day=int(platform.iloc[0]['Day']))
+        date_end = pd.Timestamp(year=int(platform.iloc[-1]['Year']),
+                                month=int(platform.iloc[-1]['Month']),
+                                day=int(platform.iloc[-1]['Day']))
+        
+        plt.title(f"{ds_names}{no}, Platform Number: {int(idx)}, {date_start.date()}~{date_end.date()}", fontsize=20)
         plt.xlabel("DO_mol/kg", fontsize=20)
         plt.ylabel("Depth/m", fontsize=20)
         plt.tick_params(axis='both', which='major', labelsize=16)
@@ -289,9 +337,32 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
             plt.show()
         plt.close(fig)
         
-def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: bool = False):
+def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance'):
+    '''
+    根据涡旋轨迹和浮标数据，绘制浮标在单位圆涡旋中的相对位置分布图。
+
+    参数:
+        DS (list): 涡旋轨迹数据集。
+        no (int): 涡旋编号。
+        show_fig (bool): 是否显示图片，默认False。
+        save_fig (bool): 是否保存图片，默认False。
+        color_mode (str): 颜色模式，可选'distance'（按距离着色）或'time'（按时间着色）。
+
+    功能:
+        对每个浮标平台，按Profile_number分组，计算每个观测点相对于涡旋中心和半径的归一化位置（单位圆内）。
+        观测点颜色可根据与涡旋中心的相对距离或采样时间变化。
+        绘制单位圆表示涡旋边界，中心点为涡旋中心。
+        支持图片保存与显示。
+    '''
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
+
+    callers_local_vars = inspect.currentframe().f_back.f_locals.items()     #加入会导致调试卡顿
+    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
+    if ds_names:
+        ds_names = ds_names[0].upper()
+    else:
+        raise ValueError("UNKNOWN VARIABLE")
 
     for idx, platform in argo_data_filtered.groupby("Platform_number"):
                 
@@ -326,8 +397,14 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
 
         # 绘制每个浮标相对单位圆涡旋的位置
         fig, ax = plt.subplots(figsize=(30, 20))
-        # ax.set_title(f'Track {no} - Platform {idx}', fontsize=20)
-        ax.set_title(f'Platform Number: {idx}', fontsize=20)
+        date_start = pd.Timestamp(year=int(needed_data.iloc[0]['Year']),
+                                  month=int(needed_data.iloc[0]['Month']),
+                                  day=int(needed_data.iloc[0]['Day']))
+        date_end = pd.Timestamp(year=int(needed_data.iloc[-1]['Year']),
+                                month=int(needed_data.iloc[-1]['Month']),
+                                day=int(needed_data.iloc[-1]['Day']))
+        
+        ax.set_title(f"{ds_names}{no}, Platform Number: {int(idx)}, {date_start.date()}~{date_end.date()}, Total: {len(needed_data)}", fontsize=20)
         ax.set_xlabel('Longitude', fontsize=20)
         ax.set_ylabel('Latitude', fontsize=20)
         cmap = plt.cm.coolwarm  # 使用渐变色
@@ -340,9 +417,15 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
             rel_x = (row['Longitude'] - center_lon) / (radius / 111320)
             rel_y = (row['Latitude'] - center_lat) / (radius / 111320)
             # 颜色映射
-            normalized_idx = (index - needed_data.index.min()) / (needed_data.index.max() - needed_data.index.min() + 1e-8)
-            color = cmap(normalized_idx)
+            if color_mode == 'distance':
+                distance = np.sqrt(rel_x**2 + rel_y**2)
+                normalized_distance = (distance - 0) / (1 - 0 + 1e-8)
+                color = cmap(1-normalized_distance)
+            elif color_mode == 'time':
+                normalized_idx = (index - needed_data.index.min()) / (needed_data.index.max() - needed_data.index.min() + 1e-8)
+                color = cmap(normalized_idx)
             ax.scatter(rel_x, rel_y, color=color, s=300, label=pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day'])).strftime("%Y-%m-%d"))
+            ax.plot(0, 0, marker='x', color='black', markersize=16, markeredgewidth=3, label='Eddy Center' if i == 0 else "")
             # 绘制顺序
             # ax.text(rel_x, rel_y, pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day'])).strftime("%Y-%m-%d"), fontsize=12, color='black', ha='center', va='center')
             ax.text(rel_x, rel_y, i+1, weight='bold', fontsize=7, color='black', ha='center', va='center')
