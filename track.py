@@ -331,7 +331,7 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
         if save_fig:
             output_dir = "plot_vertical"
             os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"vertical_profile_platform_{idx}.png"), dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_v_{idx}.png"), dpi=300, bbox_inches='tight')
 
         if show_fig:
             plt.show()
@@ -441,7 +441,7 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
         if save_fig:
             output_dir = "plot_relative_position"
             os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"relative_position_platform_{idx}.png"), dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_rp_{idx}.png"), dpi=300, bbox_inches='tight')
         
         if show_fig:
             plt.show()
