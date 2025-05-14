@@ -254,7 +254,7 @@ def convert_date(date):
     date = pd.to_datetime(date)
     return date
 
-def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance'):
+def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', variable: str = 'DO'):
     '''
     根据涡旋轨迹和浮标数据，绘制浮标的垂直剖面图。
 
@@ -263,13 +263,19 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
         no (int): 涡旋编号。
         show_fig (bool): 是否显示图片，默认False。
         save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，可选'distance'（按距离着色）或'time'（按时间着色）。
+        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
+        variable (str): 变量名称，默认'DO'（溶解氧），可选'Temp'（温度）。
 
     功能:
-        对每个浮标平台，按Profile_number分组，绘制DO_mol_kg随深度变化的曲线。
+        对每个浮标平台，按Profile_number分组，绘制DO或Temp随深度变化的曲线。
         曲线颜色可根据浮标与涡旋中心的相对距离或采样时间变化。
         支持图片保存与显示。
     '''
+    if variable == 'DO':
+        variable = 'DO_mol_kg'
+    elif variable == 'Temp':
+        variable = 'Temperature_degC'
+
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
 
@@ -311,7 +317,7 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
                 normalized_idxx = (idxx - min_idxx) / (max_idxx - min_idxx)
                 color = cmap(normalized_idxx)
             obs_date=pd.Timestamp(year=int(rows.iloc[0]['Year']), month=int(rows.iloc[0]['Month']), day=int(rows.iloc[0]['Day']))
-            plt.plot(rows["DO_mol_kg"], rows["Depth_m"], label=obs_date.strftime("%Y-%m-%d"), color=color, alpha=0.7)
+            plt.plot(rows[variable], rows["Depth_m"], label=obs_date.strftime("%Y-%m-%d"), color=color, alpha=0.7)
             
         date_start = pd.Timestamp(year=int(platform.iloc[0]['Year']),
                                     month=int(platform.iloc[0]['Month']),
@@ -320,8 +326,14 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
                                 month=int(platform.iloc[-1]['Month']),
                                 day=int(platform.iloc[-1]['Day']))
         
+        plt.ylim(-50, 2000)
+        if variable == 'DO_mol_kg':
+            plt.xlim(30,270)
+        elif variable == 'Temperature_degC':
+            plt.xlim(3, 32)
+        
         plt.title(f"{ds_names}{no}, Platform Number: {int(idx)}, {date_start.date()}~{date_end.date()}", fontsize=20)
-        plt.xlabel("DO_mol/kg", fontsize=20)
+        plt.xlabel(variable, fontsize=20)
         plt.ylabel("Depth/m", fontsize=20)
         plt.tick_params(axis='both', which='major', labelsize=16)
         plt.gca().invert_yaxis()
@@ -329,9 +341,12 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
 
         # 保存图片
         if save_fig:
-            output_dir = "plot_vertical"
+            output_dir = f"plot_vertical_{variable}"
             os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_v_{idx}.png"), dpi=300, bbox_inches='tight')
+            if variable == 'DO_mol_kg':
+                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}O{int(idx)}.png"), dpi=300, bbox_inches='tight')
+            elif variable == 'Temperature_degC':
+                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}T{int(idx)}.png"), dpi=300, bbox_inches='tight')
 
         if show_fig:
             plt.show()
@@ -346,7 +361,7 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
         no (int): 涡旋编号。
         show_fig (bool): 是否显示图片，默认False。
         save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，可选'distance'（按距离着色）或'time'（按时间着色）。
+        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
 
     功能:
         对每个浮标平台，按Profile_number分组，计算每个观测点相对于涡旋中心和半径的归一化位置（单位圆内）。
@@ -441,7 +456,7 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
         if save_fig:
             output_dir = "plot_relative_position"
             os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_rp_{idx}.png"), dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}RP{int(idx)}.png"), dpi=300, bbox_inches='tight')
         
         if show_fig:
             plt.show()
