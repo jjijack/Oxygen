@@ -326,11 +326,11 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
                                 month=int(platform.iloc[-1]['Month']),
                                 day=int(platform.iloc[-1]['Day']))
         
-        plt.ylim(-50, 2000)
+        plt.ylim(-50, 2050)
         if variable == 'DO_mol_kg':
             plt.xlim(30,270)
         elif variable == 'Temperature_degC':
-            plt.xlim(3, 32)
+            plt.xlim(1, 32)
         
         plt.title(f"{ds_names}{no}, Platform Number: {int(idx)}, {date_start.date()}~{date_end.date()}", fontsize=20)
         plt.xlabel(variable, fontsize=20)
@@ -344,7 +344,7 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
             output_dir = f"plot_vertical_{variable}"
             os.makedirs(output_dir, exist_ok=True)
             if variable == 'DO_mol_kg':
-                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}O{int(idx)}.png"), dpi=300, bbox_inches='tight')
+                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}DO{int(idx)}.png"), dpi=300, bbox_inches='tight')
             elif variable == 'Temperature_degC':
                 plt.savefig(os.path.join(output_dir, f"{ds_names}{no}T{int(idx)}.png"), dpi=300, bbox_inches='tight')
 
@@ -366,7 +366,7 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
     功能:
         对每个浮标平台，按Profile_number分组，计算每个观测点相对于涡旋中心和半径的归一化位置（单位圆内）。
         观测点颜色可根据与涡旋中心的相对距离或采样时间变化。
-        绘制单位圆表示涡旋边界，中心点为涡旋中心。
+        绘制单位圆表示涡旋边界，中心点为涡旋中心，坐标为所有时间点涡旋坐标的平均。
         支持图片保存与显示。
     '''
     wanted_track = find_track(DS, no)
@@ -451,6 +451,31 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
         ax.add_patch(circle)
         ax.set_aspect('equal')
         # ax.legend(fontsize=14)
+
+        # 设置坐标轴
+        mean_center_lon, mean_center_lat, mean_radius = np.mean([d[0] for d in needed_track_data if d[0] is not None]), np.mean([d[1] for d in needed_track_data if d[1] is not None]), np.mean([d[2] for d in needed_track_data if d[2] is not None])
+        if mean_center_lon is not None and mean_center_lat is not None and mean_radius is not None:
+            mean_degrees = mean_radius / 111320
+            
+            x_tick_locs = [-1, 0, 1]
+            x_tick_labels = [
+                f"{mean_center_lon - mean_degrees:.2f}°",  # -1 对应的真实经度
+                f"{mean_center_lon:.2f}°",                 #  0 对应的涡旋中心真实经度
+                f"{mean_center_lon + mean_degrees:.2f}°"   #  1 对应的真实经度
+            ]
+            ax.set_xticks(x_tick_locs)
+            ax.set_xticklabels(x_tick_labels, fontsize=20)
+            ax.set_xlim([-1.25, 1.25])
+
+            y_tick_locs = [-1, 0, 1]
+            y_tick_labels = [
+                f"{mean_center_lat - mean_degrees:.2f}°",  # -1 对应的真实纬度
+                f"{mean_center_lat:.2f}°",                 #  0 对应的涡旋中心真实纬度
+                f"{mean_center_lat + mean_degrees:.2f}°"   #  1 对应的真实纬度
+            ]
+            ax.set_yticks(y_tick_locs)
+            ax.set_yticklabels(y_tick_labels, fontsize=20)
+            ax.set_xlim([-1.25, 1.25])
 
         # 保存图片
         if save_fig:
