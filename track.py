@@ -501,6 +501,7 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list, show_fig: boo
         save_fig (bool): 是否保存图片，默认False。
         color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
         variable (str): 变量名称，默认'DO'（溶解氧），可选'Temp'（温度）。
+        show_colorbar (bool): 是否显示颜色条，默认False。
 
     功能:
         将指定涡旋在指定月份内所有浮标平台的所有剖面数据绘制在同一张图上。
@@ -680,7 +681,7 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list, show_fig: boo
                 
             cbar.set_ticks(current_ticks) # 设置刻度位置
             cbar.set_ticklabels(new_tick_labels) # 设置新的刻度标签
-            cbar.set_label('Normalized Distance from Eddy Center', fontsize=14)
+            cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
             # 此时，颜色条蓝色端 (dist=1) 标签为 "1.0", 红色端 (dist=0) 标签为 "0.0"
         elif color_mode == 'time':
             if min_time_for_norm and max_time_for_norm:
@@ -705,3 +706,235 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list, show_fig: boo
         plt.show()
     
     plt.close(fig) # 关闭图像，释放内存
+    
+def plot_relative_position_monthly(DS: list, no: int, month_required: list, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', show_colorbar: bool = False):
+    '''
+    根据涡旋轨迹和浮标数据，在指定月份绘制所有浮标在单位圆涡旋中的聚合相对位置分布图。
+
+    参数:
+        DS (list): 涡旋轨迹数据集。
+        no (int): 涡旋编号。
+        month_required (list): 需要绘制的月份列表，例如[7, 8]表示7月、8月。
+        show_fig (bool): 是否显示图片，默认False。
+        save_fig (bool): 是否保存图片，默认False。
+        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
+        show_colorbar (bool): 是否显示颜色条，默认False。
+
+    功能:
+        对所有浮标平台，筛选指定月份内的剖面数据，计算每个剖面代表点相对于涡旋中心的归一化位置。
+        所有点绘制在同一张图上。点旁边的数字根据日期在所选月份范围内的连续天数编号。
+        观测点颜色可根据与涡旋中心的相对距离或全局采样时间变化。
+        绘制单位圆表示涡旋边界。坐标轴刻度反映总体平均的真实地理坐标。
+    '''
+    wanted_track = find_track(DS, no)
+    argo_data_filtered = filtered_float_data(DS, no)
+
+    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
+    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
+    if ds_names:
+        ds_names = ds_names[0].upper()
+    else:
+        raise ValueError("UNKNOWN VARIABLE")
+
+    # 1. 预处理：收集所有符合月份要求的剖面数据点及其相关信息
+    points_to_process = [] # 存储 (日期, 剖面首行数据)
+    if not argo_data_filtered.empty:
+        for _, platform_data in argo_data_filtered.groupby("Platform_number"):
+            # 获取每个剖面的第一行数据作为代表点
+            profile_first_rows = platform_data.groupby("Profile_number").first().reset_index()
+            for _, p_row in profile_first_rows.iterrows():
+                try:
+                    current_date_profile = pd.Timestamp(year=int(p_row['Year']),
+                                                        month=int(p_row['Month']),
+                                                        day=int(p_row['Day']))
+                except (ValueError, TypeError) as e:
+                    # print(f"Skipping profile point due to invalid date: {e}")
+                    continue
+                
+                if current_date_profile.month in month_required:
+                    points_to_process.append({'date': current_date_profile, 'data_row': p_row})
+    
+    if not points_to_process:
+        print(f"No data found for eddy {ds_names}{no} in months {month_required}.")
+        return
+
+    # 确定日期编号的参考起始日期
+    # 参考日是所选月份中最早月份的第一天，年份取实际绘制数据中的最早年份
+    min_plot_date_overall = min(p['date'] for p in points_to_process)
+    reference_start_date_for_labels = pd.Timestamp(year=min_plot_date_overall.year, 
+                                                   month=min(month_required), 
+                                                   day=1)
+
+    points_to_plot = []
+    all_track_info_for_overall_mean = [] # 用于计算平均涡旋参数
+    all_profile_dates_for_title = []
+    all_profile_timestamps_for_time_mode = []
+    
+    track_dates_converted = convert_date([t[1] for t in wanted_track]) if wanted_track else []
+
+    for point_info in points_to_process:
+        current_date = point_info['date']
+        p_row = point_info['data_row']
+        
+        day_label = (current_date - reference_start_date_for_labels).days + 1
+        
+        # 匹配涡旋轨迹数据
+        center_lon, center_lat, radius = None, None, None
+        if wanted_track:
+            matches = [i for i, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
+            if matches:
+                idx_track = matches[0]
+                center_lon = wanted_track[idx_track][2]
+                center_lat = wanted_track[idx_track][3]
+                radius = wanted_track[idx_track][8]
+
+        if center_lon is not None and radius is not None and radius > 1e-6:
+            # 确保 'Longitude' 和 'Latitude' 列存在于 p_row
+            if 'Longitude' not in p_row or 'Latitude' not in p_row:
+                # print(f"Skipping point on {current_date.date()} due to missing Longitude/Latitude.")
+                continue
+
+            rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
+            rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
+            
+            points_to_plot.append({
+                'rel_x': rel_x, 'rel_y': rel_y, 
+                'date': current_date, 'day_label': day_label
+            })
+            all_track_info_for_overall_mean.append([center_lon, center_lat, radius])
+            all_profile_dates_for_title.append(current_date)
+            if color_mode == 'time':
+                all_profile_timestamps_for_time_mode.append(current_date)
+        # else: 涡旋数据不匹配或半径过小，则跳过该点
+
+    if not points_to_plot:
+        print(f"No valid points with track data found for eddy {ds_names}{no} in months {month_required}.")
+        return
+
+    # 2. 确定时间归一化的范围 (如果 color_mode == 'time') 和标题的日期范围
+    min_time_for_norm = None
+    max_time_for_norm = None
+    if color_mode == 'time' and all_profile_timestamps_for_time_mode:
+        min_time_for_norm = min(all_profile_timestamps_for_time_mode)
+        max_time_for_norm = max(all_profile_timestamps_for_time_mode)
+        if min_time_for_norm == max_time_for_norm and len(all_profile_timestamps_for_time_mode) > 1:
+             max_time_for_norm = min_time_for_norm + pd.Timedelta(days=1) 
+
+    date_start_overall = min(all_profile_dates_for_title)
+    date_end_overall = max(all_profile_dates_for_title)
+
+    # 3. 开始绘图
+    fig, ax = plt.subplots(figsize=(30, 20)) # 保持与原函数一致的大尺寸
+    cmap = plt.cm.coolwarm
+
+    for point in points_to_plot:
+        rel_x = point['rel_x']
+        rel_y = point['rel_y']
+        current_date = point['date']
+        day_label = point['day_label']
+        
+        color_value_normalized = 0.5 
+
+        if color_mode == 'distance':
+            distance_from_center = np.sqrt(rel_x**2 + rel_y**2)
+            # normalized_distance 的范围是 [0, ~1], 1 表示在涡旋边缘
+            # cmap(1-normalized_distance) 使中心点 (dist=0) 颜色值高 (如红色), 边缘点 (dist=1) 颜色值低 (如蓝色)
+            color_value_normalized = 1.0 - np.clip(distance_from_center, 0.0, 1.0)
+        elif color_mode == 'time':
+            if min_time_for_norm and max_time_for_norm and min_time_for_norm < max_time_for_norm:
+                time_delta_total = (max_time_for_norm - min_time_for_norm).total_seconds()
+                time_delta_current = (current_date - min_time_for_norm).total_seconds()
+                if time_delta_total > 0:
+                    color_value_normalized = time_delta_current / time_delta_total
+                else: 
+                    color_value_normalized = 0.0 
+            elif min_time_for_norm and max_time_for_norm and min_time_for_norm == max_time_for_norm :
+                 color_value_normalized = 0.0
+        
+        color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
+        
+        ax.scatter(rel_x, rel_y, color=color, s=300, zorder=5) # zorder确保点在圆和叉上方
+        ax.text(rel_x, rel_y, str(day_label), weight='bold', fontsize=9, color='black', ha='center', va='center', zorder=6)
+
+    # 绘制涡旋中心点和单位圆 (只绘制一次)
+    ax.plot(0, 0, marker='x', color='black', markersize=16, markeredgewidth=3, label='Eddy Center (Relative)', zorder=3)
+    circle = plt.Circle((0, 0), 1, color='gray', fill=False, linestyle='--', linewidth=2, label='Unit Eddy Boundary', zorder=2)
+    ax.add_patch(circle)
+    ax.set_aspect('equal')
+
+    # 4. 设置标题和坐标轴
+    month_required_str = ", ".join(map(str, month_required))
+    title_str = f"{ds_names}{no}, Months: {month_required_str}, Relative Positions"
+    if all_profile_dates_for_title:
+        title_str += f"\nData: {date_start_overall.date()}~{date_end_overall.date()}, Total Points: {len(points_to_plot)}"
+    ax.set_title(title_str, fontsize=20)
+    
+    ax.set_xlabel('Relative X (Eddy Radii)', fontsize=20) # 标签改为相对单位
+    ax.set_ylabel('Relative Y (Eddy Radii)', fontsize=20) # 标签改为相对单位
+    plt.tick_params(axis='both', which='major', labelsize=16) # 调整刻度字体大小
+
+    # 设置坐标轴刻度以反映平均真实地理坐标
+    if all_track_info_for_overall_mean:
+        mean_center_lon = np.mean([info[0] for info in all_track_info_for_overall_mean])
+        mean_center_lat = np.mean([info[1] for info in all_track_info_for_overall_mean])
+        mean_radius = np.mean([info[2] for info in all_track_info_for_overall_mean])
+
+        if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
+            mean_degrees = mean_radius / 111320.0 # 1度约111.32公里
+            
+            x_tick_locs = [-1, -0.5, 0, 0.5, 1] # 相对坐标刻度位置
+            x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_degrees):.2f}°\n({tick_loc})" for tick_loc in x_tick_locs]
+            ax.set_xticks(x_tick_locs)
+            ax.set_xticklabels(x_tick_labels) # 默认字体大小已通过tick_params设置
+
+            y_tick_locs = [-1, -0.5, 0, 0.5, 1]
+            y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_degrees):.2f}°\n({tick_loc})" for tick_loc in y_tick_locs]
+            ax.set_yticks(y_tick_locs)
+            ax.set_yticklabels(y_tick_labels)
+            
+    ax.set_xlim([-1.25, 1.25])
+    ax.set_ylim([-1.25, 1.25]) # 修正：应为 set_ylim
+
+    # ax.legend(fontsize=14) # 根据需要取消注释图例
+
+    # 5. 添加颜色条
+    if show_colorbar:
+        norm_for_cbar = Normalize(vmin=0, vmax=1)
+        scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
+        scalar_mappable.set_array([])
+        cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04) # 调整颜色条大小和位置
+
+        if color_mode == 'distance':
+            current_ticks = cbar.get_ticks()
+            new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
+            # 确保0和1的标签是 "0.0" 和 "1.0"
+            new_tick_labels = [ "0.0" if lbl == "-0.0" else ("1.0" if lbl == "1.0" and (1.0 - current_ticks[i]) < 0.01 else lbl) for i, lbl in enumerate(new_tick_labels)]
+            # 更简洁的格式化，确保0和1是一位小数
+            new_tick_labels = []
+            for t_val_one_minus_dist in current_ticks:
+                dist_val = 1.0 - t_val_one_minus_dist
+                label = f"{dist_val:.1f}"
+                new_tick_labels.append(label)
+
+            cbar.set_ticks(current_ticks)
+            cbar.set_ticklabels(new_tick_labels)
+            cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
+        elif color_mode == 'time':
+            if min_time_for_norm and max_time_for_norm:
+                cbar.set_label(f'Normalized Time ({min_time_for_norm.strftime("%Y-%m-%d")} to {max_time_for_norm.strftime("%Y-%m-%d")})', fontsize=14)
+            else:
+                cbar.set_label('Normalized Time', fontsize=14)
+
+    # 6. 保存和显示图片
+    if save_fig:
+        output_dir = "plot_relative_position_monthly_aggregated" # 修改目录名
+        os.makedirs(output_dir, exist_ok=True)
+        month_suffix = "_".join(map(str, month_required))
+        base_filename = f"{ds_names}{no}_RP_months_{month_suffix}_aggregated.png" # 修改文件名
+        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+
+    if show_fig:
+        plt.show()
+    
+    plt.close(fig)
