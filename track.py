@@ -9,12 +9,16 @@ import os
 import pickle
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+import glob
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
 
 argo_data = pd.read_parquet("Argo2014.parquet")
 argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
+
+circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
+Glorys_path = '../copernicus/GLORYS'
 
 def load_meta_data(path):
     '''
@@ -90,10 +94,9 @@ def filtered_float_data(DS: list, no: int):
     '''
     根据涡旋轨迹筛选浮标数据
     
-    筛选方式：先寻找指定编号涡旋出现日期，由日期筛选浮标数据，再判断浮标是否在涡旋contour或是effective radius内
+    筛选方式：先寻找指定编号涡旋出现日期，由日期筛选浮标数据，再判断浮标是否在涡旋contour或是effective radius内。
+    circle_enlargement_factor 用于扩大涡旋半径，收集effective radius理想圆外侧的部分浮标数据。
     '''
-    circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
-
     # 获取指定编号的涡旋轨迹数据
     wanted_track = find_track(DS, no)
     t0 = np.datetime64('1950-01-01')
@@ -1031,3 +1034,79 @@ def plot_relative_position_monthly(DS: list, no: int, month_required: list, show
         plt.show()
     
     plt.close(fig)
+
+def get_glorys_filepath(date)-> str:
+    '''
+    根据给定日期返回对应的GLORYS NetCDF文件路径。
+
+    构造目标日期的文件夹路径和文件名模式，查找匹配的文件。如果找到且仅有一个匹配文件，则返回其完整路径；
+    如果没有找到或找到多个匹配文件，则抛出异常。
+
+    参数:
+        date: 由convert_date得出的需要查找的日期。
+
+    返回:
+        str: 匹配的GLORYS NetCDF文件的完整路径。
+
+    异常:
+        RuntimeError: 如果找到多个匹配文件。
+        FileNotFoundError: 如果没有找到匹配文件。
+    '''
+    nc_path = os.path.join(Glorys_path, date.strftime("%Y"), date.strftime("%m"), 'mercatorglorys12v1_gl12_mean_')
+    nc_path += date.strftime("%Y%m%d")
+    matches = glob.glob(nc_path + '_R*')
+    if matches:
+        if len(matches) > 1:
+            raise RuntimeError(f"Multiple matching files found for {date.strftime('%Y-%m-%d')}: {matches}")
+        nc_path = matches[0]
+        #print("Matching file:", nc_path)
+        return nc_path
+    else:
+        raise FileNotFoundError(f"No matching file found for {date.strftime('%Y-%m-%d')}.")
+        
+def print_glorys_variable(nc_path: str):
+    '''
+    打印指定路径对应NetCDF文件中的所有变量名称、标准名称、维度和形状信息。
+    '''
+    nc_file = Dataset(nc_path, 'r')
+    
+    with Dataset(nc_path, 'r') as nc_file:
+        for var in nc_file.variables:
+            print(var, nc_file.variables[var].standard_name)
+            print(nc_file.variables[var].dimensions, nc_file.variables[var].shape)
+
+def find_track_glorys_filepath(DS: list, no: int) -> dict:
+    '''
+    根据涡旋编号在GLORYS数据集中查找对应的轨迹文件路径。
+
+    参数:
+        DS (list): 涡旋轨迹数据集。
+        no (int): 涡旋编号。
+
+    返回:
+        dict: 涡旋轨迹数据文件路径的字典，格式为 {date: glorys_filepath}。
+              如果未找到对应的轨迹数据或文件路径，则返回空字典。
+    '''
+    wanted_track = find_track(DS, no)
+    if not wanted_track:
+        print(f"未找到涡旋 {no} 的轨迹数据。")
+        return {}
+    
+    glorys_filepaths_dict = {}
+    for track_point in wanted_track:
+        try:
+            date = convert_date(track_point[1])  
+            glorys_filepath = get_glorys_filepath(date)
+            glorys_filepaths_dict[date] = glorys_filepath          
+        except (RuntimeError, FileNotFoundError) as e:
+            print(f"为涡旋 {no} 在日期 {track_point[1]} (转换后: {date if 'date' in locals() else '未知'}) 查找 GLORYS 文件时出错: {e}")
+        except IndexError:
+            print(f"涡旋 {no} 的轨迹点数据格式不正确: {track_point}")
+        except Exception as e: # 捕获其他可能的 convert_date 或 get_glorys_filepath 异常
+            print(f"处理涡旋 {no} 在日期 {track_point[1]} 时发生未知错误: {e}")
+
+    if not glorys_filepaths_dict:
+        print(f"未找到涡旋 {no} 的 GLORYS 文件。")
+        return {}
+        
+    return glorys_filepaths_dict
