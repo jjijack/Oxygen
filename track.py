@@ -163,7 +163,11 @@ def filtered_float_data(DS: list, no: int):
 
 def plot_track(DS: list, no: int):
     '''
-    绘制涡旋轨迹与浮标数据
+    绘制指定编号涡旋的轨迹、相关浮标数据及其存在浮标日期的有效半径和轮廓。
+
+    参数:
+    DS (list): 涡旋轨迹数据集。
+    no (int): 涡旋编号。
     '''
     wanted_track=find_track(DS, no)
     t0 = np.datetime64('1950-01-01')
@@ -200,7 +204,7 @@ def plot_track(DS: list, no: int):
     ax.plot(center_lon[0], center_lat[0], marker='o', color=colors, markersize=10)
     ax.plot(center_lon[-1], center_lat[-1], marker='x', color=colors, markersize=10)
 
-    # For each observation in needed_data, find the matching track point (by date)
+    # 对于 needed_data 中的每个观测，按日期查找对应的涡旋轨迹点
     labeled = False
     for idx, row in needed_data.iterrows():
         obs_date = pd.Timestamp(year=int(row['Year']),
@@ -209,46 +213,48 @@ def plot_track(DS: list, no: int):
         matching = np.where(pd.to_datetime(dates) == obs_date)[0]
         if matching.size > 0:
             i = matching[0]
-            # Draw the radius as a circle (convert meters to degrees approximately)
+            # 以圆的形式绘制半径（将米近似转换为经纬度度数）
             if labeled == False:
                 if ds_names == 'ACS' or ds_names == 'ACL':
                     circle = plt.Circle((center_lon[i], center_lat[i]),
-                                radius[i] / 111320,
+                                radius[i] / 111320.0,
                                 color='r', fill=False, linestyle='--', alpha=0.2, linewidth=1, label='Effective Radius')
                 else:
                     circle = plt.Circle((center_lon[i], center_lat[i]),
-                                radius[i] / 111320,
+                                radius[i] / 111320.0,
                                 color='purple', fill=False, linestyle='--', alpha=0.2, linewidth=1, label='Effective Radius')        
             else:
                 if ds_names == 'ACS' or ds_names == 'ACL':
                     circle = plt.Circle((center_lon[i], center_lat[i]),
-                                    radius[i] / 111320,
+                                    radius[i] / 111320.0,
                                     color='r', fill=False, linestyle='--', alpha=0.2, linewidth=1)
                 else:
                     circle = plt.Circle((center_lon[i], center_lat[i]),
-                                    radius[i] / 111320,
+                                    radius[i] / 111320.0,
                                     color='purple', fill=False, linestyle='--', alpha=0.2, linewidth=1)
             ax.add_patch(circle)
-            # Mark the center point
+            # 标记中心点
             # ax.plot(center_lon[i], center_lat[i], marker='o', color='black', markersize=10)
-            # Plot the contour line
+            # 绘制轮廓线
             if labeled == False:
                 ax.plot(contour_lon[i], contour_lat[i], color=colors, linewidth=1, alpha=0.5, label='Effective Contour')
                 labeled = True
             else:
                 ax.plot(contour_lon[i], contour_lat[i], color=colors, linewidth=1, alpha=0.5)
-            # Plot date
+            # 绘制日期
             dates_obs = pd.to_datetime(needed_data[['Year', 'Month', 'Day']].astype(int))
             if obs_date == dates_obs.min() or obs_date == dates_obs.max():
                 ax.text(center_lon[i], center_lat[i], obs_date.strftime('%Y-%m-%d'), fontsize=20, color='black')
 
-    # Plot each observation point from needed_data
+    # 绘制 needed_data 中的每个观测点
     ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='black', s=50, label='Floats')
     
-    x_margin = (max(center_lon) - min(center_lon)) * 0.1
-    y_margin = (max(center_lat) - min(center_lat)) * 0.1
-    ax.set_xlim(min(center_lon) - x_margin, max(center_lon) + x_margin)
-    ax.set_ylim(min(center_lat) - y_margin, max(center_lat) + y_margin)
+    # 设定边界时排除META中错误的contour数据
+    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
+    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
+    ax.set_xlim(np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5)
+    ax.set_ylim(np.min(contour_lat_filtered) - 0.5, np.max(contour_lat_filtered) + 0.5)
+    ax.set_aspect('equal')
 
     ax.legend(fontsize=18)
 
