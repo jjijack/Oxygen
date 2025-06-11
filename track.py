@@ -1116,3 +1116,206 @@ def find_track_glorys_filepath(DS: list, no: int) -> dict:
         return {}
         
     return glorys_filepaths_dict
+
+def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'thetao', show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False):
+    '''
+    绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
+
+    该函数会生成一张综合图，展示单个涡旋在某一天的详细情况。图中包括了
+    GLORYS数据的表层物理场作为背景，涡旋的完整轨迹、当前位置、轮廓和
+    半径，以及在该区域内符合条件的Argo浮标位置。
+
+    参数:
+        DS (list): 包含所有涡旋轨迹信息的数据集。
+        no (int): 需要绘制的涡旋的唯一编号。
+        needed_idx (int): 涡旋轨迹的时间点索引，用于确定绘图的具体日期。
+        variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'thetao'。
+        show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
+        save_fig (bool): 是否将生成的图像保存为文件。默认为 False。
+        deep_argo (bool): 是否使用深层Argo数据模式。若为 True，则筛选700m深度的Argo数据并按溶解氧着色；若为 False，则使用表层数据。默认为 False。
+    '''
+    wanted_track = find_track(DS, no)
+    num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
+    dates = convert_date(time) if time else None
+
+    # 获取Argo浮标数据
+    argo_data_filtered = filtered_float_data(DS, no)
+    argo_data_filtered = argo_data_filtered[pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])==dates[needed_idx]]    # 日期筛选
+    if deep_argo:
+        idx = argo_data_filtered.groupby('Profile_number')['Depth_m'].apply(lambda x: (x - 700).abs().idxmin())
+        needed_data = argo_data_filtered.loc[idx]
+        needed_data.index.name = None
+    else:
+        needed_data = argo_data_filtered.groupby('Profile_number').apply(lambda group: group.iloc[0])
+        needed_data.index.name = None
+
+    # 获取区域边界
+    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
+    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
+
+    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
+    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
+    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
+    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+
+    #获取背景场数据
+    glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, surface=True, variables=[variable])
+    glorys_variable_filtered = glorys_variables_filtered[variable]
+
+    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
+    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
+    if ds_names:
+        ds_names = ds_names[0].upper()
+    else:
+        raise ValueError("UNKNOWN VARIABLE")
+
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if ds_names == 'ACS' or ds_names == 'ACL':
+        colors =colors[1]
+    else:
+        colors =colors[0]
+    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+
+    fig, ax = plt.subplots(figsize=(30, 20))
+    ax.set_title(f'Track {ds_names}{num[0]}, {dates[needed_idx].strftime('%Y-%m-%d')}', fontsize=20)
+    ax.set_xlabel('Longitude', fontsize=20)
+    ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='green', ax=ax)
+
+    # 绘制涡旋轨迹
+    ax.plot(center_lon, center_lat, color=colors, label='Center Track')
+    ax.plot(center_lon[0], center_lat[0], marker='o', color=colors, markersize=10)
+    ax.plot(center_lon[-1], center_lat[-1], marker='x', color=colors, markersize=10)
+
+    # 绘制背景场
+    pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='coolwarm', shading='auto', alpha=0.5)
+    cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+    if variable == 'thetao':
+        cbar.set_label('Temperature (°C)', fontsize=20)
+    elif variable == 'so':
+        cbar.set_label('Salinity (psu)', fontsize=20)
+    elif variable == 'u':
+        cbar.set_label('Zonal Velocity (m/s)', fontsize=20)
+    elif variable == 'v':
+        cbar.set_label('Meridional Velocity (m/s)', fontsize=20)
+    elif variable == 'ssh':
+        cbar.set_label('Sea Surface Height (m)', fontsize=20)
+    else:
+        cbar.set_label(variable, fontsize=20)
+    cbar.ax.tick_params(labelsize=14)
+
+    # 绘制Argo浮标数据
+    if not needed_data.empty:
+        if deep_argo:
+            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=150, label='700m Argo(Red stands for high DO)', zorder=5)
+            # cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            # cbar2.set_label('DO/μmol·kg⁻¹', fontsize=20)
+            # cbar2.ax.tick_params(labelsize=14)
+        else:
+            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=150, label='Argo', zorder=5)
+        # for idx, row in needed_data.iterrows():
+        #     ax.text(row['Longitude'], row['Latitude'], str(row['Profile_number']), fontsize=8, fontweight='bold', ha='center', va='center', color='black', zorder=6)
+    else:
+        print(f"No Argo data available for eddy {ds_names}{no} at the specified index {needed_idx}.")
+
+    # 绘制当前时刻涡旋
+    circle = plt.Circle((center_lon[needed_idx], center_lat[needed_idx]),
+                                radius[needed_idx] / 111320.0,
+                                color='r', fill=False, linestyle='--', alpha=0.2, linewidth=1, label='Effective Radius')
+    ax.add_patch(circle)
+
+    ax.scatter(center_lon[needed_idx], center_lat[needed_idx], color='black', s=20, label='Eddy Center', zorder=5)
+    ax.plot(contour_lon[needed_idx], contour_lat[needed_idx], color=colors, linewidth=1, alpha=0.5, label='Effective Contour')
+
+    ax.legend(fontsize=18)
+    ax.set_xlim(glorys_lon_min, glorys_lon_max)
+    ax.set_ylim(glorys_lat_min, glorys_lat_max)
+    ax.set_aspect('equal')
+
+    # 保存和显示图片
+    if save_fig:
+        output_dir = "plot_track_area_surface_glorys"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_filename = f"{ds_names}{no}_surface_{variable}_{dates[needed_idx].strftime('%Y%m%d')}.png"
+        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+
+    if show_fig:
+        plt.show()
+
+    plt.close(fig)  # 关闭图像，释放内存
+
+def get_track_area_glorys(DS: list, no: int, needed_idx: int, surface: bool = False, variables: list = ['thetao']):
+    '''
+    获取指定涡旋在特定时间点周围的 GLORYS 数据。
+
+    该函数会根据涡旋轮廓确定一个矩形区域，并从相应的 GLORYS 文件中
+    提取此区域内的一个或多个物理变量。
+
+    参数:
+        DS (list): 包含涡旋轨迹信息的数据集。
+        no (int): 涡旋的唯一编号。
+        needed_idx (int): 涡旋轨迹的时间点索引。
+        surface (bool): 是否只提取表层数据，默认为 False，提取2000m以内的数据。
+        variables (list): 需要提取的变量列表，默认为 ['thetao']，可选'salinity', 'u', 'v', 'ssh'。
+
+    返回:
+        一个元组，包含筛选后的经度、纬度、深度数组，以及一个存储了所有请求变量数据的字典。
+    '''
+    wanted_track = find_track(DS, no)
+    num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
+
+    glorys_filepaths_dict = find_track_glorys_filepath(DS, no)
+
+    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
+    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
+
+    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
+    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
+    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
+    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+
+    needed_glorys_data = Dataset(list(glorys_filepaths_dict.values())[needed_idx], 'r')
+    glorys_lon = needed_glorys_data.variables['longitude'][:]
+    glorys_lat = needed_glorys_data.variables['latitude'][:]
+    glorys_depth = needed_glorys_data.variables['depth'][:]
+
+    glorys_lon_mask = (glorys_lon >= glorys_lon_min) & (glorys_lon <= glorys_lon_max)
+    glorys_lat_mask = (glorys_lat >= glorys_lat_min) & (glorys_lat <= glorys_lat_max)
+    if surface:
+        glorys_depth_mask = np.zeros_like(glorys_depth, dtype=bool)
+        if glorys_depth.size > 0:
+            glorys_depth_mask[0] = True
+    else:
+        glorys_depth_mask = (glorys_depth >= 0) & (glorys_depth <= 2000)
+        
+    glorys_lon_filtered = glorys_lon[glorys_lon_mask]
+    glorys_lat_filtered = glorys_lat[glorys_lat_mask]
+    glorys_depth_filtered = glorys_depth[glorys_depth_mask]
+
+    # 存储多个变量的字典
+    glorys_variables_filtered = {}
+    for var in variables:
+        if var == 'thetao':
+            glorys_variables_filtered['thetao'] = needed_glorys_data.variables['thetao'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+            if surface:
+                glorys_variables_filtered['thetao'] = glorys_variables_filtered['thetao'][0, :, :]
+        elif var == 'salinity' or var == 'so':
+            glorys_variables_filtered['salinity'] = needed_glorys_data.variables['so'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+            if surface:
+                glorys_variables_filtered['salinity'] = glorys_variables_filtered['salinity'][0, :, :]
+        elif var == 'u' or var == 'uo':
+            glorys_variables_filtered['u'] = needed_glorys_data.variables['uo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+            if surface:
+                glorys_variables_filtered['u'] = glorys_variables_filtered['u'][0, :, :]
+        elif var == 'v' or var == 'vo':
+            glorys_variables_filtered['v'] = needed_glorys_data.variables['vo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+            if surface:
+                glorys_variables_filtered['v'] = glorys_variables_filtered['v'][0, :, :]
+        elif var == 'ssh' or var == 'zos':
+            glorys_variables_filtered['ssh'] = needed_glorys_data.variables['zos'][0, glorys_lat_mask, glorys_lon_mask]
+
+    needed_glorys_data.close()
+    
+    return glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered
