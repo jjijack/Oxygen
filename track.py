@@ -1117,7 +1117,7 @@ def find_track_glorys_filepath(DS: list, no: int) -> dict:
         
     return glorys_filepaths_dict
 
-def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'thetao', show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False):
+def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity', show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False):
     '''
     绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
 
@@ -1129,7 +1129,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
         DS (list): 包含所有涡旋轨迹信息的数据集。
         no (int): 需要绘制的涡旋的唯一编号。
         needed_idx (int): 涡旋轨迹的时间点索引，用于确定绘图的具体日期。
-        variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'thetao'。
+        variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'vorticity'。
         show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
         save_fig (bool): 是否将生成的图像保存为文件。默认为 False。
         deep_argo (bool): 是否使用深层Argo数据模式。若为 True，则筛选700m深度的Argo数据并按溶解氧着色；若为 False，则使用表层数据。默认为 False。
@@ -1159,8 +1159,12 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     glorys_lat_max = np.max(contour_lat_filtered) + 0.5
 
     #获取背景场数据
-    glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, surface=True, variables=[variable])
-    glorys_variable_filtered = glorys_variables_filtered[variable]
+    if variable == 'vorticity':
+        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], surface=True)
+        glorys_variable_filtered = calculate_vorticity(glorys_lon_filtered, glorys_lat_filtered, glorys_variables_filtered['u'], glorys_variables_filtered['v'])
+    else:
+        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], surface=True)
+        glorys_variable_filtered = glorys_variables_filtered[variable]
 
     callers_local_vars = inspect.currentframe().f_back.f_locals.items()
     ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
@@ -1190,7 +1194,10 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     # 绘制背景场
     pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='coolwarm', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-    if variable == 'thetao':
+    if variable == 'vorticity':
+        cbar.set_label('Vorticity (s⁻¹)', fontsize=20)
+        pc.set_clim(-5e-5, 5e-5)
+    elif variable == 'thetao':
         cbar.set_label('Temperature (°C)', fontsize=20)
     elif variable == 'so':
         cbar.set_label('Salinity (psu)', fontsize=20)
@@ -1207,7 +1214,8 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     # 绘制Argo浮标数据
     if not needed_data.empty:
         if deep_argo:
-            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=150, label='700m Argo(Red stands for high DO)', zorder=5)
+            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=150,
+                            edgecolors='black', linewidths=0.5, label='700m Argo(Red stands for high DO)', zorder=5)
             # cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
             # cbar2.set_label('DO/μmol·kg⁻¹', fontsize=20)
             # cbar2.ax.tick_params(labelsize=14)
@@ -1246,7 +1254,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
 
     plt.close(fig)  # 关闭图像，释放内存
 
-def get_track_area_glorys(DS: list, no: int, needed_idx: int, surface: bool = False, variables: list = ['thetao']):
+def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = ['thetao'], surface: bool = False):
     '''
     获取指定涡旋在特定时间点周围的 GLORYS 数据。
 
@@ -1319,3 +1327,106 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int, surface: bool = Fa
     needed_glorys_data.close()
     
     return glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered
+
+def calculate_vorticity(lon, lat, u, v):
+    '''
+    计算给定速度场的相对涡度。该函数可智能处理2D/3D以及Masked Array输入。
+
+    输入的速度场 u, v 的维度应为 (latitude, longitude) 或
+    (depth, latitude, longitude)。如果输入为Masked Array，则输出也会是
+    Masked Array，其中在mask边缘计算不准确的点会被自动mask掉。
+
+    参数:
+        lon (np.ndarray): 一维经度数组 (单位: 度)。
+        lat (np.ndarray): 一维纬度数组 (单位: 度)。
+        u (np.ndarray | np.ma.MaskedArray): Zonal 速度数组。
+        v (np.ndarray | np.ma.MaskedArray): Meridional 速度数组。
+
+    返回:
+        np.ndarray | np.ma.MaskedArray: 计算得到的涡度数组。
+    '''
+    # --- 1. 输入校验和维度处理 ---
+    if u.shape[-2:] != (len(lat), len(lon)) or u.shape != v.shape:
+        raise ValueError("速度数组的最后两个维度必须与经纬度数组的长度匹配，且u,v数组形状需一致。")
+    if u.ndim not in [2, 3]:
+        raise ValueError("输入速度场必须是 2D 或 3D 数组。")
+
+    # --- 2. 智能处理 Masked Array ---
+    # 检查输入是否为 masked array
+    is_masked_input = np.ma.is_masked(u)
+
+    if is_masked_input:
+        # 如果是，用 NaN 填充被 mask 的位置。梯度计算会正确传播NaN。
+        u_data = u.filled(np.nan)
+        v_data = v.filled(np.nan)
+    else:
+        # 如果不是，直接使用原始数据
+        u_data = u
+        v_data = v
+
+    # --- 3. 统一升维处理 ---
+    original_ndim = u.ndim
+    if original_ndim == 2:
+        u_proc = u_data[np.newaxis, :, :]
+        v_proc = v_data[np.newaxis, :, :]
+    else:
+        u_proc = u_data
+        v_proc = v_data
+
+    # --- 4. 计算物理坐标间距 (dx, dy) ---
+    R_earth = 6371e3 
+    lon_rad, lat_rad = np.meshgrid(np.deg2rad(lon), np.deg2rad(lat))
+    dy = R_earth * np.gradient(lat_rad, axis=0)
+    dx = R_earth * np.cos(lat_rad) * np.gradient(lon_rad, axis=1)
+    
+    # --- 5. 核心计算逻辑 ---
+    vorticity_list = []
+    for k in range(u_proc.shape[0]):
+        u_slice = u_proc[k, :, :]
+        v_slice = v_proc[k, :, :]
+        dvdx = np.gradient(v_slice, axis=1) / dx
+        dudy = np.gradient(u_slice, axis=0) / dy
+        vorticity_list.append(dvdx - dudy)
+    vorticity_result = np.stack(vorticity_list, axis=0)
+    
+    # --- 6. 根据输入类型，决定最终输出 ---
+    if is_masked_input:
+        # 如果输入是 masked，将结果中的 NaN 转回为 mask
+        final_result = np.ma.masked_invalid(vorticity_result, copy=False)
+    else:
+        final_result = vorticity_result
+
+    # 如果原始输入是 2D，则降维回去
+    if original_ndim == 2:
+        return final_result.squeeze(axis=0)
+    else:
+        return final_result
+    
+def get_idx(DS: list, no: int, start_date: str, end_date: str) -> list:
+    '''
+    获取指定涡旋编号在给定时间范围内的索引列表。
+
+    参数:
+        DS (list): 涡旋轨迹数据集。
+        no (int): 涡旋编号。
+        start_date (str): 起始日期，格式为 'YYYY-MM-DD'。
+        end_date (str): 结束日期，格式为 'YYYY-MM-DD'。
+
+    返回:
+        list: 涡旋编号在指定时间范围内的索引列表。
+    '''
+    wanted_track = find_track(DS, no)
+    if not wanted_track:
+        print(f"未找到涡旋 {no} 的轨迹数据。")
+        return []
+
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
+    idx_list = []
+    for idx, track_point in enumerate(wanted_track):
+        track_date = convert_date(track_point[1])
+        if start_date <= track_date <= end_date:
+            idx_list.append(idx)
+
+    return idx_list
