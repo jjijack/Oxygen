@@ -1142,9 +1142,15 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     argo_data_filtered = filtered_float_data(DS, no)
     argo_data_filtered = argo_data_filtered[pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])==dates[needed_idx]]    # 日期筛选
     if deep_argo:
-        idx = argo_data_filtered.groupby('Profile_number')['Depth_m'].apply(lambda x: (x - 700).abs().idxmin())
-        needed_data = argo_data_filtered.loc[idx]
-        needed_data.index.name = None
+        filtered_by_depth = argo_data_filtered[argo_data_filtered['Depth_m'] >= 500].copy()
+        if filtered_by_depth.empty:
+            print("Warning: No data found with Depth_m >= 500.")
+            needed_data = pd.DataFrame(columns=argo_data_filtered.columns) # 返回一个空的DataFrame
+        else:
+            idx_max_do = filtered_by_depth.groupby('Profile_number')['DO_mol_kg'].idxmax()
+            needed_data = filtered_by_depth.loc[idx_max_do]
+            needed_data.index.name = None
+
     else:
         needed_data = argo_data_filtered.groupby('Profile_number').apply(lambda group: group.iloc[0])
         needed_data.index.name = None
@@ -1180,7 +1186,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
         colors =colors[0]
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
 
-    fig, ax = plt.subplots(figsize=(30, 20))
+    fig, ax = plt.subplots(figsize=(30, 25))
     ax.set_title(f'Track {ds_names}{num[0]}, {dates[needed_idx].strftime('%Y-%m-%d')}', fontsize=20)
     ax.set_xlabel('Longitude', fontsize=20)
     ax.set_ylabel('Latitude', fontsize=20)
@@ -1214,15 +1220,15 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     # 绘制Argo浮标数据
     if not needed_data.empty:
         if deep_argo:
-            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=150,
-                            edgecolors='black', linewidths=0.5, label='700m Argo(Red stands for high DO)', zorder=5)
-            # cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-            # cbar2.set_label('DO/μmol·kg⁻¹', fontsize=20)
-            # cbar2.ax.tick_params(labelsize=14)
+            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=180,
+                            vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo with max DO under 500m', zorder=5)
+            cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            cbar2.set_label('DO/μmol·kg⁻¹', fontsize=20)
+            cbar2.ax.tick_params(labelsize=14)
         else:
-            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=150, label='Argo', zorder=5)
-        # for idx, row in needed_data.iterrows():
-        #     ax.text(row['Longitude'], row['Latitude'], str(row['Profile_number']), fontsize=8, fontweight='bold', ha='center', va='center', color='black', zorder=6)
+            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=180, label='Argo', zorder=5)
+        for idx, row in needed_data.iterrows():
+            ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth_m'])}", fontsize=7, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
         print(f"No Argo data available for eddy {ds_names}{no} at the specified index {needed_idx}.")
 
