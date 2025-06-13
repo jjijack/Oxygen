@@ -1167,7 +1167,8 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     #获取背景场数据
     if variable == 'vorticity':
         glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], surface=True)
-        glorys_variable_filtered = calculate_vorticity(glorys_lon_filtered, glorys_lat_filtered, glorys_variables_filtered['u'], glorys_variables_filtered['v'])
+        zeta, f = calculate_vorticity(glorys_lon_filtered, glorys_lat_filtered, glorys_variables_filtered['u'], glorys_variables_filtered['v'])
+        glorys_variable_filtered = zeta/f
     else:
         glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], surface=True)
         glorys_variable_filtered = glorys_variables_filtered[variable]
@@ -1201,8 +1202,8 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='coolwarm', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
     if variable == 'vorticity':
-        cbar.set_label('Vorticity (s⁻¹)', fontsize=20)
-        pc.set_clim(-5e-5, 5e-5)
+        cbar.set_label('$\zeta/f$', fontsize=20)
+        pc.set_clim(-0.8,0.8)
     elif variable == 'thetao':
         cbar.set_label('Temperature (°C)', fontsize=20)
     elif variable == 'so':
@@ -1336,7 +1337,8 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = 
 
 def calculate_vorticity(lon, lat, u, v):
     '''
-    计算给定速度场的相对涡度。该函数可智能处理2D/3D以及Masked Array输入。
+    计算给定速度场的相对涡度 (zeta) 和科里奥利参数 (f)。
+    该函数可智能处理2D/3D以及Masked Array输入。
 
     输入的速度场 u, v 的维度应为 (latitude, longitude) 或
     (depth, latitude, longitude)。如果输入为Masked Array，则输出也会是
@@ -1349,7 +1351,9 @@ def calculate_vorticity(lon, lat, u, v):
         v (np.ndarray | np.ma.MaskedArray): Meridional 速度数组。
 
     返回:
-        np.ndarray | np.ma.MaskedArray: 计算得到的涡度数组。
+        tuple: 包含两个元素的元组 (zeta, f)。
+               zeta (np.ndarray | np.ma.MaskedArray): 计算得到的相对涡度数组。
+               f (np.ndarray | np.ma.MaskedArray): 计算得到的科里奥利参数数组。
     '''
     # --- 1. 输入校验和维度处理 ---
     if u.shape[-2:] != (len(lat), len(lon)) or u.shape != v.shape:
@@ -1379,12 +1383,25 @@ def calculate_vorticity(lon, lat, u, v):
         u_proc = u_data
         v_proc = v_data
 
-    # --- 4. 计算物理坐标间距 (dx, dy) ---
-    R_earth = 6371e3 
+    # --- 4. 计算物理坐标间距 (dx, dy) 和科里奥利参数 (f) ---
+    R_earth = 6371e3  # 地球半径 (米)
+    Omega = 7.2921e-5  # 地球自转角速度 (弧度/秒)
+
     lon_rad, lat_rad = np.meshgrid(np.deg2rad(lon), np.deg2rad(lat))
+
     dy = R_earth * np.gradient(lat_rad, axis=0)
     dx = R_earth * np.cos(lat_rad) * np.gradient(lon_rad, axis=1)
     
+    # 计算科里奥利参数 f
+    # f 的形状应该与 (latitude, longitude) 匹配，然后根据需要广播到 (depth, latitude, longitude)
+    f_2d = 2 * Omega * np.sin(lat_rad)
+
+    # 广播 f_2d 到 u_proc 和 v_proc 的深度维度，以便最终输出的 f 形状与 zeta 保持一致
+    if original_ndim == 3:
+        f_proc = np.tile(f_2d[np.newaxis, :, :], (u_proc.shape[0], 1, 1))
+    else: # original_ndim == 2
+        f_proc = f_2d # f_2d 已经是 (latitude, longitude) 形状
+
     # --- 5. 核心计算逻辑 ---
     vorticity_list = []
     for k in range(u_proc.shape[0]):
@@ -1398,15 +1415,17 @@ def calculate_vorticity(lon, lat, u, v):
     # --- 6. 根据输入类型，决定最终输出 ---
     if is_masked_input:
         # 如果输入是 masked，将结果中的 NaN 转回为 mask
-        final_result = np.ma.masked_invalid(vorticity_result, copy=False)
+        zeta_final = np.ma.masked_invalid(vorticity_result, copy=False)
+        f_final = np.ma.masked_invalid(f_proc, copy=False) # f 也可能是 masked array
     else:
-        final_result = vorticity_result
+        zeta_final = vorticity_result
+        f_final = f_proc
 
     # 如果原始输入是 2D，则降维回去
     if original_ndim == 2:
-        return final_result.squeeze(axis=0)
+        return zeta_final.squeeze(axis=0), f_final
     else:
-        return final_result
+        return zeta_final, f_final
     
 def get_idx(DS: list, no: int, start_date: str, end_date: str) -> list:
     '''
