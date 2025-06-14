@@ -10,6 +10,7 @@ import pickle
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 import glob
+from scipy.interpolate import RegularGridInterpolator
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
@@ -1117,7 +1118,9 @@ def find_track_glorys_filepath(DS: list, no: int) -> dict:
         
     return glorys_filepaths_dict
 
-def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity', show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False):
+def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity',
+                                   show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False,
+                                   k: float = None, b: float = None):
     '''
     绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
 
@@ -1133,6 +1136,8 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
         show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
         save_fig (bool): 是否将生成的图像保存为文件。默认为 False。
         deep_argo (bool): 是否使用深层Argo数据模式。若为 True，则筛选700m深度的Argo数据并按溶解氧着色；若为 False，则使用表层数据。默认为 False。
+        k (float, optional): 直线方程 y = kx + b 中的斜率。默认为 None。
+        b (float, optional): 直线方程 y = kx + b 中的截距。默认为 None。
     '''
     wanted_track = find_track(DS, no)
     num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
@@ -1202,7 +1207,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='coolwarm', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
     if variable == 'vorticity':
-        cbar.set_label('$\zeta/f$', fontsize=20)
+        cbar.set_label(r'$\zeta/f$', fontsize=20)
         pc.set_clim(-0.8,0.8)
     elif variable == 'thetao':
         cbar.set_label('Temperature (°C)', fontsize=20)
@@ -1241,6 +1246,15 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
 
     ax.scatter(center_lon[needed_idx], center_lat[needed_idx], color='black', s=20, label='Eddy Center', zorder=5)
     ax.plot(contour_lon[needed_idx], contour_lat[needed_idx], color=colors, linewidth=1, alpha=0.5, label='Effective Contour')
+
+    # 绘制 y = kx + b 直线
+    if k is not None and b is not None:
+        # 获取当前x轴的范围
+        x_min, x_max = ax.get_xlim()
+        # 根据 y = kx + b 计算y的对应范围
+        line_x = np.array([x_min, x_max])
+        line_y = k * line_x + b
+        ax.plot(line_x, line_y, color='purple', linestyle='-', linewidth=2, label=f'Profile Line: y={k:.2f}x+{b:.2f}')
 
     ax.legend(fontsize=18)
     ax.set_xlim(glorys_lon_min, glorys_lon_max)
@@ -1404,9 +1418,9 @@ def calculate_vorticity(lon, lat, u, v):
 
     # --- 5. 核心计算逻辑 ---
     vorticity_list = []
-    for k in range(u_proc.shape[0]):
-        u_slice = u_proc[k, :, :]
-        v_slice = v_proc[k, :, :]
+    for k_slice_idx in range(u_proc.shape[0]):
+        u_slice = u_proc[k_slice_idx, :, :]
+        v_slice = v_proc[k_slice_idx, :, :]
         dvdx = np.gradient(v_slice, axis=1) / dx
         dudy = np.gradient(u_slice, axis=0) / dy
         vorticity_list.append(dvdx - dudy)
@@ -1455,3 +1469,455 @@ def get_idx(DS: list, no: int, start_date: str, end_date: str) -> list:
             idx_list.append(idx)
 
     return idx_list
+
+def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variable: str = 'vorticity',
+                         show_fig: bool = False, save_fig: bool = False, xmin: float = None, xmax: float = None,
+                         ymin: float = None, ymax: float = None):
+    '''
+    绘制指定涡旋在特定时刻的垂直剖面图 (y = kx + b)。
+
+    该函数会提取 GLORYS 数据的三维场，并在由 y = kx + b 定义的直线上进行插值，
+    生成该变量的二维垂直剖面图像。
+
+    参数:
+        DS (list): 包含涡旋轨迹信息的数据集。
+        no (int): 涡旋的唯一编号。
+        needed_idx (int): 涡旋轨迹的时间点索引。
+        k (float): 直线方程 y = kx + b 中的斜率。
+        b (float): 直线方程 y = kx + b 中的截距。
+        variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'vorticity'。
+        show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
+        save_fig (bool): 是否将生成的图像保存为 False。
+        xmin (float): x轴最小值，默认为 None，表示自动计算。
+        xmax (float): x轴最大值，默认为 None，表示自动计算。
+        ymin (float): y轴最小值，默认为 None，表示自动计算。
+        ymax (float): y轴最大值，默认为 None，表示自动计算。
+    '''
+    if k is None or b is None:
+        raise ValueError("k 和 b 必须提供以绘制垂直剖面。")
+
+    R_earth = 6371e3 # 地球半径 (米)
+
+    wanted_track = find_track(DS, no)
+    num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
+    dates = convert_date(time) if time else None
+
+    # 获取涡旋中心和有效半径（度为单位）
+    current_center_lon = center_lon[needed_idx]
+    current_center_lat = center_lat[needed_idx]
+    effective_radius_deg = radius[needed_idx] / 111320.0 # 将米转换为度
+
+    # 获取区域边界
+    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
+    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
+
+    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
+    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
+    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
+    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+    
+    # 获取三维背景场数据
+    if variable == 'vorticity':
+        glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_variables_raw = \
+            get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], surface=False)
+        
+        u_data_for_vorticity = glorys_variables_raw['u']
+        v_data_for_vorticity = glorys_variables_raw['v']
+        if u_data_for_vorticity.ndim == 2:
+            u_data_for_vorticity = u_data_for_vorticity[np.newaxis, :, :]
+            v_data_for_vorticity = v_data_for_vorticity[np.newaxis, :, :]
+
+        zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw,
+                                            u_data_for_vorticity, v_data_for_vorticity)
+        glorys_variable_3d = zeta_3d / f_3d
+        cbar_label = r'$\zeta/f$'
+        cmap = 'coolwarm'
+        clim = (-0.3, 0.3)
+    else:
+        glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_variables_raw = \
+            get_track_area_glorys(DS, no, needed_idx, variables=[variable], surface=False)
+        
+        if variable == 'salinity':
+            glorys_variable_3d = glorys_variables_raw['salinity']
+        elif variable == 'u':
+            glorys_variable_3d = glorys_variables_raw['u']
+        elif variable == 'v':
+            glorys_variable_3d = glorys_variables_raw['v']
+        elif variable == 'thetao':
+            glorys_variable_3d = glorys_variables_raw['thetao']
+        elif variable == 'ssh' or variable == 'zos':
+            raise ValueError(f"Variable '{variable}' is a 2D surface variable. Vertical profile is not applicable.")
+        else:
+            glorys_variable_3d = glorys_variables_raw.get(variable)
+            if glorys_variable_3d is None:
+                 raise ValueError(f"Unknown or unsupported variable for vertical profile: '{variable}'.")
+
+        if glorys_variable_3d.ndim == 2 and len(glorys_depth_raw) == 1:
+            glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
+        elif glorys_variable_3d.ndim != 3:
+             raise ValueError(f"Expected 3D data for variable '{variable}' but got {glorys_variable_3d.ndim}D data.")
+
+        valid_values = glorys_variable_3d[~np.isnan(glorys_variable_3d)]
+        if valid_values.size > 0:
+            clim = (np.min(valid_values), np.max(valid_values))
+        else:
+            clim = (0, 1)
+
+        if variable == 'thetao':
+            cbar_label = 'Temperature (°C)'
+            cmap = 'rainbow'
+        elif variable == 'salinity':
+            cbar_label = 'Salinity (psu)'
+            cmap = 'viridis'
+        elif variable == 'u' or variable == 'v':
+            cbar_label = 'Velocity (m/s)'
+            cmap = 'RdBu_r'
+            if valid_values.size > 0:
+                max_abs_val = np.max(np.abs(valid_values))
+                clim = (-max_abs_val, max_abs_val)
+            else:
+                clim = (-1, 1)
+        else:
+            cbar_label = variable
+            cmap = 'viridis'
+
+    if glorys_variable_3d.size == 0 or np.all(np.isnan(glorys_variable_3d)):
+        print(f"Warning: GLORYS data for variable '{variable}' is empty or all NaN for Track {no} at index {needed_idx}. Cannot plot vertical profile.")
+        plt.close()
+        return
+
+    # --- 定义剖面线上的点 ---
+    num_points = 500 # 增加点数，使交点查找更精确，并保证连续性
+    
+    if k == 0: # 水平线 (y = b)
+        profile_lons = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
+        profile_lats = np.full_like(profile_lons, b)
+    elif np.isinf(k) or np.abs(k) > 1e10: # 近似垂直线 (x = const)
+        profile_lats = np.linspace(glorys_lat_min, glorys_lat_max, num_points)
+        profile_lons = np.full_like(profile_lats, (glorys_lon_min + glorys_lon_max)/2.0)
+    else: # 斜线
+        profile_lons_temp = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
+        profile_lats_temp = k * profile_lons_temp + b
+        
+        valid_mask = (profile_lats_temp >= glorys_lat_min) & (profile_lats_temp <= glorys_lat_max)
+        profile_lons = profile_lons_temp[valid_mask]
+        profile_lats = profile_lats_temp[valid_mask]
+
+        if len(profile_lons) < 2: # 如果经度范围不足以生成足够点，尝试以纬度为主
+            profile_lats_temp = np.linspace(glorys_lat_min, glorys_lat_max, num_points)
+            profile_lons_temp = (profile_lats_temp - b) / k
+            valid_mask = (profile_lons_temp >= glorys_lon_min) & (profile_lons_temp <= glorys_lon_max)
+            profile_lons = profile_lons_temp[valid_mask]
+            profile_lats = profile_lats_temp[valid_mask]
+
+    if len(profile_lons) < 2:
+        print(f"Warning: The specified line (y={k}x+{b}) does not sufficiently intersect the GLORYS data area. Cannot plot vertical profile.")
+        plt.close()
+        return
+
+    # === 修正 X 轴的物理距离计算 ===
+    # 将经纬度转换为弧度
+    profile_lons_rad = np.deg2rad(profile_lons)
+    profile_lats_rad = np.deg2rad(profile_lats)
+
+    # 计算每小段的经度差和纬度差 (弧度)
+    dlon_rad_segments = np.diff(profile_lons_rad)
+    dlat_rad_segments = np.diff(profile_lats_rad)
+
+    # 计算每小段的平均纬度 (用于计算cos因子)
+    mid_lats_rad = np.deg2rad((profile_lats[:-1] + profile_lats[1:]) / 2)
+
+    # 将弧度差转换为米 (近似笛卡尔坐标)
+    dx_meters = R_earth * np.cos(mid_lats_rad) * dlon_rad_segments
+    dy_meters = R_earth * dlat_rad_segments
+
+    # 计算每小段的斜边距离 (米)
+    distance_segments_meters = np.sqrt(dx_meters**2 + dy_meters**2)
+
+    # 累积距离 (公里)
+    x_coords_raw = np.insert(np.cumsum(distance_segments_meters), 0, 0) / 1000.0
+    # ==========================================================
+
+    # === 1. 计算涡旋中心在剖面上的投影点 ===
+    if k == 0: # 水平线 y=b
+        proj_center_lon = current_center_lon
+        proj_center_lat = b
+    elif np.isinf(k) or np.abs(k) > 1e10: # 近似垂直线 x=const
+        proj_center_lon = (glorys_lon_min + glorys_lon_max)/2.0 # 或特定x值
+        proj_center_lat = current_center_lat
+    else: # 斜线 y = kx + b
+        xp = (current_center_lon + k * current_center_lat - k * b) / (1 + k*k)
+        yp = k * xp + b
+        proj_center_lon = xp
+        proj_center_lat = yp
+
+    # 找到 (proj_center_lon, proj_center_lat) 在 profile_lons, profile_lats 序列中的索引
+    # 先将 profile_lons, profile_lats 转为点对
+    profile_points_xy = np.column_stack((profile_lons, profile_lats))
+    proj_point_xy = np.array([proj_center_lon, proj_center_lat])
+
+    # 计算投影点到剖面线上每个点的欧氏距离（在经纬度空间）
+    distances_to_profile_points_lonlat = np.sqrt(
+        (profile_points_xy[:, 0] - proj_point_xy[0])**2 +
+        (profile_points_xy[:, 1] - proj_point_xy[1])**2
+    )
+    # 找到距离最近的点的索引
+    closest_point_idx_on_profile = np.argmin(distances_to_profile_points_lonlat)
+    
+    # 涡旋中心投影点在 x_coords_raw 中的距离
+    center_proj_dist_from_start = x_coords_raw[closest_point_idx_on_profile]
+
+    # 重新中心化 X 轴
+    x_coords_recenter = x_coords_raw - center_proj_dist_from_start
+    # ==========================================================
+
+    # --- 对三维数据进行插值以获取剖面数据 ---
+    if isinstance(glorys_variable_3d, np.ma.MaskedArray):
+        interp_data = glorys_variable_3d.filled(np.nan)
+    else:
+        interp_data = glorys_variable_3d
+
+    points_grid = (glorys_depth_raw, glorys_lat_raw, glorys_lon_raw)
+    interp_func = RegularGridInterpolator(points_grid, interp_data, method='linear', bounds_error=False, fill_value=np.nan)
+
+    query_depths, query_lats = np.meshgrid(glorys_depth_raw, profile_lats, indexing='ij')
+    _, query_lons = np.meshgrid(glorys_depth_raw, profile_lons, indexing='ij')
+
+    xi_interp_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
+
+    interpolated_values_flat = interp_func(xi_interp_points)
+    profile_variable_2d = interpolated_values_flat.reshape(len(glorys_depth_raw), len(profile_lons))
+
+    if isinstance(glorys_variable_3d, np.ma.MaskedArray):
+        profile_variable_2d = np.ma.masked_invalid(profile_variable_2d, copy=False)
+
+    # --- 绘图 ---
+    fig, ax = plt.subplots(figsize=(20, 15))
+    
+    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
+    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
+    if ds_names:
+        ds_names = ds_names[0].upper()
+    else:
+        ds_names = "UNKNOWN"
+
+    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if ds_names == 'ACS' or ds_names == 'ACL':
+        eddy_color = prop_colors[1]
+    else:
+        eddy_color = prop_colors[0]
+
+    ax.set_title(f'Vertical Profile of {cbar_label} for Track {ds_names}{num[0]} on {dates[needed_idx].strftime('%Y-%m-%d')}', fontsize=20)
+    
+    ax.set_xlabel('Distance from Eddy Center Projection (km)', fontsize=18)
+    ax.set_ylabel('Depth (m)', fontsize=18)
+    ax.tick_params(labelsize=14)
+
+    X_mesh_for_plot, Y_mesh_for_plot = np.meshgrid(x_coords_recenter, glorys_depth_raw)
+    
+    pc = ax.pcolormesh(X_mesh_for_plot, Y_mesh_for_plot, profile_variable_2d, cmap=cmap, shading='auto', vmin=clim[0], vmax=clim[1])
+    cbar = plt.colorbar(pc, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label, fontsize=18)
+    cbar.ax.tick_params(labelsize=14)
+
+    ax.set_ylim(glorys_depth_raw.max(), glorys_depth_raw.min())
+
+    # === 绘制涡旋中心投影的垂直线 ===
+    ax.axvline(0, color='black', linestyle='--', linewidth=2, label='Eddy Center Projection')
+
+    # === 绘制有效半径 (circle) 的垂直线 ===
+    A_quad = 1 + k*k # 避免与A参数混淆
+    B_quad = -2*current_center_lon + 2*k*(b - current_center_lat)
+    C_quad = current_center_lon**2 + (b - current_center_lat)**2 - effective_radius_deg**2
+    
+    discriminant = B_quad**2 - 4*A_quad*C_quad
+    
+    circle_intersections_xy = []
+    if discriminant >= 0:
+        x1 = (-B_quad + np.sqrt(discriminant)) / (2*A_quad)
+        y1 = k * x1 + b
+        circle_intersections_xy.append((x1, y1))
+        if discriminant > 0:
+            x2 = (-B_quad - np.sqrt(discriminant)) / (2*A_quad)
+            y2 = k * x2 + b
+            circle_intersections_xy.append((x2, y2))
+            
+    circle_proj_distances = []
+    for int_lon, int_lat in circle_intersections_xy:
+        # 找到交点在 profile_lons, profile_lats 序列中的索引
+        int_point_xy = np.array([int_lon, int_lat])
+        distances_to_profile_points_from_int = np.sqrt(
+            (profile_points_xy[:, 0] - int_point_xy[0])**2 + 
+            (profile_points_xy[:, 1] - int_point_xy[1])**2
+        )
+        closest_profile_idx = np.argmin(distances_to_profile_points_from_int)
+        
+        dist_from_start = x_coords_raw[closest_profile_idx]
+        relative_dist = dist_from_start - center_proj_dist_from_start
+        
+        # 仅当交点接近剖面线时才绘制
+        if distances_to_profile_points_from_int[closest_profile_idx] < effective_radius_deg * 0.1: # 小于半径的10%作为阈值
+             circle_proj_distances.append(relative_dist)
+            
+    for dist in sorted(list(set(circle_proj_distances))): # 去重并排序
+        ax.axvline(dist, color='r', linestyle='--', linewidth=1, label='Effective Radius Projection' if dist == sorted(list(set(circle_proj_distances)))[0] else "")
+
+
+    # === 绘制有效轮廓 (contour) 的垂直线 ===
+    current_contour_lon = np.array(contour_lon)[needed_idx]
+    current_contour_lat = np.array(contour_lat)[needed_idx]
+
+    valid_contour_mask = (current_contour_lon != 180.0) & (current_contour_lat != 0.0)
+    current_contour_lon_valid = current_contour_lon[valid_contour_mask]
+    current_contour_lat_valid = current_contour_lat[valid_contour_mask]
+
+    if len(current_contour_lon_valid) > 2:
+        contour_intersections_xy = find_polygon_line_intersections(
+            current_contour_lon_valid, current_contour_lat_valid,
+            profile_lons, profile_lats
+        )
+        
+        contour_proj_distances = []
+        for int_lon, int_lat in contour_intersections_xy:
+            int_point_xy = np.array([int_lon, int_lat])
+            distances_to_profile_points_from_int = np.sqrt(
+                (profile_points_xy[:, 0] - int_point_xy[0])**2 + 
+                (profile_points_xy[:, 1] - int_point_xy[1])**2
+            )
+            closest_profile_idx = np.argmin(distances_to_profile_points_from_int)
+            
+            dist_from_start = x_coords_raw[closest_profile_idx]
+            relative_dist = dist_from_start - center_proj_dist_from_start
+            
+            # 检查交点是否在剖面线的有效X范围（防止绘制图外交点）
+            if np.min(x_coords_recenter) <= relative_dist <= np.max(x_coords_recenter):
+                contour_proj_distances.append(relative_dist)
+        
+        for dist in sorted(list(set(contour_proj_distances))): # 去重并排序
+            ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=1, label='Effective Contour Projection' if dist == sorted(list(set(contour_proj_distances)))[0] else "")
+    else:
+        print(f"Warning: Not enough valid points to define effective contour for Track {no} at index {needed_idx}.")
+
+    # 统一图例，避免重复标签
+    handles, labels = ax.get_legend_handles_labels()
+    unique_labels = {}
+    for handle, label in zip(handles, labels):
+        unique_labels[label] = handle
+    ax.legend(unique_labels.values(), unique_labels.keys(), fontsize=18)
+
+    if xmin is not None and xmax is not None:
+        ax.set_xlim(xmin, xmax)
+    if ymin is not None and ymax is not None:
+        ax.set_ylim(ymax, ymin)
+
+    # 保存和显示图片
+    if save_fig:
+        output_dir = "plot_vertical_glorys"
+        os.makedirs(output_dir, exist_ok=True)
+        base_filename = f"{ds_names}{no}_vertical_{variable}_{dates[needed_idx].strftime('%Y%m%d')}_k{k:.2f}b{b:.2f}.png"
+        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+
+    if show_fig:
+        plt.show()
+
+    plt.close(fig)
+
+# 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
+def _orientation(p, q, r):
+    val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+    if val == 0: return 0  # Collinear
+    return 1 if val > 0 else 2 # Clockwise or Counterclockwise (1 for clockwise, 2 for counterclockwise)
+
+# 帮助函数：判断点 q 是否在线段 pr 上
+def _on_segment(p, q, r):
+    return (q[0] <= max(p[0], r[0]) and q[0] >= min(p[0], r[0]) and
+            q[1] <= max(p[1], r[1]) and q[1] >= min(p[1], r[1]))
+
+# 核心帮助函数：计算两条线段的交点
+def _line_segment_intersect(p1, q1, p2, q2):
+    """
+    Finds the intersection point of two line segments (p1, q1) and (p2, q2).
+    Returns the intersection point as (x, y) if they intersect, otherwise None.
+    Handles collinear cases where segments overlap.
+    """
+    o1 = _orientation(p1, q1, p2)
+    o2 = _orientation(p1, q1, q2)
+    o3 = _orientation(p2, q2, p1)
+    o4 = _orientation(p2, q2, q1)
+
+    # General case: Non-collinear and non-parallel intersection
+    if o1 != o2 and o3 != o4:
+        denom = (p1[0] - q1[0]) * (p2[1] - q2[1]) - (p1[1] - q1[1]) * (p2[0] - q2[0])
+        if denom == 0:
+            return None 
+
+        t = ((p1[0] - p2[0]) * (p2[1] - q2[1]) - (p1[1] - p2[1]) * (p2[0] - q2[0])) / denom
+        u = -((p1[0] - q1[0]) * (p1[1] - p2[1]) - (p1[1] - q1[1]) * (p1[0] - p2[0])) / denom
+
+        if (0 <= t <= 1) and (0 <= u <= 1):
+            intersection_x = p1[0] + t * (q1[0] - p1[0])
+            intersection_y = p1[1] + t * (q1[1] - p1[1])
+            return (intersection_x, intersection_y)
+        return None
+
+    # Special Cases for collinear segments
+    if o1 == 0 and _on_segment(p1, p2, q1): return p2
+    if o2 == 0 and _on_segment(p1, q2, q1): return q2
+    if o3 == 0 and _on_segment(p2, p1, q2): return p1
+    if o4 == 0 and _on_segment(p2, q1, q2): return q2
+
+    return None
+
+
+# 寻找多边形和线段的交点
+def find_polygon_line_intersections(polygon_lon, polygon_lat, line_lons, line_lats, tolerance=1e-6):
+    """
+    Finds intersection points of a line (defined by line_lons, line_lats)
+    with a closed polygon (defined by polygon_lon, polygon_lat).
+
+    Args:
+        polygon_lon (array): Longitudes of polygon vertices.
+        polygon_lat (array): Latitudes of polygon vertices.
+        line_lons (array): Longitudes of line points.
+        line_lats (array): Latitudes of line points.
+        tolerance (float): Tolerance for checking duplicate intersection points.
+
+    Returns:
+        list: A list of (lon, lat) tuples for intersection points.
+    """
+    intersections = []
+    
+    polygon_points_closed = list(zip(polygon_lon, polygon_lat))
+    if not (np.isclose(polygon_points_closed[0][0], polygon_points_closed[-1][0], atol=tolerance) and
+            np.isclose(polygon_points_closed[0][1], polygon_points_closed[-1][1], atol=tolerance)):
+        polygon_points_closed.append(polygon_points_closed[0])
+
+    line_points = list(zip(line_lons, line_lats))
+
+    for i in range(len(polygon_points_closed) - 1):
+        poly_seg_p1 = polygon_points_closed[i]
+        poly_seg_p2 = polygon_points_closed[i+1]
+        
+        for j in range(len(line_points) - 1):
+            line_seg_p1 = line_points[j]
+            line_seg_p2 = line_points[j+1]
+            
+            intersect_pt = _line_segment_intersect(poly_seg_p1, poly_seg_p2, line_seg_p1, line_seg_p2)
+            if intersect_pt:
+                is_duplicate = False
+                for existing_pt in intersections:
+                    if np.isclose(existing_pt[0], intersect_pt[0], atol=tolerance) and \
+                       np.isclose(existing_pt[1], intersect_pt[1], atol=tolerance):
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    intersections.append(intersect_pt)
+    
+    if len(intersections) > 0:
+        if np.abs(line_lons[0] - line_lons[-1]) > np.abs(line_lats[0] - line_lats[-1]):
+            intersections.sort(key=lambda p: p[0])
+        else:
+            intersections.sort(key=lambda p: p[1])
+            
+    return intersections
