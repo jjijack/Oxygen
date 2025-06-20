@@ -1474,7 +1474,7 @@ def get_idx(DS: list, no: int, start_date: str, end_date: str) -> list:
 
 def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variables: list = ['vorticity']) -> dict:
     '''
-    计算并返回指定涡旋在特定时刻沿 y=kx+b 剖面的多个垂向物理量二维数组。
+    计算并返回指定涡旋在特定时刻沿 y=kx+b 剖面的垂向物理量二维数组与元数据。
 
     该函数封装了从三维 GLORYS 数据场中提取多个二维垂直剖面的核心插值计算，
     并以字典形式返回结果。
@@ -1488,132 +1488,52 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, 
         variables (list): 需要提取的GLORYS物理变量列表。默认为 ['vorticity']，可选'thetao', 'salinity', 'u', 'v'。
 
     返回:
-        dict: 一个字典，键是变量名，值是对应的二维 masked array 剖面数据。
-              如果无法生成任何数据，则返回空字典。
+        dict: 一个包含剖面数据、坐标轴、边界投影和部分元数据的综合字典。
+        字典包含以下键值对：
+            - **'profile_data' (dict)**:
+            - *键*: 您在输入参数 `variables` 列表中请求的每个物理量名称 (字符串, 如 'vorticity')。
+            - *值*: 一个二维 `numpy.ma.MaskedArray` 数组，代表了该物理量在垂直剖面上的分布。其维度为 `(深度层数, 剖面水平点数)`。
+
+          - **'x_coords' (np.ndarray)**:
+            - 一个一维NumPy数组，表示剖面的**横坐标轴**。
+            - 数值单位为**公里 (km)**，代表了沿剖面线 `y=kx+b` 的物理距离。
+            - `0` 点对应涡旋中心在剖面线上的投影位置。
+
+          - **'y_coords' (np.ndarray)**:
+            - 一个一维NumPy数组，表示剖面的**纵坐标轴**。
+            - 数值单位为**米 (m)**，代表了GLORYS数据中的深度分层。
+
+          - **'projections' (dict)**:
+            - 一个字典，包含了涡旋边界在横坐标 (`x_coords`) 上的投影位置。
+            - *键*: 边界类型 (字符串)， `'radius'` 代表有效半径，`'contour'` 代表有效轮廓。
+            - *值*: 一个包含浮点数的列表，每个浮点数是在 `x_coords` 坐标系下，边界与剖面线的交点位置(km)。通常包含两个点。
+
+          - **'metadata' (dict)**:
+            - 一个包含涡旋元数据的字典。
+            - *键*:
+              - `'eddy_no'` (int): 涡旋的唯一编号。
+              - `'date_str'` (str): 该剖面对应日期的字符串，格式为 'YYYY-MM-DD'。
     '''
     if k is None or b is None:
         raise ValueError("k 和 b 必须提供以计算垂直剖面。")
 
-    # --- 1. 确定需要获取的原始变量并一次性获取数据 ---
-    raw_vars_to_fetch = set()
-    for var in variables:
-        if var == 'vorticity':
-            raw_vars_to_fetch.update(['u', 'v'])
-        elif var in ['thetao', 'salinity', 'u', 'v', 'so', 'uo', 'vo']:
-            # 映射到GLORYS变量名
-            var_map = {'salinity': 'so', 'u': 'uo', 'v': 'vo', 'thetao': 'thetao'}
-            raw_vars_to_fetch.add(var_map.get(var, var))
-    
-    if not raw_vars_to_fetch:
-        return {}
-
-    # 一次性获取所有需要的原始三维数据场和坐标
-    glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_3d_data_raw = get_track_area_glorys(
-        DS, no, needed_idx, variables=list(raw_vars_to_fetch)
-    )
-
-    if glorys_depth_raw.size == 0:
-        return {}
-
-    # --- 2. 定义剖面线并准备插值 ---
-    wanted_track = find_track(DS, no)
-    _, _, _, _, _, _, contour_lon, contour_lat, _, _, _ = zip(*wanted_track)
-    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
-    glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
-    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
-    glorys_lat_min, glorys_lat_max = np.min(contour_lat_filtered) - 0.5, np.max(contour_lat_filtered) + 0.5
-
-    num_points = 500
-    if k == 0:
-        profile_lons = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
-        profile_lats = np.full_like(profile_lons, b)
-    else:
-        lons_temp = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
-        lats_temp = k * lons_temp + b
-        mask = (lats_temp >= glorys_lat_min) & (lats_temp <= glorys_lat_max)
-        profile_lons, profile_lats = lons_temp[mask], lats_temp[mask]
-        if len(profile_lons) < 2:
-            return {}
-            
-    # 构建插值查询点 (对所有变量通用)
-    query_depths, query_lats = np.meshgrid(glorys_depth_raw, profile_lats, indexing='ij')
-    _, query_lons = np.meshgrid(glorys_depth_raw, profile_lons, indexing='ij')
-    xi_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
-
-    # --- 3. 循环处理每个变量 ---
-    results_dict = {}
-    for var in variables:
-        glorys_variable_3d = None
-        if var == 'vorticity':
-            u, v = glorys_3d_data_raw.get('u'), glorys_3d_data_raw.get('v')
-            if u is not None and v is not None and u.size > 0 and v.size > 0:
-                if u.ndim == 2: u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
-                zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
-                glorys_variable_3d = zeta_3d / f_3d
-        else:
-            # 别名映射
-            var_map_alias = {'salinity': 'salinity', 'so':'salinity', 'u': 'u', 'uo': 'u', 'v': 'v', 'vo': 'v', 'thetao': 'thetao'}
-            glorys_variable_3d = glorys_3d_data_raw.get(var_map_alias.get(var))
-
-        if glorys_variable_3d is None or glorys_variable_3d.size == 0 or np.all(np.ma.getmask(glorys_variable_3d)):
-            results_dict[var] = np.ma.masked_all((len(glorys_depth_raw), len(profile_lons)))
-            continue
-
-        if glorys_variable_3d.ndim == 2:
-            glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
-
-        # 使用 RegularGridInterpolator 进行插值
-        interp_data = glorys_variable_3d.filled(np.nan)
-        interp_func = RegularGridInterpolator((glorys_depth_raw, glorys_lat_raw, glorys_lon_raw), interp_data, bounds_error=False, fill_value=np.nan)
-
-        # 执行插值并重塑为二维数组
-        interpolated_values_flat = interp_func(xi_points)
-        profile_variable_2d = interpolated_values_flat.reshape(len(glorys_depth_raw), len(profile_lons))
-        
-        results_dict[var] = np.ma.masked_invalid(profile_variable_2d)
-
-    return results_dict
-
-
-def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variable: str = 'vorticity',
-                         show_fig: bool = False, save_fig: bool = False, xmin: float = None, xmax: float = None,
-                         ymin: float = None, ymax: float = None):
-    '''
-    绘制指定涡旋在特定时刻的单一物理量垂直剖面图 (y = kx + b)。
-
-    该函数调用 get_vertical_glorys 获取数据字典，然后选择指定变量进行可视化。
-
-    参数:
-        (同 get_vertical_glorys, 但 variable 为 str)
-        ...
-        show_fig (bool): 是否显示图像。
-        save_fig (bool): 是否保存图像。
-        xmin, xmax, ymin, ymax (float): 坐标轴范围。
-    '''
-    # --- 1. 以列表形式调用 get 函数，并提取所需变量的数据 ---
-    data_dict = get_vertical_glorys(DS, no, needed_idx, k, b, variables=[variable])
-
-    if not data_dict or variable not in data_dict:
-        print(f"警告: 未能从 get_vertical_glorys 获取变量 '{variable}' 的有效数据。绘图已取消。")
-        return
-        
-    profile_variable_2d = data_dict[variable]
-    if profile_variable_2d.size == 0 or np.all(profile_variable_2d.mask):
-        print(f"警告: 变量 '{variable}' 的剖面数据为空或全部无效。绘图已取消。")
-        return
-
-    # --- 2. 计算绘图所需的所有辅助信息 ---
-    R_earth = 6371e3  # 地球半径 (米)
-
-    # 获取涡旋轨迹信息
+    # --- 1. 获取轨迹信息和原始GLORYS数据 ---
     wanted_track = find_track(DS, no)
     num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*wanted_track)
     dates = convert_date(time)
-    
-    # 获取GLORYS原始坐标 (为获取深度轴)
-    _, _, glorys_depth_raw, _ = get_track_area_glorys(DS, no, needed_idx, variables=['u'])
 
-    # 重新计算剖面线经纬度坐标
+    raw_vars_to_fetch = set()
+    for var in variables:
+        if var == 'vorticity': raw_vars_to_fetch.update(['u', 'v'])
+        else: raw_vars_to_fetch.add(var)
+    
+    glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_3d_data_raw = get_track_area_glorys(
+        DS, no, needed_idx, variables=list(raw_vars_to_fetch)
+    )
+    if glorys_depth_raw.size == 0: return {}
+
+    # --- 2. 计算坐标轴 (X: 距离, Y: 深度) ---
+    R_earth = 6371e3
     contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
     glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
     contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
@@ -1628,15 +1548,9 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
         lats_temp = k * lons_temp + b
         mask = (lats_temp >= glorys_lat_min) & (lats_temp <= glorys_lat_max)
         profile_lons, profile_lats = lons_temp[mask], lats_temp[mask]
-        
-    # 如果剖面点数量与get函数返回的数据维度不匹配，说明get函数内部截断了剖面，这里也要同步
-    if profile_variable_2d.shape[1] != len(profile_lons):
-       profile_lons = profile_lons[:profile_variable_2d.shape[1]]
-       profile_lats = profile_lats[:profile_variable_2d.shape[1]]
+        if len(profile_lons) < 2: return {}
 
-    # 计算物理距离 X 轴并重新中心化
-    dlat = np.deg2rad(np.diff(profile_lats))
-    dlon = np.deg2rad(np.diff(profile_lons))
+    dlat = np.deg2rad(np.diff(profile_lats)); dlon = np.deg2rad(np.diff(profile_lons))
     mid_lats = np.deg2rad((profile_lats[:-1] + profile_lats[1:]) / 2)
     dist_segments = R_earth * np.sqrt(dlat**2 + (np.cos(mid_lats) * dlon)**2)
     x_coords_raw = np.insert(np.cumsum(dist_segments), 0, 0) / 1000.0
@@ -1649,45 +1563,128 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
     center_idx_on_profile = np.argmin((profile_lons - xp)**2 + (profile_lats - yp)**2)
     x_coords_recenter = x_coords_raw - x_coords_raw[center_idx_on_profile]
 
-    # 创建用于 pcolormesh 的网格
-    X_mesh, Y_mesh = np.meshgrid(x_coords_recenter, glorys_depth_raw)
-
-    # 设置绘图元数据 (标题，颜色等)
-    if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
-    elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
-    elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
-    elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
-    else: cbar_label, cmap, clim = variable, 'viridis', None
+    # --- 3. 计算剖面数据 ---
+    query_depths, query_lats = np.meshgrid(glorys_depth_raw, profile_lats, indexing='ij')
+    _, query_lons = np.meshgrid(glorys_depth_raw, profile_lons, indexing='ij')
+    xi_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
     
-    if 'clim' not in locals() or clim is None: # 自动计算颜色范围
-        valid_values = profile_variable_2d[~profile_variable_2d.mask]
-        clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
-        if variable in ['u', 'v', 'uo', 'vo']:
-            max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
-            clim = (-max_abs, max_abs)
+    profile_data_dict = {}
+    for var in variables:
+        glorys_variable_3d = None
+        if var == 'vorticity':
+            u, v = glorys_3d_data_raw.get('u'), glorys_3d_data_raw.get('v')
+            if u is not None and v is not None and u.size > 0 and v.size > 0:
+                if u.ndim == 2: u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
+                zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
+                glorys_variable_3d = zeta_3d / f_3d
+        else:
+            glorys_variable_3d = glorys_3d_data_raw.get(var)
 
-    # 计算涡旋边界投影
+        if glorys_variable_3d is None or glorys_variable_3d.size == 0 or np.all(np.ma.getmask(glorys_variable_3d)):
+            profile_data_dict[var] = np.ma.masked_all((len(glorys_depth_raw), len(profile_lons)))
+            continue
+
+        if glorys_variable_3d.ndim == 2: glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
+        interp_data = glorys_variable_3d.filled(np.nan)
+        interp_func = RegularGridInterpolator((glorys_depth_raw, glorys_lat_raw, glorys_lon_raw), interp_data, bounds_error=False, fill_value=np.nan)
+        interpolated_values_flat = interp_func(xi_points)
+        profile_data_dict[var] = np.ma.masked_invalid(interpolated_values_flat.reshape(len(glorys_depth_raw), len(profile_lons)))
+
+    # --- 4. 计算边界投影 ---
     effective_radius_deg = radius[needed_idx] / 111320.0
-    A, B = 1 + k**2, 2 * (k * b - k * current_center_lat - current_center_lon)
+    A, B = 1 + k**2, 2 * (k*b - k*current_center_lat - current_center_lon)
     C = current_center_lon**2 + (b - current_center_lat)**2 - effective_radius_deg**2
     discriminant = B**2 - 4*A*C
     radius_intersections_lon = [(-B + s * np.sqrt(discriminant)) / (2*A) for s in [-1, 1]] if discriminant >= 0 else []
-    radius_proj_dists = [x_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - (k * lon_i + b))**2)] - x_coords_raw[center_idx_on_profile] for lon_i in radius_intersections_lon]
+    radius_proj_dists = [x_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - (k*lon_i + b))**2)] - x_coords_raw[center_idx_on_profile] for lon_i in radius_intersections_lon]
 
     contour_lon_valid = contour_lon[needed_idx][contour_lon[needed_idx] != 180.0]
     contour_lat_valid = contour_lat[needed_idx][contour_lat[needed_idx] != 0.0]
     contour_intersections_xy = find_polygon_line_intersections(contour_lon_valid, contour_lat_valid, profile_lons, profile_lats)
     contour_proj_dists = [x_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - lat_i)**2)] - x_coords_raw[center_idx_on_profile] for lon_i, lat_i in contour_intersections_xy]
 
-    # --- 3. 开始绘图 ---
+    projections_dict = {'radius': sorted(radius_proj_dists), 'contour': sorted(contour_proj_dists)}
+    
+    # --- 5. 整合并返回 ---
+    return {
+        'profile_data': profile_data_dict,
+        'x_coords': x_coords_recenter,
+        'y_coords': glorys_depth_raw,
+        'projections': projections_dict,
+        'metadata': {
+            'eddy_no': num[0],
+            'date_str': dates[needed_idx].strftime("%Y-%m-%d"),
+        }
+    }
+
+
+def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variable: str = 'vorticity',
+                         show_fig: bool = False, save_fig: bool = False, xmin: float = None, xmax: float = None,
+                         ymin: float = None, ymax: float = None):
+    '''
+    绘制指定涡旋在特定时刻的单一物理量垂直剖面图 (y = kx + b)。
+
+    该函数调用 get_vertical_glorys 获取指定变量的数据字典，然后进行可视化。
+
+    参数:
+        (同 get_vertical_glorys, 但 variable 为 str，一次只处理一个变量)
+        ...
+        show_fig (bool): 是否显示图像。
+        save_fig (bool): 是否保存图像。
+        xmin, xmax, ymin, ymax (float): 坐标轴范围。
+    '''
+    # --- 1. 获取所有计算好的数值数据和部分元数据 ---
+    data_package = get_vertical_glorys(DS, no, needed_idx, k, b, variables=[variable])
+
+    if not data_package:
+        print(f"警告: get_vertical_glorys 未能返回任何数据。绘图已取消。")
+        return
+        
+    profile_variable_2d = data_package['profile_data'].get(variable)
+    if profile_variable_2d is None or np.all(profile_variable_2d.mask):
+        print(f"警告: 变量 '{variable}' 的剖面数据无效。绘图已取消。")
+        return
+
+    # --- 2. 准备绘图（包括在当前上下文中计算元数据） ---
+    x_coords = data_package['x_coords']
+    y_coords = data_package['y_coords']
+    projections = data_package['projections']
+    metadata = data_package['metadata'] # 获取与上下文无关的元数据
+
+    # 获取数据集名称
+    callers_local_vars = inspect.currentframe().f_back.f_locals
+    ds_name = [var_name for var_name, var_val in callers_local_vars.items() if var_val is DS][0].upper()
+    
+    # 设置颜色
+    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
+    
+    if profile_variable_2d.shape[1] != len(x_coords):
+       x_coords = x_coords[:profile_variable_2d.shape[1]]
+
+    X_mesh, Y_mesh = np.meshgrid(x_coords, y_coords)
+    
+    # 设置变量相关的绘图属性
+    if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
+    elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
+    elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
+    elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
+    else: cbar_label, cmap, clim = variable, 'viridis', None
+    
+    if 'clim' not in locals() or clim is None:
+        valid_values = profile_variable_2d[~profile_variable_2d.mask]
+        clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
+        if variable in ['u', 'v', 'uo', 'vo']:
+            max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
+            clim = (-max_abs, max_abs)
+
+    # --- 3. 执行绘图 ---
     fig, ax = plt.subplots(figsize=(20, 15))
     
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS][0].upper()
-    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    eddy_color = prop_colors[1] if 'AC' in ds_names else prop_colors[0]
-
-    ax.set_title(f'Vertical Profile of {cbar_label} for Track {ds_names}{num[0]} on {dates[needed_idx].strftime("%Y-%m-%d")}, y={k}x+{b}', fontsize=20)
+    date_str = metadata['date_str']
+    title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+             f"on {date_str}, y={k:.2f}x+{b:.2f}")
+    ax.set_title(title, fontsize=20)
     ax.set_xlabel('Distance from Eddy Center Projection (km)', fontsize=18)
     ax.set_ylabel('Depth (m)', fontsize=18)
     ax.tick_params(labelsize=14)
@@ -1698,8 +1695,10 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
     cbar.ax.tick_params(labelsize=14)
 
     ax.axvline(0, color='black', linestyle='--', linewidth=2, label='Eddy Center Projection')
-    for i, dist in enumerate(sorted(radius_proj_dists)): ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if i == 0 else "")
-    for i, dist in enumerate(sorted(contour_proj_dists)): ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if i == 0 else "")
+    for i, dist in enumerate(projections['radius']): 
+        ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if i == 0 else "")
+    for i, dist in enumerate(projections['contour']): 
+        ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if i == 0 else "")
 
     ax.set_ylim(Y_mesh.max(), Y_mesh.min())
     if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
@@ -1713,7 +1712,9 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
     if save_fig:
         output_dir = "plot_vertical_glorys"
         os.makedirs(output_dir, exist_ok=True)
-        base_filename = f"{ds_names}{num[0]}_vertical_{variable}_{dates[needed_idx].strftime('%Y%m%d')}_k{k:.2f}b{b:.2f}.png"
+        date_fn = date_str.replace('-', '')
+        base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
+                         f"k{k:.2f}b{b:.2f}.png")
         plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
 
