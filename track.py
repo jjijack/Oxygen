@@ -1118,9 +1118,9 @@ def find_track_glorys_filepath(DS: list, no: int) -> dict:
         
     return glorys_filepaths_dict
 
-def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity',
+def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity',
                                    show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False,
-                                   k: float = None, b: float = None):
+                                   k: float = None, b: float = None, needed_depth: float | int = 0):
     '''
     绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
 
@@ -1138,6 +1138,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
         deep_argo (bool): 是否使用深层Argo数据模式。若为 True，则筛选700m深度的Argo数据并按溶解氧着色；若为 False，则使用表层数据。默认为 False。
         k (float, optional): 直线方程 y = kx + b 中的斜率。默认为 None。
         b (float, optional): 直线方程 y = kx + b 中的截距。默认为 None。
+        needed_depth (float | int): 需要绘制的GLORYS数据深度，默认为0（表层）。
     '''
     wanted_track = find_track(DS, no)
     num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
@@ -1171,11 +1172,11 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
 
     #获取背景场数据
     if variable == 'vorticity':
-        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], surface=True)
+        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], depth=needed_depth)
         zeta, f = calculate_vorticity(glorys_lon_filtered, glorys_lat_filtered, glorys_variables_filtered['u'], glorys_variables_filtered['v'])
         glorys_variable_filtered = zeta/f
     else:
-        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], surface=True)
+        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], depth=needed_depth)
         glorys_variable_filtered = glorys_variables_filtered[variable]
 
     callers_local_vars = inspect.currentframe().f_back.f_locals.items()
@@ -1193,7 +1194,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
 
     fig, ax = plt.subplots(figsize=(30, 25))
-    ax.set_title(f'Track {ds_names}{num[0]}, {dates[needed_idx].strftime('%Y-%m-%d')}', fontsize=20)
+    ax.set_title(f'Track {ds_names}{num[0]} at {glorys_depth_filtered[0]:.2f}m, {dates[needed_idx].strftime('%Y-%m-%d')}', fontsize=20)
     ax.set_xlabel('Longitude', fontsize=20)
     ax.set_ylabel('Latitude', fontsize=20)
     world.plot(color='green', ax=ax)
@@ -1204,11 +1205,11 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
     ax.plot(center_lon[-1], center_lat[-1], marker='x', color=colors, markersize=10)
 
     # 绘制背景场
-    pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='coolwarm', shading='auto', alpha=0.5)
+    pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
     if variable == 'vorticity':
         cbar.set_label(r'$\zeta/f$', fontsize=20)
-        pc.set_clim(-0.8,0.8)
+        pc.set_clim(-0.7,0.7)
     elif variable == 'thetao':
         cbar.set_label('Temperature (°C)', fontsize=20)
     elif variable == 'so':
@@ -1263,10 +1264,10 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
 
     # 保存和显示图片
     if save_fig:
-        output_dir = "plot_track_area_surface_glorys"
+        output_dir = "plot_track_area_horizontal_glorys"
         os.makedirs(output_dir, exist_ok=True)
         
-        base_filename = f"{ds_names}{no}_surface_{variable}_{dates[needed_idx].strftime('%Y%m%d')}.png"
+        base_filename = f"{ds_names}{no}_{glorys_depth_filtered[0]:.2f}m_{variable}_{dates[needed_idx].strftime('%Y%m%d')}.png"
         plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
 
@@ -1275,7 +1276,7 @@ def plot_track_area_surface_glorys(DS: list, no: int, needed_idx: int, variable:
 
     plt.close(fig)  # 关闭图像，释放内存
 
-def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = ['thetao'], surface: bool = False):
+def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = ['thetao'], depth: float | int | None = None):
     '''
     获取指定涡旋在特定时间点周围的 GLORYS 数据。
 
@@ -1286,8 +1287,8 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = 
         DS (list): 包含涡旋轨迹信息的数据集。
         no (int): 涡旋的唯一编号。
         needed_idx (int): 涡旋轨迹的时间点索引。
-        surface (bool): 是否只提取表层数据，默认为 False，提取2000m以内的数据。
         variables (list): 需要提取的变量列表，默认为 ['thetao']，可选'salinity', 'u', 'v', 'ssh'。
+        depth (float | int | None): 如果指定，提取该深度的 GLORYS 数据；如果为 None，则提取2000米以内的所有深度数据。
 
     返回:
         一个元组，包含筛选后的经度、纬度、深度数组，以及一个存储了所有请求变量数据的字典。
@@ -1312,10 +1313,11 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = 
 
     glorys_lon_mask = (glorys_lon >= glorys_lon_min) & (glorys_lon <= glorys_lon_max)
     glorys_lat_mask = (glorys_lat >= glorys_lat_min) & (glorys_lat <= glorys_lat_max)
-    if surface:
+    if depth is not None:
         glorys_depth_mask = np.zeros_like(glorys_depth, dtype=bool)
         if glorys_depth.size > 0:
-            glorys_depth_mask[0] = True
+            k = np.argmin(np.abs(glorys_depth - depth))
+            glorys_depth_mask[k] = True
     else:
         glorys_depth_mask = (glorys_depth >= 0) & (glorys_depth <= 2000)
         
@@ -1328,19 +1330,19 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int, variables: list = 
     for var in variables:
         if var == 'thetao':
             glorys_variables_filtered['thetao'] = needed_glorys_data.variables['thetao'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
-            if surface:
+            if depth is not None:
                 glorys_variables_filtered['thetao'] = glorys_variables_filtered['thetao'][0, :, :]
         elif var == 'salinity' or var == 'so':
             glorys_variables_filtered['salinity'] = needed_glorys_data.variables['so'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
-            if surface:
+            if depth is not None:
                 glorys_variables_filtered['salinity'] = glorys_variables_filtered['salinity'][0, :, :]
         elif var == 'u' or var == 'uo':
             glorys_variables_filtered['u'] = needed_glorys_data.variables['uo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
-            if surface:
+            if depth is not None:
                 glorys_variables_filtered['u'] = glorys_variables_filtered['u'][0, :, :]
         elif var == 'v' or var == 'vo':
             glorys_variables_filtered['v'] = needed_glorys_data.variables['vo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
-            if surface:
+            if depth is not None:
                 glorys_variables_filtered['v'] = glorys_variables_filtered['v'][0, :, :]
         elif var == 'ssh' or var == 'zos':
             glorys_variables_filtered['ssh'] = needed_glorys_data.variables['zos'][0, glorys_lat_mask, glorys_lon_mask]
@@ -1519,7 +1521,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
     # 获取三维背景场数据
     if variable == 'vorticity':
         glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_variables_raw = \
-            get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'], surface=False)
+            get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'])
         
         u_data_for_vorticity = glorys_variables_raw['u']
         v_data_for_vorticity = glorys_variables_raw['v']
@@ -1531,11 +1533,11 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
                                             u_data_for_vorticity, v_data_for_vorticity)
         glorys_variable_3d = zeta_3d / f_3d
         cbar_label = r'$\zeta/f$'
-        cmap = 'coolwarm'
+        cmap = 'seismic'
         clim = (-0.3, 0.3)
     else:
         glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_variables_raw = \
-            get_track_area_glorys(DS, no, needed_idx, variables=[variable], surface=False)
+            get_track_area_glorys(DS, no, needed_idx, variables=[variable])
         
         if variable == 'salinity':
             glorys_variable_3d = glorys_variables_raw['salinity']
@@ -1760,7 +1762,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
              circle_proj_distances.append(relative_dist)
             
     for dist in sorted(list(set(circle_proj_distances))): # 去重并排序
-        ax.axvline(dist, color='r', linestyle='--', linewidth=1, label='Effective Radius Projection' if dist == sorted(list(set(circle_proj_distances)))[0] else "")
+        ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if dist == sorted(list(set(circle_proj_distances)))[0] else "")
 
 
     # === 绘制有效轮廓 (contour) 的垂直线 ===
@@ -1794,7 +1796,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
                 contour_proj_distances.append(relative_dist)
         
         for dist in sorted(list(set(contour_proj_distances))): # 去重并排序
-            ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=1, label='Effective Contour Projection' if dist == sorted(list(set(contour_proj_distances)))[0] else "")
+            ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if dist == sorted(list(set(contour_proj_distances)))[0] else "")
     else:
         print(f"Warning: Not enough valid points to define effective contour for Track {no} at index {needed_idx}.")
 
