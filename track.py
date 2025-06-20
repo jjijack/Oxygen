@@ -1472,11 +1472,12 @@ def get_idx(DS: list, no: int, start_date: str, end_date: str) -> list:
 
     return idx_list
 
-def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variable: str = 'vorticity') -> np.ndarray:
+def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variables: list = ['vorticity']) -> dict:
     '''
-    计算并仅返回指定涡旋在特定时刻沿 y=kx+b 剖面的垂向物理量二维数组。
+    计算并返回指定涡旋在特定时刻沿 y=kx+b 剖面的多个垂向物理量二维数组。
 
-    该函数封装了从三维 GLORYS 数据场中提取二维垂直剖面的核心插值计算。
+    该函数封装了从三维 GLORYS 数据场中提取多个二维垂直剖面的核心插值计算，
+    并以字典形式返回结果。
 
     参数:
         DS (list): 包含涡旋轨迹信息的数据集。
@@ -1484,94 +1485,121 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, 
         needed_idx (int): 涡旋轨迹的时间点索引。
         k (float): 直线方程 y = kx + b 中的斜率。
         b (float): 直线方程 y = kx + b 中的截距。
-        variable (str): 需要提取的GLORYS物理变量。默认为 'vorticity'。
+        variables (list): 需要提取的GLORYS物理变量列表。默认为 ['vorticity']，可选'thetao', 'salinity', 'u', 'v'。
 
     返回:
-        np.ndarray: 一个二维的 masked array，代表了物理量在指定剖面上的分布。
-                    如果无法生成数据，则返回一个空的数组。
+        dict: 一个字典，键是变量名，值是对应的二维 masked array 剖面数据。
+              如果无法生成任何数据，则返回空字典。
     '''
     if k is None or b is None:
         raise ValueError("k 和 b 必须提供以计算垂直剖面。")
 
-    # --- 1. 获取三维背景场数据 ---
-    # 获取原始数据所需的区域边界
+    # --- 1. 确定需要获取的原始变量并一次性获取数据 ---
+    raw_vars_to_fetch = set()
+    for var in variables:
+        if var == 'vorticity':
+            raw_vars_to_fetch.update(['u', 'v'])
+        elif var in ['thetao', 'salinity', 'u', 'v', 'so', 'uo', 'vo']:
+            # 映射到GLORYS变量名
+            var_map = {'salinity': 'so', 'u': 'uo', 'v': 'vo', 'thetao': 'thetao'}
+            raw_vars_to_fetch.add(var_map.get(var, var))
+    
+    if not raw_vars_to_fetch:
+        return {}
+
+    # 一次性获取所有需要的原始三维数据场和坐标
+    glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_3d_data_raw = get_track_area_glorys(
+        DS, no, needed_idx, variables=list(raw_vars_to_fetch)
+    )
+
+    if glorys_depth_raw.size == 0:
+        return {}
+
+    # --- 2. 定义剖面线并准备插值 ---
     wanted_track = find_track(DS, no)
     _, _, _, _, _, _, contour_lon, contour_lat, _, _, _ = zip(*wanted_track)
     contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
+    glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
     contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
-    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
-    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
-    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
-    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+    glorys_lat_min, glorys_lat_max = np.min(contour_lat_filtered) - 0.5, np.max(contour_lat_filtered) + 0.5
 
-    # 根据变量类型获取相应的 GLORYS 数据
-    if variable == 'vorticity':
-        glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_vars_raw = get_track_area_glorys(DS, no, needed_idx, variables=['u', 'v'])
-        u, v = glorys_vars_raw.get('u'), glorys_vars_raw.get('v')
-        if u is None or v is None or u.size == 0 or v.size == 0: return np.array([])
-        if u.ndim == 2: u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
-        zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
-        glorys_variable_3d = zeta_3d / f_3d
-    else:
-        glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_vars_raw = get_track_area_glorys(DS, no, needed_idx, variables=[variable])
-        var_map = {'salinity': 'salinity', 'u': 'u', 'v': 'v', 'thetao': 'thetao'}
-        glorys_variable_3d = glorys_vars_raw.get(var_map.get(variable))
-        if glorys_variable_3d is None or glorys_variable_3d.size == 0: return np.array([])
-        if glorys_variable_3d.ndim == 2: glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
-
-    if np.all(np.ma.getmask(glorys_variable_3d)):
-        return np.array([])
-
-    # --- 2. 定义剖面线并插值 ---
     num_points = 500
-    if k == 0: # 水平线
+    if k == 0:
         profile_lons = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
         profile_lats = np.full_like(profile_lons, b)
-    else: # 斜线
+    else:
         lons_temp = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
         lats_temp = k * lons_temp + b
         mask = (lats_temp >= glorys_lat_min) & (lats_temp <= glorys_lat_max)
         profile_lons, profile_lats = lons_temp[mask], lats_temp[mask]
         if len(profile_lons) < 2:
-            return np.array([])
-
-    # 使用 RegularGridInterpolator 进行插值
-    interp_data = glorys_variable_3d.filled(np.nan)
-    interp_func = RegularGridInterpolator((glorys_depth_raw, glorys_lat_raw, glorys_lon_raw), interp_data, bounds_error=False)
-    
-    # 构建插值查询点
+            return {}
+            
+    # 构建插值查询点 (对所有变量通用)
     query_depths, query_lats = np.meshgrid(glorys_depth_raw, profile_lats, indexing='ij')
     _, query_lons = np.meshgrid(glorys_depth_raw, profile_lons, indexing='ij')
     xi_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
 
-    # 执行插值并重塑为二维数组
-    interpolated_values_flat = interp_func(xi_points)
-    profile_variable_2d = interpolated_values_flat.reshape(len(glorys_depth_raw), len(profile_lons))
-    
-    return np.ma.masked_invalid(profile_variable_2d)
+    # --- 3. 循环处理每个变量 ---
+    results_dict = {}
+    for var in variables:
+        glorys_variable_3d = None
+        if var == 'vorticity':
+            u, v = glorys_3d_data_raw.get('u'), glorys_3d_data_raw.get('v')
+            if u is not None and v is not None and u.size > 0 and v.size > 0:
+                if u.ndim == 2: u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
+                zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
+                glorys_variable_3d = zeta_3d / f_3d
+        else:
+            # 别名映射
+            var_map_alias = {'salinity': 'salinity', 'so':'salinity', 'u': 'u', 'uo': 'u', 'v': 'v', 'vo': 'v', 'thetao': 'thetao'}
+            glorys_variable_3d = glorys_3d_data_raw.get(var_map_alias.get(var))
+
+        if glorys_variable_3d is None or glorys_variable_3d.size == 0 or np.all(np.ma.getmask(glorys_variable_3d)):
+            results_dict[var] = np.ma.masked_all((len(glorys_depth_raw), len(profile_lons)))
+            continue
+
+        if glorys_variable_3d.ndim == 2:
+            glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
+
+        # 使用 RegularGridInterpolator 进行插值
+        interp_data = glorys_variable_3d.filled(np.nan)
+        interp_func = RegularGridInterpolator((glorys_depth_raw, glorys_lat_raw, glorys_lon_raw), interp_data, bounds_error=False, fill_value=np.nan)
+
+        # 执行插值并重塑为二维数组
+        interpolated_values_flat = interp_func(xi_points)
+        profile_variable_2d = interpolated_values_flat.reshape(len(glorys_depth_raw), len(profile_lons))
+        
+        results_dict[var] = np.ma.masked_invalid(profile_variable_2d)
+
+    return results_dict
 
 
 def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, variable: str = 'vorticity',
                          show_fig: bool = False, save_fig: bool = False, xmin: float = None, xmax: float = None,
                          ymin: float = None, ymax: float = None):
     '''
-    绘制指定涡旋在特定时刻的垂直剖面图 (y = kx + b)。
+    绘制指定涡旋在特定时刻的单一物理量垂直剖面图 (y = kx + b)。
 
-    该函数负责所有计算和绘图任务，它首先调用 get_vertical_glorys 获取核心数据，
-    然后计算坐标、标签等信息，并最终完成可视化。
+    该函数调用 get_vertical_glorys 获取数据字典，然后选择指定变量进行可视化。
 
     参数:
-        (同 get_vertical_glorys)
+        (同 get_vertical_glorys, 但 variable 为 str)
         ...
         show_fig (bool): 是否显示图像。
         save_fig (bool): 是否保存图像。
         xmin, xmax, ymin, ymax (float): 坐标轴范围。
     '''
-    # --- 1. 获取核心剖面数据 ---
-    profile_variable_2d = get_vertical_glorys(DS, no, needed_idx, k, b, variable)
+    # --- 1. 以列表形式调用 get 函数，并提取所需变量的数据 ---
+    data_dict = get_vertical_glorys(DS, no, needed_idx, k, b, variables=[variable])
 
-    if profile_variable_2d.size == 0:
-        print(f"警告: 未能从 get_vertical_glorys 获取有效数据。绘图已取消。")
+    if not data_dict or variable not in data_dict:
+        print(f"警告: 未能从 get_vertical_glorys 获取变量 '{variable}' 的有效数据。绘图已取消。")
+        return
+        
+    profile_variable_2d = data_dict[variable]
+    if profile_variable_2d.size == 0 or np.all(profile_variable_2d.mask):
+        print(f"警告: 变量 '{variable}' 的剖面数据为空或全部无效。绘图已取消。")
         return
 
     # --- 2. 计算绘图所需的所有辅助信息 ---
@@ -1582,10 +1610,10 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
     num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*wanted_track)
     dates = convert_date(time)
     
-    # 获取GLORYS原始坐标
-    _, glorys_lat_raw, glorys_depth_raw, _ = get_track_area_glorys(DS, no, needed_idx, variables=['u'])
+    # 获取GLORYS原始坐标 (为获取深度轴)
+    _, _, glorys_depth_raw, _ = get_track_area_glorys(DS, no, needed_idx, variables=['u'])
 
-    # 重新计算剖面线经纬度坐标 (必须与get_vertical_glorys中的逻辑一致)
+    # 重新计算剖面线经纬度坐标
     contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
     glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
     contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
@@ -1600,6 +1628,11 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
         lats_temp = k * lons_temp + b
         mask = (lats_temp >= glorys_lat_min) & (lats_temp <= glorys_lat_max)
         profile_lons, profile_lats = lons_temp[mask], lats_temp[mask]
+        
+    # 如果剖面点数量与get函数返回的数据维度不匹配，说明get函数内部截断了剖面，这里也要同步
+    if profile_variable_2d.shape[1] != len(profile_lons):
+       profile_lons = profile_lons[:profile_variable_2d.shape[1]]
+       profile_lats = profile_lats[:profile_variable_2d.shape[1]]
 
     # 计算物理距离 X 轴并重新中心化
     dlat = np.deg2rad(np.diff(profile_lats))
@@ -1621,15 +1654,15 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float,
 
     # 设置绘图元数据 (标题，颜色等)
     if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
-    elif variable == 'thetao': cbar_label, cmap = 'Temperature (°C)', 'rainbow'
-    elif variable == 'salinity': cbar_label, cmap = 'Salinity (psu)', 'viridis'
-    elif variable in ['u', 'v']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
+    elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
+    elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
+    elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
     else: cbar_label, cmap, clim = variable, 'viridis', None
     
-    if variable != 'vorticity':
+    if 'clim' not in locals() or clim is None: # 自动计算颜色范围
         valid_values = profile_variable_2d[~profile_variable_2d.mask]
         clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
-        if variable in ['u', 'v']:
+        if variable in ['u', 'v', 'uo', 'vo']:
             max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
             clim = (-max_abs, max_abs)
 
