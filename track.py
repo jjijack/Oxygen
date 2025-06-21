@@ -11,6 +11,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 import glob
 from scipy.interpolate import RegularGridInterpolator
+import copy
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
@@ -1490,7 +1491,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, 
     返回:
         dict: 一个包含剖面数据、坐标轴、边界投影和部分元数据的综合字典。
         字典包含以下键值对：
-            - **'profile_data' (dict)**:
+
+          - **'profile_data' (dict)**:
             - *键*: 您在输入参数 `variables` 列表中请求的每个物理量名称 (字符串, 如 'vorticity')。
             - *值*: 一个二维 `numpy.ma.MaskedArray` 数组，代表了该物理量在垂直剖面上的分布。其维度为 `(深度层数, 剖面水平点数)`。
 
@@ -1511,8 +1513,10 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, 
           - **'metadata' (dict)**:
             - 一个包含涡旋元数据的字典。
             - *键*:
-              - `'eddy_no'` (int): 涡旋的唯一编号。
-              - `'date_str'` (str): 该剖面对应日期的字符串，格式为 'YYYY-MM-DD'。
+                - `'eddy_no'` (int): 涡旋的唯一编号。
+                - `'date_str'` (str): 该剖面对应日期的字符串，格式为 'YYYY-MM-DD'。
+                - `'k'` (float): 直线方程的斜率。
+                - `'b'` (float): 直线方程的截距。
     '''
     if k is None or b is None:
         raise ValueError("k 和 b 必须提供以计算垂直剖面。")
@@ -1614,6 +1618,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int, k: float, b: float, 
         'metadata': {
             'eddy_no': num[0],
             'date_str': dates[needed_idx].strftime("%Y-%m-%d"),
+            'k': k,
+            'b': b,
         }
     }
 
@@ -1824,3 +1830,225 @@ def find_polygon_line_intersections(polygon_lon, polygon_lat, line_lons, line_la
             intersections.sort(key=lambda p: p[1])
             
     return intersections
+
+def regrid_vertical_slice(data_package: dict, dx: float = None, dy: float = None) -> dict:
+    '''
+    将垂直剖面数据包插值到新的等间距网格上。
+
+    该函数接收 get_vertical_glorys 的输出，并根据用户指定的水平(dx)或
+    垂直(dy)间距，生成一个新的、网格化更规整的数据包。
+
+    参数:
+        data_package (dict): 从 get_vertical_glorys 函数获取的原始数据包。
+        dx (float, optional): 新的水平网格间距，单位为公里(km)。
+                              默认为 None，表示不改变水平网格。
+        dy (float, optional): 新的垂直网格间距，单位为米(m)。
+                              默认为 None，表示不改变垂直网格。
+
+    返回:
+        dict: 一个结构与输入相同但数据已被插值到新网格上的新数据包。
+              字典包含以下键值对：
+
+            - **'profile_data' (dict)**:
+                - 其内部结构与输入相同，但每个二维数组的值都是插值后的结果。
+
+            - **'x_coords' (np.ndarray)**:
+                - 如果提供了 `dx`，这将是一个新生成的一维等间距数组。
+                - 否则，与输入的 'x_coords' 相同。
+
+            - **'y_coords' (np.ndarray)**:
+                - 如果提供了 `dy`，这将是一个新生成的一维等间距数组。
+                - 否则，与输入的 'y_coords' 相同。
+
+            - **'projections' (dict)**:
+                - 从原始数据包中原样复制而来，其数值仍对应原始的坐标系。
+                
+            - **'metadata' (dict)**:
+                - 从原始数据包中原样复制而来。
+    '''
+    # 如果用户未指定任何新的网格间距，则直接返回原始数据包的深拷贝
+    if dx is None and dy is None:
+        return copy.deepcopy(data_package)
+
+    # --- 1. 提取原始数据和坐标 ---
+    original_x = data_package['x_coords']
+    original_y = data_package['y_coords']
+    original_profiles = data_package['profile_data']
+    
+    # RegularGridInterpolator 要求坐标必须是严格递增的。
+    # x_coords (距离) 默认是递增的。y_coords (深度) 也通常是递增的，但我们最好确保这一点。
+    if np.any(np.diff(original_y) <= 0):
+        raise ValueError("原始y坐标（深度）必须是严格递增的才能进行插值。")
+    if np.any(np.diff(original_x) <= 0):
+        raise ValueError("原始x坐标（距离）必须是严格递增的才能进行插值。")
+
+    # --- 2. 创建新的网格坐标 ---
+    new_x = np.arange(original_x.min(), original_x.max(), dx) if dx is not None else original_x
+    if dy is not None:
+        y_min, y_max = original_y.min(), original_y.max()
+        new_y = np.arange(y_min, y_max, dy)
+    else:
+        new_y = original_y
+
+    # --- 3. 对每个变量的剖面数据进行插值 ---
+    new_profiles = {}
+    # 创建查询点网格，用于高效插值
+    # 使用 'ij' 索引确保输出的维度顺序是 (y, x)
+    yy_grid, xx_grid = np.meshgrid(new_y, new_x, indexing='ij')
+    query_points = np.vstack([yy_grid.ravel(), xx_grid.ravel()]).T
+
+    for var, data_array in original_profiles.items():
+        if data_array.mask.all():
+            new_profiles[var] = np.ma.masked_all((len(new_y), len(new_x)))
+            continue
+
+        # 创建插值器实例
+        # bounds_error=False 和 fill_value=np.nan 确保在新网格超出原始范围的区域填充为NaN
+        interp_func = RegularGridInterpolator(
+            (original_y, original_x), 
+            data_array.filled(np.nan),
+            method='linear', 
+            bounds_error=False, 
+            fill_value=np.nan
+        )
+        
+        # 在新网格上执行插值
+        new_data_flat = interp_func(query_points)
+        
+        # 将一维插值结果重塑为二维网格
+        new_data = new_data_flat.reshape(len(new_y), len(new_x))
+        
+        # 将结果转回 masked array 并存入新字典
+        new_profiles[var] = np.ma.masked_invalid(new_data)
+
+    # --- 4. 构建并返回新的数据包 ---
+    new_data_package = {
+        'profile_data': new_profiles,
+        'x_coords': new_x,
+        'y_coords': new_y,
+        'projections': copy.deepcopy(data_package['projections']),
+        'metadata': copy.deepcopy(data_package['metadata'])
+    }
+
+    return new_data_package
+
+def plot_data_package(data_package: dict, DS: list, variable: str,
+                      show_fig: bool = False, save_fig: bool = False, xmin: float = None, xmax: float = None,
+                      ymin: float = None, ymax: float = None):
+    '''
+    根据一个数据包和原始涡旋数据集，绘制单一物理量的垂直剖面图。
+
+    该函数是一个灵活的可视化接口，它接收一个数据包，并根据传入的涡旋数据集
+    (DS)来确定绘图风格（如颜色和标题），适用于 get_vertical_glorys 的输出。
+
+    参数:
+        data_package (dict): 从 get_vertical_glorys 函数获取的数据包。
+        DS (list): 原始的涡旋轨迹信息数据集 (如ACL, CL)，用于确定涡旋类型和名称。
+        variable (str): 需要从 data_package 中绘制的变量名。
+        show_fig (bool): 是否显示图像。
+        save_fig (bool): 是否保存图像。
+        xmin, xmax, ymin, ymax (float): 坐标轴范围。
+    '''
+    # --- 1. 验证输入并解包数据 ---
+    if not data_package or not all(k in data_package for k in ['profile_data', 'x_coords', 'y_coords', 'projections', 'metadata']):
+        print(f"错误: 输入的 data_package 格式不完整。")
+        return
+        
+    profile_variable_2d = data_package['profile_data'].get(variable)
+    if profile_variable_2d is None or np.all(profile_variable_2d.mask):
+        print(f"警告: 变量 '{variable}' 的剖面数据无效，无法绘图。")
+        return
+
+    x_coords = data_package['x_coords']
+    y_coords = data_package['y_coords']
+    projections = data_package['projections']
+    metadata = data_package['metadata'] # 获取与上下文无关的元数据
+
+    # --- 2. 在当前上下文中计算与DS相关的元数据 ---
+    # 获取调用者上下文中的数据集名称
+    callers_local_vars = inspect.currentframe().f_back.f_locals
+    ds_name_list = [var_name for var_name, var_val in callers_local_vars.items() if var_val is DS]
+    if not ds_name_list:
+        raise ValueError("无法在调用者环境中找到数据集变量名。请确保DS参数已正确传入。")
+    ds_name = ds_name_list[0].upper()
+    
+    # 设置颜色
+    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
+
+    # --- 3. 准备绘图元素 ---
+    if profile_variable_2d.shape[1] != len(x_coords):
+       x_coords = x_coords[:profile_variable_2d.shape[1]]
+
+    X_mesh, Y_mesh = np.meshgrid(x_coords, y_coords)
+    
+    if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
+    elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
+    elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
+    elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
+    else: cbar_label, cmap, clim = variable, 'viridis', None
+    
+    if 'clim' not in locals() or clim is None:
+        valid_values = profile_variable_2d[~profile_variable_2d.mask]
+        clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
+        if variable in ['u', 'v', 'uo', 'vo']:
+            max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
+            clim = (-max_abs, max_abs)
+
+    # --- 4. 执行绘图 ---
+    fig, ax = plt.subplots(figsize=(20, 15))
+    
+    # 从 get_vertical_glorys 拿到的数据中获取k和b
+    # 如果不存在，则无法在标题中显示
+    k_val, b_val = metadata.get('k'), metadata.get('b')
+    if k_val is not None and b_val is not None:
+        title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+                 f"on {metadata['date_str']}, y={k_val:.2f}x+{b_val:.2f}")
+    else:
+         title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+                 f"on {metadata['date_str']}")
+
+    ax.set_title(title, fontsize=20)
+    ax.set_xlabel('Distance from Eddy Center Projection (km)', fontsize=18)
+    ax.set_ylabel('Depth (m)', fontsize=18)
+    ax.tick_params(labelsize=14)
+    
+    pc = ax.pcolormesh(X_mesh, Y_mesh, profile_variable_2d, cmap=cmap, shading='auto', vmin=clim[0], vmax=clim[1])
+    cbar = fig.colorbar(pc, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label, fontsize=18)
+    cbar.ax.tick_params(labelsize=14)
+
+    ax.axvline(0, color='black', linestyle='--', linewidth=2, label='Eddy Center Projection')
+    for i, dist in enumerate(projections['radius']): 
+        ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if i == 0 else "")
+    for i, dist in enumerate(projections['contour']): 
+        ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if i == 0 else "")
+
+    ax.set_ylim(y_coords.max(), y_coords.min())
+    if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
+    if ymin is not None and ymax is not None: ax.set_ylim(ymax, ymin)
+    
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), fontsize=18)
+
+    # --- 5. 保存和显示 ---
+    if save_fig:
+        output_dir = "plot_vertical_glorys"
+        os.makedirs(output_dir, exist_ok=True)
+        date_fn = metadata['date_str'].replace('-', '')
+        
+        if k_val is not None and b_val is not None:
+            k_str = f"k{k_val:.2f}"
+            b_str = f"b{b_val:.2f}"
+            base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_{k_str}{b_str}.png")
+        else:
+            base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}.png")
+
+        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+
+    if show_fig:
+        plt.show()
+
+    plt.close(fig)
