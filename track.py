@@ -11,7 +11,9 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 import glob
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter
 import copy
+import gsw
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
@@ -2074,3 +2076,246 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
         plt.show()
 
     plt.close(fig)
+
+def get_raytraceR_inputs(data_package: dict,
+                                f_coriolis: float, # 科里奥利频率 f (例如 1.454e-4)。**必须提供**。
+                                rho0: float = 1025.0, # 参考密度 (kg/m^3)。
+                                g: float = 9.81, # 重力加速度 (m/s^2)。
+                                m0: float = 1/100.0, # 初始垂直波数。
+                                omega_factor: float = 0.97, # 固有频率 omega = omega_factor * f。
+                                v0_amplitude: float = 0.1, # 初始波速振幅。
+                                thresh_val: float = 0.1e-2, # 内部反射阈值。
+                                chstart_val: int = 1, # 初始特征线 (1或2)。
+                                filter_sigma_z: float = 0.5, # 沿Z方向高斯平滑的标准差（用于导数计算，防止噪声放大）。
+                                filter_sigma_y: float = 0.5 # 沿Y方向高斯平滑的标准差。
+                               ) -> dict:
+    """
+    将来自 track.regrid_vertical_slice 的数据包转换为 MATLAB raytraceR 函数所需的输入格式。
+
+    假设输入 data_package 的结构如下（来自 track.get_vertical_glorys 和 regrid_vertical_slice 处理后）：
+    - z_coords (np.ndarray): 等间距的深度 (Z) 坐标，单位为米(m)。
+    - y_coords (np.ndarray): 等间距的横流 (Y) 坐标，单位为公里(km)。
+    - lon_coords (np.ndarray): 剖面线上每个点对应的经度。
+    - lat_coords (np.ndarray): 剖面线上每个点对应的纬度。
+    - profile_data (dict): 包含以下二维 np.ndarray (或 np.ma.MaskedArray) 数组的字典:
+        - 'u': 纬向速度 (uo)
+        - 'v': 经向速度 (vo)
+        - 'salinity': 盐度 (Practical Salinity, SP)
+        - 'thetao': 位势温度 (potential temperature, pt)
+    
+    参数:
+        data_package (dict): 包含 GLORYS 垂直切片数据的字典，通常是
+                             track.regrid_vertical_slice 的输出。
+        f_coriolis (float): 科里奥利频率 f (例如 1.454e-4 rad/s)。**必须提供**。
+        rho0 (float): 参考密度 (kg/m^3)。
+        g (float): 重力加速度 (m/s^2)。
+        m0 (float): 初始垂直波数。
+        omega_factor (float): 固有频率的倍数，omega = omega_factor * f。
+        v0_amplitude (float): 初始波速振幅。
+        thresh_val (float): 内部反射阈值。
+        chstart_val (int): 初始特征线 (1或2)。
+        filter_sigma_z (float): 沿深度方向高斯平滑的标准差（用于导数计算）。
+        filter_sigma_y (float): 沿横流方向高斯平滑的标准差。
+
+    返回:
+        dict: 包含 raytraceR 所需所有输入参数的字典。
+    """
+
+    # 1. 提取和映射输入数据
+    # raytraceR 的 Z 是垂直/深度，Y 是水平横流。
+    z_g = data_package['z_coords'] # 深度坐标，单位：米 (m)
+    y_g_km = data_package['y_coords'] # 横流坐标，单位：公里 (km)
+    lon_coords_1d = data_package['lon_coords'] # 剖面经度 (1D array)
+    lat_coords_1d = data_package['lat_coords'] # 剖面纬度 (1D array)
+
+    # 将横流坐标从公里转换为米，以保持 raytraceR 内部单位一致性
+    y_g = y_g_km * 1000.0 # 横流坐标，单位：米 (m)
+
+    # 从 profile_data 中获取核心物理量
+    # 它们已经是 (深度点数, 横流点数) 的形状
+    # .filled(np.nan) 用于处理 MaskedArray，将其掩码值填充为 NaN
+    u_data = data_package['profile_data']['u'].filled(np.nan)
+    v_data = data_package['profile_data']['v'].filled(np.nan)
+    salinity_data = data_package['profile_data']['salinity'].filled(np.nan) # Practical Salinity (SP)
+    thetao_data = data_package['profile_data']['thetao'].filled(np.nan) # Potential Temperature (pt)
+
+    # 检查维度和数据有效性
+    expected_shape_2d = (len(z_g), len(y_g_km))
+    if not (u_data.shape == salinity_data.shape == thetao_data.shape == expected_shape_2d):
+        raise ValueError(f"Profile data shapes are inconsistent or do not match expected ({len(z_g)}, {len(y_g_km)}).")
+    if not np.isfinite(f_coriolis):
+        raise ValueError("Coriolis frequency 'f_coriolis' must be a finite number.")
+
+    # 2. 计算网格间距
+    dz = np.mean(np.diff(z_g)) # regrid_vertical_slice 保证了等间距
+    dy = np.mean(np.diff(y_g)) # 横流坐标已经转换为米，这里计算米为单位的间距
+
+    # 3. 对物理量进行平滑处理 (减少噪声对导数计算的影响)
+    # 确保 sigma 值与数据尺寸兼容
+    u_smoothed = gaussian_filter(u_data, sigma=(filter_sigma_z, filter_sigma_y))
+    v_smoothed = gaussian_filter(v_data, sigma=(filter_sigma_z, filter_sigma_y))
+    salinity_smoothed = gaussian_filter(salinity_data, sigma=(filter_sigma_z, filter_sigma_y))
+    thetao_smoothed = gaussian_filter(thetao_data, sigma=(filter_sigma_z, filter_sigma_y))
+    
+    # 处理平滑后可能出现的NaN（高斯滤波的边界效应），尤其是在mask区域外推的NaN
+    u_smoothed[np.isnan(u_smoothed)] = 0.0 # 假设用0填充，或选择其他填充值
+    v_smoothed[np.isnan(v_smoothed)] = 0.0
+    salinity_smoothed[np.isnan(salinity_smoothed)] = np.nanmean(salinity_smoothed) if np.all(np.isnan(salinity_smoothed)) else salinity_smoothed[np.isnan(salinity_smoothed)].mean() # 用平均值填充，避免gsw出错
+    thetao_smoothed[np.isnan(thetao_smoothed)] = np.nanmean(thetao_smoothed) if np.all(np.isnan(thetao_smoothed)) else thetao_smoothed[np.isnan(thetao_smoothed)].mean() # 同上
+
+    # 4. 计算核心物理量: 密度, 浮力 (bg), N2, ug, F2, S2, s_M, omegamin
+    
+    # 4.1. 转换为 gsw 所需的 Absolute Salinity (SA) 和 Conservative Temperature (CT)
+    # gsw 需要经度和纬度网格与数据形状匹配
+    Z_mesh_m, Y_mesh_m = np.meshgrid(z_g, y_g, indexing='ij') # Z_mesh_m (深度, 米), Y_mesh_m (横流，米)
+    
+    # 将 1D lon/lat_coords 扩展为 2D 网格，匹配 (深度点数, 横流点数) 形状
+    # 假设 lon_coords_1d 和 lat_coords_1d 是与 y_g_km 对应的，即沿横流方向的经纬度
+    # 那么它们需要沿着深度方向广播
+    lon_2d = np.tile(lon_coords_1d[np.newaxis, :], (len(z_g), 1))
+    lat_2d = np.tile(lat_coords_1d[np.newaxis, :], (len(z_g), 1))
+
+    # 计算压力（p_from_z 需要负深度）
+    pressure_2d = gsw.p_from_z(-Z_mesh_m, lat_2d)
+
+    # 实用盐度 -> 绝对盐度
+    SA_processed = gsw.SA_from_SP(salinity_smoothed, pressure_2d, lon_2d, lat_2d)
+    
+    # 位温 -> 保守温度
+    CT_processed = gsw.CT_from_pt(SA_processed, thetao_smoothed)
+
+    # 计算位势密度 (referenced to 0 dbar)
+    rho_potential_processed = gsw.rho(SA_processed, CT_processed, 0)
+    
+    # 计算浮力 bg = -g * (rho_potential - rho0) / rho0
+    bg_processed = -g * (rho_potential_processed - rho0) / rho0
+
+    # 4.2. 计算 N2 (浮力频率的平方)
+    # gsw.Nsquared(SA, CT, p, lat=None, axis=0) 返回 (N2, p_mid)
+    # axis=0 表示沿深度（第一个）维度计算梯度
+    N2_output, p_mid_N2 = gsw.Nsquared(SA_processed, CT_processed, pressure_2d, lat=lat_2d, axis=0)
+    
+    # N2_output 的形状比原始数据在深度维度上少一个点 (因为是 mid-point 导数)
+    # 需要将其插值或映射回原始深度网格的尺寸
+    # 常用方法是插值回原始深度点或在第一个点进行外推/复制
+    # 这里我们采用在第一个深度点复制 N2_output 的第一行，使其维度匹配
+    N2_processed = np.vstack([N2_output[0:1, :], N2_output])
+    # 再次裁剪以确保与原始深度维度完全一致（防止因浮点数问题多/少一行）
+    N2_processed = N2_processed[:u_data.shape[0], :] 
+    
+    # 处理 N2 中可能出现的 NaN 或负值（物理上 N2 应为正或零）
+    N2_processed[np.isnan(N2_processed)] = 0.0 # 用 0 填充 NaN
+    N2_processed[N2_processed < 0] = 0.0 # 强制非负
+
+    # 4.3. 计算 ug (背景地转流场)
+    # 论文中 ug 是背景地转流的 x 分量。这里直接使用平滑后的 u 分量作为 ug。
+    ug_processed = u_smoothed
+
+    # 4.4. 计算 F2, S2 (根据 Whitt and Thomas 2013 论文定义)
+    
+    # zeta_g = -du_g/dy
+    # np.gradient 自动处理 MaskedArray，但我们已填充为 NaN
+    # 注意 dy 已经是米
+    du_dy_smoothed = np.gradient(ug_processed, dy, axis=1) # du_g/dy
+    zeta_g_processed = -du_dy_smoothed
+    
+    # F2 = f * (f + zeta_g)
+    F2_processed = f_coriolis * (f_coriolis + zeta_g_processed)
+
+    # S2 = f * du_g/dz
+    # 注意 dz 已经是米
+    du_dz_smoothed = np.gradient(ug_processed, dz, axis=0) # du_g/dz
+    S2_processed = f_coriolis * du_dz_smoothed
+    
+    # 4.5. 计算 s_M = F2 / S2
+    # 避免除以零或 NaN
+    s_M_processed = np.divide(F2_processed, S2_processed, out=np.zeros_like(F2_processed), where=S2_processed!=0)
+    s_M_processed[np.isnan(s_M_processed)] = 0.0 # 填充 NaN
+    s_M_processed[np.isinf(s_M_processed)] = 0.0 # 填充 Inf
+
+    # 4.6. 计算 omegamin
+    # omegamin = sqrt(q/N2)
+    # q = F2 * N2 - S2^4
+    PV_q = F2_processed * N2_processed - S2_processed**4
+    
+    # 避免根号下出现负值或除以零
+    omegamin_squared = np.divide(PV_q, N2_processed, out=np.zeros_like(PV_q), where=N2_processed!=0)
+    omegamin_squared = np.maximum(0, omegamin_squared) # 确保非负
+
+    omegamin_processed = np.sqrt(omegamin_squared)
+    omegamin_processed = np.real(omegamin_processed) # 确保是实数
+    omegamin_processed[np.isnan(omegamin_processed)] = 0.0 # 填充 NaN
+    omegamin_processed[np.isinf(omegamin_processed)] = 0.0 # 填充 Inf
+
+    # 5. 二阶导数 (根据论文示例，默认可以设为零，或者在这里计算)
+    # 鉴于计算二阶导数对噪声敏感且需要额外代码，我们这里保持为零，
+    # 除非用户明确要求并提供计算方法。
+    d2udy2_processed = np.zeros_like(u_data)
+    d2udz2_processed = np.zeros_like(u_data)
+    d2bdy2_processed = np.zeros_like(u_data)
+    d2bdz2_processed = np.zeros_like(u_data)
+    d2bdzdy_processed = np.zeros_like(u_data)
+    d2udzdy_processed = np.zeros_like(u_data)
+
+    # 6. 计算领域长度和波参数
+    omega = omega_factor * f_coriolis
+    Lz = z_g.max() - z_g.min()
+    Ly = y_g.max() - y_g.min() # y_g 已经是米
+
+    # m0 = 1/minv，所以 minv = 1/m0
+    minv_val = 1.0 / m0
+
+    # 准备输出字典，包含 raytraceR 所需所有参数
+    raytraceR_inputs = {
+        'Z': -Z_mesh_m, # 2D 深度网格 (深度, 横流)，单位：米 (m)
+        'dz': dz, # 深度间距 (米)
+        'Y': Y_mesh_m, # 2D 横流网格 (深度, 横流)，单位：米 (m)
+        'dy': dy, # 横流间距 (米)
+        'F2': F2_processed, # 2D 矩阵 (深度, 横流)
+        'S2': S2_processed, # 2D 矩阵 (深度, 横流)
+        'N2': N2_processed, # 2D 矩阵 (深度, 横流)
+        'ug': ug_processed, # 2D 矩阵 (深度, 横流)
+        'bg': bg_processed, # 2D 矩阵 (深度, 横流)
+        's_M': s_M_processed, # 2D 矩阵 (深度, 横流)
+        'omegamin': omegamin_processed, # 2D 矩阵 (深度, 横流)
+        'f': f_coriolis, # 标量
+        'g': g, # 标量
+        'rho0': rho0, # 标量
+        'omega': omega, # 标量
+        'minv': minv_val, # 标量
+        'v0': v0_amplitude, # 标量
+        
+        # 二阶导数 (目前设为零)
+        'd2udy2': d2udy2_processed,
+        'd2udz2': d2udz2_processed,
+        'd2bdy2': d2bdy2_processed,
+        'd2bdz2': d2bdz2_processed,
+        'd2bdzdy': d2bdzdy_processed,
+        'd2udzdy': d2udzdy_processed,
+        
+        # 领域长度 (根据 Z, Y 范围计算)
+        'Lz': Lz,
+        'Ly': Ly,
+        
+        # 其他 raytraceR 需要但通常在调用时设定的参数
+        'thresh': thresh_val,
+        'm0': m0, # 与 minv 互补，此处也返回
+        'chstart': chstart_val,
+    }
+    
+    print("\n--- Data Preparation Summary for raytraceR ---")
+    print(f"Z (Depth) meshgrid shape: {Z_mesh_m.shape}, min/max: {Z_mesh_m.min():.1f}/{Z_mesh_m.max():.1f} m")
+    print(f"Y (Cross-stream) meshgrid shape: {Y_mesh_m.shape}, min/max: {Y_mesh_m.min()/1000:.1f}/{Y_mesh_m.max()/1000:.1f} km")
+    print(f"dz (Depth spacing): {dz:.3f} m")
+    print(f"dy (Cross-stream spacing): {dy:.3f} m")
+    print(f"Calculated F2 shape: {F2_processed.shape}, min/max: {np.nanmin(F2_processed):.2e}/{np.nanmax(F2_processed):.2e}")
+    print(f"Calculated S2 shape: {S2_processed.shape}, min/max: {np.nanmin(S2_processed):.2e}/{np.nanmax(S2_processed):.2e}")
+    print(f"Calculated N2 shape: {N2_processed.shape}, min/max: {np.nanmin(N2_processed):.2e}/{np.nanmax(N2_processed):.2e}")
+    print(f"Calculated ug shape: {ug_processed.shape}, min/max: {np.nanmin(ug_processed):.2e}/{np.nanmax(ug_processed):.2e}")
+    print(f"Calculated bg shape: {bg_processed.shape}, min/max: {np.nanmin(bg_processed):.2e}/{np.nanmax(bg_processed):.2e}")
+    print(f"Calculated omegamin shape: {omegamin_processed.shape}, min/max: {np.nanmin(omegamin_processed):.2e}/{np.nanmax(omegamin_processed):.2e}")
+    print(f"Coriolis frequency (f): {f_coriolis:.4e} rad/s")
+    print(f"Wave frequency (omega): {omega:.4e} rad/s")
+    print("--------------------------------------------\n")
+
+    return raytraceR_inputs
