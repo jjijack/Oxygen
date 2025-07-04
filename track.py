@@ -2301,6 +2301,9 @@ def get_raytraceR_inputs(data_package: dict,
         'thresh': thresh_val,
         'm0': m0, # 与 minv 互补，此处也返回
         'chstart': chstart_val,
+        # projections数据用于Matlab中绘图
+        'eddy_radius': data_package['projections'].get('radius', []), # 半径投影
+        'eddy_contour': data_package['projections'].get('contour', []), # 等值线投影
     }
     
     print("\n--- Data Preparation Summary for raytraceR ---")
