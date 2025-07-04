@@ -24,14 +24,23 @@ argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2
 circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
 Glorys_path = '../copernicus/GLORYS'
 
-def load_meta_data(path):
+def load_meta_data(path, version = 3.2):
     '''
-    加载meta数据，输出ACS, ACL, CS, CL四个数据集
+    加载meta数据，输出ACS, ACL, CS, CL四个数据集。
+    默认版本为3.2
     '''
-    ACS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_short_19930101_20200307.nc'))
-    ACL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_long_19930101_20200307.nc'))
-    CS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_short_19930101_20200307.nc'))
-    CL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_long_19930101_20200307.nc'))
+    if version == 3.2:
+        ACS= Dataset(os.path.join(path, 'META3.2_DT_allsat_Anticyclonic_short_19930101_20220209.nc'))
+        ACL= Dataset(os.path.join(path, 'META3.2_DT_allsat_Anticyclonic_long_19930101_20220209.nc'))
+        CS= Dataset(os.path.join(path, 'META3.2_DT_allsat_Cyclonic_short_19930101_20220209.nc'))
+        CL= Dataset(os.path.join(path, 'META3.2_DT_allsat_Cyclonic_long_19930101_20220209.nc'))
+    elif version == 3.1:
+        ACS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_short_19930101_20200307.nc'))
+        ACL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_long_19930101_20200307.nc'))
+        CS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_short_19930101_20200307.nc'))
+        CL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_long_19930101_20200307.nc'))
+    else:
+        raise ValueError("Unsupported version. Please use 3.1 or 3.2.")
 
     return ACS, ACL, CS, CL
 
@@ -43,6 +52,9 @@ def area_limit(DS, latmin, latmax, lonmin, lonmax):
     输出：涡旋序号，时间，中心点经度，中心点纬度，最值点经度，最值点纬度，边界经度，边界纬度，半径，速度边界经度，速度边界纬度
     '''
     time = DS.variables['time'][:].data
+    if np.issubdtype(time.dtype, np.floating):
+        # 如果时间是浮点数，转换为整数
+        time = np.round(time).astype(np.uint32)
     # time = convert_date(time)
     center_lon = DS.variables['longitude'][:].data
     center_lat = DS.variables['latitude'][:].data
