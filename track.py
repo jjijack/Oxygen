@@ -17,11 +17,15 @@ import gsw
 from collections import defaultdict
 import multiprocessing
 from functools import partial
+import h5py
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
 
-argo_data = pd.read_parquet("Argo2014.parquet")
+# load 2014 data by default, can be changed with load_argo_data function
+argo_path = "./Argo_data"
+default_argo_data_path = os.path.join(argo_path, 'Argo2014.parquet')
+argo_data = pd.read_parquet(default_argo_data_path)
 argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
 
 circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
@@ -96,6 +100,113 @@ def process_and_save(data, filename):
     print(f'{filename.split(".")[0].upper()} count:', len(processed))
     with open(filename, 'wb') as f:
         pickle.dump(processed, f)
+
+def convert_mat_to_parquet(year: int, input_dir: str = './Argo_addFloat', output_dir: str = './Argo_data'):
+    """
+    读取指定年份的多个Argo .mat文件，将其合并，并保存为单个Parquet文件。
+
+    参数:
+        year (int): 需要处理的数据年份。
+        input_dir (str, optional): 存放源 .mat 文件的目录。
+                                   默认为 './Argo_addFloat'。
+        output_dir (str, optional): 用于保存输出 .parquet 文件的目录。
+                                    默认为 './Argo_data'。
+    """
+    # 将年份转换为字符串，用于构建路径
+    year_str = str(year)
+    print(f"Starting to process data for the year: {year_str}")
+
+    # --- 1. 准备文件路径 ---
+    # 构建源文件路径列表
+    try:
+        paths = [os.path.join(input_dir, f'Argo{year_str}_{month}.mat') for month in range(1, 13)]
+        print("Generated paths for .mat files:")
+        for p in paths:
+            print(f"  - {p}")
+    except Exception as e:
+        print(f"Error creating file paths: {e}")
+        return
+
+    # --- 2. 读取并处理数据 ---
+    # 定义列名
+    columns = [
+        "Year", "Month", "Day", "Longitude", "Latitude", "Depth_m", "DO_mol_kg", "Salinity_psu",
+        "Temperature_degC", "Oxygen_flag", "Oxygen_flag2", "Profile_number", "Datasets_number",
+        "Platform_number", "Cycle_number", "Float_serial_no"
+    ]
+    
+    all_data = [] # 初始化空列表用于存储所有月份的 DataFrame
+
+    print("\nReading .mat files...")
+    for path in paths:
+        if not os.path.exists(path):
+            print(f"Warning: File not found, skipping: {path}")
+            continue
+        try:
+            with h5py.File(path, 'r') as f:
+                if 'do' in f:
+                    do_data = f['do'][:].T  # 转置为行优先格式
+                    df = pd.DataFrame(do_data, columns=columns)
+                    all_data.append(df)
+                    print(f"Successfully read and processed {path}")
+                else:
+                    print(f"Warning: 'do' dataset not found in {path}")
+        except Exception as e:
+            print(f"Error: Failed to read {path}. Reason: {e}")
+
+    # --- 3. 合并并保存数据 ---
+    if not all_data:
+        print("\nNo data was loaded. Nothing to save.")
+        return
+
+    print("\nConcatenating all loaded data...")
+    final_df = pd.concat(all_data, ignore_index=True)
+
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 构建输出文件路径并保存
+    output_path = os.path.join(output_dir, f"Argo{year_str}.parquet")
+    try:
+        final_df.to_parquet(output_path, index=False)
+        print(f"\nSuccess! All data for {year_str} successfully saved to:")
+        print(f"  -> {output_path}")
+    except Exception as e:
+        print(f"\nError: Failed to save Parquet file. Reason: {e}")
+
+def load_argo_data(year: int, data_dir: str = './Argo_data') -> pd.DataFrame:
+    """
+    加载指定年份的 Argo Parquet 数据文件。
+
+    参数:
+        year (int): 需要加载的数据年份, 例如 2014。
+        data_dir (str, optional): 存放 Argo Parquet 文件的目录。
+                                  默认为 './Argo_data'。
+
+    返回:
+        pd.DataFrame: 一个包含 Argo 数据的 pandas DataFrame。
+                      如果文件未找到或加载失败，则会引发异常。
+    """
+    # 构建完整的文件路径
+    file_path = os.path.join(data_dir, f'Argo{year}.parquet')
+    
+    print(f"Attempting to load Argo data from: {file_path}")
+
+    # 检查文件是否存在
+    if not os.path.exists(file_path):
+        # 如果文件不存在，抛出一个清晰的错误
+        raise FileNotFoundError(f"Error: The file '{file_path}' was not found.")
+    
+    try:
+        # 读取 Parquet 文件并返回 DataFrame
+        argo_df = pd.read_parquet(file_path)
+        argo_df = argo_df.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
+        print("Argo data loaded successfully.")
+        return argo_df
+    except Exception as e:
+        # 如果读取过程中发生其他错误，也进行报告
+        print(f"An error occurred while reading the Parquet file: {e}")
+        raise
 
 def find_track(DS: list, num: int):
     '''
