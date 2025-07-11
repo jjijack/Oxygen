@@ -14,6 +14,9 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 import copy
 import gsw
+from collections import defaultdict
+import multiprocessing
+from functools import partial
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
@@ -2334,3 +2337,209 @@ def get_raytraceR_inputs(data_package: dict,
     print("--------------------------------------------\n")
 
     return raytraceR_inputs
+
+def _process_track_for_plotting(track, ds_name, argo_points_by_date, start_date, end_date, lonmin, lonmax, latmin, latmax):
+    """
+    (并行工作函数) 处理单条涡旋轨迹，返回绘图所需信息。
+    此函数设计为在单独的进程中运行。
+    """
+    # 解包数据
+    num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, _, _, _ = zip(*track)
+    dates = convert_date(time)
+    
+    # 找到在时间范围内的轨迹点索引
+    indices_in_range = np.where((dates >= start_date) & (dates <= end_date))[0]
+    
+    if indices_in_range.size == 0:
+        return None
+
+    # 检查是否有轮廓包含Argo
+    found_argo_in_contour = False
+    contours_to_plot = []
+    for i in indices_in_range:
+        current_date = dates[i].normalize()
+        if current_date in argo_points_by_date:
+            current_contour_lon = contour_lon[i]
+            current_contour_lat = contour_lat[i]
+
+            if len(current_contour_lon) < 3 or len(current_contour_lon) != len(current_contour_lat):
+                continue
+            
+            try:
+                contour_poly = Polygon(zip(current_contour_lon, current_contour_lat))
+            except Exception:
+                continue
+
+            for argo_point in argo_points_by_date[current_date]:
+                if contour_poly.contains(argo_point):
+                    contours_to_plot.append((current_contour_lon, current_contour_lat))
+                    found_argo_in_contour = True
+                    break 
+
+    # 准备编号文本和位置
+    start_idx_in_range = indices_in_range[0]
+    start_lon = center_lon[start_idx_in_range]
+    start_lat = center_lat[start_idx_in_range]
+    
+    text_info = None
+    if (lonmin <= start_lon <= lonmax) and (latmin <= start_lat <= latmax):
+        text_info = {
+            "text": f"{ds_name}{num[0]}",
+            "lon": start_lon,
+            "lat": start_lat,
+            "color": 'red' if found_argo_in_contour else 'black'
+        }
+
+    return {
+        "ds_name": ds_name,
+        "center_lon": center_lon,
+        "center_lat": center_lat,
+        "contours_to_plot": contours_to_plot,
+        "text_info": text_info,
+        "is_ace": 'AC' in ds_name.upper()
+    }
+
+def plot_all_tracks_in_range(datasets: dict, start_date_str: str, end_date_str: str,
+                             num_workers: int = 4, show_fig: bool = False, save_fig: bool = False):
+    """
+    (多核加速版) 绘制指定时间段内所有涡旋的轨迹以及相关Argo浮标数据。
+    此版本对Argo数据预处理进行了向量化优化，修正了日期解析错误。
+
+    参数:
+        datasets (dict): 包含涡旋数据集的字典。
+        start_date_str (str): 起始日期 'YYYY-MM-DD'。
+        end_date_str (str): 结束日期 'YYYY-MM-DD'。
+        num_workers (int): 用于并行计算的工作进程数。默认为 4。
+        show_fig (bool): 是否显示图像。
+        save_fig (bool): 是否保存图像。
+    """
+    start_date = pd.to_datetime(start_date_str)
+    end_date = pd.to_datetime(end_date_str)
+    
+    # --- 1. 初始化绘图 ---
+    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    fig, ax = plt.subplots(figsize=(40, 30))
+    ax.set_title(f'Eddy Tracks and Deep Argo Max DO ({start_date_str} to {end_date_str})', fontsize=20)
+    ax.set_xlabel('Longitude', fontsize=20)
+    ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='lightgrey', edgecolor='white', ax=ax)
+    
+    # --- 2. 预处理Argo数据 (使用向量化操作优化) ---
+    print("Preprocessing Argo data using vectorized operations...")
+    argo_dates = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
+    argo_in_time_range = argo_data[(argo_dates >= start_date) & (argo_dates <= end_date)]
+    if not argo_in_time_range.empty:
+        argo_in_range = argo_in_time_range[
+            (argo_in_time_range['Longitude'] >= lonmin) & (argo_in_time_range['Longitude'] <= lonmax) &
+            (argo_in_time_range['Latitude'] >= latmin) & (argo_in_time_range['Latitude'] <= latmax)
+        ].copy()
+    else:
+        argo_in_range = pd.DataFrame()
+
+    argo_points_by_date = defaultdict(list)
+    if not argo_in_range.empty:
+        # 先转换为整数(int)再转换为字符串(str)
+        argo_in_range['date_key'] = pd.to_datetime(
+            argo_in_range['Year'].astype(int).astype(str) + '-' +
+            argo_in_range['Month'].astype(int).astype(str) + '-' +
+            argo_in_range['Day'].astype(int).astype(str)
+        )
+        
+        points = [Point(lon, lat) for lon, lat in zip(argo_in_range['Longitude'], argo_in_range['Latitude'])]
+        argo_in_range['geometry'] = points
+
+        grouped = argo_in_range.groupby('date_key')['geometry'].apply(list).to_dict()
+        argo_points_by_date.update(grouped)
+
+    # --- 3. 设置并执行并行计算 ---
+    print("Preparing tasks for parallel processing...")
+    tasks = [(track, ds_name) for ds_name, ds_data in datasets.items() for track in ds_data]
+    
+    worker_func = partial(_process_track_for_plotting, 
+                          argo_points_by_date=argo_points_by_date, 
+                          start_date=start_date, end_date=end_date,
+                          lonmin=lonmin, lonmax=lonmax, latmin=latmin, latmax=latmax)
+
+    mp_context = multiprocessing.get_context('spawn') 
+    
+    print(f"Distributing {len(tasks)} tasks across {num_workers} cores using 'spawn' method...")
+    with mp_context.Pool(processes=num_workers) as pool:
+        results = pool.starmap(worker_func, tasks)
+
+    # --- 4. 集中处理绘图 ---
+    print("Plotting results...")
+    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    eddy_colors = {'ACE': prop_colors[1], 'CE': prop_colors[0]}
+    ace_labeled = False
+    ce_labeled = False
+    plotted_something = False
+
+    for result in filter(None, results):
+        plotted_something = True
+        is_ace = result['is_ace']
+        color = eddy_colors['ACE'] if is_ace else eddy_colors['CE']
+        label = 'ACE Track' if is_ace else 'CE Track'
+        
+        if is_ace and not ace_labeled:
+            current_label = label
+            ace_labeled = True
+        elif not is_ace and not ce_labeled:
+            current_label = label
+            ce_labeled = True
+        else:
+            current_label = ""
+        
+        ax.plot(result['center_lon'], result['center_lat'], color=color, alpha=0.7, label=current_label, zorder=4)
+        
+        for contour_lon, contour_lat in result['contours_to_plot']:
+            ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle='--')
+            
+        if result['text_info']:
+            info = result['text_info']
+            ax.text(info['lon'], info['lat'], info['text'], fontsize=12, color=info['color'], weight='bold', zorder=5)
+
+    # --- 5. 绘制Argo数据散点图 ---
+    print("Processing and plotting Argo data scatter points...")
+    if not argo_in_range.empty:
+        filtered_by_depth = argo_in_range[argo_in_range['Depth_m'] >= 500].copy()
+        if not filtered_by_depth.empty:
+            # 使用.loc来避免潜在的链式索引警告
+            idx_max_do = filtered_by_depth.loc[filtered_by_depth.groupby('Profile_number')['DO_mol_kg'].idxmax()]
+            needed_argo_data = idx_max_do
+            if not needed_argo_data.empty:
+                sc = ax.scatter(needed_argo_data['Longitude'], needed_argo_data['Latitude'], 
+                                c=needed_argo_data['DO_mol_kg'], cmap='bwr', s=60,
+                                vmin=150, vmax=240, edgecolors='black', linewidths=0.5, 
+                                label='Argo (Max DO @ Depth > 500m)', zorder=3)
+                
+                cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+                cbar.set_label('DO / μmol·kg⁻¹', fontsize=20)
+                cbar.ax.tick_params(labelsize=14)
+                plotted_something = True
+    
+    # --- 6. Finalize Plot ---
+    ax.set_xlim(lonmin, lonmax)
+    ax.set_ylim(latmin, latmax)
+
+    if not plotted_something:
+        print("Warning: No eddies or Argo data found to plot in the specified range and region.")
+        plt.close(fig)
+        return
+
+    ax.legend(fontsize=18)
+    ax.tick_params(axis='both', which='major', labelsize=16)
+    ax.set_aspect('equal')
+
+    # --- 7. 保存和显示图片 ---
+    if save_fig:
+        output_dir = "plot_all_tracks_in_range"
+        os.makedirs(output_dir, exist_ok=True)
+        base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}_regional.png"
+        save_path = os.path.join(output_dir, base_filename)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+
+    if show_fig:
+        plt.show()
+
+    plt.close(fig)
