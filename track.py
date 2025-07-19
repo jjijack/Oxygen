@@ -2756,3 +2756,116 @@ def run_nested_parallel_batch(
     # --- 5. 打印总结报告 ---
     print("\n" + "="*50 + "\n--- All Supervisor Processes Have Finished ---\n" + "="*50)
     print(f"Total execution time: {total_duration_hours:.2f} hours.")
+
+def plot_argo_hotspots(
+    start_year: int,
+    end_year: int,
+    do_threshold: float = 200.0,
+    depth_threshold: float = 500.0,
+    save_fig: bool = False,
+    show_fig: bool = True
+):
+    """
+    绘制指定时间范围内所有Argo数据中，满足特定条件的“热点”分布图。
+
+    此函数旨在识别并可视化高溶解氧（DO）的区域。它通过对数据点进行排序，
+    确保高DO值的点绘制在顶层，以解决数据覆盖问题。
+
+    参数:
+        start_year (int): 开始的年份。
+        end_year (int): 结束的年份。
+        do_threshold (float, optional): 溶解氧的筛选阈值 (DO > threshold)。默认为 200.0。
+        depth_threshold (float, optional): 筛选的最小深度 (Depth >= threshold)。默认为 500.0。
+        save_fig (bool, optional): 是否将生成的图像保存到文件。默认为 False。
+        show_fig (bool, optional): 是否在屏幕上显示生成的图像。默认为 True。
+    """
+    print("--- Starting Deep Argo DO Hotspot Analysis ---")
+    
+    # --- 1. 循环加载并合并所有年份的数据 ---
+    all_yearly_data = []
+    print(f"Loading all Argo data from {start_year} to {end_year}...")
+    for year in range(start_year, end_year + 1):
+        print(f"Processing year: {year}...")
+        try:
+            yearly_argo_data = load_argo_data(year=year)
+            all_yearly_data.append(yearly_argo_data)
+        except FileNotFoundError as e:
+            print(f"Warning: {e}. Skipping year {year}.")
+        except Exception as e:
+            print(f"An error occurred processing year {year}: {e}")
+
+    if not all_yearly_data:
+        print("No Argo data was loaded. Aborting plot.")
+        return
+
+    # --- 2. 核心筛选逻辑：先筛选深度，再找DO最高点 ---
+    print("Combining all data and applying filters...")
+    combined_df = pd.concat(all_yearly_data, ignore_index=True)
+    
+    # 步骤 A: 首先，只保留深度大于等于阈值的数据
+    deep_argo_df = combined_df[combined_df['Depth_m'] >= depth_threshold].copy()
+    
+    if deep_argo_df.empty:
+        print(f"No Argo data found below {depth_threshold}m. Aborting plot.")
+        return
+
+    # 步骤 B: 然后，在这个深层数据子集上，找出每个浮标DO最高的点
+    print("Finding the highest DO record below threshold for each profile...")
+    idx_max_do = deep_argo_df.groupby('Profile_number')['DO_mol_kg'].idxmax()
+    hotspot_points_df = deep_argo_df.loc[idx_max_do].copy()
+
+    if hotspot_points_df.empty:
+        print("No data points found after selection. Aborting plot.")
+        return
+        
+    # --- 3. 准备绘图数据 ---
+    # 对筛选出的热点，按DO值升序排序，以确保高值点绘制在顶层
+    print(f"Sorting {len(hotspot_points_df)} unique hotspot points for plotting...")
+    hotspot_points_df.sort_values(by='DO_mol_kg', ascending=True, inplace=True)
+    
+    # --- 4. 开始绘图 ---
+    print("Generating plot...")
+    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    fig, ax = plt.subplots(figsize=(40, 30))
+    ax.set_title(f'Highest DO Record of Each Argo Float (below {depth_threshold}m) from {start_year}-{end_year}', fontsize=20)
+    ax.set_xlabel('Longitude', fontsize=20)
+    ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='lightgrey', edgecolor='white', ax=ax)
+    
+    sc = ax.scatter(
+        hotspot_points_df['Longitude'], 
+        hotspot_points_df['Latitude'], 
+        c=hotspot_points_df['DO_mol_kg'], 
+        cmap='bwr',
+        vmin=150,
+        vmax=240,
+        s=25,
+        alpha=0.8,
+        label=f'Highest DO point of each float (below {depth_threshold}m)'
+    )
+    
+    cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+    cbar.set_label('DO / μmol·kg⁻¹ at hotspot depth', fontsize=20)
+    cbar.ax.tick_params(labelsize=14)
+
+    # --- 5. 最终化绘图 ---
+    ax.set_xlim(lonmin, lonmax)
+    ax.set_ylim(latmin, latmax)
+    ax.tick_params(axis='both', which='major', labelsize=16)
+    ax.set_aspect('equal')
+    ax.legend(fontsize=18, loc='upper left')
+
+    # --- 6. 保存和显示图片 ---
+    if save_fig:
+        output_dir = "argo_hotspot_plots"
+        os.makedirs(output_dir, exist_ok=True)
+        base_filename = f"Argo_DO_Hotspots_{start_year}_to_{end_year}.png"
+        save_path = os.path.join(output_dir, base_filename)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+
+    if show_fig:
+        plt.show()
+
+    plt.close(fig)
+    print("--- Hotspot analysis finished. ---")
