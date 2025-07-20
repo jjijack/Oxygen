@@ -6,6 +6,7 @@ import geopandas as gpd
 import inspect
 from netCDF4 import Dataset
 import os
+from pathlib import Path
 import pickle
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
@@ -18,16 +19,29 @@ from collections import defaultdict
 import multiprocessing
 import h5py
 import time as tm
+import shutil
 from matplotlib.lines import Line2D
+import dask.dataframe as dd
+from dask.distributed import Client
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
 
+argo_origin_path = Path("./Argo_origin")
+tmp_parquet_path = Path("./Argo_data_tmp")
+argo_path = Path("./Argo_data")
+
 # load 2014 data by default, can be changed with load_argo_data function
-argo_path = "./Argo_data"
-default_argo_data_path = os.path.join(argo_path, 'Argo2014.parquet')
-argo_data = pd.read_parquet(default_argo_data_path)
-argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
+default_argo_data_path = argo_path / 'Argo2014.parquet'
+try:
+    argo_data = pd.read_parquet(default_argo_data_path)
+    argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
+    print("Old format Argo data loaded successfully.")
+except FileNotFoundError:
+    print(f"Default Argo data file not found at {default_argo_data_path}. Empty DataFrame created.")
+    argo_data = pd.DataFrame()
+except KeyError:
+    print("New format Argo data loaded successfully.")
 
 circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
 Glorys_path = '../copernicus/GLORYS'
@@ -174,6 +188,206 @@ def convert_mat_to_parquet(year: int, input_dir: str = './Argo_addFloat', output
         print(f"  -> {output_path}")
     except Exception as e:
         print(f"\nError: Failed to save Parquet file. Reason: {e}")
+
+def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
+    """
+    解析单个扁平的、由制表符分隔的Argo表格文件。
+
+    功能:
+        此函数假设输入文件是一个标准的表格文件，其中第一行是列标题，
+        后续行是数据，所有字段均由制表符 ('\t') 分隔。
+        它会自动将指定的占位符（如 -999）转换成标准的 NaN。
+
+    参数:
+        file_path (Path): 单个Argo txt文件的路径。
+
+    返回:
+        pd.DataFrame | None: 如果文件成功解析且内容不为空，返回DataFrame；否则返回None。
+    """
+    try:
+        # 定义需要被视作NaN的占位符列表
+        missing_values = [-999, -999.0, -999.00, -999.000, -999.0000, -999.000000]
+        
+        # 在读取时使用 na_values 参数直接完成替换
+        df = pd.read_csv(
+            file_path,
+            sep='\t',
+            na_values=missing_values
+        )
+        
+        # 如果文件只有表头或完全为空，df.empty会是True
+        if df.empty:
+            return None
+        return df
+    except Exception as e:
+        # print(f"  [Warning] 读取文件 {file_path.name} 失败: {e}")
+        return None
+
+
+def worker_process_file(task_args: tuple[Path, Path]):
+    """
+    (Worker函数) 这是Dask的工作单元，负责处理单个文件。
+
+    功能:
+        接收一个包含输入和输出路径的元组，调用解析函数，
+        并将结果保存为中间Parquet文件。
+
+    参数:
+        task_args (tuple[Path, Path]): 一个元组，包含:
+            - 原始txt文件路径 (input_path)
+            - 中间Parquet文件输出路径 (output_path)
+    """
+    input_path, output_path = task_args
+    try:
+        df = parse_argo_txt_file(input_path)
+        if df is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(output_path, index=False)
+    except Exception as e:
+        print(f"\n[Error] 在工作进程中处理文件 {input_path.name} 时出错: {e}")
+
+
+def process_argo_txt_to_yearly_parquet_dask(
+    origin_dir: Path,
+    temp_dir: Path,
+    final_dir: Path,
+    cleanup_temp_dir: bool = True
+):
+    """
+    (主流程函数) 使用Dask统一并行处理Argo txt文件，高效处理大规模数据。
+
+    功能:
+        这是一个完整的、适用于超大数据集的ETL流程，完全由Dask驱动：
+        1. (并行) [Dask] 将所有原始 .txt 文件转换为临时的 .parquet 文件。
+        2. (并行) [Dask] 对所有临时文件进行并行地合并、清洗、排序，并输出为按年份分区的临时目录。
+        3. (串行) 将分区目录合并为最终的单个年度文件。
+        此版本利用Dask的HPC环境自适应能力，避免内存瓶颈，全程并行执行。
+        最后，根据参数选择是否清理所有临时文件。
+
+    参数:
+        origin_dir (Path): 存放原始Argo .txt文件的目录。
+        temp_dir (Path): 用于存放所有中间产物（初始Parquet、映射表、分区数据）的临时目录。
+        final_dir (Path): 用于保存最终年份.parquet文件的目录。
+        cleanup_temp_dir (bool, optional): 是否在任务结束后删除临时目录。默认为 True。
+    """
+    start_total_time = tm.time()
+    
+    # --- 准备工作：初始化Dask客户端并创建目录 ---
+    client = Client()
+    print(f"[*] Dask客户端已启动，仪表盘链接: {client.dashboard_link}")
+    
+    scheduler_info = client.scheduler_info()
+    workers_count = len(scheduler_info['workers'])
+    total_threads = sum(worker['nthreads'] for worker in scheduler_info['workers'].values())
+    print(f"[*] Dask自动检测到 {workers_count} 个 worker，共 {total_threads} 个工作核心。")
+    
+    print("[*] 准备工作环境...")
+    if temp_dir.exists():
+        print(f"  - 发现旧的临时目录，正在清理: {temp_dir}")
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    
+    # --- 阶段一: 使用Dask并行解析 -> 中间文件 ---
+    print("\n--- 阶段一: 开始并行解析原始 .txt 文件 ---")
+    txt_files = list(origin_dir.glob('*.txt'))
+    if not txt_files:
+        print("[Error] 输入目录中未找到任何 .txt 文件。程序终止。")
+        client.close()
+        return
+        
+    tasks = [(p, temp_dir / f"{p.stem}.parquet") for p in txt_files]
+    print(f"[*] 找到 {len(txt_files)} 个文件，将任务分发给Dask处理...")
+    
+    start_map_time = tm.time()
+    futures = client.map(worker_process_file, tasks)
+    client.gather(futures)
+    print(f"--- 阶段一完成 --- (耗时: {tm.time() - start_map_time:.2f} 秒)")
+    
+    # --- 阶段二: Dask并行ETL并输出分区文件 ---
+    print("\n--- 阶段二: Dask开始并行处理中间文件 ---")
+    start_reduce_time = tm.time()
+
+    print(f"[*] Dask正在逻辑读取 {temp_dir} 中的Parquet文件...")
+    ddf = dd.read_parquet(temp_dir / '*.parquet')
+    record_count = len(ddf)
+    print(f"[*] 数据逻辑加载完成，总计 {record_count:,} 条记录。")
+
+    print("[*] 正在重命名列...")
+    rename_map = {'WMO': 'Platform_number', 'Cycle': 'Profile_number', 'Lon': 'Longitude', 'Lat': 'Latitude'}
+    ddf = ddf.rename(columns=rename_map)
+
+    print("[*] 正在并行生成全局唯一的 Profile_number...")
+    unique_profiles = ddf[['Platform_number', 'Profile_number']].drop_duplicates().compute()
+    unique_profiles_sorted = unique_profiles.sort_values(by=['Platform_number', 'Profile_number'])
+    unique_profiles_sorted['Global_Profile_Number'] = range(1, len(unique_profiles_sorted) + 1)
+    mapping_file_path = temp_dir / 'profile_mapping.parquet'
+    unique_profiles_sorted.to_parquet(mapping_file_path, index=False)
+    mapping_ddf = dd.read_parquet(mapping_file_path)
+    ddf = ddf.merge(mapping_ddf, on=['Platform_number', 'Profile_number'], how='left')
+    ddf = ddf.drop(columns=['Profile_number']).rename(columns={'Global_Profile_Number': 'Profile_number'})
+
+    print("[*] 正在优化并转换数据类型...")
+    float64_cols = list(ddf.select_dtypes(include='float64').columns)
+    if float64_cols:
+        for col in float64_cols:
+            ddf[col] = ddf[col].astype('float32')
+    int_conversion_map = {'Year': 'Int16', 'Month': 'Int8', 'Day': 'Int8', 'Platform_number': 'Int64', 'Profile_number': 'Int64'}
+    for col, dtype in int_conversion_map.items():
+        if col in ddf.columns:
+            ddf[col] = ddf[col].astype(dtype)
+    
+    print("[*] Dask开始执行所有计算并按年份分区写入临时目录...")
+    ddf = ddf.dropna(subset=['Year'])
+    partitioned_output_dir = temp_dir / 'dask_partitioned_output'
+    ddf.to_parquet(partitioned_output_dir, write_index=False, partition_on=['Year'])
+    
+    end_reduce_time = tm.time()
+    print(f"--- 阶段二完成 --- (耗时: {end_reduce_time - start_reduce_time:.2f} 秒)")
+    
+    # --- 阶段三: 将分区文件合并为最终产物 ---
+    print("\n--- 阶段三: 开始合并分区文件并重排定序 ---")
+    start_consolidation_time = tm.time()
+    
+    year_dirs = sorted([d for d in partitioned_output_dir.iterdir() if d.is_dir() and d.name.startswith('Year=')])
+    for year_dir in year_dirs:
+        year_str = year_dir.name.split('=')[1]
+        year_int = int(year_str)
+        final_single_file_path = final_dir / f"Argo{year_int}.parquet"
+        print(f"  -> 合并年份 {year_int} -> {final_single_file_path}")
+        
+        year_df = pd.read_parquet(year_dir)
+        year_df['Year'] = year_int
+        year_df.sort_values(by=['Year', 'Month', 'Day', 'Platform_number'], inplace=True)
+        
+        start_cols = ['Year', 'Month', 'Day']
+        end_cols = ['Profile_number', 'Platform_number']
+        middle_cols = [col for col in year_df.columns if col not in start_cols + end_cols]
+        final_column_order = start_cols + middle_cols + end_cols
+        year_df = year_df[final_column_order]
+        
+        year_df.to_parquet(final_single_file_path, index=False)
+        
+    end_consolidation_time = tm.time()
+    print(f"--- 阶段三完成 --- (耗时: {end_consolidation_time - start_consolidation_time:.2f} 秒)")
+
+    # --- 清理工作 ---
+    if cleanup_temp_dir:
+        print("\n--- 清理阶段: 删除临时文件 ---")
+        try:
+            shutil.rmtree(temp_dir)
+            print(f"[*] 临时目录 {temp_dir} 已成功删除。")
+        except Exception as e:
+            print(f"[Error] 删除临时目录失败: {e}")
+    else:
+        print("\n--- 清理阶段: 已跳过 ---")
+        print(f"[*] 临时文件已保留在: {temp_dir}")
+
+    client.close()
+    end_total_time = tm.time()
+    print("\n==================================================")
+    print(f"[Success] 所有任务完成！总耗时: {(end_total_time - start_total_time)/60:.2f} 分钟。")
+    print("==================================================")
 
 def load_argo_data(year: int, data_dir: str = './Argo_data') -> pd.DataFrame:
     """
