@@ -31,17 +31,17 @@ argo_origin_path = Path("./Argo_origin")
 tmp_parquet_path = Path("./Argo_data_tmp")
 argo_path = Path("./Argo_data")
 
-# load 2014 data by default, can be changed with load_argo_data function
-default_argo_data_path = argo_path / 'Argo2014.parquet'
-try:
-    argo_data = pd.read_parquet(default_argo_data_path)
-    argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
-    print("Old format Argo data loaded successfully.")
-except FileNotFoundError:
-    print(f"Default Argo data file not found at {default_argo_data_path}. Empty DataFrame created.")
-    argo_data = pd.DataFrame()
-except KeyError:
-    print("New format Argo data loaded successfully.")
+# # load 2014 data by default, can be changed with load_argo_data function
+# default_argo_data_path = argo_path / 'Argo2014.parquet'
+# try:
+#     argo_data = pd.read_parquet(default_argo_data_path)
+#     argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
+#     print("Old format Argo data loaded successfully.")
+# except FileNotFoundError:
+#     print(f"Default Argo data file not found at {default_argo_data_path}. Empty DataFrame created.")
+#     argo_data = pd.DataFrame()
+# except KeyError:
+#     print("New format Argo data loaded successfully.")
 
 circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
 Glorys_path = '../copernicus/GLORYS'
@@ -389,39 +389,81 @@ def process_argo_txt_to_yearly_parquet_dask(
     print(f"[Success] 所有任务完成！总耗时: {(end_total_time - start_total_time)/60:.2f} 分钟。")
     print("==================================================")
 
-def load_argo_data(year: int, data_dir: str = './Argo_data') -> pd.DataFrame:
+def load_argo_data(year: int, data_dir: str = './Argo_data', 
+    variable_selection: dict | None = None) -> pd.DataFrame:
     """
-    加载指定年份的 Argo Parquet 数据文件。
+    加载指定年份的 Argo Parquet 数据文件，并进行列名规范化和变量选择。
+
+    功能:
+        1. 自动将旧版列名 (如 'Depth_m') 转换为新版标准名 ('Depth')。
+        2. 通过 `variable_selection` 参数，允许用户灵活选择最终输出的标准变量
+           (Temperature, DO, Salinity) 分别来源于文件中的哪一列数据。
 
     参数:
-        year (int): 需要加载的数据年份, 例如 2014。
-        data_dir (str, optional): 存放 Argo Parquet 文件的目录。
-                                  默认为 './Argo_data'。
+        year (int): 
+            需要加载的数据年份, 例如 2014。
+        data_dir (str, optional): 
+            存放 Argo Parquet 文件的目录。默认为 './Argo_data'。
+        variable_selection (dict | None, optional): 
+            一个字典，用于覆盖默认的变量来源。未指定的键将使用默认值。
+            例如: {'Salinity': 'PSAL_WOA'} 只会更改盐度来源。
+            默认来源为: {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}
 
     返回:
-        pd.DataFrame: 一个包含 Argo 数据的 pandas DataFrame。
-                      如果文件未找到或加载失败，则会引发异常。
+        pd.DataFrame: 一个包含处理后 Argo 数据的 pandas DataFrame，其列名和数据源
+                      均已根据参数进行了标准化。
     """
-    # 构建完整的文件路径
-    file_path = os.path.join(data_dir, f'Argo{year}.parquet')
+    # --- 1. 定义并合并变量选择 ---
+    # 定义默认选择
+    default_selection = {
+        'Temperature': 'Temp_Adjusted',
+        'DO': 'DOXY_Adjusted',
+        'Salinity': 'PSAL_Adjusted'
+    }
+    # 如果用户提供了自定义选择，则用它来更新（覆盖）默认值
+    if variable_selection:
+        default_selection.update(variable_selection)
     
+    # 最终生效的选择
+    final_selection = default_selection
+    
+    # --- 2. 构建路径并加载文件 ---
+    file_path = Path(data_dir) / f'Argo{year}.parquet'
     print(f"Attempting to load Argo data from: {file_path}")
-
-    # 检查文件是否存在
-    if not os.path.exists(file_path):
-        # 如果文件不存在，抛出一个清晰的错误
+    if not file_path.exists():
         raise FileNotFoundError(f"Error: The file '{file_path}' was not found.")
-    
     try:
-        # 读取 Parquet 文件并返回 DataFrame
         argo_df = pd.read_parquet(file_path)
-        argo_df = argo_df.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
-        print("Argo data loaded successfully.")
-        return argo_df
     except Exception as e:
-        # 如果读取过程中发生其他错误，也进行报告
         print(f"An error occurred while reading the Parquet file: {e}")
         raise
+
+    # --- 3. 列名规范化：将所有已知的旧列名统一为新版中对应的名称 ---
+    normalization_map = {
+        'Depth_m': 'Depth',
+        'Temperature_degC': 'Temp_Adjusted',
+        'DO_mol_kg': 'DOXY_Adjusted',
+        'Salinity_psu': 'PSAL_Adjusted'
+    }
+    argo_df.rename(columns=normalization_map, inplace=True)
+
+    # --- 4. 变量选择与最终DataFrame构建 ---
+    base_columns = [
+        'Year', 'Month', 'Day', 'Longitude', 'Latitude', 'Depth',
+        'Profile_number', 'Platform_number'
+    ]
+    existing_base_columns = [col for col in base_columns if col in argo_df.columns]
+    final_df = argo_df[existing_base_columns].copy()
+
+    for standard_name, source_col in final_selection.items():
+        if source_col in argo_df.columns:
+            final_df[standard_name] = argo_df[source_col]
+        else:
+            print(f"Warning: Column '{source_col}' not found in {file_path}. Creating empty column '{standard_name}'.")
+            final_df[standard_name] = pd.NA
+
+    print("Argo data loaded and processed successfully.")
+    return final_df
 
 def find_track(DS: list, num: int):
     '''
@@ -435,75 +477,150 @@ def find_track(DS: list, num: int):
                 return track
     raise ValueError('Track not found')
 
-def filtered_float_data(DS: list, no: int):
-    '''
-    根据涡旋轨迹筛选浮标数据
-    
-    筛选方式：先寻找指定编号涡旋出现日期，由日期筛选浮标数据，再判断浮标是否在涡旋contour或是effective radius内。
-    circle_enlargement_factor 用于扩大涡旋半径，收集effective radius理想圆外侧的部分浮标数据。
-    '''
-    # 获取指定编号的涡旋轨迹数据
+def is_point_in_contour(row: pd.Series) -> bool:
+    """
+    检查一个数据行中的点坐标是否在其涡旋轮廓坐标内部。
+
+    功能:
+        这是一个辅助函数，通常与DataFrame的.apply()方法配合使用。
+        它从一行数据中提取'Longitude', 'Latitude', 'contour_lon', 'contour_lat'，
+        并判断点是否在多边形内部。
+
+    参数:
+        row (pd.Series): 
+            一个Pandas DataFrame的数据行，必须包含经纬度和轮廓坐标。
+
+    返回:
+        bool: 如果点在轮廓内部，则返回True，否则返回False。
+    """
+    try:
+        # 从行数据中提取轮廓坐标和点坐标
+        contour_coords = zip(row['contour_lon'], row['contour_lat'])
+        point_coord = Point(row['Longitude'], row['Latitude'])
+        
+        # 创建多边形对象
+        polygon = Polygon(contour_coords)
+        
+        # 执行包含判断
+        return polygon.contains(point_coord)
+    except Exception:
+        # 如果轮廓数据格式错误或不完整，安全地返回False
+        return False
+
+def filtered_float_data(
+    DS: list, 
+    no: int,
+    argo_data_dir: str | Path = './Argo_data',
+    circle_enlargement_factor: float = 1.2
+) -> pd.DataFrame:
+    """
+    根据涡旋轨迹，动态加载并筛选匹配的Argo浮标剖面数据。
+
+    功能:
+        1. 分析涡旋轨迹覆盖的年份，并自动加载对应年份的Argo数据。
+        2. 使用向量化的方式高效匹配在同一天出现在涡旋区域内的Argo浮标。
+        3. 筛选标准为：浮标位置处于涡旋的有效轮廓内，或处于扩大一定倍数后的有效半径内。
+
+    参数:
+        DS (list): 
+            包含所有涡旋轨迹信息的数据集。
+        no (int): 
+            需要筛选的涡旋的唯一编号。
+        argo_data_dir (str | Path, optional): 
+            存放Argo Parquet文件的目录。默认为 './Argo_data'。
+        circle_enlargement_factor (float, optional): 
+            筛选过程中涡旋半径的放大倍数。默认为 1.2。
+
+    返回:
+        pd.DataFrame: 一个包含所有匹配的Argo剖面完整数据的DataFrame（所有深度层级）。
+                      如果无匹配数据，则返回一个空的DataFrame。
+    """
+    # --- 1. 准备涡旋数据 ---
+    # print(f"[*] Preparing track data for eddy ID {no}...")
     wanted_track = find_track(DS, no)
-    t0 = np.datetime64('1950-01-01')
-    num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
+    if not wanted_track:
+        print(f"  - Track for eddy {no} not found, returning empty result.")
+        return pd.DataFrame()
+
+    # 将涡旋轨迹列表转换为DataFrame，方便后续处理
+    track_df = pd.DataFrame(
+        wanted_track,
+        columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+                 'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
+    )
+    # 使用convert_date函数转换日期
+    track_df['date'] = convert_date(track_df['time'])
+
+    # --- 2. 动态加载所需的Argo数据 ---
+    min_year, max_year = track_df['date'].min().year, track_df['date'].max().year
+    print(f"[*] Eddy track spans years: {min_year} - {max_year}. Loading corresponding Argo data...")
     
-    dates = t0 + time
-    dates = pd.to_datetime(dates)
+    all_argo_data = []
+    for year in range(min_year, max_year + 1):
+        try:
+            yearly_argo_data = load_argo_data(year, data_dir=argo_data_dir)
+            if not yearly_argo_data.empty:
+                all_argo_data.append(yearly_argo_data)
+        except FileNotFoundError:
+            print(f"  - Warning: Argo data file for year {year} not found, skipping.")
+
+    if not all_argo_data:
+        print(f"  - No Argo data was loaded, returning empty result.")
+        return pd.DataFrame()
+        
+    argo_data = pd.concat(all_argo_data, ignore_index=True)
+    # print(f"[*] All relevant yearly Argo data loaded, total records: {len(argo_data):,}.")
+
+    # --- 3. 准备Argo数据用于合并 ---
+    # 预处理：删除没有有效坐标的记录，并创建日期列
+    argo_data.dropna(subset=['Longitude', 'Latitude'], inplace=True)
+    argo_data['date'] = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
     
-    argo_dates = pd.to_datetime({'year': argo_data["Year"],
-                                 'month': argo_data["Month"],
-                                 'day': argo_data["Day"]})
-    mask = argo_dates.isin(dates)
-    new_argo_data = argo_data[mask]  # 仅排除了日期不符合的数据
+    # 每个剖面只需要一个位置点来做匹配，因此我们按Profile_number去重，只保留第一个出现的点
+    argo_positions = argo_data.drop_duplicates(subset='Profile_number', keep='first').copy()
+    
+    # --- 4. 核心步骤：将Argo与涡旋数据按日期合并 ---
+    # pd.merge会高效地找出在同一天既有涡旋轨迹、又有Argo浮标的记录
+    merged_df = pd.merge(argo_positions, track_df, on='date')
+    if merged_df.empty:
+        print(f"  - No Argo floats found on the same day as the eddy track.")
+        return pd.DataFrame()
+    # print(f"[*] Found {len(merged_df)} potential 'float-eddy' pairs based on date matching.")
 
-    needed_rows = []
+    # --- 5. 向量化地理筛选 ---
+    # print(f"[*] Performing geographic location matching...")
+    # 5.1 检查是否在多边形内部
+    inside_poly_mask = merged_df.apply(is_point_in_contour, axis=1)
 
-    # 按 Profile_number 分组，确保每个 Profile_number 只处理一行
-    for profile_number, group in new_argo_data.groupby('Profile_number'):
-        # 取组中的第一行数据进行日期和地理条件的判断
-        row = group.iloc[0]
-        
-        # 根据 Year, Month, Day 列构造日期
-        row_date = pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day']))
-        
-        # 在 dates 数组中查找与 row_date 匹配的索引
-        matching_indices = np.where(dates == row_date)[0]
-        
-        # 如果没有匹配的日期，跳过该组
-        if len(matching_indices) == 0:
-            continue
-        
-        # 取第一个匹配的索引
-        i = matching_indices[0]
-        
-        # 基于轮廓点构造多边形
-        poly_coords = list(zip(contour_lon[i], contour_lat[i]))
-        poly = Polygon(poly_coords)
-        pt = Point(row['Longitude'], row['Latitude'])
-        inside_poly = poly.contains(pt)
-        
-        # 检查点是否在圆内，圆心和半径已知
-        center = np.array([center_lon[i], center_lat[i]])
-        point_coord = np.array([row['Longitude'], row['Latitude']])
-        distance = np.linalg.norm(point_coord - center)
-        inside_circle = distance <= (radius[i] / 111320) * circle_enlargement_factor
-        
-        # 如果点在多边形内或圆内，则将该组所有行数据加入结果中
-        if inside_poly or inside_circle:
-            # 添加原始索引
-            group['Original_Index'] = group.index
-            needed_rows.extend(group.to_dict(orient='records'))
+    # 5.2 检查是否在扩大后的圆内（完全向量化）
+    argo_coords = merged_df[['Longitude', 'Latitude']].values
+    eddy_centers = merged_df[['center_lon', 'center_lat']].values
+    distances = np.linalg.norm(argo_coords - eddy_centers, axis=1) # 批量计算所有点对的距离
+    radii_deg = (merged_df['radius'].values / 111320) * circle_enlargement_factor
+    inside_circle_mask = distances <= radii_deg
+    
+    # 5.3 合并两种筛选条件
+    final_mask = inside_poly_mask | inside_circle_mask
+    
+    # 筛选出真正匹配的记录
+    matched_profiles = merged_df[final_mask]
+    
+    if matched_profiles.empty:
+        print(f"  - After geographic filtering, no matching Argo floats were found.")
+        return pd.DataFrame()
 
-    # 创建一个包含筛选数据的 DataFrame
-    needed_data = pd.DataFrame(needed_rows)
-
-    # 设置原始索引
-    if 'Original_Index' in needed_data.columns:
-        needed_data.set_index('Original_Index', inplace=True)
-        # 删除显式显示的 'Original_Index' 列
-        needed_data.index.name = None  # 这行删除索引名称
-
-    return needed_data
+    # --- 6. 根据筛选结果获取完整的剖面数据 ---
+    # 从原始的、包含所有深度数据的argo_data中，筛选出所有匹配上的Profile_number
+    matching_profile_numbers = matched_profiles['Profile_number'].unique()
+    final_argo_data = argo_data[argo_data['Profile_number'].isin(matching_profile_numbers)].copy()
+    
+    # 在返回结果前，删除临时的'date'辅助列
+    if 'date' in final_argo_data.columns:
+        final_argo_data = final_argo_data.drop(columns=['date'])
+    
+    print(f"[*] Filtering complete! Found {len(matching_profile_numbers)} matching Argo profiles, with a total of {len(final_argo_data):,} data records.")
+    
+    return final_argo_data
 
 
 def plot_track(DS: list, no: int):
@@ -603,12 +720,29 @@ def plot_track(DS: list, no: int):
 
     ax.legend(fontsize=18)
 
-def convert_date(date):
-    '''转换META数据中的日期格式'''
-    t0 = np.datetime64('1950-01-01')
-    date = t0 + date
-    date = pd.to_datetime(date)
-    return date
+def convert_date(days_since_1950: pd.Series) -> pd.Series:
+    """
+    将以"自1950-01-01以来的天数"表示的数值转换为标准的datetime对象。
+
+    功能:
+        采用现代Pandas方法，使用pd.to_timedelta来处理日期运算，
+        以避免版本更新带来的TypeError。
+
+    参数:
+        days_since_1950 (pd.Series): 包含天数数值的Pandas Series。
+
+    返回:
+        pd.Series: 转换后的datetime对象组成的Pandas Series。
+    """
+    # 定义基准日期，使用Pandas的Timestamp对象更佳
+    t0 = pd.Timestamp('1950-01-01')
+    
+    # 核心步骤：将天数数值的Series转换为Timedelta Series
+    # unit='D' 参数明确地告诉Pandas，这些数值的单位是“天”
+    time_deltas = pd.to_timedelta(days_since_1950, unit='D')
+    
+    # 将基准日期与Timedelta Series相加，这是Pandas完全支持的操作
+    return t0 + time_deltas
 
 def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', variable: str = 'DO', show_colorbar: bool = False):
     '''
@@ -629,10 +763,8 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
         支持图片保存与显示，可选择显示颜色条。
     '''
     original_variable_name = variable # 用于文件名
-    if variable == 'DO':
-        variable = 'DO_mol_kg'
-    elif variable == 'Temp':
-        variable = 'Temperature_degC'
+    if variable == 'Temp':
+        variable = 'Temperature'
 
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
@@ -716,7 +848,7 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
                     color_value_normalized = 0.0 
             
             color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-            ax.plot(rows[variable], rows["Depth_m"], color=color, alpha=0.7) # label=current_profile_date.strftime("%Y-%m-%d") 移除以避免图例混乱
+            ax.plot(rows[variable], rows["Depth"], color=color, alpha=0.7)
             
         if not profile_dates_for_title: # 如果该平台没有有效的剖面数据被绘制
             plt.close(fig)
@@ -726,9 +858,9 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
         date_end_platform = max(profile_dates_for_title)
         
         ax.set_ylim(-50, 2050)
-        if variable == 'DO_mol_kg':
+        if variable == 'DO':
             ax.set_xlim(30,270)
-        elif variable == 'Temperature_degC':
+        elif variable == 'Temperature':
             ax.set_xlim(1, 32)
         
         ax.set_title(f"{ds_names}{no}, Platform: {int(platform_id_val)}, {date_start_platform.date()}~{date_end_platform.date()}", fontsize=20)
@@ -956,10 +1088,8 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list, show_fig: boo
         支持图片保存与显示，并带有颜色条。
     '''
     original_variable_name = variable # 保存原始变量名用于文件名
-    if variable == 'DO':
-        variable = 'DO_mol_kg'
-    elif variable == 'Temp':
-        variable = 'Temperature_degC'
+    if variable == 'Temp':
+        variable = 'Temperature'
 
     wanted_track = find_track(DS, no) # 获取涡旋轨迹数据
     argo_data_filtered = filtered_float_data(DS, no) # 获取与涡旋相关的浮标数据
@@ -1088,13 +1218,13 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list, show_fig: boo
 
         color = cmap(np.clip(color_value_normalized, 0.0, 1.0)) # 再次确保裁剪， cmap 输入应在 [0,1]
         
-        plt.plot(rows[variable], rows["Depth_m"], color=color, alpha=0.7)
+        plt.plot(rows[variable], rows["Depth"], color=color, alpha=0.7)
 
     # 4. 设置图像属性和颜色条
     plt.ylim(-50, 2050) # 深度范围
-    if variable == 'DO_mol_kg':
+    if variable == 'DO':
         plt.xlim(30, 270) # DO范围
-    elif variable == 'Temperature_degC':
+    elif variable == 'Temperature':
         plt.xlim(1, 32) # 温度范围
     
     month_required_str = ", ".join(map(str, month_required)) # 将月份列表转换为字符串
@@ -1492,12 +1622,12 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
     argo_data_filtered = filtered_float_data(DS, no)
     argo_data_filtered = argo_data_filtered[pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])==dates[needed_idx]]    # 日期筛选
     if deep_argo:
-        filtered_by_depth = argo_data_filtered[argo_data_filtered['Depth_m'] >= 500].copy()
+        filtered_by_depth = argo_data_filtered[argo_data_filtered['Depth'] >= 500].copy()
         if filtered_by_depth.empty:
-            print("Warning: No data found with Depth_m >= 500.")
+            print("Warning: No data found with Depth >= 500.")
             needed_data = pd.DataFrame(columns=argo_data_filtered.columns) # 返回一个空的DataFrame
         else:
-            idx_max_do = filtered_by_depth.groupby('Profile_number')['DO_mol_kg'].idxmax()
+            idx_max_do = filtered_by_depth.groupby('Profile_number')['DO'].idxmax()
             needed_data = filtered_by_depth.loc[idx_max_do]
             needed_data.index.name = None
 
@@ -1571,7 +1701,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
     # 绘制Argo浮标数据
     if not needed_data.empty:
         if deep_argo:
-            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO_mol_kg'], cmap = 'bwr', s=180,
+            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=180,
                             vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo with max DO under 500m', zorder=5)
             cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
             cbar2.set_label('DO/μmol·kg⁻¹', fontsize=20)
@@ -1579,7 +1709,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         else:
             ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=180, label='Argo', zorder=5)
         for idx, row in needed_data.iterrows():
-            ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth_m'])}", fontsize=7, fontweight='bold', ha='center', va='center', color='black', zorder=6)
+            ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth'])}", fontsize=7, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
         print(f"No Argo data available for eddy {ds_names}{no} at the specified index {needed_idx}.")
 
@@ -2784,9 +2914,9 @@ def plot_all_tracks_in_range(datasets: dict, start_date_str: str, end_date_str: 
     if not argo_in_time_range.empty:
         argo_in_range = argo_in_time_range[(argo_in_time_range['Longitude'] >= lonmin) & (argo_in_time_range['Longitude'] <= lonmax) & (argo_in_time_range['Latitude'] >= latmin) & (argo_in_time_range['Latitude'] <= latmax)].copy()
         if not argo_in_range.empty:
-            filtered_by_depth = argo_in_range[argo_in_range['Depth_m'] >= 500].copy()
+            filtered_by_depth = argo_in_range[argo_in_range['Depth'] >= 500].copy()
             if not filtered_by_depth.empty:
-                idx_max_do = filtered_by_depth.groupby(['Profile_number', 'Year', 'Month', 'Day'])['DO_mol_kg'].idxmax()
+                idx_max_do = filtered_by_depth.groupby(['Profile_number', 'Year', 'Month', 'Day'])['DO'].idxmax()
                 needed_argo_data = filtered_by_depth.loc[idx_max_do]
 
     argo_points_by_date = defaultdict(list)
@@ -2835,7 +2965,7 @@ def plot_all_tracks_in_range(datasets: dict, start_date_str: str, end_date_str: 
 
     # --- 5. 绘制Argo数据散点图 ---
     if not needed_argo_data.empty:
-        sc = ax.scatter(needed_argo_data['Longitude'], needed_argo_data['Latitude'], c=needed_argo_data['DO_mol_kg'], cmap='bwr', s=60, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo (Max DO @ Depth > 500m)', zorder=3)
+        sc = ax.scatter(needed_argo_data['Longitude'], needed_argo_data['Latitude'], c=needed_argo_data['DO'], cmap='bwr', s=60, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo (Max DO @ Depth > 500m)', zorder=3)
         cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
         cbar.set_label('DO / μmol·kg⁻¹', fontsize=20)
         cbar.ax.tick_params(labelsize=14)
@@ -3017,7 +3147,7 @@ def plot_argo_hotspots(
     combined_df = pd.concat(all_yearly_data, ignore_index=True)
     
     # 步骤 A: 首先，只保留深度大于等于阈值的数据
-    deep_argo_df = combined_df[combined_df['Depth_m'] >= depth_threshold].copy()
+    deep_argo_df = combined_df[combined_df['Depth'] >= depth_threshold].copy()
     
     if deep_argo_df.empty:
         print(f"No Argo data found below {depth_threshold}m. Aborting plot.")
@@ -3025,7 +3155,7 @@ def plot_argo_hotspots(
 
     # 步骤 B: 然后，在这个深层数据子集上，找出每个浮标DO最高的点
     print("Finding the highest DO record below threshold for each profile...")
-    idx_max_do = deep_argo_df.groupby('Profile_number')['DO_mol_kg'].idxmax()
+    idx_max_do = deep_argo_df.groupby('Profile_number')['DO'].idxmax()
     hotspot_points_df = deep_argo_df.loc[idx_max_do].copy()
 
     if hotspot_points_df.empty:
@@ -3035,7 +3165,7 @@ def plot_argo_hotspots(
     # --- 3. 准备绘图数据 ---
     # 对筛选出的热点，按DO值升序排序，以确保高值点绘制在顶层
     print(f"Sorting {len(hotspot_points_df)} unique hotspot points for plotting...")
-    hotspot_points_df.sort_values(by='DO_mol_kg', ascending=True, inplace=True)
+    hotspot_points_df.sort_values(by='DO', ascending=True, inplace=True)
     
     # --- 4. 开始绘图 ---
     print("Generating plot...")
@@ -3049,7 +3179,7 @@ def plot_argo_hotspots(
     sc = ax.scatter(
         hotspot_points_df['Longitude'], 
         hotspot_points_df['Latitude'], 
-        c=hotspot_points_df['DO_mol_kg'], 
+        c=hotspot_points_df['DO'], 
         cmap='bwr',
         vmin=150,
         vmax=240,
