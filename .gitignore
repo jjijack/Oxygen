@@ -1,3 +1,12 @@
 .DS_Store
 *.pkl
 *.png
+*.parquet
+*.csv
+
+Argo_addFloat
+Argo_data
+Argo_origin
+Mat_data_results
+*tmp*
+__pycache__/

@@ -23,6 +23,7 @@ import shutil
 from matplotlib.lines import Line2D
 import dask.dataframe as dd
 from dask.distributed import Client
+from tqdm.auto import tqdm
 
 lonmin,lonmax=140-2.5, 180+2.5
 latmin,latmax=28-2.5, 40+2.5
@@ -2794,317 +2795,299 @@ def get_raytraceR_inputs(data_package: dict,
 
     return raytraceR_inputs
 
-def init_worker(argo_data_dict, start_dt, end_dt):
+def init_worker(eddy_data_shared: dict):
     """
-    (Initializer函数) 为单月绘图的子进程初始化共享的、只读的数据。
+    (Initializer函数) 为multiprocessing的子进程初始化共享的、只读的数据。
 
-    这个函数在每个工作进程启动时仅被调用一次。它接收大的数据集
-    (如Argo位置字典)并将其设置为该进程的全局变量。这可以极大地避免
-    在每个任务间重复传输大数据的开销，是性能优化的关键。
+    功能:
+        这个函数在每个工作进程启动时仅被调用一次。它接收大的数据集
+        (如涡旋数据字典)并将其设置为该进程的全局变量。这可以极大地避免
+        在每个任务间重复传输大数据的开销，是性能优化的关键。
     """
-    global worker_argo_points, worker_start_date, worker_end_date
-    worker_argo_points = argo_data_dict
-    worker_start_date = start_dt
-    worker_end_date = end_dt
-    # print(f"[PID {os.getpid()}] Worker initialized for date range: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}.")
+    global worker_eddy_datasets
+    worker_eddy_datasets = eddy_data_shared
 
-def _process_track_for_plotting(track, ds_name):
+def check_single_track(track_data, argo_points_by_date, start_date, end_date, ds_name):
     """
-    (Worker函数) 处理单条涡旋轨迹，返回用于最终绘图的结构化信息。
+    (内部辅助函数) 检查单个涡旋轨迹是否与Argo数据有交集。
 
-    此函数是并行处理的核心，它在独立的子进程中运行。它依赖于由`init_worker`
-    函数创建的进程内全局变量来获取共享的、只读的数据。
-    判定逻辑已更新，统一为轮廓或扩大半径。
+    功能:
+        这是一个纯计算函数，会为所有在时间范围内的涡旋返回结果，
+        并附带一个布尔标志来说明其是否与Argo浮标有交集。
+
+    参数:
+        track_data (list): 单条涡旋的轨迹数据 (list of lists)。
+        argo_points_by_date (dict): 按日期组织的Argo位置字典。
+        start_date (pd.Timestamp): 检查的开始日期。
+        end_date (pd.Timestamp): 检查的结束日期。
+        ds_name (str): 数据集名称 (如 'ACS')。
+
+    返回:
+        dict | None: 如果涡旋在时间范围内，返回包含绘图信息的字典，否则返回None。
     """
-    global worker_argo_points, worker_start_date, worker_end_date
-    
-    num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*track)
+    num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*track_data)
     dates = convert_date(time)
     
-    indices_in_range = np.where((dates >= worker_start_date) & (dates <= worker_end_date))[0]
-    
+    indices_in_range = np.where((dates >= start_date) & (dates <= end_date))[0]
     if indices_in_range.size == 0:
         return None
 
-    # 检查是否有Argo浮标在涡旋内部（轮廓或扩大半径）
-    found_argo_inside = False
+    has_interaction = False
     contours_to_plot = []
     for i in indices_in_range:
         current_date = dates[i].normalize()
-        if current_date in worker_argo_points:
+        if current_date in argo_points_by_date:
             contour_poly = Polygon(zip(contour_lon[i], contour_lat[i]))
-            for argo_point in worker_argo_points[current_date]:
-                # 判定1：是否在轮廓内
+            for argo_point in argo_points_by_date[current_date]:
                 inside_poly = contour_poly.contains(argo_point)
-                
-                # 判定2：是否在扩大的半径圆内
                 center = np.array([center_lon[i], center_lat[i]])
                 point_coord = np.array([argo_point.x, argo_point.y])
                 distance = np.linalg.norm(point_coord - center)
                 inside_circle = distance <= (radius[i] / 111320) * circle_enlargement_factor
-
                 if inside_poly or inside_circle:
                     contours_to_plot.append((contour_lon[i], contour_lat[i]))
-                    found_argo_inside = True
-                    break  # 找到一个即可，跳出当前日期的Argo点循环
+                    has_interaction = True
+                    break
     
-    # 计算在指定时间范围内的连续轨迹段，用于高亮显示
     in_range_segments = []
-    if indices_in_range.size > 0:
-        splits = np.where(np.diff(indices_in_range) != 1)[0] + 1
-        contiguous_blocks = np.split(indices_in_range, splits)
-        for block in contiguous_blocks:
-            if block.size > 1:
-                in_range_segments.append((np.array(center_lon)[block], np.array(center_lat)[block]))
+    splits = np.where(np.diff(indices_in_range) != 1)[0] + 1
+    contiguous_blocks = np.split(indices_in_range, splits)
+    for block in contiguous_blocks:
+        if block.size > 0:
+            in_range_segments.append((np.array(center_lon)[block], np.array(center_lat)[block]))
 
-    # 准备涡旋编号的文本信息
     start_idx = indices_in_range[0]
-    text_info = {
-        "text": f"{ds_name}{num[0]}",
-        "lon": center_lon[start_idx],
-        "lat": center_lat[start_idx],
-        "color": 'red' if found_argo_inside else 'black'
-    }
+    text_info = {"text": f"{ds_name}{num[0]}", "lon": center_lon[start_idx], "lat": center_lat[start_idx]}
 
     return {
-        "ds_name": ds_name,
-        "center_lon": center_lon,
-        "center_lat": center_lat,
-        "in_range_segments": in_range_segments,
-        "contours_to_plot": contours_to_plot,
-        "text_info": text_info,
-        "is_ace": 'AC' in ds_name.upper()
+        "ds_name": ds_name, "center_lon": center_lon, "center_lat": center_lat,
+        "in_range_segments": in_range_segments, "contours_to_plot": contours_to_plot,
+        "text_info": text_info, "is_ace": 'AC' in ds_name.upper(),
+        "has_interaction": has_interaction
     }
 
-def plot_all_tracks_in_range(datasets: dict, start_date_str: str, end_date_str: str,
-                             num_workers: int = 4, chunk_size: int = 100,
-                             show_fig: bool = False, save_fig: bool = False):
+def plot_all_tracks_in_range(
+    start_date_str: str, 
+    end_date_str: str, 
+    eddy_datasets: dict | None = None,
+    plot_unrelated_eddies: bool = False,
+    save_fig: bool = False,
+    show_fig: bool = True
+):
     """
-    (单任务绘图函数) 使用多进程高效绘制指定时间范围内的涡旋与Argo数据图。
+    (核心绘图引擎) 为指定时间段生成涡旋与Argo数据的快照图。
 
-    此函数是所有绘图工作的核心，它可以处理任意长度的时间段。为了性能，
-    它内部使用多进程来并行处理大量的涡旋轨迹计算。
+    功能:
+        这是一个混合模式函数，既可以独立调用（需传入eddy_datasets），
+        也可以作为multiprocessing的工作单元（此时会自动从全局变量获取eddy_datasets）。
+        它会动态加载Argo数据，并进行高效的匹配和绘图。
 
     参数:
-        datasets (dict): 包含涡旋数据集的字典。
-                         例如: {'ACS': acs_data, 'CL': cl_data}
-        start_date_str (str): 绘图的起始日期，格式为 'YYYY-MM-DD'。
-        end_date_str (str): 绘图的结束日期，格式为 'YYYY-MM-DD'。
-        num_workers (int, optional): 用于并行计算的工作进程数。默认为 4。
-        chunk_size (int, optional): 每个工作进程一次性处理的任务块大小。默认为 100。
-        show_fig (bool, optional): 是否在屏幕上显示生成的图像。默认为 False。
-        save_fig (bool, optional): 是否将生成的图像保存到文件。默认为 False。
+        start_date_str (str): 开始日期 'YYYY-MM-DD'。
+        end_date_str (str): 结束日期 'YYYY-MM-DD'。
+        eddy_datasets (dict | None, optional): 包含已加载的涡旋数据集的字典。
+                                              在独立调用时必须提供。在并行批处理中应为None。
+        plot_unrelated_eddies (bool): 是否绘制在时间范围内但与Argo无交集的涡旋轨迹。
+        save_fig (bool): 是否保存图片。
+        show_fig (bool): 是否显示图片。
     """
+    # --- 0. 确定数据源 ---
+    local_eddy_datasets = eddy_datasets
+    # 如果作为并行worker运行，eddy_datasets会是None，此时从全局变量获取
+    if local_eddy_datasets is None:
+        global worker_eddy_datasets
+        local_eddy_datasets = worker_eddy_datasets
+
     start_date = pd.to_datetime(start_date_str)
     end_date = pd.to_datetime(end_date_str)
     
-    # --- 1. 初始化绘图 ---
-    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
-    fig, ax = plt.subplots(figsize=(40, 30))
-    ax.set_title(f'Eddy Tracks and Deep Argo Max DO ({start_date_str} to {end_date_str})', fontsize=20)
-    ax.set_xlabel('Longitude', fontsize=20)
-    ax.set_ylabel('Latitude', fontsize=20)
-    world.plot(color='lightgrey', edgecolor='white', ax=ax)
+    # --- 1. 动态加载Argo数据 ---
+    min_year, max_year = start_date.year, end_date.year
+    argo_data_list = []
+    for year in range(min_year, max_year + 1):
+        try:
+            argo_data_list.append(load_argo_data(year, data_dir=argo_path))
+        except FileNotFoundError:
+            print(f"Warning: Argo data for year {year} not found, skipping.")
+    if not argo_data_list:
+        print(f"No Argo data found for the period {start_date_str} to {end_date_str}.")
+        return
+
+    argo_data = pd.concat(argo_data_list, ignore_index=True)
     
     # --- 2. 预处理Argo数据 ---
-    print("Preprocessing Argo data for the given time range...")
     argo_dates = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
-    argo_in_time_range = argo_data[(argo_dates >= start_date) & (argo_dates <= end_date)]
+    argo_in_range = argo_data[(argo_dates >= start_date) & (argo_dates <= end_date)]
     needed_argo_data = pd.DataFrame()
-    if not argo_in_time_range.empty:
-        argo_in_range = argo_in_time_range[(argo_in_time_range['Longitude'] >= lonmin) & (argo_in_time_range['Longitude'] <= lonmax) & (argo_in_time_range['Latitude'] >= latmin) & (argo_in_time_range['Latitude'] <= latmax)].copy()
-        if not argo_in_range.empty:
-            filtered_by_depth = argo_in_range[argo_in_range['Depth'] >= 500].copy()
+    if not argo_in_range.empty:
+        geo_mask = (argo_in_range['Longitude'] >= lonmin) & (argo_in_range['Longitude'] <= lonmax) & \
+                   (argo_in_range['Latitude'] >= latmin) & (argo_in_range['Latitude'] <= latmax)
+        argo_in_geo_range = argo_in_range[geo_mask].copy()
+        if not argo_in_geo_range.empty:
+            filtered_by_depth = argo_in_geo_range[argo_in_geo_range['Depth'] >= 500].copy()
             if not filtered_by_depth.empty:
-                idx_max_do = filtered_by_depth.groupby(['Profile_number', 'Year', 'Month', 'Day'])['DO'].idxmax()
-                needed_argo_data = filtered_by_depth.loc[idx_max_do]
+                max_do_indices = filtered_by_depth.groupby(['Profile_number', 'Year', 'Month', 'Day'])['DO'].idxmax().dropna()
+                if not max_do_indices.empty:
+                    needed_argo_data = filtered_by_depth.loc[max_do_indices]
 
     argo_points_by_date = defaultdict(list)
     if not needed_argo_data.empty:
-        needed_argo_data_copy = needed_argo_data.copy()
-        needed_argo_data_copy['date_key'] = pd.to_datetime(needed_argo_data_copy['Year'].astype(int).astype(str) + '-' + needed_argo_data_copy['Month'].astype(int).astype(str) + '-' + needed_argo_data_copy['Day'].astype(int).astype(str))
-        for _, row in needed_argo_data_copy.iterrows():
-             argo_points_by_date[row['date_key']].append(Point(row['Longitude'], row['Latitude']))
+        for _, row in needed_argo_data.iterrows():
+            date_key = pd.Timestamp(year=row['Year'], month=row['Month'], day=row['Day'])
+            argo_points_by_date[date_key].append(Point(row['Longitude'], row['Latitude']))
 
-    # --- 3. 设置并执行并行计算 ---
-    # print("Preparing tasks for parallel processing...")
-    tasks = [(track, ds_name) for ds_name, ds_data in datasets.items() for track in ds_data]
-    init_args = (argo_points_by_date, start_date, end_date)
-    mp_context = multiprocessing.get_context('spawn') 
+    # --- 3. 检查所有涡旋轨迹 ---
+    all_tracks_with_names = [(track, ds_name) for ds_name, ds_data in local_eddy_datasets.items() for track in ds_data]
+    results = [check_single_track(track, argo_points_by_date, start_date, end_date, ds_name) for track, ds_name in all_tracks_with_names]
+
+    # --- 4. 绘图 ---
+    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    fig, ax = plt.subplots(figsize=(40, 30))
+    ax.set_title(f"Eddy Tracks and Deep Argo Max DO ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})", fontsize=20)
+    ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='lightgrey', edgecolor='white', ax=ax)
     
-    print(f"Running parallel processing for {len(tasks)} tasks across {num_workers} cores...")
-    with mp_context.Pool(processes=num_workers, initializer=init_worker, initargs=init_args) as pool:
-        results = pool.starmap(_process_track_for_plotting, tasks, chunksize=chunk_size)
-
-    # --- 4. 集中处理绘图结果 ---
-    print("Plotting results...")
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_colors = {'ACE': prop_colors[1], 'CE': prop_colors[0]}
-    plotted_something = False
 
     for result in filter(None, results):
-        plotted_something = True
+        has_interaction = result['has_interaction']
+        if not has_interaction and not plot_unrelated_eddies:
+            continue
+        
         is_ace = result['is_ace']
         color = eddy_colors['ACE'] if is_ace else eddy_colors['CE']
+        text_color = 'red' if has_interaction else 'black'
         
-        # 将整条轨迹作为背景，用虚线绘制
         ax.plot(result['center_lon'], result['center_lat'], color=color, alpha=0.4, linestyle='--', zorder=4)
-        
-        # 将“范围内”的片段用实线覆盖以高亮
         for lon_seg, lat_seg in result['in_range_segments']:
             ax.plot(lon_seg, lat_seg, color=color, alpha=0.8, linestyle='-', zorder=4)
-            
-        # 将符合条件的轮廓线用点线绘制
-        for contour_lon, contour_lat in result['contours_to_plot']:
-            ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle=':')
-            
-        # 绘制涡旋编号
-        if result['text_info']:
-            info = result['text_info']
-            ax.text(info['lon'], info['lat'], info['text'], fontsize=12, color=info['color'], weight='bold', zorder=5)
+        
+        info = result['text_info']
+        ax.text(info['lon'], info['lat'], info['text'], fontsize=12, color=text_color, weight='bold', zorder=5)
 
-    # --- 5. 绘制Argo数据散点图 ---
+        if has_interaction:
+            for contour_lon, contour_lat in result['contours_to_plot']:
+                ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle=':')
+
     if not needed_argo_data.empty:
         sc = ax.scatter(needed_argo_data['Longitude'], needed_argo_data['Latitude'], c=needed_argo_data['DO'], cmap='bwr', s=60, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo (Max DO @ Depth > 500m)', zorder=3)
         cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-        cbar.set_label('DO / μmol·kg⁻¹', fontsize=20)
-        cbar.ax.tick_params(labelsize=14)
+        cbar.set_label('DO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
 
-    # --- 6. 最终化绘图设置 ---
-    ax.set_xlim(lonmin, lonmax)
-    ax.set_ylim(latmin, latmax)
-    ax.tick_params(axis='both', which='major', labelsize=16)
-    ax.set_aspect('equal')
+    ax.set_xlim(lonmin, lonmax); ax.set_ylim(latmin, latmax)
+    ax.tick_params(axis='both', which='major', labelsize=16); ax.set_aspect('equal')
     
-    if not plotted_something:
-        print(f"Warning: No eddies or Argo data found to plot for {start_date_str[:7]}.")
-        plt.close(fig)
-        return
-
-    # 使用代理创建健壮的图例
-    legend_elements = [
-        Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'),
-        Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')
-    ]
+    legend_elements = [Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'), Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')]
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles=legend_elements + handles, fontsize=18, loc='upper left')
+    if "Argo (Max DO @ Depth > 500m)" in labels:
+        ax.legend(handles=legend_elements + [handles[labels.index("Argo (Max DO @ Depth > 500m)")]], fontsize=18, loc='upper left')
+    else:
+        ax.legend(handles=legend_elements, fontsize=18, loc='upper left')
 
-    # --- 7. 保存和显示图片 ---
+    # --- 5. 输出控制 ---
     if save_fig:
-        output_dir = "plot_all_tracks_in_range"
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = Path("plot_all_tracks_in_range")
+        output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}.png"
-        save_path = os.path.join(output_dir, base_filename)
+        save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
-
+    
     if show_fig:
         plt.show()
+    
     plt.close(fig)
 
-def process_time_chunk(start_month_str, end_month_str, eddy_datasets, num_workers_inner, chunk_size_inner):
+def worker_wrapper(args: tuple):
     """
-    (主管进程工作函数) 此函数在一个独立的“主管”进程中运行，负责处理一个大的时间区块。
+    (顶层Worker包装函数) 解包传递给worker的参数并调用核心绘图函数。
+
+    功能:
+        这是一个独立的顶层函数，专门用作`multiprocessing.Pool`的目标。
+        它负责接收包含所有参数的元组，解包后安全地调用`plot_all_tracks_in_range`。
+    
+    参数:
+        args (tuple): 包含所有绘图参数的元组，顺序为
+                      (start_date_str, end_date_str, plot_unrelated_eddies)。
     """
-    pid = os.getpid()
-    print(f"[Supervisor PID: {pid}] Started processing time chunk: {start_month_str} to {end_month_str}")
-    
-    date_range = pd.date_range(start=start_month_str, end=end_month_str, freq='MS')
-    total_months_in_chunk = len(date_range)
-    current_loaded_year = None
-    
-    global argo_data
+    # 解包参数
+    start_d, end_d, unrelated_flag = args
+    try:
+        # eddy_datasets 通过 initializer 共享，无需在此传递
+        plot_all_tracks_in_range(
+            start_date_str=start_d,
+            end_date_str=end_d,
+            plot_unrelated_eddies=unrelated_flag,
+            save_fig=True,  # 在批处理中，总是保存
+            show_fig=False  # 并且从不显示
+        )
+    except Exception as e:
+        # 在worker中捕获并打印错误，避免让整个进程池崩溃
+        print(f"!!! ERROR processing period {start_d}: {e}")
 
-    for i, month_start_date in enumerate(date_range):
-        year_to_process = month_start_date.year
-        if year_to_process != current_loaded_year:
-            print(f"[Supervisor PID: {pid}] Loading Argo data for year {year_to_process}...")
-            try:
-                argo_data = load_argo_data(year=year_to_process)
-                current_loaded_year = year_to_process
-            except FileNotFoundError as e:
-                print(f"[Supervisor PID: {pid}] Warning: {e}. Skipping year {year_to_process}.")
-                current_loaded_year = year_to_process
-                continue
-        
-        start_str = month_start_date.strftime('%Y-%m-%d')
-        end_str = (month_start_date + pd.tseries.offsets.MonthEnd(1)).strftime('%Y-%m-%d')
-        print(f"[Supervisor PID: {pid}] ({i+1}/{total_months_in_chunk}) Submitting plot job for {start_str[:7]}...")
-        
-        try:
-            plot_all_tracks_in_range(datasets=eddy_datasets, start_date_str=start_str, end_date_str=end_str, num_workers=num_workers_inner, chunk_size=chunk_size_inner, save_fig=True, show_fig=False)
-        except Exception as e:
-            print(f"[Supervisor PID: {pid}] ({i+1}/{total_months_in_chunk}) !!! An error occurred for {start_str[:7]}: {e}")
-            
-    print(f"[Supervisor PID: {pid}] Finished processing its entire time chunk.")
-
-def run_nested_parallel_batch(
+def run_batch_plotting_multiprocessing(
     start_date_str: str,
     end_date_str: str,
     eddy_datasets: dict,
-    total_outer_processes: int,
-    workers_per_process: int,
-    inner_chunk_size: int = 100
+    num_workers: int,
+    plot_unrelated_eddies: bool = False
 ):
     """
-    (总控制器) 使用嵌套并行策略，处理一个长时间序列的绘图任务。
+    (批处理控制器) 使用multiprocessing启动一个扁平化的并行绘图作业，并带有进度条。
     
-    此函数负责将总时间范围切分成 N 块，然后创建 N 个“主管”进程。
-    每个主管进程再调用内部并行的绘图函数(plot_all_tracks_in_range)
-    来处理其负责的时间区块内的每个月份。
+    功能:
+        1. 创建一个横跨指定数量核心的进程池。
+        2. 使用initializer高效地将涡旋数据共享给所有工作进程。
+        3. 按月份切分任务，并使用tqdm实时显示处理进度。
 
     参数:
-        start_date_str (str): 总任务的起始日期，格式为 'YYYY-MM-DD'。
-        end_date_str (str): 总任务的结束日期，格式为 'YYYY-MM-DD'。
-        eddy_datasets (dict): 已加载的、将在进程间共享的涡旋数据集。
-        total_outer_processes (int): 外层“主管”进程的数量。
-        workers_per_process (int): 每个主管进程内部创建的“工人”进程池大小。
-                                   总使用核心数 = total_outer_processes * workers_per_process。
-        inner_chunk_size (int, optional): 传递给内部 plot_all_tracks_in_range 函数的
-                                          chunksize 参数。默认为 100。
+        start_date_str (str): 批处理的开始日期 'YYYY-MM-DD'。
+        end_date_str (str): 批处理的结束日期 'YYYY-MM-DD'。
+        eddy_datasets (dict): 【已加载】的、将被共享给所有进程的涡旋数据集。
+        num_workers (int): 需要启动的并行工作进程数（核心数）。
+        plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
     """
-    # --- 1. 打印执行计划 ---
-    print("="*50 + "\n      Nested Parallel Batch Processing      \n" + "="*50)
-    print(f"Strategy: {total_outer_processes} supervisor processes, each with {workers_per_process} workers.")
-    print(f"Total cores to be utilized: {total_outer_processes * workers_per_process}")
+    print("="*60)
+    print("      Multiprocessing Batch Plotting with Progress Bar      ")
+    print("="*60)
+    print(f"Strategy: Creating a single pool of {num_workers} workers.")
     
-    # --- 2. 切分时间区块 ---
-    full_range = pd.date_range(start=start_date_str, end=end_date_str, freq='MS')
-    time_chunks = np.array_split(full_range, total_outer_processes)
-    month_spans = [(chunk[0].strftime('%Y-%m-%d'), chunk[-1].strftime('%Y-%m-%d')) for chunk in time_chunks]
-
-    # --- 3. 设置启动模式并创建进程 ---
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        print("Multiprocessing context already set.")
-        pass
-
-    processes = []
-    print("\n--- Starting Supervisor Processes ---")
+    # --- 1. 创建按月切分的任务列表 ---
+    month_starts = pd.date_range(start=start_date_str, end=end_date_str, freq='MS')
+    tasks = [
+        (
+            start_date.strftime('%Y-%m-%d'), 
+            (start_date + pd.tseries.offsets.MonthEnd(1)).strftime('%Y-%m-%d'),
+            plot_unrelated_eddies
+        ) 
+        for start_date in month_starts
+    ]
+    
+    print(f"[*] Created {len(tasks)} monthly plotting tasks to be processed by {num_workers} cores.")
+    
+    # --- 2. 启动进程池并执行任务 ---
     start_time_total = tm.time()
-
-    for start_month, end_month in month_spans:
-        p = multiprocessing.Process(target=process_time_chunk, 
-                       args=(start_month, end_month, eddy_datasets, workers_per_process, inner_chunk_size))
-        processes.append(p)
-        p.start()
-
-    # --- 4. 等待所有进程完成 ---
-    for p in processes:
-        p.join()
-
-    end_time_total = tm.time()
-    total_duration_hours = (end_time_total - start_time_total) / 3600
     
-    # --- 5. 打印总结报告 ---
-    print("\n" + "="*50 + "\n--- All Supervisor Processes Have Finished ---\n" + "="*50)
-    print(f"Total execution time: {total_duration_hours:.2f} hours.")
+    # 使用 initializer 来高效地传递一次大的涡旋数据
+    with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(eddy_datasets,)) as pool:
+        # 使用imap_unordered，它会乱序返回结果，效率最高
+        # 用tqdm包装迭代器，即可实现进度条
+        print("[*] Processing tasks...")
+        for _ in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
+            pass
+        
+    end_time_total = tm.time()
+    total_duration_minutes = (end_time_total - start_time_total) / 60
+    
+    print("\n" + "="*60)
+    print("--- All Plotting Tasks Have Finished ---")
+    print(f"Total execution time: {total_duration_minutes:.2f} minutes.")
+    print("="*60)
 
 def plot_argo_hotspots(
     start_year: int,
     end_year: int,
-    do_threshold: float = 200.0,
     depth_threshold: float = 500.0,
     save_fig: bool = False,
     show_fig: bool = True
@@ -3112,13 +3095,12 @@ def plot_argo_hotspots(
     """
     绘制指定时间范围内所有Argo数据中，满足特定条件的“热点”分布图。
 
-    此函数旨在识别并可视化高溶解氧（DO）的区域。它通过对数据点进行排序，
-    确保高DO值的点绘制在顶层，以解决数据覆盖问题。
+    此函数旨在识别并可视化高溶解氧（DO）的区域。它会找出每个Argo剖面在指定深度
+    之下的最大溶解氧点，并将其绘制在地图上。
 
     参数:
         start_year (int): 开始的年份。
         end_year (int): 结束的年份。
-        do_threshold (float, optional): 溶解氧的筛选阈值 (DO > threshold)。默认为 200.0。
         depth_threshold (float, optional): 筛选的最小深度 (Depth >= threshold)。默认为 500.0。
         save_fig (bool, optional): 是否将生成的图像保存到文件。默认为 False。
         show_fig (bool, optional): 是否在屏幕上显示生成的图像。默认为 True。
@@ -3155,15 +3137,22 @@ def plot_argo_hotspots(
 
     # 步骤 B: 然后，在这个深层数据子集上，找出每个浮标DO最高的点
     print("Finding the highest DO record below threshold for each profile...")
-    idx_max_do = deep_argo_df.groupby('Profile_number')['DO'].idxmax()
-    hotspot_points_df = deep_argo_df.loc[idx_max_do].copy()
+    
+    # --- 核心修正点 ---
+    # 1. 先计算出每组最大DO值的行索引
+    max_do_indices = deep_argo_df.groupby('Profile_number')['DO'].idxmax()
+    # 2. 清理索引：使用 .dropna() 去掉因整组都是NaN而产生的缺失值
+    valid_indices = max_do_indices.dropna()
 
-    if hotspot_points_df.empty:
-        print("No data points found after selection. Aborting plot.")
+    if valid_indices.empty:
+        print("No valid max DO points found after filtering. Aborting plot.")
         return
         
+    # 3. 使用清理后的有效索引来选取行
+    hotspot_points_df = deep_argo_df.loc[valid_indices].copy()
+    # --- 修正结束 ---
+        
     # --- 3. 准备绘图数据 ---
-    # 对筛选出的热点，按DO值升序排序，以确保高值点绘制在顶层
     print(f"Sorting {len(hotspot_points_df)} unique hotspot points for plotting...")
     hotspot_points_df.sort_values(by='DO', ascending=True, inplace=True)
     
