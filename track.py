@@ -623,104 +623,197 @@ def filtered_float_data(
     
     return final_argo_data
 
+def plot_track(
+    DS: list, 
+    no: int,
+    save_fig: bool = False,
+    show_fig: bool = True,
+    plot_radius: bool = False,
+    connection_threshold_days: int = 5
+):
+    """
+    绘制指定编号涡旋的详细轨迹，并智能高亮显示与Argo浮标的交互情况。
 
-def plot_track(DS: list, no: int):
-    '''
-    绘制指定编号涡旋的轨迹、相关浮标数据及其存在浮标日期的有效半径和轮廓。
+    功能:
+        1. 自动加载并筛选与指定涡旋匹配的Argo数据。
+        2. 绘制涡旋的完整轨迹（虚线）。
+        3. 智能高亮Argo浮标存在的时期：当浮标存在日的间隔小于阈值时，
+           会将这段完整的涡旋轨迹绘制为连续实线（孤立的单日则标记为点）。
+        4. 将匹配的Argo浮标按深海最大溶解氧浓度着色绘制，并确保高DO点在顶层显示。
+        5. 可选地绘制涡旋在交互日的有效半径和轮廓。
 
     参数:
-    DS (list): 涡旋轨迹数据集。
-    no (int): 涡旋编号。
-    '''
-    wanted_track=find_track(DS, no)
-    t0 = np.datetime64('1950-01-01')
-    num, time, center_lon, center_lat, max_lon, max_lat, contour_lon, contour_lat, radius, speed_contour_lon, speed_contour_lat = zip(*wanted_track)
+        DS (list): 
+            包含所有涡旋轨迹信息的数据集。
+        no (int): 
+            需要绘制的涡旋的唯一编号。
+        save_fig (bool, optional): 
+            是否将生成的图像保存到文件。默认为 False。
+        show_fig (bool, optional): 
+            是否在交互式环境中显示生成的图像。默认为 True。
+        plot_radius (bool, optional): 
+            是否以圆的形式绘制涡旋在交互日的有效半径。默认为 False。
+        connection_threshold_days (int, optional):
+            连接Argo交互点的最大天数阈值。默认为 5 天。
+    """
+    # --- 1. 准备涡旋和Argo数据 ---
+    print(f"[*] Preparing data for eddy ID {no}...")
     
+    # 获取涡旋轨迹并转换为DataFrame
+    wanted_track = find_track(DS, no)
+    if not wanted_track:
+        print(f"  - Error: Track for eddy {no} not found.")
+        return
+        
+    track_df = pd.DataFrame(
+        wanted_track,
+        columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+                 'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
+    )
+    track_df['date'] = convert_date(track_df['time'])
+    num = track_df['index_org'].iloc[0]
+
+    # 调用筛选函数，获取所有匹配的Argo数据（包含所有深度）
     argo_data_filtered = filtered_float_data(DS, no)
-    needed_data = argo_data_filtered.groupby('Profile_number').apply(lambda group: group.iloc[0])
-    needed_data.index.name = None
+
+    # 准备用于绘图的Argo代表点 (深海最大DO)
+    argo_plot_points = pd.DataFrame()
+    if not argo_data_filtered.empty:
+        deep_argo_df = argo_data_filtered[argo_data_filtered['Depth'] >= 500].copy()
+        if not deep_argo_df.empty:
+            max_do_indices = deep_argo_df.groupby('Profile_number')['DO'].idxmax().dropna()
+            if not max_do_indices.empty:
+                argo_plot_points = deep_argo_df.loc[max_do_indices]
+
+    # --- 2. 准备绘图 ---
+    # 获取数据集名称 (例如 ACS, CL)
+    ds_name = "UNKNOWN"
+    for name, var in inspect.currentframe().f_back.f_locals.items():
+        if var is DS:
+            ds_name = name.upper()
+            break
+            
+    prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
     
-    dates = t0 + time
-    dates = pd.to_datetime(dates)
-
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE")
-
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    if ds_names == 'ACS' or ds_names == 'ACL':
-        colors =colors[1]
-    else:
-        colors =colors[0]
+    # 加载地理底图
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
 
+    # 初始化画布与坐标轴
     fig, ax = plt.subplots(figsize=(30, 20))
-    ax.set_title(f'Track {ds_names}{num[0]}', fontsize=20)
-    ax.set_xlabel('Longitude', fontsize=20)
-    ax.set_ylabel('Latitude', fontsize=20)
-    world.plot(color='green', ax=ax)
+    ax.set_title(f'Track Analysis for Eddy {ds_name}{num}', fontsize=20)
+    ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='lightgrey', edgecolor='white', ax=ax)
 
-    ax.plot(center_lon, center_lat, color=colors, label='Center Track')
-    ax.plot(center_lon[0], center_lat[0], marker='o', color=colors, markersize=10)
-    ax.plot(center_lon[-1], center_lat[-1], marker='x', color=colors, markersize=10)
-
-    # 对于 needed_data 中的每个观测，按日期查找对应的涡旋轨迹点
-    labeled = False
-    for idx, row in needed_data.iterrows():
-        obs_date = pd.Timestamp(year=int(row['Year']),
-                                month=int(row['Month']),
-                                day=int(row['Day']))
-        matching = np.where(pd.to_datetime(dates) == obs_date)[0]
-        if matching.size > 0:
-            i = matching[0]
-            # 以圆的形式绘制半径（将米近似转换为经纬度度数）
-            if labeled == False:
-                if ds_names == 'ACS' or ds_names == 'ACL':
-                    circle = plt.Circle((center_lon[i], center_lat[i]),
-                                radius[i] / 111320.0,
-                                color='r', fill=False, linestyle='--', alpha=0.2, linewidth=1, label='Effective Radius')
-                else:
-                    circle = plt.Circle((center_lon[i], center_lat[i]),
-                                radius[i] / 111320.0,
-                                color='purple', fill=False, linestyle='--', alpha=0.2, linewidth=1, label='Effective Radius')        
-            else:
-                if ds_names == 'ACS' or ds_names == 'ACL':
-                    circle = plt.Circle((center_lon[i], center_lat[i]),
-                                    radius[i] / 111320.0,
-                                    color='r', fill=False, linestyle='--', alpha=0.2, linewidth=1)
-                else:
-                    circle = plt.Circle((center_lon[i], center_lat[i]),
-                                    radius[i] / 111320.0,
-                                    color='purple', fill=False, linestyle='--', alpha=0.2, linewidth=1)
-            ax.add_patch(circle)
-            # 标记中心点
-            # ax.plot(center_lon[i], center_lat[i], marker='o', color='black', markersize=10)
-            # 绘制轮廓线
-            if labeled == False:
-                ax.plot(contour_lon[i], contour_lat[i], color=colors, linewidth=1, alpha=0.5, label='Effective Contour')
-                labeled = True
-            else:
-                ax.plot(contour_lon[i], contour_lat[i], color=colors, linewidth=1, alpha=0.5)
-            # 绘制日期
-            dates_obs = pd.to_datetime(needed_data[['Year', 'Month', 'Day']].astype(int))
-            if obs_date == dates_obs.min() or obs_date == dates_obs.max():
-                ax.text(center_lon[i], center_lat[i], obs_date.strftime('%Y-%m-%d'), fontsize=20, color='black')
-
-    # 绘制 needed_data 中的每个观测点
-    ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='black', s=50, label='Floats')
+    # --- 3. 绘制涡旋轨迹 (背景和高亮) ---
+    # 绘制完整的背景轨迹 (虚线)
+    ax.plot(track_df['center_lon'], track_df['center_lat'], color=eddy_color, linestyle='--', alpha=0.5, label='Full Track Path')
     
+    # 找出有Argo交互的日期
+    interaction_track_df = pd.DataFrame(columns=track_df.columns)
+    if not argo_plot_points.empty:
+        interaction_dates = pd.to_datetime(argo_plot_points[['Year', 'Month', 'Day']]).unique()
+        interaction_track_df = track_df[track_df['date'].isin(interaction_dates)].copy()
+        
+        # 识别并分别绘制不连续的实线段
+        if not interaction_track_df.empty:
+            date_diffs = interaction_track_df['date'].diff()
+            break_points = date_diffs > pd.Timedelta(f'{connection_threshold_days} days')
+            segment_ids = break_points.cumsum()
+            
+            labeled_interaction_path = False
+            labeled_interaction_point = False
+            # 按段落ID分组并分别绘图
+            for _, segment_df in interaction_track_df.groupby(segment_ids):
+                start_segment_date = segment_df['date'].min()
+                end_segment_date = segment_df['date'].max()
+                full_path_segment = track_df[
+                    (track_df['date'] >= start_segment_date) & 
+                    (track_df['date'] <= end_segment_date)
+                ]
+
+                # 如果段内只有一个交互点，画成散点
+                if len(segment_df) == 1:
+                    label = 'Interaction Point' if not labeled_interaction_point else None
+                    ax.scatter(full_path_segment['center_lon'], full_path_segment['center_lat'], 
+                               facecolors='none', edgecolors=eddy_color, 
+                                linewidths=1.5, s=100, zorder=5, label=label)
+                    labeled_interaction_point = True
+                # 否则，将这段时间的完整轨迹画成实线
+                else:
+                    label = 'Interaction Path' if not labeled_interaction_path else None
+                    ax.plot(full_path_segment['center_lon'], full_path_segment['center_lat'], 
+                            color=eddy_color, linestyle='-', linewidth=2.5, label=label)
+                    labeled_interaction_path = True
+    
+    # 标记轨迹的起点和终点
+    ax.plot(track_df['center_lon'].iloc[0], track_df['center_lat'].iloc[0], marker='o', color=eddy_color, markersize=10, label='Start')
+    ax.plot(track_df['center_lon'].iloc[-1], track_df['center_lat'].iloc[-1], marker='x', color=eddy_color, markersize=12, mew=2.5, label='End')
+
+    # --- 4. 绘制交互日的轮廓、半径和日期 ---
+    labeled_contour = False
+    labeled_radius = False
+    for _, eddy_day in interaction_track_df.iterrows():
+        # 绘制轮廓线
+        if not labeled_contour:
+            ax.plot(eddy_day['contour_lon'], eddy_day['contour_lat'], color=eddy_color, linewidth=1, alpha=0.6, label='Effective Contour')
+            labeled_contour = True
+        else:
+            ax.plot(eddy_day['contour_lon'], eddy_day['contour_lat'], color=eddy_color, linewidth=1, alpha=0.6)
+        
+        # 绘制有效半径
+        if plot_radius:
+            radius_color = 'r' if 'AC' in ds_name else 'purple'
+            circle_label = 'Effective Radius' if not labeled_radius else None
+            circle = plt.Circle((eddy_day['center_lon'], eddy_day['center_lat']), eddy_day['radius'] / 111320.0,
+                                color=radius_color, fill=False, linestyle='--', alpha=0.4, linewidth=1.5, label=circle_label)
+            ax.add_patch(circle)
+            labeled_radius = True
+            
+        # 标记交互的起始和结束日期
+        if eddy_day['date'] == interaction_track_df['date'].min() or eddy_day['date'] == interaction_track_df['date'].max():
+             ax.text(eddy_day['center_lon'], eddy_day['center_lat'] + 0.1, eddy_day['date'].strftime('%Y-%m-%d'), 
+                     fontsize=16, color='black', ha='center', zorder=11)
+
+    # --- 5. 绘制Argo数据散点图 ---
+    if not argo_plot_points.empty:
+        # 按DO值升序排序，确保高值点最后绘制（在顶层）
+        argo_plot_points.sort_values(by='DO', ascending=True, inplace=True)
+        
+        sc = ax.scatter(argo_plot_points['Longitude'], argo_plot_points['Latitude'], c=argo_plot_points['DO'],
+                        cmap='bwr', s=80, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, 
+                        label='Argo (Max DO @ Depth > 500m)', zorder=10)
+        
+        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.08)
+        cbar.set_label('DO / μmol·kg⁻¹', fontsize=18)
+        cbar.ax.tick_params(labelsize=14)
+
+    # --- 6. 最终化绘图设置 ---
     # 设定边界时排除META中错误的contour数据
-    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
-    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
-    ax.set_xlim(np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5)
-    ax.set_ylim(np.min(contour_lat_filtered) - 0.5, np.max(contour_lat_filtered) + 0.5)
+    valid_contours_lon = [lon for day_lons in track_df['contour_lon'] for lon in day_lons if lon != 180.0]
+    valid_contours_lat = [lat for day_lats in track_df['contour_lat'] for lat in day_lats if lat != 0.0]
+    if valid_contours_lon and valid_contours_lat:
+        ax.set_xlim(min(valid_contours_lon) - 0.5, max(valid_contours_lon) + 0.5)
+        ax.set_ylim(min(valid_contours_lat) - 0.5, max(valid_contours_lat) + 0.5)
+        
     ax.set_aspect('equal')
-
     ax.legend(fontsize=18)
+    ax.tick_params(axis='both', which='major', labelsize=16)
 
+    # --- 7. 输出控制 ---
+    if save_fig:
+        output_dir = Path("plot_track_analysis")
+        output_dir.mkdir(exist_ok=True, parents=True)
+        base_filename = f"Track_Analysis_{ds_name}{num}.png"
+        save_path = output_dir / base_filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    if show_fig:
+        plt.show()
+    
+    plt.close(fig)
+    
 def convert_date(days_since_1950: pd.Series) -> pd.Series:
     """
     将以"自1950-01-01以来的天数"表示的数值转换为标准的datetime对象。
