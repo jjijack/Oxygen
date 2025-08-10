@@ -418,8 +418,11 @@ def load_argo_data(year: int, data_dir: str = './Argo_data',
     # 定义默认选择
     default_selection = {
         'Temperature': 'Temp_Adjusted',
+        'Temperature_Flag': 'Temp_Adjusted_Flag',
         'DO': 'DOXY_Adjusted',
-        'Salinity': 'PSAL_Adjusted'
+        'DO_Flag': 'DOXY_Adjusted_Flag',
+        'Salinity': 'PSAL_Adjusted',
+        'Salinity_Flag': 'PSAL_Adjusted_Flag'
     }
     # 如果用户提供了自定义选择，则用它来更新（覆盖）默认值
     if variable_selection:
@@ -909,21 +912,30 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
 
                 # 根据选项移除剖面中的异常值
                 if remove_outliers:
+                    # 质量控制过滤：仅保留 Argo QC 等级为 {1,2,5,8} 的观测（1=Good, 2=Probably good, 5=Changed, 8=Estimated），兼容字符串/整数标记
+                    qc_column_name = f"{db_variable_name}_Flag"
+                    if qc_column_name in rows_to_plot.columns:
+                        good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                        # rows_to_plot = rows_to_plot[rows_to_plot[qc_column_name].isin(good_qc_flags)]
+                        bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
+                        rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
                     # 规则法：移除特定变量的已知错误值（例如，DO值小于等于1）
                     if db_variable_name == 'DO':
-                        rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
+                        # rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
+                        bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
+                        rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
 
-                    # 统计法：使用IQR方法移除统计上的离群点
-                    if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
-                        Q1 = rows_to_plot[db_variable_name].quantile(0.25)
-                        Q3 = rows_to_plot[db_variable_name].quantile(0.75)
-                        IQR = Q3 - Q1
-                        lower_bound = Q1 - 1.5 * IQR
-                        upper_bound = Q3 + 1.5 * IQR
-                        rows_to_plot = rows_to_plot[
-                            (rows_to_plot[db_variable_name] >= lower_bound) &
-                            (rows_to_plot[db_variable_name] <= upper_bound)
-                        ]
+                    # # 统计法：使用IQR方法移除统计上的离群点
+                    # if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
+                    #     Q1 = rows_to_plot[db_variable_name].quantile(0.25)
+                    #     Q3 = rows_to_plot[db_variable_name].quantile(0.75)
+                    #     IQR = Q3 - Q1
+                    #     lower_bound = Q1 - 1.5 * IQR
+                    #     upper_bound = Q3 + 1.5 * IQR
+                    #     rows_to_plot = rows_to_plot[
+                    #         (rows_to_plot[db_variable_name] >= lower_bound) &
+                    #         (rows_to_plot[db_variable_name] <= upper_bound)
+                    #     ]
                 
                 if rows_to_plot.empty: # 移除异常值后可能为空，需跳过
                     continue
@@ -1293,21 +1305,30 @@ def plot_vertical_monthly(DS: list, no: int, month_required: list = None, show_f
 
             # 根据选项移除剖面中的异常值
             if remove_outliers:
+                # 质量控制过滤：仅保留 Argo QC 等级为 {1,2,5,8} 的观测（1=Good, 2=Probably good, 5=Changed, 8=Estimated），兼容字符串/整数标记
+                qc_column_name = f"{db_variable_name}_Flag"
+                if qc_column_name in rows_to_plot.columns:
+                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                    # rows_to_plot = rows_to_plot[rows_to_plot[qc_column_name].isin(good_qc_flags)]
+                    bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
+                    rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
                 # 规则法：移除特定变量的已知错误值（例如，DO值小于等于1）
                 if db_variable_name == 'DO':
-                    rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
+                    # rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
+                    bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
+                    rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
                 
-                # 统计法：使用IQR方法移除统计上的离群点
-                if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
-                    Q1 = rows_to_plot[db_variable_name].quantile(0.25)
-                    Q3 = rows_to_plot[db_variable_name].quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - 1.5 * IQR
-                    upper_bound = Q3 + 1.5 * IQR
-                    rows_to_plot = rows_to_plot[
-                        (rows_to_plot[db_variable_name] >= lower_bound) &
-                        (rows_to_plot[db_variable_name] <= upper_bound)
-                    ]
+                # # 统计法：使用IQR方法移除统计上的离群点
+                # if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
+                #     Q1 = rows_to_plot[db_variable_name].quantile(0.25)
+                #     Q3 = rows_to_plot[db_variable_name].quantile(0.75)
+                #     IQR = Q3 - Q1
+                #     lower_bound = Q1 - 1.5 * IQR
+                #     upper_bound = Q3 + 1.5 * IQR
+                #     rows_to_plot = rows_to_plot[
+                #         (rows_to_plot[db_variable_name] >= lower_bound) &
+                #         (rows_to_plot[db_variable_name] <= upper_bound)
+                #     ]
 
             if rows_to_plot.empty: # 移除异常值后可能为空，需跳过
                 continue
