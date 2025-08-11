@@ -841,25 +841,51 @@ def convert_date(days_since_1950: pd.Series) -> pd.Series:
     # 将基准日期与Timedelta Series相加，这是Pandas完全支持的操作
     return t0 + time_deltas
 
-def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', variables: list = ['DO', 'Temp', 'Salinity'], show_colorbar: bool = False, remove_outliers: bool = True):
+def plot_vertical(
+    DS: list,
+    no: int,
+    show_fig: bool = False,
+    save_fig: bool = False,
+    color_mode: str = 'distance',
+    variables: list = ['DO', 'Temp', 'Salinity'],
+    show_colorbar: bool = False,
+    remove_outliers: bool = True,
+    aggregated: bool = False,
+    argo_required: list | None = None,
+    year_required: list | None = None,
+    month_required: list | None = None,
+    day_required: list | None = None
+):
     '''
-    根据涡旋轨迹和浮标数据，为每个浮标平台绘制多个变量的垂直剖面图。
+    根据涡旋轨迹与匹配到的 Argo 剖面，绘制变量-深度的垂直剖面。
 
     参数:
         DS (list): 涡旋轨迹数据集。
         no (int): 涡旋编号。
-        show_fig (bool): 是否显示图片，默认False。
-        save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
-        variables (list): 需要绘制的变量名称列表，默认为['DO', 'Temp', 'Salinity']。
-        show_colorbar (bool): 是否显示颜色条，默认False。
-        remove_outliers (bool): 是否移除异常值，默认为True。采用规则法+IQR统计法。
+        show_fig (bool): 是否显示图片，默认 False。
+        save_fig (bool): 是否保存图片，默认 False。
+        color_mode (str): 颜色模式，'distance' 或 'time'，默认 'distance'。
+        variables (list): 需要绘制的变量名称，默认 ['DO', 'Temp', 'Salinity']。
+        show_colorbar (bool): 是否显示颜色条，默认 False。
+        remove_outliers (bool): 是否执行 QC 过滤与规则法去极值，默认 True。
+        aggregated (bool): 是否进行跨平台聚合绘制，默认 False。
+        argo_required (list | None): 平台过滤；None 表示不过滤；传入平台编号列表时仅保留指定平台。
+        year_required (list | None): 年份过滤；None 表示不过滤；传入年份列表时仅保留指定年份。
+        month_required (list | None): 月份过滤；聚合模式 None 表示使用所有可用月份；逐平台模式 None 表示不过滤。
+        day_required (list | None): 日期过滤（按日1-31）；None 表示不过滤；传入日期列表时仅保留指定日期。
 
     功能:
-        对每个浮标平台，为variables列表中的每个变量创建一个子图。
-        在每个子图中，按Profile_number分组，绘制变量随深度变化的曲线。
-        曲线颜色可根据浮标与涡旋中心的相对距离或采样时间（剖面号顺序）变化。
-        支持图片保存与显示，可选择显示颜色条。
+        - 为 variables 中的每个变量创建一个子图，按剖面绘制变量随深度变化的曲线。
+        - 曲线颜色可根据与涡旋中心的相对距离（distance）或采样时间（time）变化。
+        - 可选显示颜色条；支持图片保存与显示。
+        - remove_outliers=True 时执行基础质量控制（QC 仅保留 {1,2,5,8}；DO<=1 置为 NaN）。
+        - 可用 month_required 和 argo_required 对数据进行月份与平台筛选。
+
+    模式差异:
+        - aggregated=False（逐平台）：
+            • 为每个浮标平台单独出图；每图包含 variables 中各变量的一个子图。
+        - aggregated=True（聚合）：
+            • 所有平台剖面在同一张图上聚合绘制（每个变量一个子图）。
     '''
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
@@ -872,177 +898,392 @@ def plot_vertical(DS: list, no: int, show_fig: bool = False, save_fig: bool = Fa
         raise ValueError("UNKNOWN VARIABLE: Could not automatically determine the dataset name.")
 
     if argo_data_filtered.empty:
-        print(f"No Argo data found for eddy {ds_names}{no} to plot vertical profiles.")
+        msg = "plot vertical profiles." if not aggregated else "to plot aggregated vertical profiles."
+        print(f"No Argo data found for eddy {ds_names}{no} {msg}")
         return
 
-    # 为每个平台生成一张图
-    for platform_id_val, platform_data in argo_data_filtered.groupby("Platform_number"):
-        profile_num_agg = platform_data['Profile_number'].agg(['min', 'max'])
-        min_profile_num = profile_num_agg['min']
-        max_profile_num = profile_num_agg['max']
+    # 统一的月份和平台过滤（在两种模式下共享）
+    # 先处理平台过滤（argo_required）
+    if argo_required is not None:
+        try:
+            argo_required_set = set(int(x) for x in argo_required)
+        except Exception:
+            argo_required_set = set(argo_required)
+        before_cnt = len(argo_data_filtered)
+        argo_data_filtered = argo_data_filtered[argo_data_filtered['Platform_number'].isin(argo_required_set)]
+        if argo_data_filtered.empty:
+            print(f"No Argo data left after filtering by platforms {sorted(list(argo_required_set))}.")
+            return
 
-        num_variables = len(variables)
-        fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
-        if num_variables == 1:
-            axes = [axes]
-        
-        cmap = plt.cm.coolwarm
-        profile_dates_for_title = []
+    # 处理年月日过滤（year/month/day）
+    # 注意：aggregated=True 时，按原逻辑在未提供月份时默认使用所有可用月份；
+    #       aggregated=False 时，仅在提供了 month_required 时进行过滤。
+    #       year_required/day_required 在两种模式下仅当提供时进行过滤。
+    
+    # Year
+    argo_data_filtered['Year'] = pd.to_numeric(argo_data_filtered['Year'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Year'], inplace=True)
+    argo_data_filtered['Year'] = argo_data_filtered['Year'].astype(int)
 
-        # 遍历每个变量，在对应的子图上绘图
-        for i, var_name in enumerate(variables):
-            ax = axes[i]
-            original_variable_name = var_name
-            db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
-            
-            if db_variable_name not in platform_data.columns:
-                ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.", 
-                        ha='center', va='center', transform=ax.transAxes, fontsize=16)
-                ax.set_title(f"Variable: {original_variable_name}", fontsize=20)
+    # Month
+    argo_data_filtered['Month'] = pd.to_numeric(argo_data_filtered['Month'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Month'], inplace=True)
+    argo_data_filtered['Month'] = argo_data_filtered['Month'].astype(int)
+
+    # Day
+    argo_data_filtered['Day'] = pd.to_numeric(argo_data_filtered['Day'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Day'], inplace=True)
+    argo_data_filtered['Day'] = argo_data_filtered['Day'].astype(int)
+
+    if aggregated:
+        # 若未指定月份，采用所有可用月份（保持原 plot_vertical_monthly 行为）
+        if not month_required:
+            all_available_months = sorted(argo_data_filtered['Month'].unique().tolist())
+            if not all_available_months:
+                print(f"No valid months found in data for eddy {ds_names}{no}.")
+                return
+            print(f"No months specified. Defaulting to all available months: {all_available_months}")
+            month_required = all_available_months
+        # 根据年月日过滤
+        if month_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
+        if year_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Year'].isin(year_required)].copy()
+        if day_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Day'].isin(day_required)].copy()
+        if argo_data_filtered.empty:
+            print(f"No data found for eddy {ds_names}{no} after applying filters: year={year_required}, month={month_required}, day={day_required}.")
+            return
+    else:
+        # 非聚合模式：仅当提供了对应过滤条件才过滤
+        if year_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Year'].isin(year_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in years {year_required} (per-platform mode).")
+                return
+        if month_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in months {month_required} (per-platform mode).")
+                return
+        if day_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Day'].isin(day_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in days {day_required} (per-platform mode).")
+                return
+
+    # =========================
+    # 分支一：非聚合（原 plot_vertical 行为，新增月份/平台筛选）
+    # =========================
+    if not aggregated:
+        for platform_id_val, platform_data in argo_data_filtered.groupby("Platform_number"):
+            profile_num_agg = platform_data['Profile_number'].agg(['min', 'max'])
+            min_profile_num = profile_num_agg['min']
+            max_profile_num = profile_num_agg['max']
+
+            num_variables = len(variables)
+            fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
+            if num_variables == 1:
+                axes = [axes]
+
+            cmap = plt.cm.coolwarm
+            profile_dates_for_title = []
+
+            for i, var_name in enumerate(variables):
+                ax = axes[i]
+                original_variable_name = var_name
+                db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
+
+                if db_variable_name not in platform_data.columns:
+                    ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
+                            ha='center', va='center', transform=ax.transAxes, fontsize=16)
+                    ax.set_title(f"Variable: {original_variable_name}", fontsize=20)
+                    continue
+
+                for profile_num, rows in platform_data.groupby("Profile_number"):
+                    if rows.empty:
+                        continue
+
+                    rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
+                    if rows_to_plot.empty:
+                        continue
+
+                    if remove_outliers:
+                        qc_column_name = f"{db_variable_name}_Flag"
+                        if qc_column_name in rows_to_plot.columns:
+                            good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                            bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
+                            rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
+                        if db_variable_name == 'DO':
+                            bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
+                            rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
+
+                    if rows_to_plot.empty:
+                        continue
+
+                    try:
+                        current_profile_date = pd.Timestamp(year=int(rows.iloc[0]['Year']),
+                                                            month=int(rows.iloc[0]['Month']),
+                                                            day=int(rows.iloc[0]['Day']))
+                        if i == 0:
+                            profile_dates_for_title.append(current_profile_date)
+                    except (ValueError, TypeError):
+                        continue
+
+                    color_value_normalized = 0.5
+
+                    if color_mode == 'distance':
+                        if 'Longitude' in rows.iloc[0] and 'Latitude' in rows.iloc[0] and wanted_track:
+                            track_dates_converted = convert_date([t[1] for t in wanted_track])
+                            idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_profile_date.date()]
+                            if idx_track_list:
+                                idx_track = idx_track_list[0]
+                                center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
+                                if radius > 1e-6:
+                                    rel_x = (rows.iloc[0]['Longitude'] - center_lon) / (radius / 111320.0)
+                                    rel_y = (rows.iloc[0]['Latitude'] - center_lat) / (radius / 111320.0)
+                                    distance = np.sqrt(rel_x**2 + rel_y**2)
+                                    color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
+                    elif color_mode == 'time':
+                        if max_profile_num > min_profile_num:
+                            color_value_normalized = (profile_num - min_profile_num) / (max_profile_num - min_profile_num)
+                        else:
+                            color_value_normalized = 0.0
+
+                    color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
+                    ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
+
+                # 子图属性
+                ax.set_ylim(-50, 2050)
+                if db_variable_name == 'DO':
+                    ax.set_xlim(10, 350)
+                elif db_variable_name == 'Temperature':
+                    ax.set_xlim(1, 32)
+                elif db_variable_name == 'Salinity':
+                    ax.set_xlim(32.5, 35.5)
+
+                ax.set_xlabel(original_variable_name, fontsize=20)
+                ax.tick_params(axis='x', labelsize=16)
+                ax.grid(True)
+
+                if show_colorbar:
+                    norm_for_cbar = Normalize(vmin=0, vmax=1)
+                    scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
+                    scalar_mappable.set_array([])
+                    cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+                    if color_mode == 'distance':
+                        current_ticks = cbar.get_ticks()
+                        new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
+                        cbar.set_ticks(current_ticks)
+                        cbar.set_ticklabels(new_tick_labels)
+                        cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
+                    elif color_mode == 'time':
+                        cbar.set_label(f'Normalized Profile Sequence (Range: {min_profile_num} to {max_profile_num})', fontsize=14)
+
+            # 整体属性
+            if not profile_dates_for_title:
+                plt.close(fig)
                 continue
 
-            # 遍历该平台的每个剖面
-            for profile_num, rows in platform_data.groupby("Profile_number"):
-                if rows.empty:
-                    continue
-                
-                rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
-                if rows_to_plot.empty:
-                    continue
+            date_start_platform = min(profile_dates_for_title)
+            date_end_platform = max(profile_dates_for_title)
 
-                # 根据选项移除剖面中的异常值
-                if remove_outliers:
-                    # 质量控制过滤：仅保留 Argo QC 等级为 {1,2,5,8} 的观测（1=Good, 2=Probably good, 5=Changed, 8=Estimated），兼容字符串/整数标记
-                    qc_column_name = f"{db_variable_name}_Flag"
-                    if qc_column_name in rows_to_plot.columns:
-                        good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                        # rows_to_plot = rows_to_plot[rows_to_plot[qc_column_name].isin(good_qc_flags)]
-                        bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
-                        rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
-                    # 规则法：移除特定变量的已知错误值（例如，DO值小于等于1）
-                    if db_variable_name == 'DO':
-                        # rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
-                        bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
-                        rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
+            axes[0].set_ylabel("Depth/m", fontsize=20)
+            axes[0].tick_params(axis='y', labelsize=16)
+            axes[0].invert_yaxis()
 
-                    # # 统计法：使用IQR方法移除统计上的离群点
-                    # if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
-                    #     Q1 = rows_to_plot[db_variable_name].quantile(0.25)
-                    #     Q3 = rows_to_plot[db_variable_name].quantile(0.75)
-                    #     IQR = Q3 - Q1
-                    #     lower_bound = Q1 - 1.5 * IQR
-                    #     upper_bound = Q3 + 1.5 * IQR
-                    #     rows_to_plot = rows_to_plot[
-                    #         (rows_to_plot[db_variable_name] >= lower_bound) &
-                    #         (rows_to_plot[db_variable_name] <= upper_bound)
-                    #     ]
-                
-                if rows_to_plot.empty: # 移除异常值后可能为空，需跳过
-                    continue
+            fig.suptitle(f"{ds_names}{no}, Platform: {int(platform_id_val)}, {date_start_platform.date()}~{date_end_platform.date()}", fontsize=24, y=0.95)
+            plt.tight_layout(rect=[0, 0, 1, 0.93])
 
-                try:
-                    current_profile_date = pd.Timestamp(year=int(rows.iloc[0]['Year']),
-                                                        month=int(rows.iloc[0]['Month']),
-                                                        day=int(rows.iloc[0]['Day']))
-                    if i == 0: # 只在处理第一个变量时收集日期，避免重复
-                        profile_dates_for_title.append(current_profile_date)
-                except (ValueError, TypeError):
-                    continue
+            if save_fig:
+                output_dir = "plot_vertical_profiles"
+                os.makedirs(output_dir, exist_ok=True)
+                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_Platform_{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
 
-                color_value_normalized = 0.5
-
-                if color_mode == 'distance':
-                    if 'Longitude' in rows.iloc[0] and 'Latitude' in rows.iloc[0] and wanted_track:
-                        track_dates_converted = convert_date([t[1] for t in wanted_track])
-                        idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_profile_date.date()]
-                        
-                        if idx_track_list:
-                            idx_track = idx_track_list[0]
-                            center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
-                            
-                            if radius > 1e-6:
-                                rel_x = (rows.iloc[0]['Longitude'] - center_lon) / (radius / 111320.0)
-                                rel_y = (rows.iloc[0]['Latitude'] - center_lat) / (radius / 111320.0)
-                                distance = np.sqrt(rel_x**2 + rel_y**2)
-                                color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
-                
-                elif color_mode == 'time':
-                    if max_profile_num > min_profile_num:
-                        color_value_normalized = (profile_num - min_profile_num) / (max_profile_num - min_profile_num)
-                    else:
-                        color_value_normalized = 0.0
-                
-                color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-                ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
-
-            # --- 设置每个子图的属性 ---
-            ax.set_ylim(-50, 2050)
-            if db_variable_name == 'DO':
-                ax.set_xlim(10, 350)
-            elif db_variable_name == 'Temperature':
-                ax.set_xlim(1, 32)
-            elif db_variable_name == 'Salinity':
-                ax.set_xlim(32.5, 35.5)
-            
-            ax.set_xlabel(original_variable_name, fontsize=20)
-            ax.tick_params(axis='x', labelsize=16)
-            ax.grid(True)
-            
-            if show_colorbar:
-                norm_for_cbar = Normalize(vmin=0, vmax=1)
-                scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
-                scalar_mappable.set_array([])
-                cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-                
-                if color_mode == 'distance':
-                    current_ticks = cbar.get_ticks()
-                    new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
-                    cbar.set_ticks(current_ticks)
-                    cbar.set_ticklabels(new_tick_labels)
-                    cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
-                elif color_mode == 'time':
-                    cbar.set_label(f'Normalized Profile Sequence (Range: {min_profile_num} to {max_profile_num})', fontsize=14)
-        
-        # --- 设置整个图表的共享属性 ---
-        if not profile_dates_for_title:
+            if show_fig:
+                plt.show()
             plt.close(fig)
+        return
+
+    # =========================
+    # 分支二：聚合（等价于原 plot_vertical_monthly）
+    # =========================
+    # 收集各剖面的基本信息
+    profiles_to_plot = []
+    try:
+        argo_data_filtered['date_ts'] = pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])
+    except (ValueError, TypeError) as e:
+        print(f"Could not create timestamps for all rows due to invalid date components: {e}.")
+        argo_data_filtered = argo_data_filtered.dropna(subset=['Year', 'Month', 'Day'])
+        argo_data_filtered['date_ts'] = pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])
+
+    for _, profile_rows in argo_data_filtered.groupby(['Platform_number', 'Profile_number']):
+        if not profile_rows.empty:
+            profiles_to_plot.append({
+                'rows': profile_rows,
+                'date': profile_rows.iloc[0]['date_ts'],
+                'lon': profile_rows.iloc[0]['Longitude'],
+                'lat': profile_rows.iloc[0]['Latitude']
+            })
+
+    if not profiles_to_plot:
+        print(f"No data found for eddy {ds_names}{no} in months {month_required}.")
+        return
+
+    all_dates = [p['date'] for p in profiles_to_plot]
+    min_time_for_norm, max_time_for_norm = (min(all_dates), max(all_dates)) if all_dates else (None, None)
+
+    num_variables = len(variables)
+    fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
+    if num_variables == 1:
+        axes = [axes]
+
+    cmap = plt.cm.coolwarm
+
+    for i, var_name in enumerate(variables):
+        ax = axes[i]
+        original_variable_name = var_name
+        db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
+
+        if db_variable_name not in argo_data_filtered.columns:
+            ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=16)
+            ax.set_xlabel(original_variable_name, fontsize=20)
+            ax.grid(True)
             continue
-            
-        date_start_platform = min(profile_dates_for_title)
-        date_end_platform = max(profile_dates_for_title)
 
-        axes[0].set_ylabel("Depth/m", fontsize=20)
-        axes[0].tick_params(axis='y', labelsize=16)
-        axes[0].invert_yaxis()
+        for profile_info in profiles_to_plot:
+            rows = profile_info['rows']
+            rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
+            if rows_to_plot.empty:
+                continue
 
-        fig.suptitle(f"{ds_names}{no}, Platform: {int(platform_id_val)}, {date_start_platform.date()}~{date_end_platform.date()}", fontsize=24, y=0.95)
-        plt.tight_layout(rect=[0, 0, 1, 0.93])
+            if remove_outliers:
+                qc_column_name = f"{db_variable_name}_Flag"
+                if qc_column_name in rows_to_plot.columns:
+                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                    bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
+                    rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
+                if db_variable_name == 'DO':
+                    bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
+                    rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
 
-        if save_fig:
-            output_dir = "plot_vertical_profiles"
-            os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_Platform_{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
+            if rows_to_plot.empty:
+                continue
 
-        if show_fig:
-            plt.show()
-        plt.close(fig)
+            current_date = profile_info['date']
+            color_value_normalized = 0.5
+
+            if color_mode == 'distance':
+                if wanted_track and 'lon' in profile_info and 'lat' in profile_info:
+                    track_dates_converted = convert_date([t[1] for t in wanted_track])
+                    idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
+                    if idx_track_list:
+                        idx_track = idx_track_list[0]
+                        center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
+                        if radius > 1e-6:
+                            rel_x = (profile_info['lon'] - center_lon) / (radius / 111320.0)
+                            rel_y = (profile_info['lat'] - center_lat) / (radius / 111320.0)
+                            distance = np.sqrt(rel_x**2 + rel_y**2)
+                            color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
+            elif color_mode == 'time':
+                if min_time_for_norm and max_time_for_norm and max_time_for_norm > min_time_for_norm:
+                    total_delta = (max_time_for_norm - min_time_for_norm).total_seconds()
+                    current_delta = (current_date - min_time_for_norm).total_seconds()
+                    color_value_normalized = current_delta / total_delta if total_delta > 0 else 0.0
+                else:
+                    color_value_normalized = 0.0
+
+            color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
+            ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
+
+        # 子图属性
+        ax.set_ylim(-50, 2050)
+        if db_variable_name == 'DO':
+            ax.set_xlim(10, 350)
+        elif db_variable_name == 'Temperature':
+            ax.set_xlim(1, 32)
+        elif db_variable_name == 'Salinity':
+            ax.set_xlim(32.5, 35.5)
+
+        ax.set_xlabel(original_variable_name, fontsize=20)
+        ax.tick_params(axis='x', labelsize=16)
+        ax.grid(True)
+
+        if show_colorbar:
+            norm = Normalize(vmin=0, vmax=1)
+            sm = ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+            if color_mode == 'distance':
+                cbar.set_ticks([0, 0.5, 1])
+                cbar.set_ticklabels(['1.0', '0.5', '0.0'])
+                cbar.set_label('Normalized Distance (0=center, 1=edge)', fontsize=14)
+            elif color_mode == 'time' and min_time_for_norm and max_time_for_norm:
+                cbar.set_label(f'Normalized Time\n({min_time_for_norm.strftime("%Y-%m-%d")} to {max_time_for_norm.strftime("%Y-%m-%d")})', fontsize=12)
+
+    # 整体属性
+    axes[0].set_ylabel("Depth/m", fontsize=20)
+    axes[0].tick_params(axis='y', labelsize=16)
+    axes[0].invert_yaxis()
+
+    month_str = "All" if month_required and len(month_required) > 6 else (", ".join(map(str, month_required)) if month_required else "All")
+    date_range_str = f"{min_time_for_norm.date()}~{max_time_for_norm.date()}" if all_dates else "No date range"
+    fig.suptitle(f"{ds_names}{no}, Months: {month_str}, Data: {date_range_str}", fontsize=24, y=0.95)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+    if save_fig:
+        output_dir = "plot_vertical_monthly_aggregated"
+        os.makedirs(output_dir, exist_ok=True)
+        month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
+        filename = f"{ds_names}{no}_months_{month_suffix}_aggregated.png"
+        plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {os.path.join(output_dir, filename)}")
+
+    if show_fig:
+        plt.show()
+    plt.close(fig)
         
-def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', show_colorbar: bool = False):
+def plot_relative_position(
+    DS: list,
+    no: int,
+    show_fig: bool = False,
+    save_fig: bool = False,
+    color_mode: str = 'distance',
+    show_colorbar: bool = False,
+    aggregated: bool = False,
+    argo_required: list | None = None,
+    year_required: list | None = None,
+    month_required: list | None = None,
+    day_required: list | None = None
+):
     '''
     根据涡旋轨迹和浮标数据，绘制浮标在单位圆涡旋中的相对位置分布图。
 
     参数:
         DS (list): 涡旋轨迹数据集。
         no (int): 涡旋编号。
-        show_fig (bool): 是否显示图片，默认False。
-        save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按剖面号顺序着色）。
-        show_colorbar (bool): 是否显示颜色条，默认False。
+        show_fig (bool): 是否显示图片，默认 False。
+        save_fig (bool): 是否保存图片，默认 False。
+        color_mode (str): 'distance' 或 'time'，默认 'distance'。
+        show_colorbar (bool): 是否显示颜色条，默认 False。
+        aggregated (bool): 是否聚合所有平台于一图，默认 False。
+        argo_required (list | None): 平台筛选；None 表示不过滤；传入平台编号列表时仅保留指定平台。
+        year_required (list | None): 年份筛选；None 表示不过滤。
+        month_required (list | None): 月份筛选；聚合模式 None 表示使用所有可用月份；逐平台模式 None 表示不过滤。
+        day_required (list | None): 日期筛选（按日1-31）；None 表示不过滤。
 
-    功能:
-        对每个浮标平台，绘制其各剖面代表点相对于涡旋中心的归一化位置。
-        点旁数字表示平台内剖面时序。坐标轴刻度显示真实地理坐标和相对坐标。
-        观测点颜色可变。支持图片保存与显示，可选择显示颜色条。
+        功能:
+        - 计算剖面代表点在单位圆涡旋中的相对位置，并以散点标注（中心×，单位圆圈）。
+        - 颜色模式: 'distance'（距离中心归一化，0=中心，1=边缘）或 'time'（按时间顺序归一化）。
+        - 横纵轴刻度包含真实经纬度与相对坐标。可选显示颜色条；支持图片保存与显示。
+        - 支持按照月份（month_required）与平台编号（argo_required）进行筛选。
+
+    模式差异:
+        - aggregated=False（逐平台）：
+            • 对每个浮标平台分别出图，点内数字代表该平台内部的剖面时序，从1开始递增。
+        - aggregated=True（聚合）：
+            • 所有平台的代表点聚合到同一张图，点内数字代表相对于所选月份范围起始日的累积天数。例如，若数据从7月29日开始，则该日所有剖面的数字为29，7月30日为30，8月1日则为32。
     '''
     wanted_track = find_track(DS, no)
     argo_data_filtered = filtered_float_data(DS, no)
@@ -1058,450 +1299,253 @@ def plot_relative_position(DS: list, no: int, show_fig: bool = False, save_fig: 
         print(f"No Argo data found for eddy {ds_names}{no} to plot relative positions.")
         return
 
-    for platform_id_val, platform_data in argo_data_filtered.groupby("Platform_number"):
+    # 平台筛选（与 plot_vertical 一致）
+    if argo_required is not None:
+        try:
+            argo_required_set = set(int(x) for x in argo_required)
+        except Exception:
+            argo_required_set = set(argo_required)
+        argo_data_filtered = argo_data_filtered[argo_data_filtered['Platform_number'].isin(argo_required_set)]
+        if argo_data_filtered.empty:
+            print(f"No Argo data left after filtering by platforms {sorted(list(argo_required_set))}.")
+            return
+
+    # 年月日筛选（与 plot_vertical 一致）
+    argo_data_filtered['Year'] = pd.to_numeric(argo_data_filtered['Year'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Year'], inplace=True)
+    argo_data_filtered['Year'] = argo_data_filtered['Year'].astype(int)
+
+    argo_data_filtered['Month'] = pd.to_numeric(argo_data_filtered['Month'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Month'], inplace=True)
+    argo_data_filtered['Month'] = argo_data_filtered['Month'].astype(int)
+
+    argo_data_filtered['Day'] = pd.to_numeric(argo_data_filtered['Day'], errors='coerce')
+    argo_data_filtered.dropna(subset=['Day'], inplace=True)
+    argo_data_filtered['Day'] = argo_data_filtered['Day'].astype(int)
+
+    if aggregated:
+        if not month_required:
+            all_months = sorted(argo_data_filtered['Month'].unique().tolist())
+            if not all_months:
+                print(f"No valid months found in data for eddy {ds_names}{no}.")
+                return
+            print(f"No months specified for relative position plot. Defaulting to all available months: {all_months}")
+            month_required = all_months
+        # 按提供的年/月/日过滤（月份在聚合模式下为必有列表）
+        if month_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
+        if year_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Year'].isin(year_required)].copy()
+        if day_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Day'].isin(day_required)].copy()
+        if argo_data_filtered.empty:
+            print(f"No data found for eddy {ds_names}{no} after applying filters: year={year_required}, month={month_required}, day={day_required}.")
+            return
+    else:
+        if year_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Year'].isin(year_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in years {year_required} (per-platform mode).")
+                return
+        if month_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in months {month_required} (per-platform mode).")
+                return
+        if day_required:
+            argo_data_filtered = argo_data_filtered[argo_data_filtered['Day'].isin(day_required)].copy()
+            if argo_data_filtered.empty:
+                print(f"No data found for eddy {ds_names}{no} in days {day_required} (per-platform mode).")
+                return
+
+    # =========================
+    # 分支一：逐平台模式（aggregated=False）
+    # =========================
+    if not aggregated:
+        for platform_id_val, platform_data in argo_data_filtered.groupby("Platform_number"):
         # 获取每个剖面的第一行数据作为代表点
         # 原文: needed_data = platform.groupby("Profile_number").apply(lambda group: group.iloc[0])
         #       needed_data.index.name = None
         # 使用 .first() 更简洁，并且可以直接用 Profile_number 作为索引或后续处理
-        profile_first_rows = platform_data.groupby("Profile_number").first().reset_index() # reset_index 使 Profile_number 成为列
+            profile_first_rows = platform_data.groupby("Profile_number").first().reset_index() # reset_index 使 Profile_number 成为列
 
-        if profile_first_rows.empty:
+            if profile_first_rows.empty:
             # print(f"No profile data for platform {platform_id_val}.")
-            continue
-
-        # 准备每个剖面点对应的涡旋轨迹数据
-        points_for_this_platform = []
-        track_info_for_this_platform = [] # 用于计算该平台下的平均涡旋参数
-        
-        track_dates_converted = convert_date([t[1] for t in wanted_track]) if wanted_track else []
-
-        for i, p_row in profile_first_rows.iterrows(): # i 将用作顺序编号
-            try:
-                current_date_profile = pd.Timestamp(year=int(p_row['Year']),
-                                                    month=int(p_row['Month']),
-                                                    day=int(p_row['Day']))
-            except (ValueError, TypeError):
-                # print(f"Skipping profile {p_row.get('Profile_number')} for platform {platform_id_val} due to invalid date.")
                 continue
 
-            center_lon, center_lat, radius = None, None, None
-            if wanted_track:
-                matches = [k for k, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date_profile.date()]
-                if matches:
-                    idx_track = matches[0]
-                    center_lon = wanted_track[idx_track][2]
-                    center_lat = wanted_track[idx_track][3]
-                    radius = wanted_track[idx_track][8]
-            
-            if center_lon is not None and radius is not None and radius > 1e-6:
-                 if 'Longitude' not in p_row or 'Latitude' not in p_row:
-                    # print(f"Skipping point on {current_date_profile.date()} due to missing Longitude/Latitude.")
+            # 准备每个剖面点对应的涡旋轨迹数据
+            points_for_this_platform = []
+            track_info_for_this_platform = [] # 用于计算该平台下的平均涡旋参数
+        
+            track_dates_converted = convert_date([t[1] for t in wanted_track]) if wanted_track else []
+
+            for i, p_row in profile_first_rows.iterrows(): # i 将用作顺序编号
+                try:
+                    current_date_profile = pd.Timestamp(year=int(p_row['Year']),
+                                                        month=int(p_row['Month']),
+                                                        day=int(p_row['Day']))
+                except (ValueError, TypeError):
+                    # print(f"Skipping profile {p_row.get('Profile_number')} for platform {platform_id_val} due to invalid date.")
                     continue
-                 rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
-                 rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
-                 points_for_this_platform.append({
-                     'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date_profile,
-                     'profile_num_original_idx': p_row['Profile_number'], # 用于 'time' mode
-                     'sequence_label': i + 1 # 平台内时序标签
-                 })
-                 track_info_for_this_platform.append([center_lon, center_lat, radius])
+
+                center_lon, center_lat, radius = None, None, None
+                if wanted_track:
+                    matches = [k for k, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date_profile.date()]
+                    if matches:
+                        idx_track = matches[0]
+                        center_lon = wanted_track[idx_track][2]
+                        center_lat = wanted_track[idx_track][3]
+                        radius = wanted_track[idx_track][8]
+            
+                if center_lon is not None and radius is not None and radius > 1e-6:
+                    if 'Longitude' not in p_row or 'Latitude' not in p_row:
+                        # print(f"Skipping point on {current_date_profile.date()} due to missing Longitude/Latitude.")
+                        continue
+                    rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
+                    rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
+                    points_for_this_platform.append({
+                        'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date_profile,
+                        'profile_num_original_idx': p_row['Profile_number'], # 用于 'time' mode
+                        'sequence_label': i + 1 # 平台内时序标签
+                    })
+                    track_info_for_this_platform.append([center_lon, center_lat, radius])
             # else: 涡旋数据不匹配或半径过小，则跳过该点
         
-        if not points_for_this_platform:
+            if not points_for_this_platform:
             # print(f"No valid points with track data for platform {platform_id_val}.")
-            continue
-
-        fig, ax = plt.subplots(figsize=(30, 20)) # 原为 (30,20) 但相对位置图常用正方形，可考虑 (20,20) 或 (15,15)
-        cmap = plt.cm.coolwarm
-
-        # 准备 'time' 模式颜色归一化 (基于 Profile_number)
-        min_prof_num_platform = min(p['profile_num_original_idx'] for p in points_for_this_platform)
-        max_prof_num_platform = max(p['profile_num_original_idx'] for p in points_for_this_platform)
-
-        for point_data in points_for_this_platform:
-            rel_x = point_data['rel_x']
-            rel_y = point_data['rel_y']
-            
-            color_value_normalized = 0.5
-            if color_mode == 'distance':
-                distance = np.sqrt(rel_x**2 + rel_y**2)
-                color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
-            elif color_mode == 'time':
-                if max_prof_num_platform > min_prof_num_platform:
-                    color_value_normalized = (point_data['profile_num_original_idx'] - min_prof_num_platform) / \
-                                             (max_prof_num_platform - min_prof_num_platform)
-                else:
-                    color_value_normalized = 0.0
-            
-            color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-            ax.scatter(rel_x, rel_y, color=color, s=300, zorder=5)
-            ax.text(rel_x, rel_y, str(point_data['sequence_label']), weight='bold', fontsize=9, color='black', ha='center', va='center', zorder=6)
-            
-        ax.plot(0, 0, marker='x', color='black', markersize=16, markeredgewidth=3, label='Eddy Center (Relative)', zorder=3)
-        circle = plt.Circle((0, 0), 1, color='gray', fill=False, linestyle='--', linewidth=2, label='Unit Eddy Boundary', zorder=2)
-        ax.add_patch(circle)
-        ax.set_aspect('equal')
-
-        # 标题和坐标轴标签
-        platform_dates = [p['date'] for p in points_for_this_platform]
-        date_start_platform = min(platform_dates)
-        date_end_platform = max(platform_dates)
-        ax.set_title(f"{ds_names}{no}, Platform: {int(platform_id_val)}, {date_start_platform.date()}~{date_end_platform.date()}, Points: {len(points_for_this_platform)}", fontsize=20)
-        ax.set_xlabel('Relative X (Eddy Radii)', fontsize=20)
-        ax.set_ylabel('Relative Y (Eddy Radii)', fontsize=20)
-        ax.tick_params(axis='both', which='major', labelsize=16) # 使用tick_params统一设置
-
-        # 设置坐标轴刻度 (与 plot_relative_position_monthly 一致)
-        if track_info_for_this_platform:
-            mean_center_lon = np.mean([info[0] for info in track_info_for_this_platform])
-            mean_center_lat = np.mean([info[1] for info in track_info_for_this_platform])
-            mean_radius = np.mean([info[2] for info in track_info_for_this_platform])
-
-            if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
-                mean_degrees = mean_radius / 111320.0
-                
-                tick_locs = [-1, -0.5, 0, 0.5, 1] # 使用更详细的刻度
-                
-                x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
-                ax.set_xticks(tick_locs)
-                ax.set_xticklabels(x_tick_labels)
-
-                y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
-                ax.set_yticks(tick_locs)
-                ax.set_yticklabels(y_tick_labels)
-        
-        ax.set_xlim([-1.25, 1.25])
-        ax.set_ylim([-1.25, 1.25])
-        # ax.legend(fontsize=14) # 原代码legend注释掉了，保持一致
-
-        # 添加颜色条
-        if show_colorbar:
-            norm_for_cbar = Normalize(vmin=0, vmax=1)
-            scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
-            scalar_mappable.set_array([])
-            cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-
-            if color_mode == 'distance':
-                current_ticks = cbar.get_ticks()
-                new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
-                cbar.set_ticks(current_ticks)
-                cbar.set_ticklabels(new_tick_labels)
-                cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
-            elif color_mode == 'time':
-                cbar.set_label(f'Normalized Profile Sequence (Platform Range: {min_prof_num_platform} to {max_prof_num_platform})', fontsize=14)
-        
-        if save_fig:
-            output_dir = "plot_relative_position"
-            os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(os.path.join(output_dir, f"{ds_names}{no}RP{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
-        
-        if show_fig:
-            plt.show()
-        plt.close(fig)
-
-def plot_vertical_monthly(DS: list, no: int, month_required: list = None, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', variables: list = ['DO', 'Temp', 'Salinity'], show_colorbar: bool = False, remove_outliers: bool = True):
-    '''
-    绘制指定涡旋在指定月份内所有浮标平台的多个变量的聚合垂直剖面图。
-
-    参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
-        month_required (list, optional): 需要绘制的月份列表。如果为None或空列表，则默认绘制数据中存在的所有月份。
-        show_fig (bool): 是否显示图片，默认False。
-        save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
-        variables (list): 变量名称列表，默认['DO', 'Temp', 'Salinity']。
-        show_colorbar (bool): 是否显示颜色条，默认False。
-        remove_outliers (bool): 是否移除异常值，默认为True。采用规则法+IQR统计法。
-
-    功能:
-        为'variables'中的每个变量创建一个子图。
-        将指定涡旋在指定月份内所有浮标平台的所有剖面数据绘制在对应的子图上。
-        曲线颜色可根据浮标与涡旋中心的相对距离或采样时间（全局归一化）变化。
-        支持图片保存与显示，并带有颜色条。
-    '''
-    wanted_track = find_track(DS, no)
-    argo_data_filtered = filtered_float_data(DS, no)
-
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE")
-
-    if argo_data_filtered.empty:
-        print(f"No Argo data found for eddy {ds_names}{no} to plot.")
-        return
-
-    argo_data_filtered['Month'] = pd.to_numeric(argo_data_filtered['Month'], errors='coerce')
-    argo_data_filtered.dropna(subset=['Month'], inplace=True)
-    argo_data_filtered['Month'] = argo_data_filtered['Month'].astype(int)
-
-    if not month_required:
-        all_available_months = sorted(argo_data_filtered['Month'].unique().tolist())
-        if not all_available_months:
-            print(f"No valid months found in data for eddy {ds_names}{no}.")
-            return
-        print(f"No months specified. Defaulting to all available months: {all_available_months}")
-        month_required = all_available_months
-
-    # 1. 预处理：收集所有符合月份要求的剖面数据
-    profiles_to_plot = []
-    monthly_filtered_data = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
-    
-    if not monthly_filtered_data.empty:
-        try:
-            monthly_filtered_data['date_ts'] = pd.to_datetime(monthly_filtered_data[['Year', 'Month', 'Day']])
-        except (ValueError, TypeError) as e:
-            print(f"Could not create timestamps for all rows due to invalid date components: {e}.")
-            monthly_filtered_data = monthly_filtered_data.dropna(subset=['Year', 'Month', 'Day'])
-            monthly_filtered_data['date_ts'] = pd.to_datetime(monthly_filtered_data[['Year', 'Month', 'Day']])
-
-        for _, profile_rows in monthly_filtered_data.groupby(['Platform_number', 'Profile_number']):
-            if not profile_rows.empty:
-                profiles_to_plot.append({
-                    'rows': profile_rows,
-                    'date': profile_rows.iloc[0]['date_ts'],
-                    'lon': profile_rows.iloc[0]['Longitude'],
-                    'lat': profile_rows.iloc[0]['Latitude']
-                })
-    
-    if not profiles_to_plot:
-        print(f"No data found for eddy {ds_names}{no} in months {month_required}.")
-        return
-    
-    # 2. 确定时间和日期范围
-    all_dates = [p['date'] for p in profiles_to_plot]
-    min_time_for_norm, max_time_for_norm = (min(all_dates), max(all_dates)) if all_dates else (None, None)
-    
-    # 3. 开始绘图
-    num_variables = len(variables)
-    fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
-    if num_variables == 1:
-        axes = [axes]
-        
-    cmap = plt.cm.coolwarm
-
-    # 遍历每个变量，在对应的子图上绘图
-    for i, var_name in enumerate(variables):
-        ax = axes[i]
-        original_variable_name = var_name
-        db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
-        
-        if db_variable_name not in argo_data_filtered.columns:
-            ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.", 
-                        ha='center', va='center', transform=ax.transAxes, fontsize=16)
-            ax.set_xlabel(original_variable_name, fontsize=20)
-            ax.grid(True)
-            continue
-
-        for profile_info in profiles_to_plot:
-            rows = profile_info['rows']
-            
-            rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
-            if rows_to_plot.empty:
                 continue
 
-            # 根据选项移除剖面中的异常值
-            if remove_outliers:
-                # 质量控制过滤：仅保留 Argo QC 等级为 {1,2,5,8} 的观测（1=Good, 2=Probably good, 5=Changed, 8=Estimated），兼容字符串/整数标记
-                qc_column_name = f"{db_variable_name}_Flag"
-                if qc_column_name in rows_to_plot.columns:
-                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                    # rows_to_plot = rows_to_plot[rows_to_plot[qc_column_name].isin(good_qc_flags)]
-                    bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
-                    rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
-                # 规则法：移除特定变量的已知错误值（例如，DO值小于等于1）
-                if db_variable_name == 'DO':
-                    # rows_to_plot = rows_to_plot[rows_to_plot[db_variable_name] > 1.0]
-                    bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
-                    rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
-                
-                # # 统计法：使用IQR方法移除统计上的离群点
-                # if len(rows_to_plot) > 4: # 计算IQR至少需要几个点
-                #     Q1 = rows_to_plot[db_variable_name].quantile(0.25)
-                #     Q3 = rows_to_plot[db_variable_name].quantile(0.75)
-                #     IQR = Q3 - Q1
-                #     lower_bound = Q1 - 1.5 * IQR
-                #     upper_bound = Q3 + 1.5 * IQR
-                #     rows_to_plot = rows_to_plot[
-                #         (rows_to_plot[db_variable_name] >= lower_bound) &
-                #         (rows_to_plot[db_variable_name] <= upper_bound)
-                #     ]
+            fig, ax = plt.subplots(figsize=(30, 20)) # 原为 (30,20) 但相对位置图常用正方形，可考虑 (20,20) 或 (15,15)
+            cmap = plt.cm.coolwarm
 
-            if rows_to_plot.empty: # 移除异常值后可能为空，需跳过
-                continue
+            # 准备 'time' 模式颜色归一化 (基于 Profile_number)
+            min_prof_num_platform = min(p['profile_num_original_idx'] for p in points_for_this_platform)
+            max_prof_num_platform = max(p['profile_num_original_idx'] for p in points_for_this_platform)
 
-            current_date = profile_info['date']
-            color_value_normalized = 0.5
-
-            if color_mode == 'distance':
-                if wanted_track and 'lon' in profile_info and 'lat' in profile_info:
-                    track_dates_converted = convert_date([t[1] for t in wanted_track])
-                    idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
-                    
-                    if idx_track_list:
-                        idx_track = idx_track_list[0]
-                        center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
-                        if radius > 1e-6:
-                            rel_x = (profile_info['lon'] - center_lon) / (radius / 111320.0)
-                            rel_y = (profile_info['lat'] - center_lat) / (radius / 111320.0)
-                            distance = np.sqrt(rel_x**2 + rel_y**2)
-                            color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
+            for point_data in points_for_this_platform:
+                rel_x = point_data['rel_x']
+                rel_y = point_data['rel_y']
             
-            elif color_mode == 'time':
-                if min_time_for_norm and max_time_for_norm and max_time_for_norm > min_time_for_norm:
-                    total_delta = (max_time_for_norm - min_time_for_norm).total_seconds()
-                    current_delta = (current_date - min_time_for_norm).total_seconds()
-                    color_value_normalized = current_delta / total_delta if total_delta > 0 else 0.0
-                else:
-                    color_value_normalized = 0.0
+                color_value_normalized = 0.5
+                if color_mode == 'distance':
+                    distance = np.sqrt(rel_x**2 + rel_y**2)
+                    color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
+                elif color_mode == 'time':
+                    if max_prof_num_platform > min_prof_num_platform:
+                        color_value_normalized = (point_data['profile_num_original_idx'] - min_prof_num_platform) / \
+                                                 (max_prof_num_platform - min_prof_num_platform)
+                    else:
+                        color_value_normalized = 0.0
+            
+                color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
+                ax.scatter(rel_x, rel_y, color=color, s=300, zorder=5)
+                ax.text(rel_x, rel_y, str(point_data['sequence_label']), weight='bold', fontsize=9, color='black', ha='center', va='center', zorder=6)
+            
+            ax.plot(0, 0, marker='x', color='black', markersize=16, markeredgewidth=3, label='Eddy Center (Relative)', zorder=3)
+            circle = plt.Circle((0, 0), 1, color='gray', fill=False, linestyle='--', linewidth=2, label='Unit Eddy Boundary', zorder=2)
+            ax.add_patch(circle)
+            ax.set_aspect('equal')
 
-            color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-            ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
+            # 标题和坐标轴标签
+            platform_dates = [p['date'] for p in points_for_this_platform]
+            date_start_platform = min(platform_dates)
+            date_end_platform = max(platform_dates)
+            ax.set_title(f"{ds_names}{no}, Platform: {int(platform_id_val)}, {date_start_platform.date()}~{date_end_platform.date()}, Points: {len(points_for_this_platform)}", fontsize=20)
+            ax.set_xlabel('Relative X (Eddy Radii)', fontsize=20)
+            ax.set_ylabel('Relative Y (Eddy Radii)', fontsize=20)
+            ax.tick_params(axis='both', which='major', labelsize=16) # 使用tick_params统一设置
 
-        # --- 设置每个子图的属性 ---
-        ax.set_ylim(-50, 2050)
-        if db_variable_name == 'DO':
-            ax.set_xlim(10, 350)
-        elif db_variable_name == 'Temperature':
-            ax.set_xlim(1, 32)
-        elif db_variable_name == 'Salinity':
-            ax.set_xlim(32.5, 35.5)
+            # 设置坐标轴刻度 (与聚合版一致)
+            if track_info_for_this_platform:
+                mean_center_lon = np.mean([info[0] for info in track_info_for_this_platform])
+                mean_center_lat = np.mean([info[1] for info in track_info_for_this_platform])
+                mean_radius = np.mean([info[2] for info in track_info_for_this_platform])
 
-        ax.set_xlabel(original_variable_name, fontsize=20)
-        ax.tick_params(axis='x', labelsize=16)
-        ax.grid(True)
+                if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
+                    mean_degrees = mean_radius / 111320.0
+                
+                    tick_locs = [-1, -0.5, 0, 0.5, 1] # 使用更详细的刻度
+                
+                    x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
+                    ax.set_xticks(tick_locs)
+                    ax.set_xticklabels(x_tick_labels)
+
+                    y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
+                    ax.set_yticks(tick_locs)
+                    ax.set_yticklabels(y_tick_labels)
         
-        if show_colorbar:
-            norm = Normalize(vmin=0, vmax=1)
-            sm = ScalarMappable(cmap=cmap, norm=norm)
-            sm.set_array([])
-            cbar = plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-            if color_mode == 'distance':
-                cbar.set_ticks([0, 0.5, 1])
-                cbar.set_ticklabels(['1.0', '0.5', '0.0'])
-                cbar.set_label('Normalized Distance (0=center, 1=edge)', fontsize=14)
-            elif color_mode == 'time' and min_time_for_norm and max_time_for_norm:
-                cbar.set_label(f'Normalized Time\n({min_time_for_norm.strftime("%Y-%m-%d")} to {max_time_for_norm.strftime("%Y-%m-%d")})', fontsize=12)
+            ax.set_xlim([-1.25, 1.25])
+            ax.set_ylim([-1.25, 1.25])
+            # ax.legend(fontsize=14) # 原代码legend注释掉了，保持一致
 
-    # --- 设置整个图表的共享属性 ---
-    axes[0].set_ylabel("Depth/m", fontsize=20)
-    axes[0].tick_params(axis='y', labelsize=16)
-    axes[0].invert_yaxis()
+            # 添加颜色条
+            if show_colorbar:
+                norm_for_cbar = Normalize(vmin=0, vmax=1)
+                scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
+                scalar_mappable.set_array([])
+                cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
 
-    month_str = "All" if len(month_required) > 6 else ", ".join(map(str, month_required))
-    date_range_str = f"{min_time_for_norm.date()}~{max_time_for_norm.date()}" if all_dates else "No date range"
-    fig.suptitle(f"{ds_names}{no}, Months: {month_str}, Data: {date_range_str}", fontsize=24, y=0.95)
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-
-    if save_fig:
-        output_dir = "plot_vertical_monthly_aggregated"
-        os.makedirs(output_dir, exist_ok=True)
-        month_suffix = "all" if len(month_required) > 6 else "_".join(map(str, month_required))
-        filename = f"{ds_names}{no}_months_{month_suffix}_aggregated.png"
-        plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {os.path.join(output_dir, filename)}")
-
-    if show_fig:
-        plt.show()
-    plt.close(fig)
-    
-def plot_relative_position_monthly(DS: list, no: int, show_fig: bool = False, save_fig: bool = False, color_mode: str = 'distance', show_colorbar: bool = False, month_required: list = None):
-    '''
-    根据涡旋轨迹和浮标数据，在指定月份绘制所有浮标在单位圆涡旋中的聚合相对位置分布图。
-
-    参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
-        show_fig (bool): 是否显示图片，默认False。
-        save_fig (bool): 是否保存图片，默认False。
-        color_mode (str): 颜色模式，默认'distance'（按距离着色），可选'time'（按时间着色）。
-        show_colorbar (bool): 是否显示颜色条，默认False。
-        month_required (list, optional): 需要绘制的月份列表。如果为None或空列表，则默认绘制数据中存在的所有月份。
-
-
-    功能:
-        对所有浮标平台，筛选指定月份内的剖面数据，计算每个剖面代表点相对于涡旋中心的归一化位置。
-        所有点绘制在同一张图上。点旁边的数字根据日期在所选月份范围内的连续天数编号。
-        观测点颜色可根据与涡旋中心的相对距离或全局采样时间变化。
-        绘制单位圆表示涡旋边界。坐标轴刻度反映总体平均的真实地理坐标。
-    '''
-    wanted_track = find_track(DS, no)
-    argo_data_filtered = filtered_float_data(DS, no)
-
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE")
-
-    if argo_data_filtered.empty:
-        print(f"No Argo data found for eddy {ds_names}{no} to plot.")
+                if color_mode == 'distance':
+                    current_ticks = cbar.get_ticks()
+                    new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
+                    cbar.set_ticks(current_ticks)
+                    cbar.set_ticklabels(new_tick_labels)
+                    cbar.set_label('Normalized Distance from Eddy Center (0=center, 1=edge)', fontsize=14)
+                elif color_mode == 'time':
+                    cbar.set_label(f'Normalized Profile Sequence (Platform Range: {min_prof_num_platform} to {max_prof_num_platform})', fontsize=14)
+        
+            if save_fig:
+                output_dir = "plot_relative_position"
+                os.makedirs(output_dir, exist_ok=True)
+                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}RP{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
+        
+            if show_fig:
+                plt.show()
+            plt.close(fig)
         return
 
-    # 确保'Month'列是干净的数值类型
-    argo_data_filtered['Month'] = pd.to_numeric(argo_data_filtered['Month'], errors='coerce')
-    argo_data_filtered.dropna(subset=['Month'], inplace=True)
-    argo_data_filtered['Month'] = argo_data_filtered['Month'].astype(int)
-
-    # --- 新增逻辑：如果未指定月份，则默认使用数据中存在的所有月份 ---
-    if not month_required:
-        all_available_months = sorted(argo_data_filtered['Month'].unique().tolist())
-        if not all_available_months:
-            print(f"No valid months found in data for eddy {ds_names}{no}.")
-            return
-        print(f"No months specified for relative position plot. Defaulting to all available months: {all_available_months}")
-        month_required = all_available_months
-    # --- 逻辑结束 ---
-
-    # 1. 预处理：收集所有符合月份要求的剖面数据点及其相关信息
-    points_to_process = [] # 存储 (日期, 剖面首行数据)
-    
-    # 根据最终确定的月份列表来过滤数据
-    monthly_filtered_data = argo_data_filtered[argo_data_filtered['Month'].isin(month_required)].copy()
+    # =========================
+    # 分支二：聚合模式（aggregated=True）
+    # =========================
+    # 1) 收集聚合绘图所需点
+    points_to_process = []  # {date, data_row}
+    monthly_filtered_data = argo_data_filtered.copy()
+    if month_required:
+        monthly_filtered_data = monthly_filtered_data[monthly_filtered_data['Month'].isin(month_required)].copy()
 
     if not monthly_filtered_data.empty:
         # 获取每个剖面的第一行数据作为代表点
         profile_first_rows = monthly_filtered_data.groupby(["Platform_number", "Profile_number"]).first().reset_index()
         for _, p_row in profile_first_rows.iterrows():
             try:
-                current_date_profile = pd.Timestamp(year=int(p_row['Year']),
-                                                    month=int(p_row['Month']),
-                                                    day=int(p_row['Day']))
-            except (ValueError, TypeError) as e:
-                # print(f"Skipping profile point due to invalid date: {e}")
+                current_date_profile = pd.Timestamp(year=int(p_row['Year']), month=int(p_row['Month']), day=int(p_row['Day']))
+            except (ValueError, TypeError):
                 continue
-            
-            # 再次确认月份在选择范围内（虽然前面已过滤，但作为保险）
-            if current_date_profile.month in month_required:
+            if not month_required or current_date_profile.month in month_required:
                 points_to_process.append({'date': current_date_profile, 'data_row': p_row})
-    
+
     if not points_to_process:
         print(f"No data found for eddy {ds_names}{no} in months {month_required}.")
         return
 
-    # 确定日期编号的参考起始日期
+    # 2) 计算日期标签的参考起点（按所选月份的最小月的一号）
     min_plot_date_overall = min(p['date'] for p in points_to_process)
-    reference_start_date_for_labels = pd.Timestamp(year=min_plot_date_overall.year, 
-                                                   month=min(month_required), 
-                                                   day=1)
+    ref_month = min(month_required) if month_required else min_plot_date_overall.month
+    reference_start_date_for_labels = pd.Timestamp(year=min_plot_date_overall.year, month=ref_month, day=1)
 
     points_to_plot = []
     all_track_info_for_overall_mean = []
     all_profile_dates_for_title = []
     all_profile_timestamps_for_time_mode = []
-    
+
     track_dates_converted = convert_date([t[1] for t in wanted_track]) if wanted_track else []
 
     for point_info in points_to_process:
         current_date = point_info['date']
         p_row = point_info['data_row']
-        
+
         day_label = (current_date - reference_start_date_for_labels).days + 1
-        
+
         center_lon, center_lat, radius = None, None, None
         if wanted_track:
             matches = [i for i, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
@@ -1517,11 +1561,8 @@ def plot_relative_position_monthly(DS: list, no: int, show_fig: bool = False, sa
 
             rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
             rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
-            
-            points_to_plot.append({
-                'rel_x': rel_x, 'rel_y': rel_y, 
-                'date': current_date, 'day_label': day_label
-            })
+
+            points_to_plot.append({'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date, 'day_label': day_label})
             all_track_info_for_overall_mean.append([center_lon, center_lat, radius])
             all_profile_dates_for_title.append(current_date)
             if color_mode == 'time':
@@ -1531,27 +1572,26 @@ def plot_relative_position_monthly(DS: list, no: int, show_fig: bool = False, sa
         print(f"No valid points with track data found for eddy {ds_names}{no} in months {month_required}.")
         return
 
-    # 2. 确定时间归一化的范围和标题日期范围
+    # 3) 确定时间归一化范围（仅用于 color_mode='time'）
     min_time_for_norm, max_time_for_norm = (None, None)
     if color_mode == 'time' and all_profile_timestamps_for_time_mode:
         min_time_for_norm = min(all_profile_timestamps_for_time_mode)
         max_time_for_norm = max(all_profile_timestamps_for_time_mode)
         if min_time_for_norm == max_time_for_norm and len(all_profile_timestamps_for_time_mode) > 1:
-             max_time_for_norm = min_time_for_norm + pd.Timedelta(days=1) 
+            max_time_for_norm = min_time_for_norm + pd.Timedelta(days=1)
 
-    date_start_overall = min(all_profile_dates_for_title)
-    date_end_overall = max(all_profile_dates_for_title)
+    date_start_overall = min(all_profile_dates_for_title) if all_profile_dates_for_title else None
+    date_end_overall = max(all_profile_dates_for_title) if all_profile_dates_for_title else None
 
-    # 3. 开始绘图
+    # 4) 绘图
     fig, ax = plt.subplots(figsize=(30, 20))
     cmap = plt.cm.coolwarm
 
     for point in points_to_plot:
         rel_x, rel_y = point['rel_x'], point['rel_y']
         current_date, day_label = point['date'], point['day_label']
-        
-        color_value_normalized = 0.5 
 
+        color_value_normalized = 0.5
         if color_mode == 'distance':
             distance_from_center = np.sqrt(rel_x**2 + rel_y**2)
             color_value_normalized = 1.0 - np.clip(distance_from_center, 0.0, 1.0)
@@ -1559,65 +1599,54 @@ def plot_relative_position_monthly(DS: list, no: int, show_fig: bool = False, sa
             if min_time_for_norm and max_time_for_norm and min_time_for_norm < max_time_for_norm:
                 total_delta = (max_time_for_norm - min_time_for_norm).total_seconds()
                 current_delta = (current_date - min_time_for_norm).total_seconds()
-                if total_delta > 0:
-                    color_value_normalized = current_delta / total_delta
-                else: 
-                    color_value_normalized = 0.0 
-            elif min_time_for_norm and max_time_for_norm and min_time_for_norm == max_time_for_norm :
-                 color_value_normalized = 0.0
-        
+                color_value_normalized = (current_delta / total_delta) if total_delta > 0 else 0.0
+            elif min_time_for_norm and max_time_for_norm and min_time_for_norm == max_time_for_norm:
+                color_value_normalized = 0.0
+
         color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-        
         ax.scatter(rel_x, rel_y, color=color, s=300, zorder=5)
         ax.text(rel_x, rel_y, str(day_label), weight='bold', fontsize=9, color='black', ha='center', va='center', zorder=6)
 
-    # 绘制涡旋中心点和单位圆
+    # 中心与单位圆
     ax.plot(0, 0, marker='x', color='black', markersize=16, markeredgewidth=3, label='Eddy Center (Relative)', zorder=3)
     circle = plt.Circle((0, 0), 1, color='gray', fill=False, linestyle='--', linewidth=2, label='Unit Eddy Boundary', zorder=2)
     ax.add_patch(circle)
     ax.set_aspect('equal')
 
-    # 4. 设置标题和坐标轴
-    # 改进标题的月份显示
-    month_str = "All" if len(month_required) > 6 else ", ".join(map(str, month_required))
+    # 标题与坐标轴
+    month_str = "All" if (month_required and len(month_required) > 6) else ", ".join(map(str, month_required)) if month_required else "All"
     title_str = f"{ds_names}{no}, Months: {month_str}, Relative Positions"
-    if all_profile_dates_for_title:
+    if date_start_overall and date_end_overall:
         title_str += f"\nData: {date_start_overall.date()}~{date_end_overall.date()}, Total Points: {len(points_to_plot)}"
     ax.set_title(title_str, fontsize=20)
-    
     ax.set_xlabel('Relative X (Eddy Radii)', fontsize=20)
     ax.set_ylabel('Relative Y (Eddy Radii)', fontsize=20)
-    plt.tick_params(axis='both', which='major', labelsize=16)
+    ax.tick_params(axis='both', which='major', labelsize=16)
 
-    # 设置坐标轴刻度以反映平均真实地理坐标
+    # 地理刻度（均值）
     if all_track_info_for_overall_mean:
         mean_center_lon = np.mean([info[0] for info in all_track_info_for_overall_mean])
         mean_center_lat = np.mean([info[1] for info in all_track_info_for_overall_mean])
         mean_radius = np.mean([info[2] for info in all_track_info_for_overall_mean])
-
         if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
             mean_degrees = mean_radius / 111320.0
-            
-            x_tick_locs = [-1, -0.5, 0, 0.5, 1]
-            x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_degrees):.2f}°\n({tick_loc})" for tick_loc in x_tick_locs]
-            ax.set_xticks(x_tick_locs)
+            tick_locs = [-1, -0.5, 0, 0.5, 1]
+            x_tick_labels = [f"{(mean_center_lon + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
+            y_tick_labels = [f"{(mean_center_lat + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
+            ax.set_xticks(tick_locs)
             ax.set_xticklabels(x_tick_labels)
-
-            y_tick_locs = [-1, -0.5, 0, 0.5, 1]
-            y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_degrees):.2f}°\n({tick_loc})" for tick_loc in y_tick_locs]
-            ax.set_yticks(y_tick_locs)
+            ax.set_yticks(tick_locs)
             ax.set_yticklabels(y_tick_labels)
-            
+
     ax.set_xlim([-1.25, 1.25])
     ax.set_ylim([-1.25, 1.25])
 
-    # 5. 添加颜色条
+    # 颜色条
     if show_colorbar:
         norm_for_cbar = Normalize(vmin=0, vmax=1)
         scalar_mappable = ScalarMappable(cmap=cmap, norm=norm_for_cbar)
         scalar_mappable.set_array([])
         cbar = plt.colorbar(scalar_mappable, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-
         if color_mode == 'distance':
             current_ticks = cbar.get_ticks()
             new_tick_labels = [f"{1.0 - t:.1f}" for t in current_ticks]
@@ -1630,20 +1659,72 @@ def plot_relative_position_monthly(DS: list, no: int, show_fig: bool = False, sa
             else:
                 cbar.set_label('Normalized Time', fontsize=14)
 
-    # 6. 保存和显示图片
+    # 保存/显示
     if save_fig:
         output_dir = "plot_relative_position_monthly_aggregated"
         os.makedirs(output_dir, exist_ok=True)
-        # 改进文件名的月份后缀
-        month_suffix = "all" if len(month_required) > 6 else "_".join(map(str, month_required))
+        month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
         base_filename = f"{ds_names}{no}_RP_months_{month_suffix}_aggregated.png"
         plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
 
     if show_fig:
         plt.show()
-    
     plt.close(fig)
+
+def plot_vertical_monthly(
+    DS: list,
+    no: int,
+    month_required: list = None,
+    show_fig: bool = False,
+    save_fig: bool = False,
+    color_mode: str = 'distance',
+    variables: list = ['DO', 'Temp', 'Salinity'],
+    show_colorbar: bool = False,
+    remove_outliers: bool = True,
+    argo_required: list | None = None
+):
+    '''
+    兼容封装：保持旧接口，内部调用统一的 plot_vertical。
+    '''
+    return plot_vertical(
+        DS=DS,
+        no=no,
+        show_fig=show_fig,
+        save_fig=save_fig,
+        color_mode=color_mode,
+        variables=variables,
+        show_colorbar=show_colorbar,
+        remove_outliers=remove_outliers,
+        aggregated=True,
+        month_required=month_required,
+        argo_required=argo_required
+    )
+    
+def plot_relative_position_monthly(
+    DS: list,
+    no: int,
+    show_fig: bool = False,
+    save_fig: bool = False,
+    color_mode: str = 'distance',
+    show_colorbar: bool = False,
+    month_required: list | None = None,
+    argo_required: list | None = None
+):
+    '''
+    兼容封装：保持旧接口，内部调用统一的 plot_relative_position（aggregated=True）。
+    '''
+    return plot_relative_position(
+        DS=DS,
+        no=no,
+        show_fig=show_fig,
+        save_fig=save_fig,
+        color_mode=color_mode,
+        show_colorbar=show_colorbar,
+        aggregated=True,
+        month_required=month_required,
+        argo_required=argo_required,
+    )
 
 def get_glorys_filepath(date)-> str:
     '''
