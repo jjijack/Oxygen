@@ -3668,3 +3668,229 @@ def plot_argo_hotspots(
 
     plt.close(fig)
     print("--- Hotspot analysis finished. ---")
+
+def calculate_delta_do(
+    data: pd.DataFrame,
+    depth_col: str = 'Depth',
+    do_col: str = 'DO',
+    salinity_col: str = 'Salinity',
+    temperature_col: str = 'Temperature',
+    depth_interval: float = 100.0,
+    do_threshold: float = 50.0,
+    salinity_threshold: float = 0.0,
+    temperature_threshold: float = 0.0,
+    depth_merge_tolerance: float = 10.0,
+    remove_outliers: bool = True,
+    verbose: bool = False
+) -> pd.DataFrame:
+    """
+    参考论文方法计算亚表层异常信号（以 DO 为主）。
+
+    步骤概述：
+    1. 按 Profile_number 分组，分别处理每个剖面；
+    2. 计算 DO 随深度的一阶导数，定位 DO 的正峰值（代表可能的表层富氧水体俯冲信号）；
+    3. 以 DO 峰深度为中心，取窗口 [p-Δp, p+Δp]，用两端点连线构造参考剖面；
+    4. 在峰值同一深度计算 ΔDO、ΔSalinity 与 ΔTemperature（原始值减参考线值）；
+    5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
+    6. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
+
+    参数：
+        data (pd.DataFrame): 包含多个剖面数据的表；需包含 Profile_number、深度、DO、盐度等列。
+        depth_col (str): 深度列名，默认 'Depth'。
+        do_col (str): 溶解氧列名，默认 'DO'。
+        salinity_col (str): 盐度列名，默认 'Salinity'。
+        temperature_col (str): 温度列名，默认 'Temperature'。
+        depth_interval (float): 深度窗口半宽（dbar），默认 100.0（总宽度 2*Δp）。
+        do_threshold (float): ΔDO 判定阈值（μmol/kg），默认 50.0。
+        salinity_threshold (float): ΔSalinity 可选阈值（psu）；≤0 表示不启用盐度过滤，默认 0.0。
+        temperature_threshold (float): ΔTemperature 可选阈值（°C）；≤0 表示不启用温度过滤，默认 0.0。
+        depth_merge_tolerance (float): 同一 Profile 内“深度近邻合并”阈值（dbar）。若两个候选点深度差小于该值，仅保留 delta_do 较大的记录；设为 ≤0 表示不合并，默认 10.0。
+        remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
+        verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
+
+    返回：
+        pd.DataFrame: 每个满足条件的峰值一行，含
+        Profile_number, depth, delta_do, delta_salinity, delta_temperature,
+        do_value, salinity_value, temperature_value，
+        以及 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）。
+        若无满足条件记录，返回空表。
+    """
+    
+    # 检查必要的列是否存在
+    required_cols = [depth_col, do_col, salinity_col, 'Profile_number']
+    missing_cols = [col for col in required_cols if col not in data.columns]
+    if missing_cols:
+        print(f"警告：缺少必要的列: {missing_cols}")
+        return pd.DataFrame()
+    
+    # 复制数据以避免修改原始数据
+    input_data = data.copy()
+    
+    # 存储所有剖面的结果
+    all_results = []
+    
+    # 按Profile_number分组处理
+    profile_groups = input_data.groupby('Profile_number')
+    total_profiles = len(profile_groups)
+    if verbose:
+        print(f"开始处理 {total_profiles} 个剖面...")
+    
+    processed_profiles = 0
+    
+    for profile_num, profile_data in profile_groups:
+        # 质量控制：移除异常值和质量标记不良的数据
+        if remove_outliers:
+            # 应用Argo QC标准：仅保留等级为{1,2,5,8}的观测
+            for var in [do_col, salinity_col, temperature_col]:
+                qc_column_name = f"{var}_Flag"
+                if qc_column_name in profile_data.columns:
+                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                    bad_qc_mask = ~profile_data[qc_column_name].isin(good_qc_flags)
+                    profile_data.loc[bad_qc_mask, var] = np.nan
+            
+            # 规则法：移除已知的错误值
+            if do_col in profile_data.columns:
+                bad_do_mask = profile_data[do_col] <= 1.0
+                profile_data.loc[bad_do_mask, do_col] = np.nan
+        
+        # 移除包含NaN值的行
+        drop_subset = [depth_col, do_col, salinity_col, temperature_col]
+        profile_data_clean = profile_data.dropna(subset=drop_subset)
+        
+        if len(profile_data_clean) < 5:  # 需要至少5个数据点来计算导数和峰值
+            continue  # 跳过数据点太少的剖面
+
+        # 按深度排序
+        profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
+
+        # 计算深度对DO和Salinity的斜率（一阶导数）
+        depth_values = profile_data_clean[depth_col].values
+        do_values = profile_data_clean[do_col].values
+        salinity_values = profile_data_clean[salinity_col].values
+        temperature_values = profile_data_clean[temperature_col].values
+
+        # 使用中心差分法计算导数
+        do_slopes = np.gradient(do_values, depth_values)
+        
+        # 重要说明：坐标系差异
+        # 图像坐标系（海洋学习惯）：深度向下为正，图像上正斜率表示随深度增加变量增大
+        # 数据计算坐标系：np.gradient计算dVar/dDepth，图像正斜率对应数值负斜率(<0)
+        # 峰值识别：图像上斜率从正变负为负峰值，从负变正为正峰值
+        # 因此代码中的判断条件与图像描述看似相反，但逻辑正确
+        
+        # 仅定位 DO 的峰值（保留正峰值作为俯冲信号候选）
+        do_peaks = []
+        for i in range(1, len(do_slopes) - 1):
+            # DO 正峰值：图像上斜率从负变正（数值上从正变负）
+            if do_slopes[i-1] > 0 and do_slopes[i+1] < 0:
+                do_peaks.append((i, 'positive', depth_values[i]))
+            # DO 负峰值：如需扩展也可纳入；当前仅保留正峰值
+
+        if not do_peaks:
+            continue
+
+        # 对每个 DO 正峰，按同一深度计算 ΔDO、ΔSalinity、ΔTemperature
+        use_salinity_filter = (salinity_threshold is not None and salinity_threshold > 0)
+        use_temperature_filter = (temperature_threshold is not None and temperature_threshold > 0)
+        profile_results = []
+
+        for do_idx, do_type, target_depth in do_peaks:
+            # 定义窗口 [p-Δp, p+Δp]
+            depth_lower = max(0, target_depth - depth_interval)
+            depth_upper = target_depth + depth_interval
+
+            depth_mask = (depth_values >= depth_lower) & (depth_values <= depth_upper)
+            if not np.any(depth_mask):
+                continue
+
+            depth_range = depth_values[depth_mask]
+            do_range = do_values[depth_mask]
+            salinity_range = salinity_values[depth_mask]
+            temperature_range = temperature_values[depth_mask]
+
+            if len(depth_range) < 2:
+                continue
+
+            # 线性参考剖面（两端点连线）
+            do_ref_values = np.interp(
+                depth_range, [depth_range[0], depth_range[-1]], [do_range[0], do_range[-1]]
+            )
+            salinity_ref_values = np.interp(
+                depth_range, [depth_range[0], depth_range[-1]], [salinity_range[0], salinity_range[-1]]
+            )
+            temperature_ref_values = np.interp(
+                depth_range, [depth_range[0], depth_range[-1]], [temperature_range[0], temperature_range[-1]]
+            )
+
+            # 取最接近目标深度的观测点
+            target_idx = np.argmin(np.abs(depth_range - target_depth))
+
+            delta_do = do_range[target_idx] - do_ref_values[target_idx]
+            delta_salinity = salinity_range[target_idx] - salinity_ref_values[target_idx]
+            delta_temperature = temperature_range[target_idx] - temperature_ref_values[target_idx]
+
+            # 判定：ΔDO 为必需条件；ΔSalinity/ΔTemperature 在各自阈值>0时作为附加过滤（与条件）
+            cond = (delta_do >= do_threshold)
+            if use_salinity_filter:
+                cond = cond and (not np.isnan(delta_salinity)) and (abs(delta_salinity) >= salinity_threshold)
+            if use_temperature_filter:
+                cond = cond and (not np.isnan(delta_temperature)) and (abs(delta_temperature) >= temperature_threshold)
+            if cond:
+                result = {
+                    'Profile_number': profile_num,
+                    'depth': target_depth,
+                    'delta_do': delta_do,
+                    'delta_salinity': delta_salinity,
+                    'delta_temperature': delta_temperature,
+                    'do_value': do_values[do_idx],
+                    'salinity_value': salinity_range[target_idx],
+                    'temperature_value': temperature_range[target_idx]
+                }
+
+                # 添加额外的剖面信息（如果存在）
+                if 'Year' in profile_data_clean.columns:
+                    result['Year'] = profile_data_clean['Year'].iloc[0]
+                if 'Month' in profile_data_clean.columns:
+                    result['Month'] = profile_data_clean['Month'].iloc[0]
+                if 'Day' in profile_data_clean.columns:
+                    result['Day'] = profile_data_clean['Day'].iloc[0]
+                if 'Longitude' in profile_data_clean.columns:
+                    result['Longitude'] = profile_data_clean['Longitude'].iloc[0]
+                if 'Latitude' in profile_data_clean.columns:
+                    result['Latitude'] = profile_data_clean['Latitude'].iloc[0]
+                if 'Platform_number' in profile_data_clean.columns:
+                    result['Platform_number'] = profile_data_clean['Platform_number'].iloc[0]
+
+                profile_results.append(result)
+
+        # 剖面内“深度近邻合并”：按 delta_do 降序贪心选取，避免在峰上下方重复取点
+        if profile_results:
+            if depth_merge_tolerance is not None and depth_merge_tolerance > 0:
+                profile_results.sort(key=lambda r: (np.nan_to_num(r['delta_do'], nan=-np.inf)), reverse=True)
+                kept = []
+                kept_depths = []
+                for rec in profile_results:
+                    d = rec['depth']
+                    if all(abs(d - kd) >= depth_merge_tolerance for kd in kept_depths):
+                        kept.append(rec)
+                        kept_depths.append(d)
+                # 输出前按深度升序，便于查看
+                kept.sort(key=lambda r: r['depth'])
+                all_results.extend(kept)
+            else:
+                all_results.extend(profile_results)
+        
+        processed_profiles += 1
+        if processed_profiles % 100 == 0 and verbose:
+            print(f"已处理 {processed_profiles}/{total_profiles} 个剖面...")
+    
+    if not all_results:
+        if verbose:
+            print("未检测到满足阈值条件的DO异常信号。")
+        return pd.DataFrame()
+    
+    results_df = pd.DataFrame(all_results)
+    if verbose:
+        print(f"总共检测到 {len(results_df)} 个潜在的DO异常信号，来自 {len(results_df['Profile_number'].unique())} 个剖面")
+
+    return results_df
