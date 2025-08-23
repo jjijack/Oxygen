@@ -224,7 +224,6 @@ def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
         # print(f"  [Warning] 读取文件 {file_path.name} 失败: {e}")
         return None
 
-
 def worker_process_file(task_args: tuple[Path, Path]):
     """
     (Worker函数) 这是Dask的工作单元，负责处理单个文件。
@@ -3333,29 +3332,45 @@ def check_single_track(track_data, argo_points_by_date, start_date, end_date, ds
     }
 
 def plot_all_tracks_in_range(
-    start_date_str: str, 
-    end_date_str: str, 
+    start_date_str: str,
+    end_date_str: str,
     eddy_datasets: dict | None = None,
     plot_unrelated_eddies: bool = False,
+    plot_unrelated_argo: bool = True,
     save_fig: bool = False,
-    show_fig: bool = True
+    show_fig: bool = True,
+    do_threshold: float = 50.0,
+    salinity_threshold: float = 0.0,
+    temperature_threshold: float = 0.0,
+    depth_interval: float = 100.0,
+    depth_merge_tolerance: float = 10.0,
+    anomaly_min_depth: float | None = 300.0,
+    anomaly_color_by: str = 'delta_do',
+    fix_delta_do_colorbar: bool = True,
+    delta_do_cbar_min: float = 50.0,
+    delta_do_cbar_max: float = 100.0,
+    delta_do_cbar_ticks: list | None = None
 ):
-    """
-    (核心绘图引擎) 为指定时间段生成涡旋与Argo数据的快照图。
+    """(核心绘图) 指定时间段内涡旋轨迹 + Argo ΔDO 异常代表点（仅采用 ΔDO 方法）。
 
-    功能:
-        这是一个混合模式函数，既可以独立调用（需传入eddy_datasets），
-        也可以作为multiprocessing的工作单元（此时会自动从全局变量获取eddy_datasets）。
-        它会动态加载Argo数据，并进行高效的匹配和绘图。
+    工作流程：
+      1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 计算 ΔDO 异常。
+      2. 可选按 anomaly_min_depth 过滤异常深度。
+      3. 每个剖面保留 delta_do（或 do_value）最大的一条。
+      4. 按 anomaly_color_by 着色：'delta_do' (默认) 或 'do_value'。
 
     参数:
-        start_date_str (str): 开始日期 'YYYY-MM-DD'。
-        end_date_str (str): 结束日期 'YYYY-MM-DD'。
-        eddy_datasets (dict | None, optional): 包含已加载的涡旋数据集的字典。
-                                              在独立调用时必须提供。在并行批处理中应为None。
-        plot_unrelated_eddies (bool): 是否绘制在时间范围内但与Argo无交集的涡旋轨迹。
-        save_fig (bool): 是否保存图片。
-        show_fig (bool): 是否显示图片。
+        start_date_str, end_date_str: 日期范围。
+        eddy_datasets: 预加载涡旋数据；并行 worker 模式下从全局读取。
+        plot_unrelated_eddies: 是否绘制未与 Argo 交互的涡旋。
+        plot_unrelated_argo: 是否额外绘制所有 Argo 剖面位置（空心圆），用于提供基准分布背景。
+        save_fig, show_fig: 输出控制。
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance: 传给 calculate_delta_do。
+        anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；None 不限制。
+        anomaly_color_by: 'delta_do' 或 'do_value'。
+        fix_delta_do_colorbar: 若为 True 且按 delta_do 着色，则强制使用 [delta_do_cbar_min, delta_do_cbar_max] 作为色标范围。
+        delta_do_cbar_min / delta_do_cbar_max: ΔDO 色标固定范围上下限（仅在 fix_delta_do_colorbar=True 且 anomaly_color_by='delta_do' 时生效）。
+        delta_do_cbar_ticks: 自定义 ΔDO 色标刻度列表（None 自动：若只提供上下限则显示两端；若范围>30 添加中点）。
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
@@ -3385,21 +3400,45 @@ def plot_all_tracks_in_range(
     argo_dates = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
     argo_in_range = argo_data[(argo_dates >= start_date) & (argo_dates <= end_date)]
     needed_argo_data = pd.DataFrame()
+    base_argo_positions = pd.DataFrame()
     if not argo_in_range.empty:
-        geo_mask = (argo_in_range['Longitude'] >= lonmin) & (argo_in_range['Longitude'] <= lonmax) & \
-                   (argo_in_range['Latitude'] >= latmin) & (argo_in_range['Latitude'] <= latmax)
+        geo_mask = (
+            (argo_in_range['Longitude'] >= lonmin) & (argo_in_range['Longitude'] <= lonmax) &
+            (argo_in_range['Latitude'] >= latmin) & (argo_in_range['Latitude'] <= latmax)
+        )
         argo_in_geo_range = argo_in_range[geo_mask].copy()
         if not argo_in_geo_range.empty:
-            filtered_by_depth = argo_in_geo_range[argo_in_geo_range['Depth'] >= 500].copy()
-            if not filtered_by_depth.empty:
-                max_do_indices = filtered_by_depth.groupby(['Profile_number', 'Year', 'Month', 'Day'])['DO'].idxmax().dropna()
-                if not max_do_indices.empty:
-                    needed_argo_data = filtered_by_depth.loc[max_do_indices]
+            # 所有剖面基础位置（避免按深度重复）
+            base_argo_positions = (
+                argo_in_geo_range.sort_values(['Profile_number','Depth'])
+                .groupby('Profile_number', as_index=False)
+                .first()[['Profile_number','Longitude','Latitude']]
+            )
+            anomalies = calculate_delta_do(
+                argo_in_geo_range,
+                depth_interval=depth_interval,
+                do_threshold=do_threshold,
+                salinity_threshold=salinity_threshold,
+                temperature_threshold=temperature_threshold,
+                depth_merge_tolerance=depth_merge_tolerance,
+                remove_outliers=True,
+                verbose=False
+            )
+            if not anomalies.empty:
+                if anomaly_min_depth is not None:
+                    anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
+                if not anomalies.empty:
+                    sort_field = 'delta_do' if (
+                        anomaly_color_by == 'delta_do' and 'delta_do' in anomalies.columns
+                    ) else 'do_value'
+                    anomalies_sorted = anomalies.sort_values(by=[sort_field], ascending=False)
+                    anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
+                    needed_argo_data = anomalies_unique.rename(columns={'depth': 'Anomaly_depth'})
 
     argo_points_by_date = defaultdict(list)
     if not needed_argo_data.empty:
         for _, row in needed_argo_data.iterrows():
-            date_key = pd.Timestamp(year=row['Year'], month=row['Month'], day=row['Day'])
+            date_key = pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day']))
             argo_points_by_date[date_key].append(Point(row['Longitude'], row['Latitude']))
 
     # --- 3. 检查所有涡旋轨迹 ---
@@ -3409,7 +3448,10 @@ def plot_all_tracks_in_range(
     # --- 4. 绘图 ---
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
     fig, ax = plt.subplots(figsize=(40, 30))
-    ax.set_title(f"Eddy Tracks and Deep Argo Max DO ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})", fontsize=20)
+    ax.set_title(
+        f"Eddy Tracks and Argo ΔDO Anomalies ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})",
+        fontsize=20
+    )
     ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
     world.plot(color='lightgrey', edgecolor='white', ax=ax)
     
@@ -3436,18 +3478,68 @@ def plot_all_tracks_in_range(
             for contour_lon, contour_lat in result['contours_to_plot']:
                 ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle=':')
 
+    if plot_unrelated_argo and not base_argo_positions.empty:
+        ax.scatter(
+            base_argo_positions['Longitude'], base_argo_positions['Latitude'],
+            facecolors='none', edgecolors='gray', linewidths=0.8, s=36,
+            label='All Argo Profiles (baseline)', zorder=2
+        )
+
     if not needed_argo_data.empty:
-        sc = ax.scatter(needed_argo_data['Longitude'], needed_argo_data['Latitude'], c=needed_argo_data['DO'], cmap='bwr', s=60, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo (Max DO @ Depth > 500m)', zorder=3)
-        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-        cbar.set_label('DO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
+        if anomaly_color_by == 'delta_do' and 'delta_do' in needed_argo_data.columns:
+            # 应用固定色标（可选）
+            scatter_kwargs = {}
+            if fix_delta_do_colorbar:
+                scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+            sc = ax.scatter(
+                needed_argo_data['Longitude'], needed_argo_data['Latitude'],
+                c=needed_argo_data['delta_do'], cmap='Reds', s=70,
+                edgecolors='black', linewidths=0.5,
+                label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹ @ depth ≥ {anomaly_min_depth} m', zorder=3,
+                **scatter_kwargs
+            )
+            cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
+            # 自动或用户自定义刻度
+            if fix_delta_do_colorbar:
+                if delta_do_cbar_ticks is not None:
+                    cbar.set_ticks(delta_do_cbar_ticks)
+                else:
+                    # 默认：只显示上下限；若范围较大则加中点
+                    rng = delta_do_cbar_max - delta_do_cbar_min
+                    if rng > 30:
+                        mid = (delta_do_cbar_max + delta_do_cbar_min) / 2
+                        cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
+                    else:
+                        cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
+        else:
+            color_values = needed_argo_data.get('do_value') if 'do_value' in needed_argo_data.columns else needed_argo_data.get('DO')
+            sc = ax.scatter(
+                needed_argo_data['Longitude'], needed_argo_data['Latitude'],
+                c=color_values, cmap='bwr', s=60, vmin=150, vmax=240,
+                edgecolors='black', linewidths=0.5,
+                label='Argo DO Anomaly Profiles',
+                zorder=3
+            )
+            cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            cbar.set_label('DO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
 
     ax.set_xlim(lonmin, lonmax); ax.set_ylim(latmin, latmax)
     ax.tick_params(axis='both', which='major', labelsize=16); ax.set_aspect('equal')
     
-    legend_elements = [Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'), Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')]
+    legend_elements = [
+        Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'),
+        Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')
+    ]
     handles, labels = ax.get_legend_handles_labels()
-    if "Argo (Max DO @ Depth > 500m)" in labels:
-        ax.legend(handles=legend_elements + [handles[labels.index("Argo (Max DO @ Depth > 500m)")]], fontsize=18, loc='upper left')
+    extra_labels = [f"Argo ΔDO ≥ {do_threshold}", 'Argo DO Anomaly Profiles', 'All Argo Profiles (baseline)']
+    added = None
+    for lab in extra_labels:
+        if lab in labels:
+            added = handles[labels.index(lab)]
+            break
+    if added is not None:
+        ax.legend(handles=legend_elements + [added], fontsize=18, loc='upper left')
     else:
         ax.legend(handles=legend_elements, fontsize=18, loc='upper left')
 
@@ -3465,32 +3557,27 @@ def plot_all_tracks_in_range(
     
     plt.close(fig)
 
-def worker_wrapper(args: tuple):
-    """
-    (顶层Worker包装函数) 解包传递给worker的参数并调用核心绘图函数。
+    # 返回本时间段内发生交互(标红)的涡旋标签列表（如 ACxxx / CEyyy）
+    interacted_eddies = []
+    for r in filter(None, results):
+        if r['has_interaction']:
+            interacted_eddies.append(r['text_info']['text'])
+    return interacted_eddies
 
-    功能:
-        这是一个独立的顶层函数，专门用作`multiprocessing.Pool`的目标。
-        它负责接收包含所有参数的元组，解包后安全地调用`plot_all_tracks_in_range`。
-    
-    参数:
-        args (tuple): 包含所有绘图参数的元组，顺序为
-                      (start_date_str, end_date_str, plot_unrelated_eddies)。
-    """
-    # 解包参数
+def worker_wrapper(args: tuple):
+    """multiprocessing worker 包装函数。args: (start_date_str, end_date_str, plot_unrelated_eddies). 返回本月交互涡旋标签列表。"""
     start_d, end_d, unrelated_flag = args
     try:
-        # eddy_datasets 通过 initializer 共享，无需在此传递
-        plot_all_tracks_in_range(
+        return plot_all_tracks_in_range(
             start_date_str=start_d,
             end_date_str=end_d,
             plot_unrelated_eddies=unrelated_flag,
-            save_fig=True,  # 在批处理中，总是保存
-            show_fig=False  # 并且从不显示
+            save_fig=True,
+            show_fig=False,
         )
     except Exception as e:
-        # 在worker中捕获并打印错误，避免让整个进程池崩溃
         print(f"!!! ERROR processing period {start_d}: {e}")
+        return []
 
 def run_batch_plotting_multiprocessing(
     start_date_str: str,
@@ -3536,20 +3623,26 @@ def run_batch_plotting_multiprocessing(
     start_time_total = tm.time()
     
     # 使用 initializer 来高效地传递一次大的涡旋数据
+    collected = []
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(eddy_datasets,)) as pool:
-        # 使用imap_unordered，它会乱序返回结果，效率最高
-        # 用tqdm包装迭代器，即可实现进度条
         print("[*] Processing tasks...")
-        for _ in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
-            pass
+        for month_result in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
+            if month_result:
+                collected.extend(month_result)
         
     end_time_total = tm.time()
     total_duration_minutes = (end_time_total - start_time_total) / 60
     
+    unique_interacted = sorted(set(collected))
     print("\n" + "="*60)
     print("--- All Plotting Tasks Have Finished ---")
     print(f"Total execution time: {total_duration_minutes:.2f} minutes.")
+    print(f"Total interacted eddies: {len(unique_interacted)}")
+    if unique_interacted:
+        preview = ", ".join(unique_interacted[:20])
+        print(f"Sample (first 20): {preview}{' ...' if len(unique_interacted)>20 else ''}")
     print("="*60)
+    return unique_interacted
 
 def plot_argo_hotspots(
     start_year: int,
