@@ -642,7 +642,8 @@ def plot_track(
     fix_delta_do_colorbar: bool = True,
     delta_do_cbar_min: float = 50.0,
     delta_do_cbar_max: float = 100.0,
-    delta_do_cbar_ticks: list | None = None
+    delta_do_cbar_ticks: list | None = None,
+    min_anomaly_count: int = 0
 ):
     """
     绘制指定编号涡旋的详细轨迹，并智能高亮显示与 Argo 剖面的 ΔDO 异常交互情况。
@@ -678,6 +679,8 @@ def plot_track(
             是否固定 ΔDO 色标范围。
         delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 
             色标范围与刻度设置。
+        min_anomaly_count (int): 
+            若 >0：要求 ΔDO 异常数量 ≥ 该值才绘图；=0 表示不做数量阈值过滤（默认 0）。
     """
     # --- 1. 准备涡旋和Argo数据 ---
     print(f"[*] Preparing data for eddy ID {no}...")
@@ -696,10 +699,26 @@ def plot_track(
     track_df['date'] = convert_date(track_df['time'])
     num = track_df['index_org'].iloc[0]
 
+    # 获取数据集名称
+    ds_name = "UNKNOWN"
+    for name, var in inspect.currentframe().f_back.f_locals.items():
+        if var is DS:
+            ds_name = name.upper()
+            break
+
     # 调用筛选函数，获取所有匹配的 Argo 数据（包含所有深度）
     argo_data_filtered = filtered_float_data(DS, no)
 
-    # 使用 ΔDO 异常检测替换传统 500m 最大 DO 方案
+    # 预筛选：若匹配到的剖面数不足 min_anomaly_count，直接跳过
+    if argo_data_filtered.empty:
+        print(f"  - Skip plotting {ds_name}{no}: no matched Argo profiles.")
+        return
+    matched_profile_count = argo_data_filtered['Profile_number'].nunique()
+    if min_anomaly_count > 0 and matched_profile_count < min_anomaly_count:
+        print(f"\033[31m  - Skip plotting {ds_name}{no}: matched profiles ({matched_profile_count}) < min_anomaly_count ({min_anomaly_count}).\033[0m")
+        return
+
+    # 使用 ΔDO 异常检测
     anomalies = pd.DataFrame()
     base_argo_positions = pd.DataFrame()
     if not argo_data_filtered.empty:
@@ -728,14 +747,13 @@ def plot_track(
                 .drop_duplicates(subset='Profile_number', keep='first')
             )
 
+    # 若异常数量不足阈值，直接跳过
+    anomaly_count = 0 if anomalies.empty else len(anomalies)
+    if min_anomaly_count > 0 and anomaly_count < min_anomaly_count:
+        print(f"\033[31m  - Skip plotting {ds_name}{no}: anomalies ({anomaly_count}) < min_anomaly_count ({min_anomaly_count}).\033[0m")
+        return
+
     # --- 2. 准备绘图 ---
-    # 获取数据集名称 (例如 ACS, CL)
-    ds_name = "UNKNOWN"
-    for name, var in inspect.currentframe().f_back.f_locals.items():
-        if var is DS:
-            ds_name = name.upper()
-            break
-            
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
     
