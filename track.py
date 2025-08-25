@@ -631,17 +631,28 @@ def plot_track(
     save_fig: bool = False,
     show_fig: bool = True,
     plot_radius: bool = False,
-    connection_threshold_days: int = 5
+    connection_threshold_days: int = 5,
+    do_threshold: float = 50.0,
+    salinity_threshold: float = 0.0,
+    temperature_threshold: float = 0.0,
+    depth_interval: float = 100.0,
+    depth_merge_tolerance: float = 10.0,
+    anomaly_min_depth: float | None = 300.0,
+    plot_unrelated_argo: bool = True,
+    fix_delta_do_colorbar: bool = True,
+    delta_do_cbar_min: float = 50.0,
+    delta_do_cbar_max: float = 100.0,
+    delta_do_cbar_ticks: list | None = None
 ):
     """
-    绘制指定编号涡旋的详细轨迹，并智能高亮显示与Argo浮标的交互情况。
+    绘制指定编号涡旋的详细轨迹，并智能高亮显示与 Argo 剖面的 ΔDO 异常交互情况。
 
     功能:
         1. 自动加载并筛选与指定涡旋匹配的Argo数据。
         2. 绘制涡旋的完整轨迹（虚线）。
         3. 智能高亮Argo浮标存在的时期：当浮标存在日的间隔小于阈值时，
            会将这段完整的涡旋轨迹绘制为连续实线（孤立的单日则标记为点）。
-        4. 将匹配的Argo浮标按深海最大溶解氧浓度着色绘制，并确保高DO点在顶层显示。
+        4. 使用 calculate_delta_do 识别 ΔDO 异常（取每个剖面最大 ΔDO 一条，支持按最小深度过滤），并按 ΔDO 着色。
         5. 可选地绘制涡旋在交互日的有效半径和轮廓。
 
     参数:
@@ -656,7 +667,17 @@ def plot_track(
         plot_radius (bool, optional): 
             是否以圆的形式绘制涡旋在交互日的有效半径。默认为 False。
         connection_threshold_days (int, optional):
-            连接Argo交互点的最大天数阈值。默认为 5 天。
+            连接 Argo 交互点的最大天数阈值。默认为 5 天。
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance: 
+            传递给 calculate_delta_do 的参数。
+        anomaly_min_depth (float | None): 
+            ΔDO 异常最小深度限制；None 表示不限制。
+        plot_unrelated_argo (bool): 
+            是否绘制被 ΔDO 筛选掉的所有匹配 Argo 剖面基准位置（空心灰圈）。
+        fix_delta_do_colorbar (bool): 
+            是否固定 ΔDO 色标范围。
+        delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 
+            色标范围与刻度设置。
     """
     # --- 1. 准备涡旋和Argo数据 ---
     print(f"[*] Preparing data for eddy ID {no}...")
@@ -675,17 +696,37 @@ def plot_track(
     track_df['date'] = convert_date(track_df['time'])
     num = track_df['index_org'].iloc[0]
 
-    # 调用筛选函数，获取所有匹配的Argo数据（包含所有深度）
+    # 调用筛选函数，获取所有匹配的 Argo 数据（包含所有深度）
     argo_data_filtered = filtered_float_data(DS, no)
 
-    # 准备用于绘图的Argo代表点 (深海最大DO)
-    argo_plot_points = pd.DataFrame()
+    # 使用 ΔDO 异常检测替换传统 500m 最大 DO 方案
+    anomalies = pd.DataFrame()
+    base_argo_positions = pd.DataFrame()
     if not argo_data_filtered.empty:
-        deep_argo_df = argo_data_filtered[argo_data_filtered['Depth'] >= 500].copy()
-        if not deep_argo_df.empty:
-            max_do_indices = deep_argo_df.groupby('Profile_number')['DO'].idxmax().dropna()
-            if not max_do_indices.empty:
-                argo_plot_points = deep_argo_df.loc[max_do_indices]
+        # 基准剖面位置（去除深度重复）
+        base_argo_positions = (
+            argo_data_filtered.sort_values(['Profile_number','Depth'])
+            .groupby('Profile_number', as_index=False)
+            .first()[['Profile_number','Longitude','Latitude','Year','Month','Day']]
+        )
+        anomalies = calculate_delta_do(
+            argo_data_filtered,
+            depth_interval=depth_interval,
+            do_threshold=do_threshold,
+            salinity_threshold=salinity_threshold,
+            temperature_threshold=temperature_threshold,
+            depth_merge_tolerance=depth_merge_tolerance,
+            remove_outliers=True,
+            verbose=False
+        )
+        if not anomalies.empty and anomaly_min_depth is not None:
+            anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
+        if not anomalies.empty:
+            # 每个剖面取最大 ΔDO
+            anomalies = (
+                anomalies.sort_values('delta_do', ascending=False)
+                .drop_duplicates(subset='Profile_number', keep='first')
+            )
 
     # --- 2. 准备绘图 ---
     # 获取数据集名称 (例如 ACS, CL)
@@ -713,8 +754,8 @@ def plot_track(
     
     # 找出有Argo交互的日期
     interaction_track_df = pd.DataFrame(columns=track_df.columns)
-    if not argo_plot_points.empty:
-        interaction_dates = pd.to_datetime(argo_plot_points[['Year', 'Month', 'Day']]).unique()
+    if not anomalies.empty:
+        interaction_dates = pd.to_datetime(anomalies[['Year', 'Month', 'Day']]).unique()
         interaction_track_df = track_df[track_df['date'].isin(interaction_dates)].copy()
         
         # 识别并分别绘制不连续的实线段
@@ -777,18 +818,39 @@ def plot_track(
              ax.text(eddy_day['center_lon'], eddy_day['center_lat'] + 0.1, eddy_day['date'].strftime('%Y-%m-%d'), 
                      fontsize=16, color='black', ha='center', zorder=11)
 
-    # --- 5. 绘制Argo数据散点图 ---
-    if not argo_plot_points.empty:
-        # 按DO值升序排序，确保高值点最后绘制（在顶层）
-        argo_plot_points.sort_values(by='DO', ascending=True, inplace=True)
-        
-        sc = ax.scatter(argo_plot_points['Longitude'], argo_plot_points['Latitude'], c=argo_plot_points['DO'],
-                        cmap='bwr', s=80, vmin=150, vmax=240, edgecolors='black', linewidths=0.5, 
-                        label='Argo (Max DO @ Depth > 500m)', zorder=10)
-        
+    # --- 5. 绘制 ΔDO 异常与基准剖面 ---
+    if plot_unrelated_argo and not base_argo_positions.empty:
+        ax.scatter(
+            base_argo_positions['Longitude'], base_argo_positions['Latitude'],
+            facecolors='none', edgecolors='gray', linewidths=0.8, s=50,
+            label='All Matched Argo Profiles', zorder=5
+        )
+
+    if not anomalies.empty:
+        scatter_kwargs = {}
+        if fix_delta_do_colorbar:
+            scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+        sc = ax.scatter(
+            anomalies['Longitude'], anomalies['Latitude'],
+            c=anomalies['delta_do'], cmap='Reds', s=90,
+            edgecolors='black', linewidths=0.6,
+            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹' + (f' @ depth ≥ {anomaly_min_depth} m' if anomaly_min_depth is not None else ''),
+            zorder=10,
+            **scatter_kwargs
+        )
         cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.08)
-        cbar.set_label('DO / μmol·kg⁻¹', fontsize=18)
+        cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=18)
         cbar.ax.tick_params(labelsize=14)
+        if fix_delta_do_colorbar:
+            if delta_do_cbar_ticks is not None:
+                cbar.set_ticks(delta_do_cbar_ticks)
+            else:
+                rng = delta_do_cbar_max - delta_do_cbar_min
+                if rng > 30:
+                    mid = (delta_do_cbar_min + delta_do_cbar_max) / 2
+                    cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
+                else:
+                    cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
 
     # --- 6. 最终化绘图设置 ---
     # 设定边界时排除META中错误的contour数据
