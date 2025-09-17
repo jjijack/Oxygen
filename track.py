@@ -3731,120 +3731,169 @@ def run_batch_plotting_multiprocessing(
 def plot_argo_hotspots(
     start_year: int,
     end_year: int,
-    depth_threshold: float = 500.0,
+    do_threshold: float = 50.0,
+    salinity_threshold: float = 0.0,
+    temperature_threshold: float = 0.0,
+    depth_interval: float = 100.0,
+    depth_merge_tolerance: float = 10.0,
+    duplicate_depth_strategy: str = 'best_qc',
+    anomaly_min_depth: float | None = 300.0,
+    plot_unrelated_argo: bool = True,
+    fix_delta_do_colorbar: bool = True,
+    delta_do_cbar_min: float = 50.0,
+    delta_do_cbar_max: float = 100.0,
+    delta_do_cbar_ticks: list | None = None,
     save_fig: bool = False,
-    show_fig: bool = True
+    show_fig: bool = True,
+    return_anomalies: bool = False
 ):
-    """
-    绘制指定时间范围内所有Argo数据中，满足特定条件的“热点”分布图。
+    """以 ΔDO 异常方法绘制多年期 Argo 异常分布。
 
-    此函数旨在识别并可视化高溶解氧（DO）的区域。它会找出每个Argo剖面在指定深度
-    之下的最大溶解氧点，并将其绘制在地图上。
+    流程：
+      1. 逐年加载 Argo 年度数据并合并；可利用全局 lonmin/latmin/lonmax/latmax 做空间裁剪；
+      2. 用 calculate_delta_do 检测每个剖面潜在 ΔDO 异常；
+      3. 按 anomaly_min_depth 过滤（若不为 None）；
+      4. 每个剖面保留最大 ΔDO 一条记录；
+      5. 绘制 ΔDO 异常散点（可选固定色标范围），并可选绘制所有匹配剖面基线位置（空心灰圈）。
 
     参数:
-        start_year (int): 开始的年份。
-        end_year (int): 结束的年份。
-        depth_threshold (float, optional): 筛选的最小深度 (Depth >= threshold)。默认为 500.0。
-        save_fig (bool, optional): 是否将生成的图像保存到文件。默认为 False。
-        show_fig (bool, optional): 是否在屏幕上显示生成的图像。默认为 True。
+        start_year / end_year: 年度范围（闭区间）。
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
+        anomaly_min_depth: 仅保留异常深度 >= 该值；None 不限制。
+        plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
+        fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
+        delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 色标范围与刻度配置。
+        save_fig / show_fig: 输出控制。
+        return_anomalies: True 时返回 anomalies DataFrame，便于后续统计；False 返回 None。
+
+    返回:
+        pd.DataFrame | None: 若 return_anomalies=True，返回列含 Profile_number, depth, delta_do, do_value, Year/Month/Day/Longitude/Latitude 等的异常表。
     """
-    print("--- Starting Deep Argo DO Hotspot Analysis ---")
-    
-    # --- 1. 循环加载并合并所有年份的数据 ---
-    all_yearly_data = []
-    print(f"Loading all Argo data from {start_year} to {end_year}...")
+    print(f"--- Building Argo ΔDO Anomaly Map {start_year}-{end_year} ---")
+
+    all_yearly_data: list[pd.DataFrame] = []
     for year in range(start_year, end_year + 1):
-        print(f"Processing year: {year}...")
         try:
-            yearly_argo_data = load_argo_data(year=year)
-            all_yearly_data.append(yearly_argo_data)
-        except FileNotFoundError as e:
-            print(f"Warning: {e}. Skipping year {year}.")
+            df_y = load_argo_data(year=year)
+            all_yearly_data.append(df_y)
+        except FileNotFoundError:
+            print(f"Warning: missing Argo year {year}, skipped.")
         except Exception as e:
-            print(f"An error occurred processing year {year}: {e}")
+            print(f"Warning: error loading year {year}: {e}")
 
     if not all_yearly_data:
-        print("No Argo data was loaded. Aborting plot.")
-        return
+        print("No data loaded; abort.")
+        return None
 
-    # --- 2. 核心筛选逻辑：先筛选深度，再找DO最高点 ---
-    print("Combining all data and applying filters...")
-    combined_df = pd.concat(all_yearly_data, ignore_index=True)
-    
-    # 步骤 A: 首先，只保留深度大于等于阈值的数据
-    deep_argo_df = combined_df[combined_df['Depth'] >= depth_threshold].copy()
-    
-    if deep_argo_df.empty:
-        print(f"No Argo data found below {depth_threshold}m. Aborting plot.")
-        return
+    combined = pd.concat(all_yearly_data, ignore_index=True)
 
-    # 步骤 B: 然后，在这个深层数据子集上，找出每个浮标DO最高的点
-    print("Finding the highest DO record below threshold for each profile...")
-    
-    # --- 核心修正点 ---
-    # 1. 先计算出每组最大DO值的行索引
-    max_do_indices = deep_argo_df.groupby('Profile_number')['DO'].idxmax()
-    # 2. 清理索引：使用 .dropna() 去掉因整组都是NaN而产生的缺失值
-    valid_indices = max_do_indices.dropna()
+    # 空值/必要列检查
+    needed_cols = {'Longitude','Latitude','Depth','Profile_number','Year','Month','Day','DO'}
+    missing = needed_cols - set(combined.columns)
+    if missing:
+        print(f"缺少必要列: {missing}，无法继续。")
+        return None
 
-    if valid_indices.empty:
-        print("No valid max DO points found after filtering. Aborting plot.")
-        return
-        
-    # 3. 使用清理后的有效索引来选取行
-    hotspot_points_df = deep_argo_df.loc[valid_indices].copy()
-    # --- 修正结束 ---
-        
-    # --- 3. 准备绘图数据 ---
-    print(f"Sorting {len(hotspot_points_df)} unique hotspot points for plotting...")
-    hotspot_points_df.sort_values(by='DO', ascending=True, inplace=True)
-    
-    # --- 4. 开始绘图 ---
-    print("Generating plot...")
+    # 空间过滤（若已在全局设置）
+    geo_mask = (
+        (combined['Longitude'] >= lonmin) & (combined['Longitude'] <= lonmax) &
+        (combined['Latitude']  >= latmin) & (combined['Latitude']  <= latmax)
+    )
+    combined_geo = combined[geo_mask].copy()
+    if combined_geo.empty:
+        print("Geographic filter produced empty dataset; abort.")
+        return None
+
+    # 基线剖面位置（每剖面第一条记录）
+    baseline_profiles = (
+        combined_geo.sort_values(['Profile_number','Depth'])
+        .groupby('Profile_number', as_index=False)
+        .first()[['Profile_number','Longitude','Latitude','Year','Month','Day']]
+    )
+
+    # ΔDO 异常检测
+    anomalies = calculate_delta_do(
+        combined_geo,
+        depth_interval=depth_interval,
+        do_threshold=do_threshold,
+        salinity_threshold=salinity_threshold,
+        temperature_threshold=temperature_threshold,
+        depth_merge_tolerance=depth_merge_tolerance,
+        duplicate_depth_strategy=duplicate_depth_strategy,
+        remove_outliers=True,
+        verbose=False
+    )
+    if anomalies.empty:
+        print("No ΔDO anomalies detected.")
+    else:
+        if anomaly_min_depth is not None and 'depth' in anomalies.columns:
+            anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
+        if not anomalies.empty:
+            anomalies = (
+                anomalies.sort_values('delta_do', ascending=False)
+                .drop_duplicates(subset='Profile_number', keep='first')
+            )
+
+    # 绘图
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
     fig, ax = plt.subplots(figsize=(40, 30))
-    ax.set_title(f'Highest DO Record of Each Argo Float (below {depth_threshold}m) from {start_year}-{end_year}', fontsize=20)
-    ax.set_xlabel('Longitude', fontsize=20)
-    ax.set_ylabel('Latitude', fontsize=20)
-    world.plot(color='lightgrey', edgecolor='white', ax=ax)
-    
-    sc = ax.scatter(
-        hotspot_points_df['Longitude'], 
-        hotspot_points_df['Latitude'], 
-        c=hotspot_points_df['DO'], 
-        cmap='bwr',
-        vmin=150,
-        vmax=240,
-        s=25,
-        alpha=0.8,
-        label=f'Highest DO point of each float (below {depth_threshold}m)'
+    ax.set_title(
+        f'Argo ΔDO Anomalies {start_year}-{end_year}' + (
+            f' (depth ≥ {anomaly_min_depth} m)' if anomaly_min_depth is not None else ''
+        ), fontsize=20
     )
-    
-    cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-    cbar.set_label('DO / μmol·kg⁻¹ at hotspot depth', fontsize=20)
-    cbar.ax.tick_params(labelsize=14)
+    ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
+    world.plot(color='lightgrey', edgecolor='white', ax=ax)
 
-    # --- 5. 最终化绘图 ---
-    ax.set_xlim(lonmin, lonmax)
-    ax.set_ylim(latmin, latmax)
-    ax.tick_params(axis='both', which='major', labelsize=16)
-    ax.set_aspect('equal')
+    if plot_unrelated_argo and not baseline_profiles.empty:
+        ax.scatter(
+            baseline_profiles['Longitude'], baseline_profiles['Latitude'],
+            facecolors='none', edgecolors='gray', linewidths=0.7, s=25,
+            label='All Argo Profiles (baseline)', zorder=2
+        )
+
+    if not anomalies.empty:
+        scatter_kwargs = {}
+        if fix_delta_do_colorbar:
+            scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+        sc = ax.scatter(
+            anomalies['Longitude'], anomalies['Latitude'],
+            c=anomalies['delta_do'], cmap='Reds', s=45,
+            edgecolors='black', linewidths=0.4,
+            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹', zorder=3,
+            **scatter_kwargs
+        )
+        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+        cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
+        if fix_delta_do_colorbar:
+            if delta_do_cbar_ticks is not None:
+                cbar.set_ticks(delta_do_cbar_ticks)
+            else:
+                rng = delta_do_cbar_max - delta_do_cbar_min
+                if rng > 30:
+                    mid = (delta_do_cbar_min + delta_do_cbar_max)/2
+                    cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
+                else:
+                    cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
+    else:
+        ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
+
+    ax.set_xlim(lonmin, lonmax); ax.set_ylim(latmin, latmax)
+    ax.set_aspect('equal'); ax.tick_params(axis='both', which='major', labelsize=16)
     ax.legend(fontsize=18, loc='upper left')
 
-    # --- 6. 保存和显示图片 ---
     if save_fig:
-        output_dir = "argo_hotspot_plots"
-        os.makedirs(output_dir, exist_ok=True)
-        base_filename = f"Argo_DO_Hotspots_{start_year}_to_{end_year}.png"
-        save_path = os.path.join(output_dir, base_filename)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-
+        out_dir = Path('argo_hotspot_plots'); out_dir.mkdir(exist_ok=True, parents=True)
+        fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}.png"
+        plt.savefig(fname, dpi=300, bbox_inches='tight')
+        print(f"Figure saved: {fname}")
     if show_fig:
         plt.show()
-
     plt.close(fig)
-    print("--- Hotspot analysis finished. ---")
+
+    if return_anomalies:
+        return anomalies
+    return None
 
 def calculate_delta_do(
     data: pd.DataFrame,
