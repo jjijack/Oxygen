@@ -637,6 +637,7 @@ def plot_track(
     temperature_threshold: float = 0.0,
     depth_interval: float = 100.0,
     depth_merge_tolerance: float = 10.0,
+    duplicate_depth_strategy: str = 'best_qc',
     anomaly_min_depth: float | None = 300.0,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
@@ -669,7 +670,7 @@ def plot_track(
             是否以圆的形式绘制涡旋在交互日的有效半径。默认为 False。
         connection_threshold_days (int, optional):
             连接 Argo 交互点的最大天数阈值。默认为 5 天。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance: 
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 
             传递给 calculate_delta_do 的参数。
         anomaly_min_depth (float | None): 
             ΔDO 异常最小深度限制；None 表示不限制。
@@ -735,6 +736,7 @@ def plot_track(
             salinity_threshold=salinity_threshold,
             temperature_threshold=temperature_threshold,
             depth_merge_tolerance=depth_merge_tolerance,
+            duplicate_depth_strategy=duplicate_depth_strategy,
             remove_outliers=True,
             verbose=False
         )
@@ -3424,6 +3426,7 @@ def plot_all_tracks_in_range(
     temperature_threshold: float = 0.0,
     depth_interval: float = 100.0,
     depth_merge_tolerance: float = 10.0,
+    duplicate_depth_strategy: str = 'best_qc',
     anomaly_min_depth: float | None = 300.0,
     anomaly_color_by: str = 'delta_do',
     fix_delta_do_colorbar: bool = True,
@@ -3445,7 +3448,7 @@ def plot_all_tracks_in_range(
         plot_unrelated_eddies: 是否绘制未与 Argo 交互的涡旋。
         plot_unrelated_argo: 是否额外绘制所有 Argo 剖面位置（空心圆），用于提供基准分布背景。
         save_fig, show_fig: 输出控制。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance: 传给 calculate_delta_do。
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
         anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；None 不限制。
         anomaly_color_by: 'delta_do' 或 'do_value'。
         fix_delta_do_colorbar: 若为 True 且按 delta_do 着色，则强制使用 [delta_do_cbar_min, delta_do_cbar_max] 作为色标范围。
@@ -3501,6 +3504,7 @@ def plot_all_tracks_in_range(
                 salinity_threshold=salinity_threshold,
                 temperature_threshold=temperature_threshold,
                 depth_merge_tolerance=depth_merge_tolerance,
+                duplicate_depth_strategy=duplicate_depth_strategy,
                 remove_outliers=True,
                 verbose=False
             )
@@ -3853,6 +3857,7 @@ def calculate_delta_do(
     salinity_threshold: float = 0.0,
     temperature_threshold: float = 0.0,
     depth_merge_tolerance: float = 10.0,
+    duplicate_depth_strategy: str = 'best_qc',
     remove_outliers: bool = True,
     verbose: bool = False
 ) -> pd.DataFrame:
@@ -3878,6 +3883,8 @@ def calculate_delta_do(
         salinity_threshold (float): ΔSalinity 可选阈值（psu）；≤0 表示不启用盐度过滤，默认 0.0。
         temperature_threshold (float): ΔTemperature 可选阈值（°C）；≤0 表示不启用温度过滤，默认 0.0。
         depth_merge_tolerance (float): 同一 Profile 内“深度近邻合并”阈值（dbar）。若两个候选点深度差小于该值，仅保留 delta_do 较大的记录；设为 ≤0 表示不合并，默认 10.0。
+        duplicate_depth_strategy (str): 处理同一剖面内“同深度多条记录”的策略。
+            可选 'best_qc'|'first'|'mean'|'max'|'min'（默认 'best_qc'：按 DO 的 QC 优先级 1>2>5>8 选最佳；并列取首个）。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
         verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
 
@@ -3936,21 +3943,93 @@ def calculate_delta_do(
         # 按深度排序
         profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
 
+        # 处理重复或非严格递增的深度值以避免 np.gradient 内部出现除零 (dx1 或 dx2 = 0)
+        # 策略：对同一深度的多条记录按 duplicate_depth_strategy 聚合为单条
+        def _best_qc_pick(group: pd.DataFrame) -> pd.Series:
+            qccol = f"{do_col}_Flag"
+            priority = {1: 0, 2: 1, 5: 2, 8: 3}
+            def rank(v):
+                try:
+                    iv = int(v)
+                except Exception:
+                    return 999
+                return priority.get(iv, 999)
+            if qccol in group.columns:
+                ranks = group[qccol].apply(rank)
+                min_rank = ranks.min()
+                picked = group.loc[ranks[ranks == min_rank].index]
+                # 并列时优先 DO 非空，随后保留第一条
+                picked = picked[pd.notna(picked[do_col])] if do_col in picked.columns else picked
+                return picked.iloc[0]
+            # 无 QC 列则退化为 first
+            return group.iloc[0]
+
+        def _mean_pick(group: pd.DataFrame) -> pd.Series:
+            # 对核心变量取均值，其他元数据取首个
+            first = group.iloc[0].copy()
+            for c in [do_col, salinity_col, temperature_col]:
+                if c in group.columns:
+                    first[c] = group[c].astype(float).mean()
+            return first
+
+        if profile_data_clean[depth_col].duplicated().any():
+            strategy = (duplicate_depth_strategy or 'best_qc').lower()
+            if strategy not in {'best_qc','first','mean','max','min'}:
+                strategy = 'best_qc'
+            grouped = list(profile_data_clean.groupby(depth_col, sort=False))
+            picked_rows = []
+            for depth_val, grp in grouped:
+                if len(grp) == 1:
+                    picked_rows.append(grp.iloc[0])
+                    continue
+                if strategy == 'best_qc':
+                    picked_rows.append(_best_qc_pick(grp))
+                elif strategy == 'first':
+                    picked_rows.append(grp.iloc[0])
+                elif strategy == 'mean':
+                    picked_rows.append(_mean_pick(grp))
+                elif strategy == 'max':
+                    picked_rows.append(grp.loc[grp[do_col].idxmax()])
+                elif strategy == 'min':
+                    picked_rows.append(grp.loc[grp[do_col].idxmin()])
+            profile_data_clean = pd.DataFrame(picked_rows)
+            # 可能破坏原索引，重排并按深度排序
+            profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
+        depth_series = profile_data_clean[depth_col].values
+        # 若仍非严格递增（可能存在逆序或噪声导致深度减小），尝试再次排序并去除 <= 前一值 的点
+        # （二次排序保证顺序，随后用 np.diff > 0 过滤）
+        if np.any(np.diff(depth_series) <= 0):
+            # 先强制排序（已经排序过, 这里是保险）
+            profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
+            # 过滤掉与前一个深度差 <= 0 的观测
+            cleaned_rows = [0]
+            last_depth = profile_data_clean.loc[0, depth_col]
+            for ridx in range(1, len(profile_data_clean)):
+                dval = profile_data_clean.loc[ridx, depth_col]
+                if dval > last_depth:  # 严格递增才保留
+                    cleaned_rows.append(ridx)
+                    last_depth = dval
+            profile_data_clean = profile_data_clean.iloc[cleaned_rows].reset_index(drop=True)
+            depth_series = profile_data_clean[depth_col].values
+        # 若清理后点数不足或仍不严格递增则跳过
+        if len(profile_data_clean) < 5 or (len(depth_series) > 1 and np.any(np.diff(depth_series) <= 0)):
+            continue
+
         # 计算深度对DO和Salinity的斜率（一阶导数）
-        depth_values = profile_data_clean[depth_col].values
+        depth_values = profile_data_clean[depth_col].values  # 已保证严格递增
         do_values = profile_data_clean[do_col].values
         salinity_values = profile_data_clean[salinity_col].values
         temperature_values = profile_data_clean[temperature_col].values
 
         # 使用中心差分法计算导数
         do_slopes = np.gradient(do_values, depth_values)
-        
+
         # 重要说明：坐标系差异
         # 图像坐标系（海洋学习惯）：深度向下为正，图像上正斜率表示随深度增加变量增大
         # 数据计算坐标系：np.gradient计算dVar/dDepth，图像正斜率对应数值负斜率(<0)
         # 峰值识别：图像上斜率从正变负为负峰值，从负变正为正峰值
         # 因此代码中的判断条件与图像描述看似相反，但逻辑正确
-        
+
         # 仅定位 DO 的峰值（保留正峰值作为俯冲信号候选）
         do_peaks = []
         for i in range(1, len(do_slopes) - 1):
