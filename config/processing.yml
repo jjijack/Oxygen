@@ -1,0 +1,11 @@
+# 处理与算法参数配置
+version: 1.0
+processing:
+  circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
+  distance_earth_deg_per_meter: 111320.0  # 旧近似值（未来可替换为球面距离函数）
+  default_delta_do_threshold: 50.0
+  default_salinity_threshold: 0.0
+  default_temperature_threshold: 0.0
+  depth_interval: 100.0
+  depth_merge_tolerance: 10.0
+  duplicate_depth_strategy: best_qc

@@ -1,0 +1,66 @@
+# 区域配置文件
+# 说明:
+# - 每个区域提供经纬度边界、可选描述、是否跨经线、默认投影建议。
+# - 可扩展字段: basin, notes, resolution, padding, wrap_convention.
+# - 所有经度推荐使用 [-180, 180] 体系; 如果数据源为 [0, 360] 需在读取后统一转换。
+# - global 区域可以作为回退默认值。
+
+version: 1.0
+wrap_convention: "-180_180"  # 全局默认经度体系
+
+default_region: kuroshio_extension
+
+regions:
+  global:
+    name: Global Ocean
+    lon_min: -180.0
+    lon_max: 180.0
+    lat_min: -90.0
+    lat_max: 90.0
+    crosses_dateline: true
+    suggest_projection: PlateCarree
+    padding_deg: 0.0
+    notes: "全局默认，不做额外裁剪。"
+
+  kuroshio_extension:
+    name: Kuroshio Extension
+    # 源代码原始设置: lon 137.5~182.5, lat 25.5~42.5 (通过 140±2.5, 180±2.5, 28±2.5, 40±2.5 得出)
+    # 转换到 [-180, 180] 体系后，182.5°E 等价于 -177.5°
+    # 为避免跨经线歧义，这里保留两种表示法: primary (0~360) 与 normalized (-180~180)
+    lon_min: 137.5
+    lon_max: 182.5
+    lon_min_normalized: 137.5
+    lon_max_normalized: -177.5   # 182.5 - 360
+    lat_min: 25.5
+    lat_max: 42.5
+    crosses_dateline: true
+    suggest_projection: PlateCarree
+    padding_deg: 0.5
+    reference: "Hard-coded in legacy track.py"
+    notes: "需要在代码中统一经度后再判断 dateline 包裹。"
+
+  north_atlantic_subtropical:
+    name: North Atlantic Subtropical Gyre
+    lon_min: -80.0
+    lon_max:  10.0
+    lat_min:  10.0
+    lat_max:  45.0
+    crosses_dateline: false
+    suggest_projection: PlateCarree
+    padding_deg: 1.0
+    notes: "示例: 可用于扩展其它盆地统计。"
+
+  equatorial_pacific:
+    name: Equatorial Pacific
+    lon_min: 140.0
+    lon_max: -70.0     # 约等于 290°E -> -70° (跨经线)
+    lon_min_normalized: 140.0
+    lon_max_normalized: -70.0
+    lat_min: -10.0
+    lat_max:  10.0
+    crosses_dateline: true
+    suggest_projection: PlateCarree
+    padding_deg: 0.5
+    notes: "示例区域, 用于热带动力异常分析。"
+
+# 未来可扩展: 南大洋扇区、北极区、低氧最小带 (OMZ) 等。

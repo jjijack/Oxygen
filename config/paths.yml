@@ -1,0 +1,8 @@
+# 数据路径配置
+version: 1.0
+paths:
+  argo_origin: ./Argo_origin
+  argo_intermediate: ./Argo_data_tmp
+  argo_parquet: ./Argo_data
+  argo_mat_input: ./Argo_addFloat
+  glorys_root: ../copernicus/GLORYS

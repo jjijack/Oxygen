@@ -24,28 +24,127 @@ from matplotlib.lines import Line2D
 import dask.dataframe as dd
 from dask.distributed import Client
 from tqdm.auto import tqdm
+import yaml
 
-lonmin,lonmax=140-2.5, 180+2.5
-latmin,latmax=28-2.5, 40+2.5
+# -------------------- 区域配置加载 --------------------
+def _load_region_config(config_path: str | Path = 'config/regions.yml', region: str | None = None):
+    """加载区域配置文件并返回指定区域字典。
 
-argo_origin_path = Path("./Argo_origin")
-tmp_parquet_path = Path("./Argo_data_tmp")
-argo_path = Path("./Argo_data")
+    若未安装 PyYAML 或文件缺失，则回退到黑潮延伸体默认范围。
+    """
+    fallback = {
+        'lon_min': 140 - 2.5,
+        'lon_max': 180 + 2.5,
+        'lat_min': 28 - 2.5,
+        'lat_max': 40 + 2.5,
+        'crosses_dateline': True,
+        '_fallback': True
+    }
+    cfg_path = Path(config_path)
+    if yaml is None or not cfg_path.exists():
+        return fallback
+    try:
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        if region is None:
+            region = cfg.get('default_region')
+        region_dict = cfg['regions'][region]
+        # 统一键名，缺失时使用 fallback
+        for k, v in fallback.items():
+            region_dict.setdefault(k, v)
+        region_dict['_fallback'] = False
+        return region_dict
+    except Exception:
+        return fallback
 
-# # load 2014 data by default, can be changed with load_argo_data function
-# default_argo_data_path = argo_path / 'Argo2014.parquet'
-# try:
-#     argo_data = pd.read_parquet(default_argo_data_path)
-#     argo_data = argo_data.drop(columns=['Salinity_psu', 'Oxygen_flag', 'Oxygen_flag2', 'Datasets_number', 'Cycle_number', 'Float_serial_no'])
-#     print("Old format Argo data loaded successfully.")
-# except FileNotFoundError:
-#     print(f"Default Argo data file not found at {default_argo_data_path}. Empty DataFrame created.")
-#     argo_data = pd.DataFrame()
-# except KeyError:
-#     print("New format Argo data loaded successfully.")
+_REGION_CFG = _load_region_config()
+lonmin, lonmax = _REGION_CFG['lon_min'], _REGION_CFG['lon_max']
+latmin, latmax = _REGION_CFG['lat_min'], _REGION_CFG['lat_max']
 
-circle_enlargement_factor = 1.2  # 筛选过程中涡旋半径放大倍数
-Glorys_path = '../copernicus/GLORYS'
+# 对跨日界线区域的简单提示（当前裁剪逻辑仍使用单一区间，后续可升级为双区间或经度归一）
+if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
+    # 若采用 normalized 表达（例如 lon_max_normalized < lon_min_normalized），可在后续筛选函数中加特殊处理
+    print('[RegionConfig] Detected dateline-crossing region with inverted lon bounds; consider implementing split-range filtering.')
+
+# -------------------- 数据路径与处理参数配置加载（Paths & Processing Config） --------------------
+def _load_yaml(path: str | Path) -> dict:
+    if yaml is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, 'r') as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+_PATHS_CFG = _load_yaml('config/paths.yml')
+_PROC_CFG = _load_yaml('config/processing.yml')
+
+argo_origin_path = Path(_PATHS_CFG.get('paths', {}).get('argo_origin', './Argo_origin'))
+tmp_parquet_path = Path(_PATHS_CFG.get('paths', {}).get('argo_intermediate', './Argo_data_tmp'))
+argo_path = Path(_PATHS_CFG.get('paths', {}).get('argo_parquet', './Argo_data'))
+_argo_mat_input_dir = _PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat')
+Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLORYS')
+
+# 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
+circle_enlargement_factor = float(
+    _PROC_CFG.get('processing', {}).get('circle_enlargement_factor', 1.2)
+)
+_distance_deg_per_meter = float(
+    _PROC_CFG.get('processing', {}).get('distance_earth_deg_per_meter', 111320.0)
+)
+_default_delta_do_threshold = float(
+    _PROC_CFG.get('processing', {}).get('default_delta_do_threshold', 50.0)
+)
+_default_salinity_threshold = float(
+    _PROC_CFG.get('processing', {}).get('default_salinity_threshold', 0.0)
+)
+_default_temperature_threshold = float(
+    _PROC_CFG.get('processing', {}).get('default_temperature_threshold', 0.0)
+)
+_default_depth_interval = float(
+    _PROC_CFG.get('processing', {}).get('depth_interval', 100.0)
+)
+_default_depth_merge_tolerance = float(
+    _PROC_CFG.get('processing', {}).get('depth_merge_tolerance', 10.0)
+)
+_default_duplicate_depth_strategy = _PROC_CFG.get('processing', {}).get('duplicate_depth_strategy', 'best_qc')
+
+# -------------------------------------------------------------------------------
+
+def switch_region(region_name: str, config_path: str | Path = 'config/regions.yml'):
+    """在运行时切换默认区域（无需改 YAML），并刷新全局经纬度。
+
+    更新内容: `lonmin, lonmax, latmin, latmax, _REGION_CFG`。
+
+    推荐用法 (确保后续访问得到最新值):
+        import track
+        track.switch_region('global')
+        print(track.lonmin, track.lonmax)
+
+    不推荐:
+        from track import lonmin  # 后续 switch_region 不会自动更新这个已绑定的数值副本
+
+    参数:
+        region_name: 在 regions.yml 中定义的区域 key。
+        config_path: 配置文件路径，默认 'config/regions.yml'。
+
+    异常:
+        KeyError: 区域未找到或加载失败（进入 fallback）。
+    """
+    global _REGION_CFG, lonmin, lonmax, latmin, latmax
+    new_cfg = _load_region_config(config_path=config_path, region=region_name)
+    if new_cfg.get('_fallback'):
+        raise KeyError(f"Region '{region_name}' not found or config load failed; fallback config in use.")
+    _REGION_CFG = new_cfg
+    lonmin, lonmax = _REGION_CFG['lon_min'], _REGION_CFG['lon_max']
+    latmin, latmax = _REGION_CFG['lat_min'], _REGION_CFG['lat_max']
+    if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
+        print(f"[RegionConfig] Region '{region_name}' crosses dateline; implement split-range filtering if needed.")
+    else:
+        print(f"[RegionConfig] Switched to region '{region_name}': lon[{lonmin}, {lonmax}], lat[{latmin}, {latmax}]")
 
 def load_meta_data(path, version = 3.2):
     '''
@@ -117,78 +216,66 @@ def process_and_save(data, filename):
     with open(filename, 'wb') as f:
         pickle.dump(processed, f)
 
-def convert_mat_to_parquet(year: int, input_dir: str = './Argo_addFloat', output_dir: str = './Argo_data'):
-    """
-    读取指定年份的多个Argo .mat文件，将其合并，并保存为单个Parquet文件。
+def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: str | Path = None):
+    """将某年份的逐月 Argo .mat 原始文件合并为单一 Parquet。
 
     参数:
-        year (int): 需要处理的数据年份。
-        input_dir (str, optional): 存放源 .mat 文件的目录。
-                                   默认为 './Argo_addFloat'。
-        output_dir (str, optional): 用于保存输出 .parquet 文件的目录。
-                                    默认为 './Argo_data'。
+        year (int): 年份 (如 2008)。
+        input_dir (str | Path | None): 每月 .mat 文件所在目录；None → 配置 paths.yml 的 argo_mat_input。
+        output_dir (str | Path | None): 输出目录；None → 配置 paths.yml 的 argo_parquet。
+
+    说明:
+        该函数当前仅示例性地提取 'do' 数据集（如果存在），并按固定列顺序写出。
+        若未来需要更多变量，可在此扩展。
     """
-    # 将年份转换为字符串，用于构建路径
     year_str = str(year)
-    print(f"Starting to process data for the year: {year_str}")
+    if input_dir is None:
+        input_dir = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
+    else:
+        input_dir = Path(input_dir)
+    if output_dir is None:
+        output_dir = argo_path
+    else:
+        output_dir = Path(output_dir)
 
-    # --- 1. 准备文件路径 ---
-    # 构建源文件路径列表
-    try:
-        paths = [os.path.join(input_dir, f'Argo{year_str}_{month}.mat') for month in range(1, 13)]
-        print("Generated paths for .mat files:")
-        for p in paths:
-            print(f"  - {p}")
-    except Exception as e:
-        print(f"Error creating file paths: {e}")
-        return
-
-    # --- 2. 读取并处理数据 ---
-    # 定义列名
     columns = [
         "Year", "Month", "Day", "Longitude", "Latitude", "Depth_m", "DO_mol_kg", "Salinity_psu",
         "Temperature_degC", "Oxygen_flag", "Oxygen_flag2", "Profile_number", "Datasets_number",
         "Platform_number", "Cycle_number", "Float_serial_no"
     ]
-    
-    all_data = [] # 初始化空列表用于存储所有月份的 DataFrame
 
-    print("\nReading .mat files...")
-    for path in paths:
-        if not os.path.exists(path):
-            print(f"Warning: File not found, skipping: {path}")
+    paths = [input_dir / f'Argo{year_str}_{m}.mat' for m in range(1, 13)]
+    print(f"[convert_mat_to_parquet] Year {year_str}: expecting {len(paths)} monthly files under {input_dir}")
+
+    all_monthly = []
+    for p in paths:
+        if not p.exists():
+            print(f"  - Missing file: {p}")
             continue
         try:
-            with h5py.File(path, 'r') as f:
-                if 'do' in f:
-                    do_data = f['do'][:].T  # 转置为行优先格式
-                    df = pd.DataFrame(do_data, columns=columns)
-                    all_data.append(df)
-                    print(f"Successfully read and processed {path}")
-                else:
-                    print(f"Warning: 'do' dataset not found in {path}")
+            with h5py.File(p, 'r') as f:
+                if 'do' not in f:
+                    print(f"  - 'do' dataset absent in {p}, skipping")
+                    continue
+                do_data = f['do'][:].T  # 原数据转置为 (n_rows, n_cols)
+                df = pd.DataFrame(do_data, columns=columns[:do_data.shape[1]])  # 防御性截断
+                all_monthly.append(df)
+                print(f"  + Loaded {p}")
         except Exception as e:
-            print(f"Error: Failed to read {path}. Reason: {e}")
+            print(f"  ! Error reading {p}: {e}")
 
-    # --- 3. 合并并保存数据 ---
-    if not all_data:
-        print("\nNo data was loaded. Nothing to save.")
+    if not all_monthly:
+        print(f"[convert_mat_to_parquet] No monthly data loaded for {year_str}; abort.")
         return
 
-    print("\nConcatenating all loaded data...")
-    final_df = pd.concat(all_data, ignore_index=True)
-
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 构建输出文件路径并保存
-    output_path = os.path.join(output_dir, f"Argo{year_str}.parquet")
+    final_df = pd.concat(all_monthly, ignore_index=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f'Argo{year_str}.parquet'
     try:
-        final_df.to_parquet(output_path, index=False)
-        print(f"\nSuccess! All data for {year_str} successfully saved to:")
-        print(f"  -> {output_path}")
+        final_df.to_parquet(out_path, index=False)
+        print(f"[convert_mat_to_parquet] Saved merged parquet: {out_path}")
     except Exception as e:
-        print(f"\nError: Failed to save Parquet file. Reason: {e}")
+        print(f"[convert_mat_to_parquet] Failed to save {out_path}: {e}")
 
 def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
     """
@@ -389,8 +476,8 @@ def process_argo_txt_to_yearly_parquet_dask(
     print(f"[Success] 所有任务完成！总耗时: {(end_total_time - start_total_time)/60:.2f} 分钟。")
     print("==================================================")
 
-def load_argo_data(year: int, data_dir: str = './Argo_data', 
-    variable_selection: dict | None = None) -> pd.DataFrame:
+def load_argo_data(year: int, data_dir: str | Path = None,
+                   variable_selection: dict | None = None) -> pd.DataFrame:
     """
     加载指定年份的 Argo Parquet 数据文件，并进行列名规范化和变量选择。
 
@@ -400,19 +487,20 @@ def load_argo_data(year: int, data_dir: str = './Argo_data',
            (Temperature, DO, Salinity) 分别来源于文件中的哪一列数据。
 
     参数:
-        year (int): 
-            需要加载的数据年份, 例如 2014。
-        data_dir (str, optional): 
-            存放 Argo Parquet 文件的目录。默认为 './Argo_data'。
-        variable_selection (dict | None, optional): 
-            一个字典，用于覆盖默认的变量来源。未指定的键将使用默认值。
-            例如: {'Salinity': 'PSAL_WOA'} 只会更改盐度来源。
-            默认来源为: {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}
+        year (int): 需要加载的数据年份 (例如 2014)。
+        data_dir (str | Path | None): Argo Parquet 所在目录；None → paths.yml: argo_parquet。
+        variable_selection (dict | None): 覆盖默认变量来源映射，例如 {'Salinity':'PSAL_WOA'}。
+            默认: {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}
 
     返回:
         pd.DataFrame: 一个包含处理后 Argo 数据的 pandas DataFrame，其列名和数据源
                       均已根据参数进行了标准化。
     """
+    if data_dir is None:
+        data_dir = argo_path
+    else:
+        data_dir = Path(data_dir)
+
     # --- 1. 定义并合并变量选择 ---
     # 定义默认选择
     default_selection = {
@@ -511,10 +599,10 @@ def is_point_in_contour(row: pd.Series) -> bool:
         return False
 
 def filtered_float_data(
-    DS: list, 
+    DS: list,
     no: int,
-    argo_data_dir: str | Path = './Argo_data',
-    circle_enlargement_factor: float = 1.2
+    argo_data_dir: str | Path = None,
+    circle_enlargement_factor: float | None = None
 ) -> pd.DataFrame:
     """
     根据涡旋轨迹，动态加载并筛选匹配的Argo浮标剖面数据。
@@ -530,14 +618,20 @@ def filtered_float_data(
         no (int): 
             需要筛选的涡旋的唯一编号。
         argo_data_dir (str | Path, optional): 
-            存放Argo Parquet文件的目录。默认为 './Argo_data'。
-        circle_enlargement_factor (float, optional): 
-            筛选过程中涡旋半径的放大倍数。默认为 1.2。
+            存放Argo Parquet文件的目录。None 时使用配置文件 paths.yml 中的 argo_parquet。
+        circle_enlargement_factor (float | None, optional): 
+            为 None 时使用配置 processing.yml 中的 circle_enlargement_factor。
 
     返回:
         pd.DataFrame: 一个包含所有匹配的Argo剖面完整数据的DataFrame（所有深度层级）。
                       如果无匹配数据，则返回一个空的DataFrame。
     """
+    # 参数回退
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    if circle_enlargement_factor is None:
+        circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
+
     # --- 1. 准备涡旋数据 ---
     # print(f"[*] Preparing track data for eddy ID {no}...")
     wanted_track = find_track(DS, no)
@@ -3354,7 +3448,14 @@ def init_worker(eddy_data_shared: dict):
     global worker_eddy_datasets
     worker_eddy_datasets = eddy_data_shared
 
-def check_single_track(track_data, argo_points_by_date, start_date, end_date, ds_name):
+def check_single_track(
+    track_data,
+    argo_points_by_date,
+    start_date,
+    end_date,
+    ds_name,
+    circle_enlargement_factor: float | None = None
+):
     """
     (内部辅助函数) 检查单个涡旋轨迹是否与Argo数据有交集。
 
@@ -3378,6 +3479,9 @@ def check_single_track(track_data, argo_points_by_date, start_date, end_date, ds
     indices_in_range = np.where((dates >= start_date) & (dates <= end_date))[0]
     if indices_in_range.size == 0:
         return None
+
+    if circle_enlargement_factor is None:
+        circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
 
     has_interaction = False
     contours_to_plot = []
@@ -3421,6 +3525,7 @@ def plot_all_tracks_in_range(
     plot_unrelated_argo: bool = True,
     save_fig: bool = False,
     show_fig: bool = True,
+    circle_enlargement_factor: float | None = None,
     do_threshold: float = 50.0,
     salinity_threshold: float = 0.0,
     temperature_threshold: float = 0.0,
@@ -3457,6 +3562,8 @@ def plot_all_tracks_in_range(
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
+    if circle_enlargement_factor is None:
+        circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
     # 如果作为并行worker运行，eddy_datasets会是None，此时从全局变量获取
     if local_eddy_datasets is None:
         global worker_eddy_datasets
@@ -3527,7 +3634,17 @@ def plot_all_tracks_in_range(
 
     # --- 3. 检查所有涡旋轨迹 ---
     all_tracks_with_names = [(track, ds_name) for ds_name, ds_data in local_eddy_datasets.items() for track in ds_data]
-    results = [check_single_track(track, argo_points_by_date, start_date, end_date, ds_name) for track, ds_name in all_tracks_with_names]
+    results = [
+        check_single_track(
+            track,
+            argo_points_by_date,
+            start_date,
+            end_date,
+            ds_name,
+            circle_enlargement_factor=circle_enlargement_factor
+        )
+        for track, ds_name in all_tracks_with_names
+    ]
 
     # --- 4. 绘图 ---
     world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
