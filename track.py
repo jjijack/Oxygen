@@ -85,7 +85,7 @@ _PROC_CFG = _load_yaml('config/processing.yml')
 argo_origin_path = Path(_PATHS_CFG.get('paths', {}).get('argo_origin', './Argo_origin'))
 tmp_parquet_path = Path(_PATHS_CFG.get('paths', {}).get('argo_intermediate', './Argo_data_tmp'))
 argo_path = Path(_PATHS_CFG.get('paths', {}).get('argo_parquet', './Argo_data'))
-_argo_mat_input_dir = _PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat')
+argo_mat_input_path = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
 Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLORYS')
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
@@ -113,6 +113,27 @@ _default_depth_merge_tolerance = float(
 _default_duplicate_depth_strategy = _PROC_CFG.get('processing', {}).get('duplicate_depth_strategy', 'best_qc')
 
 # -------------------------------------------------------------------------------
+
+def print_current_processing_defaults():
+        """打印当前生效的处理参数全局默认值（从 processing.yml 读取/回退）。
+
+        包含：
+            circle_enlargement_factor,
+            distance_deg_per_meter,
+            delta_do_threshold / salinity_threshold / temperature_threshold,
+            depth_interval / depth_merge_tolerance / duplicate_depth_strategy。
+
+        目的：调试与运行时确认当前配置，无返回值。
+        """
+        print("[Processing Defaults]")
+        print(f"  circle_enlargement_factor : {circle_enlargement_factor}")
+        print(f"  distance_deg_per_meter    : {_distance_deg_per_meter}")
+        print(f"  delta_do_threshold        : {_default_delta_do_threshold}")
+        print(f"  salinity_threshold        : {_default_salinity_threshold}")
+        print(f"  temperature_threshold     : {_default_temperature_threshold}")
+        print(f"  depth_interval            : {_default_depth_interval}")
+        print(f"  depth_merge_tolerance     : {_default_depth_merge_tolerance}")
+        print(f"  duplicate_depth_strategy  : {_default_duplicate_depth_strategy}")
 
 def switch_region(region_name: str, config_path: str | Path = 'config/regions.yml'):
     """在运行时切换默认区域（无需改 YAML），并刷新全局经纬度。
@@ -230,7 +251,7 @@ def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: 
     """
     year_str = str(year)
     if input_dir is None:
-        input_dir = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
+        input_dir = argo_mat_input_path
     else:
         input_dir = Path(input_dir)
     if output_dir is None:
@@ -693,7 +714,7 @@ def filtered_float_data(
     argo_coords = merged_df[['Longitude', 'Latitude']].values
     eddy_centers = merged_df[['center_lon', 'center_lat']].values
     distances = np.linalg.norm(argo_coords - eddy_centers, axis=1) # 批量计算所有点对的距离
-    radii_deg = (merged_df['radius'].values / 111320) * circle_enlargement_factor
+    radii_deg = (merged_df['radius'].values / _distance_deg_per_meter) * circle_enlargement_factor
     inside_circle_mask = distances <= radii_deg
     
     # 5.3 合并两种筛选条件
@@ -726,12 +747,12 @@ def plot_track(
     show_fig: bool = True,
     plot_radius: bool = False,
     connection_threshold_days: int = 5,
-    do_threshold: float = 50.0,
-    salinity_threshold: float = 0.0,
-    temperature_threshold: float = 0.0,
-    depth_interval: float = 100.0,
-    depth_merge_tolerance: float = 10.0,
-    duplicate_depth_strategy: str = 'best_qc',
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
     anomaly_min_depth: float | None = 300.0,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
@@ -765,7 +786,7 @@ def plot_track(
         connection_threshold_days (int, optional):
             连接 Argo 交互点的最大天数阈值。默认为 5 天。
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 
-            传递给 calculate_delta_do 的参数。
+            传递给 calculate_delta_do；若为 None 则回退到全局配置默认。
         anomaly_min_depth (float | None): 
             ΔDO 异常最小深度限制；None 表示不限制。
         plot_unrelated_argo (bool): 
@@ -779,6 +800,20 @@ def plot_track(
     """
     # --- 1. 准备涡旋和Argo数据 ---
     print(f"[*] Preparing data for eddy ID {no}...")
+
+    # 参数回退
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None:
+        salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None:
+        temperature_threshold = _default_temperature_threshold
+    if depth_interval is None:
+        depth_interval = _default_depth_interval
+    if depth_merge_tolerance is None:
+        depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None:
+        duplicate_depth_strategy = _default_duplicate_depth_strategy
     
     # 获取涡旋轨迹并转换为DataFrame
     wanted_track = find_track(DS, no)
@@ -922,7 +957,7 @@ def plot_track(
         if plot_radius:
             radius_color = 'r' if 'AC' in ds_name else 'purple'
             circle_label = 'Effective Radius' if not labeled_radius else None
-            circle = plt.Circle((eddy_day['center_lon'], eddy_day['center_lat']), eddy_day['radius'] / 111320.0,
+            circle = plt.Circle((eddy_day['center_lon'], eddy_day['center_lat']), eddy_day['radius'] / _distance_deg_per_meter,
                                 color=radius_color, fill=False, linestyle='--', alpha=0.4, linewidth=1.5, label=circle_label)
             ax.add_patch(circle)
             labeled_radius = True
@@ -1215,8 +1250,8 @@ def plot_vertical(
                                 idx_track = idx_track_list[0]
                                 center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
                                 if radius > 1e-6:
-                                    rel_x = (rows.iloc[0]['Longitude'] - center_lon) / (radius / 111320.0)
-                                    rel_y = (rows.iloc[0]['Latitude'] - center_lat) / (radius / 111320.0)
+                                    rel_x = (rows.iloc[0]['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
+                                    rel_y = (rows.iloc[0]['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
                                     distance = np.sqrt(rel_x**2 + rel_y**2)
                                     color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
                     elif color_mode == 'time':
@@ -1357,8 +1392,8 @@ def plot_vertical(
                         idx_track = idx_track_list[0]
                         center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
                         if radius > 1e-6:
-                            rel_x = (profile_info['lon'] - center_lon) / (radius / 111320.0)
-                            rel_y = (profile_info['lat'] - center_lat) / (radius / 111320.0)
+                            rel_x = (profile_info['lon'] - center_lon) / (radius / _distance_deg_per_meter)
+                            rel_y = (profile_info['lat'] - center_lat) / (radius / _distance_deg_per_meter)
                             distance = np.sqrt(rel_x**2 + rel_y**2)
                             color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
             elif color_mode == 'time':
@@ -1576,8 +1611,8 @@ def plot_relative_position(
                     if 'Longitude' not in p_row or 'Latitude' not in p_row:
                         # print(f"Skipping point on {current_date_profile.date()} due to missing Longitude/Latitude.")
                         continue
-                    rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
-                    rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
+                    rel_x = (p_row['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
+                    rel_y = (p_row['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
                     points_for_this_platform.append({
                         'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date_profile,
                         'profile_num_original_idx': p_row['Profile_number'], # 用于 'time' mode
@@ -1637,7 +1672,7 @@ def plot_relative_position(
                 mean_radius = np.mean([info[2] for info in track_info_for_this_platform])
 
                 if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
-                    mean_degrees = mean_radius / 111320.0
+                    mean_degrees = mean_radius / _distance_deg_per_meter
                 
                     tick_locs = [-1, -0.5, 0, 0.5, 1] # 使用更详细的刻度
                 
@@ -1734,8 +1769,8 @@ def plot_relative_position(
             if 'Longitude' not in p_row or 'Latitude' not in p_row:
                 continue
 
-            rel_x = (p_row['Longitude'] - center_lon) / (radius / 111320.0)
-            rel_y = (p_row['Latitude'] - center_lat) / (radius / 111320.0)
+            rel_x = (p_row['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
+            rel_y = (p_row['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
 
             points_to_plot.append({'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date, 'day_label': day_label})
             all_track_info_for_overall_mean.append([center_lon, center_lat, radius])
@@ -1804,7 +1839,7 @@ def plot_relative_position(
         mean_center_lat = np.mean([info[1] for info in all_track_info_for_overall_mean])
         mean_radius = np.mean([info[2] for info in all_track_info_for_overall_mean])
         if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
-            mean_degrees = mean_radius / 111320.0
+            mean_degrees = mean_radius / _distance_deg_per_meter
             tick_locs = [-1, -0.5, 0, 0.5, 1]
             x_tick_labels = [f"{(mean_center_lon + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
             y_tick_labels = [f"{(mean_center_lat + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
@@ -2214,7 +2249,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         print(f"No Argo data available for eddy {ds_names}{no} at the specified index {needed_idx}.")
 
     # 绘制当前时刻涡旋
-    circle = plt.Circle((center_lon[needed_idx], center_lat[needed_idx]), radius[needed_idx] / 111320.0,
+    circle = plt.Circle((center_lon[needed_idx], center_lat[needed_idx]), radius[needed_idx] / _distance_deg_per_meter,
                         color='r', fill=False, linestyle='--', alpha=0.2, linewidth=circle_lw, label='Effective Radius')
     ax.add_patch(circle)
     ax.scatter(center_lon[needed_idx], center_lat[needed_idx], color='black', s=20, label='Eddy Center', zorder=5)
@@ -2671,7 +2706,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
             profile_data_dict[standard_name] = np.ma.masked_invalid(interpolated_values_flat.reshape(len(z_coords), len(profile_lons)))
 
         # --- 3. 计算边界投影 ---
-        effective_radius_deg = radius[needed_idx] / 111320.0
+        effective_radius_deg = radius[needed_idx] / _distance_deg_per_meter
         A, B = 1 + k_val**2, 2 * (k_val*b_val - k_val*current_center_lat - current_center_lon)
         C = current_center_lon**2 + (b_val - current_center_lat)**2 - effective_radius_deg**2
         discriminant = B**2 - 4*A*C
@@ -3494,7 +3529,7 @@ def check_single_track(
                 center = np.array([center_lon[i], center_lat[i]])
                 point_coord = np.array([argo_point.x, argo_point.y])
                 distance = np.linalg.norm(point_coord - center)
-                inside_circle = distance <= (radius[i] / 111320) * circle_enlargement_factor
+                inside_circle = distance <= (radius[i] / _distance_deg_per_meter) * circle_enlargement_factor
                 if inside_poly or inside_circle:
                     contours_to_plot.append((contour_lon[i], contour_lat[i]))
                     has_interaction = True
@@ -3526,12 +3561,12 @@ def plot_all_tracks_in_range(
     save_fig: bool = False,
     show_fig: bool = True,
     circle_enlargement_factor: float | None = None,
-    do_threshold: float = 50.0,
-    salinity_threshold: float = 0.0,
-    temperature_threshold: float = 0.0,
-    depth_interval: float = 100.0,
-    depth_merge_tolerance: float = 10.0,
-    duplicate_depth_strategy: str = 'best_qc',
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
     anomaly_min_depth: float | None = 300.0,
     anomaly_color_by: str = 'delta_do',
     fix_delta_do_colorbar: bool = True,
@@ -3564,6 +3599,18 @@ def plot_all_tracks_in_range(
     local_eddy_datasets = eddy_datasets
     if circle_enlargement_factor is None:
         circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None:
+        salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None:
+        temperature_threshold = _default_temperature_threshold
+    if depth_interval is None:
+        depth_interval = _default_depth_interval
+    if depth_merge_tolerance is None:
+        depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None:
+        duplicate_depth_strategy = _default_duplicate_depth_strategy
     # 如果作为并行worker运行，eddy_datasets会是None，此时从全局变量获取
     if local_eddy_datasets is None:
         global worker_eddy_datasets
@@ -4018,12 +4065,12 @@ def calculate_delta_do(
     do_col: str = 'DO',
     salinity_col: str = 'Salinity',
     temperature_col: str = 'Temperature',
-    depth_interval: float = 100.0,
-    do_threshold: float = 50.0,
-    salinity_threshold: float = 0.0,
-    temperature_threshold: float = 0.0,
-    depth_merge_tolerance: float = 10.0,
-    duplicate_depth_strategy: str = 'best_qc',
+    depth_interval: float | None = None,
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
     remove_outliers: bool = True,
     verbose: bool = False
 ) -> pd.DataFrame:
@@ -4044,13 +4091,12 @@ def calculate_delta_do(
         do_col (str): 溶解氧列名，默认 'DO'。
         salinity_col (str): 盐度列名，默认 'Salinity'。
         temperature_col (str): 温度列名，默认 'Temperature'。
-        depth_interval (float): 深度窗口半宽（dbar），默认 100.0（总宽度 2*Δp）。
-        do_threshold (float): ΔDO 判定阈值（μmol/kg），默认 50.0。
-        salinity_threshold (float): ΔSalinity 可选阈值（psu）；≤0 表示不启用盐度过滤，默认 0.0。
-        temperature_threshold (float): ΔTemperature 可选阈值（°C）；≤0 表示不启用温度过滤，默认 0.0。
-        depth_merge_tolerance (float): 同一 Profile 内“深度近邻合并”阈值（dbar）。若两个候选点深度差小于该值，仅保留 delta_do 较大的记录；设为 ≤0 表示不合并，默认 10.0。
-        duplicate_depth_strategy (str): 处理同一剖面内“同深度多条记录”的策略。
-            可选 'best_qc'|'first'|'mean'|'max'|'min'（默认 'best_qc'：按 DO 的 QC 优先级 1>2>5>8 选最佳；并列取首个）。
+        depth_interval (float | None): 深度窗口半宽；None → 全局 `_default_depth_interval`。
+        do_threshold (float | None): ΔDO 阈值；None → `_default_delta_do_threshold`。
+        salinity_threshold (float | None): 盐度阈值；None → `_default_salinity_threshold`；≤0 不启用过滤。
+        temperature_threshold (float | None): 温度阈值；None → `_default_temperature_threshold`；≤0 不启用过滤。
+        depth_merge_tolerance (float | None): 深度近邻合并阈值；None → `_default_depth_merge_tolerance`；≤0 不合并。
+        duplicate_depth_strategy (str | None): 同深度多记录聚合策略；None → `_default_duplicate_depth_strategy`。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
         verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
 
@@ -4060,6 +4106,10 @@ def calculate_delta_do(
         do_value, salinity_value, temperature_value，
         以及 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）。
         若无满足条件记录，返回空表。
+    
+    提示:
+        可调用 `print_current_processing_defaults()` 查看当前全局默认阈值与处理参数，
+        以便核对本函数 None 回退所采用的配置来源。
     """
     
     # 检查必要的列是否存在
@@ -4083,6 +4133,20 @@ def calculate_delta_do(
     
     processed_profiles = 0
     
+    # 参数回退（放在循环外，避免每个剖面重复判定）
+    if depth_interval is None:
+        depth_interval = _default_depth_interval
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None:
+        salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None:
+        temperature_threshold = _default_temperature_threshold
+    if depth_merge_tolerance is None:
+        depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None:
+        duplicate_depth_strategy = _default_duplicate_depth_strategy
+
     for profile_num, profile_data in profile_groups:
         # 质量控制：移除异常值和质量标记不良的数据
         if remove_outliers:
