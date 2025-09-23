@@ -21,6 +21,7 @@ import h5py
 import time as tm
 import shutil
 from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
 import dask.dataframe as dd
 from dask.distributed import Client
 from tqdm.auto import tqdm
@@ -92,9 +93,7 @@ Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLOR
 circle_enlargement_factor = float(
     _PROC_CFG.get('processing', {}).get('circle_enlargement_factor', 1.2)
 )
-_distance_deg_per_meter = float(
-    _PROC_CFG.get('processing', {}).get('distance_earth_deg_per_meter', 111320.0)
-)
+# 已弃用的平均米/度常量删除，统一使用 approximate_degree_length 计算局地尺度
 _default_delta_do_threshold = float(
     _PROC_CFG.get('processing', {}).get('default_delta_do_threshold', 50.0)
 )
@@ -111,6 +110,12 @@ _default_depth_merge_tolerance = float(
     _PROC_CFG.get('processing', {}).get('depth_merge_tolerance', 10.0)
 )
 _default_duplicate_depth_strategy = _PROC_CFG.get('processing', {}).get('duplicate_depth_strategy', 'best_qc')
+_default_adaptive_lat_threshold = float(
+    _PROC_CFG.get('processing', {}).get('adaptive_lat_threshold', 70.0)
+)
+_default_adaptive_distance_threshold_km = float(
+    _PROC_CFG.get('processing', {}).get('adaptive_distance_threshold_km', 300.0)
+)
 
 # -------------------------------------------------------------------------------
 
@@ -127,13 +132,261 @@ def print_current_processing_defaults():
         """
         print("[Processing Defaults]")
         print(f"  circle_enlargement_factor : {circle_enlargement_factor}")
-        print(f"  distance_deg_per_meter    : {_distance_deg_per_meter}")
         print(f"  delta_do_threshold        : {_default_delta_do_threshold}")
         print(f"  salinity_threshold        : {_default_salinity_threshold}")
         print(f"  temperature_threshold     : {_default_temperature_threshold}")
         print(f"  depth_interval            : {_default_depth_interval}")
         print(f"  depth_merge_tolerance     : {_default_depth_merge_tolerance}")
         print(f"  duplicate_depth_strategy  : {_default_duplicate_depth_strategy}")
+
+def approximate_degree_length(lat: float | np.ndarray, lon: float | np.ndarray | None = None) -> dict:
+    """计算指定纬度（可选经度）处经纬度与距离的近似换算关系。
+
+    采用 WGS84 椭球常用的近似级数公式 (单位: 米/度)，适用于绝大多数海洋学分析精度需求。
+
+    公式来源（展开项保留到 cos(5φ)/cos(6φ)）：
+        meters_per_degree_lat ≈ 111132.92 - 559.82*cos(2φ) + 1.175*cos(4φ) - 0.0023*cos(6φ)
+        meters_per_degree_lon ≈ 111412.84*cos(φ) - 93.5*cos(3φ) + 0.118*cos(5φ)
+
+    参数:
+        lat (float | np.ndarray): 纬度（度）。可为标量或 numpy 数组。
+        lon (float | np.ndarray | None): 经度（度）。对当前计算不影响，只是为了接口对称；
+            可传入与 lat 同形状数组（将被忽略）。保留此参数便于未来扩展（比如考虑地形加权等）。
+
+    返回:
+        dict: 包含以下键：
+            meters_per_degree_lat: 指定纬度上一度纬差对应的米数
+            meters_per_degree_lon: 指定纬度上一度经差对应的米数
+            degrees_per_meter_lat: 上述量的倒数（度/米）
+            degrees_per_meter_lon: 上述量的倒数（度/米）
+
+    备注:
+        1. 若输入为数组，则返回值各字段为同形状 numpy 数组。
+        2. 该函数提供纬度依赖的更精细米/度估计，替代旧的单一平均值。
+        3. 用于将“米单位半径”换算到“角度半径”时，推荐： radius_deg_lat = radius_m / meters_per_degree_lat。
+    """
+    # 转换为 numpy 数组以统一处理
+    lat_arr = np.asarray(lat, dtype=float)
+    phi = np.deg2rad(lat_arr)
+
+    # 分别计算纬度与经度方向一度的米数（WGS84 近似）
+    meters_per_degree_lat = (
+        111132.92
+        - 559.82 * np.cos(2 * phi)
+        + 1.175 * np.cos(4 * phi)
+        - 0.0023 * np.cos(6 * phi)
+    )
+    meters_per_degree_lon = (
+        111412.84 * np.cos(phi)
+        - 93.5 * np.cos(3 * phi)
+        + 0.118 * np.cos(5 * phi)
+    )
+
+    # 倒数（度/米）。对 0 做防护：若 cos(phi) ~ 0（极点），经向一度长度 → 0，避免除零设为 np.inf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        degrees_per_meter_lat = 1.0 / meters_per_degree_lat
+        degrees_per_meter_lon = np.where(meters_per_degree_lon != 0, 1.0 / meters_per_degree_lon, np.inf)
+
+    result = {
+        'meters_per_degree_lat': meters_per_degree_lat,
+        'meters_per_degree_lon': meters_per_degree_lon,
+        'degrees_per_meter_lat': degrees_per_meter_lat,
+        'degrees_per_meter_lon': degrees_per_meter_lon,
+    }
+
+    # 若输入是标量（非数组或0维），将结果中对应项转换为原生 float，避免下游出现 0-d ndarray 序列化/打印差异
+    if np.asarray(lat).shape == ():
+        for k, v in result.items():
+            # v 可能是 ndarray 标量或 Python float
+            if isinstance(v, np.ndarray) and v.shape == ():
+                result[k] = v.item()
+    return result
+
+def _minimal_lon_diff_deg(lon: float | np.ndarray, lon0: float) -> np.ndarray:
+    """计算经度差并映射到 (-180, 180] 区间，支持标量或数组。
+
+    用于跨日界线区域，保证 179.8° 与 -179.7° 的差为 0.5° 而不是 -359.5°。
+    """
+    d = np.asarray(lon) - lon0
+    return (d + 180.0) % 360.0 - 180.0
+
+def local_xy_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
+                        lon0: float, lat0: float, wrap_dateline: bool = True) -> np.ndarray:
+    """计算点 (lon,lat) 到参考点 (lon0,lat0) 的局地平面近似距离（米）。
+
+    参数:
+        lon, lat: 点的经纬度，可为标量或数组（广播到与 lon 相同形状）。
+        lon0, lat0: 参考中心（标量）。
+        wrap_dateline: 是否对经度差进行跨日界线 (±180°) 最短差处理。
+
+    说明:
+        1. 使用纬度依赖的经/纬一度长度（WGS84 近似）。在中低纬、距离 <~500 km 下平面近似足够。
+        2. 若距离很大或靠近极区，平面近似误差增大，可考虑改用大圆距离（后续可扩展）。
+        3. wrap_dateline=True 时能正确处理 179.9° 与 -179.9° 仅 0.2° 之差的情况。
+    """
+    scale = approximate_degree_length(lat0)
+    m_per_deg_lat = scale['meters_per_degree_lat']
+    m_per_deg_lon = scale['meters_per_degree_lon']
+    dlon = _minimal_lon_diff_deg(lon, lon0) if wrap_dateline else (np.asarray(lon) - lon0)
+    dlat = np.asarray(lat) - lat0
+    dx_m = dlon * m_per_deg_lon
+    dy_m = dlat * m_per_deg_lat
+    return np.hypot(dx_m, dy_m)
+
+def great_circle_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
+                            lon0: float, lat0: float, wrap_dateline: bool = True,
+                            radius_earth_m: float = 6371000.0) -> np.ndarray:
+    """计算球面大圆距离（Haversine 公式），单位: 米。
+
+    设计目标: 简单、稳定、无自动切换逻辑；与 local_xy_distance_m 并存，供需要更精确/大尺度/高纬场景手动调用。
+
+    参数:
+        lon, lat : 目标点经纬度（标量或一维数组）。
+        lon0, lat0 : 中心点经纬度（标量）。
+        wrap_dateline : True 时对经度差做跨日界线最短差归一（±180°）。
+        radius_earth_m : 地球半径（可根据需要调整为更精确椭球平均半径）。
+
+    返回:
+        与输入 (lon, lat) 形状一致的距离（米）。标量输入 → 标量输出。
+
+    说明:
+        Haversine 公式: 
+            a = sin²(Δφ/2) + cos φ1 * cos φ2 * sin²(Δλ/2)
+            c = 2 * asin( sqrt(a) )
+            d = R * c
+        在中短距离下与球面真值非常接近；对极区与大尺度优于局地平面近似。
+    """
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    dlon_deg = _minimal_lon_diff_deg(lon_arr, lon0) if wrap_dateline else (lon_arr - lon0)
+    dlat_deg = lat_arr - lat0
+    dlon = np.deg2rad(dlon_deg)
+    dlat = np.deg2rad(dlat_deg)
+    lat1 = np.deg2rad(lat0)
+    lat2 = np.deg2rad(lat_arr)
+    sin_dlat = np.sin(dlat / 2.0)
+    sin_dlon = np.sin(dlon / 2.0)
+    a = sin_dlat**2 + np.cos(lat1) * np.cos(lat2) * sin_dlon**2
+    # 数值稳定保护：浮点误差可能导致 a 略超 1
+    c = 2.0 * np.arcsin(np.minimum(1.0, np.sqrt(a)))
+    dist = radius_earth_m * c
+    if np.ndim(dist) == 0:
+        return float(dist)
+    return dist
+
+def adaptive_distance_m(
+    lon: float | np.ndarray,
+    lat: float | np.ndarray,
+    lon0: float,
+    lat0: float,
+    wrap_dateline: bool = True,
+    gc_lat_threshold: float | None = None,
+    gc_distance_threshold_km: float | None = None,
+    force_great_circle: bool = False,
+    radius_earth_m: float = 6371000.0
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """自适应距离 (米)。在保持平面估算速度的前提下，自动在高纬或大尺度条件改用大圆距离。
+
+    策略:
+        1. force_great_circle=True 时直接使用大圆（适合全球/大范围批处理）。
+        2. 若 |lat0| >= gc_lat_threshold → 直接大圆，跳过平面计算。
+        3. 否则先计算一次平面近似 (planar)；若最大平面距离 > gc_distance_threshold_km → 改用大圆；否则保留平面结果。
+
+    使用建议:
+        - 全球或大量远距点：直接 force_great_circle=True 减少双重计算。
+        - 中低纬涡旋附近（大多数点在半径数倍内）：保持默认，可获得接近平面距离的速度与足够精度。
+        - 极区或大半径场景对精度敏感：force_great_circle=True。
+
+    参数:
+        lon, lat : 目标点（标量或数组）。
+        lon0, lat0 : 中心经纬度（标量）。
+        gc_lat_threshold : 高纬触发大圆的绝对纬度阈值；None 时使用配置文件 adaptive_lat_threshold。
+        gc_distance_threshold_km : 平面最大距离超过该值 (km) 触发大圆；None 时使用配置文件 adaptive_distance_threshold_km。
+        force_great_circle : 强制使用大圆。
+        radius_earth_m : 地球半径。
+
+    返回:
+        与 (lon, lat) 形状一致的距离；标量输入返回 float。
+    """
+    if gc_lat_threshold is None:
+        gc_lat_threshold = _default_adaptive_lat_threshold
+    if gc_distance_threshold_km is None:
+        gc_distance_threshold_km = _default_adaptive_distance_threshold_km
+
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+
+    # (1) 强制模式：直接大圆
+    if force_great_circle:
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+        return gc
+
+    # (2) 高纬提前判定：无需先算平面
+    if gc_lat_threshold is not None and abs(lat0) >= gc_lat_threshold:
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+        return gc
+
+    # (3) 需要距离阈值判定，才计算平面距离
+    scale = approximate_degree_length(lat0)
+    dlon = _minimal_lon_diff_deg(lon_arr, lon0) if wrap_dateline else (lon_arr - lon0)
+    dlat = lat_arr - lat0
+    planar = np.hypot(
+        dlon * scale['meters_per_degree_lon'],
+        dlat * scale['meters_per_degree_lat']
+    )
+
+    if gc_distance_threshold_km is not None and np.max(planar) > gc_distance_threshold_km * 1000.0:
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+        return gc
+
+    if np.ndim(planar) == 0:
+        return float(planar)
+    return planar
+
+def inside_radius_m_adaptive(
+    lon: float | np.ndarray,
+    lat: float | np.ndarray,
+    lon0: float,
+    lat0: float,
+    radius_m: float | np.ndarray,
+    enlarge: float = 1.0,
+    wrap_dateline: bool = True,
+    gc_lat_threshold: float | None = None,
+    gc_distance_threshold_km: float | None = None,
+    force_great_circle: bool = False
+) -> np.ndarray | bool:
+    """自适应包含判定：与 adaptive_distance_m 策略一致。"""
+    dist = adaptive_distance_m(
+        lon, lat, lon0, lat0,
+        wrap_dateline=wrap_dateline,
+        gc_lat_threshold=gc_lat_threshold,
+        gc_distance_threshold_km=gc_distance_threshold_km,
+        force_great_circle=force_great_circle,
+    )
+    r_arr = np.asarray(radius_m, dtype=float)
+    if r_arr.shape not in ((), np.shape(dist)):
+        r_arr = np.broadcast_to(r_arr, np.shape(dist))
+    inside = dist <= r_arr * enlarge
+    if np.shape(inside) == ():
+        return bool(inside)
+    return inside
+
+def ellipse_patch_for_eddy(lon0: float, lat0: float, radius_m: float, enlarge: float = 1.0,
+                           **kwargs):
+    """构造在经纬度坐标下表示真实米尺度涡旋半径的椭圆补丁。
+
+    在 lon-lat 图上，同一米半径在经向与纬向角度跨度不同（lon 方向按 cos(lat) 收缩），
+    因此绘制为椭圆 (width=Δlon, height=Δlat)。
+    """
+    scale = approximate_degree_length(lat0)
+    m_per_deg_lat = scale['meters_per_degree_lat']
+    m_per_deg_lon = scale['meters_per_degree_lon']
+    radius_eff = radius_m * enlarge
+    dlat = radius_eff / m_per_deg_lat
+    dlon = radius_eff / m_per_deg_lon
+    default_kwargs = dict(edgecolor='gray', facecolor='none', linestyle='--', linewidth=1.0, zorder=3)
+    default_kwargs.update(kwargs)
+    return Ellipse((lon0, lat0), width=2*dlon, height=2*dlat, **default_kwargs)
 
 def switch_region(region_name: str, config_path: str | Path = 'config/regions.yml'):
     """在运行时切换默认区域（无需改 YAML），并刷新全局经纬度。
@@ -623,7 +876,11 @@ def filtered_float_data(
     DS: list,
     no: int,
     argo_data_dir: str | Path = None,
-    circle_enlargement_factor: float | None = None
+    circle_enlargement_factor: float | None = None,
+    use_adaptive_circle: bool = False,
+    adaptive_lat_threshold: float = 70.0,
+    adaptive_distance_threshold_km: float = 300.0,
+    force_great_circle_circle: bool = False
 ) -> pd.DataFrame:
     """
     根据涡旋轨迹，动态加载并筛选匹配的Argo浮标剖面数据。
@@ -634,18 +891,17 @@ def filtered_float_data(
         3. 筛选标准为：浮标位置处于涡旋的有效轮廓内，或处于扩大一定倍数后的有效半径内。
 
     参数:
-        DS (list): 
-            包含所有涡旋轨迹信息的数据集。
-        no (int): 
-            需要筛选的涡旋的唯一编号。
-        argo_data_dir (str | Path, optional): 
-            存放Argo Parquet文件的目录。None 时使用配置文件 paths.yml 中的 argo_parquet。
-        circle_enlargement_factor (float | None, optional): 
-            为 None 时使用配置 processing.yml 中的 circle_enlargement_factor。
+        DS (list): 包含所有涡旋轨迹信息的数据集。
+        no (int): 需要筛选的涡旋的唯一编号。
+        argo_data_dir (str | Path, optional): 存放Argo Parquet文件的目录。None 时使用配置文件 paths.yml 中的 argo_parquet。
+        circle_enlargement_factor (float | None, optional): None 时回退配置值。
+        use_adaptive_circle (bool): 若为 True，则半径匹配的距离用 `adaptive_distance_m`（高纬或大距离自动切换大圆），否则使用局地平面近似。
+        adaptive_lat_threshold (float): |lat| 高于该阈值触发自适应大圆距离计算。
+        adaptive_distance_threshold_km (float): 平面近似距离超过该阈值(km)触发大圆距离计算。
+        force_great_circle_circle (bool): 强制半径距离全部使用大圆（忽略阈值条件）。
 
     返回:
-        pd.DataFrame: 一个包含所有匹配的Argo剖面完整数据的DataFrame（所有深度层级）。
-                      如果无匹配数据，则返回一个空的DataFrame。
+        pd.DataFrame: 匹配的Argo剖面完整数据（所有深度层级）。若无匹配返回空 DataFrame。
     """
     # 参数回退
     if argo_data_dir is None:
@@ -710,12 +966,26 @@ def filtered_float_data(
     # 5.1 检查是否在多边形内部
     inside_poly_mask = merged_df.apply(is_point_in_contour, axis=1)
 
-    # 5.2 检查是否在扩大后的圆内（完全向量化）
-    argo_coords = merged_df[['Longitude', 'Latitude']].values
-    eddy_centers = merged_df[['center_lon', 'center_lat']].values
-    distances = np.linalg.norm(argo_coords - eddy_centers, axis=1) # 批量计算所有点对的距离
-    radii_deg = (merged_df['radius'].values / _distance_deg_per_meter) * circle_enlargement_factor
-    inside_circle_mask = distances <= radii_deg
+    # 5.2 圆内判定
+    if use_adaptive_circle:
+        dist_m = adaptive_distance_m(
+            merged_df['Longitude'].values,
+            merged_df['Latitude'].values,
+            merged_df['center_lon'].values,
+            merged_df['center_lat'].values,
+            wrap_dateline=True,
+            gc_lat_threshold=adaptive_lat_threshold,
+            gc_distance_threshold_km=adaptive_distance_threshold_km,
+            force_great_circle=force_great_circle_circle
+        )
+    else:
+        scale_all = approximate_degree_length(merged_df['center_lat'].values)
+        scale_lat = scale_all['meters_per_degree_lat']
+        scale_lon = scale_all['meters_per_degree_lon']
+        dx_m = (merged_df['Longitude'].values - merged_df['center_lon'].values) * scale_lon
+        dy_m = (merged_df['Latitude'].values - merged_df['center_lat'].values) * scale_lat
+        dist_m = np.hypot(dx_m, dy_m)
+    inside_circle_mask = dist_m <= (merged_df['radius'].values * circle_enlargement_factor)
     
     # 5.3 合并两种筛选条件
     final_mask = inside_poly_mask | inside_circle_mask
@@ -957,9 +1227,12 @@ def plot_track(
         if plot_radius:
             radius_color = 'r' if 'AC' in ds_name else 'purple'
             circle_label = 'Effective Radius' if not labeled_radius else None
-            circle = plt.Circle((eddy_day['center_lon'], eddy_day['center_lat']), eddy_day['radius'] / _distance_deg_per_meter,
-                                color=radius_color, fill=False, linestyle='--', alpha=0.4, linewidth=1.5, label=circle_label)
-            ax.add_patch(circle)
+            scale = approximate_degree_length(eddy_day['center_lat'])
+            deg_height = (eddy_day['radius'] * circle_enlargement_factor) / scale['meters_per_degree_lat']
+            deg_width = (eddy_day['radius'] * circle_enlargement_factor) / scale['meters_per_degree_lon']
+            ell = Ellipse((eddy_day['center_lon'], eddy_day['center_lat']), width=2*deg_width, height=2*deg_height,
+                          edgecolor=radius_color, facecolor='none', linestyle='--', alpha=0.4, linewidth=1.5, label=circle_label)
+            ax.add_patch(ell)
             labeled_radius = True
             
         # 标记交互的起始和结束日期
@@ -1250,8 +1523,11 @@ def plot_vertical(
                                 idx_track = idx_track_list[0]
                                 center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
                                 if radius > 1e-6:
-                                    rel_x = (rows.iloc[0]['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
-                                    rel_y = (rows.iloc[0]['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
+                                    scale = approximate_degree_length(center_lat)
+                                    dx_m = (rows.iloc[0]['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+                                    dy_m = (rows.iloc[0]['Latitude'] - center_lat) * scale['meters_per_degree_lat']
+                                    rel_x = dx_m / radius
+                                    rel_y = dy_m / radius
                                     distance = np.sqrt(rel_x**2 + rel_y**2)
                                     color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
                     elif color_mode == 'time':
@@ -1392,8 +1668,11 @@ def plot_vertical(
                         idx_track = idx_track_list[0]
                         center_lon, center_lat, radius = wanted_track[idx_track][2], wanted_track[idx_track][3], wanted_track[idx_track][8]
                         if radius > 1e-6:
-                            rel_x = (profile_info['lon'] - center_lon) / (radius / _distance_deg_per_meter)
-                            rel_y = (profile_info['lat'] - center_lat) / (radius / _distance_deg_per_meter)
+                            scale = approximate_degree_length(center_lat)
+                            dx_m = (profile_info['lon'] - center_lon) * scale['meters_per_degree_lon']
+                            dy_m = (profile_info['lat'] - center_lat) * scale['meters_per_degree_lat']
+                            rel_x = dx_m / radius
+                            rel_y = dy_m / radius
                             distance = np.sqrt(rel_x**2 + rel_y**2)
                             color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
             elif color_mode == 'time':
@@ -1611,8 +1890,11 @@ def plot_relative_position(
                     if 'Longitude' not in p_row or 'Latitude' not in p_row:
                         # print(f"Skipping point on {current_date_profile.date()} due to missing Longitude/Latitude.")
                         continue
-                    rel_x = (p_row['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
-                    rel_y = (p_row['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
+                    scale = approximate_degree_length(center_lat)
+                    dx_m = (p_row['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+                    dy_m = (p_row['Latitude'] - center_lat) * scale['meters_per_degree_lat']
+                    rel_x = dx_m / radius
+                    rel_y = dy_m / radius
                     points_for_this_platform.append({
                         'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date_profile,
                         'profile_num_original_idx': p_row['Profile_number'], # 用于 'time' mode
@@ -1672,15 +1954,17 @@ def plot_relative_position(
                 mean_radius = np.mean([info[2] for info in track_info_for_this_platform])
 
                 if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
-                    mean_degrees = mean_radius / _distance_deg_per_meter
+                    scale_mean = approximate_degree_length(mean_center_lat)
+                    mean_deg_x = mean_radius / scale_mean['meters_per_degree_lon']
+                    mean_deg_y = mean_radius / scale_mean['meters_per_degree_lat']
                 
                     tick_locs = [-1, -0.5, 0, 0.5, 1] # 使用更详细的刻度
                 
-                    x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
+                    x_tick_labels = [f"{(mean_center_lon + tick_loc * mean_deg_x):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
                     ax.set_xticks(tick_locs)
                     ax.set_xticklabels(x_tick_labels)
 
-                    y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_degrees):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
+                    y_tick_labels = [f"{(mean_center_lat + tick_loc * mean_deg_y):.2f}°\n({tick_loc:.1f})" for tick_loc in tick_locs]
                     ax.set_yticks(tick_locs)
                     ax.set_yticklabels(y_tick_labels)
         
@@ -1769,8 +2053,11 @@ def plot_relative_position(
             if 'Longitude' not in p_row or 'Latitude' not in p_row:
                 continue
 
-            rel_x = (p_row['Longitude'] - center_lon) / (radius / _distance_deg_per_meter)
-            rel_y = (p_row['Latitude'] - center_lat) / (radius / _distance_deg_per_meter)
+            scale = approximate_degree_length(center_lat)
+            dx_m = (p_row['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+            dy_m = (p_row['Latitude'] - center_lat) * scale['meters_per_degree_lat']
+            rel_x = dx_m / radius
+            rel_y = dy_m / radius
 
             points_to_plot.append({'rel_x': rel_x, 'rel_y': rel_y, 'date': current_date, 'day_label': day_label})
             all_track_info_for_overall_mean.append([center_lon, center_lat, radius])
@@ -1839,10 +2126,12 @@ def plot_relative_position(
         mean_center_lat = np.mean([info[1] for info in all_track_info_for_overall_mean])
         mean_radius = np.mean([info[2] for info in all_track_info_for_overall_mean])
         if not np.isnan(mean_center_lon) and not np.isnan(mean_center_lat) and not np.isnan(mean_radius) and mean_radius > 1e-6:
-            mean_degrees = mean_radius / _distance_deg_per_meter
+            scale_mean = approximate_degree_length(mean_center_lat)
+            mean_deg_x = mean_radius / scale_mean['meters_per_degree_lon']
+            mean_deg_y = mean_radius / scale_mean['meters_per_degree_lat']
             tick_locs = [-1, -0.5, 0, 0.5, 1]
-            x_tick_labels = [f"{(mean_center_lon + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
-            y_tick_labels = [f"{(mean_center_lat + t * mean_degrees):.2f}°\n({t})" for t in tick_locs]
+            x_tick_labels = [f"{(mean_center_lon + t * mean_deg_x):.2f}°\n({t})" for t in tick_locs]
+            y_tick_labels = [f"{(mean_center_lat + t * mean_deg_y):.2f}°\n({t})" for t in tick_locs]
             ax.set_xticks(tick_locs)
             ax.set_xticklabels(x_tick_labels)
             ax.set_yticks(tick_locs)
@@ -2249,9 +2538,12 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         print(f"No Argo data available for eddy {ds_names}{no} at the specified index {needed_idx}.")
 
     # 绘制当前时刻涡旋
-    circle = plt.Circle((center_lon[needed_idx], center_lat[needed_idx]), radius[needed_idx] / _distance_deg_per_meter,
-                        color='r', fill=False, linestyle='--', alpha=0.2, linewidth=circle_lw, label='Effective Radius')
-    ax.add_patch(circle)
+    scale_now = approximate_degree_length(center_lat[needed_idx])
+    deg_h = radius[needed_idx] / scale_now['meters_per_degree_lat']
+    deg_w = radius[needed_idx] / scale_now['meters_per_degree_lon']
+    ell_now = Ellipse((center_lon[needed_idx], center_lat[needed_idx]), width=2*deg_w, height=2*deg_h,
+                      edgecolor='r', facecolor='none', linestyle='--', alpha=0.2, linewidth=circle_lw, label='Effective Radius')
+    ax.add_patch(ell_now)
     ax.scatter(center_lon[needed_idx], center_lat[needed_idx], color='black', s=20, label='Eddy Center', zorder=5)
     ax.plot(contour_lon[needed_idx], contour_lat[needed_idx], color=colors, linewidth=contour_lw, alpha=0.5, label='Effective Contour')
 
@@ -2706,7 +2998,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
             profile_data_dict[standard_name] = np.ma.masked_invalid(interpolated_values_flat.reshape(len(z_coords), len(profile_lons)))
 
         # --- 3. 计算边界投影 ---
-        effective_radius_deg = radius[needed_idx] / _distance_deg_per_meter
+        scale_line = approximate_degree_length(current_center_lat)
+        effective_radius_deg = radius[needed_idx] / scale_line['meters_per_degree_lon']  # 使用经向角度跨度近似
         A, B = 1 + k_val**2, 2 * (k_val*b_val - k_val*current_center_lat - current_center_lon)
         C = current_center_lon**2 + (b_val - current_center_lat)**2 - effective_radius_deg**2
         discriminant = B**2 - 4*A*C
@@ -3489,7 +3782,11 @@ def check_single_track(
     start_date,
     end_date,
     ds_name,
-    circle_enlargement_factor: float | None = None
+    circle_enlargement_factor: float | None = None,
+    use_adaptive_circle: bool = False,
+    adaptive_lat_threshold: float = 70.0,
+    adaptive_distance_threshold_km: float = 300.0,
+    force_great_circle_circle: bool = False
 ):
     """
     (内部辅助函数) 检查单个涡旋轨迹是否与Argo数据有交集。
@@ -3504,6 +3801,11 @@ def check_single_track(
         start_date (pd.Timestamp): 检查的开始日期。
         end_date (pd.Timestamp): 检查的结束日期。
         ds_name (str): 数据集名称 (如 'ACS')。
+        circle_enlargement_factor (float | None): 半径放大因子，None 回退全局配置。
+        use_adaptive_circle (bool): True 时半径距离用 `adaptive_distance_m` 自适应大圆。
+        adaptive_lat_threshold (float): |lat| 超过此值触发大圆距离。
+        adaptive_distance_threshold_km (float): 平面距离超过此值(km)触发大圆距离。
+        force_great_circle_circle (bool): 强制使用大圆距离（忽略阈值）。
 
     返回:
         dict | None: 如果涡旋在时间范围内，返回包含绘图信息的字典，否则返回None。
@@ -3529,7 +3831,20 @@ def check_single_track(
                 center = np.array([center_lon[i], center_lat[i]])
                 point_coord = np.array([argo_point.x, argo_point.y])
                 distance = np.linalg.norm(point_coord - center)
-                inside_circle = distance <= (radius[i] / _distance_deg_per_meter) * circle_enlargement_factor
+                if use_adaptive_circle:
+                    distance_m = adaptive_distance_m(
+                        point_coord[0], point_coord[1], center[0], center[1],
+                        wrap_dateline=True,
+                        gc_lat_threshold=adaptive_lat_threshold,
+                        gc_distance_threshold_km=adaptive_distance_threshold_km,
+                        force_great_circle=force_great_circle_circle
+                    )
+                else:
+                    scale_ci = approximate_degree_length(center_lat[i])
+                    dx_m = (point_coord[0] - center[0]) * scale_ci['meters_per_degree_lon']
+                    dy_m = (point_coord[1] - center[1]) * scale_ci['meters_per_degree_lat']
+                    distance_m = np.hypot(dx_m, dy_m)
+                inside_circle = distance_m <= radius[i] * circle_enlargement_factor
                 if inside_poly or inside_circle:
                     contours_to_plot.append((contour_lon[i], contour_lat[i]))
                     has_interaction = True
