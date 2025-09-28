@@ -24,8 +24,13 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 import dask.dataframe as dd
 from dask.distributed import Client
+from dask import delayed, compute
+from dask.diagnostics import ProgressBar
 from tqdm.auto import tqdm
 import yaml
+import json, pyarrow as pa, pyarrow.parquet as pq
+import math
+import zarr
 
 # -------------------- 区域配置加载 --------------------
 def _load_region_config(config_path: str | Path = 'config/regions.yml', region: str | None = None):
@@ -88,6 +93,7 @@ tmp_parquet_path = Path(_PATHS_CFG.get('paths', {}).get('argo_intermediate', './
 argo_path = Path(_PATHS_CFG.get('paths', {}).get('argo_parquet', './Argo_data'))
 argo_mat_input_path = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
 Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLORYS')
+META_root_path = Path(_PATHS_CFG.get('paths', {}).get('meta_root', '../META3.2_DT_allsat'))
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -420,21 +426,34 @@ def switch_region(region_name: str, config_path: str | Path = 'config/regions.ym
     else:
         print(f"[RegionConfig] Switched to region '{region_name}': lon[{lonmin}, {lonmax}], lat[{latmin}, {latmax}]")
 
-def load_meta_data(path, version = 3.2):
+def load_meta_data(path: str | os.PathLike | None = None, version: float = 3.2):
     '''
-    加载meta数据，输出ACS, ACL, CS, CL四个数据集。
-    默认版本为3.2
+    加载 META 涡旋数据，返回 (ACS, ACL, CS, CL)。
+
+    参数:
+        path : META 数据根目录；None 时使用配置文件 `paths.meta_root` (默认 '../META3.2_DT_allsat')。
+        version : 3.1 或 3.2。
+
+    目录期望包含相应命名模式的 NetCDF 文件，例如 (version=3.2):
+        META3.2_DT_allsat_Anticyclonic_short_*.nc
+        META3.2_DT_allsat_Anticyclonic_long_*.nc
+        META3.2_DT_allsat_Cyclonic_short_*.nc
+        META3.2_DT_allsat_Cyclonic_long_*.nc
     '''
+    if path is None:
+        path = META_root_path
+    else:
+        path = Path(path)
     if version == 3.2:
-        ACS= Dataset(os.path.join(path, 'META3.2_DT_allsat_Anticyclonic_short_19930101_20220209.nc'))
-        ACL= Dataset(os.path.join(path, 'META3.2_DT_allsat_Anticyclonic_long_19930101_20220209.nc'))
-        CS= Dataset(os.path.join(path, 'META3.2_DT_allsat_Cyclonic_short_19930101_20220209.nc'))
-        CL= Dataset(os.path.join(path, 'META3.2_DT_allsat_Cyclonic_long_19930101_20220209.nc'))
+        ACS= Dataset(path / 'META3.2_DT_allsat_Anticyclonic_short_19930101_20220209.nc')
+        ACL= Dataset(path / 'META3.2_DT_allsat_Anticyclonic_long_19930101_20220209.nc')
+        CS= Dataset(path / 'META3.2_DT_allsat_Cyclonic_short_19930101_20220209.nc')
+        CL= Dataset(path / 'META3.2_DT_allsat_Cyclonic_long_19930101_20220209.nc')
     elif version == 3.1:
-        ACS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_short_19930101_20200307.nc'))
-        ACL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Anticyclonic_long_19930101_20200307.nc'))
-        CS=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_short_19930101_20200307.nc'))
-        CL=Dataset(os.path.join(path, 'META3.1exp_DT_allsat_Cyclonic_long_19930101_20200307.nc'))
+        ACS=Dataset(path / 'META3.1exp_DT_allsat_Anticyclonic_short_19930101_20200307.nc')
+        ACL=Dataset(path / 'META3.1exp_DT_allsat_Anticyclonic_long_19930101_20200307.nc')
+        CS=Dataset(path / 'META3.1exp_DT_allsat_Cyclonic_short_19930101_20200307.nc')
+        CL=Dataset(path / 'META3.1exp_DT_allsat_Cyclonic_long_19930101_20200307.nc')
     else:
         raise ValueError("Unsupported version. Please use 3.1 or 3.2.")
 
@@ -484,11 +503,493 @@ def area_limit(DS, latmin, latmax, lonmin, lonmax):
               ds.append(current_list)
     return ds
 
-def process_and_save(data, filename):
-    processed = area_limit(data,latmin, latmax, lonmin, lonmax)
-    print(f'{filename.split(".")[0].upper()} count:', len(processed))
-    with open(filename, 'wb') as f:
-        pickle.dump(processed, f)
+def _ensure_meta_tracks_root(root: str | Path | None = None) -> Path:
+    """获取/创建 META_tracks 根目录。优先读取配置 `paths.META_tracks_root`，兼容 `paths.meta_tracks_root`；默认 `./META_tracks`。"""
+    default_root = Path('./META_tracks')
+    paths_cfg = _PATHS_CFG.get('paths', {})
+    cfg_val = paths_cfg.get('META_tracks_root', default_root)
+    cfg_root = Path(cfg_val)
+    if root is not None:
+        cfg_root = Path(root)
+    cfg_root.mkdir(parents=True, exist_ok=True)
+    return cfg_root
+
+def _current_region_key() -> str:
+    # regions.yml 中的 key 并未直接保存在 _REGION_CFG；此处基于 fallback 标志无法反推 key。
+    # 方案：若 _REGION_CFG 包含 name 且不是 fallback，取 name 的 slug；否则 generic。
+    name = _REGION_CFG.get('name') or 'region'
+    slug = name.lower().replace(' ', '_')
+    return slug
+
+def export_meta_tracks(ds: Dataset,
+                       kind: str,
+                       region_key: str | None = None,
+                       output_root: str | Path | None = None,
+                       chunk_size: int = 100_000,
+                       write_contours: bool = False,
+                       build_track_summary: bool = True,
+                       keep_legacy_pickle: bool = False,
+                       use_dask: bool = False,
+                       dask_num_workers: int | None = None,
+                       compact_after: bool = True) -> dict:
+    """流式导出 META 涡旋数据为标准化拆表格式（Parquet + Zarr）。
+
+    输出：
+        - <kind>_daily.parquet   : 每个涡旋每日一行（标量 & 计数）
+        - <kind>_contours.zarr   : 轮廓顶点按 1D 扁平数组存储，含 prefix index（N+1）
+        - <kind>_contours.parquet: (可选) 展开轮廓顶点逐行记录（用于 SQL/分析）
+        - <kind>_tracks.parquet  : (可选) 汇总轨迹层（聚合统计）
+        - <kind>_metadata.json   : 基本元信息（区域、生成时间、列说明、Zarr 路径）
+
+    参数:
+        ds : netCDF4.Dataset (已打开的 META 文件)
+        kind : 标识（如 'acs','acl','cs','cl'）用于文件前缀
+        region_key : 区域 key / slug（默认基于当前 _REGION_CFG['name'] 生成）
+        output_root : 根输出目录（默认 ./META_tracks 或配置 paths.META_tracks_root/meta_tracks_root）
+        chunk_size : indices 分块大小（按满足区域筛选的记录索引数量）
+        write_contours : 是否同时写 contours 的 Parquet 拆表（顶点逐行），Zarr 始终会生成
+        build_track_summary : 是否生成轨迹汇总表
+        keep_legacy_pickle : 是否额外写出旧嵌套结构 pickle（用于临时兼容调试）
+        use_dask : 是否用 Dask 并行按块处理
+        dask_num_workers : Dask 并行进程数
+        compact_after : 是否在完成后直接将目录形式的 Parquet 压实为单文件，并删除目录
+
+    返回:
+        dict: 包含写出的关键文件路径（如 daily_file/daily_dir、tracks_path、contours_zarr、metadata 等）。
+    """
+    # 记录总长度用于分块；避免一次性加载变量
+    try:
+        total_len = ds.dimensions['time'].size
+    except Exception:
+        total_len = ds.variables['time'].shape[0]
+
+    region_slug = region_key or _current_region_key()
+    root = _ensure_meta_tracks_root(output_root)
+    region_dir = root / region_slug
+    region_dir.mkdir(parents=True, exist_ok=True)
+
+    # 输出路径：分片写入使用临时目录，压实后生成同名 .parquet 单文件，避免目录/文件冲突
+    daily_stage = region_dir / f"{kind}_daily_tmp"
+    contours_stage = region_dir / f"{kind}_contours_tmp"
+    contours_zarr_path = region_dir / f"{kind}_contours.zarr"
+    contours_parts_dir = region_dir / f"{kind}_contours_zarr_parts"
+    tracks_path = region_dir / f"{kind}_tracks.parquet"
+    meta_path = region_dir / f"{kind}_metadata.json"
+    legacy_pickle_path = region_dir / f"{kind}_legacy_nested.pkl"
+
+    # 清理旧的分片临时目录（若存在）
+    if daily_stage.exists():
+        if daily_stage.is_dir():
+            shutil.rmtree(daily_stage)
+        else:
+            daily_stage.unlink()
+    if write_contours and contours_stage.exists():
+        if contours_stage.is_dir():
+            shutil.rmtree(contours_stage)
+        else:
+            contours_stage.unlink()
+    # 清理旧 Zarr 目标和分片目录
+    if contours_zarr_path.exists():
+        shutil.rmtree(contours_zarr_path)
+    if contours_parts_dir.exists():
+        shutil.rmtree(contours_parts_dir)
+
+    daily_stage.mkdir(parents=True, exist_ok=True)
+    if write_contours:
+        contours_stage.mkdir(parents=True, exist_ok=True)
+    contours_parts_dir.mkdir(parents=True, exist_ok=True)
+
+    daily_schema = pa.schema([
+        pa.field('track_id', pa.int64()),
+        pa.field('time', pa.timestamp('ns')),
+        pa.field('center_lon', pa.float64()),
+        pa.field('center_lat', pa.float64()),
+        pa.field('max_lon', pa.float64()),
+        pa.field('max_lat', pa.float64()),
+        pa.field('radius', pa.float64()),
+        pa.field('contour_vertex_count', pa.int32()),
+        pa.field('speed_contour_vertex_count', pa.int32()),
+        pa.field('orig_index', pa.int64()),
+    ])
+
+    contour_schema = pa.schema([
+        pa.field('track_id', pa.int64()),
+        pa.field('time', pa.timestamp('ns')),
+        pa.field('kind', pa.string()),  # 'effective' or 'speed'
+        pa.field('vertex_index', pa.int32()),
+        pa.field('lon', pa.float64()),
+        pa.field('lat', pa.float64()),
+    ]) if write_contours else None
+
+    # 构造 chunk 写入
+    def write_daily_chunk(tbl: pa.Table, idx: int):
+        pq.write_table(tbl, daily_stage / f"part_{idx:05d}.parquet")
+
+    def write_contour_chunk(tbl: pa.Table, idx: int, suffix: str):
+        pq.write_table(tbl, contours_stage / f"part_{suffix}_{idx:05d}.parquet")
+
+    # 旧结构临时兼容：按轨迹分组的嵌套列表（外层按 track，内层按日）
+    # 为减少内存占用，使用 dict 累积，每个 track_id -> list[day_item]
+    # day_item 结构与 area_limit 输出一致：[orig_i, time_YYYYMMDD, center_lon, center_lat, max_lon, max_lat, contour_lon[], contour_lat[], radius, speed_contour_lon[], speed_contour_lat[]]
+    legacy_nested = {} if (keep_legacy_pickle and not use_dask) else None
+
+    # 自动决定是否跳过区域筛选：当配置等同于全球范围时跳过
+    is_global_lon = (lonmin <= -179.999) and (lonmax >= 179.999)
+    is_global_lat = (latmin <= -89.999) and (latmax >= 89.999)
+    auto_skip = bool(is_global_lon and is_global_lat)
+
+    # 单块处理函数：可被串行调用，或用 dask.delayed 并发调用
+    def _process_chunk(file_path: str, part_idx: int, start: int, end: int) -> int:
+        ds_local = Dataset(file_path)
+        try:
+            # 读取该块变量
+            time_var = ds_local.variables['time'][start:end]
+            center_lon = ds_local.variables['longitude'][start:end]
+            center_lat = ds_local.variables['latitude'][start:end]
+            n_chunk = len(center_lon)
+            # 区域过滤（单块）；若跳过则全选
+            if auto_skip:
+                sel = np.arange(n_chunk, dtype=int)
+            else:
+                mask = (center_lat >= latmin) & (center_lat <= latmax) & \
+                       (center_lon >= lonmin) & (center_lon <= lonmax)
+                if not np.any(mask):
+                    return 0
+                sel = np.nonzero(mask)[0]
+            # 仅在需要时读取其它变量
+            max_lon = ds_local.variables['longitude_max'][start:end]
+            max_lat = ds_local.variables['latitude_max'][start:end]
+            radius = ds_local.variables['effective_radius'][start:end]
+            track_id = ds_local.variables['track'][start:end]
+            eff_lon = ds_local.variables['effective_contour_longitude'][start:end]
+            eff_lat = ds_local.variables['effective_contour_latitude'][start:end]
+            spd_lon = ds_local.variables['speed_contour_longitude'][start:end]
+            spd_lat = ds_local.variables['speed_contour_latitude'][start:end]
+
+            # 时间转换到 datetime64[ns]
+            time_dt = convert_date(pd.Series(time_var)).to_numpy().astype('datetime64[ns]')
+
+            # 组装并写出
+            rows = []
+            eff_rows = []
+            spd_rows = []
+            # Zarr 分片缓存
+            e_counts_list = []
+            s_counts_list = []
+            eff_concat_lon = []
+            eff_concat_lat = []
+            spd_concat_lon = []
+            spd_concat_lat = []
+            for off in sel:
+                orig_i = start + int(off)
+                v_track = int(track_id[off])
+                v_time = time_dt[off]
+                c_lon = float(center_lon[off])
+                c_lat = float(center_lat[off])
+                mx_lon = float(max_lon[off])
+                mx_lat = float(max_lat[off])
+                rad = float(radius[off])
+                e_lon = eff_lon[off]
+                e_lat = eff_lat[off]
+                s_lon = spd_lon[off]
+                s_lat = spd_lat[off]
+                e_cnt = len(e_lon) if hasattr(e_lon, '__len__') else 0
+                s_cnt = len(s_lon) if hasattr(s_lon, '__len__') else 0
+                rows.append((v_track, v_time, c_lon, c_lat, mx_lon, mx_lat, rad, e_cnt, s_cnt, int(orig_i)))
+
+                if write_contours and e_cnt:
+                    for vi in range(e_cnt):
+                        eff_rows.append((v_track, v_time, 'effective', vi, float(e_lon[vi]), float(e_lat[vi])))
+                if write_contours and s_cnt:
+                    for vi in range(s_cnt):
+                        spd_rows.append((v_track, v_time, 'speed', vi, float(s_lon[vi]), float(s_lat[vi])))
+
+                # 记录 Zarr 分片内容（每日计数与扁平顶点）
+                e_counts_list.append(int(e_cnt))
+                s_counts_list.append(int(s_cnt))
+                if e_cnt:
+                    eff_concat_lon.append(np.asarray(e_lon, dtype='f8'))
+                    eff_concat_lat.append(np.asarray(e_lat, dtype='f8'))
+                if s_cnt:
+                    spd_concat_lon.append(np.asarray(s_lon, dtype='f8'))
+                    spd_concat_lat.append(np.asarray(s_lat, dtype='f8'))
+
+                if legacy_nested is not None:
+                    time_ymd = int(str(v_time)[:10].replace('-', ''))
+                    item = [
+                        int(orig_i), time_ymd, c_lon, c_lat,
+                        mx_lon, mx_lat, e_lon, e_lat, rad, s_lon, s_lat
+                    ]
+                    legacy_nested.setdefault(v_track, []).append(item)
+
+            if rows:
+                daily_tbl = pa.Table.from_pylist([
+                    {
+                        'track_id': r[0], 'time': r[1], 'center_lon': r[2], 'center_lat': r[3],
+                        'max_lon': r[4], 'max_lat': r[5], 'radius': r[6],
+                        'contour_vertex_count': r[7], 'speed_contour_vertex_count': r[8], 'orig_index': r[9]
+                    } for r in rows
+                ], schema=daily_schema)
+                write_daily_chunk(daily_tbl, part_idx)
+
+            if write_contours:
+                if eff_rows:
+                    eff_tbl = pa.Table.from_pylist([
+                        {
+                            'track_id': r[0], 'time': r[1], 'kind': r[2], 'vertex_index': r[3], 'lon': r[4], 'lat': r[5]
+                        } for r in eff_rows
+                    ], schema=contour_schema)
+                    write_contour_chunk(eff_tbl, part_idx, 'eff')
+                if spd_rows:
+                    spd_tbl = pa.Table.from_pylist([
+                        {
+                            'track_id': r[0], 'time': r[1], 'kind': r[2], 'vertex_index': r[3], 'lon': r[4], 'lat': r[5]
+                        } for r in spd_rows
+                    ], schema=contour_schema)
+                    write_contour_chunk(spd_tbl, part_idx, 'spd')
+
+            # 将本分块的 Zarr 数据写为 NPZ 分片，供后续合并
+            if rows:
+                e_counts = np.asarray(e_counts_list, dtype='i8')
+                s_counts = np.asarray(s_counts_list, dtype='i8')
+                eff_lon_concat = np.concatenate(eff_concat_lon) if eff_concat_lon else np.empty((0,), dtype='f8')
+                eff_lat_concat = np.concatenate(eff_concat_lat) if eff_concat_lat else np.empty((0,), dtype='f8')
+                spd_lon_concat = np.concatenate(spd_concat_lon) if spd_concat_lon else np.empty((0,), dtype='f8')
+                spd_lat_concat = np.concatenate(spd_concat_lat) if spd_concat_lat else np.empty((0,), dtype='f8')
+                np.savez_compressed(
+                    contours_parts_dir / f"part_{part_idx:05d}.npz",
+                    eff_lon=eff_lon_concat,
+                    eff_lat=eff_lat_concat,
+                    eff_counts=e_counts,
+                    spd_lon=spd_lon_concat,
+                    spd_lat=spd_lat_concat,
+                    spd_counts=s_counts,
+                )
+            return len(rows)
+        finally:
+            try:
+                ds_local.close()
+            except Exception:
+                pass
+
+    # 生成块边界
+    file_path = ds.filepath() if hasattr(ds, 'filepath') else None
+    if file_path is None:
+        # netCDF4.Dataset 在某些场景没有 filepath 属性，尝试从 repr 中提取失败则报错
+        raise RuntimeError("Dataset filepath unavailable; Dask/streaming requires file path.")
+
+    # 在执行前，根据数据量与目标并发自动调整 chunk_size，避免只有 1 个分块导致只能单核
+    expected_workers = 1
+    if use_dask:
+        expected_workers = int(dask_num_workers) if dask_num_workers else max(1, (os.cpu_count() or 1))
+    parts = max(1, (total_len + chunk_size - 1) // chunk_size)
+    if use_dask and parts < expected_workers:
+        target_parts = max(expected_workers * 3, 2)
+        new_chunk = max(25_000, math.ceil(total_len / target_parts))
+        if new_chunk != chunk_size:
+            print(f"[export_meta_tracks] Auto-tune chunk_size: {chunk_size} -> {new_chunk} (total={total_len}, workers={expected_workers}, target_parts≈{target_parts})")
+            chunk_size = new_chunk
+            parts = max(1, (total_len + chunk_size - 1) // chunk_size)
+
+    print(f"[export_meta_tracks] Plan kind={kind}: total={total_len}, chunk_size={chunk_size}, parts={parts}, parallel={use_dask}, workers={expected_workers}")
+
+    # dask 并行或串行执行
+    wrote_any = False
+    if use_dask:
+        if keep_legacy_pickle:
+            print("[export_meta_tracks] keep_legacy_pickle=True 在 Dask 模式下会占用大量内存，已强制关闭。")
+            legacy_nested = None
+
+    if use_dask:
+        tasks = []
+        part_idx = 0
+        for start in range(0, total_len, chunk_size):
+            end = min(total_len, start + chunk_size)
+            task = delayed(_process_chunk)(file_path, part_idx, start, end)
+            tasks.append(task)
+            part_idx += 1
+        scheduler_kwargs = {}
+        if dask_num_workers is not None:
+            scheduler_kwargs['num_workers'] = dask_num_workers
+        with ProgressBar():
+            results = compute(*tasks, scheduler='processes', **scheduler_kwargs)
+        total_rows = int(np.sum(results))
+        wrote_any = total_rows > 0
+        print(f"[export_meta_tracks] kind={kind} dask-complete parts={len(tasks)} rows={total_rows}")
+    else:
+        parts = (total_len + chunk_size - 1) // chunk_size
+        for part_idx, start in enumerate(tqdm(range(0, total_len, chunk_size), total=parts, desc=f"export {kind} serial", unit="part")):
+            end = min(total_len, start + chunk_size)
+            nrows = _process_chunk(file_path, part_idx, start, end)
+            wrote_any = wrote_any or (nrows > 0)
+            # 串行时不需要额外计数，最终通过分片合并生成 index
+
+    # 轨迹汇总
+    written = {
+        'daily_dir': str(daily_stage),
+        'contours_dir': str(contours_stage) if write_contours else None,
+    }
+
+    if build_track_summary and wrote_any:
+        # 读回 daily parquet dataset 聚合（数据量相比 contours 小得多）
+        daily_dataset = pq.ParquetDataset(daily_stage)
+        daily_tbl = daily_dataset.read()
+        df = daily_tbl.to_pandas()
+        grp = df.groupby('track_id', sort=False)
+        summary = grp.agg(
+            n_points=('time', 'count'),
+            time_start=('time', 'min'),
+            time_end=('time', 'max'),
+            center_lon_mean=('center_lon', 'mean'),
+            center_lat_mean=('center_lat', 'mean'),
+            radius_mean=('radius', 'mean'),
+            radius_max=('radius', 'max'),
+        ).reset_index()
+        pq.write_table(pa.Table.from_pandas(summary), tracks_path)
+        written['tracks_path'] = str(tracks_path)
+
+    # 合并 NPZ 分片为单一 Zarr 存储（支持串行和 Dask）
+    def _merge_zarr_parts(parts_dir: Path, out_path: Path, meta_info: dict):
+        part_files = sorted(parts_dir.glob('part_*.npz'))
+        if not part_files:
+            return None
+        # 第一遍：统计总长度
+        eff_rows_total = 0
+        spd_rows_total = 0
+        eff_vert_total = 0
+        spd_vert_total = 0
+        for pf in part_files:
+            with np.load(pf) as npz:
+                ec = npz['eff_counts']
+                sc = npz['spd_counts']
+                eff_rows_total += int(ec.size)
+                spd_rows_total += int(sc.size)
+                eff_vert_total += int(npz['eff_lon'].size)
+                spd_vert_total += int(npz['spd_lon'].size)
+        # 创建 Zarr 存储
+        if out_path.exists():
+            shutil.rmtree(out_path)
+        root = zarr.open_group(out_path, mode='w')
+        z_eff = root.create_group('effective')
+        z_spd = root.create_group('speed')
+        z_meta = root.create_group('meta')
+        eff_lon_arr = z_eff.create_array('lon', shape=(eff_vert_total,), chunks=(262144,), dtype='f8')
+        eff_lat_arr = z_eff.create_array('lat', shape=(eff_vert_total,), chunks=(262144,), dtype='f8')
+        spd_lon_arr = z_spd.create_array('lon', shape=(spd_vert_total,), chunks=(262144,), dtype='f8')
+        spd_lat_arr = z_spd.create_array('lat', shape=(spd_vert_total,), chunks=(262144,), dtype='f8')
+        eff_idx_arr = z_eff.create_array('index', shape=(eff_rows_total + 1,), chunks=(262144,), dtype='i8')
+        spd_idx_arr = z_spd.create_array('index', shape=(spd_rows_total + 1,), chunks=(262144,), dtype='i8')
+        eff_idx_arr[0] = 0
+        spd_idx_arr[0] = 0
+        z_meta.attrs.update(meta_info)
+        # 第二遍：按顺序写入
+        e_vert_pos = 0
+        s_vert_pos = 0
+        e_row_pos = 0
+        s_row_pos = 0
+        for pf in part_files:
+            with np.load(pf) as npz:
+                ev_lon = npz['eff_lon']; ev_lat = npz['eff_lat']; ec = npz['eff_counts']
+                sv_lon = npz['spd_lon']; sv_lat = npz['spd_lat']; sc = npz['spd_counts']
+                if ev_lon.size:
+                    eff_lon_arr[e_vert_pos:e_vert_pos+ev_lon.size] = ev_lon
+                    eff_lat_arr[e_vert_pos:e_vert_pos+ev_lat.size] = ev_lat
+                    e_vert_pos += int(ev_lon.size)
+                if sv_lon.size:
+                    spd_lon_arr[s_vert_pos:s_vert_pos+sv_lon.size] = sv_lon
+                    spd_lat_arr[s_vert_pos:s_vert_pos+sv_lat.size] = sv_lat
+                    s_vert_pos += int(sv_lon.size)
+                if ec.size:
+                    csum = np.cumsum(ec, dtype=np.int64)
+                    eff_idx_arr[e_row_pos+1:e_row_pos+1+csum.size] = eff_idx_arr[e_row_pos] + csum
+                    e_row_pos += int(ec.size)
+                if sc.size:
+                    csum = np.cumsum(sc, dtype=np.int64)
+                    spd_idx_arr[s_row_pos+1:s_row_pos+1+csum.size] = spd_idx_arr[s_row_pos] + csum
+                    s_row_pos += int(sc.size)
+        return str(out_path)
+
+    contours_zarr_written = None
+    if True:
+        meta_info = {
+            'kind': kind,
+            'region': region_slug,
+            'lon_min': float(lonmin), 'lon_max': float(lonmax),
+            'lat_min': float(latmin), 'lat_max': float(latmax),
+        }
+        try:
+            contours_zarr_written = _merge_zarr_parts(contours_parts_dir, contours_zarr_path, meta_info)
+        finally:
+            if contours_parts_dir.exists():
+                try:
+                    shutil.rmtree(contours_parts_dir)
+                except Exception:
+                    pass
+
+    # 元信息写出
+    meta = {
+        'kind': kind,
+        'region': region_slug,
+        'lon_min': float(lonmin), 'lon_max': float(lonmax),
+        'lat_min': float(latmin), 'lat_max': float(latmax),
+        'generated_at': str(np.datetime64('now')),
+        'columns_daily': [f.name for f in daily_schema],
+        # 兼容旧键：Parquet 顶点拆表
+        'has_contours': write_contours,
+        'contour_schema': [f.name for f in contour_schema] if contour_schema else None,
+        # 新增：Zarr 轮廓信息
+        'has_contours_zarr': bool(contours_zarr_written),
+        'contours_format': 'zarr' if contours_zarr_written else None,
+        'contours_zarr': contours_zarr_written,
+        'track_summary': bool(build_track_summary),
+        'legacy_nested_pickle': bool(keep_legacy_pickle),
+    }
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    written['metadata'] = str(meta_path)
+
+    if keep_legacy_pickle and legacy_nested is not None:
+        # 把 dict 转为 list[list]，保持“首次出现”的轨迹顺序，以及每轨迹内的原始追加顺序
+        nested_list = list(legacy_nested.values())
+        with open(legacy_pickle_path, 'wb') as f:
+            pickle.dump(nested_list, f)
+        written['legacy_pickle'] = str(legacy_pickle_path)
+        print(f"[export_meta_tracks] Legacy nested pickle written: {legacy_pickle_path}")
+
+    # 压实：将目录 Dataset 合并为单文件，并删除目录
+    if wrote_any and compact_after:
+        try:
+            daily_file = compact_parquet_dataset(kind, 'daily', region_slug, root, delete_source=True)
+            written['daily_file'] = daily_file
+            written['daily_dir'] = None
+        except Exception as e:
+            print(f"[export_meta_tracks] compact daily failed: {e}")
+        if write_contours:
+            try:
+                contours_file = compact_parquet_dataset(kind, 'contours', region_slug, root, delete_source=True)
+                written['contours_file'] = contours_file
+                written['contours_dir'] = None
+            except Exception as e:
+                print(f"[export_meta_tracks] compact contours failed: {e}")
+
+    # 简单 Zarr 校验
+    if contours_zarr_written:
+        try:
+            zroot = zarr.open_group(contours_zarr_path, mode='r')
+            eff_idx_len = int(zroot['effective']['index'].shape[0])
+            spd_idx_len = int(zroot['speed']['index'].shape[0])
+            if eff_idx_len != spd_idx_len:
+                print(f"[export_meta_tracks] Warning: effective/speed index length mismatch: {eff_idx_len} vs {spd_idx_len}")
+        except Exception as e:
+            print(f"[export_meta_tracks] Zarr open failed for validation: {e}")
+
+    if not wrote_any:
+        print(f"[export_meta_tracks] No records inside region bounds for kind={kind}.")
+    out_hint = written.get('daily_file', str(daily_stage))
+    if contours_zarr_written:
+        written['contours_zarr'] = contours_zarr_written
+    print(f"[export_meta_tracks] Completed kind={kind}. Daily: {out_hint}; Contours(zarr): {contours_zarr_written}")
+    return written
 
 def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: str | Path = None):
     """将某年份的逐月 Argo .mat 原始文件合并为单一 Parquet。
@@ -550,6 +1051,73 @@ def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: 
         print(f"[convert_mat_to_parquet] Saved merged parquet: {out_path}")
     except Exception as e:
         print(f"[convert_mat_to_parquet] Failed to save {out_path}: {e}")
+
+def compact_parquet_dataset(kind: str,
+                            which: str,
+                            region_key: str | None = None,
+                            output_root: str | Path | None = None,
+                            delete_source: bool = True) -> str:
+    """将目录形式的 Parquet Dataset (many part_*.parquet) 压实为单一文件，并可选删除源目录。
+
+    参数:
+        kind: 数据类型前缀，如 'acs'、'acl'、'cs'、'cl'。
+        which: 'daily' 或 'contours'。
+        region_key: 区域 slug；None 时基于当前区域生成。
+    output_root: 根输出目录；None 则读取配置或使用默认 './META_tracks'。
+        delete_source: 压实完成后是否删除源目录。
+
+    返回:
+        目标单一 Parquet 文件路径（字符串）。
+    """
+    region_slug = region_key or _current_region_key()
+    root = _ensure_meta_tracks_root(output_root)
+    region_dir = root / region_slug
+    if which not in { 'daily', 'contours' }:
+        raise ValueError("which 必须是 'daily' 或 'contours'")
+
+    # 优先使用 *_tmp 作为分片目录；若不存在，则兼容旧的 *_<which>.parquet 目录
+    candidate_dirs = [
+        region_dir / f"{kind}_{which}_tmp",
+        region_dir / f"{kind}_{which}.parquet",
+    ]
+    dir_path = None
+    for cand in candidate_dirs:
+        if cand.exists() and cand.is_dir():
+            dir_path = cand
+            break
+    if dir_path is None:
+        raise FileNotFoundError(f"未找到分片目录: {candidate_dirs[0]} 或 {candidate_dirs[1]}")
+
+    # 目标文件路径（最终与目录同名，但先写 tmp，再替换）
+    tmp_path = region_dir / f"{kind}_{which}.parquet.tmp"
+    final_file = region_dir / f"{kind}_{which}.parquet"
+
+    # 收集分片文件
+    part_files = sorted([p for p in dir_path.glob('*.parquet') if p.is_file()])
+    if not part_files:
+        raise RuntimeError(f"未发现任何分片文件于 {dir_path}")
+
+    # 流式合并
+    first_tbl = pq.read_table(part_files[0])
+    schema = first_tbl.schema
+    # 若存在旧 tmp，先移除
+    if tmp_path.exists():
+        tmp_path.unlink()
+    rows_total = 0
+    with pq.ParquetWriter(tmp_path, schema) as writer:
+        for pf in part_files:
+            tbl = pq.read_table(pf)
+            writer.write_table(tbl)
+            rows_total += tbl.num_rows
+
+    # 删除源目录，重命名 tmp 为最终文件（若已存在则先删除）
+    if delete_source:
+        shutil.rmtree(dir_path)
+    if final_file.exists():
+        final_file.unlink()
+    tmp_path.rename(final_file)
+    print(f"[compact] {which} -> {final_file} (rows≈{rows_total})")
+    return str(final_file)
 
 def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
     """
@@ -1300,29 +1868,63 @@ def plot_track(
     
     plt.close(fig)
     
-def convert_date(days_since_1950: pd.Series) -> pd.Series:
+def convert_date(values: pd.Series | np.ndarray | list | str | int | float) -> pd.Series | pd.Timestamp:
+    """统一将整数/字符串编码日期转为 pandas datetime（日精度）。
+
+    支持两种编码：
+      1) 自 1950-01-01 起的天数 (CF 常见 time 轴)
+      2) YYYYMMDD 8 位整数 (如 20220131)
+
+    返回：
+      - 标量输入（如单个字符串/数字）→ 返回单个 `pd.Timestamp`
+      - 序列输入（Series/ndarray/list）→ 返回 `pd.Series` (dtype=datetime64[ns])，未能解析的元素为 NaT。
     """
-    将以"自1950-01-01以来的天数"表示的数值转换为标准的datetime对象。
+    is_scalar_input = isinstance(values, (str, bytes, int, float, np.integer, np.floating, np.str_))
+    if isinstance(values, pd.Series):
+        ser = values
+    elif is_scalar_input:
+        ser = pd.Series([values])
+    else:
+        # 注意：若 values 是字符串且不想被逐字符拆分，需封装为列表
+        if isinstance(values, (str, bytes, np.str_)):
+            ser = pd.Series([values])
+        else:
+            ser = pd.Series(values)
+    # 结果容器，避免在原 float Series 上就地赋值导致 dtype 警告
+    result = pd.Series(pd.NaT, index=ser.index, dtype='datetime64[ns]')
 
-    功能:
-        采用现代Pandas方法，使用pd.to_timedelta来处理日期运算，
-        以避免版本更新带来的TypeError。
+    non_na = ser.dropna()
+    if non_na.empty:
+        return result.iloc[0] if is_scalar_input else result
 
-    参数:
-        days_since_1950 (pd.Series): 包含天数数值的Pandas Series。
+    # 判定是否全为 8 位 YYYYMMDD
+    try:
+        strs = non_na.astype('int64').astype(str)
+    except Exception:
+        strs = pd.Series([str(x) for x in non_na], index=non_na.index)
+    is_all_yyyymmdd = strs.map(len).eq(8).all()
 
-    返回:
-        pd.Series: 转换后的datetime对象组成的Pandas Series。
-    """
-    # 定义基准日期，使用Pandas的Timestamp对象更佳
+    if is_all_yyyymmdd:
+        parsed = []
+        for s in strs:
+            try:
+                y = int(s[0:4]); m = int(s[4:6]); d = int(s[6:8])
+                parsed.append(pd.Timestamp(year=y, month=m, day=d))
+            except Exception as e:
+                raise ValueError(f"Invalid YYYYMMDD integer {s}: {e}")
+        dt = pd.Series(parsed, index=strs.index)
+        result.loc[dt.index] = dt.values
+        return result.iloc[0] if is_scalar_input else result
+
+    # 默认按 days since 1950-01-01 解析（对浮点会取整）
     t0 = pd.Timestamp('1950-01-01')
-    
-    # 核心步骤：将天数数值的Series转换为Timedelta Series
-    # unit='D' 参数明确地告诉Pandas，这些数值的单位是“天”
-    time_deltas = pd.to_timedelta(days_since_1950, unit='D')
-    
-    # 将基准日期与Timedelta Series相加，这是Pandas完全支持的操作
-    return t0 + time_deltas
+    try:
+        deltas = pd.to_timedelta(non_na.astype('int64'), unit='D')
+        dt = t0 + deltas
+        result.loc[dt.index] = dt.values
+        return result.iloc[0] if is_scalar_input else result
+    except Exception as e:
+        raise ValueError(f"Values neither valid YYYYMMDD nor days-since-1950: {e}")
 
 def plot_vertical(
     DS: list,
