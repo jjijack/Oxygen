@@ -1177,9 +1177,9 @@ def worker_process_file(task_args: tuple[Path, Path]):
 
 
 def process_argo_txt_to_yearly_parquet_dask(
-    origin_dir: Path,
-    temp_dir: Path,
-    final_dir: Path,
+    origin_dir: Path | str | None = None,
+    temp_dir: Path | str | None = None,
+    final_dir: Path | str | None = None,
     cleanup_temp_dir: bool = True
 ):
     """
@@ -1194,12 +1194,28 @@ def process_argo_txt_to_yearly_parquet_dask(
         最后，根据参数选择是否清理所有临时文件。
 
     参数:
-        origin_dir (Path): 存放原始Argo .txt文件的目录。
-        temp_dir (Path): 用于存放所有中间产物（初始Parquet、映射表、分区数据）的临时目录。
-        final_dir (Path): 用于保存最终年份.parquet文件的目录。
+        origin_dir (Path | str | None): 存放原始 Argo .txt 文件的目录。
+            - None 时自动读取 paths.yml 中的 paths.argo_txt_input；若缺省，则回退到 './Argo_origin'。
+        temp_dir (Path | str | None): 存放中间产物（初始 Parquet、映射表、分区数据）的临时目录。
+            - None 时优先读取 paths.yml 中的 paths.tmp_parquet_path；若缺省，则回退到 final_dir / '_tmp_txt2parquet_dask'。
+        final_dir (Path | str | None): 保存最终年度 Parquet 文件（ArgoYYYY.parquet）的目录。
+            - None 时使用配置 paths.yml 中的 paths.argo_parquet（即全局 argo_path）。
         cleanup_temp_dir (bool, optional): 是否在任务结束后删除临时目录。默认为 True。
     """
+    # --- 0. 解析/回退目录参数（与 META 一致的配置驱动） ---
     start_total_time = tm.time()
+    origin_dir = Path(origin_dir) if origin_dir is not None else Path(_PATHS_CFG.get('paths', {}).get('argo_txt_input', './Argo_origin'))
+    final_dir = Path(final_dir) if final_dir is not None else Path(argo_path)
+    if temp_dir is None:
+        # 使用已在模块顶层解析好的全局 tmp_parquet_path（paths.yml: argo_intermediate），
+        # 若用户未配置则回退到 final_dir/_tmp_txt2parquet_dask
+        temp_dir = Path(tmp_parquet_path) if tmp_parquet_path else (final_dir / '_tmp_txt2parquet_dask')
+    else:
+        temp_dir = Path(temp_dir)
+    print("[*] Using directories for Argo TXT → Parquet:")
+    print(f"    - origin_dir = {origin_dir}")
+    print(f"    - temp_dir   = {temp_dir}")
+    print(f"    - final_dir  = {final_dir}")
     
     # --- 准备工作：初始化Dask客户端并创建目录 ---
     client = Client()
@@ -1319,7 +1335,8 @@ def process_argo_txt_to_yearly_parquet_dask(
     print("==================================================")
 
 def load_argo_data(year: int, data_dir: str | Path = None,
-                   variable_selection: dict | None = None) -> pd.DataFrame:
+                   variable_selection: dict | None = None,
+                   verbose: bool = False) -> pd.DataFrame:
     """
     加载指定年份的 Argo Parquet 数据文件，并进行列名规范化和变量选择。
 
@@ -1333,6 +1350,7 @@ def load_argo_data(year: int, data_dir: str | Path = None,
         data_dir (str | Path | None): Argo Parquet 所在目录；None → paths.yml: argo_parquet。
         variable_selection (dict | None): 覆盖默认变量来源映射，例如 {'Salinity':'PSAL_WOA'}。
             默认: {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}
+        verbose (bool): 是否输出详细日志，默认 False（安静模式）。
 
     返回:
         pd.DataFrame: 一个包含处理后 Argo 数据的 pandas DataFrame，其列名和数据源
@@ -1362,14 +1380,14 @@ def load_argo_data(year: int, data_dir: str | Path = None,
     
     # --- 2. 构建路径并加载文件 ---
     file_path = Path(data_dir) / f'Argo{year}.parquet'
-    print(f"Attempting to load Argo data from: {file_path}")
+    if verbose:
+        print(f"Attempting to load Argo data from: {file_path}")
     if not file_path.exists():
         raise FileNotFoundError(f"Error: The file '{file_path}' was not found.")
     try:
         argo_df = pd.read_parquet(file_path)
     except Exception as e:
-        print(f"An error occurred while reading the Parquet file: {e}")
-        raise
+        raise RuntimeError(f"Failed to read Argo parquet file: {file_path}") from e
 
     # --- 3. 列名规范化：将所有已知的旧列名统一为新版中对应的名称 ---
     normalization_map = {
@@ -1392,10 +1410,12 @@ def load_argo_data(year: int, data_dir: str | Path = None,
         if source_col in argo_df.columns:
             final_df[standard_name] = argo_df[source_col]
         else:
-            print(f"Warning: Column '{source_col}' not found in {file_path}. Creating empty column '{standard_name}'.")
+            if verbose:
+                print(f"Warning: Column '{source_col}' not found in {file_path}. Creating empty column '{standard_name}'.")
             final_df[standard_name] = pd.NA
 
-    print("Argo data loaded and processed successfully.")
+    if verbose:
+        print("Argo data loaded and processed successfully.")
     return final_df
 
 def find_track(DS_or_kind: list | str | None, num: int,
