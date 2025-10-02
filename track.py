@@ -94,6 +94,7 @@ argo_path = Path(_PATHS_CFG.get('paths', {}).get('argo_parquet', './Argo_data'))
 argo_mat_input_path = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
 Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLORYS')
 META_root_path = Path(_PATHS_CFG.get('paths', {}).get('meta_root', '../META3.2_DT_allsat'))
+plots_output_root = Path(_PATHS_CFG.get('paths', {}).get('plots_output', './plot_outputs'))
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -122,6 +123,13 @@ _default_adaptive_lat_threshold = float(
 _default_adaptive_distance_threshold_km = float(
     _PROC_CFG.get('processing', {}).get('adaptive_distance_threshold_km', 300.0)
 )
+
+# -------------------- 自带底图加载（使用本地 Natural Earth, 简洁版） --------------------
+def _load_world_geodataframe():
+    """从配置读取底图路径，默认 external/natural_earth/ne_110m_admin_0_countries.shp。"""
+    cfg_paths = _PATHS_CFG.get('paths', {}) if isinstance(_PATHS_CFG, dict) else {}
+    shp_path = Path(cfg_paths.get('gpd_world_shp', './external/natural_earth/ne_110m_admin_0_countries.shp'))
+    return gpd.read_file(str(shp_path))
 
 # -------------------------------------------------------------------------------
 
@@ -1418,48 +1426,119 @@ def load_argo_data(year: int, data_dir: str | Path = None,
         print("Argo data loaded and processed successfully.")
     return final_df
 
-def find_track(DS_or_kind: list | str | None, num: int,
-               *,
-               region: str | None = None,
-               output_root: str | Path | None = None,
-               include_contours: bool = True,
-               return_list: bool = False) -> pd.DataFrame | list:
-    """寻找指定编号的涡旋整条轨迹（兼容旧/新两种数据来源）。默认返回 DataFrame。
+def find_track(
+    DS_or_kind: list | str | None,
+    num: int | list | tuple | set | np.ndarray,
+    *,
+    region: str | None = None,
+    output_root: str | Path | None = None,
+    include_contours: bool = True,
+    return_list: bool = False
+) -> pd.DataFrame | list | dict:
+    """查找一个或多个涡旋编号的整条轨迹（兼容老/新两种数据源），并统一输出约定。
 
-    兼容行为：
-      - 若 DS_or_kind 是旧的嵌套列表（例如从 pickle 加载的 `acl`），沿用旧实现直接在内存中查找并返回。
-      - 若 DS_or_kind 是字符串 kind（'acs'|'acl'|'cs'|'cl'），则按当前或指定 region，
-        从 META_tracks/<region> 下读取 <kind>_daily.parquet 与 <kind>_contours.zarr，
-        按 track_id=num 提取整条轨迹，重建为旧版元素列表：
-          [orig_index, YYYYMMDD, center_lon, center_lat, max_lon, max_lat,
-           eff_contour_lon[], eff_contour_lat[], radius,
-           speed_contour_lon[], speed_contour_lat[]]
+    支持的数据源:
+    - DS_or_kind 为旧的嵌套列表（例如从 pickle 读取的 legacy `acl/acs/...` 列表）。
+    - DS_or_kind 为字符串 kind（'acs'|'acl'|'cs'|'cl'）：从 META_tracks/<region>
+      读取 <kind>_daily.parquet 与（可选）<kind>_contours.zarr。
 
-    参数：
-      DS_or_kind: 旧数据结构（list）或新 kind 字符串（'acs'、'acl'、'cs'、'cl'）。
-      num: track_id（META 的“轨迹编号”）。
-      region: 指定区域 slug；None 时自动使用当前配置区域。
-      output_root: META_tracks 根目录；None 读取配置或默认 './META_tracks'。
-      include_contours: 是否读取 Zarr 轮廓（建议 True）。
-
-        返回：
-            - 默认：pandas.DataFrame，包含列：
+    返回契约（默认 return_list=False):
+    - 单 ID: 返回 DataFrame（列依数据源而异）
+            • 新结构（DS_or_kind 为字符串 kind）：首列为 'track_id'，列为
+                ['track_id','time','center_lon','center_lat','max_lon','max_lat',
+                    'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date']
+                说明：'date' 由 'time' 规范化得到；不附加末尾重复的 'track_id' 列。
+            • 旧结构（DS_or_kind 为嵌套列表 legacy）：首列为 'index_org'，并在末尾追加 'track_id'：
                 ['index_org','time','center_lon','center_lat','max_lon','max_lat',
-                 'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date','track_id']
-            - 若 return_list=True：返回旧版 list[list] 结构（与历史行为一致）。
+                    'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date','track_id']
+    - 多 ID: 返回合并后的 DataFrame（含 'track_id' 列），并按 ['track_id','date'] 排序。
+
+    当 return_list=True 时:
+    - 单 ID: 返回旧版 list[list] 结构，每个日项的首元素为真实 track_id：
+        [track_id, YYYYMMDD, center_lon, center_lat, max_lon, max_lat,
+         eff_contour_lon[], eff_contour_lat[], radius, speed_contour_lon[], speed_contour_lat[]]
+    - 多 ID: 返回 { track_id: list[list] } 的字典。
+
+    参数:
+    - DS_or_kind: 旧结构列表或新结构 kind 字符串。
+    - num: 单个 track_id 或可迭代的多个 track_id。
+    - region: 区域 slug，None 使用当前默认区域。
+    - output_root: META_tracks 根目录，None 读取配置或使用默认 './META_tracks'。
+    - include_contours: True 时加载等值线（新结构路径）；False 时 'contour_*' 为空数组。
+
+    异常:
+    - TypeError: DS_or_kind 类型非法。
+    - ValueError: 指定 track_id 未找到。
     """
+    # 规范化 num 输入，判断是否批量
+    def _is_scalar_id(x) -> bool:
+        return isinstance(x, (int, np.integer))
+
+    if _is_scalar_id(num):
+        id_set = {int(num)}
+        multi = False
+    else:
+        try:
+            id_set = set(int(x) for x in list(num))
+        except Exception:
+            id_set = {int(num)}
+            multi = False
+        else:
+            multi = len(id_set) > 1
     # 1) 旧数据结构兼容：DS_or_kind 为 list 时沿用旧逻辑
     if isinstance(DS_or_kind, list):
         DS = DS_or_kind
-        # 旧结构中每个 track 是若干“日记录”的列表，且每条记录的第一个字段为 track_id（相同）。
-        # 因此只需检查首条记录即可，大幅降低查找复杂度。
+        id_to_track = {}
         for track in DS:
             if not track:
                 continue
-            if num == track[0][0]:
-                if return_list:
-                    return track
-                # 转成 DataFrame
+            try:
+                tid = int(track[0][0])
+            except Exception:
+                continue
+            if tid in id_set:
+                id_to_track[tid] = track
+
+        missing = sorted(list(id_set - set(id_to_track.keys())))
+        if missing:
+            raise ValueError(f"Track not found for id(s): {missing}")
+
+        if not multi:
+            tid = next(iter(id_set))
+            track = id_to_track[tid]
+            if return_list:
+                return track
+            df = pd.DataFrame(track, columns=[
+                'index_org','time','center_lon','center_lat','max_lon','max_lat',
+                'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'
+            ])
+            try:
+                df['date'] = convert_date(df['time'])
+            except Exception:
+                df['date'] = pd.NaT
+            
+            ACS, ACL, CS, CL = load_meta_data()
+            # 匹配传入列表变量名对应的 META 数据集（ACS/ACL/CS/CL）
+            matched_ds_name = 'UNKNOWN'
+            try:
+                caller_locals = inspect.currentframe().f_back.f_locals
+                for var_name, var_val in caller_locals.items():
+                    if var_val is DS_or_kind:
+                        matched_ds_name = var_name.upper()
+                        break
+            except Exception:
+                matched_ds_name = 'UNKNOWN'
+
+            meta_map = {'ACS': ACS, 'ACL': ACL, 'CS': CS, 'CL': CL}
+            matched_meta = meta_map.get(matched_ds_name)
+
+            df['track_id'] = matched_meta['track'][df['index_org']] if matched_meta is not None else int(tid)
+            return df
+        else:
+            if return_list:
+                return {tid: id_to_track[tid] for tid in sorted(id_set)}
+            frames = []
+            for tid, track in id_to_track.items():
                 df = pd.DataFrame(track, columns=[
                     'index_org','time','center_lon','center_lat','max_lon','max_lat',
                     'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'
@@ -1468,9 +1547,29 @@ def find_track(DS_or_kind: list | str | None, num: int,
                     df['date'] = convert_date(df['time'])
                 except Exception:
                     df['date'] = pd.NaT
-                df['track_id'] = int(num)
-                return df
-        raise ValueError('Track not found')
+
+                ACS, ACL, CS, CL = load_meta_data()
+                # 匹配传入列表变量名对应的 META 数据集（ACS/ACL/CS/CL）
+                matched_ds_name = 'UNKNOWN'
+                try:
+                    caller_locals = inspect.currentframe().f_back.f_locals
+                    for var_name, var_val in caller_locals.items():
+                        if var_val is DS_or_kind:
+                            matched_ds_name = var_name.upper()
+                            break
+                except Exception:
+                    matched_ds_name = 'UNKNOWN'
+
+                meta_map = {'ACS': ACS, 'ACL': ACL, 'CS': CS, 'CL': CL}
+                matched_meta = meta_map.get(matched_ds_name)
+
+                df['track_id'] = matched_meta['track'][df['index_org']] if matched_meta is not None else int(tid)
+
+                frames.append(df)
+            out = pd.concat(frames, ignore_index=True)
+            out.sort_values(['track_id', 'date'], inplace=True)
+            out.reset_index(drop=True, inplace=True)
+            return out
 
     # 2) 新数据结构：按 kind 从 Parquet + Zarr 中提取
     if not isinstance(DS_or_kind, str):
@@ -1516,7 +1615,7 @@ def find_track(DS_or_kind: list | str | None, num: int,
             pass
 
     # 2.3 流式扫描 Parquet（按行组/分片顺序）收集该 track 的全部行及其“全局行号”
-    def _scan_daily_rows_file(parquet_file: Path):
+    def _scan_daily_rows_file(parquet_file: Path, target_ids: set[int]):
         pf = pq.ParquetFile(parquet_file)
         # 找到 track_id 列的索引（用于读取统计信息）
         try:
@@ -1524,6 +1623,8 @@ def find_track(DS_or_kind: list | str | None, num: int,
         except Exception:
             track_idx = None
         cum = 0
+        min_tid = min(target_ids)
+        max_tid = max(target_ids)
         for rg in range(pf.num_row_groups):
             # 先用统计信息快速判断是否可能包含 num
             if track_idx is not None and pf.metadata is not None:
@@ -1538,7 +1639,7 @@ def find_track(DS_or_kind: list | str | None, num: int,
                         except Exception:
                             pass
                         if isinstance(min_v, (int, np.integer)) and isinstance(max_v, (int, np.integer)):
-                            if not (min_v <= num <= max_v):
+                            if (max_tid < min_v) or (min_tid > max_v):
                                 # 不可能命中，跳过读取该行组
                                 cum += pf.metadata.row_group(rg).num_rows
                                 continue
@@ -1549,17 +1650,19 @@ def find_track(DS_or_kind: list | str | None, num: int,
                 'track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 'radius', 'orig_index'
             ])
             t_id = tbl.column('track_id').to_numpy()
-            idxs = np.nonzero(t_id == num)[0]
+            mask = np.isin(t_id, list(target_ids))
+            idxs = np.nonzero(mask)[0]
             if idxs.size:
-                # 将本 row group 中匹配行转为 pandas 以便取值
                 df = tbl.to_pandas()
                 for j in idxs.tolist():
                     yield cum + j, df.iloc[j]
             cum += tbl.num_rows
 
-    def _scan_daily_rows_dir(parquet_dir: Path):
+    def _scan_daily_rows_dir(parquet_dir: Path, target_ids: set[int]):
         parts = sorted([p for p in parquet_dir.glob('*.parquet') if p.is_file()])
         cum = 0
+        min_tid = min(target_ids)
+        max_tid = max(target_ids)
         for p in parts:
             pf = pq.ParquetFile(p)
             # 找到 track_id 列的索引
@@ -1580,7 +1683,7 @@ def find_track(DS_or_kind: list | str | None, num: int,
                             except Exception:
                                 pass
                             if isinstance(min_v, (int, np.integer)) and isinstance(max_v, (int, np.integer)):
-                                if not (min_v <= num <= max_v):
+                                if (max_tid < min_v) or (min_tid > max_v):
                                     cum += pf.metadata.row_group(rg).num_rows
                                     continue
                     except Exception:
@@ -1590,7 +1693,8 @@ def find_track(DS_or_kind: list | str | None, num: int,
                     'track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 'radius', 'orig_index'
                 ])
                 t_id = tbl.column('track_id').to_numpy()
-                idxs = np.nonzero(t_id == num)[0]
+                mask = np.isin(t_id, list(target_ids))
+                idxs = np.nonzero(mask)[0]
                 if idxs.size:
                     df = tbl.to_pandas()
                     for j in idxs.tolist():
@@ -1598,9 +1702,9 @@ def find_track(DS_or_kind: list | str | None, num: int,
                 cum += tbl.num_rows
 
     scanner = _scan_daily_rows_file if source_type == 'file' else _scan_daily_rows_dir
-    rows = list(scanner(daily_source))
+    rows = list(scanner(daily_source, id_set))
     if not rows:
-        raise ValueError(f"Track id {num} 未在 {daily_source} 中找到")
+        raise ValueError(f"Track id(s) {sorted(list(id_set))} 未在 {daily_source} 中找到")
 
     # 2.4 可选：打开 Zarr 并准备索引数组
     eff_lon_arr = eff_lat_arr = spd_lon_arr = spd_lat_arr = None
@@ -1627,10 +1731,13 @@ def find_track(DS_or_kind: list | str | None, num: int,
     # 排序（多数情况下已是有序，这里稳妥起见按 time 排）
     rows_sorted = sorted(rows, key=lambda kv: pd.Timestamp(kv[1]['time']))
 
-    rows_list = []
+    # 将结果分配到各个 track_id 下
+    rows_per_id: dict[int, list] = {}
     for global_idx, r in rows_sorted:
+        tid = int(r['track_id']) if 'track_id' in r else None
+        if tid is None:
+            continue
         # 基础字段
-        orig_index = int(r['orig_index']) if 'orig_index' in r and not pd.isna(r['orig_index']) else int(global_idx)
         t_ymd = _ymd_i8(r['time'])
         center_lon = float(r['center_lon'])
         center_lat = float(r['center_lat'])
@@ -1644,7 +1751,6 @@ def find_track(DS_or_kind: list | str | None, num: int,
         spd_lon = np.array([], dtype='f8')
         spd_lat = np.array([], dtype='f8')
         if include_contours and eff_idx is not None:
-            # 防御：索引可能越界（理论不应发生）；索引数组也按需切片以避免整数组载入
             if 0 <= global_idx < (eff_idx.shape[0] - 1):
                 s_e = eff_idx[global_idx:global_idx+2]
                 s = int(s_e[0]); e = int(s_e[1])
@@ -1658,24 +1764,50 @@ def find_track(DS_or_kind: list | str | None, num: int,
                     spd_lon = np.asarray(spd_lon_arr[s:e])
                     spd_lat = np.asarray(spd_lat_arr[s:e])
 
-        rows_list.append([
-            orig_index, t_ymd, center_lon, center_lat, max_lon, max_lat,
+        # 注意：为简化后续标注/检索，首字段使用 track_id（tid）而非原始行索引
+        rows_per_id.setdefault(tid, []).append([
+            int(tid), t_ymd, center_lon, center_lat, max_lon, max_lat,
             eff_lon, eff_lat, radius, spd_lon, spd_lat
         ])
 
-    if return_list:
-        return rows_list
+    # 检查是否全部命中
+    hit_ids = set(rows_per_id.keys())
+    missing = sorted(list(id_set - hit_ids))
+    if missing:
+        raise ValueError(f"Track not found for id(s): {missing}")
 
-    df = pd.DataFrame(rows_list, columns=[
-        'index_org','time','center_lon','center_lat','max_lon','max_lat',
-        'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'
-    ])
-    try:
-        df['date'] = convert_date(df['time'])
-    except Exception:
-        df['date'] = pd.NaT
-    df['track_id'] = int(num)
-    return df
+    if not multi:
+        tid = next(iter(id_set))
+        rows_list = rows_per_id[tid]
+        if return_list:
+            return rows_list
+        df = pd.DataFrame(rows_list, columns=[
+            'track_id','time','center_lon','center_lat','max_lon','max_lat',
+            'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'
+        ])
+        try:
+            df['date'] = convert_date(df['time'])
+        except Exception:
+            df['date'] = pd.NaT
+        return df
+    else:
+        if return_list:
+            return {tid: rows_per_id[tid] for tid in sorted(rows_per_id.keys())}
+        frames = []
+        for tid, rows_list in rows_per_id.items():
+            df = pd.DataFrame(rows_list, columns=[
+                'track_id','time','center_lon','center_lat','max_lon','max_lat',
+                'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'
+            ])
+            try:
+                df['date'] = convert_date(df['time'])
+            except Exception:
+                df['date'] = pd.NaT
+            frames.append(df)
+        out = pd.concat(frames, ignore_index=True)
+        out.sort_values(['track_id', 'date'], inplace=True)
+        out.reset_index(drop=True, inplace=True)
+        return out
 
 def is_point_in_contour(row: pd.Series) -> bool:
     """
@@ -1762,13 +1894,13 @@ def filtered_float_data(
             # 将涡旋轨迹列表转换为DataFrame，方便后续处理（旧结构）
             track_df = pd.DataFrame(
                 wanted_track,
-                columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+                columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
                          'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
             )
     elif isinstance(track, pd.DataFrame):
         track_df = track.copy()
         # 尝试确保必要列存在
-        needed_cols = {'index_org','time','center_lon','center_lat','max_lon','max_lat','contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'}
+        needed_cols = {'track_id','time','center_lon','center_lat','max_lon','max_lat','contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'}
         missing = needed_cols - set(track_df.columns)
         if missing:
             raise ValueError(f"track DataFrame is missing required columns: {sorted(list(missing))}")
@@ -1776,7 +1908,7 @@ def filtered_float_data(
         # 视为 list[list | tuple]
         track_df = pd.DataFrame(
             track,
-            columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+            columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
                      'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
         )
     # 使用convert_date函数转换日期（如果没有或类型不对）
@@ -1951,11 +2083,11 @@ def plot_track(
         
     track_df = pd.DataFrame(
         wanted_track,
-        columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+        columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
                  'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
     )
     track_df['date'] = convert_date(track_df['time'])
-    num = track_df['index_org'].iloc[0]
+    num = track_df['track_id'].iloc[0]
 
     # 获取数据集名称
     ds_name = "UNKNOWN"
@@ -2017,7 +2149,7 @@ def plot_track(
     eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
     
     # 加载地理底图
-    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    world = _load_world_geodataframe()
 
     # 初始化画布与坐标轴
     fig, ax = plt.subplots(figsize=(30, 20))
@@ -2187,6 +2319,12 @@ def convert_date(values: pd.Series | np.ndarray | list | str | int | float) -> p
     if non_na.empty:
         return result.iloc[0] if is_scalar_input else result
 
+    # 若输入已是 datetime64 类型，直接标准化返回
+    if pd.api.types.is_datetime64_any_dtype(non_na):
+        dt = pd.to_datetime(non_na).dt.normalize()
+        result.loc[dt.index] = dt.values
+        return result.iloc[0] if is_scalar_input else result
+
     # 判定是否全为 8 位 YYYYMMDD
     try:
         strs = non_na.astype('int64').astype(str)
@@ -2266,7 +2404,7 @@ def plot_vertical(
     # 复用已读取的 wanted_track，避免 filtered_float_data 内部重复 find_track
     track_df = pd.DataFrame(
         wanted_track,
-        columns=['index_org', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
+        columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
                  'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
     )
     track_df['date'] = convert_date(track_df['time'])
@@ -3396,7 +3534,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         colors =colors[1]
     else:
         colors =colors[0]
-    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    world = _load_world_geodataframe()
 
     fig, ax = plt.subplots(figsize=figsize)
     ax.set_title(f'Track {ds_names}{no} at {glorys_depth_filtered[0]:.2f}m, {dates[needed_idx].strftime("%Y-%m-%d")}', fontsize=title_fs)
@@ -4723,7 +4861,7 @@ def check_single_track(
         force_great_circle_circle (bool): 强制使用大圆距离（忽略阈值）。
 
     返回:
-        dict | None: 如果涡旋在时间范围内，返回包含绘图信息的字典，否则返回None。
+        dict | None: 如果涡旋在时间范围内，返回包含绘图信息的字典（含 'track_id'、'has_interaction' 等），否则返回 None。
     """
     num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*track_data)
     dates = convert_date(time)
@@ -4737,12 +4875,23 @@ def check_single_track(
 
     has_interaction = False
     contours_to_plot = []
+    candidate_dates_for_contour = set()
     for i in indices_in_range:
         current_date = dates[i].normalize()
         if current_date in argo_points_by_date:
-            contour_poly = Polygon(zip(contour_lon[i], contour_lat[i]))
+            # 仅当存在有效等值线时才做多边形包含判断
+            inside_poly = False
+            try:
+                if contour_lon[i] is not None and contour_lat[i] is not None and len(contour_lon[i]) >= 3 and len(contour_lat[i]) >= 3:
+                    contour_poly = Polygon(zip(contour_lon[i], contour_lat[i]))
+                    # 点集数量可能很大，先不构造 shapely MultiPoint，逐点判断即可
+                    for argo_point in argo_points_by_date[current_date]:
+                        if contour_poly.contains(argo_point):
+                            inside_poly = True
+                            break
+            except Exception:
+                inside_poly = False
             for argo_point in argo_points_by_date[current_date]:
-                inside_poly = contour_poly.contains(argo_point)
                 center = np.array([center_lon[i], center_lat[i]])
                 point_coord = np.array([argo_point.x, argo_point.y])
                 distance = np.linalg.norm(point_coord - center)
@@ -4761,7 +4910,10 @@ def check_single_track(
                     distance_m = np.hypot(dx_m, dy_m)
                 inside_circle = distance_m <= radius[i] * circle_enlargement_factor
                 if inside_poly or inside_circle:
-                    contours_to_plot.append((contour_lon[i], contour_lat[i]))
+                    if inside_poly and contour_lon[i] is not None and contour_lat[i] is not None:
+                        contours_to_plot.append((contour_lon[i], contour_lat[i]))
+                    if inside_circle:
+                        candidate_dates_for_contour.add(current_date)
                     has_interaction = True
                     break
     
@@ -4773,19 +4925,28 @@ def check_single_track(
             in_range_segments.append((np.array(center_lon)[block], np.array(center_lat)[block]))
 
     start_idx = indices_in_range[0]
-    text_info = {"text": f"{ds_name}{num[0]}", "lon": center_lon[start_idx], "lat": center_lat[start_idx]}
+    # 统一使用旧版结构首字段（已在新路径中改为 track_id）
+    _tid_label = int(num[0])
+    text_info = {"text": f"{ds_name}{_tid_label}", "lon": center_lon[start_idx], "lat": center_lat[start_idx]}
 
     return {
-        "ds_name": ds_name, "center_lon": center_lon, "center_lat": center_lat,
-        "in_range_segments": in_range_segments, "contours_to_plot": contours_to_plot,
-        "text_info": text_info, "is_ace": 'AC' in ds_name.upper(),
-        "has_interaction": has_interaction
+        "ds_name": ds_name,
+        "track_id": int(_tid_label) if len(num) else None,
+        "center_lon": center_lon,
+        "center_lat": center_lat,
+        "in_range_segments": in_range_segments,
+        "contours_to_plot": contours_to_plot,
+        "candidate_dates_for_contour": sorted(candidate_dates_for_contour),
+        "dates_in_range": [pd.Timestamp(d).normalize() for d in dates[indices_in_range]],
+        "text_info": text_info,
+        "is_ace": 'AC' in ds_name.upper(),
+        "has_interaction": has_interaction,
     }
 
 def plot_all_tracks_in_range(
     start_date_str: str,
     end_date_str: str,
-    eddy_datasets: dict | None = None,
+    eddy_datasets: dict | list[str] | tuple[str, ...] | None = None,
     plot_unrelated_eddies: bool = False,
     plot_unrelated_argo: bool = True,
     save_fig: bool = False,
@@ -4802,7 +4963,8 @@ def plot_all_tracks_in_range(
     fix_delta_do_colorbar: bool = True,
     delta_do_cbar_min: float = 50.0,
     delta_do_cbar_max: float = 100.0,
-    delta_do_cbar_ticks: list | None = None
+    delta_do_cbar_ticks: list | None = None,
+    meta_output_root: str | Path | None = None
 ):
     """(核心绘图) 指定时间段内涡旋轨迹 + Argo ΔDO 异常代表点（仅采用 ΔDO 方法）。
 
@@ -4814,7 +4976,10 @@ def plot_all_tracks_in_range(
 
     参数:
         start_date_str, end_date_str: 日期范围。
-        eddy_datasets: 预加载涡旋数据；并行 worker 模式下从全局读取。
+        eddy_datasets:
+          - 兼容旧版: dict，如 {'ACS': acs, 'ACL': acl, 'CS': cs, 'CL': cl}，每个值是“轨迹列表(list of tracks)”；
+          - 新版便捷: 字符串列表/元组，如 ['acs','acl','cs','cl']，函数将按配置从 META_tracks 读取对应时间段与区域内的轨迹；
+          - None: 并行 worker 模式下默认使用全局 worker_eddy_datasets。
         plot_unrelated_eddies: 是否绘制未与 Argo 交互的涡旋。
         plot_unrelated_argo: 是否额外绘制所有 Argo 剖面位置（空心圆），用于提供基准分布背景。
         save_fig, show_fig: 输出控制。
@@ -4824,6 +4989,7 @@ def plot_all_tracks_in_range(
         fix_delta_do_colorbar: 若为 True 且按 delta_do 着色，则强制使用 [delta_do_cbar_min, delta_do_cbar_max] 作为色标范围。
         delta_do_cbar_min / delta_do_cbar_max: ΔDO 色标固定范围上下限（仅在 fix_delta_do_colorbar=True 且 anomaly_color_by='delta_do' 时生效）。
         delta_do_cbar_ticks: 自定义 ΔDO 色标刻度列表（None 自动：若只提供上下限则显示两端；若范围>30 添加中点）。
+        meta_output_root: 指定 META_tracks 根目录（可覆盖配置默认）。
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
@@ -4841,10 +5007,26 @@ def plot_all_tracks_in_range(
         depth_merge_tolerance = _default_depth_merge_tolerance
     if duplicate_depth_strategy is None:
         duplicate_depth_strategy = _default_duplicate_depth_strategy
-    # 如果作为并行worker运行，eddy_datasets会是None，此时从全局变量获取
+    # 若未显式提供，则在并行 worker 中从全局共享获得
     if local_eddy_datasets is None:
-        global worker_eddy_datasets
-        local_eddy_datasets = worker_eddy_datasets
+        try:
+            global worker_eddy_datasets
+            local_eddy_datasets = worker_eddy_datasets
+        except NameError:
+            local_eddy_datasets = None
+
+    # 新版便捷用法：若传入的是字符串列表/元组（kinds），先不加载等值线以加速第一轮判定
+    lazy_contour_mode = False
+    if isinstance(local_eddy_datasets, (list, tuple)):
+        kinds = [str(k).lower() for k in local_eddy_datasets]
+        local_eddy_datasets = _load_eddy_datasets_for_range(
+            kinds=kinds,
+            start_date=pd.to_datetime(start_date_str),
+            end_date=pd.to_datetime(end_date_str),
+            output_root=meta_output_root,
+            include_contours=False,
+        )
+        lazy_contour_mode = True
 
     start_date = pd.to_datetime(start_date_str)
     end_date = pd.to_datetime(end_date_str)
@@ -4910,7 +5092,19 @@ def plot_all_tracks_in_range(
             argo_points_by_date[date_key].append(Point(row['Longitude'], row['Latitude']))
 
     # --- 3. 检查所有涡旋轨迹 ---
-    all_tracks_with_names = [(track, ds_name) for ds_name, ds_data in local_eddy_datasets.items() for track in ds_data]
+    # 兼容两种形态：
+    #  - 旧形态：ds_data 为 [track_list, ...]
+    #  - 新形态：ds_data 为 [(track_list, track_id), ...]
+    all_tracks_with_names: list[tuple[list, str, int | None]] = []
+    for ds_name, ds_data in local_eddy_datasets.items():
+        for item in ds_data:
+            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (int, np.integer)):
+                track_list, tid = item
+            else:
+                track_list, tid = item, None
+            all_tracks_with_names.append((track_list, ds_name, tid))
+    # 第一轮判定时的圆半径：使用原始 circle_enlargement_factor（不再放大）。
+    _cef_first_pass = circle_enlargement_factor
     results = [
         check_single_track(
             track,
@@ -4918,13 +5112,13 @@ def plot_all_tracks_in_range(
             start_date,
             end_date,
             ds_name,
-            circle_enlargement_factor=circle_enlargement_factor
+            circle_enlargement_factor=_cef_first_pass,
         )
-        for track, ds_name in all_tracks_with_names
+        for track, ds_name, tid in all_tracks_with_names
     ]
 
-    # --- 4. 绘图 ---
-    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    # --- 4. 绘图（第一轮：不画等值线） ---
+    world = _load_world_geodataframe()
     fig, ax = plt.subplots(figsize=(40, 30))
     ax.set_title(
         f"Eddy Tracks and Argo ΔDO Anomalies ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})",
@@ -4952,7 +5146,8 @@ def plot_all_tracks_in_range(
         info = result['text_info']
         ax.text(info['lon'], info['lat'], info['text'], fontsize=12, color=text_color, weight='bold', zorder=5)
 
-        if has_interaction:
+        # 第一轮不画等值线；若不是 lazy 模式但已有 contours_to_plot，则保持现状
+        if (not lazy_contour_mode) and has_interaction:
             for contour_lon, contour_lat in result['contours_to_plot']:
                 ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle=':')
 
@@ -5021,9 +5216,83 @@ def plot_all_tracks_in_range(
     else:
         ax.legend(handles=legend_elements, fontsize=18, loc='upper left')
 
+    # --- 4.2 第二轮：按需补充绘制等值线（仅对 lazy 模式下有交互的涡旋；使用真实 track_id） ---
+    if lazy_contour_mode:
+        try:
+            need_items = [r for r in results if r and r.get('has_interaction')]
+            if need_items:
+                need_by_ds: dict[str, dict[int, set[pd.Timestamp]]] = {}
+                for r in need_items:
+                    ds = r['ds_name']
+                    tid = r.get('track_id')
+                    if tid is None:
+                        continue
+                    # 仅针对“半径命中”的候选日期进一步检查等值线
+                    dates_req = set(r.get('candidate_dates_for_contour', []) or r.get('dates_in_range', []))
+                    if not dates_req:
+                        continue
+                    need_by_ds.setdefault(ds, {})
+                    need_by_ds[ds].setdefault(tid, set()).update(dates_req)
+
+                for ds_name, tid_map in need_by_ds.items():
+                    kind_l = ds_name.lower()
+                    rich = find_track(
+                        kind_l,
+                        sorted(tid_map.keys()),
+                        region=_current_region_key(),
+                        include_contours=True,
+                        return_list=False,
+                    )
+                    # 统一为 {track_id: DataFrame}
+                    grouped: dict[int, pd.DataFrame]
+                    if isinstance(rich, dict):
+                        grouped = {
+                            k: pd.DataFrame(v, columns=['track_id','time','center_lon','center_lat','max_lon','max_lat','contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat'])
+                            for k, v in rich.items()
+                        }
+                    else:
+                        df_rich = pd.DataFrame(rich) if isinstance(rich, list) else rich
+                        if isinstance(df_rich, pd.DataFrame) and 'track_id' in df_rich.columns:
+                            grouped = {tid: g for tid, g in df_rich.groupby('track_id')}
+                        else:
+                            only_tid = next(iter(tid_map.keys())) if len(tid_map)==1 else None
+                            grouped = {only_tid: df_rich if isinstance(df_rich, pd.DataFrame) else pd.DataFrame(df_rich)}
+
+                    for tid, dates_req in tid_map.items():
+                        df_t = grouped.get(tid)
+                        if df_t is None or df_t.empty:
+                            continue
+                        if 'date' not in df_t.columns:
+                            if 'time' in df_t.columns:
+                                df_t = df_t.copy(); df_t['date'] = convert_date(df_t['time'])
+                            else:
+                                continue
+                        mask = df_t['date'].isin(dates_req)
+                        df_needed = df_t[mask]
+                        if df_needed.empty:
+                            continue
+                        color2 = eddy_colors['ACE'] if 'AC' in ds_name else eddy_colors['CE']
+                        for _, row in df_needed.iterrows():
+                            cl = row.get('contour_lon'); ct = row.get('contour_lat')
+                            if isinstance(cl, (list, np.ndarray)) and isinstance(ct, (list, np.ndarray)) and len(cl) >= 3 and len(ct) >= 3:
+                                # 二次判定：仅当 Argo 点在等值线内时才绘制该 contour
+                                try:
+                                    poly = Polygon(zip(cl, ct))
+                                    date_norm = row['date'].normalize() if isinstance(row['date'], pd.Timestamp) else pd.Timestamp(row['date']).normalize()
+                                    pts = argo_points_by_date.get(date_norm, [])
+                                    draw_it = any(poly.contains(pt) for pt in pts)
+                                except Exception:
+                                    draw_it = False
+                                if draw_it:
+                                    ax.plot(cl, ct, color=color2, linewidth=1, alpha=0.6, zorder=4, linestyle=':')
+        except Exception as e:
+            print(f"[LazyContour] failed to draw contours lazily: {e}")
+
     # --- 5. 输出控制 ---
     if save_fig:
-        output_dir = Path("plot_all_tracks_in_range")
+        # 使用全局配置的输出根目录，按区域分子目录
+        region_slug_for_path = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
         output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}.png"
         save_path = output_dir / base_filename
@@ -5035,12 +5304,208 @@ def plot_all_tracks_in_range(
     
     plt.close(fig)
 
-    # 返回本时间段内发生交互(标红)的涡旋标签列表（如 ACxxx / CEyyy）
+    # 返回本时间段内发生交互(标红)的涡旋标签列表（与第一轮判定一致）
     interacted_eddies = []
     for r in filter(None, results):
         if r['has_interaction']:
             interacted_eddies.append(r['text_info']['text'])
     return interacted_eddies
+
+def _load_eddy_datasets_for_range(
+    *,
+    kinds: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    region_key: str | None = None,
+    output_root: str | Path | None = None,
+    include_contours: bool = False,
+) -> dict:
+    """根据 kinds（如 ['acs','acl']）与时间/区域，从 Parquet+Zarr 动态装载需要的涡旋轨迹列表。
+
+    返回: dict，如 {'ACS': [(track_list, track_id), ...], 'ACL': [...]}。
+    其中 track_list 为“旧版轨迹结构”的 list[list]，track_id 为真实的轨迹ID（与 parquet 的 track_id 对齐），
+    便于后续懒加载等值线阶段精准定位。
+    """
+    region_slug = region_key or _current_region_key()
+    root = _ensure_meta_tracks_root(output_root)
+    region_dir = Path(root) / region_slug
+    if not region_dir.exists():
+        raise FileNotFoundError(f"区域目录不存在：{region_dir}")
+
+    def _locate_daily_source(kind_l: str) -> tuple[Path, str]:
+        daily_file = region_dir / f"{kind_l}_daily.parquet"
+        daily_tmp_dir = region_dir / f"{kind_l}_daily_tmp"
+        daily_dir = region_dir / f"{kind_l}_daily.parquet"  # 目录形式
+        if daily_file.exists() and daily_file.is_file():
+            return daily_file, 'file'
+        if daily_tmp_dir.exists() and daily_tmp_dir.is_dir():
+            return daily_tmp_dir, 'dir'
+        if daily_dir.exists() and daily_dir.is_dir():
+            return daily_dir, 'dir'
+        raise FileNotFoundError(f"未找到 daily 数据：{daily_file} 或 {daily_tmp_dir} / {daily_dir}")
+
+    # dateline 兼容：使用全局 lonmin/lonmax/latmin/latmax
+    crosses = _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin)
+
+    out: dict[str, list] = {}
+    # 预先计算时间边界（闭开区间），避免逐行日期转换：time ∈ [start_ts, end_exclusive)
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+    for kind in kinds:
+        kind_l = kind.lower()
+        if kind_l not in {'acs','acl','cs','cl'}:
+            continue
+        daily_source, source_type = _locate_daily_source(kind_l)
+
+        # 收集时间+区域内的 track_id
+        track_ids: set[int] = set()
+        if source_type == 'file':
+            pf = pq.ParquetFile(daily_source)
+            for rg in range(pf.num_row_groups):
+                # 先用统计信息按时间裁剪（使用 'time' 列的 min/max）
+                # 同时在不跨日界线时，尝试用经纬度 min/max 做粗滤
+                read_rg = True
+                try:
+                    schema_names = pf.schema.names
+                    # time stats
+                    if 'time' in schema_names:
+                        t_idx = schema_names.index('time')
+                        t_stats = pf.metadata.row_group(rg).column(t_idx).statistics
+                        if t_stats and t_stats.has_min_max:
+                            tmin = pd.to_datetime(t_stats.min)
+                            tmax = pd.to_datetime(t_stats.max)
+                            # 跳过与 [start_ts, end_exclusive) 无交集的行组
+                            if (tmax < start_ts) or (tmin >= end_exclusive):
+                                read_rg = False
+                    # lat/lon stats（仅当不跨日界线时启用）
+                    if read_rg and not crosses:
+                        try:
+                            lat_idx = schema_names.index('center_lat')
+                            lon_idx = schema_names.index('center_lon')
+                            lat_stats = pf.metadata.row_group(rg).column(lat_idx).statistics
+                            lon_stats = pf.metadata.row_group(rg).column(lon_idx).statistics
+                            if lat_stats and lat_stats.has_min_max:
+                                lat_min, lat_max_ = float(lat_stats.min), float(lat_stats.max)
+                                if (lat_max_ < latmin) or (lat_min > latmax):
+                                    read_rg = False
+                            if read_rg and lon_stats and lon_stats.has_min_max:
+                                lon_min_, lon_max_ = float(lon_stats.min), float(lon_stats.max)
+                                if (lon_max_ < lonmin) or (lon_min_ > lonmax):
+                                    read_rg = False
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if not read_rg:
+                    continue
+
+                table = pf.read_row_group(rg, columns=['track_id','time','center_lon','center_lat'])
+                df = table.to_pandas()
+                # 直接用时间戳闭开区间过滤，避免生成 'date'
+                mask_time = (df['time'] >= start_ts) & (df['time'] < end_exclusive)
+                if crosses:
+                    lon = df['center_lon']; lon360 = (lon % 360 + 360) % 360
+                    mask_lon = (lon >= lonmin) | (lon <= lonmax)
+                    mask_lon360 = (lon360 >= lonmin) | (lon360 <= lonmax)
+                    mask_geo = ((df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) & (mask_lon | mask_lon360))
+                else:
+                    mask_geo = (
+                        (df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) &
+                        (df['center_lon'] >= lonmin) & (df['center_lon'] <= lonmax)
+                    )
+                df_sel = df[mask_time & mask_geo]
+                if not df_sel.empty:
+                    track_ids.update(df_sel['track_id'].astype(int).unique().tolist())
+        else:
+            # 目录形式：逐个 part 文件按 row-group 读取与裁剪，避免整文件加载与逐行日期转换
+            for part in sorted(daily_source.glob('*.parquet')):
+                try:
+                    ppf = pq.ParquetFile(part)
+                except Exception:
+                    continue
+                schema_names = ppf.schema.names
+                for rg in range(ppf.num_row_groups):
+                    read_rg = True
+                    try:
+                        # time stats
+                        if 'time' in schema_names:
+                            t_idx = schema_names.index('time')
+                            t_stats = ppf.metadata.row_group(rg).column(t_idx).statistics
+                            if t_stats and t_stats.has_min_max:
+                                tmin = pd.to_datetime(t_stats.min)
+                                tmax = pd.to_datetime(t_stats.max)
+                                if (tmax < start_ts) or (tmin >= end_exclusive):
+                                    read_rg = False
+                        # lat/lon stats prune（不跨日界线时）
+                        if read_rg and not crosses:
+                            try:
+                                lat_idx = schema_names.index('center_lat')
+                                lon_idx = schema_names.index('center_lon')
+                                lat_stats = ppf.metadata.row_group(rg).column(lat_idx).statistics
+                                lon_stats = ppf.metadata.row_group(rg).column(lon_idx).statistics
+                                if lat_stats and lat_stats.has_min_max:
+                                    lat_min, lat_max_ = float(lat_stats.min), float(lat_stats.max)
+                                    if (lat_max_ < latmin) or (lat_min > latmax):
+                                        read_rg = False
+                                if read_rg and lon_stats and lon_stats.has_min_max:
+                                    lon_min_, lon_max_ = float(lon_stats.min), float(lon_stats.max)
+                                    if (lon_max_ < lonmin) or (lon_min_ > lonmax):
+                                        read_rg = False
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if not read_rg:
+                        continue
+                    tbl = ppf.read_row_group(rg, columns=['track_id','time','center_lon','center_lat'])
+                    df = tbl.to_pandas()
+                    mask_time = (df['time'] >= start_ts) & (df['time'] < end_exclusive)
+                    if crosses:
+                        lon = df['center_lon']; lon360 = (lon % 360 + 360) % 360
+                        mask_lon = (lon >= lonmin) | (lon <= lonmax)
+                        mask_lon360 = (lon360 >= lonmin) | (lon360 <= lonmax)
+                        mask_geo = ((df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) & (mask_lon | mask_lon360))
+                    else:
+                        mask_geo = (
+                            (df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) &
+                            (df['center_lon'] >= lonmin) & (df['center_lon'] <= lonmax)
+                        )
+                    df_sel = df[mask_time & mask_geo]
+                    if not df_sel.empty:
+                        track_ids.update(df_sel['track_id'].astype(int).unique().tolist())
+
+        # 组装旧版轨迹结构（批量提取以减少重复 I/O；失败时回退逐个提取）
+        tracks: list = []
+        if track_ids:
+            try:
+                batch = find_track(
+                    kind_l,
+                    sorted(track_ids),
+                    region=region_key,
+                    output_root=output_root,
+                    include_contours=include_contours,
+                    return_list=True
+                )
+                # 批量返回为 {track_id: list}
+                tracks = [(batch[tid], int(tid)) for tid in sorted(batch.keys())]
+            except Exception:
+                for tid in sorted(track_ids):
+                    try:
+                        track_list = find_track(
+                            kind_l,
+                            tid,
+                            region=region_key,
+                            output_root=output_root,
+                            include_contours=include_contours,
+                            return_list=True
+                        )
+                        tracks.append((track_list, int(tid)))
+                    except Exception:
+                        continue
+
+        out[kind_l.upper()] = tracks
+
+    return out
 
 def worker_wrapper(args: tuple):
     """multiprocessing worker 包装函数。args: (start_date_str, end_date_str, plot_unrelated_eddies). 返回本月交互涡旋标签列表。"""
@@ -5229,7 +5694,7 @@ def plot_argo_hotspots(
             )
 
     # 绘图
-    world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    world = _load_world_geodataframe()
     fig, ax = plt.subplots(figsize=(40, 30))
     ax.set_title(
         f'Argo ΔDO Anomalies {start_year}-{end_year}' + (
