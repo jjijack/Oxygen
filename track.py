@@ -31,7 +31,7 @@ import yaml
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
 import zarr
-
+from adjustText import adjust_text
 # -------------------- 区域配置加载 --------------------
 def _load_region_config(config_path: str | Path = 'config/regions.yml', region: str | None = None):
     """加载区域配置文件并返回指定区域字典。
@@ -1427,7 +1427,7 @@ def load_argo_data(year: int, data_dir: str | Path = None,
     return final_df
 
 def find_track(
-    DS_or_kind: list | str | None,
+    DS_or_kind: list | str,
     num: int | list | tuple | set | np.ndarray,
     *,
     region: str | None = None,
@@ -1840,7 +1840,7 @@ def is_point_in_contour(row: pd.Series) -> bool:
         return False
 
 def filtered_float_data(
-    DS: list,
+    DS: list | str,
     no: int,
     argo_data_dir: str | Path = None,
     circle_enlargement_factor: float | None = None,
@@ -1859,7 +1859,9 @@ def filtered_float_data(
         3. 筛选标准为：浮标位置处于涡旋的有效轮廓内，或处于扩大一定倍数后的有效半径内。
 
     参数:
-        DS (list): 包含所有涡旋轨迹信息的数据集。
+        DS (list | str):
+            • 旧结构：legacy 轨迹列表（如从 pickle 读取的 acl/acs/... 数据）。
+            • 新结构：字符串 kind（'acs'|'acl'|'cs'|'cl'），内部会调用 find_track 动态装载 META_tracks/<region> 数据。
         no (int): 需要筛选的涡旋的唯一编号。
         argo_data_dir (str | Path, optional): 存放Argo Parquet文件的目录。None 时使用配置文件 paths.yml 中的 argo_parquet。
         circle_enlargement_factor (float | None, optional): None 时回退配置值。
@@ -1872,7 +1874,7 @@ def filtered_float_data(
         pd.DataFrame: 匹配的Argo剖面完整数据（所有深度层级）。若无匹配返回空 DataFrame。
 
     额外优化:
-        track 参数可传入已加载的涡旋轨迹（list 或 DataFrame），以避免函数内部再次调用 find_track 触发重复磁盘 I/O。
+        track 参数可传入事先加载好的涡旋轨迹（list 或 DataFrame），以避免函数内部再次调用 find_track 触发重复磁盘 I/O。
     """
     # 参数回退
     if argo_data_dir is None:
@@ -4950,6 +4952,8 @@ def plot_all_tracks_in_range(
     plot_unrelated_eddies: bool = False,
     plot_unrelated_argo: bool = True,
     save_fig: bool = False,
+    skip_save_if_empty: bool = False,
+    show_labels: bool = True,
     show_fig: bool = True,
     circle_enlargement_factor: float | None = None,
     do_threshold: float | None = None,
@@ -4983,6 +4987,8 @@ def plot_all_tracks_in_range(
         plot_unrelated_eddies: 是否绘制未与 Argo 交互的涡旋。
         plot_unrelated_argo: 是否额外绘制所有 Argo 剖面位置（空心圆），用于提供基准分布背景。
         save_fig, show_fig: 输出控制。
+        skip_save_if_empty: 若为 True 且本图中未绘制任何涡旋（不含底图/Argo点），则跳过保存；默认 False（单次绘图默认不跳过）。
+        show_labels: 是否绘制轨迹文本标签（如 ACLXXXX）。
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
         anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；None 不限制。
         anomaly_color_by: 'delta_do' 或 'do_value'。
@@ -5130,6 +5136,10 @@ def plot_all_tracks_in_range(
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_colors = {'ACE': prop_colors[1], 'CE': prop_colors[0]}
 
+    any_eddy_drawn = False
+    label_texts = []
+    label_points_x = []
+    label_points_y = []
     for result in filter(None, results):
         has_interaction = result['has_interaction']
         if not has_interaction and not plot_unrelated_eddies:
@@ -5140,11 +5150,25 @@ def plot_all_tracks_in_range(
         text_color = 'red' if has_interaction else 'black'
         
         ax.plot(result['center_lon'], result['center_lat'], color=color, alpha=0.4, linestyle='--', zorder=4)
+        any_eddy_drawn = True
         for lon_seg, lat_seg in result['in_range_segments']:
             ax.plot(lon_seg, lat_seg, color=color, alpha=0.8, linestyle='-', zorder=4)
         
-        info = result['text_info']
-        ax.text(info['lon'], info['lat'], info['text'], fontsize=12, color=text_color, weight='bold', zorder=5)
+        if show_labels:
+            info = result['text_info']
+            text_obj = ax.text(
+                info['lon'],
+                info['lat'],
+                info['text'],
+                fontsize=12,
+                color=text_color,
+                weight='bold',
+                zorder=5,
+                clip_on=False,
+            )
+            label_texts.append(text_obj)
+            label_points_x.append(info['lon'])
+            label_points_y.append(info['lat'])
 
         # 第一轮不画等值线；若不是 lazy 模式但已有 contours_to_plot，则保持现状
         if (not lazy_contour_mode) and has_interaction:
@@ -5288,6 +5312,30 @@ def plot_all_tracks_in_range(
         except Exception as e:
             print(f"[LazyContour] failed to draw contours lazily: {e}")
 
+    # --- 4.3 标签避让 ---
+    orig_xlim = ax.get_xlim()
+    orig_ylim = ax.get_ylim()
+    if adjust_text is not None and label_texts:
+        try:
+            adjust_text(
+                label_texts,
+                x=label_points_x,
+                y=label_points_y,
+                ax=ax,
+                arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6, shrinkA=6, shrinkB=6),
+                expand_text=(1.25, 1.25),
+                expand_points=(1.6, 1.6),
+                expand_axes=(1.04, 1.04),
+                force_text=(0.6, 0.6),
+                force_axes=(0.05, 0.05),
+                lim=800,
+                only_move={'text': 'xy'},
+            )
+        except Exception as e:
+            print(f"[plot_all_tracks_in_range] adjust_text failed: {e}")
+    ax.set_xlim(orig_xlim)
+    ax.set_ylim(orig_ylim)
+
     # --- 5. 输出控制 ---
     if save_fig:
         # 使用全局配置的输出根目录，按区域分子目录
@@ -5296,8 +5344,12 @@ def plot_all_tracks_in_range(
         output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}.png"
         save_path = output_dir / base_filename
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
+        # 若开启跳过空图保存且确认为空（没有任何涡旋轨迹绘制），则跳过
+        if skip_save_if_empty and not any_eddy_drawn:
+            print(f"Skip saving empty figure for {start_date_str} to {end_date_str} (no eddies plotted).")
+        else:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Figure saved to: {save_path}")
     
     if show_fig:
         plt.show()
@@ -5508,14 +5560,20 @@ def _load_eddy_datasets_for_range(
     return out
 
 def worker_wrapper(args: tuple):
-    """multiprocessing worker 包装函数。args: (start_date_str, end_date_str, plot_unrelated_eddies). 返回本月交互涡旋标签列表。"""
-    start_d, end_d, unrelated_flag = args
+    """multiprocessing worker 包装函数。
+    参数:
+        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels)
+    返回: 本月交互涡旋标签列表。
+    """
+    start_d, end_d, unrelated_flag, skip_empty, show_labels = args
     try:
         return plot_all_tracks_in_range(
             start_date_str=start_d,
             end_date_str=end_d,
             plot_unrelated_eddies=unrelated_flag,
             save_fig=True,
+            skip_save_if_empty=skip_empty,
+            show_labels=show_labels,
             show_fig=False,
         )
     except Exception as e:
@@ -5527,7 +5585,9 @@ def run_batch_plotting_multiprocessing(
     end_date_str: str,
     eddy_datasets: dict,
     num_workers: int,
-    plot_unrelated_eddies: bool = False
+    plot_unrelated_eddies: bool = False,
+    skip_save_if_empty: bool = True,
+    show_labels: bool | None = None,
 ):
     """
     (批处理控制器) 使用multiprocessing启动一个扁平化的并行绘图作业，并带有进度条。
@@ -5543,6 +5603,8 @@ def run_batch_plotting_multiprocessing(
         eddy_datasets (dict): 【已加载】的、将被共享给所有进程的涡旋数据集。
         num_workers (int): 需要启动的并行工作进程数（核心数）。
         plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
+        skip_save_if_empty (bool): 批处理默认 True（空图不保存）；当传入 False 时，将把 False 透传至 worker，空图也会保存。
+        show_labels (bool | None): 是否绘制轨迹标签；None 表示使用智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
     """
     print("="*60)
     print("      Multiprocessing Batch Plotting with Progress Bar      ")
@@ -5551,16 +5613,36 @@ def run_batch_plotting_multiprocessing(
     
     # --- 1. 创建按月切分的任务列表 ---
     month_starts = pd.date_range(start=start_date_str, end=end_date_str, freq='MS')
+    region_slug_for_path = _current_region_key()
+    effective_show_labels = show_labels
+    if show_labels is None:
+        if plot_unrelated_eddies and region_slug_for_path.lower() in {'global', 'world', 'global_ocean', 'all'}:
+            effective_show_labels = False
+        else:
+            effective_show_labels = True
+
     tasks = [
         (
-            start_date.strftime('%Y-%m-%d'), 
+            start_date.strftime('%Y-%m-%d'),
             (start_date + pd.tseries.offsets.MonthEnd(1)).strftime('%Y-%m-%d'),
-            plot_unrelated_eddies
-        ) 
+            plot_unrelated_eddies,
+            skip_save_if_empty,
+            effective_show_labels,
+        )
         for start_date in month_starts
     ]
     
     print(f"[*] Created {len(tasks)} monthly plotting tasks to be processed by {num_workers} cores.")
+
+    # 在批量任务开始前清理输出目录
+    output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
+    try:
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[*] Cleared output directory: {output_dir}")
+    except Exception as e:
+        print(f"[WARN] Failed to clear output directory {output_dir}: {e}")
     
     # --- 2. 启动进程池并执行任务 ---
     start_time_total = tm.time()
