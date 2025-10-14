@@ -31,6 +31,8 @@ import yaml
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
 import zarr
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 from adjustText import adjust_text
 # -------------------- 区域配置加载 --------------------
 def _load_region_config(config_path: str | Path = 'config/regions.yml', region: str | None = None):
@@ -67,10 +69,9 @@ _REGION_CFG = _load_region_config()
 lonmin, lonmax = _REGION_CFG['lon_min'], _REGION_CFG['lon_max']
 latmin, latmax = _REGION_CFG['lat_min'], _REGION_CFG['lat_max']
 
-# 对跨日界线区域的简单提示（当前裁剪逻辑仍使用单一区间，后续可升级为双区间或经度归一）
+# 对跨日界线区域的提示：若 lon_max < lon_min，表示经度区间在 [-180, 180] 中发生了换向，需要在后续逻辑中做归一化处理
 if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
-    # 若采用 normalized 表达（例如 lon_max_normalized < lon_min_normalized），可在后续筛选函数中加特殊处理
-    print('[RegionConfig] Detected dateline-crossing region with inverted lon bounds; consider implementing split-range filtering.')
+    print(f"[RegionConfig] Dateline-crossing region detected (lon_min={lonmin}, lon_max={lonmax}); normalized longitude filtering will be applied.")
 
 # -------------------- 数据路径与处理参数配置加载（Paths & Processing Config） --------------------
 def _load_yaml(path: str | Path) -> dict:
@@ -123,6 +124,24 @@ _default_adaptive_lat_threshold = float(
 _default_adaptive_distance_threshold_km = float(
     _PROC_CFG.get('processing', {}).get('adaptive_distance_threshold_km', 300.0)
 )
+
+def _load_basemap_colors() -> dict:
+    defaults = {
+        'ocean': '#f8fafc',
+        'land': '#d9d9d9',
+        'coastline': '#787d85',
+        'border': '#9aa0a8',
+        'grid': '#b6bdc6',
+    }
+    if not isinstance(_PROC_CFG, dict):
+        return defaults
+    bm = _PROC_CFG.get('processing', {}).get('basemap_colors', {})
+    merged = defaults.copy()
+    if isinstance(bm, dict):
+        merged.update({k: str(v) for k, v in bm.items() if k in defaults})
+    return merged
+
+_BASEMAP_COLORS = _load_basemap_colors()
 
 # -------------------- 自带底图加载（使用本地 Natural Earth, 简洁版） --------------------
 def _load_world_geodataframe():
@@ -224,6 +243,35 @@ def _minimal_lon_diff_deg(lon: float | np.ndarray, lon0: float) -> np.ndarray:
     d = np.asarray(lon) - lon0
     return (d + 180.0) % 360.0 - 180.0
 
+def _normalize_lon_array(val: np.ndarray | float) -> np.ndarray:
+    """将任意经度值映射到 (-180, 180] 区间，返回 np.ndarray。"""
+    arr = np.asarray(val, dtype=float)
+    return (arr + 180.0) % 360.0 - 180.0
+
+def _region_lon_mask(lon_vals: np.ndarray, lon_min_cfg: float, lon_max_cfg: float) -> np.ndarray:
+    """根据区域经度范围（允许跨日界线）生成布尔掩码。"""
+    lon_arr = np.asarray(lon_vals, dtype=float)
+    if lon_arr.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    lon_min_norm = float(_normalize_lon_array(lon_min_cfg))
+    lon_max_norm = float(_normalize_lon_array(lon_max_cfg))
+
+    raw_span = abs(float(lon_max_cfg) - float(lon_min_cfg))
+    eff_span = (lon_max_norm - lon_min_norm) % 360.0
+    is_global_lon = (
+        (raw_span >= 359.5)
+        or (eff_span >= 359.5)
+        or np.isclose(eff_span, 0.0, atol=1e-6)
+    )
+    if is_global_lon:
+        return np.ones(lon_arr.shape, dtype=bool)
+
+    lon_norm = _normalize_lon_array(lon_arr)
+    if lon_min_norm <= lon_max_norm:
+        return (lon_norm >= lon_min_norm) & (lon_norm <= lon_max_norm)
+    return (lon_norm >= lon_min_norm) | (lon_norm <= lon_max_norm)
+
 def local_xy_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
                         lon0: float, lat0: float, wrap_dateline: bool = True) -> np.ndarray:
     """计算点 (lon,lat) 到参考点 (lon0,lat0) 的局地平面近似距离（米）。
@@ -291,8 +339,8 @@ def great_circle_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
 def adaptive_distance_m(
     lon: float | np.ndarray,
     lat: float | np.ndarray,
-    lon0: float,
-    lat0: float,
+    lon0: float | np.ndarray,
+    lat0: float | np.ndarray,
     wrap_dateline: bool = True,
     gc_lat_threshold: float | None = None,
     gc_distance_threshold_km: float | None = None,
@@ -313,7 +361,7 @@ def adaptive_distance_m(
 
     参数:
         lon, lat : 目标点（标量或数组）。
-        lon0, lat0 : 中心经纬度（标量）。
+        lon0, lat0 : 中心经纬度（标量或数组，可与目标点一一对应广播）。
         gc_lat_threshold : 高纬触发大圆的绝对纬度阈值；None 时使用配置文件 adaptive_lat_threshold。
         gc_distance_threshold_km : 平面最大距离超过该值 (km) 触发大圆；None 时使用配置文件 adaptive_distance_threshold_km。
         force_great_circle : 强制使用大圆。
@@ -329,28 +377,40 @@ def adaptive_distance_m(
 
     lon_arr = np.asarray(lon, dtype=float)
     lat_arr = np.asarray(lat, dtype=float)
+    lon0_arr = np.asarray(lon0, dtype=float)
+    lat0_arr = np.asarray(lat0, dtype=float)
+
+    # 广播到统一形状，便于处理逐点中心（例如逐日涡旋中心）
+    try:
+        broadcast_shape = np.broadcast(lon_arr, lat_arr, lon0_arr, lat0_arr).shape
+    except ValueError as exc:
+        raise ValueError("adaptive_distance_m: inputs cannot be broadcast to a common shape") from exc
+    lon_arr = np.broadcast_to(lon_arr, broadcast_shape)
+    lat_arr = np.broadcast_to(lat_arr, broadcast_shape)
+    lon0_arr = np.broadcast_to(lon0_arr, broadcast_shape)
+    lat0_arr = np.broadcast_to(lat0_arr, broadcast_shape)
 
     # (1) 强制模式：直接大圆
     if force_great_circle:
-        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0_arr, lat0_arr, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
         return gc
 
     # (2) 高纬提前判定：无需先算平面
-    if gc_lat_threshold is not None and abs(lat0) >= gc_lat_threshold:
-        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+    if gc_lat_threshold is not None and np.any(np.abs(lat0_arr) >= gc_lat_threshold):
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0_arr, lat0_arr, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
         return gc
 
     # (3) 需要距离阈值判定，才计算平面距离
-    scale = approximate_degree_length(lat0)
-    dlon = _minimal_lon_diff_deg(lon_arr, lon0) if wrap_dateline else (lon_arr - lon0)
-    dlat = lat_arr - lat0
+    scale = approximate_degree_length(lat0_arr)
+    dlon = _minimal_lon_diff_deg(lon_arr, lon0_arr) if wrap_dateline else (lon_arr - lon0_arr)
+    dlat = lat_arr - lat0_arr
     planar = np.hypot(
         dlon * scale['meters_per_degree_lon'],
         dlat * scale['meters_per_degree_lat']
     )
 
     if gc_distance_threshold_km is not None and np.max(planar) > gc_distance_threshold_km * 1000.0:
-        gc = great_circle_distance_m(lon_arr, lat_arr, lon0, lat0, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
+        gc = great_circle_distance_m(lon_arr, lat_arr, lon0_arr, lat0_arr, wrap_dateline=wrap_dateline, radius_earth_m=radius_earth_m)
         return gc
 
     if np.ndim(planar) == 0:
@@ -1826,17 +1886,34 @@ def is_point_in_contour(row: pd.Series) -> bool:
         bool: 如果点在轮廓内部，则返回True，否则返回False。
     """
     try:
-        # 从行数据中提取轮廓坐标和点坐标
-        contour_coords = zip(row['contour_lon'], row['contour_lat'])
-        point_coord = Point(row['Longitude'], row['Latitude'])
-        
-        # 创建多边形对象
+        contour_lon = np.asarray(row['contour_lon'], dtype=float)
+        contour_lat = np.asarray(row['contour_lat'], dtype=float)
+        if contour_lon.size < 3 or contour_lat.size < 3:
+            return False
+        if contour_lon.shape != contour_lat.shape:
+            return False
+
+        center_lon = row.get('center_lon', np.nan)
+        if pd.isna(center_lon):
+            if contour_lon.size:
+                center_lon = float(contour_lon[0])
+            else:
+                center_lon = float(row['Longitude'])
+
+        contour_lon_norm = center_lon + _minimal_lon_diff_deg(contour_lon, center_lon)
+        point_lon_norm = center_lon + _minimal_lon_diff_deg(row['Longitude'], center_lon)
+
+        contour_coords = list(zip(contour_lon_norm, contour_lat))
+        if len(contour_coords) < 3:
+            return False
+
         polygon = Polygon(contour_coords)
-        
-        # 执行包含判断
+        if polygon.is_empty:
+            return False
+
+        point_coord = Point(point_lon_norm, row['Latitude'])
         return polygon.contains(point_coord)
     except Exception:
-        # 如果轮廓数据格式错误或不完整，安全地返回False
         return False
 
 def filtered_float_data(
@@ -1974,7 +2051,11 @@ def filtered_float_data(
         scale_all = approximate_degree_length(merged_df['center_lat'].values)
         scale_lat = scale_all['meters_per_degree_lat']
         scale_lon = scale_all['meters_per_degree_lon']
-        dx_m = (merged_df['Longitude'].values - merged_df['center_lon'].values) * scale_lon
+        dlon_deg = _minimal_lon_diff_deg(
+            merged_df['Longitude'].values,
+            merged_df['center_lon'].values
+        )
+        dx_m = dlon_deg * scale_lon
         dy_m = (merged_df['Latitude'].values - merged_df['center_lat'].values) * scale_lat
         dist_m = np.hypot(dx_m, dy_m)
     inside_circle_mask = dist_m <= (merged_df['radius'].values * circle_enlargement_factor)
@@ -2565,7 +2646,8 @@ def plot_vertical(
                                 radius = float(wanted_track.iloc[idx_track]['radius'])
                                 if radius > 1e-6:
                                     scale = approximate_degree_length(center_lat)
-                                    dx_m = (rows.iloc[0]['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+                                    dlon_deg = _minimal_lon_diff_deg(rows.iloc[0]['Longitude'], center_lon)
+                                    dx_m = dlon_deg * scale['meters_per_degree_lon']
                                     dy_m = (rows.iloc[0]['Latitude'] - center_lat) * scale['meters_per_degree_lat']
                                     rel_x = dx_m / radius
                                     rel_y = dy_m / radius
@@ -2712,7 +2794,8 @@ def plot_vertical(
                         radius = float(wanted_track.iloc[idx_track]['radius'])
                         if radius > 1e-6:
                             scale = approximate_degree_length(center_lat)
-                            dx_m = (profile_info['lon'] - center_lon) * scale['meters_per_degree_lon']
+                            dlon_deg = _minimal_lon_diff_deg(profile_info['lon'], center_lon)
+                            dx_m = dlon_deg * scale['meters_per_degree_lon']
                             dy_m = (profile_info['lat'] - center_lat) * scale['meters_per_degree_lat']
                             rel_x = dx_m / radius
                             rel_y = dy_m / radius
@@ -2934,7 +3017,8 @@ def plot_relative_position(
                         # print(f"Skipping point on {current_date_profile.date()} due to missing Longitude/Latitude.")
                         continue
                     scale = approximate_degree_length(center_lat)
-                    dx_m = (p_row['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+                    dlon_deg = _minimal_lon_diff_deg(p_row['Longitude'], center_lon)
+                    dx_m = dlon_deg * scale['meters_per_degree_lon']
                     dy_m = (p_row['Latitude'] - center_lat) * scale['meters_per_degree_lat']
                     rel_x = dx_m / radius
                     rel_y = dy_m / radius
@@ -3097,7 +3181,8 @@ def plot_relative_position(
                 continue
 
             scale = approximate_degree_length(center_lat)
-            dx_m = (p_row['Longitude'] - center_lon) * scale['meters_per_degree_lon']
+            dlon_deg = _minimal_lon_diff_deg(p_row['Longitude'], center_lon)
+            dx_m = dlon_deg * scale['meters_per_degree_lon']
             dy_m = (p_row['Latitude'] - center_lat) * scale['meters_per_degree_lat']
             rel_x = dx_m / radius
             rel_y = dy_m / radius
@@ -4881,36 +4966,52 @@ def check_single_track(
     for i in indices_in_range:
         current_date = dates[i].normalize()
         if current_date in argo_points_by_date:
+            center_lon_i = float(center_lon[i])
+            center_lat_i = float(center_lat[i])
+            radius_i = float(radius[i])
+
             # 仅当存在有效等值线时才做多边形包含判断
             inside_poly = False
             try:
-                if contour_lon[i] is not None and contour_lat[i] is not None and len(contour_lon[i]) >= 3 and len(contour_lat[i]) >= 3:
-                    contour_poly = Polygon(zip(contour_lon[i], contour_lat[i]))
-                    # 点集数量可能很大，先不构造 shapely MultiPoint，逐点判断即可
-                    for argo_point in argo_points_by_date[current_date]:
-                        if contour_poly.contains(argo_point):
-                            inside_poly = True
-                            break
+                contour_lon_i = contour_lon[i]
+                contour_lat_i = contour_lat[i]
+                if contour_lon_i is not None and contour_lat_i is not None:
+                    contour_lon_arr = np.asarray(contour_lon_i, dtype=float)
+                    contour_lat_arr = np.asarray(contour_lat_i, dtype=float)
+                    if contour_lon_arr.size >= 3 and contour_lat_arr.size >= 3 and contour_lon_arr.shape == contour_lat_arr.shape:
+                        contour_lon_norm = center_lon_i + _minimal_lon_diff_deg(contour_lon_arr, center_lon_i)
+                        contour_poly = Polygon(zip(contour_lon_norm, contour_lat_arr))
+                        if not contour_poly.is_empty:
+                            for argo_point in argo_points_by_date[current_date]:
+                                point_lon_norm = center_lon_i + _minimal_lon_diff_deg(argo_point.x, center_lon_i)
+                                point_norm = Point(point_lon_norm, argo_point.y)
+                                if contour_poly.contains(point_norm):
+                                    inside_poly = True
+                                    break
             except Exception:
                 inside_poly = False
+
             for argo_point in argo_points_by_date[current_date]:
-                center = np.array([center_lon[i], center_lat[i]])
-                point_coord = np.array([argo_point.x, argo_point.y])
-                distance = np.linalg.norm(point_coord - center)
+                point_lon = float(argo_point.x)
+                point_lat = float(argo_point.y)
                 if use_adaptive_circle:
                     distance_m = adaptive_distance_m(
-                        point_coord[0], point_coord[1], center[0], center[1],
+                        point_lon,
+                        point_lat,
+                        center_lon_i,
+                        center_lat_i,
                         wrap_dateline=True,
                         gc_lat_threshold=adaptive_lat_threshold,
                         gc_distance_threshold_km=adaptive_distance_threshold_km,
                         force_great_circle=force_great_circle_circle
                     )
                 else:
-                    scale_ci = approximate_degree_length(center_lat[i])
-                    dx_m = (point_coord[0] - center[0]) * scale_ci['meters_per_degree_lon']
-                    dy_m = (point_coord[1] - center[1]) * scale_ci['meters_per_degree_lat']
+                    scale_ci = approximate_degree_length(center_lat_i)
+                    dlon_deg = _minimal_lon_diff_deg(point_lon, center_lon_i)
+                    dx_m = dlon_deg * scale_ci['meters_per_degree_lon']
+                    dy_m = (point_lat - center_lat_i) * scale_ci['meters_per_degree_lat']
                     distance_m = np.hypot(dx_m, dy_m)
-                inside_circle = distance_m <= radius[i] * circle_enlargement_factor
+                inside_circle = distance_m <= radius_i * circle_enlargement_factor
                 if inside_poly or inside_circle:
                     if inside_poly and contour_lon[i] is not None and contour_lat[i] is not None:
                         contours_to_plot.append((contour_lon[i], contour_lat[i]))
@@ -4971,6 +5072,8 @@ def plot_all_tracks_in_range(
     meta_output_root: str | Path | None = None
 ):
     """(核心绘图) 指定时间段内涡旋轨迹 + Argo ΔDO 异常代表点（仅采用 ΔDO 方法）。
+
+    依赖 Cartopy 进行制图，自动处理跨国际日期变更线的轨迹连线。
 
     工作流程：
       1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 计算 ΔDO 异常。
@@ -5057,10 +5160,11 @@ def plot_all_tracks_in_range(
     needed_argo_data = pd.DataFrame()
     base_argo_positions = pd.DataFrame()
     if not argo_in_range.empty:
-        geo_mask = (
-            (argo_in_range['Longitude'] >= lonmin) & (argo_in_range['Longitude'] <= lonmax) &
-            (argo_in_range['Latitude'] >= latmin) & (argo_in_range['Latitude'] <= latmax)
-        )
+        lon_vals = argo_in_range['Longitude'].to_numpy(dtype=float, copy=False)
+        lat_vals = argo_in_range['Latitude'].to_numpy(dtype=float, copy=False)
+        lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+        lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+        geo_mask = lon_mask & lat_mask
         argo_in_geo_range = argo_in_range[geo_mask].copy()
         if not argo_in_geo_range.empty:
             # 所有剖面基础位置（避免按深度重复）
@@ -5124,14 +5228,42 @@ def plot_all_tracks_in_range(
     ]
 
     # --- 4. 绘图（第一轮：不画等值线） ---
-    world = _load_world_geodataframe()
-    fig, ax = plt.subplots(figsize=(40, 30))
+    crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig = plt.figure(figsize=(40, 30))
+    ax = fig.add_subplot(1, 1, 1, projection=map_crs)
     ax.set_title(
         f"Eddy Tracks and Argo ΔDO Anomalies ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})",
         fontsize=20
     )
-    ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
-    world.plot(color='lightgrey', edgecolor='white', ax=ax)
+
+    # Basemap features（自然地理背景）
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    border_color = _BASEMAP_COLORS['border']
+    grid_color = _BASEMAP_COLORS['grid']
+
+    ax.set_facecolor(base_ocean)
+    ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+    ax.add_feature(cfeature.BORDERS.with_scale('110m'), linewidth=0.4, edgecolor=border_color, zorder=1)
+
+    gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # 地图范围处理（跨日界线时扩展 longitude）
+    lon_extent_min = lonmin
+    lon_extent_max = lonmax
+    if crosses_dateline:
+        if lon_extent_max < lon_extent_min:
+            lon_extent_max += 360
+    ax.set_extent([lon_extent_min, lon_extent_max, latmin, latmax], crs=data_crs)
     
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_colors = {'ACE': prop_colors[1], 'CE': prop_colors[0]}
@@ -5149,10 +5281,26 @@ def plot_all_tracks_in_range(
         color = eddy_colors['ACE'] if is_ace else eddy_colors['CE']
         text_color = 'red' if has_interaction else 'black'
         
-        ax.plot(result['center_lon'], result['center_lat'], color=color, alpha=0.4, linestyle='--', zorder=4)
+        ax.plot(
+            result['center_lon'],
+            result['center_lat'],
+            color=color,
+            alpha=0.4,
+            linestyle='--',
+            zorder=4,
+            transform=ccrs.Geodetic(),
+        )
         any_eddy_drawn = True
         for lon_seg, lat_seg in result['in_range_segments']:
-            ax.plot(lon_seg, lat_seg, color=color, alpha=0.8, linestyle='-', zorder=4)
+            ax.plot(
+                lon_seg,
+                lat_seg,
+                color=color,
+                alpha=0.8,
+                linestyle='-',
+                zorder=4,
+                transform=ccrs.Geodetic(),
+            )
         
         if show_labels:
             info = result['text_info']
@@ -5165,6 +5313,7 @@ def plot_all_tracks_in_range(
                 weight='bold',
                 zorder=5,
                 clip_on=False,
+                transform=data_crs,
             )
             label_texts.append(text_obj)
             label_points_x.append(info['lon'])
@@ -5173,13 +5322,23 @@ def plot_all_tracks_in_range(
         # 第一轮不画等值线；若不是 lazy 模式但已有 contours_to_plot，则保持现状
         if (not lazy_contour_mode) and has_interaction:
             for contour_lon, contour_lat in result['contours_to_plot']:
-                ax.plot(contour_lon, contour_lat, color=color, linewidth=1, alpha=0.5, zorder=4, linestyle=':')
+                ax.plot(
+                    contour_lon,
+                    contour_lat,
+                    color=color,
+                    linewidth=1,
+                    alpha=0.5,
+                    zorder=4,
+                    linestyle=':',
+                    transform=ccrs.Geodetic(),
+                )
 
     if plot_unrelated_argo and not base_argo_positions.empty:
         ax.scatter(
             base_argo_positions['Longitude'], base_argo_positions['Latitude'],
             facecolors='none', edgecolors='gray', linewidths=0.8, s=36,
-            label='All Argo Profiles (baseline)', zorder=2
+            label='All Argo Profiles (baseline)', zorder=2,
+            transform=data_crs,
         )
 
     if not needed_argo_data.empty:
@@ -5193,6 +5352,7 @@ def plot_all_tracks_in_range(
                 c=needed_argo_data['delta_do'], cmap='Reds', s=70,
                 edgecolors='black', linewidths=0.5,
                 label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹ @ depth ≥ {anomaly_min_depth} m', zorder=3,
+                transform=data_crs,
                 **scatter_kwargs
             )
             cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
@@ -5216,14 +5376,12 @@ def plot_all_tracks_in_range(
                 c=color_values, cmap='bwr', s=60, vmin=150, vmax=240,
                 edgecolors='black', linewidths=0.5,
                 label='Argo DO Anomaly Profiles',
-                zorder=3
+                zorder=3,
+                transform=data_crs,
             )
             cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
             cbar.set_label('DO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
 
-    ax.set_xlim(lonmin, lonmax); ax.set_ylim(latmin, latmax)
-    ax.tick_params(axis='both', which='major', labelsize=16); ax.set_aspect('equal')
-    
     legend_elements = [
         Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'),
         Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')
@@ -5301,22 +5459,54 @@ def plot_all_tracks_in_range(
                             if isinstance(cl, (list, np.ndarray)) and isinstance(ct, (list, np.ndarray)) and len(cl) >= 3 and len(ct) >= 3:
                                 # 二次判定：仅当 Argo 点在等值线内时才绘制该 contour
                                 try:
-                                    poly = Polygon(zip(cl, ct))
+                                    contour_lon_arr = np.asarray(cl, dtype=float)
+                                    contour_lat_arr = np.asarray(ct, dtype=float)
+                                    center_lon_i = float(row.get('center_lon', contour_lon_arr[0]))
+                                    contour_lon_norm = center_lon_i + _minimal_lon_diff_deg(contour_lon_arr, center_lon_i)
+                                    contour_lon_norm = np.asarray(contour_lon_norm, dtype=float)
+                                    poly = Polygon(zip(contour_lon_norm, contour_lat_arr))
+                                    if poly.is_empty:
+                                        raise ValueError("Empty polygon after normalization")
+
                                     date_norm = row['date'].normalize() if isinstance(row['date'], pd.Timestamp) else pd.Timestamp(row['date']).normalize()
                                     pts = argo_points_by_date.get(date_norm, [])
-                                    draw_it = any(poly.contains(pt) for pt in pts)
+                                    draw_it = False
+                                    for pt in pts:
+                                        point_lon_norm = float(center_lon_i + _minimal_lon_diff_deg(pt.x, center_lon_i))
+                                        point_norm = Point(point_lon_norm, pt.y)
+                                        if poly.contains(point_norm):
+                                            draw_it = True
+                                            break
                                 except Exception:
                                     draw_it = False
                                 if draw_it:
-                                    ax.plot(cl, ct, color=color2, linewidth=1, alpha=0.6, zorder=4, linestyle=':')
+                                    ax.plot(
+                                        contour_lon_norm,
+                                        contour_lat_arr,
+                                        color=color2,
+                                        linewidth=1,
+                                        alpha=0.6,
+                                        zorder=4,
+                                        linestyle=':',
+                                        transform=ccrs.Geodetic(),
+                                    )
         except Exception as e:
             print(f"[LazyContour] failed to draw contours lazily: {e}")
 
     # --- 4.3 标签避让 ---
     orig_xlim = ax.get_xlim()
     orig_ylim = ax.get_ylim()
-    if adjust_text is not None and label_texts:
+    region_is_global = _current_region_key().lower() == 'global'
+    if region_is_global and adjust_text is not None and label_texts:
         try:
+            span_x = max(abs(orig_xlim[1] - orig_xlim[0]), 1e-6)
+            span_y = max(abs(orig_ylim[1] - orig_ylim[0]), 1e-6)
+            span_ratio_x = span_x / 360.0
+            span_ratio_y = span_y / 180.0
+            span_ratio = max(span_ratio_x, span_ratio_y, 0.02)
+            force_mag = 0.6 * span_ratio
+            axis_force = 0.05 * span_ratio
+            limit_steps = max(200, int(800 * min(span_ratio, 1.2)))
             adjust_text(
                 label_texts,
                 x=label_points_x,
@@ -5326,9 +5516,9 @@ def plot_all_tracks_in_range(
                 expand_text=(1.25, 1.25),
                 expand_points=(1.6, 1.6),
                 expand_axes=(1.04, 1.04),
-                force_text=(0.6, 0.6),
-                force_axes=(0.05, 0.05),
-                lim=800,
+                force_text=(force_mag, force_mag),
+                force_axes=(axis_force, axis_force),
+                lim=limit_steps,
                 only_move={'text': 'xy'},
             )
         except Exception as e:
@@ -5397,7 +5587,37 @@ def _load_eddy_datasets_for_range(
         raise FileNotFoundError(f"未找到 daily 数据：{daily_file} 或 {daily_tmp_dir} / {daily_dir}")
 
     # dateline 兼容：使用全局 lonmin/lonmax/latmin/latmax
-    crosses = _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin)
+    def _normalize_lon(val: np.ndarray | float) -> np.ndarray | float:
+        return (np.asarray(val, dtype=float) + 180.0) % 360.0 - 180.0
+
+    lon_min_cfg = float(lonmin)
+    lon_max_cfg = float(lonmax)
+    lon_min_eff = float(_normalize_lon(lon_min_cfg))
+    lon_max_eff = float(_normalize_lon(lon_max_cfg))
+
+    raw_span = abs(lon_max_cfg - lon_min_cfg)
+    eff_span = (lon_max_eff - lon_min_eff) % 360.0
+    is_global_lon = (raw_span >= 359.5) or (eff_span >= 359.5) or np.isclose(eff_span, 0.0, atol=1e-6)
+
+    crosses_cfg = bool(_REGION_CFG.get('crosses_dateline'))
+    simple_interval = (not crosses_cfg) and (not is_global_lon) and (lon_min_eff <= lon_max_eff)
+
+    def _build_lon_mask(lon_vals: np.ndarray) -> np.ndarray:
+        if lon_vals.size == 0 or is_global_lon:
+            return np.ones(lon_vals.size, dtype=bool)
+        lon_norm = _normalize_lon(lon_vals)
+        if lon_min_eff <= lon_max_eff:
+            return (lon_norm >= lon_min_eff) & (lon_norm <= lon_max_eff)
+        return (lon_norm >= lon_min_eff) | (lon_norm <= lon_max_eff)
+
+    def _geo_mask(df: pd.DataFrame) -> np.ndarray:
+        if df.empty:
+            return np.zeros(0, dtype=bool)
+        lon_vals = df['center_lon'].to_numpy(dtype=float, copy=False)
+        lat_vals = df['center_lat'].to_numpy(dtype=float, copy=False)
+        lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+        lon_mask = _build_lon_mask(lon_vals)
+        return lat_mask & lon_mask
 
     out: dict[str, list] = {}
     # 预先计算时间边界（闭开区间），避免逐行日期转换：time ∈ [start_ts, end_exclusive)
@@ -5429,21 +5649,32 @@ def _load_eddy_datasets_for_range(
                             # 跳过与 [start_ts, end_exclusive) 无交集的行组
                             if (tmax < start_ts) or (tmin >= end_exclusive):
                                 read_rg = False
-                    # lat/lon stats（仅当不跨日界线时启用）
-                    if read_rg and not crosses:
+                    # lat/lon stats（仅当使用简单区间时启用）
+                    if read_rg:
                         try:
                             lat_idx = schema_names.index('center_lat')
-                            lon_idx = schema_names.index('center_lon')
                             lat_stats = pf.metadata.row_group(rg).column(lat_idx).statistics
-                            lon_stats = pf.metadata.row_group(rg).column(lon_idx).statistics
                             if lat_stats and lat_stats.has_min_max:
                                 lat_min, lat_max_ = float(lat_stats.min), float(lat_stats.max)
                                 if (lat_max_ < latmin) or (lat_min > latmax):
                                     read_rg = False
-                            if read_rg and lon_stats and lon_stats.has_min_max:
-                                lon_min_, lon_max_ = float(lon_stats.min), float(lon_stats.max)
-                                if (lon_max_ < lonmin) or (lon_min_ > lonmax):
-                                    read_rg = False
+                        except Exception:
+                            pass
+                    if read_rg and simple_interval:
+                        try:
+                            lon_idx = schema_names.index('center_lon')
+                            lon_stats = pf.metadata.row_group(rg).column(lon_idx).statistics
+                            if lon_stats and lon_stats.has_min_max:
+                                lon_min_rg = float(lon_stats.min)
+                                lon_max_rg = float(lon_stats.max)
+                                lon_norm_min = float(_normalize_lon(lon_min_rg))
+                                lon_norm_max = float(_normalize_lon(lon_max_rg))
+                                if lon_norm_min <= lon_norm_max:
+                                    if (lon_norm_max < lon_min_eff) or (lon_norm_min > lon_max_eff):
+                                        read_rg = False
+                                else:
+                                    # 无法可靠判断跨日期线的行组，保留
+                                    pass
                         except Exception:
                             pass
                 except Exception:
@@ -5455,17 +5686,8 @@ def _load_eddy_datasets_for_range(
                 df = table.to_pandas()
                 # 直接用时间戳闭开区间过滤，避免生成 'date'
                 mask_time = (df['time'] >= start_ts) & (df['time'] < end_exclusive)
-                if crosses:
-                    lon = df['center_lon']; lon360 = (lon % 360 + 360) % 360
-                    mask_lon = (lon >= lonmin) | (lon <= lonmax)
-                    mask_lon360 = (lon360 >= lonmin) | (lon360 <= lonmax)
-                    mask_geo = ((df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) & (mask_lon | mask_lon360))
-                else:
-                    mask_geo = (
-                        (df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) &
-                        (df['center_lon'] >= lonmin) & (df['center_lon'] <= lonmax)
-                    )
-                df_sel = df[mask_time & mask_geo]
+                mask_geo = _geo_mask(df)
+                df_sel = df.loc[mask_time.to_numpy() & mask_geo]
                 if not df_sel.empty:
                     track_ids.update(df_sel['track_id'].astype(int).unique().tolist())
         else:
@@ -5489,20 +5711,29 @@ def _load_eddy_datasets_for_range(
                                 if (tmax < start_ts) or (tmin >= end_exclusive):
                                     read_rg = False
                         # lat/lon stats prune（不跨日界线时）
-                        if read_rg and not crosses:
+                        if read_rg:
                             try:
                                 lat_idx = schema_names.index('center_lat')
-                                lon_idx = schema_names.index('center_lon')
                                 lat_stats = ppf.metadata.row_group(rg).column(lat_idx).statistics
-                                lon_stats = ppf.metadata.row_group(rg).column(lon_idx).statistics
                                 if lat_stats and lat_stats.has_min_max:
                                     lat_min, lat_max_ = float(lat_stats.min), float(lat_stats.max)
                                     if (lat_max_ < latmin) or (lat_min > latmax):
                                         read_rg = False
-                                if read_rg and lon_stats and lon_stats.has_min_max:
-                                    lon_min_, lon_max_ = float(lon_stats.min), float(lon_stats.max)
-                                    if (lon_max_ < lonmin) or (lon_min_ > lonmax):
-                                        read_rg = False
+                            except Exception:
+                                pass
+                        if read_rg and simple_interval:
+                            try:
+                                lon_idx = schema_names.index('center_lon')
+                                lon_stats = ppf.metadata.row_group(rg).column(lon_idx).statistics
+                                if lon_stats and lon_stats.has_min_max:
+                                    lon_min_rg = float(lon_stats.min)
+                                    lon_max_rg = float(lon_stats.max)
+                                    lon_norm_min = float(_normalize_lon(lon_min_rg))
+                                    lon_norm_max = float(_normalize_lon(lon_max_rg))
+                                    if lon_norm_min <= lon_norm_max:
+                                        if (lon_norm_max < lon_min_eff) or (lon_norm_min > lon_max_eff):
+                                            read_rg = False
+                                # 若归一化后出现 wrap（lon_norm_min > lon_norm_max），不做截断
                             except Exception:
                                 pass
                     except Exception:
@@ -5512,17 +5743,8 @@ def _load_eddy_datasets_for_range(
                     tbl = ppf.read_row_group(rg, columns=['track_id','time','center_lon','center_lat'])
                     df = tbl.to_pandas()
                     mask_time = (df['time'] >= start_ts) & (df['time'] < end_exclusive)
-                    if crosses:
-                        lon = df['center_lon']; lon360 = (lon % 360 + 360) % 360
-                        mask_lon = (lon >= lonmin) | (lon <= lonmax)
-                        mask_lon360 = (lon360 >= lonmin) | (lon360 <= lonmax)
-                        mask_geo = ((df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) & (mask_lon | mask_lon360))
-                    else:
-                        mask_geo = (
-                            (df['center_lat'] >= latmin) & (df['center_lat'] <= latmax) &
-                            (df['center_lon'] >= lonmin) & (df['center_lon'] <= lonmax)
-                        )
-                    df_sel = df[mask_time & mask_geo]
+                    mask_geo = _geo_mask(df)
+                    df_sel = df.loc[mask_time.to_numpy() & mask_geo]
                     if not df_sel.empty:
                         track_ids.update(df_sel['track_id'].astype(int).unique().tolist())
 
@@ -5605,6 +5827,10 @@ def run_batch_plotting_multiprocessing(
         plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
         skip_save_if_empty (bool): 批处理默认 True（空图不保存）；当传入 False 时，将把 False 透传至 worker，空图也会保存。
         show_labels (bool | None): 是否绘制轨迹标签；None 表示使用智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
+
+    输出:
+        每月图像会写入 `plot_outputs/<region>/plot_all_tracks_in_range/` 目录，所有交互涡旋标签最终会保存至
+        `plot_outputs/<region>/plot_all_tracks_in_range/eddy_list.npy`。
     """
     print("="*60)
     print("      Multiprocessing Batch Plotting with Progress Bar      ")
@@ -5667,7 +5893,10 @@ def run_batch_plotting_multiprocessing(
         preview = ", ".join(unique_interacted[:20])
         print(f"Sample (first 20): {preview}{' ...' if len(unique_interacted)>20 else ''}")
     print("="*60)
-    return unique_interacted
+    # 保存交互涡旋标签列表
+    eddy_list_path = output_dir / "eddy_list.npy"
+    np.save(eddy_list_path, np.array(unique_interacted, dtype=object))
+    print(f"Eddy list saved to: {eddy_list_path}")
 
 def plot_argo_hotspots(
     start_year: int,
@@ -5736,10 +5965,11 @@ def plot_argo_hotspots(
         return None
 
     # 空间过滤（若已在全局设置）
-    geo_mask = (
-        (combined['Longitude'] >= lonmin) & (combined['Longitude'] <= lonmax) &
-        (combined['Latitude']  >= latmin) & (combined['Latitude']  <= latmax)
-    )
+    lon_vals = combined['Longitude'].to_numpy(dtype=float, copy=False)
+    lat_vals = combined['Latitude'].to_numpy(dtype=float, copy=False)
+    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+    geo_mask = lon_mask & lat_mask
     combined_geo = combined[geo_mask].copy()
     if combined_geo.empty:
         print("Geographic filter produced empty dataset; abort.")

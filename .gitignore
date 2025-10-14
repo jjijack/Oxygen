@@ -3,6 +3,7 @@
 *.png
 *.parquet
 *.csv
+*.npy
 
 Argo_addFloat/
 Argo_data/
