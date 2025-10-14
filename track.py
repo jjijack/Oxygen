@@ -118,6 +118,9 @@ _default_depth_merge_tolerance = float(
     _PROC_CFG.get('processing', {}).get('depth_merge_tolerance', 10.0)
 )
 _default_duplicate_depth_strategy = _PROC_CFG.get('processing', {}).get('duplicate_depth_strategy', 'best_qc')
+_cfg_anomaly_min_depth = float(
+    _PROC_CFG.get('processing', {}).get('anomaly_min_depth', 300.0)
+)
 _default_adaptive_lat_threshold = float(
     _PROC_CFG.get('processing', {}).get('adaptive_lat_threshold', 70.0)
 )
@@ -126,6 +129,10 @@ _default_adaptive_distance_threshold_km = float(
 )
 
 def _load_basemap_colors() -> dict:
+    """加载底图颜色配置。
+
+    未配置的键使用默认值；缺失 plot.basemap_colors 则全部取默认。
+    """
     defaults = {
         'ocean': '#f8fafc',
         'land': '#d9d9d9',
@@ -135,7 +142,7 @@ def _load_basemap_colors() -> dict:
     }
     if not isinstance(_PROC_CFG, dict):
         return defaults
-    bm = _PROC_CFG.get('processing', {}).get('basemap_colors', {})
+    bm = _PROC_CFG.get('plot', {}).get('basemap_colors', {})
     merged = defaults.copy()
     if isinstance(bm, dict):
         merged.update({k: str(v) for k, v in bm.items() if k in defaults})
@@ -2096,7 +2103,7 @@ def plot_track(
     depth_interval: float | None = None,
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = 300.0,
+    anomaly_min_depth: float | None = None,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
     delta_do_cbar_min: float = 50.0,
@@ -2131,7 +2138,7 @@ def plot_track(
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 
             传递给 calculate_delta_do；若为 None 则回退到全局配置默认。
         anomaly_min_depth (float | None): 
-            ΔDO 异常最小深度限制；None 表示不限制。
+            ΔDO 异常最小深度限制；≤0 表示不限制；None 表示使用 processing.yml 的 anomaly_min_depth 配置值。
         plot_unrelated_argo (bool): 
             是否绘制被 ΔDO 筛选掉的所有匹配 Argo 剖面基准位置（空心灰圈）。
         fix_delta_do_colorbar (bool): 
@@ -2157,6 +2164,8 @@ def plot_track(
         depth_merge_tolerance = _default_depth_merge_tolerance
     if duplicate_depth_strategy is None:
         duplicate_depth_strategy = _default_duplicate_depth_strategy
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
     
     # 获取涡旋轨迹并转换为DataFrame
     wanted_track = find_track(DS, no)
@@ -2207,13 +2216,12 @@ def plot_track(
             do_threshold=do_threshold,
             salinity_threshold=salinity_threshold,
             temperature_threshold=temperature_threshold,
+            anomaly_min_depth=anomaly_min_depth,
             depth_merge_tolerance=depth_merge_tolerance,
             duplicate_depth_strategy=duplicate_depth_strategy,
             remove_outliers=True,
             verbose=False
         )
-        if not anomalies.empty and anomaly_min_depth is not None:
-            anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
         if not anomalies.empty:
             # 每个剖面取最大 ΔDO
             anomalies = (
@@ -2325,11 +2333,16 @@ def plot_track(
         scatter_kwargs = {}
         if fix_delta_do_colorbar:
             scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+        depth_label = (
+            f' @ depth ≥ {anomaly_min_depth} m'
+            if anomaly_min_depth is not None and anomaly_min_depth > 0
+            else ''
+        )
         sc = ax.scatter(
             anomalies['Longitude'], anomalies['Latitude'],
             c=anomalies['delta_do'], cmap='Reds', s=90,
             edgecolors='black', linewidths=0.6,
-            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹' + (f' @ depth ≥ {anomaly_min_depth} m' if anomaly_min_depth is not None else ''),
+            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹{depth_label}',
             zorder=10,
             **scatter_kwargs
         )
@@ -5063,7 +5076,7 @@ def plot_all_tracks_in_range(
     depth_interval: float | None = None,
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = 300.0,
+    anomaly_min_depth: float | None = None,
     anomaly_color_by: str = 'delta_do',
     fix_delta_do_colorbar: bool = True,
     delta_do_cbar_min: float = 50.0,
@@ -5077,7 +5090,7 @@ def plot_all_tracks_in_range(
 
     工作流程：
       1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 计算 ΔDO 异常。
-      2. 可选按 anomaly_min_depth 过滤异常深度。
+      2. 若 anomaly_min_depth > 0，则按该阈值过滤异常深度。
       3. 每个剖面保留 delta_do（或 do_value）最大的一条。
       4. 按 anomaly_color_by 着色：'delta_do' (默认) 或 'do_value'。
 
@@ -5093,7 +5106,7 @@ def plot_all_tracks_in_range(
         skip_save_if_empty: 若为 True 且本图中未绘制任何涡旋（不含底图/Argo点），则跳过保存；默认 False（单次绘图默认不跳过）。
         show_labels: 是否绘制轨迹文本标签（如 ACLXXXX）。
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
-        anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；None 不限制。
+        anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
         anomaly_color_by: 'delta_do' 或 'do_value'。
         fix_delta_do_colorbar: 若为 True 且按 delta_do 着色，则强制使用 [delta_do_cbar_min, delta_do_cbar_max] 作为色标范围。
         delta_do_cbar_min / delta_do_cbar_max: ΔDO 色标固定范围上下限（仅在 fix_delta_do_colorbar=True 且 anomaly_color_by='delta_do' 时生效）。
@@ -5116,6 +5129,8 @@ def plot_all_tracks_in_range(
         depth_merge_tolerance = _default_depth_merge_tolerance
     if duplicate_depth_strategy is None:
         duplicate_depth_strategy = _default_duplicate_depth_strategy
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
     # 若未显式提供，则在并行 worker 中从全局共享获得
     if local_eddy_datasets is None:
         try:
@@ -5179,21 +5194,19 @@ def plot_all_tracks_in_range(
                 do_threshold=do_threshold,
                 salinity_threshold=salinity_threshold,
                 temperature_threshold=temperature_threshold,
+                anomaly_min_depth=anomaly_min_depth,
                 depth_merge_tolerance=depth_merge_tolerance,
                 duplicate_depth_strategy=duplicate_depth_strategy,
                 remove_outliers=True,
                 verbose=False
             )
             if not anomalies.empty:
-                if anomaly_min_depth is not None:
-                    anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
-                if not anomalies.empty:
-                    sort_field = 'delta_do' if (
-                        anomaly_color_by == 'delta_do' and 'delta_do' in anomalies.columns
-                    ) else 'do_value'
-                    anomalies_sorted = anomalies.sort_values(by=[sort_field], ascending=False)
-                    anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
-                    needed_argo_data = anomalies_unique.rename(columns={'depth': 'Anomaly_depth'})
+                sort_field = 'delta_do' if (
+                    anomaly_color_by == 'delta_do' and 'delta_do' in anomalies.columns
+                ) else 'do_value'
+                anomalies_sorted = anomalies.sort_values(by=[sort_field], ascending=False)
+                anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
+                needed_argo_data = anomalies_unique.rename(columns={'depth': 'Anomaly_depth'})
 
     argo_points_by_date = defaultdict(list)
     if not needed_argo_data.empty:
@@ -5347,11 +5360,16 @@ def plot_all_tracks_in_range(
             scatter_kwargs = {}
             if fix_delta_do_colorbar:
                 scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+            depth_label = (
+                f' @ depth ≥ {anomaly_min_depth} m'
+                if anomaly_min_depth is not None and anomaly_min_depth > 0
+                else ''
+            )
             sc = ax.scatter(
                 needed_argo_data['Longitude'], needed_argo_data['Latitude'],
                 c=needed_argo_data['delta_do'], cmap='Reds', s=70,
                 edgecolors='black', linewidths=0.5,
-                label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹ @ depth ≥ {anomaly_min_depth} m', zorder=3,
+                label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹{depth_label}', zorder=3,
                 transform=data_crs,
                 **scatter_kwargs
             )
@@ -5907,7 +5925,7 @@ def plot_argo_hotspots(
     depth_interval: float = 100.0,
     depth_merge_tolerance: float = 10.0,
     duplicate_depth_strategy: str = 'best_qc',
-    anomaly_min_depth: float | None = 300.0,
+    anomaly_min_depth: float | None = None,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
     delta_do_cbar_min: float = 50.0,
@@ -5922,14 +5940,14 @@ def plot_argo_hotspots(
     流程：
       1. 逐年加载 Argo 年度数据并合并；可利用全局 lonmin/latmin/lonmax/latmax 做空间裁剪；
       2. 用 calculate_delta_do 检测每个剖面潜在 ΔDO 异常；
-      3. 按 anomaly_min_depth 过滤（若不为 None）；
+      3. 若 anomaly_min_depth > 0，则按该阈值过滤；
       4. 每个剖面保留最大 ΔDO 一条记录；
       5. 绘制 ΔDO 异常散点（可选固定色标范围），并可选绘制所有匹配剖面基线位置（空心灰圈）。
 
     参数:
         start_year / end_year: 年度范围（闭区间）。
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
-        anomaly_min_depth: 仅保留异常深度 >= 该值；None 不限制。
+        anomaly_min_depth: 仅保留异常深度 >= 该值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
         plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
         fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
         delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 色标范围与刻度配置。
@@ -5939,6 +5957,9 @@ def plot_argo_hotspots(
     返回:
         pd.DataFrame | None: 若 return_anomalies=True，返回列含 Profile_number, depth, delta_do, do_value, Year/Month/Day/Longitude/Latitude 等的异常表。
     """
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
+
     print(f"--- Building Argo ΔDO Anomaly Map {start_year}-{end_year} ---")
 
     all_yearly_data: list[pd.DataFrame] = []
@@ -5989,6 +6010,7 @@ def plot_argo_hotspots(
         do_threshold=do_threshold,
         salinity_threshold=salinity_threshold,
         temperature_threshold=temperature_threshold,
+        anomaly_min_depth=anomaly_min_depth,
         depth_merge_tolerance=depth_merge_tolerance,
         duplicate_depth_strategy=duplicate_depth_strategy,
         remove_outliers=True,
@@ -5997,8 +6019,6 @@ def plot_argo_hotspots(
     if anomalies.empty:
         print("No ΔDO anomalies detected.")
     else:
-        if anomaly_min_depth is not None and 'depth' in anomalies.columns:
-            anomalies = anomalies[anomalies['depth'] >= anomaly_min_depth]
         if not anomalies.empty:
             anomalies = (
                 anomalies.sort_values('delta_do', ascending=False)
@@ -6008,10 +6028,13 @@ def plot_argo_hotspots(
     # 绘图
     world = _load_world_geodataframe()
     fig, ax = plt.subplots(figsize=(40, 30))
+    depth_title = (
+        f' (depth ≥ {anomaly_min_depth} m)'
+        if anomaly_min_depth is not None and anomaly_min_depth > 0
+        else ''
+    )
     ax.set_title(
-        f'Argo ΔDO Anomalies {start_year}-{end_year}' + (
-            f' (depth ≥ {anomaly_min_depth} m)' if anomaly_min_depth is not None else ''
-        ), fontsize=20
+        f'Argo ΔDO Anomalies {start_year}-{end_year}{depth_title}', fontsize=20
     )
     ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
     world.plot(color='lightgrey', edgecolor='white', ax=ax)
@@ -6076,6 +6099,7 @@ def calculate_delta_do(
     do_threshold: float | None = None,
     salinity_threshold: float | None = None,
     temperature_threshold: float | None = None,
+    anomaly_min_depth: float | None = None,
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
     remove_outliers: bool = True,
@@ -6090,7 +6114,8 @@ def calculate_delta_do(
     3. 以 DO 峰深度为中心，取窗口 [p-Δp, p+Δp]，用两端点连线构造参考剖面；
     4. 在峰值同一深度计算 ΔDO、ΔSalinity 与 ΔTemperature（原始值减参考线值）；
     5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
-    6. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
+    6. 若 anomaly_min_depth > 0，仅保留深度不小于该阈值的异常；
+    7. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
 
     参数：
         data (pd.DataFrame): 包含多个剖面数据的表；需包含 Profile_number、深度、DO、盐度等列。
@@ -6102,6 +6127,7 @@ def calculate_delta_do(
         do_threshold (float | None): ΔDO 阈值；None → `_default_delta_do_threshold`。
         salinity_threshold (float | None): 盐度阈值；None → `_default_salinity_threshold`；≤0 不启用过滤。
         temperature_threshold (float | None): 温度阈值；None → `_default_temperature_threshold`；≤0 不启用过滤。
+        anomaly_min_depth (float | None): ΔDO 异常最小深度；≤0 表示不做深度过滤；None 表示使用 processing.yml 的 anomaly_min_depth。
         depth_merge_tolerance (float | None): 深度近邻合并阈值；None → `_default_depth_merge_tolerance`；≤0 不合并。
         duplicate_depth_strategy (str | None): 同深度多记录聚合策略；None → `_default_duplicate_depth_strategy`。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
@@ -6153,6 +6179,8 @@ def calculate_delta_do(
         depth_merge_tolerance = _default_depth_merge_tolerance
     if duplicate_depth_strategy is None:
         duplicate_depth_strategy = _default_duplicate_depth_strategy
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
 
     for profile_num, profile_data in profile_groups:
         # 质量控制：移除异常值和质量标记不良的数据
@@ -6354,6 +6382,17 @@ def calculate_delta_do(
 
         # 剖面内“深度近邻合并”：按 delta_do 降序贪心选取，避免在峰上下方重复取点
         if profile_results:
+            if anomaly_min_depth is not None and anomaly_min_depth > 0:
+                filtered_results = []
+                for rec in profile_results:
+                    depth_val = rec.get('depth')
+                    if depth_val is None or np.isnan(depth_val):
+                        continue
+                    if depth_val >= anomaly_min_depth:
+                        filtered_results.append(rec)
+                profile_results = filtered_results
+            if not profile_results:
+                continue
             if depth_merge_tolerance is not None and depth_merge_tolerance > 0:
                 profile_results.sort(key=lambda r: (np.nan_to_num(r['delta_do'], nan=-np.inf)), reverse=True)
                 kept = []
@@ -6379,6 +6418,8 @@ def calculate_delta_do(
         return pd.DataFrame()
     
     results_df = pd.DataFrame(all_results)
+    if anomaly_min_depth is not None and anomaly_min_depth > 0 and 'depth' in results_df.columns:
+        results_df = results_df[results_df['depth'] >= anomaly_min_depth]
     if verbose:
         print(f"总共检测到 {len(results_df)} 个潜在的DO异常信号，来自 {len(results_df['Profile_number'].unique())} 个剖面")
 
