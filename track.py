@@ -23,7 +23,7 @@ import shutil
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 import dask.dataframe as dd
-from dask.distributed import Client
+from dask.distributed import Client, LocalCluster, as_completed
 from dask import delayed, compute
 from dask.diagnostics import ProgressBar
 from tqdm.auto import tqdm
@@ -68,10 +68,6 @@ def _load_region_config(config_path: str | Path = 'config/regions.yml', region: 
 _REGION_CFG = _load_region_config()
 lonmin, lonmax = _REGION_CFG['lon_min'], _REGION_CFG['lon_max']
 latmin, latmax = _REGION_CFG['lat_min'], _REGION_CFG['lat_max']
-
-# 对跨日界线区域的提示：若 lon_max < lon_min，表示经度区间在 [-180, 180] 中发生了换向，需要在后续逻辑中做归一化处理
-if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
-    print(f"[RegionConfig] Dateline-crossing region detected (lon_min={lonmin}, lon_max={lonmax}); normalized longitude filtering will be applied.")
 
 # -------------------- 数据路径与处理参数配置加载（Paths & Processing Config） --------------------
 def _load_yaml(path: str | Path) -> dict:
@@ -5919,12 +5915,12 @@ def run_batch_plotting_multiprocessing(
 def plot_argo_hotspots(
     start_year: int,
     end_year: int,
-    do_threshold: float = 50.0,
-    salinity_threshold: float = 0.0,
-    temperature_threshold: float = 0.0,
-    depth_interval: float = 100.0,
-    depth_merge_tolerance: float = 10.0,
-    duplicate_depth_strategy: str = 'best_qc',
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
     anomaly_min_depth: float | None = None,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
@@ -5933,7 +5929,10 @@ def plot_argo_hotspots(
     delta_do_cbar_ticks: list | None = None,
     save_fig: bool = False,
     show_fig: bool = True,
-    return_anomalies: bool = False
+    return_anomalies: bool = False,
+    dask_scheduler: str | None = None,
+    dask_workers: int | None = None,
+    dask_memory_limit: str | None = None
 ):
     """以 ΔDO 异常方法绘制多年期 Argo 异常分布。
 
@@ -5946,104 +5945,174 @@ def plot_argo_hotspots(
 
     参数:
         start_year / end_year: 年度范围（闭区间）。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
+        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy:
+            传给 calculate_delta_do；当为 None 时从 processing.yml 读取默认值。
         anomaly_min_depth: 仅保留异常深度 >= 该值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
         plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
         fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
         delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 色标范围与刻度配置。
         save_fig / show_fig: 输出控制。
         return_anomalies: True 时返回 anomalies DataFrame，便于后续统计；False 返回 None。
+        dask_scheduler (str | None): Dask 调度器，'threads'|'processes'|'single'，None 默认 'processes'。
+        dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
+        dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 '4GB'；None 不限制。
 
     返回:
         pd.DataFrame | None: 若 return_anomalies=True，返回列含 Profile_number, depth, delta_do, do_value, Year/Month/Day/Longitude/Latitude 等的异常表。
     """
+    # 从配置读取默认值
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None:
+        salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None:
+        temperature_threshold = _default_temperature_threshold
+    if depth_interval is None:
+        depth_interval = _default_depth_interval
+    if depth_merge_tolerance is None:
+        depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None:
+        duplicate_depth_strategy = _default_duplicate_depth_strategy
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
 
     print(f"--- Building Argo ΔDO Anomaly Map {start_year}-{end_year} ---")
 
-    all_yearly_data: list[pd.DataFrame] = []
-    for year in range(start_year, end_year + 1):
+    # --- 按年份加载策略：串行或并行 ---
+    years = list(range(start_year, end_year + 1))
+    # Worker 参数打包列表（避免闭包，支持多进程 pickling）
+    # 捕获当前区域边界到参数中，避免在 Dask 子进程中重新导入模块后回退默认区域
+    current_lon_min = float(lonmin)
+    current_lon_max = float(lonmax)
+    current_lat_min = float(latmin)
+    current_lat_max = float(latmax)
+    worker_args_list = [
+        (
+            y,
+            depth_interval,
+            do_threshold,
+            salinity_threshold,
+            temperature_threshold,
+            anomaly_min_depth,
+            depth_merge_tolerance,
+            duplicate_depth_strategy,
+            current_lon_min,
+            current_lon_max,
+            current_lat_min,
+            current_lat_max,
+        )
+        for y in years
+    ]
+
+    # Dask-only backend
+    # 结果累积容器
+    baselines_list: list[pd.DataFrame] = []
+    anomalies_list: list[pd.DataFrame] = []
+
+    sched = dask_scheduler or 'processes'
+    worker_count = dask_workers or min(len(years), os.cpu_count() or 1)
+    print(f"[*] Hotspots Dask mode: scheduler={sched}, workers={worker_count}, years={len(years)}")
+    cluster = None
+    client = None
+    if sched == 'processes':
         try:
-            df_y = load_argo_data(year=year)
-            all_yearly_data.append(df_y)
-        except FileNotFoundError:
-            print(f"Warning: missing Argo year {year}, skipped.")
+            cluster = LocalCluster(n_workers=worker_count, threads_per_worker=1,
+                                   memory_limit=dask_memory_limit or None,
+                                   silence_logs='CRITICAL')
+            client = Client(cluster)
         except Exception as e:
-            print(f"Warning: error loading year {year}: {e}")
+            print(f"[WARN] 创建 LocalCluster 失败，改用 dask.compute scheduler='{sched}': {e}")
+            cluster = None
+            client = None
 
-    if not all_yearly_data:
-        print("No data loaded; abort.")
+    delayed_tasks = [delayed(_hotspot_year_worker)(args) for args in worker_args_list]
+    # 显示进度：优先使用 distributed.as_completed + tqdm；否则回退到 ProgressBar
+    if client is not None:
+        try:
+            futures = client.compute(delayed_tasks)
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="hotspots(dask)"):
+                try:
+                    baseline_year, anomalies_year = fut.result()
+                except Exception as e:
+                    print(f"[hotspots] Dask task failed: {e}")
+                    continue
+                if not baseline_year.empty:
+                    baselines_list.append(baseline_year)
+                if not anomalies_year.empty:
+                    anomalies_list.append(anomalies_year)
+        finally:
+            if client:
+                client.close()
+            if cluster:
+                cluster.close()
+    else:
+        # 非 distributed client 情况：使用 dask.diagnostics.ProgressBar
+        try:
+            with ProgressBar():
+                results = compute(*delayed_tasks, scheduler=sched)
+        except Exception:
+            results = compute(*delayed_tasks, scheduler=sched)
+        for baseline_year, anomalies_year in results:
+            if not baseline_year.empty:
+                baselines_list.append(baseline_year)
+            if not anomalies_year.empty:
+                anomalies_list.append(anomalies_year)
+
+    if not baselines_list and not anomalies_list:
+        print("No data loaded after filtering; abort.")
         return None
 
-    combined = pd.concat(all_yearly_data, ignore_index=True)
+    baseline_profiles = pd.concat(baselines_list, ignore_index=True) if baselines_list else pd.DataFrame()
+    anomalies = pd.concat(anomalies_list, ignore_index=True) if anomalies_list else pd.DataFrame()
 
-    # 空值/必要列检查
-    needed_cols = {'Longitude','Latitude','Depth','Profile_number','Year','Month','Day','DO'}
-    missing = needed_cols - set(combined.columns)
-    if missing:
-        print(f"缺少必要列: {missing}，无法继续。")
-        return None
-
-    # 空间过滤（若已在全局设置）
-    lon_vals = combined['Longitude'].to_numpy(dtype=float, copy=False)
-    lat_vals = combined['Latitude'].to_numpy(dtype=float, copy=False)
-    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
-    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
-    geo_mask = lon_mask & lat_mask
-    combined_geo = combined[geo_mask].copy()
-    if combined_geo.empty:
-        print("Geographic filter produced empty dataset; abort.")
-        return None
-
-    # 基线剖面位置（每剖面第一条记录）
-    baseline_profiles = (
-        combined_geo.sort_values(['Profile_number','Depth'])
-        .groupby('Profile_number', as_index=False)
-        .first()[['Profile_number','Longitude','Latitude','Year','Month','Day']]
-    )
-
-    # ΔDO 异常检测
-    anomalies = calculate_delta_do(
-        combined_geo,
-        depth_interval=depth_interval,
-        do_threshold=do_threshold,
-        salinity_threshold=salinity_threshold,
-        temperature_threshold=temperature_threshold,
-        anomaly_min_depth=anomaly_min_depth,
-        depth_merge_tolerance=depth_merge_tolerance,
-        duplicate_depth_strategy=duplicate_depth_strategy,
-        remove_outliers=True,
-        verbose=False
-    )
+    # 基线与异常已在加载阶段完成区域过滤，这里只再检查是否为空
+    if baseline_profiles.empty:
+        print("No baseline profiles after filtering.")
     if anomalies.empty:
         print("No ΔDO anomalies detected.")
-    else:
-        if not anomalies.empty:
-            anomalies = (
-                anomalies.sort_values('delta_do', ascending=False)
-                .drop_duplicates(subset='Profile_number', keep='first')
-            )
 
     # 绘图
-    world = _load_world_geodataframe()
-    fig, ax = plt.subplots(figsize=(40, 30))
+    crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig = plt.figure(figsize=(40, 30))
+    ax = fig.add_subplot(1, 1, 1, projection=map_crs)
     depth_title = (
         f' (depth ≥ {anomaly_min_depth} m)'
-        if anomaly_min_depth is not None and anomaly_min_depth > 0
-        else ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0 else ''
     )
-    ax.set_title(
-        f'Argo ΔDO Anomalies {start_year}-{end_year}{depth_title}', fontsize=20
-    )
-    ax.set_xlabel('Longitude', fontsize=20); ax.set_ylabel('Latitude', fontsize=20)
-    world.plot(color='lightgrey', edgecolor='white', ax=ax)
+    thr_title = f' (ΔDO ≥ {do_threshold:g} μmol kg⁻¹)'
+    ax.set_title(f'Argo ΔDO Anomalies {start_year}-{end_year}{thr_title}{depth_title}', fontsize=20)
+
+    # Basemap features
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    border_color = _BASEMAP_COLORS['border']
+    grid_color = _BASEMAP_COLORS['grid']
+    ax.set_facecolor(base_ocean)
+    ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+    ax.add_feature(cfeature.BORDERS.with_scale('110m'), linewidth=0.4, edgecolor=border_color, zorder=1)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # 设定范围（处理跨日界线）
+    lon_extent_min = lonmin
+    lon_extent_max = lonmax
+    if crosses_dateline and lon_extent_max < lon_extent_min:
+        lon_extent_max += 360
+    ax.set_extent([lon_extent_min, lon_extent_max, latmin, latmax], crs=data_crs)
 
     if plot_unrelated_argo and not baseline_profiles.empty:
         ax.scatter(
             baseline_profiles['Longitude'], baseline_profiles['Latitude'],
             facecolors='none', edgecolors='gray', linewidths=0.7, s=25,
-            label='All Argo Profiles (baseline)', zorder=2
+            label='All Argo Profiles (baseline)', zorder=2, transform=data_crs
         )
 
     if not anomalies.empty:
@@ -6052,12 +6121,13 @@ def plot_argo_hotspots(
             scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
         sc = ax.scatter(
             anomalies['Longitude'], anomalies['Latitude'],
-            c=anomalies['delta_do'], cmap='Reds', s=45,
-            edgecolors='black', linewidths=0.4,
+            c=anomalies['delta_do'], cmap='Reds', s=60,
+            edgecolors='black', linewidths=0.5,
             label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹', zorder=3,
+            transform=data_crs,
             **scatter_kwargs
         )
-        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
         cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
         if fix_delta_do_colorbar:
             if delta_do_cbar_ticks is not None:
@@ -6072,13 +6142,18 @@ def plot_argo_hotspots(
     else:
         ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
 
-    ax.set_xlim(lonmin, lonmax); ax.set_ylim(latmin, latmax)
-    ax.set_aspect('equal'); ax.tick_params(axis='both', which='major', labelsize=16)
     ax.legend(fontsize=18, loc='upper left')
 
     if save_fig:
-        out_dir = Path('argo_hotspot_plots'); out_dir.mkdir(exist_ok=True, parents=True)
-        fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}.png"
+        region_slug_for_path = _current_region_key()
+        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+        out_dir.mkdir(exist_ok=True, parents=True)
+        thr_str = f"{do_threshold:g}".replace('.', 'p')
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+        fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.png"
         plt.savefig(fname, dpi=300, bbox_inches='tight')
         print(f"Figure saved: {fname}")
     if show_fig:
@@ -6088,6 +6163,86 @@ def plot_argo_hotspots(
     if return_anomalies:
         return anomalies
     return None
+
+def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """模块级 worker，支持 multiprocessing pickling。
+
+    参数 args: (
+        year,
+        depth_interval,
+        do_threshold,
+        salinity_threshold,
+        temperature_threshold,
+        anomaly_min_depth,
+        depth_merge_tolerance,
+        duplicate_depth_strategy,
+        lon_min_bound,
+        lon_max_bound,
+        lat_min_bound,
+        lat_max_bound,
+    )
+    返回: (baseline_df, anomalies_df)
+    baseline_df: 每个剖面第一条记录的基本信息
+    anomalies_df: 该年筛选出的 ΔDO 异常（每剖面保留最大 delta_do 一条）
+    """
+    (
+        year,
+        depth_interval,
+        do_threshold,
+        salinity_threshold,
+        temperature_threshold,
+        anomaly_min_depth,
+        depth_merge_tolerance,
+        duplicate_depth_strategy,
+        lon_min_bound,
+        lon_max_bound,
+        lat_min_bound,
+        lat_max_bound,
+    ) = args
+    try:
+        df_y = load_argo_data(year=year)
+    except FileNotFoundError:
+        print(f"[hotspots] Missing year {year}, skip.")
+        return pd.DataFrame(), pd.DataFrame()
+    except Exception as e:
+        print(f"[hotspots] Error loading year {year}: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+    # 地理过滤
+    lon_vals = df_y['Longitude'].to_numpy(dtype=float, copy=False)
+    lat_vals = df_y['Latitude'].to_numpy(dtype=float, copy=False)
+    lon_mask = _region_lon_mask(lon_vals, lon_min_bound, lon_max_bound)
+    lat_mask = (lat_vals >= lat_min_bound) & (lat_vals <= lat_max_bound)
+    geo_mask = lon_mask & lat_mask
+    df_geo = df_y[geo_mask].copy()
+    if df_geo.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    # baseline
+    baseline = (
+        df_geo.sort_values(['Profile_number','Depth'])
+        .groupby('Profile_number', as_index=False)
+        .first()[['Profile_number','Longitude','Latitude','Year','Month','Day']]
+    )
+    anomalies_year = calculate_delta_do(
+        df_geo,
+        depth_interval=depth_interval,
+        do_threshold=do_threshold,
+        salinity_threshold=salinity_threshold,
+        temperature_threshold=temperature_threshold,
+        anomaly_min_depth=anomaly_min_depth,
+        depth_merge_tolerance=depth_merge_tolerance,
+        duplicate_depth_strategy=duplicate_depth_strategy,
+        remove_outliers=True,
+        verbose=False
+    )
+    if anomalies_year.empty:
+        return baseline, pd.DataFrame()
+    anomalies_year = (
+        anomalies_year.sort_values('delta_do', ascending=False)
+        .drop_duplicates(subset='Profile_number', keep='first')
+    )
+    needed_cols = [c for c in ['Profile_number','Longitude','Latitude','Year','Month','Day','depth','delta_do','do_value'] if c in anomalies_year.columns]
+    anomalies_year = anomalies_year[needed_cols]
+    return baseline, anomalies_year
 
 def calculate_delta_do(
     data: pd.DataFrame,
