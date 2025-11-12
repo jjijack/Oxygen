@@ -5253,14 +5253,12 @@ def plot_all_tracks_in_range(
     base_ocean = _BASEMAP_COLORS['ocean']
     base_land = _BASEMAP_COLORS['land']
     coast_color = _BASEMAP_COLORS['coastline']
-    border_color = _BASEMAP_COLORS['border']
     grid_color = _BASEMAP_COLORS['grid']
 
     ax.set_facecolor(base_ocean)
     ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
-    ax.add_feature(cfeature.BORDERS.with_scale('110m'), linewidth=0.4, edgecolor=border_color, zorder=1)
 
     gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
     gl.top_labels = False
@@ -6090,13 +6088,11 @@ def plot_argo_hotspots(
     base_ocean = _BASEMAP_COLORS['ocean']
     base_land = _BASEMAP_COLORS['land']
     coast_color = _BASEMAP_COLORS['coastline']
-    border_color = _BASEMAP_COLORS['border']
     grid_color = _BASEMAP_COLORS['grid']
     ax.set_facecolor(base_ocean)
     ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
-    ax.add_feature(cfeature.BORDERS.with_scale('110m'), linewidth=0.4, edgecolor=border_color, zorder=1)
     gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
     gl.top_labels = False
     gl.right_labels = False
