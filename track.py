@@ -5,6 +5,7 @@ from shapely.geometry import Point, Polygon
 import geopandas as gpd
 import inspect
 from netCDF4 import Dataset
+import re
 import os
 from pathlib import Path
 import pickle
@@ -4927,7 +4928,7 @@ def init_worker(eddy_data_shared: dict):
 
 def check_single_track(
     track_data,
-    argo_points_by_date,
+    argo_by_date,
     start_date,
     end_date,
     ds_name,
@@ -4935,7 +4936,8 @@ def check_single_track(
     use_adaptive_circle: bool = False,
     adaptive_lat_threshold: float = 70.0,
     adaptive_distance_threshold_km: float = 300.0,
-    force_great_circle_circle: bool = False
+    force_great_circle_circle: bool = False,
+    save_interacting_argo: bool = False,
 ):
     """
     (内部辅助函数) 检查单个涡旋轨迹是否与Argo数据有交集。
@@ -4946,7 +4948,9 @@ def check_single_track(
 
     参数:
         track_data (list): 单条涡旋的轨迹数据 (list of lists)。
-        argo_points_by_date (dict): 按日期组织的Argo位置字典。
+        argo_by_date (dict): 按日期组织的 Argo 明细，形如 {date: list[dict]}，
+            每个 dict 至少包含 'Longitude','Latitude'，可附带 Profile_number、Year/Month/Day、
+            delta_do、do_value/DO、Anomaly_depth 等元数据。
         start_date (pd.Timestamp): 检查的开始日期。
         end_date (pd.Timestamp): 检查的结束日期。
         ds_name (str): 数据集名称 (如 'ACS')。
@@ -4955,9 +4959,23 @@ def check_single_track(
         adaptive_lat_threshold (float): |lat| 超过此值触发大圆距离。
         adaptive_distance_threshold_km (float): 平面距离超过此值(km)触发大圆距离。
         force_great_circle_circle (bool): 强制使用大圆距离（忽略阈值）。
+        save_interacting_argo (bool): True 时收集并返回每个命中的 Argo 点明细（含 method/track 等），
+            False 时为性能考虑在首个命中即停止当日迭代且不返回点明细。
 
     返回:
-        dict | None: 如果涡旋在时间范围内，返回包含绘图信息的字典（含 'track_id'、'has_interaction' 等），否则返回 None。
+        dict | None: 如果涡旋在时间范围内，返回包含绘图/判定信息的字典，否则返回 None。
+        主要键：
+          - 'track_id': 轨迹编号
+          - 'has_interaction': 是否与 Argo 交互
+          - 'in_range_segments': 连续片段用于绘图
+          - 'contours_to_plot': 命中多边形时用于绘图的等值线
+          - 'candidate_dates_for_contour': 圆命中待进一步二次判定的日期
+          - 'dates_in_range': 轨迹在时间窗内的日期
+          - 'text_info': 绘图标签信息
+          - 'is_ace': 是否反气旋
+          - 'interacting_argo': 当 save_interacting_argo=True 时返回 list[dict]，
+             每个 dict 至少含 {'date','lon','lat','method'(poly/circle),'ds_name'}，
+                 并按 argo_by_date 附带 Profile_number/指标等元数据；否则为空列表。
     """
     num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*track_data)
     dates = convert_date(time)
@@ -4972,15 +4990,17 @@ def check_single_track(
     has_interaction = False
     contours_to_plot = []
     candidate_dates_for_contour = set()
+    interacting_points: list[dict] = []
     for i in indices_in_range:
         current_date = dates[i].normalize()
-        if current_date in argo_points_by_date:
+        if current_date in argo_by_date:
             center_lon_i = float(center_lon[i])
             center_lat_i = float(center_lat[i])
             radius_i = float(radius[i])
 
-            # 仅当存在有效等值线时才做多边形包含判断
-            inside_poly = False
+            # 预计算等值线多边形（若存在）
+            contour_poly = None
+            contour_lon_norm = None
             try:
                 contour_lon_i = contour_lon[i]
                 contour_lat_i = contour_lat[i]
@@ -4990,19 +5010,19 @@ def check_single_track(
                     if contour_lon_arr.size >= 3 and contour_lat_arr.size >= 3 and contour_lon_arr.shape == contour_lat_arr.shape:
                         contour_lon_norm = center_lon_i + _minimal_lon_diff_deg(contour_lon_arr, center_lon_i)
                         contour_poly = Polygon(zip(contour_lon_norm, contour_lat_arr))
-                        if not contour_poly.is_empty:
-                            for argo_point in argo_points_by_date[current_date]:
-                                point_lon_norm = center_lon_i + _minimal_lon_diff_deg(argo_point.x, center_lon_i)
-                                point_norm = Point(point_lon_norm, argo_point.y)
-                                if contour_poly.contains(point_norm):
-                                    inside_poly = True
-                                    break
+                        if contour_poly.is_empty:
+                            contour_poly = None
             except Exception:
-                inside_poly = False
+                contour_poly = None
 
-            for argo_point in argo_points_by_date[current_date]:
-                point_lon = float(argo_point.x)
-                point_lat = float(argo_point.y)
+            points_today = argo_by_date[current_date]
+
+            any_point_inside_poly = False
+            added_contour_for_today = False
+            for idx_pt, argo_point in enumerate(points_today):
+                # argo_point 为 dict，至少含 Longitude/Latitude；兼容 lon/lat 键
+                point_lon = float(argo_point.get('Longitude', argo_point.get('lon')))
+                point_lat = float(argo_point.get('Latitude', argo_point.get('lat')))
                 if use_adaptive_circle:
                     distance_m = adaptive_distance_m(
                         point_lon,
@@ -5021,13 +5041,48 @@ def check_single_track(
                     dy_m = (point_lat - center_lat_i) * scale_ci['meters_per_degree_lat']
                     distance_m = np.hypot(dx_m, dy_m)
                 inside_circle = distance_m <= radius_i * circle_enlargement_factor
-                if inside_poly or inside_circle:
-                    if inside_poly and contour_lon[i] is not None and contour_lat[i] is not None:
-                        contours_to_plot.append((contour_lon[i], contour_lat[i]))
+
+                inside_poly_point = False
+                if contour_poly is not None:
+                    point_lon_norm = center_lon_i + _minimal_lon_diff_deg(point_lon, center_lon_i)
+                    point_norm = Point(point_lon_norm, point_lat)
+                    try:
+                        inside_poly_point = contour_poly.contains(point_norm)
+                    except Exception:
+                        inside_poly_point = False
+                if inside_poly_point:
+                    any_point_inside_poly = True
+
+                if inside_poly_point or inside_circle:
+                    has_interaction = True
                     if inside_circle:
                         candidate_dates_for_contour.add(current_date)
-                    has_interaction = True
-                    break
+                    # 仅在首次发现多边形命中时加入对应等值线以供绘制
+                    if inside_poly_point and (not added_contour_for_today) and contour_poly is not None and contour_lon[i] is not None and contour_lat[i] is not None:
+                        contours_to_plot.append((contour_lon[i], contour_lat[i]))
+                        added_contour_for_today = True
+                    if save_interacting_argo:
+                        rec = {
+                            'method': 'poly' if inside_poly_point else 'circle',
+                            'ds_name': ds_name,
+                        }
+                        if isinstance(argo_point, dict):
+                            rec.update(argo_point)
+                        # 若缺失日期拆分列，使用当前日期补齐
+                        if 'Year' not in rec or pd.isna(rec.get('Year')):
+                            rec['Year'] = int(current_date.year)
+                        if 'Month' not in rec or pd.isna(rec.get('Month')):
+                            rec['Month'] = int(current_date.month)
+                        if 'Day' not in rec or pd.isna(rec.get('Day')):
+                            rec['Day'] = int(current_date.day)
+                        # 移除与原始字段重复的派生列
+                        rec.pop('lon', None)
+                        rec.pop('lat', None)
+                        rec.pop('date', None)
+                        interacting_points.append(rec)
+                    # 若不需要收集全部点，则命中一个即可跳出当天循环
+                    if not save_interacting_argo:
+                        break
     
     in_range_segments = []
     splits = np.where(np.diff(indices_in_range) != 1)[0] + 1
@@ -5053,6 +5108,7 @@ def check_single_track(
         "text_info": text_info,
         "is_ace": 'AC' in ds_name.upper(),
         "has_interaction": has_interaction,
+        "interacting_argo": interacting_points if save_interacting_argo else [],
     }
 
 def plot_all_tracks_in_range(
@@ -5078,7 +5134,9 @@ def plot_all_tracks_in_range(
     delta_do_cbar_min: float = 50.0,
     delta_do_cbar_max: float = 100.0,
     delta_do_cbar_ticks: list | None = None,
-    meta_output_root: str | Path | None = None
+    meta_output_root: str | Path | None = None,
+    save_interacted_eddies: bool = False,
+    save_interacting_argo: bool = False,
 ):
     """(核心绘图) 指定时间段内涡旋轨迹 + Argo ΔDO 异常代表点（仅采用 ΔDO 方法）。
 
@@ -5108,6 +5166,13 @@ def plot_all_tracks_in_range(
         delta_do_cbar_min / delta_do_cbar_max: ΔDO 色标固定范围上下限（仅在 fix_delta_do_colorbar=True 且 anomaly_color_by='delta_do' 时生效）。
         delta_do_cbar_ticks: 自定义 ΔDO 色标刻度列表（None 自动：若只提供上下限则显示两端；若范围>30 添加中点）。
         meta_output_root: 指定 META_tracks 根目录（可覆盖配置默认）。
+        save_interacted_eddies (bool): True 时保存本期交互涡旋标签（NPY）；默认 False。
+        save_interacting_argo (bool): True 时保存本期交互 Argo 明细（Parquet）；默认 False，输出目录固定为按阈值划分的子目录。
+
+    输出（按阈值子目录 thr{thr}[_depth{d}m] 保存）：
+        - All_Tracks_{start}_to_{end}.png
+        - Interacted_Eddies_{start}_{end}_thr{thr}[_depth{d}m}.npy（当 save_interacted_eddies=True 时）
+        - Interacting_Argo_{start}_{end}_thr{thr}[_depth{d}m}.parquet（当 save_interacting_argo=True 时）
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
@@ -5204,11 +5269,21 @@ def plot_all_tracks_in_range(
                 anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
                 needed_argo_data = anomalies_unique.rename(columns={'depth': 'Anomaly_depth'})
 
-    argo_points_by_date = defaultdict(list)
+    argo_by_date = defaultdict(list)
     if not needed_argo_data.empty:
         for _, row in needed_argo_data.iterrows():
             date_key = pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day']))
-            argo_points_by_date[date_key].append(Point(row['Longitude'], row['Latitude']))
+            argo_by_date[date_key].append({
+                'Profile_number': row.get('Profile_number'),
+                'Longitude': float(row.get('Longitude')),
+                'Latitude': float(row.get('Latitude')),
+                'Year': int(row.get('Year')),
+                'Month': int(row.get('Month')),
+                'Day': int(row.get('Day')),
+                'delta_do': float(row.get('delta_do')) if 'delta_do' in row else np.nan,
+                'do_value': float(row.get('do_value')) if 'do_value' in row else (float(row.get('DO')) if 'DO' in row else np.nan),
+                'Anomaly_depth': float(row.get('Anomaly_depth')) if 'Anomaly_depth' in row else np.nan,
+            })
 
     # --- 3. 检查所有涡旋轨迹 ---
     # 兼容两种形态：
@@ -5227,11 +5302,12 @@ def plot_all_tracks_in_range(
     results = [
         check_single_track(
             track,
-            argo_points_by_date,
+            argo_by_date,
             start_date,
             end_date,
             ds_name,
             circle_enlargement_factor=_cef_first_pass,
+            save_interacting_argo=bool(save_interacting_argo),
         )
         for track, ds_name, tid in all_tracks_with_names
     ]
@@ -5481,11 +5557,16 @@ def plot_all_tracks_in_range(
                                         raise ValueError("Empty polygon after normalization")
 
                                     date_norm = row['date'].normalize() if isinstance(row['date'], pd.Timestamp) else pd.Timestamp(row['date']).normalize()
-                                    pts = argo_points_by_date.get(date_norm, [])
+                                    entries = argo_by_date.get(date_norm, [])
                                     draw_it = False
-                                    for pt in pts:
-                                        point_lon_norm = float(center_lon_i + _minimal_lon_diff_deg(pt.x, center_lon_i))
-                                        point_norm = Point(point_lon_norm, pt.y)
+                                    for entry in entries:
+                                        try:
+                                            pt_lon = float(entry.get('Longitude', entry.get('lon')))
+                                            pt_lat = float(entry.get('Latitude', entry.get('lat')))
+                                        except Exception:
+                                            continue
+                                        point_lon_norm = float(center_lon_i + _minimal_lon_diff_deg(pt_lon, center_lon_i))
+                                        point_norm = Point(point_lon_norm, pt_lat)
                                         if poly.contains(point_norm):
                                             draw_it = True
                                             break
@@ -5540,9 +5621,14 @@ def plot_all_tracks_in_range(
 
     # --- 5. 输出控制 ---
     if save_fig:
-        # 使用全局配置的输出根目录，按区域分子目录
+        # 使用阈值子目录
         region_slug_for_path = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
+        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
+        thr_dir = f"thr{thr_str}"
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            thr_dir += f"_depth{depth_str}m"
+        output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
         output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}.png"
         save_path = output_dir / base_filename
@@ -5558,12 +5644,68 @@ def plot_all_tracks_in_range(
     
     plt.close(fig)
 
-    # 返回本时间段内发生交互(标红)的涡旋标签列表（与第一轮判定一致）
+    # 汇总输出
     interacted_eddies = []
+    interacting_argo_records = []
     for r in filter(None, results):
         if r['has_interaction']:
             interacted_eddies.append(r['text_info']['text'])
-    return interacted_eddies
+        if save_interacting_argo and r.get('interacting_argo'):
+            # 补充轨迹标签信息，便于后续统计
+            track_label = r['text_info']['text']
+            for rec in r['interacting_argo']:
+                rec2 = dict(rec)
+                rec2['track_label'] = track_label
+                rec2['track_id'] = r.get('track_id')
+                interacting_argo_records.append(rec2)
+
+    if save_interacting_argo and interacting_argo_records:
+        region_slug_for_path = _current_region_key()
+        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
+        thr_dir = f"thr{thr_str}"
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            thr_dir += f"_depth{depth_str}m"
+        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
+        out_dir.mkdir(exist_ok=True, parents=True)
+        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+        fname_pq = out_dir / f"Interacting_Argo_{start_date_str}_to_{end_date_str}_thr{thr_str}{depth_suffix}.parquet"
+        try:
+            df_out = pd.DataFrame(interacting_argo_records)
+            df_out.to_parquet(fname_pq, index=False)
+            print(f"Interacting Argo saved to: {fname_pq}")
+        except Exception as e:
+            print(f"[WARN] Failed to save interacting Argo parquet: {e}")
+
+    # 保存交互涡旋标签（每期）为 NPY，并不返回
+    try:
+        region_slug_for_path = _current_region_key()
+        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
+        thr_dir = f"thr{thr_str}"
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            thr_dir += f"_depth{depth_str}m"
+        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
+        out_dir.mkdir(exist_ok=True, parents=True)
+        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+        if save_interacted_eddies and interacted_eddies:
+            eddies_npy = out_dir / f"Interacted_Eddies_{start_date_str}_to_{end_date_str}_thr{thr_str}{depth_suffix}.npy"
+            # 保存为标准 Unicode 字符串数组，避免 object 导致读取需 allow_pickle=True
+            labels = sorted(set(interacted_eddies))
+            np.save(eddies_npy, np.array(labels, dtype=str))
+            print(f"Interacted eddies saved to: {eddies_npy}")
+    except Exception as e:
+        print(f"[WARN] Failed to save interacted eddies npy: {e}")
+
+    return None
 
 def _load_eddy_datasets_for_range(
     *,
@@ -5796,12 +5938,12 @@ def _load_eddy_datasets_for_range(
 def worker_wrapper(args: tuple):
     """multiprocessing worker 包装函数。
     参数:
-        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels)
-    返回: 本月交互涡旋标签列表。
+        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels, save_interacting_argo, save_interacted_eddies, do_threshold, anomaly_min_depth)
+    返回: None（结果由子函数写盘保存）。
     """
-    start_d, end_d, unrelated_flag, skip_empty, show_labels = args
+    start_d, end_d, unrelated_flag, skip_empty, show_labels, save_interacting_argo_flag, save_eddies_flag, do_thr, anom_depth = args
     try:
-        return plot_all_tracks_in_range(
+        plot_all_tracks_in_range(
             start_date_str=start_d,
             end_date_str=end_d,
             plot_unrelated_eddies=unrelated_flag,
@@ -5809,10 +5951,15 @@ def worker_wrapper(args: tuple):
             skip_save_if_empty=skip_empty,
             show_labels=show_labels,
             show_fig=False,
+            save_interacting_argo=bool(save_interacting_argo_flag),
+            save_interacted_eddies=bool(save_eddies_flag),
+            do_threshold=do_thr,
+            anomaly_min_depth=anom_depth,
         )
+        return None
     except Exception as e:
         print(f"!!! ERROR processing period {start_d}: {e}")
-        return []
+        return None
 
 def run_batch_plotting_multiprocessing(
     start_date_str: str,
@@ -5822,6 +5969,10 @@ def run_batch_plotting_multiprocessing(
     plot_unrelated_eddies: bool = False,
     skip_save_if_empty: bool = True,
     show_labels: bool | None = None,
+    do_threshold: float | None = None,
+    anomaly_min_depth: float | None = None,
+    save_interacted_eddies: bool = False,
+    save_interacting_argo: bool = False,
 ):
     """
     (批处理控制器) 使用multiprocessing启动一个扁平化的并行绘图作业，并带有进度条。
@@ -5839,10 +5990,19 @@ def run_batch_plotting_multiprocessing(
         plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
         skip_save_if_empty (bool): 批处理默认 True（空图不保存）；当传入 False 时，将把 False 透传至 worker，空图也会保存。
         show_labels (bool | None): 是否绘制轨迹标签；None 表示使用智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
+        do_threshold (float | None): ΔDO 阈值；None 使用配置默认。
+        anomaly_min_depth (float | None): 最小深度阈值；None 使用配置默认；≤0 表示不限制。
+        save_interacted_eddies (bool): True 时各月份写出 `Interacted_Eddies_*.npy` 并在末尾汇总；默认 False。
+        save_interacting_argo (bool): True 时各月份写出 `Interacting_Argo_*.parquet` 并在末尾聚合；默认 False。
 
-    输出:
-        每月图像会写入 `plot_outputs/<region>/plot_all_tracks_in_range/` 目录，所有交互涡旋标签最终会保存至
-        `plot_outputs/<region>/plot_all_tracks_in_range/eddy_list.npy`。
+        输出:
+                - 每月图像写入 `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/`。
+                - 当 save_interacted_eddies=True：整期交互涡旋标签汇总保存为带阈值后缀的 NPY：
+                    `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/eddy_list_thr{thr}[_depth{d}m].npy`。
+                - 当 save_interacting_argo=True 时，额外保存整期交互 Argo 汇总（Parquet）：
+                    `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/interacting_argo_all_thr{thr}[_depth{d}m].parquet`。
+        清理:
+                - 批处理开始前仅清空对应阈值子目录 `<thr_dir>`，不会清空整个 `plot_all_tracks_in_range` 目录。
     """
     print("="*60)
     print("      Multiprocessing Batch Plotting with Progress Bar      ")
@@ -5852,6 +6012,14 @@ def run_batch_plotting_multiprocessing(
     # --- 1. 创建按月切分的任务列表 ---
     month_starts = pd.date_range(start=start_date_str, end=end_date_str, freq='MS')
     region_slug_for_path = _current_region_key()
+    # 计算生效阈值并确定阈值子目录名
+    eff_do_thr = do_threshold if do_threshold is not None else _default_delta_do_threshold
+    eff_anom_depth = anomaly_min_depth if anomaly_min_depth is not None else _cfg_anomaly_min_depth
+    thr_str = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int, float)) else str(eff_do_thr)
+    thr_dir = f"thr{thr_str}"
+    if eff_anom_depth is not None and eff_anom_depth > 0:
+        depth_str = f"{eff_anom_depth:g}".replace('.', 'p')
+        thr_dir += f"_depth{depth_str}m"
     effective_show_labels = show_labels
     if show_labels is None:
         if plot_unrelated_eddies and region_slug_for_path.lower() in {'global', 'world', 'global_ocean', 'all'}:
@@ -5866,6 +6034,10 @@ def run_batch_plotting_multiprocessing(
             plot_unrelated_eddies,
             skip_save_if_empty,
             effective_show_labels,
+            save_interacting_argo,
+            save_interacted_eddies,
+            eff_do_thr,
+            eff_anom_depth,
         )
         for start_date in month_starts
     ]
@@ -5873,42 +6045,104 @@ def run_batch_plotting_multiprocessing(
     print(f"[*] Created {len(tasks)} monthly plotting tasks to be processed by {num_workers} cores.")
 
     # 在批量任务开始前清理输出目录
-    output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
+    base_output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
+    output_dir = base_output_dir / thr_dir
     try:
         if output_dir.exists():
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[*] Cleared output directory: {output_dir}")
+        print(f"[*] Cleared threshold-specific output directory: {output_dir}")
     except Exception as e:
         print(f"[WARN] Failed to clear output directory {output_dir}: {e}")
     
     # --- 2. 启动进程池并执行任务 ---
     start_time_total = tm.time()
     
-    # 使用 initializer 来高效地传递一次大的涡旋数据
-    collected = []
+    # 使用 initializer 来高效地传递一次大的涡旋数据（子进程写盘，不收集返回）
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(eddy_datasets,)) as pool:
         print("[*] Processing tasks...")
-        for month_result in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
-            if month_result:
-                collected.extend(month_result)
+        for _ in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
+            pass
         
     end_time_total = tm.time()
     total_duration_minutes = (end_time_total - start_time_total) / 60
     
-    unique_interacted = sorted(set(collected))
     print("\n" + "="*60)
     print("--- All Plotting Tasks Have Finished ---")
     print(f"Total execution time: {total_duration_minutes:.2f} minutes.")
-    print(f"Total interacted eddies: {len(unique_interacted)}")
-    if unique_interacted:
-        preview = ", ".join(unique_interacted[:20])
-        print(f"Sample (first 20): {preview}{' ...' if len(unique_interacted)>20 else ''}")
-    print("="*60)
-    # 保存交互涡旋标签列表
-    eddy_list_path = output_dir / "eddy_list.npy"
-    np.save(eddy_list_path, np.array(unique_interacted, dtype=object))
-    print(f"Eddy list saved to: {eddy_list_path}")
+    # 聚合交互涡旋标签（从每月 NPY 汇总）
+    interacted_labels: set[str] = set()
+    try:
+        monthly_eddy_files = sorted(output_dir.glob("Interacted_Eddies_*.npy"))
+        for f in monthly_eddy_files:
+            try:
+                # 优先以非 pickle 方式读取；兼容历史 object 数组文件回退到允许 pickle
+                try:
+                    arr = np.load(f)
+                except Exception:
+                    arr = np.load(f, allow_pickle=True)
+                interacted_labels.update([str(x) for x in np.asarray(arr).ravel().tolist()])
+            except Exception:
+                pass
+        unique_interacted = sorted(interacted_labels)
+        print(f"Total interacted eddies: {len(unique_interacted)}")
+        if unique_interacted:
+            preview = ", ".join(unique_interacted[:20])
+            print(f"Sample (first 20): {preview}{' ...' if len(unique_interacted)>20 else ''}")
+        # 不再保存未带阈值后缀的 eddy_list.npy，改为仅保存带阈值后缀版本（见后续输出）
+        # 另存带阈值后缀的汇总版本（从文件名解析 thr 与 depth）
+        thr_tag = None
+        depth_tag = None
+        if monthly_eddy_files:
+            m = re.search(r"_thr([A-Za-z0-9p]+)(?:_depth([A-Za-z0-9p]+)m)?\\.npy$", monthly_eddy_files[0].name)
+            if m:
+                thr_tag = m.group(1)
+                depth_tag = m.group(2)
+        if thr_tag:
+            suffix = f"_thr{thr_tag}"
+            if depth_tag:
+                suffix += f"_depth{depth_tag}m"
+            eddy_list_suffixed = output_dir / f"eddy_list{suffix}.npy"
+            # 使用标准 Unicode 字符串数组，避免后续读取需要 allow_pickle
+            np.save(eddy_list_suffixed, np.array(unique_interacted, dtype=str))
+            print(f"Eddy list (with thresholds) saved to: {eddy_list_suffixed}")
+    except Exception as e:
+        print(f"[WARN] Failed to aggregate eddy labels: {e}")
+
+    # 聚合交互 Argo（Parquet）
+    if save_interacting_argo:
+        try:
+            monthly_argo_files = sorted(output_dir.glob("Interacting_Argo_*.parquet"))
+            df_parts = []
+            for f in monthly_argo_files:
+                try:
+                    dfp = pd.read_parquet(f)
+                    if isinstance(dfp, pd.DataFrame) and not dfp.empty:
+                        df_parts.append(dfp)
+                except Exception:
+                    pass
+            if df_parts:
+                df_all = pd.concat(df_parts, ignore_index=True)
+                if 'Profile_number' in df_all.columns:
+                    if 'date' in df_all.columns:
+                        df_all.sort_values(by=['Profile_number', 'date'], inplace=True)
+                        df_all = df_all.drop_duplicates(subset=['Profile_number', 'date', 'track_label'], keep='first')
+                    elif all(col in df_all.columns for col in ('Year', 'Month', 'Day')):
+                        temp_date = pd.to_datetime(df_all[['Year', 'Month', 'Day']])
+                        df_all = df_all.assign(_date=temp_date)
+                        df_all.sort_values(by=['Profile_number', '_date'], inplace=True)
+                        df_all = df_all.drop_duplicates(subset=['Profile_number', '_date', 'track_label'], keep='first')
+                        df_all.drop(columns=['_date'], inplace=True)
+                thr_str2 = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int,float)) else str(eff_do_thr)
+                depth_suffix2 = ''
+                if eff_anom_depth is not None and eff_anom_depth > 0:
+                    depth_str2 = f"{eff_anom_depth:g}".replace('.', 'p')
+                    depth_suffix2 = f"_depth{depth_str2}m"
+                argo_parquet = output_dir / f"interacting_argo_all_thr{thr_str2}{depth_suffix2}.parquet"
+                df_all.to_parquet(argo_parquet, index=False)
+                print(f"Interacting Argo (all) saved to: {argo_parquet}")
+        except Exception as e:
+            print(f"[WARN] Failed to aggregate/save interacting Argo parquet: {e}")
 
 def plot_argo_hotspots(
     start_year: int,
@@ -5927,7 +6161,7 @@ def plot_argo_hotspots(
     delta_do_cbar_ticks: list | None = None,
     save_fig: bool = False,
     show_fig: bool = True,
-    return_anomalies: bool = False,
+    save_data: bool = True,
     dask_scheduler: str | None = None,
     dask_workers: int | None = None,
     dask_memory_limit: str | None = None
@@ -5950,13 +6184,14 @@ def plot_argo_hotspots(
         fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
         delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 色标范围与刻度配置。
         save_fig / show_fig: 输出控制。
-        return_anomalies: True 时返回 anomalies DataFrame，便于后续统计；False 返回 None。
+        save_data (bool): True 时保存 anomalies 为 Parquet；False 不保存数据，输出路径固定为 `plot_outputs/<region>/plot_argo_hotspots/`。
         dask_scheduler (str | None): Dask 调度器，'threads'|'processes'|'single'，None 默认 'processes'。
         dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
         dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 '4GB'；None 不限制。
 
-    返回:
-        pd.DataFrame | None: 若 return_anomalies=True，返回列含 Profile_number, depth, delta_do, do_value, Year/Month/Day/Longitude/Latitude 等的异常表。
+    输出:
+        - 图像（可选）：`plot_outputs/<region>/plot_argo_hotspots/Argo_DeltaDO_Hotspots_*.png`
+        - 异常数据（Parquet，可选）：`plot_outputs/<region>/plot_argo_hotspots/anomalies_{start}_{end}_thr{thr}[_depth{d}m].parquet`
     """
     # 从配置读取默认值
     if do_threshold is None:
@@ -6156,8 +6391,23 @@ def plot_argo_hotspots(
         plt.show()
     plt.close(fig)
 
-    if return_anomalies:
-        return anomalies
+    # 保存 anomalies 为 Parquet（高效压缩存储）
+    if save_data and not anomalies.empty:
+        region_slug_for_path = _current_region_key()
+        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+        out_dir.mkdir(exist_ok=True, parents=True)
+        thr_str = f"{do_threshold:g}".replace('.', 'p')
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+        pq_path = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        try:
+            anomalies.to_parquet(pq_path, index=False)
+            print(f"Anomalies saved to: {pq_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save anomalies parquet: {e}")
+
     return None
 
 def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
