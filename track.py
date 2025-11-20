@@ -175,6 +175,7 @@ def print_current_processing_defaults():
         print(f"  depth_interval            : {_default_depth_interval}")
         print(f"  depth_merge_tolerance     : {_default_depth_merge_tolerance}")
         print(f"  duplicate_depth_strategy  : {_default_duplicate_depth_strategy}")
+        print(f"  anomaly_min_depth         : {_cfg_anomaly_min_depth}")
 
 def approximate_degree_length(lat: float | np.ndarray, lon: float | np.ndarray | None = None) -> dict:
     """计算指定纬度（可选经度）处经纬度与距离的近似换算关系。
@@ -4923,6 +4924,19 @@ def init_worker(eddy_data_shared: dict):
         (如涡旋数据字典)并将其设置为该进程的全局变量。这可以极大地避免
         在每个任务间重复传输大数据的开销，是性能优化的关键。
     """
+    # 限制 OpenMP/MKL 线程数，避免多进程 x 多线程导致 CPU 争抢
+    # 注意：这只影响子进程环境，不影响主进程
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+    # 强制切换 Matplotlib 后端为非交互式 (Agg)，避免多进程绘图死锁
+    # 注意：init_worker 仅在子进程中运行，此处修改不会影响 Jupyter 主进程的交互式绘图
+    try:
+        plt.switch_backend('Agg')
+    except Exception:
+        pass
+    
     global worker_eddy_datasets
     worker_eddy_datasets = eddy_data_shared
 
@@ -6059,7 +6073,8 @@ def run_batch_plotting_multiprocessing(
     start_time_total = tm.time()
     
     # 使用 initializer 来高效地传递一次大的涡旋数据（子进程写盘，不收集返回）
-    with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(eddy_datasets,)) as pool:
+    # maxtasksperchild=1: 强制每个子进程处理完一个任务后重启，彻底释放 Matplotlib 内存和文件句柄，防止死锁和内存泄漏
+    with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(eddy_datasets,), maxtasksperchild=1) as pool:
         print("[*] Processing tasks...")
         for _ in tqdm(pool.imap_unordered(worker_wrapper, tasks), total=len(tasks)):
             pass
@@ -6164,7 +6179,8 @@ def plot_argo_hotspots(
     save_data: bool = True,
     dask_scheduler: str | None = None,
     dask_workers: int | None = None,
-    dask_memory_limit: str | None = None
+    dask_memory_limit: str | None = None,
+    use_interacting_argo: bool = False
 ):
     """以 ΔDO 异常方法绘制多年期 Argo 异常分布。
 
@@ -6188,6 +6204,9 @@ def plot_argo_hotspots(
         dask_scheduler (str | None): Dask 调度器，'threads'|'processes'|'single'，None 默认 'processes'。
         dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
         dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 '4GB'；None 不限制。
+        use_interacting_argo (bool): 是否读取 run_batch_plotting_multiprocessing 生成的交互 Argo 文件，
+                                          并在图中区分交互/非交互 Argo，同时统计交互比例。
+                                          默认 False。
 
     输出:
         - 图像（可选）：`plot_outputs/<region>/plot_argo_hotspots/Argo_DeltaDO_Hotspots_*.png`
@@ -6208,6 +6227,35 @@ def plot_argo_hotspots(
         duplicate_depth_strategy = _default_duplicate_depth_strategy
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
+
+    # --- 尝试加载交互 Argo 文件（若启用） ---
+    interacting_argo_ids: set[int] = set()
+    if use_interacting_argo:
+        region_slug_for_path = _current_region_key()
+        eff_do_thr = do_threshold
+        eff_anom_depth = anomaly_min_depth
+        
+        thr_str = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int, float)) else str(eff_do_thr)
+        thr_dir_name = f"thr{thr_str}"
+        depth_suffix = ""
+        if eff_anom_depth is not None and eff_anom_depth > 0:
+            d_str = f"{eff_anom_depth:g}".replace('.', 'p')
+            thr_dir_name += f"_depth{d_str}m"
+            depth_suffix = f"_depth{d_str}m"
+            
+        interacting_file = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir_name / f"interacting_argo_all_thr{thr_str}{depth_suffix}.parquet"
+        
+        if interacting_file.exists():
+            print(f"[*] Loading interacting Argo from: {interacting_file}")
+            try:
+                df_int = pd.read_parquet(interacting_file)
+                if 'Profile_number' in df_int.columns:
+                    interacting_argo_ids = set(df_int['Profile_number'].unique())
+                print(f"[*] Loaded {len(interacting_argo_ids)} unique interacting profiles.")
+            except Exception as e:
+                print(f"[WARN] Failed to read interacting Argo file: {e}")
+        else:
+            print(f"[WARN] Interacting Argo file not found: {interacting_file}")
 
     print(f"--- Building Argo ΔDO Anomaly Map {start_year}-{end_year} ---")
 
@@ -6350,26 +6398,91 @@ def plot_argo_hotspots(
         scatter_kwargs = {}
         if fix_delta_do_colorbar:
             scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
-        sc = ax.scatter(
-            anomalies['Longitude'], anomalies['Latitude'],
-            c=anomalies['delta_do'], cmap='Reds', s=60,
-            edgecolors='black', linewidths=0.5,
-            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹', zorder=3,
-            transform=data_crs,
-            **scatter_kwargs
-        )
-        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
-        cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
-        if fix_delta_do_colorbar:
-            if delta_do_cbar_ticks is not None:
-                cbar.set_ticks(delta_do_cbar_ticks)
-            else:
-                rng = delta_do_cbar_max - delta_do_cbar_min
-                if rng > 30:
-                    mid = (delta_do_cbar_min + delta_do_cbar_max)/2
-                    cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
+        
+        # 分离交互与非交互
+        anom_interacting = pd.DataFrame()
+        anom_others = anomalies
+        
+        if use_interacting_argo and interacting_argo_ids:
+            is_interacting = anomalies['Profile_number'].isin(interacting_argo_ids)
+            anom_interacting = anomalies[is_interacting]
+            anom_others = anomalies[~is_interacting]
+            
+            # 统计输出
+            total_anom = len(anomalies)
+            count_int = len(anom_interacting)
+            pct = (count_int / total_anom * 100) if total_anom > 0 else 0.0
+            stats_txt = (
+                f"Interacting Argo Statistics\n"
+                f"Total Anomalies: {total_anom}\n"
+                f"Interacting with Eddies: {count_int} ({pct:.2f}%)\n"
+                f"Non-interacting: {len(anom_others)}\n"
+            )
+            print("\n" + "="*40)
+            print(stats_txt.strip())
+            print("="*40 + "\n")
+            
+            # 保存统计到文件
+            if save_data:
+                region_slug_for_path = _current_region_key()
+                out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+                out_dir.mkdir(exist_ok=True, parents=True)
+                thr_str = f"{do_threshold:g}".replace('.', 'p')
+                depth_suffix = ''
+                if anomaly_min_depth is not None and anomaly_min_depth > 0:
+                    depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+                    depth_suffix = f"_depth{depth_str}m"
+                stats_file = out_dir / f"statistics_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.txt"
+                try:
+                    with open(stats_file, 'w') as f:
+                        f.write(stats_txt)
+                    print(f"Statistics saved to: {stats_file}")
+                except Exception as e:
+                    print(f"[WARN] Failed to save statistics file: {e}")
+
+        # 绘制非交互（或全部，若未分离）
+        sc = None
+        if not anom_others.empty:
+            label_str = f'ΔDO ≥ {do_threshold} μmol kg⁻¹'
+            if use_interacting_argo and interacting_argo_ids:
+                label_str = f'Non-interacting (ΔDO ≥ {do_threshold})'
+            
+            sc = ax.scatter(
+                anom_others['Longitude'], anom_others['Latitude'],
+                c=anom_others['delta_do'], cmap='Reds', s=60,
+                edgecolors='black', linewidths=0.5,
+                label=label_str, zorder=3,
+                transform=data_crs,
+                **scatter_kwargs
+            )
+        
+        # 绘制交互（若存在）
+        if not anom_interacting.empty:
+            sc_int = ax.scatter(
+                anom_interacting['Longitude'], anom_interacting['Latitude'],
+                c=anom_interacting['delta_do'], cmap='Reds', s=100,
+                marker='D', # 菱形
+                edgecolors='blue', # 蓝色边框以示区别
+                linewidths=1.0,
+                label=f'Interacting (ΔDO ≥ {do_threshold})', zorder=4,
+                transform=data_crs,
+                **scatter_kwargs
+            )
+            sc = sc_int # 覆盖 sc 用于 colorbar（两者 cmap/norm 一致）
+
+        if sc is not None:
+            cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
+            cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
+            if fix_delta_do_colorbar:
+                if delta_do_cbar_ticks is not None:
+                    cbar.set_ticks(delta_do_cbar_ticks)
                 else:
-                    cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
+                    rng = delta_do_cbar_max - delta_do_cbar_min
+                    if rng > 30:
+                        mid = (delta_do_cbar_min + delta_do_cbar_max)/2
+                        cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
+                    else:
+                        cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
     else:
         ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
 
