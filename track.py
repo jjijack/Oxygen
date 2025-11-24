@@ -1922,7 +1922,7 @@ def filtered_float_data(
     no: int,
     argo_data_dir: str | Path = None,
     circle_enlargement_factor: float | None = None,
-    use_adaptive_circle: bool = False,
+    use_adaptive_circle: bool = True,
     adaptive_lat_threshold: float = 70.0,
     adaptive_distance_threshold_km: float = 300.0,
     force_great_circle_circle: bool = False,
@@ -2652,13 +2652,11 @@ def plot_vertical(
                                 center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
                                 radius = float(wanted_track.iloc[idx_track]['radius'])
                                 if radius > 1e-6:
-                                    scale = approximate_degree_length(center_lat)
-                                    dlon_deg = _minimal_lon_diff_deg(rows.iloc[0]['Longitude'], center_lon)
-                                    dx_m = dlon_deg * scale['meters_per_degree_lon']
-                                    dy_m = (rows.iloc[0]['Latitude'] - center_lat) * scale['meters_per_degree_lat']
-                                    rel_x = dx_m / radius
-                                    rel_y = dy_m / radius
-                                    distance = np.sqrt(rel_x**2 + rel_y**2)
+                                    dist_m = adaptive_distance_m(
+                                        rows.iloc[0]['Longitude'], rows.iloc[0]['Latitude'],
+                                        center_lon, center_lat
+                                    )
+                                    distance = dist_m / radius
                                     color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
                     elif color_mode == 'time':
                         if max_profile_num > min_profile_num:
@@ -2800,13 +2798,11 @@ def plot_vertical(
                         center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
                         radius = float(wanted_track.iloc[idx_track]['radius'])
                         if radius > 1e-6:
-                            scale = approximate_degree_length(center_lat)
-                            dlon_deg = _minimal_lon_diff_deg(profile_info['lon'], center_lon)
-                            dx_m = dlon_deg * scale['meters_per_degree_lon']
-                            dy_m = (profile_info['lat'] - center_lat) * scale['meters_per_degree_lat']
-                            rel_x = dx_m / radius
-                            rel_y = dy_m / radius
-                            distance = np.sqrt(rel_x**2 + rel_y**2)
+                            dist_m = adaptive_distance_m(
+                                profile_info['lon'], profile_info['lat'],
+                                center_lon, center_lat
+                            )
+                            distance = dist_m / radius
                             color_value_normalized = 1.0 - np.clip(distance, 0.0, 1.0)
             elif color_mode == 'time':
                 if min_time_for_norm and max_time_for_norm and max_time_for_norm > min_time_for_norm:
@@ -3866,16 +3862,33 @@ def calculate_vorticity(lon, lat, u, v):
         v_proc = v_data
 
     # --- 4. 计算物理坐标间距 (dx, dy) 和科里奥利参数 (f) ---
-    R_earth = 6371e3  # 地球半径 (米)
     Omega = 7.2921e-5  # 地球自转角速度 (弧度/秒)
 
-    lon_rad, lat_rad = np.meshgrid(np.deg2rad(lon), np.deg2rad(lat))
-
-    dy = R_earth * np.gradient(lat_rad, axis=0)
-    dx = R_earth * np.cos(lat_rad) * np.gradient(lon_rad, axis=1)
+    # lon, lat 是 1D 数组
+    scale = approximate_degree_length(lat) # shape: (n_lat,)
+    m_per_deg_lat = scale['meters_per_degree_lat']
+    m_per_deg_lon = scale['meters_per_degree_lon']
+    
+    # 广播到 2D 网格 (lat, lon)
+    # m_per_deg_lat 只随 lat 变化，沿 lon 轴广播
+    # m_per_deg_lon 只随 lat 变化，沿 lon 轴广播
+    m_per_deg_lat_2d = m_per_deg_lat[:, np.newaxis]
+    m_per_deg_lon_2d = m_per_deg_lon[:, np.newaxis]
+    
+    # 计算梯度 (单位: 度)
+    # np.gradient(lat) 返回 lat 方向的梯度 (dlat)
+    # np.gradient(lon) 返回 lon 方向的梯度 (dlon)
+    dlat_grid = np.gradient(lat)[:, np.newaxis] # shape (n_lat, 1)
+    dlon_grid = np.gradient(lon)[np.newaxis, :] # shape (1, n_lon)
+    
+    # dy: 沿 axis=0 (lat) 的距离变化
+    dy = dlat_grid * m_per_deg_lat_2d
+    
+    # dx: 沿 axis=1 (lon) 的距离变化
+    dx = dlon_grid * m_per_deg_lon_2d
     
     # 计算科里奥利参数 f
-    # f 的形状应该与 (latitude, longitude) 匹配，然后根据需要广播到 (depth, latitude, longitude)
+    lon_rad, lat_rad = np.meshgrid(np.deg2rad(lon), np.deg2rad(lat))
     f_2d = 2 * Omega * np.sin(lat_rad)
 
     # 广播 f_2d 到 u_proc 和 v_proc 的深度维度，以便最终输出的 f 形状与 zeta 保持一致
@@ -4066,7 +4079,6 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     # --- 开始循环，为每一对 k, b 计算一个剖面 ---
     for k_val, b_val in zip(k_list, b_list):
         # --- 1. 计算水平剖面线的坐标 ---
-        R_earth = 6371e3
         contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
         glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
         contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
@@ -4085,9 +4097,15 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
                 all_profiles_data.append({})
                 continue
 
-        dlat = np.deg2rad(np.diff(profile_lats)); dlon = np.deg2rad(np.diff(profile_lons))
-        mid_lats = np.deg2rad((profile_lats[:-1] + profile_lats[1:]) / 2)
-        dist_segments = R_earth * np.sqrt(dlat**2 + (np.cos(mid_lats) * dlon)**2)
+        dlat_deg = np.diff(profile_lats)
+        dlon_deg = np.diff(profile_lons) # 假设不跨日界线，因为是局部剖面
+        mid_lats_deg = (profile_lats[:-1] + profile_lats[1:]) / 2
+        
+        scale_mid = approximate_degree_length(mid_lats_deg)
+        dist_segments = np.hypot(
+            dlon_deg * scale_mid['meters_per_degree_lon'],
+            dlat_deg * scale_mid['meters_per_degree_lat']
+        )
         y_coords_raw = np.insert(np.cumsum(dist_segments), 0, 0) / 1000.0
 
         current_center_lon, current_center_lat = center_lon_arr[needed_idx], center_lat_arr[needed_idx]
