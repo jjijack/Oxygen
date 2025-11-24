@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from shapely.geometry import Point, Polygon
+from matplotlib.path import Path as MplPath
 import geopandas as gpd
 import inspect
 from netCDF4 import Dataset
@@ -1912,12 +1912,8 @@ def is_point_in_contour(row: pd.Series) -> bool:
         if len(contour_coords) < 3:
             return False
 
-        polygon = Polygon(contour_coords)
-        if polygon.is_empty:
-            return False
-
-        point_coord = Point(point_lon_norm, row['Latitude'])
-        return polygon.contains(point_coord)
+        path = MplPath(contour_coords)
+        return path.contains_point((point_lon_norm, row['Latitude']))
     except Exception:
         return False
 
@@ -5023,9 +5019,7 @@ def check_single_track(
                     contour_lat_arr = np.asarray(contour_lat_i, dtype=float)
                     if contour_lon_arr.size >= 3 and contour_lat_arr.size >= 3 and contour_lon_arr.shape == contour_lat_arr.shape:
                         contour_lon_norm = center_lon_i + _minimal_lon_diff_deg(contour_lon_arr, center_lon_i)
-                        contour_poly = Polygon(zip(contour_lon_norm, contour_lat_arr))
-                        if contour_poly.is_empty:
-                            contour_poly = None
+                        contour_poly = MplPath(list(zip(contour_lon_norm, contour_lat_arr)))
             except Exception:
                 contour_poly = None
 
@@ -5059,9 +5053,8 @@ def check_single_track(
                 inside_poly_point = False
                 if contour_poly is not None:
                     point_lon_norm = center_lon_i + _minimal_lon_diff_deg(point_lon, center_lon_i)
-                    point_norm = Point(point_lon_norm, point_lat)
                     try:
-                        inside_poly_point = contour_poly.contains(point_norm)
+                        inside_poly_point = contour_poly.contains_point((point_lon_norm, point_lat))
                     except Exception:
                         inside_poly_point = False
                 if inside_poly_point:
@@ -5566,9 +5559,8 @@ def plot_all_tracks_in_range(
                                     center_lon_i = float(row.get('center_lon', contour_lon_arr[0]))
                                     contour_lon_norm = center_lon_i + _minimal_lon_diff_deg(contour_lon_arr, center_lon_i)
                                     contour_lon_norm = np.asarray(contour_lon_norm, dtype=float)
-                                    poly = Polygon(zip(contour_lon_norm, contour_lat_arr))
-                                    if poly.is_empty:
-                                        raise ValueError("Empty polygon after normalization")
+                                    
+                                    path = MplPath(list(zip(contour_lon_norm, contour_lat_arr)))
 
                                     date_norm = row['date'].normalize() if isinstance(row['date'], pd.Timestamp) else pd.Timestamp(row['date']).normalize()
                                     entries = argo_by_date.get(date_norm, [])
@@ -5580,8 +5572,8 @@ def plot_all_tracks_in_range(
                                         except Exception:
                                             continue
                                         point_lon_norm = float(center_lon_i + _minimal_lon_diff_deg(pt_lon, center_lon_i))
-                                        point_norm = Point(point_lon_norm, pt_lat)
-                                        if poly.contains(point_norm):
+                                        
+                                        if path.contains_point((point_lon_norm, pt_lat)):
                                             draw_it = True
                                             break
                                 except Exception:
