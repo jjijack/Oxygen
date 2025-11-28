@@ -5770,6 +5770,8 @@ def _load_eddy_datasets_for_range(
 
     lon_min_cfg = float(lonmin)
     lon_max_cfg = float(lonmax)
+    lat_min_cfg = float(latmin)
+    lat_max_cfg = float(latmax)
     lon_min_eff = float(_normalize_lon(lon_min_cfg))
     lon_max_eff = float(_normalize_lon(lon_max_cfg))
 
@@ -5834,7 +5836,7 @@ def _load_eddy_datasets_for_range(
                             lat_stats = pf.metadata.row_group(rg).column(lat_idx).statistics
                             if lat_stats and lat_stats.has_min_max:
                                 lat_min, lat_max_ = float(lat_stats.min), float(lat_stats.max)
-                                if (lat_max_ < latmin) or (lat_min > latmax):
+                                if (lat_max_ < lat_min_cfg) or (lat_min > lat_max_cfg):
                                     read_rg = False
                         except Exception:
                             pass
@@ -6948,3 +6950,638 @@ def calculate_delta_do(
         print(f"总共检测到 {len(results_df)} 个潜在的DO异常信号，来自 {len(results_df['Profile_number'].unique())} 个剖面")
 
     return results_df
+
+def _export_interacting_argo_worker(args):
+    """
+    Worker function for export_all_interacting_argo to support multiprocessing.
+    Optimized for batch processing by Year with Low Memory Footprint.
+    """
+    y, kinds, cef, r_key, lmin, lmax, ltmin, ltmax = args
+
+    try:
+        # 1. 加载 Argo (按年加载)
+        df = load_argo_data(y)
+        if df.empty: return [], pd.DataFrame()
+        
+        # 地理过滤 (粗筛)
+        pad = 2.0 
+        lon_vals = df['Longitude'].to_numpy(dtype=float)
+        lat_vals = df['Latitude'].to_numpy(dtype=float)
+        
+        if lmax < lmin: # 跨日界线
+            lon_mask = (lon_vals >= lmin - pad) | (lon_vals <= lmax + pad)
+        else:
+            lon_mask = (lon_vals >= lmin - pad) & (lon_vals <= lmax + pad)
+            
+        lat_mask = (lat_vals >= ltmin - pad) & (lat_vals <= ltmax + pad)
+        df_geo = df[lon_mask & lat_mask].copy()
+        if df_geo.empty: return [], pd.DataFrame()
+        
+        # 提取 Baseline (去重)
+        baseline = (
+            df_geo.sort_values(['Profile_number', 'Depth'])
+            .groupby('Profile_number', as_index=False)
+            .first()[['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day']]
+        )
+        baseline['date'] = pd.to_datetime(baseline[['Year', 'Month', 'Day']])
+        
+        # 按天分组 Argo (Dict of DataFrames)
+        argo_by_day = {d: grp for d, grp in baseline.groupby('date')}
+
+        # 2. 加载当年涡旋数据 (仅元数据，不含轮廓，节省内存)
+        start_d = pd.Timestamp(f"{y}-01-01")
+        end_d = pd.Timestamp(f"{y}-12-31")
+        
+        # Pass 1: Load lightweight metadata
+        eddy_data_meta = _load_eddy_datasets_for_range(
+            kinds=kinds,
+            start_date=start_d,
+            end_date=end_d,
+            region_key=r_key,
+            include_contours=False # 关键：先不加载轮廓
+        )
+        
+        # 3. 构建涡旋按天索引 (仅元数据)
+        eddy_by_day = defaultdict(list)
+        for ds_name, ds_tracks in eddy_data_meta.items():
+            for item in ds_tracks:
+                track = item[0] if isinstance(item, tuple) else item
+                if not track: continue
+                
+                # 批量转换时间
+                raw_times = [p[1] for p in track]
+                converted_times = convert_date(raw_times)
+                
+                if isinstance(converted_times, pd.Series):
+                    ts_index = pd.DatetimeIndex(converted_times)
+                else:
+                    ts_index = pd.DatetimeIndex([converted_times])
+                
+                mask = (ts_index >= start_d) & (ts_index <= end_d)
+                valid_indices = np.where(mask)[0]
+                
+                for idx in valid_indices:
+                    p = track[idx]
+                    d = ts_index[idx].normalize()
+                    
+                    eddy_by_day[d].append({
+                        'track_id': p[0],
+                        'lon': p[2],
+                        'lat': p[3],
+                        'radius': p[8],
+                        'ds_name': ds_name,
+                        # 'contour_lon': p[6], # Pass 1 中这些是 None 或空
+                        # 'contour_lat': p[7]
+                    })
+
+        interacting_records = []
+        
+        # 记录需要进一步检查轮廓的候选者
+        # candidates[ds_name][track_id] = set(dates)
+        candidates = defaultdict(lambda: defaultdict(set))
+        
+        # 4. Pass 1: 批量圆筛选
+        common_days = sorted(set(argo_by_day.keys()) & set(eddy_by_day.keys()))
+        
+        # print(f"[Info] Year {y}: Checking {len(common_days)} days with Argo & Eddies...")
+
+        for current_date in common_days:
+            day_argo_df = argo_by_day[current_date]
+            day_eddies = eddy_by_day[current_date]
+            
+            argo_lons = day_argo_df['Longitude'].to_numpy(dtype=float)
+            argo_lats = day_argo_df['Latitude'].to_numpy(dtype=float)
+            
+            for eddy in day_eddies:
+                e_lon, e_lat, e_rad = eddy['lon'], eddy['lat'], eddy['radius']
+                eff_rad = e_rad * cef
+                
+                # 粗筛
+                scale_rough = approximate_degree_length(e_lat)
+                # 使用 1.5 倍 buffer，并分别计算经纬度方向的度数阈值
+                # 注意：meters_per_degree_lon 随纬度增加而减小，因此同样的米数对应的度数会变大
+                # 为安全起见，使用 local scale
+                rad_deg_lat = (eff_rad / scale_rough['meters_per_degree_lat']) * 1.5
+                # 防止极点附近除零或过大，设置上限（例如 180度）
+                if scale_rough['meters_per_degree_lon'] < 1000: # 极靠近极点
+                     rad_deg_lon = 180.0
+                else:
+                     rad_deg_lon = (eff_rad / scale_rough['meters_per_degree_lon']) * 1.5
+                
+                dlon = np.abs(_minimal_lon_diff_deg(argo_lons, e_lon))
+                dlat = np.abs(argo_lats - e_lat)
+                
+                mask_bb = (dlon < rad_deg_lon) & (dlat < rad_deg_lat)
+                if not np.any(mask_bb):
+                    continue
+                
+                # 精细距离
+                # 使用 adaptive_distance_m 替代手动平面计算，以解决高纬度畸变问题
+                c_lons = argo_lons[mask_bb]
+                c_lats = argo_lats[mask_bb]
+                
+                dists = adaptive_distance_m(c_lons, c_lats, e_lon, e_lat)
+                mask_circle = dists <= eff_rad
+                
+                if np.any(mask_circle):
+                    # 命中圆，记录为候选，稍后加载轮廓做精确检查
+                    candidates[eddy['ds_name']][eddy['track_id']].add(current_date)
+
+        # 5. Pass 2: 批量加载轮廓并精确匹配 (Batch Loading Optimization)
+        # 收集所有需要加载轮廓的 track_ids
+        for ds_name, track_map in candidates.items():
+            target_ids = list(track_map.keys())
+            if not target_ids:
+                continue
+            
+            try:
+                # 批量加载：一次性读取该数据集下所有候选涡旋的完整轨迹（含轮廓）
+                # find_track 返回 {tid: list_of_rows} (当 len(target_ids) > 1)
+                # 或 list_of_rows (当 len(target_ids) == 1)
+                # 统一处理为 dict
+                batch_res = find_track(
+                    ds_name.lower(), 
+                    target_ids, 
+                    region=r_key, 
+                    include_contours=True, 
+                    return_list=True
+                )
+                
+                tracks_dict = {}
+                if len(target_ids) == 1:
+                    # 单个 ID 返回的是 list
+                    tracks_dict[target_ids[0]] = batch_res
+                else:
+                    tracks_dict = batch_res
+                
+                # 遍历每个涡旋进行多边形检测
+                for track_id, full_track_list in tracks_dict.items():
+                    dates_set = track_map.get(track_id, set())
+                    if not dates_set: continue
+                    
+                    # 构建时间索引: YYYYMMDD int -> row
+                    # full_track_list item: [tid, ymd, clon, clat, mlon, mlat, clon_poly, clat_poly, rad, ...]
+                    # Index: 1=ymd, 2=clon, 3=clat, 6=clon_poly, 7=clat_poly, 8=rad
+                    
+                    # 快速筛选：只处理 dates_set 中的日期
+                    # 将 dates_set 转为 YYYYMMDD 整数集合以便快速查找
+                    target_ymds = {d.year * 10000 + d.month * 100 + d.day for d in dates_set}
+                    
+                    for row in full_track_list:
+                        ymd = row[1]
+                        if ymd not in target_ymds:
+                            continue
+                            
+                        # 提取数据
+                        e_lon = row[2]
+                        e_lat = row[3]
+                        c_lon_poly = row[6]
+                        c_lat_poly = row[7]
+                        e_rad = row[8]
+                        
+                        # 还原日期对象用于查找 Argo
+                        # ymd is int YYYYMMDD
+                        y_ = ymd // 10000
+                        m_ = (ymd % 10000) // 100
+                        d_ = ymd % 100
+                        current_date = pd.Timestamp(year=y_, month=m_, day=d_)
+                        
+                        # 获取当天的 Argo
+                        if current_date not in argo_by_day: continue
+                        day_argo_df = argo_by_day[current_date]
+                        
+                        argo_lons = day_argo_df['Longitude'].to_numpy(dtype=float)
+                        argo_lats = day_argo_df['Latitude'].to_numpy(dtype=float)
+                        argo_ids = day_argo_df['Profile_number'].to_numpy()
+                        
+                        # 重复圆筛选 (为了拿到 mask_circle 对应的点)
+                        eff_rad = e_rad * cef
+                        
+                        scale_rough = approximate_degree_length(e_lat)
+                        rad_deg_lat = (eff_rad / scale_rough['meters_per_degree_lat']) * 1.5
+                        if scale_rough['meters_per_degree_lon'] < 1000:
+                             rad_deg_lon = 180.0
+                        else:
+                             rad_deg_lon = (eff_rad / scale_rough['meters_per_degree_lon']) * 1.5
+
+                        dlon = np.abs(_minimal_lon_diff_deg(argo_lons, e_lon))
+                        dlat = np.abs(argo_lats - e_lat)
+                        mask_bb = (dlon < rad_deg_lon) & (dlat < rad_deg_lat)
+                        
+                        if not np.any(mask_bb): continue
+                        
+                        c_lons = argo_lons[mask_bb]
+                        c_lats = argo_lats[mask_bb]
+                        c_ids = argo_ids[mask_bb]
+                        
+                        # 使用 adaptive_distance_m 替代手动平面计算
+                        dists = adaptive_distance_m(c_lons, c_lats, e_lon, e_lat)
+                        mask_circle = dists <= eff_rad
+                        
+                        if np.any(mask_circle):
+                            circle_hits_idx = np.where(mask_circle)[0]
+                            
+                            # 多边形检测
+                            has_poly = False
+                            is_inside = np.zeros(len(circle_hits_idx), dtype=bool)
+                            
+                            if c_lon_poly is not None and c_lat_poly is not None:
+                                c_lon_arr = np.asarray(c_lon_poly)
+                                c_lat_arr = np.asarray(c_lat_poly)
+                                if c_lon_arr.size >= 3:
+                                    has_poly = True
+                                    c_lon_norm = e_lon + _minimal_lon_diff_deg(c_lon_arr, e_lon)
+                                    verts = np.column_stack((c_lon_norm, c_lat_arr))
+                                    path = MplPath(verts)
+                                    
+                                    p_lons = c_lons[mask_circle]
+                                    p_lats = c_lats[mask_circle]
+                                    p_lons_norm = e_lon + _minimal_lon_diff_deg(p_lons, e_lon)
+                                    points = np.column_stack((p_lons_norm, p_lats))
+                                    is_inside = path.contains_points(points)
+                            
+                            for idx_in_subset, inside in enumerate(is_inside):
+                                real_idx = circle_hits_idx[idx_in_subset]
+                                if has_poly:
+                                    m_str = 'poly' if inside else 'circle'
+                                else:
+                                    m_str = 'circle'
+                                    
+                                interacting_records.append({
+                                    'Profile_number': c_ids[real_idx],
+                                    'Year': y,
+                                    'Month': current_date.month,
+                                    'Day': current_date.day,
+                                    'track_id': track_id,
+                                    'ds_name': ds_name,
+                                    'method': m_str
+                                })
+            except Exception as e:
+                print(f"[Warn] Batch processing failed for {ds_name} in Year {y}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        return interacting_records, baseline
+    except Exception as e:
+        print(f"[Error] Year {y}: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], pd.DataFrame()
+
+def export_all_interacting_argo(
+    start_year: int,
+    end_year: int,
+    eddy_datasets: dict | list[str] | tuple[str, ...] | None = None,
+    circle_enlargement_factor: float | None = None,
+    output_path: str | Path | None = None,
+    num_workers: int = 1,
+):
+    """
+    计算并导出指定年份范围内所有位于涡旋内部的 Argo 剖面数据。
+
+    功能：
+        1. 遍历指定年份的 Argo 数据。
+        2. 加载对应的涡旋轨迹数据（META Tracks）。
+        3. 判断每个 Argo 剖面是否位于涡旋内部（支持多核并行加速）。
+        4. 将所有位于涡旋内的 Argo 剖面信息（包含匹配的涡旋ID、类型等）保存为 Parquet 文件。
+        5. 同时保存该区域内所有 Argo 剖面的基础信息（用于后续计算交互率分母）。
+
+    参数:
+        start_year (int): 起始年份。
+        end_year (int): 结束年份。
+        eddy_datasets (list, optional): 指定使用的涡旋数据集列表（如 ['acl', 'acs', 'cyclonic', 'anticyclonic']）。默认为 None，使用所有可用数据集。
+        circle_enlargement_factor (float, optional): 涡旋边界放大系数。默认为从 processing.yml 中读取。
+        output_path (str | Path, optional): 结果文件保存路径。默认为 `plot_outputs/<region>/statistics/all_interacting_argo_<years>.parquet`。
+        num_workers (int): 并行进程数。默认为 1。
+
+    输出:
+        生成一个 Parquet 文件，包含所有与涡旋发生交互的 Argo 剖面详细信息。
+    """
+    if circle_enlargement_factor is None:
+        circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
+    
+    region_slug = _current_region_key()
+    if output_path is None:
+        out_dir = Path(plots_output_root) / region_slug / "statistics"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = out_dir / f"all_interacting_argo_{start_year}_{end_year}.parquet"
+    else:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"--- Exporting All Interacting Argo (Baseline) {start_year}-{end_year} ---")
+    print(f"Output: {output_path}")
+    print(f"Workers: {num_workers} (Task granularity: Yearly)")
+    
+    # 准备任务列表 (Year)
+    years = list(range(start_year, end_year + 1))
+    
+    # 准备参数
+    kinds = eddy_datasets if eddy_datasets else ['acs', 'acl', 'cs', 'cl']
+    if isinstance(kinds, dict): kinds = list(kinds.keys())
+    kinds = [str(k).lower() for k in kinds]
+    
+    worker_args = [
+        (y, kinds, circle_enlargement_factor, region_slug, lonmin, lonmax, latmin, latmax)
+        for y in years
+    ]
+    
+    print(f"Total tasks: {len(worker_args)}")
+    
+    # 执行并行
+    all_results = []
+    all_profiles = []
+    
+    if num_workers > 1:
+        with multiprocessing.Pool(processes=num_workers, initializer=init_worker, initargs=(None,), maxtasksperchild=1) as pool:
+            for res_interactions, res_profiles in tqdm(pool.imap_unordered(_export_interacting_argo_worker, worker_args), total=len(worker_args), desc="Processing Years"):
+                all_results.extend(res_interactions)
+                if not res_profiles.empty:
+                    all_profiles.append(res_profiles)
+    else:
+        for args in tqdm(worker_args, desc="Processing Years"):
+            res_interactions, res_profiles = _export_interacting_argo_worker(args)
+            all_results.extend(res_interactions)
+            if not res_profiles.empty:
+                all_profiles.append(res_profiles)
+            
+    # 保存交互记录
+    if all_results:
+        df_out = pd.DataFrame(all_results)
+        df_out.to_parquet(output_path, index=False)
+        print(f"Saved {len(df_out)} interacting records to: {output_path}")
+    else:
+        print("No interacting profiles found.")
+
+    # 保存区域内所有 Argo 剖面 (Baseline)
+    if all_profiles:
+        df_profiles = pd.concat(all_profiles, ignore_index=True)
+        # 构造 Baseline 文件名: all_region_argo_{start}_{end}.parquet
+        baseline_path = output_path.parent / f"all_region_argo_{start_year}_{end_year}.parquet"
+        df_profiles.to_parquet(baseline_path, index=False)
+        print(f"Saved {len(df_profiles)} region profiles (Baseline) to: {baseline_path}")
+    else:
+        print("No region profiles found.")
+
+def calculate_interaction_statistics(
+    start_year: int,
+    end_year: int,
+    eddy_datasets: dict | list[str] | tuple[str, ...] | None = None,
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
+    anomaly_min_depth: float | None = None,
+    circle_enlargement_factor: float | None = None,
+    save_report: bool = True,
+    precomputed_file: str | Path | None = None,
+    anomalies_file: str | Path | None = None,
+    use_precomputed_anomalies: bool = True,
+):
+    """
+    计算并对比 Argo 剖面与涡旋的交互概率（Baseline vs Anomalies）。
+    
+    功能：
+        1. 加载指定年份的所有 Argo 数据。
+        2. 加载预计算的交互记录文件（由 export_all_interacting_argo 生成）。
+           注意：必须先运行 export_all_interacting_argo 生成该文件，否则报错。
+        3. 计算 Baseline：所有 Argo 剖面中，有多少比例落在涡旋内。
+        4. 计算 Anomalies：筛选出 ΔDO 异常剖面，计算其中有多少比例落在涡旋内。
+           - 若 use_precomputed_anomalies=True (默认)，会自动尝试查找 plot_argo_hotspots 生成的异常文件。
+           - 若找到文件，直接读取；若未找到或读取失败，回退到实时调用 calculate_delta_do 计算。
+        5. 输出对比报告。
+    """
+    # 参数回退
+    if do_threshold is None: do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None: salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None: temperature_threshold = _default_temperature_threshold
+    if depth_interval is None: depth_interval = _default_depth_interval
+    if depth_merge_tolerance is None: depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None: duplicate_depth_strategy = _default_duplicate_depth_strategy
+    if anomaly_min_depth is None: anomaly_min_depth = _cfg_anomaly_min_depth
+    if circle_enlargement_factor is None: circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
+
+    print(f"--- Calculating Interaction Statistics {start_year}-{end_year} ---")
+    
+    # --- 0. 尝试加载预计算的交互记录 ---
+    interacting_ids = set()
+    loaded_precomputed = False
+    
+    region_slug = _current_region_key()
+    if precomputed_file is None:
+        # 尝试默认路径
+        default_file = Path(plots_output_root) / region_slug / "statistics" / f"all_interacting_argo_{start_year}_{end_year}.parquet"
+        if default_file.exists():
+            precomputed_file = default_file
+            
+    if precomputed_file and Path(precomputed_file).exists():
+        print(f"[*] Loading precomputed interactions from: {precomputed_file}")
+        try:
+            df_int = pd.read_parquet(precomputed_file)
+            if 'Profile_number' in df_int.columns:
+                interacting_ids = set(df_int['Profile_number'].unique())
+                loaded_precomputed = True
+                print(f"[*] Loaded {len(interacting_ids)} unique interacting profiles.")
+        except Exception as e:
+            print(f"[WARN] Failed to read precomputed file: {e}")
+            
+    # 1. 加载 Argo 数据 (用于计算分母和检测异常)
+    # 优化：尝试加载预计算的区域 Argo 列表 (Baseline)
+    baseline_profiles = pd.DataFrame()
+    loaded_baseline_file = False
+    
+    default_baseline_file = Path(plots_output_root) / region_slug / "statistics" / f"all_region_argo_{start_year}_{end_year}.parquet"
+    if default_baseline_file.exists():
+        print(f"[*] Loading precomputed region profiles from: {default_baseline_file}")
+        try:
+            baseline_profiles = pd.read_parquet(default_baseline_file)
+            if not baseline_profiles.empty:
+                # 确保严格符合当前区域定义 (因为 export 可能包含 padding)
+                lons = baseline_profiles['Longitude'].to_numpy()
+                lats = baseline_profiles['Latitude'].to_numpy()
+                mask_geo = _region_lon_mask(lons, lonmin, lonmax) & (lats >= latmin) & (lats <= latmax)
+                baseline_profiles = baseline_profiles[mask_geo].copy()
+                
+                baseline_profiles['date'] = pd.to_datetime(baseline_profiles[['Year', 'Month', 'Day']])
+                loaded_baseline_file = True
+                print(f"[*] Loaded {len(baseline_profiles)} region profiles (Strictly inside region).")
+        except Exception as e:
+            print(f"[WARN] Failed to read region profiles file: {e}")
+
+    argo_geo = pd.DataFrame() # 用于实时计算异常的原始数据
+    
+    if not loaded_baseline_file:
+        print("[*] Loading Argo data (Real-time)...")
+        argo_list = []
+        for y in range(start_year, end_year + 1):
+            try:
+                df = load_argo_data(y)
+                if not df.empty:
+                    argo_list.append(df)
+            except Exception:
+                pass
+        if not argo_list:
+            print("No Argo data found.")
+            return
+        argo_all = pd.concat(argo_list, ignore_index=True)
+        
+        # 地理过滤
+        lon_vals = argo_all['Longitude'].to_numpy(dtype=float)
+        lat_vals = argo_all['Latitude'].to_numpy(dtype=float)
+        lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+        lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+        argo_geo = argo_all[lon_mask & lat_mask].copy()
+        
+        if argo_geo.empty:
+            print("No Argo data in region.")
+            return
+
+        # 提取 Baseline (所有剖面)
+        # 按 Profile_number 去重，保留时间/位置
+        baseline_profiles = (
+            argo_geo.sort_values(['Profile_number', 'Depth'])
+            .groupby('Profile_number', as_index=False)
+            .first()[['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day']]
+        )
+        baseline_profiles['date'] = pd.to_datetime(baseline_profiles[['Year', 'Month', 'Day']])
+    
+    # 提取 Anomalies (异常剖面)
+    anomalies = pd.DataFrame()
+    
+    # 自动查找默认异常文件
+    if anomalies_file is None and use_precomputed_anomalies:
+        region_slug = _current_region_key()
+        out_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots"
+        
+        thr_str = f"{do_threshold:g}".replace('.', 'p')
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+            
+        default_anomalies_file = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        if default_anomalies_file.exists():
+            anomalies_file = default_anomalies_file
+            print(f"[*] Found default precomputed anomalies file: {anomalies_file}")
+        else:
+            print(f"[*] Default precomputed anomalies file not found: {default_anomalies_file}")
+            print("    Will proceed with real-time calculation.")
+
+    if anomalies_file and Path(anomalies_file).exists():
+        print(f"[*] Loading precomputed anomalies from: {anomalies_file}")
+        try:
+            anomalies = pd.read_parquet(anomalies_file)
+            # 确保只统计当前区域内的异常（如果文件包含更多区域）
+            # 使用 Profile_number 与 baseline_profiles (已过滤区域) 取交集最稳妥
+            valid_ids = set(baseline_profiles['Profile_number'])
+            anomalies = anomalies[anomalies['Profile_number'].isin(valid_ids)].copy()
+            print(f"[*] Loaded {len(anomalies)} anomalies (filtered by region).")
+        except Exception as e:
+            print(f"[WARN] Failed to read anomalies file: {e}. Falling back to calculation.")
+            anomalies = pd.DataFrame() # 触发下方重新计算
+
+    if anomalies.empty:
+        print("[*] Detecting anomalies (Real-time calculation)...")
+        # 如果没有加载 baseline file，说明 argo_geo 已经准备好了
+        # 如果加载了 baseline file，但没有 anomalies file，我们需要重新加载 argo_geo 吗？
+        # 是的，因为 calculate_delta_do 需要原始剖面数据 (argo_geo)
+        
+        if argo_geo.empty:
+             print("[*] Reloading Argo data for anomaly calculation...")
+             # 这里必须重新加载，因为之前可能跳过了
+             argo_list = []
+             for y in range(start_year, end_year + 1):
+                try:
+                    df = load_argo_data(y)
+                    if not df.empty:
+                        argo_list.append(df)
+                except Exception:
+                    pass
+             if argo_list:
+                 argo_all = pd.concat(argo_list, ignore_index=True)
+                 lon_vals = argo_all['Longitude'].to_numpy(dtype=float)
+                 lat_vals = argo_all['Latitude'].to_numpy(dtype=float)
+                 lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+                 lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+                 argo_geo = argo_all[lon_mask & lat_mask].copy()
+
+        if not argo_geo.empty:
+            anomalies = calculate_delta_do(
+                argo_geo,
+                depth_interval=depth_interval,
+                do_threshold=do_threshold,
+                salinity_threshold=salinity_threshold,
+                temperature_threshold=temperature_threshold,
+                anomaly_min_depth=anomaly_min_depth,
+                depth_merge_tolerance=depth_merge_tolerance,
+                duplicate_depth_strategy=duplicate_depth_strategy,
+                remove_outliers=True,
+                verbose=False
+            )
+        else:
+            print("[Error] Cannot calculate anomalies: No Argo data available.")
+    
+    anomaly_ids = set()
+    if not anomalies.empty:
+        anomaly_ids = set(anomalies['Profile_number'].unique())
+    
+    # 2. 若未加载预计算文件，则报错返回
+    if not loaded_precomputed:
+        print(f"[Error] Precomputed interaction file not found or failed to load.")
+        print(f"Please run 'export_all_interacting_argo(start_year={start_year}, end_year={end_year}, ...)' first.")
+        return
+
+    # 4. 统计
+    total_baseline = len(baseline_profiles)
+    interacted_baseline = len(interacting_ids)
+    pct_baseline = (interacted_baseline / total_baseline * 100) if total_baseline > 0 else 0.0
+    
+    total_anom = len(anomaly_ids)
+    # 异常且交互 = 异常ID集合 与 交互ID集合 的交集
+    interacted_anom = len(anomaly_ids & interacting_ids)
+    pct_anom = (interacted_anom / total_anom * 100) if total_anom > 0 else 0.0
+    
+    # 5. 输出报告
+    source_str = f"Precomputed File ({Path(precomputed_file).name})" if loaded_precomputed else "Real-time Calculation"
+    
+    report = (
+        f"========================================\n"
+        f"Interaction Statistics Report ({start_year}-{end_year})\n"
+        f"Region: {_current_region_key()}\n"
+        f"Source: {source_str}\n"
+        f"Thresholds: ΔDO>={do_threshold}, Depth>={anomaly_min_depth}m\n"
+        f"----------------------------------------\n"
+        f"[Baseline] All Argo Profiles:\n"
+        f"  Total Profiles:       {total_baseline}\n"
+        f"  Inside Eddies:        {interacted_baseline}\n"
+        f"  Interaction Rate:     {pct_baseline:.2f}%\n"
+        f"----------------------------------------\n"
+        f"[Subset] ΔDO Anomalies:\n"
+        f"  Total Anomalies:      {total_anom}\n"
+        f"  Inside Eddies:        {interacted_anom}\n"
+        f"  Interaction Rate:     {pct_anom:.2f}%\n"
+        f"----------------------------------------\n"
+        f"Ratio (Anom Rate / Base Rate): {(pct_anom/pct_baseline if pct_baseline > 0 else 0):.2f}x\n"
+        f"========================================"
+    )
+    
+    print(report)
+    
+    if save_report:
+        region_slug = _current_region_key()
+        out_dir = Path(plots_output_root) / region_slug / "statistics"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        thr_str = f"{do_threshold:g}".replace('.', 'p')
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+            
+        fname = out_dir / f"interaction_stats_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.txt"
+        with open(fname, 'w') as f:
+            f.write(report)
+        print(f"Report saved to: {fname}")
