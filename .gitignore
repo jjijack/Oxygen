@@ -4,6 +4,7 @@
 *.parquet
 *.csv
 *.npy
+*.txt
 
 Argo_addFloat/
 Argo_data/

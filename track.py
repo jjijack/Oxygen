@@ -6183,7 +6183,7 @@ def plot_argo_hotspots(
     anomaly_min_depth: float | None = None,
     plot_unrelated_argo: bool = True,
     fix_delta_do_colorbar: bool = True,
-    delta_do_cbar_min: float = 50.0,
+    delta_do_cbar_min: float = 10.0,
     delta_do_cbar_max: float = 100.0,
     delta_do_cbar_ticks: list | None = None,
     save_fig: bool = False,
@@ -6192,7 +6192,8 @@ def plot_argo_hotspots(
     dask_scheduler: str | None = None,
     dask_workers: int | None = None,
     dask_memory_limit: str | None = None,
-    use_interacting_argo: bool = False
+    use_interacting_argo: bool = False,
+    split_plots: bool = False
 ):
     """以 ΔDO 异常方法绘制多年期 Argo 异常分布。
 
@@ -6219,6 +6220,8 @@ def plot_argo_hotspots(
         use_interacting_argo (bool): 是否读取 run_batch_plotting_multiprocessing 生成的交互 Argo 文件，
                                           并在图中区分交互/非交互 Argo，同时统计交互比例。
                                           默认 False。
+        split_plots (bool): 若为 True 且 use_interacting_argo=True，则将交互（菱形）与非交互（圆形）异常点分别绘制在两张图中。
+                            默认 False。
 
     输出:
         - 图像（可选）：`plot_outputs/<region>/plot_argo_hotspots/Argo_DeltaDO_Hotspots_*.png`
@@ -6370,117 +6373,123 @@ def plot_argo_hotspots(
     data_crs = ccrs.PlateCarree()
     map_crs = ccrs.PlateCarree(central_longitude=central_lon)
 
-    fig = plt.figure(figsize=(40, 30))
-    ax = fig.add_subplot(1, 1, 1, projection=map_crs)
-    depth_title = (
-        f' (depth ≥ {anomaly_min_depth} m)'
-        if anomaly_min_depth is not None and anomaly_min_depth > 0 else ''
-    )
-    thr_title = f' (ΔDO ≥ {do_threshold:g} μmol kg⁻¹)'
-    ax.set_title(f'Argo ΔDO Anomalies {start_year}-{end_year}{thr_title}{depth_title}', fontsize=20)
-
-    # Basemap features
-    base_ocean = _BASEMAP_COLORS['ocean']
-    base_land = _BASEMAP_COLORS['land']
-    coast_color = _BASEMAP_COLORS['coastline']
-    grid_color = _BASEMAP_COLORS['grid']
-    ax.set_facecolor(base_ocean)
-    ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
-    ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
-    gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
-    gl.top_labels = False
-    gl.right_labels = False
-
-    # 设定范围（处理跨日界线）
-    lon_extent_min = lonmin
-    lon_extent_max = lonmax
-    if crosses_dateline and lon_extent_max < lon_extent_min:
-        lon_extent_max += 360
-    ax.set_extent([lon_extent_min, lon_extent_max, latmin, latmax], crs=data_crs)
-
-    if plot_unrelated_argo and not baseline_profiles.empty:
-        ax.scatter(
-            baseline_profiles['Longitude'], baseline_profiles['Latitude'],
-            facecolors='none', edgecolors='gray', linewidths=0.7, s=25,
-            label='All Argo Profiles (baseline)', zorder=2, transform=data_crs
-        )
-
+    # 准备数据分组
+    anom_interacting = pd.DataFrame()
+    anom_others = pd.DataFrame()
+    scatter_kwargs = {}
+    
     if not anomalies.empty:
-        scatter_kwargs = {}
         if fix_delta_do_colorbar:
             scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
-        
-        # 分离交互与非交互
-        anom_interacting = pd.DataFrame()
-        anom_others = anomalies
-        
+
+        anom_others = anomalies.copy()
         if use_interacting_argo and interacting_argo_ids:
             is_interacting = anomalies['Profile_number'].isin(interacting_argo_ids)
-            anom_interacting = anomalies[is_interacting]
-            anom_others = anomalies[~is_interacting]
+            anom_interacting = anomalies[is_interacting].copy()
+            anom_others = anomalies[~is_interacting].copy()
             
             # 统计输出
             total_anom = len(anomalies)
             count_int = len(anom_interacting)
             pct = (count_int / total_anom * 100) if total_anom > 0 else 0.0
-            stats_txt = (
-                f"Interacting Argo Statistics\n"
-                f"Total Anomalies: {total_anom}\n"
-                f"Interacting with Eddies: {count_int} ({pct:.2f}%)\n"
-                f"Non-interacting: {len(anom_others)}\n"
-            )
-            print("\n" + "="*40)
-            print(stats_txt.strip())
-            print("="*40 + "\n")
-            
-            # 保存统计到文件
-            if save_data:
-                region_slug_for_path = _current_region_key()
-                out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
-                out_dir.mkdir(exist_ok=True, parents=True)
-                thr_str = f"{do_threshold:g}".replace('.', 'p')
-                depth_suffix = ''
-                if anomaly_min_depth is not None and anomaly_min_depth > 0:
-                    depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-                    depth_suffix = f"_depth{depth_str}m"
-                stats_file = out_dir / f"statistics_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.txt"
-                try:
-                    with open(stats_file, 'w') as f:
-                        f.write(stats_txt)
-                    print(f"Statistics saved to: {stats_file}")
-                except Exception as e:
-                    print(f"[WARN] Failed to save statistics file: {e}")
+            print(f"[Plot Info] Anomalies: {total_anom}, Interacting: {count_int} ({pct:.1f}%)")
 
-        # 绘制非交互（或全部，若未分离）
-        sc = None
+    # 定义绘图任务
+    plots_to_generate = []
+    if split_plots and use_interacting_argo:
+        plots_to_generate.append({
+            'name': 'interacting',
+            'title_extra': ' (Interacting)',
+            'file_suffix': '_interacting',
+            'data_list': [
+                {'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4}
+            ]
+        })
+        plots_to_generate.append({
+            'name': 'non_interacting',
+            'title_extra': ' (Non-interacting)',
+            'file_suffix': '_non_interacting',
+            'data_list': [
+                {'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': f'Non-interacting (ΔDO ≥ {do_threshold})', 's': 60, 'zorder': 3}
+            ]
+        })
+    else:
+        # 合并模式
+        combined_data = []
         if not anom_others.empty:
             label_str = f'ΔDO ≥ {do_threshold} μmol kg⁻¹'
             if use_interacting_argo and interacting_argo_ids:
                 label_str = f'Non-interacting (ΔDO ≥ {do_threshold})'
-            
-            sc = ax.scatter(
-                anom_others['Longitude'], anom_others['Latitude'],
-                c=anom_others['delta_do'], cmap='Reds', s=60,
-                edgecolors='black', linewidths=0.5,
-                label=label_str, zorder=3,
-                transform=data_crs,
-                **scatter_kwargs
-            )
+            combined_data.append({'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': label_str, 's': 60, 'zorder': 3})
         
-        # 绘制交互（若存在）
         if not anom_interacting.empty:
-            sc_int = ax.scatter(
-                anom_interacting['Longitude'], anom_interacting['Latitude'],
-                c=anom_interacting['delta_do'], cmap='Reds', s=100,
-                marker='D', # 菱形
-                edgecolors='blue', # 蓝色边框以示区别
-                linewidths=1.0,
-                label=f'Interacting (ΔDO ≥ {do_threshold})', zorder=4,
+            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4})
+            
+        plots_to_generate.append({
+            'name': 'combined',
+            'title_extra': '',
+            'file_suffix': '',
+            'data_list': combined_data
+        })
+
+    for p_cfg in plots_to_generate:
+        fig = plt.figure(figsize=(40, 30))
+        ax = fig.add_subplot(1, 1, 1, projection=map_crs)
+        
+        depth_title = (
+            f' (depth ≥ {anomaly_min_depth} m)'
+            if anomaly_min_depth is not None and anomaly_min_depth > 0 else ''
+        )
+        thr_title = f' (ΔDO ≥ {do_threshold:g} μmol kg⁻¹)'
+        ax.set_title(f'Argo ΔDO Anomalies {start_year}-{end_year}{thr_title}{depth_title}{p_cfg["title_extra"]}', fontsize=20)
+
+        # Basemap features
+        base_ocean = _BASEMAP_COLORS['ocean']
+        base_land = _BASEMAP_COLORS['land']
+        coast_color = _BASEMAP_COLORS['coastline']
+        grid_color = _BASEMAP_COLORS['grid']
+        ax.set_facecolor(base_ocean)
+        ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        # 设定范围（处理跨日界线）
+        lon_extent_min = lonmin
+        lon_extent_max = lonmax
+        if crosses_dateline and lon_extent_max < lon_extent_min:
+            lon_extent_max += 360
+        ax.set_extent([lon_extent_min, lon_extent_max, latmin, latmax], crs=data_crs)
+
+        if plot_unrelated_argo and not baseline_profiles.empty:
+            ax.scatter(
+                baseline_profiles['Longitude'], baseline_profiles['Latitude'],
+                facecolors='none', edgecolors='gray', linewidths=0.7, s=25,
+                label='All Argo Profiles (baseline)', zorder=2, transform=data_crs
+            )
+
+        sc = None
+        has_anom_plot = False
+        for d_cfg in p_cfg['data_list']:
+            data = d_cfg['data']
+            if data.empty: continue
+            has_anom_plot = True
+            
+            sc_curr = ax.scatter(
+                data['Longitude'], data['Latitude'],
+                c=data['delta_do'], cmap='Reds', s=d_cfg['s'],
+                marker=d_cfg['marker'],
+                edgecolors=d_cfg['edgecolor'], linewidths=0.5 if d_cfg['marker']=='o' else 1.0,
+                label=d_cfg['label'], zorder=d_cfg['zorder'],
                 transform=data_crs,
                 **scatter_kwargs
             )
-            sc = sc_int # 覆盖 sc 用于 colorbar（两者 cmap/norm 一致）
+            sc = sc_curr
+
+        if not has_anom_plot and anomalies.empty:
+             ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
 
         if sc is not None:
             cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
@@ -6495,26 +6504,24 @@ def plot_argo_hotspots(
                         cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
                     else:
                         cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
-    else:
-        ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
 
-    ax.legend(fontsize=18, loc='upper left')
+        ax.legend(fontsize=18, loc='upper left')
 
-    if save_fig:
-        region_slug_for_path = _current_region_key()
-        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
-        out_dir.mkdir(exist_ok=True, parents=True)
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-        fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.png"
-        plt.savefig(fname, dpi=300, bbox_inches='tight')
-        print(f"Figure saved: {fname}")
-    if show_fig:
-        plt.show()
-    plt.close(fig)
+        if save_fig:
+            region_slug_for_path = _current_region_key()
+            out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+            out_dir.mkdir(exist_ok=True, parents=True)
+            thr_str = f"{do_threshold:g}".replace('.', 'p')
+            depth_suffix = ''
+            if anomaly_min_depth is not None and anomaly_min_depth > 0:
+                depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+                depth_suffix = f"_depth{depth_str}m"
+            fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}{p_cfg['file_suffix']}.png"
+            plt.savefig(fname, dpi=300, bbox_inches='tight')
+            print(f"Figure saved: {fname}")
+        if show_fig:
+            plt.show()
+        plt.close(fig)
 
     # 保存 anomalies 为 Parquet（高效压缩存储）
     if save_data and not anomalies.empty:
