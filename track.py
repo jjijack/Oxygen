@@ -2085,7 +2085,7 @@ def filtered_float_data(
     return final_argo_data
 
 def plot_track(
-    DS: list, 
+    DS: list | str | tuple | dict, 
     no: int,
     save_fig: bool = False,
     show_fig: bool = True,
@@ -2117,8 +2117,11 @@ def plot_track(
         5. 可选地绘制涡旋在交互日的有效半径和轮廓。
 
     参数:
-        DS (list): 
-            包含所有涡旋轨迹信息的数据集。
+        DS (list | str | sequence[str] | dict): 
+            legacy 模式传入已加载的数据列表（如 ACL/ACS）；
+            新模式可直接传入字符串 kind（'acs' 等）或字符串列表/元组，
+            函数会自动从本地 META_tracks 中检索对应轨迹；
+            亦支持传入 {"ACS": acs, ...} 字典以兼容旧流程。
         no (int): 
             需要绘制的涡旋的唯一编号。
         save_fig (bool, optional): 
@@ -2161,29 +2164,115 @@ def plot_track(
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
     
-    # 获取涡旋轨迹并转换为DataFrame
-    wanted_track = find_track(DS, no)
-    if not wanted_track:
+    def _infer_dataset_name_from_caller(obj) -> str:
+        frame = inspect.currentframe()
+        plot_track_frame = None
+        caller_frame = None
+        try:
+            plot_track_frame = frame.f_back  # frame inside plot_track
+            caller_frame = plot_track_frame.f_back if plot_track_frame else None
+            search_frame = caller_frame or plot_track_frame
+            while search_frame:
+                for var_name, var_val in search_frame.f_locals.items():
+                    if var_val is obj:
+                        return var_name.upper()
+                search_frame = search_frame.f_back if search_frame is caller_frame else None
+        except Exception:
+            pass
+        finally:
+            del frame
+            if plot_track_frame:
+                del plot_track_frame
+            if caller_frame:
+                del caller_frame
+        return "UNKNOWN"
+
+    def _is_kind_sequence(value) -> bool:
+        return isinstance(value, (list, tuple)) and len(value) > 0 and all(isinstance(item, str) for item in value)
+
+    def _build_track_df(track_payload):
+        required_cols = [
+            'track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat',
+            'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat'
+        ]
+        if isinstance(track_payload, pd.DataFrame):
+            missing_cols = [col for col in required_cols if col not in track_payload.columns]
+            if missing_cols:
+                raise ValueError(f"Track data missing required columns: {missing_cols}")
+            return track_payload[required_cols].copy()
+        return pd.DataFrame(track_payload, columns=required_cols)
+
+    ds_name = "UNKNOWN"
+    ds_source_for_filter: list | str | tuple | dict = DS
+    wanted_track = None
+    candidate_kind_names: list[str] = []
+
+    if isinstance(DS, str):
+        candidate_kind_names = [DS]
+    elif _is_kind_sequence(DS):
+        candidate_kind_names = [str(k) for k in DS]
+    elif isinstance(DS, dict):
+        for key, value in DS.items():
+            if isinstance(value, list) and not _is_kind_sequence(value):
+                try:
+                    wanted_track = find_track(value, no)
+                except ValueError:
+                    continue
+                ds_name = str(key).upper()
+                ds_source_for_filter = value
+                break
+        if wanted_track is None:
+            candidate_kind_names = [str(k) for k in DS.keys()]
+    elif isinstance(DS, list):
+        wanted_track = find_track(DS, no)
+        ds_name = _infer_dataset_name_from_caller(DS)
+    elif isinstance(DS, tuple):
+        ds_list = list(DS)
+        wanted_track = find_track(ds_list, no)
+        ds_source_for_filter = ds_list
+        ds_name = _infer_dataset_name_from_caller(ds_list)
+    else:
+        raise TypeError("plot_track expects DS to be a legacy track list, a kind string, a string sequence, or a dataset dict.")
+
+    if wanted_track is None and candidate_kind_names:
+        last_error: Exception | None = None
+        for kind in candidate_kind_names:
+            kind_str = str(kind).strip()
+            if not kind_str:
+                continue
+            try:
+                wanted_track = find_track(kind_str.lower(), no, include_contours=True)
+                ds_source_for_filter = kind_str.lower()
+                ds_name = kind_str.upper()
+                break
+            except Exception as exc:
+                last_error = exc
+        if wanted_track is None:
+            print(f"  - Error: Track for eddy {no} not found in datasets {candidate_kind_names}.")
+            if last_error is not None:
+                print(f"    Last error: {last_error}")
+            return
+
+    if wanted_track is None:
         print(f"  - Error: Track for eddy {no} not found.")
         return
-        
-    track_df = pd.DataFrame(
-        wanted_track,
-        columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
-                 'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
-    )
-    track_df['date'] = convert_date(track_df['time'])
+
+    try:
+        track_df = _build_track_df(wanted_track)
+    except Exception as exc:
+        print(f"  - Error: Failed to normalize track data for eddy {no}: {exc}")
+        return
+
+    if track_df.empty:
+        print(f"  - Error: Track for eddy {no} is empty.")
+        return
+
+    if 'date' not in track_df.columns:
+        track_df['date'] = convert_date(track_df['time'])
     num = track_df['track_id'].iloc[0]
 
-    # 获取数据集名称
-    ds_name = "UNKNOWN"
-    for name, var in inspect.currentframe().f_back.f_locals.items():
-        if var is DS:
-            ds_name = name.upper()
-            break
-
     # 调用筛选函数，获取所有匹配的 Argo 数据（包含所有深度）
-    argo_data_filtered = filtered_float_data(DS, no, track=track_df)
+    argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
 
     # 预筛选：若匹配到的剖面数不足 min_anomaly_count，直接跳过
     if argo_data_filtered.empty:
@@ -2368,7 +2457,8 @@ def plot_track(
 
     # --- 7. 输出控制 ---
     if save_fig:
-        output_dir = Path("plot_track_analysis")
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_track"
         output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"Track_Analysis_{ds_name}{num}.png"
         save_path = output_dir / base_filename
@@ -6170,6 +6260,84 @@ def run_batch_plotting_multiprocessing(
                 print(f"Interacting Argo (all) saved to: {argo_parquet}")
         except Exception as e:
             print(f"[WARN] Failed to aggregate/save interacting Argo parquet: {e}")
+
+def load_combined_eddy_list(
+    region: str | None = None,
+    thr_dir: str | Path | None = None,
+    plots_root: str | Path | None = None,
+    include_monthly: bool = True,
+    deduplicate: bool = True,
+    save_path: str | Path | None = None,
+) -> list[str]:
+    """读取并合并单个阈值目录下的 `eddy_list*.npy`（及可选月度文件）。
+
+    参数:
+        region: 区域 slug；None 时复用当前 `switch_region` 的配置。
+        thr_dir: 阈值子目录名称或路径；None 时自动扫描 `thr*` 目录并要求只存在一个候选目录。
+        plots_root: 可选自定义 `plot_outputs` 根路径；None 使用配置 `plots_output_root`。
+        include_monthly: True 时若目录缺少汇总 `eddy_list*.npy`，会退回加载 `Interacted_Eddies_*.npy`（逐月文件）。
+        deduplicate: True 返回去重并排序后的唯一列表；False 按读取顺序返回。
+        save_path: 可选输出路径；相对路径时会解析到目标阈值目录中。
+
+    返回:
+        list[str]: 聚合后的涡旋标签列表；当没有匹配文件时返回空列表。
+    """
+    region_slug = region or _current_region_key()
+    plots_base = Path(plots_root) if plots_root is not None else Path(plots_output_root)
+    base_dir = plots_base / region_slug / "plot_all_tracks_in_range"
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Plot outputs directory not found: {base_dir}")
+
+    if thr_dir is not None:
+        target_dir = Path(thr_dir)
+        if not target_dir.is_absolute():
+            target_dir = base_dir / target_dir
+        if not target_dir.is_dir():
+            raise FileNotFoundError(f"阈值目录不存在：{target_dir}")
+    else:
+        candidate_dirs = sorted(
+            p for p in base_dir.iterdir() if p.is_dir() and p.name.lower().startswith('thr')
+        )
+        if not candidate_dirs:
+            print(f"[load_combined_eddy_list] No threshold directories found under {base_dir}.")
+            return []
+        if len(candidate_dirs) > 1:
+            raise ValueError(f"检测到多个阈值目录，请通过 thr_dir 指定其一：{[p.name for p in candidate_dirs]}")
+        target_dir = candidate_dirs[0]
+
+    collected_labels: list[str] = []
+    npy_files = sorted(target_dir.glob('eddy_list*.npy'))
+    if not npy_files and include_monthly:
+        npy_files = sorted(target_dir.glob('Interacted_Eddies_*.npy'))
+    for npy_path in npy_files:
+        try:
+            try:
+                arr = np.load(npy_path)
+            except Exception:
+                arr = np.load(npy_path, allow_pickle=True)
+            flattened = np.asarray(arr).ravel().tolist()
+            labels = [str(item) for item in flattened if str(item)]
+            collected_labels.extend(labels)
+        except Exception as exc:
+            print(f"[load_combined_eddy_list] Failed to read {npy_path}: {exc}")
+
+    if not collected_labels:
+        print("[load_combined_eddy_list] No eddy labels were loaded.")
+        return []
+
+    combined = sorted(set(collected_labels)) if deduplicate else collected_labels
+
+    if save_path is None:
+        save_path = target_dir / "eddy_list_combined.npy"
+    else:
+        save_path = Path(save_path)
+        if not save_path.is_absolute():
+            save_path = target_dir / save_path
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(save_path, np.array(combined, dtype=str))
+    print(f"[load_combined_eddy_list] Combined eddy list saved to: {save_path}")
+
+    return combined
 
 def plot_argo_hotspots(
     start_year: int,
