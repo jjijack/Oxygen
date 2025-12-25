@@ -6,6 +6,10 @@
 - Data products are materialized into local folders referenced in `config/paths.yml` (e.g., `Argo_data/`, `META_tracks/`, `plot_outputs/`, `external/natural_earth/`).
 - There are no tests; validate changes by running the specific workflow function you touched.
 
+## Notebook Workflow & Comments
+- Author new or updated functions in `track.py`, then import them into `GLORYS.ipynb` for experimentation; treat the notebook purely as a consumer of `track.py` logic.
+- When updating docstrings or comments after making changes, describe the function for a first-time reader by focusing on its current behavior rather than a changelog, and ensure any functional modifications are reflected by synchronizing the function’s description accordingly.
+
 ## Config & Regions
 - Always read paths via `_PATHS_CFG` accessors at the top of `track.py`; new features should expose knobs through the YAML instead of constants.
 - Region bounds (`lonmin`, `lonmax`, `latmin`, `latmax`) are globals populated by `_load_region_config`; call `switch_region('global')` (or another key from `config/regions.yml`) before running workflows that depend on spatial filtering.
