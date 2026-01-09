@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.path import Path as MplPath
 import geopandas as gpd
 import inspect
@@ -2084,6 +2085,120 @@ def filtered_float_data(
     
     return final_argo_data
 
+def _resolve_track_context(
+    DS_input: list | str | tuple | dict,
+    track_id: int,
+    *,
+    include_contours: bool = True,
+) -> tuple[pd.DataFrame, str, list | str | tuple | dict]:
+    """Normalize various dataset inputs into a track DataFrame and metadata."""
+
+    def _infer_dataset_name_from_caller(obj) -> str:
+        frame = inspect.currentframe()
+        plot_frame = None
+        caller_frame = None
+        try:
+            plot_frame = frame.f_back
+            caller_frame = plot_frame.f_back if plot_frame else None
+            search_frame = caller_frame or plot_frame
+            while search_frame:
+                for var_name, var_val in search_frame.f_locals.items():
+                    if var_val is obj:
+                        return var_name.upper()
+                search_frame = search_frame.f_back if search_frame is caller_frame else None
+        except Exception:
+            pass
+        finally:
+            del frame
+            if plot_frame:
+                del plot_frame
+            if caller_frame:
+                del caller_frame
+        return "UNKNOWN"
+
+    def _is_kind_sequence(value) -> bool:
+        return isinstance(value, (list, tuple)) and len(value) > 0 and all(isinstance(item, str) for item in value)
+
+    def _build_track_df(track_payload):
+        required_cols = [
+            'track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat',
+            'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat'
+        ]
+        if isinstance(track_payload, pd.DataFrame):
+            missing_cols = [col for col in required_cols if col not in track_payload.columns]
+            if missing_cols:
+                raise ValueError(f"Track data missing required columns: {missing_cols}")
+            df = track_payload[required_cols].copy()
+        else:
+            df = pd.DataFrame(track_payload, columns=required_cols)
+        if 'date' not in df.columns:
+            df['date'] = convert_date(df['time'])
+        return df
+
+    ds_name = "UNKNOWN"
+    ds_source_for_filter: list | str | tuple | dict = DS_input
+    wanted_track = None
+    candidate_kind_names: list[str] = []
+
+    if isinstance(DS_input, str):
+        candidate_kind_names = [DS_input]
+        ds_name = DS_input.upper()
+    elif _is_kind_sequence(DS_input):
+        candidate_kind_names = [str(k) for k in DS_input]
+    elif isinstance(DS_input, dict):
+        for key, value in DS_input.items():
+            if isinstance(value, list) and not _is_kind_sequence(value):
+                try:
+                    wanted_track = find_track(value, track_id)
+                except ValueError:
+                    continue
+                ds_name = str(key).upper()
+                ds_source_for_filter = value
+                break
+        if wanted_track is None:
+            candidate_kind_names = [str(k) for k in DS_input.keys()]
+    elif isinstance(DS_input, list):
+        wanted_track = find_track(DS_input, track_id)
+        ds_name = _infer_dataset_name_from_caller(DS_input)
+    elif isinstance(DS_input, tuple):
+        ds_list = list(DS_input)
+        wanted_track = find_track(ds_list, track_id)
+        ds_source_for_filter = ds_list
+        ds_name = _infer_dataset_name_from_caller(ds_list)
+    else:
+        raise TypeError("Unsupported DS type. Expected legacy list, kind string, tuple, or dataset dict.")
+
+    if wanted_track is None and candidate_kind_names:
+        last_error: Exception | None = None
+        for kind in candidate_kind_names:
+            kind_str = str(kind).strip()
+            if not kind_str:
+                continue
+            try:
+                wanted_track = find_track(kind_str.lower(), track_id, include_contours=include_contours)
+                ds_source_for_filter = kind_str.lower()
+                ds_name = kind_str.upper()
+                break
+            except Exception as exc:
+                last_error = exc
+        if wanted_track is None:
+            if last_error is not None:
+                raise ValueError(f"Track for eddy {track_id} not found in datasets {candidate_kind_names}: {last_error}")
+            raise ValueError(f"Track for eddy {track_id} not found in datasets {candidate_kind_names}.")
+
+    if wanted_track is None:
+        raise ValueError(f"Track for eddy {track_id} not found.")
+
+    try:
+        track_df = _build_track_df(wanted_track)
+    except Exception as exc:
+        raise ValueError(f"Failed to normalize track data for eddy {track_id}: {exc}") from exc
+
+    if track_df.empty:
+        raise ValueError(f"Track for eddy {track_id} is empty.")
+
+    return track_df, ds_name, ds_source_for_filter
+
 def plot_track(
     DS: list | str | tuple | dict, 
     no: int,
@@ -2164,111 +2279,11 @@ def plot_track(
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
     
-    def _infer_dataset_name_from_caller(obj) -> str:
-        frame = inspect.currentframe()
-        plot_track_frame = None
-        caller_frame = None
-        try:
-            plot_track_frame = frame.f_back  # frame inside plot_track
-            caller_frame = plot_track_frame.f_back if plot_track_frame else None
-            search_frame = caller_frame or plot_track_frame
-            while search_frame:
-                for var_name, var_val in search_frame.f_locals.items():
-                    if var_val is obj:
-                        return var_name.upper()
-                search_frame = search_frame.f_back if search_frame is caller_frame else None
-        except Exception:
-            pass
-        finally:
-            del frame
-            if plot_track_frame:
-                del plot_track_frame
-            if caller_frame:
-                del caller_frame
-        return "UNKNOWN"
-
-    def _is_kind_sequence(value) -> bool:
-        return isinstance(value, (list, tuple)) and len(value) > 0 and all(isinstance(item, str) for item in value)
-
-    def _build_track_df(track_payload):
-        required_cols = [
-            'track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat',
-            'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat'
-        ]
-        if isinstance(track_payload, pd.DataFrame):
-            missing_cols = [col for col in required_cols if col not in track_payload.columns]
-            if missing_cols:
-                raise ValueError(f"Track data missing required columns: {missing_cols}")
-            return track_payload[required_cols].copy()
-        return pd.DataFrame(track_payload, columns=required_cols)
-
-    ds_name = "UNKNOWN"
-    ds_source_for_filter: list | str | tuple | dict = DS
-    wanted_track = None
-    candidate_kind_names: list[str] = []
-
-    if isinstance(DS, str):
-        candidate_kind_names = [DS]
-    elif _is_kind_sequence(DS):
-        candidate_kind_names = [str(k) for k in DS]
-    elif isinstance(DS, dict):
-        for key, value in DS.items():
-            if isinstance(value, list) and not _is_kind_sequence(value):
-                try:
-                    wanted_track = find_track(value, no)
-                except ValueError:
-                    continue
-                ds_name = str(key).upper()
-                ds_source_for_filter = value
-                break
-        if wanted_track is None:
-            candidate_kind_names = [str(k) for k in DS.keys()]
-    elif isinstance(DS, list):
-        wanted_track = find_track(DS, no)
-        ds_name = _infer_dataset_name_from_caller(DS)
-    elif isinstance(DS, tuple):
-        ds_list = list(DS)
-        wanted_track = find_track(ds_list, no)
-        ds_source_for_filter = ds_list
-        ds_name = _infer_dataset_name_from_caller(ds_list)
-    else:
-        raise TypeError("plot_track expects DS to be a legacy track list, a kind string, a string sequence, or a dataset dict.")
-
-    if wanted_track is None and candidate_kind_names:
-        last_error: Exception | None = None
-        for kind in candidate_kind_names:
-            kind_str = str(kind).strip()
-            if not kind_str:
-                continue
-            try:
-                wanted_track = find_track(kind_str.lower(), no, include_contours=True)
-                ds_source_for_filter = kind_str.lower()
-                ds_name = kind_str.upper()
-                break
-            except Exception as exc:
-                last_error = exc
-        if wanted_track is None:
-            print(f"  - Error: Track for eddy {no} not found in datasets {candidate_kind_names}.")
-            if last_error is not None:
-                print(f"    Last error: {last_error}")
-            return
-
-    if wanted_track is None:
-        print(f"  - Error: Track for eddy {no} not found.")
-        return
-
     try:
-        track_df = _build_track_df(wanted_track)
+        track_df, ds_name, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
     except Exception as exc:
-        print(f"  - Error: Failed to normalize track data for eddy {no}: {exc}")
+        print(f"  - Error: {exc}")
         return
-
-    if track_df.empty:
-        print(f"  - Error: Track for eddy {no} is empty.")
-        return
-
-    if 'date' not in track_df.columns:
-        track_df['date'] = convert_date(track_df['time'])
     num = track_df['track_id'].iloc[0]
 
     # 调用筛选函数，获取所有匹配的 Argo 数据（包含所有深度）
@@ -2468,6 +2483,305 @@ def plot_track(
     if show_fig:
         plt.show()
     
+    plt.close(fig)
+
+def plot_track_variable_timeseries(
+    DS: list | str | tuple | dict,
+    no: int,
+    variable: str = 'DO',
+    threshold: float | None = None,
+    only_above_threshold: bool = True,
+    depth_col: str = 'Depth',
+    max_depth: float | None = 1000.0,
+    depth_bin_size: float = 25.0,
+    cmap: str = 'RdYlBu_r',
+    show_profile_hist: bool = True,
+    start_date: str | int | float | pd.Timestamp | None = None,
+    end_date: str | int | float | pd.Timestamp | None = None,
+    platform_number: int | str | list | tuple | set | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
+    anomaly_min_depth: float | None = None,
+    save_fig: bool = False,
+    show_fig: bool = True,
+):
+    """绘制位于涡旋内的 Argo 剖面变量在时间-深度平面上的连续等值分布。
+    
+
+    参数:
+        DS: legacy轨迹列表、kind字符串、字符串序列或数据集字典。
+        no: 涡旋编号。
+        variable: 需要统计的变量列名，默认 'DO'。
+        threshold: 变量阈值；only_above_threshold=True 时用于筛选，None 回退到 `_default_delta_do_threshold`。
+        only_above_threshold: True 时仅统计变量值 ≥ threshold 的剖面；False 使用全部可用剖面。
+        depth_col: 深度列名，默认 'Depth'。
+        max_depth: 最大深度（单位与 depth_col 一致），默认 1000 dbar；None 表示使用观测最大值。
+        depth_bin_size: 深度分箱大小（dbar），默认 25。
+        cmap: 色标名称，默认 'RdYlBu_r'。
+        show_profile_hist: 是否在底部显示每日剖面数柱状条，默认 True。
+        start_date / end_date: 限制横轴开始/结束日期，可传 pandas.Timestamp、YYYYMMDD 整数、days-since-1950、ISO 字符串。
+        platform_number: 可选，仅绘制指定 Argo 浮标（单个或列表/集合），先于 ΔDO 筛选过滤。
+        salinity_threshold / temperature_threshold: 传递给 calculate_delta_do 的 ΔS/ΔT 条件，None 时使用 processing.yml 默认。
+        depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传递给 calculate_delta_do 的参数，控制 ΔDO 计算窗口与合并方式。
+        anomaly_min_depth: ΔDO 最小深度阈值（同 plot_all_tracks_in_range）；None 回退配置。
+        save_fig / show_fig: 控制图像输出。
+    """
+    print(f"[*] Building {variable} time series for eddy {no}...")
+
+    if threshold is None:
+        threshold = _default_delta_do_threshold
+
+    def _normalize_date_input(value, label):
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.normalize()
+        try:
+            converted = convert_date(value)
+        except Exception as exc:
+            raise ValueError(f"Invalid {label}: {exc}")
+        if isinstance(converted, pd.Series):
+            converted = converted.iloc[0]
+        if pd.isna(converted):
+            raise ValueError(f"Invalid {label}: could not parse {value!r}")
+        return pd.to_datetime(converted).normalize()
+
+    try:
+        start_dt = _normalize_date_input(start_date, 'start_date')
+        end_dt = _normalize_date_input(end_date, 'end_date')
+    except ValueError as exc:
+        print(f"  - {exc}")
+        return
+
+    if start_dt is not None and end_dt is not None and start_dt > end_dt:
+        print("  - start_date must be earlier than or equal to end_date.")
+        return
+
+    try:
+        track_df, ds_name, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=False)
+    except Exception as exc:
+        print(f"  - Error: {exc}")
+        return
+
+    argo_data = filtered_float_data(ds_source_for_filter, no, track=track_df)
+    if argo_data.empty:
+        print(f"  - Skip plotting {ds_name}{no}: no matched Argo profiles.")
+        return
+
+    if variable not in argo_data.columns:
+        print(f"  - Column '{variable}' not found in matched Argo data.")
+        return
+
+    if depth_col not in argo_data.columns:
+        print(f"  - Column '{depth_col}' not found in matched Argo data.")
+        return
+
+    argo_data = argo_data.copy()
+    if platform_number is not None:
+        if 'Platform_number' not in argo_data.columns:
+            print("  - Column 'Platform_number' not available; cannot filter by platform_number.")
+            return
+        pn_list = platform_number
+        if not isinstance(pn_list, (list, tuple, set)):
+            pn_list = [pn_list]
+        argo_data = argo_data[argo_data['Platform_number'].isin(pn_list)]
+        if argo_data.empty:
+            print("  - No data after filtering by platform_number.")
+            return
+    argo_data['date'] = pd.to_datetime(argo_data[['Year', 'Month', 'Day']], errors='coerce')
+    if argo_data['date'].isna().all():
+        print("  - No valid timestamps/depths available after parsing Year/Month/Day.")
+        return
+    if start_dt is not None:
+        argo_data = argo_data[argo_data['date'] >= start_dt]
+    if end_dt is not None:
+        argo_data = argo_data[argo_data['date'] <= end_dt]
+    if argo_data.empty:
+        print("  - No data within the requested date window.")
+        return
+
+    if 'Profile_number' not in argo_data.columns:
+        print("  - Column 'Profile_number' is required to align with ΔDO anomaly filtering.")
+        return
+
+    anomaly_filtered = False
+    if only_above_threshold:
+        anomalies = calculate_delta_do(
+            argo_data,
+            depth_col=depth_col,
+            depth_interval=depth_interval,
+            do_threshold=threshold,
+            salinity_threshold=salinity_threshold,
+            temperature_threshold=temperature_threshold,
+            anomaly_min_depth=anomaly_min_depth,
+            depth_merge_tolerance=depth_merge_tolerance,
+            duplicate_depth_strategy=duplicate_depth_strategy,
+            remove_outliers=True,
+            verbose=False,
+        )
+        if anomalies.empty or 'Profile_number' not in anomalies.columns:
+            print("  - No profiles satisfy the ΔDO anomaly criteria.")
+            return
+        anomalies_sorted = anomalies.sort_values(by='delta_do', ascending=False)
+        anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
+        qualifying_profiles = anomalies_unique['Profile_number'].dropna().unique()
+        if qualifying_profiles.size == 0:
+            print("  - No profiles satisfy the ΔDO anomaly criteria.")
+            return
+        argo_data = argo_data[argo_data['Profile_number'].isin(qualifying_profiles)].copy()
+        if argo_data.empty:
+            print("  - No profiles remain after applying ΔDO anomaly filter.")
+            return
+        anomaly_filtered = True
+
+    argo_data['_var'] = pd.to_numeric(argo_data[variable], errors='coerce')
+    argo_data['_depth'] = pd.to_numeric(argo_data[depth_col], errors='coerce')
+    argo_data.dropna(subset=['date', '_depth'], inplace=True)
+    if argo_data.empty:
+        print("  - No valid timestamps/depths available after parsing Year/Month/Day.")
+        return
+
+    mask = ~argo_data['_var'].isna()
+    if not anomaly_filtered and threshold is not None:
+        mask &= argo_data['_var'] >= threshold
+    if max_depth is not None:
+        mask &= argo_data['_depth'] <= max_depth
+    selected = argo_data.loc[mask]
+    if selected.empty:
+        print("  - No profiles satisfy the selected threshold/variable conditions.")
+        return
+
+    if depth_bin_size <= 0:
+        raise ValueError("depth_bin_size must be positive.")
+
+    if max_depth is None:
+        max_depth_val = float(selected['_depth'].max())
+    else:
+        max_depth_val = float(max_depth)
+    depth_min_val = float(max(selected['_depth'].min(), 0.0))
+    depth_bins = np.arange(depth_min_val, max_depth_val + depth_bin_size, depth_bin_size)
+    if depth_bins.size < 2:
+        depth_bins = np.array([depth_min_val, depth_min_val + depth_bin_size])
+    selected = selected.copy()
+    selected['depth_bin'] = pd.cut(selected['_depth'], bins=depth_bins, include_lowest=True, right=False)
+    selected.dropna(subset=['depth_bin'], inplace=True)
+    selected['depth_mid'] = selected['depth_bin'].apply(lambda iv: iv.left + depth_bin_size / 2 if pd.notna(iv) else np.nan)
+    selected.dropna(subset=['depth_mid'], inplace=True)
+
+    grouped = (
+        selected.groupby(['depth_mid', 'date'], observed=False)['_var']
+        .mean()
+        .reset_index()
+    )
+    if grouped.empty:
+        print("  - No averages could be computed for the selected bins.")
+        return
+
+    pivot = grouped.pivot(index='depth_mid', columns='date', values='_var')
+    pivot.sort_index(inplace=True)
+    pivot = pivot.sort_index(axis=1)
+    if pivot.isna().all().all():
+        print("  - All grid cells are NaN; cannot plot.")
+        return
+
+    depth_vals = pivot.index.to_numpy()
+    date_vals = pivot.columns.to_pydatetime()
+    if len(date_vals) == 0:
+        print("  - No valid dates after grouping.")
+        return
+
+    Z = np.ma.masked_invalid(pivot.to_numpy())
+    if np.ma.count_masked(Z) == Z.size:
+        print("  - No valid data points remain after masking.")
+        return
+
+    vmin = np.nanmin(pivot.values)
+    vmax = np.nanmax(pivot.values)
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        print("  - Unable to determine color scale (all values NaN/inf).")
+        return
+    if np.isclose(vmin, vmax):
+        levels = 10
+    else:
+        levels = 20
+
+    date_nums = mdates.date2num(date_vals)
+    if show_profile_hist:
+        hist_counts = selected.groupby('date').size().reindex(pivot.columns, fill_value=0)
+
+    height_ratios = [5, 1] if show_profile_hist else [1]
+    nrows = 2 if show_profile_hist else 1
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=1,
+        sharex=True,
+        figsize=(20, 10 if show_profile_hist else 8),
+        gridspec_kw={'height_ratios': height_ratios},
+        constrained_layout=True
+    )
+    if show_profile_hist:
+        ax, ax_hist = axes
+    else:
+        ax = axes
+
+    cf = ax.contourf(date_vals, depth_vals, Z, levels=levels, cmap=cmap)
+    ax.invert_yaxis()
+    ax.set_ylabel('Depth (dbar)', fontsize=14)
+    title_suffix = ' (thresholded)' if only_above_threshold else ' (all profiles)'
+    ax.set_title(f"{ds_name}{no} {variable} mean inside eddy{title_suffix}", fontsize=16)
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+    if start_dt is not None or end_dt is not None:
+        xmin = start_dt if start_dt is not None else date_vals[0]
+        xmax = end_dt if end_dt is not None else date_vals[-1]
+        ax.set_xlim(xmin, xmax)
+
+    cbar_axes = [ax, ax_hist] if show_profile_hist else ax
+    cbar = fig.colorbar(
+        cf,
+        ax=cbar_axes,
+        orientation='vertical',
+        pad=0.12,
+        fraction=0.035,
+        location='right'
+    )
+    cbar.set_label(f'{variable} mean', fontsize=14)
+
+    if show_profile_hist:
+        ax_hist.bar(hist_counts.index, hist_counts.values, width=0.8, color='gray')
+        ax_hist.set_ylabel('Profiles', fontsize=12)
+        ax_hist.set_xlabel('Date', fontsize=14)
+        ax_hist.set_ylim(0, max(hist_counts.max() * 1.2, 1))
+        ax_hist.xaxis_date()
+        ax_hist.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        if start_dt is not None or end_dt is not None:
+            xmin = start_dt if start_dt is not None else hist_counts.index.min()
+            xmax = end_dt if end_dt is not None else hist_counts.index.max()
+            ax_hist.set_xlim(xmin, xmax)
+    else:
+        ax.set_xlabel('Date', fontsize=14)
+
+    fig.autofmt_xdate()
+
+    if save_fig:
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_track_timeseries"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        thr_suffix = ''
+        if only_above_threshold and threshold is not None:
+            thr_suffix = f"_thr{str(threshold).replace('.', 'p')}"
+        depth_suffix = f"_depth{str(max_depth).replace('.', 'p')}" if max_depth is not None else ''
+        base_filename = f"{ds_name}{no}_{variable}_timeseries{thr_suffix}{depth_suffix}.png"
+        save_path = output_dir / base_filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+
+    if show_fig:
+        plt.show()
     plt.close(fig)
     
 def convert_date(values: pd.Series | np.ndarray | list | str | int | float) -> pd.Series | pd.Timestamp:
