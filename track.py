@@ -2848,6 +2848,84 @@ def convert_date(values: pd.Series | np.ndarray | list | str | int | float) -> p
     except Exception as e:
         raise ValueError(f"Values neither valid YYYYMMDD nor days-since-1950: {e}")
 
+def convert_eddy_number(
+    kind: str,
+    value: str | int | float | list | tuple | np.ndarray,
+    order: str,
+    *,
+    meta_root: str | os.PathLike | None = None,
+    version: float = 3.2
+) -> int | list[int]:
+    """
+    在 legacy orig_index 与标准 track_id 之间转换涡旋编号。
+
+    参数:
+        kind: 涡旋类型，'acs'|'acl'|'cs'|'cl'。必须指定，以保证索引映射到正确数据集。
+        value: 单个编号或编号可迭代。可为旧编号（orig_index）或新编号（track_id）。
+        order: 转换方向，支持别名：
+            • legacy->new: 'old_to_new', 'orig_to_track', 'legacy_to_track', 'to_track'.
+            • new->legacy: 'new_to_old', 'track_to_orig', 'track_to_legacy', 'to_orig'.
+        meta_root: META 原始 NetCDF 目录，默认读取配置 paths.meta_root。
+        version: META 版本（3.1 或 3.2）。
+
+    返回:
+        按输入形状返回转换后的编号：
+            • 标量输入 -> int
+            • 可迭代输入 -> list[int]
+
+    说明:
+        - 旧编号对应 NetCDF 中的全局行索引（orig_index）。
+        - 新编号为轨迹唯一的 track_id。
+        - new->old 方向返回该轨迹首次出现的行索引（最早时间点）。
+    """
+
+    direction = order.lower().strip()
+    if direction in {'old_to_new', 'orig_to_track', 'legacy_to_track', 'to_track', 'orig_to_new'}:
+        mode = 'orig_to_track'
+    elif direction in {'new_to_old', 'track_to_orig', 'track_to_legacy', 'to_orig'}:
+        mode = 'track_to_orig'
+    else:
+        raise ValueError("order must be one of: old_to_new/orig_to_track/legacy_to_track/to_track or new_to_old/track_to_orig/track_to_legacy/to_orig")
+
+    kind_norm = kind.lower().strip()
+    if kind_norm not in {'acs', 'acl', 'cs', 'cl'}:
+        raise ValueError("kind must be one of 'acs', 'acl', 'cs', 'cl'")
+
+    ACS, ACL, CS, CL = load_meta_data(path=meta_root, version=version)
+    ds_map = {'acs': ACS, 'acl': ACL, 'cs': CS, 'cl': CL}
+    ds = ds_map[kind_norm]
+
+    # 将 track 数组载入内存，便于快速索引或反查
+    track_arr = np.asarray(ds.variables['track'][:], dtype=np.int64)
+
+    def _convert_one(val) -> int:
+        try:
+            n = int(val)
+        except Exception as e:
+            raise ValueError(f"Cannot convert value '{val}' to int") from e
+
+        if mode == 'orig_to_track':
+            if n < 0 or n >= track_arr.shape[0]:
+                raise ValueError(f"orig_index {n} out of range for {kind_norm}")
+            return int(track_arr[n])
+
+        # track_id -> 最早出现的 orig_index
+        hits = np.nonzero(track_arr == n)[0]
+        if hits.size == 0:
+            raise ValueError(f"track_id {n} not found in {kind_norm}")
+        return int(hits[0])
+
+    is_scalar = np.isscalar(value) or isinstance(value, (str, bytes, np.str_))
+    if is_scalar:
+        return _convert_one(value)
+
+    try:
+        values = list(value)
+    except Exception as e:
+        raise ValueError("value must be scalar or iterable of scalars") from e
+
+    return [_convert_one(v) for v in values]
+
 def plot_vertical(
     DS: list,
     no: int,
