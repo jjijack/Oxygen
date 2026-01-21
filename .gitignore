@@ -5,6 +5,7 @@
 *.csv
 *.npy
 *.txt
+*.mat
 
 Argo_addFloat/
 Argo_data/

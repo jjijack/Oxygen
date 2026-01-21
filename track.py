@@ -2972,22 +2972,13 @@ def plot_vertical(
         - aggregated=True（聚合）：
             • 所有平台剖面在同一张图上聚合绘制（每个变量一个子图）。
     '''
-    wanted_track = find_track(DS, no)
-    # 复用已读取的 wanted_track，避免 filtered_float_data 内部重复 find_track
-    track_df = pd.DataFrame(
-        wanted_track,
-        columns=['track_id', 'time', 'center_lon', 'center_lat', 'max_lon', 'max_lat', 
-                 'contour_lon', 'contour_lat', 'radius', 'speed_contour_lon', 'speed_contour_lat']
-    )
-    track_df['date'] = convert_date(track_df['time'])
-    argo_data_filtered = filtered_float_data(DS, no, track=track_df)
+    try:
+        track_df, ds_names, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=False)
+    except Exception as exc:
+        print(f"  - Error: {exc}")
+        return
 
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE: Could not automatically determine the dataset name.")
+    argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
 
     if argo_data_filtered.empty:
         msg = "plot vertical profiles." if not aggregated else "to plot aggregated vertical profiles."
@@ -3125,14 +3116,14 @@ def plot_vertical(
                     color_value_normalized = 0.5
 
                     if color_mode == 'distance':
-                        if 'Longitude' in rows.iloc[0] and 'Latitude' in rows.iloc[0] and wanted_track is not None and len(wanted_track) > 0:
-                            track_dates_converted = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
+                        if 'Longitude' in rows.iloc[0] and 'Latitude' in rows.iloc[0] and track_df is not None and not track_df.empty:
+                            track_dates_converted = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
                             idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_profile_date.date()]
                             if idx_track_list:
                                 idx_track = idx_track_list[0]
-                                center_lon = float(wanted_track.iloc[idx_track]['center_lon'])
-                                center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
-                                radius = float(wanted_track.iloc[idx_track]['radius'])
+                                center_lon = float(track_df.iloc[idx_track]['center_lon'])
+                                center_lat = float(track_df.iloc[idx_track]['center_lat'])
+                                radius = float(track_df.iloc[idx_track]['radius'])
                                 if radius > 1e-6:
                                     dist_m = adaptive_distance_m(
                                         rows.iloc[0]['Longitude'], rows.iloc[0]['Latitude'],
@@ -3192,9 +3183,12 @@ def plot_vertical(
             plt.tight_layout(rect=[0, 0, 1, 0.93])
 
             if save_fig:
-                output_dir = "plot_vertical_profiles"
-                os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}_Platform_{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
+                region_slug = _current_region_key()
+                output_dir = Path(plots_output_root) / region_slug / "plot_vertical_profiles"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                save_path = output_dir / f"{ds_names}{no}_Platform_{int(platform_id_val)}.png"
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"Figure saved to: {save_path}")
 
             if show_fig:
                 plt.show()
@@ -3271,14 +3265,14 @@ def plot_vertical(
             color_value_normalized = 0.5
 
             if color_mode == 'distance':
-                if wanted_track is not None and len(wanted_track) > 0 and 'lon' in profile_info and 'lat' in profile_info:
-                    track_dates_converted = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
+                if track_df is not None and not track_df.empty and 'lon' in profile_info and 'lat' in profile_info:
+                    track_dates_converted = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
                     idx_track_list = [j for j, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
                     if idx_track_list:
                         idx_track = idx_track_list[0]
-                        center_lon = float(wanted_track.iloc[idx_track]['center_lon'])
-                        center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
-                        radius = float(wanted_track.iloc[idx_track]['radius'])
+                        center_lon = float(track_df.iloc[idx_track]['center_lon'])
+                        center_lat = float(track_df.iloc[idx_track]['center_lat'])
+                        radius = float(track_df.iloc[idx_track]['radius'])
                         if radius > 1e-6:
                             dist_m = adaptive_distance_m(
                                 profile_info['lon'], profile_info['lat'],
@@ -3333,12 +3327,14 @@ def plot_vertical(
     plt.tight_layout(rect=[0, 0, 1, 0.93])
 
     if save_fig:
-        output_dir = "plot_vertical_monthly_aggregated"
-        os.makedirs(output_dir, exist_ok=True)
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_vertical_monthly_aggregated"
+        output_dir.mkdir(parents=True, exist_ok=True)
         month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
         filename = f"{ds_names}{no}_months_{month_suffix}_aggregated.png"
-        plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {os.path.join(output_dir, filename)}")
+        save_path = output_dir / filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
 
     if show_fig:
         plt.show()
@@ -3385,15 +3381,14 @@ def plot_relative_position(
         - aggregated=True（聚合）：
             • 所有平台的代表点聚合到同一张图，点内数字代表相对于所选月份范围起始日的累积天数。例如，若数据从7月29日开始，则该日所有剖面的数字为29，7月30日为30，8月1日则为32。
     '''
-    wanted_track = find_track(DS, no)
-    argo_data_filtered = filtered_float_data(DS, no, track=wanted_track)
+    try:
+        track_df, ds_names, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=False)
+    except Exception as exc:
+        print(f"  - Error: {exc}")
+        return
 
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE: Could not automatically determine the dataset name.")
+    argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
+    ds_names = ds_names.upper()
 
     if argo_data_filtered.empty:
         print(f"No Argo data found for eddy {ds_names}{no} to plot relative positions.")
@@ -3477,7 +3472,7 @@ def plot_relative_position(
             points_for_this_platform = []
             track_info_for_this_platform = [] # 用于计算该平台下的平均涡旋参数
         
-            track_dates_converted = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
+            track_dates_converted = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
 
             for i, p_row in profile_first_rows.iterrows(): # i 将用作顺序编号
                 try:
@@ -3489,13 +3484,13 @@ def plot_relative_position(
                     continue
 
                 center_lon, center_lat, radius = None, None, None
-                if wanted_track is not None and len(wanted_track) > 0:
+                if track_df is not None and not track_df.empty:
                     matches = [k for k, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date_profile.date()]
                     if matches:
                         idx_track = matches[0]
-                        center_lon = float(wanted_track.iloc[idx_track]['center_lon'])
-                        center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
-                        radius = float(wanted_track.iloc[idx_track]['radius'])
+                        center_lon = float(track_df.iloc[idx_track]['center_lon'])
+                        center_lat = float(track_df.iloc[idx_track]['center_lat'])
+                        radius = float(track_df.iloc[idx_track]['radius'])
             
                 if center_lon is not None and radius is not None and radius > 1e-6:
                     if 'Longitude' not in p_row or 'Latitude' not in p_row:
@@ -3601,9 +3596,12 @@ def plot_relative_position(
                     cbar.set_label(f'Normalized Profile Sequence (Platform Range: {min_prof_num_platform} to {max_prof_num_platform})', fontsize=14)
         
             if save_fig:
-                output_dir = "plot_relative_position"
-                os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(os.path.join(output_dir, f"{ds_names}{no}RP{int(platform_id_val)}.png"), dpi=300, bbox_inches='tight')
+                region_slug = _current_region_key()
+                output_dir = Path(plots_output_root) / region_slug / "plot_relative_position"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                save_path = output_dir / f"{ds_names}{no}RP{int(platform_id_val)}.png"
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"Figure saved to: {save_path}")
         
             if show_fig:
                 plt.show()
@@ -3644,7 +3642,7 @@ def plot_relative_position(
     all_profile_dates_for_title = []
     all_profile_timestamps_for_time_mode = []
 
-    track_dates_converted = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
+    track_dates_converted = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
 
     for point_info in points_to_process:
         current_date = point_info['date']
@@ -3653,13 +3651,13 @@ def plot_relative_position(
         day_label = (current_date - reference_start_date_for_labels).days + 1
 
         center_lon, center_lat, radius = None, None, None
-        if wanted_track is not None and len(wanted_track) > 0:
+        if track_df is not None and not track_df.empty:
             matches = [i for i, td in enumerate(track_dates_converted) if hasattr(td, 'date') and td.date() == current_date.date()]
             if matches:
                 idx_track = matches[0]
-                center_lon = float(wanted_track.iloc[idx_track]['center_lon'])
-                center_lat = float(wanted_track.iloc[idx_track]['center_lat'])
-                radius = float(wanted_track.iloc[idx_track]['radius'])
+                center_lon = float(track_df.iloc[idx_track]['center_lon'])
+                center_lat = float(track_df.iloc[idx_track]['center_lat'])
+                radius = float(track_df.iloc[idx_track]['radius'])
 
         if center_lon is not None and radius is not None and radius > 1e-6:
             if 'Longitude' not in p_row or 'Latitude' not in p_row:
@@ -3773,12 +3771,14 @@ def plot_relative_position(
 
     # 保存/显示
     if save_fig:
-        output_dir = "plot_relative_position_monthly_aggregated"
-        os.makedirs(output_dir, exist_ok=True)
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_relative_position_monthly_aggregated"
+        output_dir.mkdir(parents=True, exist_ok=True)
         month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
         base_filename = f"{ds_names}{no}_RP_months_{month_suffix}_aggregated.png"
-        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+        save_path = output_dir / base_filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
 
     if show_fig:
         plt.show()
@@ -3890,13 +3890,14 @@ def find_track_glorys_filepath(DS: list, no: int) -> dict:
         dict: 涡旋轨迹数据文件路径的字典，格式为 {date: glorys_filepath}。
               如果未找到对应的轨迹数据或文件路径，则返回空字典。
     '''
-    wanted_track = find_track(DS, no)
-    if wanted_track is None or len(wanted_track) == 0:
-        print(f"未找到涡旋 {no} 的轨迹数据。")
+    try:
+        track_df, _, _ = _resolve_track_context(DS, no, include_contours=False)
+    except Exception as exc:
+        print(f"未找到涡旋 {no} 的轨迹数据：{exc}")
         return {}
     
     glorys_filepaths_dict = {}
-    for _, track_point in wanted_track.iterrows():
+    for _, track_point in track_df.iterrows():
         try:
             date = convert_date(track_point['time'])  
             glorys_filepath = get_glorys_filepath(date)
@@ -3981,7 +3982,7 @@ class LineDrawer:
         else:
             k = (y2 - y1) / (x2 - x1)
             b = y1 - k * x1
-            eq_text = f"y = {k:.4f}x + {b:.4f}"
+            eq_text = f"y = {k:.4f}x{b:+.4f}"
 
         # 根据坐标轴的当前范围，计算直线的端点并绘制
         x_vals = np.array(self.ax.get_xlim())
@@ -4029,36 +4030,37 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         needed_depth (float | int): 需要绘制的GLORYS数据深度，默认为0（表层）。
         inline_mode (bool): 是否为静态内联模式。默认为True。设为False以启用交互式widget模式的优化。
     '''
-    # 根据模式定义一套协调的尺寸参数
+    # 若从 widget 切回 inline，清理遗留的交互式 figure，避免被 inline 后端顺带渲染
     if inline_mode:
-        # 适用于高分辨率保存的静态模式尺寸，与原始版本完全一致
-        figsize = (30, 25)
-        title_fs, label_fs, tick_fs, legend_fs = 20, 20, 16, 18
-        cbar_label_fs, cbar_tick_fs = 20, 14
-        argo_text_fs = 7
-        track_lw, contour_lw, circle_lw, line_lw = 1.0, 1.0, 1.0, 2.0
-        cbar_pad = 0.046 # 原始cbar间距
-    else:
-        # 适用于交互式widget的屏幕友好尺寸
-        figsize = (12, 10) 
-        title_fs, label_fs, tick_fs, legend_fs = 16, 14, 12, 10
-        cbar_label_fs, cbar_tick_fs = 12, 10
-        argo_text_fs = 6
-        track_lw, contour_lw, circle_lw, line_lw = 1.0, 1.0, 1.0, 2.0
-        cbar_pad = 0.12 # 交互模式下增大cbar间距
+        plt.close('all')
+
+    # 统一两种模式的视觉参数
+    figsize = (12, 10)
+    title_fs, label_fs, tick_fs, legend_fs = 16, 14, 12, 10
+    cbar_label_fs, cbar_tick_fs = 12, 10
+    argo_text_fs = 6
+    track_lw, contour_lw, circle_lw, line_lw = 1.0, 1.0, 1.0, 2.0
+    cbar_pad = 0.18  # 增大两条水平色标间距
 
     # 加载轨迹（DataFrame）并准备常用列
-    wanted_track = find_track(DS, no)
-    dates = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
-    center_lon_arr = wanted_track['center_lon'].to_numpy()
-    center_lat_arr = wanted_track['center_lat'].to_numpy()
-    radius_arr = wanted_track['radius'].to_numpy()
+    try:
+        track_df, ds_name, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
+    except Exception as exc:
+        print(f"  - Error: {exc}")
+        return
+    if track_df.empty:
+        print(f"  - Track for eddy {no} is empty.")
+        return
+    dates = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
+    center_lon_arr = track_df['center_lon'].to_numpy()
+    center_lat_arr = track_df['center_lat'].to_numpy()
+    radius_arr = track_df['radius'].to_numpy()
     # 当前时刻（needed_idx）的轮廓坐标
-    curr_contour_lon = wanted_track.iloc[needed_idx]['contour_lon']
-    curr_contour_lat = wanted_track.iloc[needed_idx]['contour_lat']
+    curr_contour_lon = track_df.iloc[needed_idx]['contour_lon']
+    curr_contour_lat = track_df.iloc[needed_idx]['contour_lat']
 
     # 获取Argo浮标数据（复用已读取轨迹，避免重复 I/O）
-    argo_data_filtered = filtered_float_data(DS, no, track=wanted_track)
+    argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
     argo_data_filtered = argo_data_filtered[pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])==dates[needed_idx]]
     
     if deep_argo:
@@ -4077,13 +4079,34 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
             needed_data = argo_data_filtered.groupby('Profile_number').apply(lambda group: group.iloc[0])
             needed_data.index.name = None
 
-    # 获取区域边界（基于当前时刻轮廓）
-    contour_lon_filtered = np.ma.masked_equal(curr_contour_lon, 180.0)
-    contour_lat_filtered = np.ma.masked_equal(curr_contour_lat, 0.0)
-    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
-    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
-    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
-    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+    # 获取区域边界（覆盖整条轨迹，优先用全程轮廓，否则退回中心轨迹）
+    all_contour_lon = []
+    all_contour_lat = []
+    for lon_arr, lat_arr in zip(track_df['contour_lon'], track_df['contour_lat']):
+        try:
+            lon_np = np.asarray(lon_arr, dtype=float).ravel()
+            lat_np = np.asarray(lat_arr, dtype=float).ravel()
+        except Exception:
+            continue
+        if lon_np.size and lat_np.size:
+            all_contour_lon.append(lon_np)
+            all_contour_lat.append(lat_np)
+
+    pad_deg = 0.5
+    if all_contour_lon and all_contour_lat:
+        lon_stack = np.concatenate(all_contour_lon)
+        lat_stack = np.concatenate(all_contour_lat)
+        lon_stack = lon_stack[lon_stack != 180.0]
+        lat_stack = lat_stack[lat_stack != 0.0]
+        glorys_lon_min = lon_stack.min() - pad_deg
+        glorys_lon_max = lon_stack.max() + pad_deg
+        glorys_lat_min = lat_stack.min() - pad_deg
+        glorys_lat_max = lat_stack.max() + pad_deg
+    else:
+        glorys_lon_min = center_lon_arr.min() - pad_deg
+        glorys_lon_max = center_lon_arr.max() + pad_deg
+        glorys_lat_min = center_lat_arr.min() - pad_deg
+        glorys_lat_max = center_lat_arr.max() + pad_deg
 
     #获取背景场数据
     if variable == 'vorticity':
@@ -4094,18 +4117,9 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], depth=needed_depth)
         glorys_variable_filtered = glorys_variables_filtered[variable]
 
-    callers_local_vars = inspect.currentframe().f_back.f_locals.items()
-    ds_names = [var_name for var_name, var_val in callers_local_vars if var_val is DS]
-    if ds_names:
-        ds_names = ds_names[0].upper()
-    else:
-        raise ValueError("UNKNOWN VARIABLE")
-
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    if ds_names == 'ACS' or ds_names == 'ACL':
-        colors =colors[1]
-    else:
-        colors =colors[0]
+    ds_names = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
+    colors_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    colors = colors_cycle[1] if ds_names in {'ACS', 'ACL'} else colors_cycle[0]
     world = _load_world_geodataframe()
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -4118,12 +4132,12 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
 
     # 绘制涡旋轨迹
     ax.plot(center_lon_arr, center_lat_arr, color=colors, linewidth=track_lw, label='Center Track')
-    ax.plot(center_lon_arr[0], center_lat_arr[0], marker='o', color=colors, markersize=10)
-    ax.plot(center_lon_arr[-1], center_lat_arr[-1], marker='x', color=colors, markersize=10)
+    ax.plot(center_lon_arr[0], center_lat_arr[0], marker='o', color=colors, markersize=8)
+    ax.plot(center_lon_arr[-1], center_lat_arr[-1], marker='x', color=colors, markersize=8)
 
     # 绘制背景场
     pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
-    cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.046)
+    cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.06)
     if variable == 'vorticity':
         cbar.set_label(r'$\zeta/f$', fontsize=cbar_label_fs)
         pc.set_clim(-0.7,0.7)
@@ -4144,13 +4158,13 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
     # 绘制Argo浮标数据
     if not needed_data.empty:
         if deep_argo:
-            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=180,
+            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=120,
                             vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo with max DO under 500m', zorder=5)
             cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=cbar_pad)
             cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
             cbar2.ax.tick_params(labelsize=cbar_tick_fs)
         else:
-            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=180, label='Argo', zorder=5)
+            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=120, label='Argo', zorder=5)
         for idx, row in needed_data.iterrows():
             ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth'])}", fontsize=argo_text_fs, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
@@ -4163,7 +4177,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
     ell_now = Ellipse((center_lon_arr[needed_idx], center_lat_arr[needed_idx]), width=2*deg_w, height=2*deg_h,
                       edgecolor='r', facecolor='none', linestyle='--', alpha=0.2, linewidth=circle_lw, label='Effective Radius')
     ax.add_patch(ell_now)
-    ax.scatter(center_lon_arr[needed_idx], center_lat_arr[needed_idx], color='black', s=20, label='Eddy Center', zorder=5)
+    ax.scatter(center_lon_arr[needed_idx], center_lat_arr[needed_idx], color='black', s=16, label='Eddy Center', zorder=5)
     ax.plot(curr_contour_lon, curr_contour_lat, color=colors, linewidth=contour_lw, alpha=0.5, label='Effective Contour')
 
     # 绘制 y = kx + b 直线
@@ -4178,7 +4192,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
 
         for i, (k_val, b_val) in enumerate(zip(k_list, b_list)):
             line_y = k_val * line_x + b_val
-            ax.plot(line_x, line_y, color='purple', linestyle='-', linewidth=line_lw, label=f'Profile Line {i+1}: y={k_val:.2f}x+{b_val:.2f}')
+            ax.plot(line_x, line_y, color='purple', linestyle='-', linewidth=line_lw, label=f'Profile Line {i+1}: y={k_val:.2f}x{b_val:+.2f}')
 
     ax.legend(fontsize=legend_fs)
     ax.set_xlim(glorys_lon_min, glorys_lon_max)
@@ -4190,11 +4204,13 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
 
     # 保存图片
     if save_fig:
-        output_dir = "plot_track_area_horizontal_glorys"
-        os.makedirs(output_dir, exist_ok=True)
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_track_area_horizontal_glorys"
+        output_dir.mkdir(parents=True, exist_ok=True)
         base_filename = f"{ds_names}{no}_{glorys_depth_filtered[0]:.2f}m_{variable}_{dates[needed_idx].strftime('%Y%m%d')}.png"
-        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
-        print(f"\nFigure saved to: {os.path.join(output_dir, base_filename)}")
+        save_path = output_dir / base_filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"\nFigure saved to: {save_path}")
 
     # 显示图像
     if show_fig:
@@ -4202,12 +4218,19 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         if not inline_mode:
             line_drawer = LineDrawer(ax)
             fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
-        
-        plt.show()
+            try:
+                plt.show(block=False)
+            except TypeError:
+                plt.show()
+        else:
+            plt.show()
 
     # 只有在静态内联模式下，才在函数结束时关闭图像以释放内存
     if inline_mode:
         plt.close(fig)
+
+    # 返回句柄便于调用侧自行管理或重复展示
+    return fig, ax
 
 def get_track_area_glorys(DS: list, no: int, needed_idx: int | pd.Timestamp, variables: list = ['thetao'], depth: float | int | None = None):
     '''
@@ -4227,8 +4250,26 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int | pd.Timestamp, var
         一个元组，包含筛选后的经度、纬度、深度数组，以及一个存储了所有请求变量数据的字典。
     '''
     wanted_track = find_track(DS, no)
-    contour_lon = wanted_track['contour_lon'].values
-    contour_lat = wanted_track['contour_lat'].values
+    # 展平轮廓数组并过滤无效值，兼容 DataFrame/ndarray/object 列
+    contour_lon_col = wanted_track['contour_lon'].values
+    contour_lat_col = wanted_track['contour_lat'].values
+    lon_flat: list[np.ndarray] = []
+    lat_flat: list[np.ndarray] = []
+    for lon_arr, lat_arr in zip(contour_lon_col, contour_lat_col):
+        try:
+            lon_np = np.asarray(lon_arr, dtype=float).ravel()
+            lat_np = np.asarray(lat_arr, dtype=float).ravel()
+        except Exception:
+            continue
+        if lon_np.size and lat_np.size:
+            lon_flat.append(lon_np)
+            lat_flat.append(lat_np)
+
+    if not lon_flat or not lat_flat:
+        raise ValueError("No valid contour coordinates found for the requested track.")
+
+    contour_lon = np.concatenate(lon_flat)
+    contour_lat = np.concatenate(lat_flat)
 
     if type(needed_idx) is int:
         glorys_filepaths_dict = find_track_glorys_filepath(DS, no)
@@ -4242,10 +4283,11 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int | pd.Timestamp, var
     contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
     contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
 
-    glorys_lon_min = np.min(contour_lon_filtered) - 0.5
-    glorys_lon_max = np.max(contour_lon_filtered) + 0.5
-    glorys_lat_min = np.min(contour_lat_filtered) - 0.5
-    glorys_lat_max = np.max(contour_lat_filtered) + 0.5
+    pad_deg = 0.5
+    glorys_lon_min = np.min(contour_lon_filtered) - pad_deg
+    glorys_lon_max = np.max(contour_lon_filtered) + pad_deg
+    glorys_lat_min = np.min(contour_lat_filtered) - pad_deg
+    glorys_lat_max = np.max(contour_lat_filtered) + pad_deg
 
     glorys_lon = needed_glorys_data.variables['longitude'][:]
     glorys_lat = needed_glorys_data.variables['latitude'][:]
@@ -4537,17 +4579,51 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         if var == 'vorticity': raw_vars_to_fetch.update(['u', 'v'])
         else: raw_vars_to_fetch.add(var)
 
-    wanted_track = find_track(DS, no)
-    if wanted_track is None or len(wanted_track) == 0:
+    try:
+        track_df, ds_name, _ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
+    except Exception as exc:
+        print(f"  - Error: {exc}")
+        return [{} for _ in k_list]
+    if track_df is None or track_df.empty:
         print(f"未找到涡旋 {no} 的轨迹数据。")
         return [{} for _ in k_list]
-    
-    dates = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
-    contour_lon = wanted_track['contour_lon'].values
-    contour_lat = wanted_track['contour_lat'].values
-    center_lon_arr = wanted_track['center_lon'].values
-    center_lat_arr = wanted_track['center_lat'].values
-    radius_arr = wanted_track['radius'].values
+
+    ds_name_upper = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
+
+    dates = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
+    contour_lon_col = track_df['contour_lon'].to_numpy()
+    contour_lat_col = track_df['contour_lat'].to_numpy()
+    center_lon_arr = track_df['center_lon'].to_numpy()
+    center_lat_arr = track_df['center_lat'].to_numpy()
+    radius_arr = track_df['radius'].to_numpy()
+
+    lon_flat: list[np.ndarray] = []
+    lat_flat: list[np.ndarray] = []
+    for lon_arr, lat_arr in zip(contour_lon_col, contour_lat_col):
+        try:
+            lon_np = np.asarray(lon_arr, dtype=float).ravel()
+            lat_np = np.asarray(lat_arr, dtype=float).ravel()
+        except Exception:
+            continue
+        if lon_np.size and lat_np.size:
+            lon_flat.append(lon_np)
+            lat_flat.append(lat_np)
+
+    pad_deg = 0.5
+    if lon_flat and lat_flat:
+        lon_stack = np.concatenate(lon_flat)
+        lat_stack = np.concatenate(lat_flat)
+        lon_stack = lon_stack[lon_stack != 180.0]
+        lat_stack = lat_stack[lat_stack != 0.0]
+        glorys_lon_min = lon_stack.min() - pad_deg if lon_stack.size else center_lon_arr.min() - pad_deg
+        glorys_lon_max = lon_stack.max() + pad_deg if lon_stack.size else center_lon_arr.max() + pad_deg
+        glorys_lat_min = lat_stack.min() - pad_deg if lat_stack.size else center_lat_arr.min() - pad_deg
+        glorys_lat_max = lat_stack.max() + pad_deg if lat_stack.size else center_lat_arr.max() + pad_deg
+    else:
+        glorys_lon_min = center_lon_arr.min() - pad_deg
+        glorys_lon_max = center_lon_arr.max() + pad_deg
+        glorys_lat_min = center_lat_arr.min() - pad_deg
+        glorys_lat_max = center_lat_arr.max() + pad_deg
     
     glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_data_raw = get_track_area_glorys(
         DS, no, needed_idx, variables=list(raw_vars_to_fetch)
@@ -4561,11 +4637,6 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     # --- 开始循环，为每一对 k, b 计算一个剖面 ---
     for k_val, b_val in zip(k_list, b_list):
         # --- 1. 计算水平剖面线的坐标 ---
-        contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
-        glorys_lon_min, glorys_lon_max = np.min(contour_lon_filtered) - 0.5, np.max(contour_lon_filtered) + 0.5
-        contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
-        glorys_lat_min, glorys_lat_max = np.min(contour_lat_filtered) - 0.5, np.max(contour_lat_filtered) + 0.5
-        
         num_points = 500
         if k_val == 0:
             profile_lons = np.linspace(glorys_lon_min, glorys_lon_max, num_points)
@@ -4653,9 +4724,12 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         radius_intersections_lon = [(-B + s * np.sqrt(discriminant)) / (2*A) for s in [-1, 1]] if discriminant >= 0 else []
         radius_proj_dists = [y_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - (k_val*lon_i + b_val))**2)] - y_coords_raw[center_idx_on_profile] for lon_i in radius_intersections_lon]
 
-        contour_lon_valid = contour_lon[needed_idx][contour_lon[needed_idx] != 180.0]
-        contour_lat_valid = contour_lat[needed_idx][contour_lat[needed_idx] != 0.0]
-        contour_intersections_xy = find_polygon_line_intersections(contour_lon_valid, contour_lat_valid, profile_lons, profile_lats)
+        curr_contour_lon = np.asarray(contour_lon_col[needed_idx], dtype=float).ravel()
+        curr_contour_lat = np.asarray(contour_lat_col[needed_idx], dtype=float).ravel()
+        valid_mask = (curr_contour_lon != 180.0) & (curr_contour_lat != 0.0)
+        curr_contour_lon = curr_contour_lon[valid_mask]
+        curr_contour_lat = curr_contour_lat[valid_mask]
+        contour_intersections_xy = find_polygon_line_intersections(curr_contour_lon, curr_contour_lat, profile_lons, profile_lats)
         contour_proj_dists = [y_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - lat_i)**2)] - y_coords_raw[center_idx_on_profile] for lon_i, lat_i in contour_intersections_xy]
 
         projections_dict = {'radius': sorted(radius_proj_dists), 'contour': sorted(contour_proj_dists)}
@@ -4673,6 +4747,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
                 'date_str': dates[needed_idx].strftime("%Y-%m-%d"),
                 'k': k_val,
                 'b': b_val,
+                'ds_name': ds_name_upper,
             }
         }
         all_profiles_data.append(single_profile_result)
@@ -4722,9 +4797,9 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
             
         profile_variable_2d = data_package['profile_data'].get(variable)
         if profile_variable_2d is None:
-             alias_map = {'so': 'salinity', 'uo': 'u', 'vo': 'v'}
-             standard_name = alias_map.get(variable, variable)
-             profile_variable_2d = data_package['profile_data'].get(standard_name)
+            alias_map = {'so': 'salinity', 'uo': 'u', 'vo': 'v'}
+            standard_name = alias_map.get(variable, variable)
+            profile_variable_2d = data_package['profile_data'].get(standard_name)
 
         if profile_variable_2d is None or np.all(getattr(profile_variable_2d, 'mask', True)):
             k_meta, b_meta = data_package.get('metadata', {}).get('k'), data_package.get('metadata', {}).get('b')
@@ -4735,16 +4810,21 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         y_coords = data_package['y_coords']
         z_coords = data_package['z_coords']
         projections = data_package['projections']
-        metadata = data_package['metadata'] 
+        metadata = data_package['metadata']
 
-        callers_local_vars = inspect.currentframe().f_back.f_locals
-        ds_name = [var_name for var_name, var_val in callers_local_vars.items() if var_val is DS][0].upper()
-        
+        ds_name = metadata.get('ds_name')
+        if not ds_name:
+            try:
+                _, ds_name, _ = _resolve_track_context(DS, no, include_contours=False)
+            except Exception:
+                ds_name = "UNKNOWN"
+        ds_name = ds_name.upper() if isinstance(ds_name, str) else str(ds_name)
+
         prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
         
         if profile_variable_2d.shape[1] != len(y_coords):
-           y_coords = y_coords[:profile_variable_2d.shape[1]]
+            y_coords = y_coords[:profile_variable_2d.shape[1]]
 
         Y_mesh, Z_mesh = np.meshgrid(y_coords, z_coords)
         
@@ -4766,8 +4846,10 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         fig, ax = plt.subplots(figsize=(20, 15))
         
         date_str = metadata['date_str']
-        title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
-                 f"on {date_str}, y={metadata['k']:.2f}x+{metadata['b']:.2f}")
+        title = (
+            f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+            f"on {date_str}, y={metadata['k']:.2f}x{metadata['b']:+.2f}"
+        )
         ax.set_title(title, fontsize=20)
         ax.set_xlabel('Distance from Eddy Center Projection (km)', fontsize=18)
         ax.set_ylabel('Depth (m)', fontsize=18)
@@ -4813,13 +4895,15 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
 
         # --- 4. 保存和显示 ---
         if save_fig:
-            output_dir = "plot_vertical_glorys"
-            os.makedirs(output_dir, exist_ok=True)
+            region_slug = _current_region_key()
+            output_dir = Path(plots_output_root) / region_slug / "plot_vertical_glorys"
+            output_dir.mkdir(parents=True, exist_ok=True)
             date_fn = date_str.replace('-', '')
             base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
                              f"k{metadata['k']:.2f}b{metadata['b']:.2f}.png")
-            plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
-            print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+            save_path = output_dir / base_filename
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Figure saved to: {save_path}")
 
         if show_fig:
             plt.show()
@@ -5081,18 +5165,24 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     metadata = data_package['metadata']
 
     # --- 2. 在当前上下文中计算与DS相关的元数据 ---
-    callers_local_vars = inspect.currentframe().f_back.f_locals
-    ds_name_list = [var_name for var_name, var_val in callers_local_vars.items() if var_val is DS]
-    if not ds_name_list:
-        raise ValueError("无法在调用者环境中找到数据集变量名。请确保DS参数已正确传入。")
-    ds_name = ds_name_list[0].upper()
-    
+    ds_name = metadata.get('ds_name')
+    if not ds_name:
+        track_id_for_resolve = metadata.get('eddy_no')
+        if track_id_for_resolve is not None:
+            try:
+                _, ds_name, _ = _resolve_track_context(DS, track_id_for_resolve, include_contours=False)
+            except Exception:
+                ds_name = "UNKNOWN"
+        else:
+            ds_name = "UNKNOWN"
+    ds_name = ds_name.upper() if isinstance(ds_name, str) else str(ds_name)
+
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
 
     # --- 3. 准备绘图元素 ---
     if profile_variable_2d.shape[1] != len(y_coords):
-       y_coords = y_coords[:profile_variable_2d.shape[1]]
+        y_coords = y_coords[:profile_variable_2d.shape[1]]
 
     Y_mesh, Z_mesh = np.meshgrid(y_coords, z_coords)
     
@@ -5115,9 +5205,9 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     k_val, b_val = metadata.get('k'), metadata.get('b')
     if k_val is not None and b_val is not None:
         title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
-                 f"on {metadata['date_str']}, y={k_val:.2f}x+{b_val:.2f}")
+                 f"on {metadata['date_str']}, y={k_val:.2f}x{b_val:+.2f}")
     else:
-         title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+        title = (f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
                  f"on {metadata['date_str']}")
 
     ax.set_title(title, fontsize=20)
@@ -5146,8 +5236,9 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
 
     # --- 5. 保存和显示 ---
     if save_fig:
-        output_dir = "plot_vertical_glorys"
-        os.makedirs(output_dir, exist_ok=True)
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_vertical_glorys"
+        output_dir.mkdir(parents=True, exist_ok=True)
         date_fn = metadata['date_str'].replace('-', '')
         
         if k_val is not None and b_val is not None:
@@ -5157,8 +5248,9 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
         else:
             base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}.png")
 
-        plt.savefig(os.path.join(output_dir, base_filename), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {os.path.join(output_dir, base_filename)}")
+        save_path = output_dir / base_filename
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
 
     if show_fig:
         plt.show()
