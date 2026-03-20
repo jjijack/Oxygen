@@ -289,7 +289,7 @@ def local_xy_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
 
     说明:
         1. 使用纬度依赖的经/纬一度长度（WGS84 近似）。在中低纬、距离 <~500 km 下平面近似足够。
-        2. 若距离很大或靠近极区，平面近似误差增大，可考虑改用大圆距离（后续可扩展）。
+        2. 若距离很大或靠近极区，平面近似误差增大，可考虑改用大圆距离。
         3. wrap_dateline=True 时能正确处理 179.9° 与 -179.9° 仅 0.2° 之差的情况。
     """
     scale = approximate_degree_length(lat0)

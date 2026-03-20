@@ -1,7 +1,7 @@
 # Oxygen Copilot Instructions
 
 ## Repo Snapshot
-- Majority of the logic lives in `track.py` (~6.8k lines) covering geometry helpers, data ingestion, analytics, and plotting for eddy–Argo interactions.
+- Majority of the logic lives in `track.py` covering geometry helpers, data ingestion, analytics, and plotting for eddy–Argo interactions.
 - Configuration is entirely YAML-driven under `config/` (`paths.yml`, `processing.yml`, `regions.yml`); do not hardcode paths or thresholds.
 - Data products are materialized into local folders referenced in `config/paths.yml` (e.g., `Argo_data/`, `META_tracks/`, `plot_outputs/`, `external/natural_earth/`).
 - There are no tests; validate changes by running the specific workflow function you touched.
@@ -12,7 +12,7 @@
 
 ## Config & Regions
 - Always read paths via `_PATHS_CFG` accessors at the top of `track.py`; new features should expose knobs through the YAML instead of constants.
-- Region bounds (`lonmin`, `lonmax`, `latmin`, `latmax`) are globals populated by `_load_region_config`; call `switch_region('global')` (or another key from `config/regions.yml`) before running workflows that depend on spatial filtering.
+- Region bounds (`lonmin`, `lonmax`, `latmin`, `latmax`) are globals populated by `_load_region_config`; if you do not call `switch_region(...)`, code uses `default_region` from `config/regions.yml` (currently `kuroshio_extension`). Call `switch_region('global')` (or another key) before workflows that depend on spatial filtering.
 - Regions may cross the dateline; rely on `_region_lon_mask`, `_minimal_lon_diff_deg`, or `adaptive_distance_m` instead of naive `lon` comparisons.
 - Basemap styling derives from `processing.yml:plot.basemap_colors`; reuse `_BASEMAP_COLORS` when adding new plots.
 
@@ -20,16 +20,18 @@
 - Use `load_meta_data()` to open the official META 3.x NetCDF files defined in `config/paths.yml`.
 - Convert META NetCDF to parquet/zarr via `export_meta_tracks(...)`; it streams by chunks, can run with `use_dask=True`, and writes under `META_tracks/<region>/<kind>_*`.
 - `find_track(kind, track_id, include_contours=True)` is the canonical accessor for META tracks; it automatically fuses parquet daily records with contours from the matching zarr store.
+- Prefer kind-string driven calls (`'acs'|'acl'|'cs'|'cl'`) across new workflows (`find_track`, `plot_track`, etc.); keep legacy list-based DS inputs only for backward compatibility.
 - Keep chunk sizes and Dask worker counts configurable when extending `export_meta_tracks`—the code already autoscales chunking based on dataset length.
 
 ## Argo Ingestion
 - Legacy `.mat` files go through `convert_mat_to_parquet(year, input_dir, output_dir)`; newer `.txt` drops are ingested by `process_argo_txt_to_yearly_parquet_dask(...)` which maps each file to parquet with Dask.
-- `process_argo_txt_to_yearly_parquet_dask` expects directories declared in `paths.yml` (`argo_origin`, `argo_intermediate`, `argo_parquet`); it spins up a distributed client, so guard new code with Dask-friendly constructs.
+- `process_argo_txt_to_yearly_parquet_dask` is configuration-driven for origin/intermediate/output directories; in current code, txt input prefers `paths.argo_txt_input` and falls back to `./Argo_origin` when unset. Keep key naming consistent when evolving `paths.yml`.
 - `load_argo_data(year, variable_selection=...)` is the normalized reader; it standardizes column names and picks adjusted variables. Extend variable handling by updating the `default_selection` dict.
 - Massive joins should work on yearly parquet files instead of loading everything in memory—follow the pattern in `filtered_float_data` (lazy loading only the needed years).
 
 ## GLORYS & Vertical Diagnostics
-- GLORYS fields are pulled with `get_track_area_glorys(...)` and interpolated via `get_vertical_glorys`/`plot_vertical_glorys`. Both expect a META dataset handle (ACS/ACL/CS/CL list) plus a `track_id` and snapshot index.
+- GLORYS fields are pulled with `get_track_area_glorys(...)` and interpolated via `get_vertical_glorys`/`plot_vertical_glorys`.
+- Prefer passing kind strings (`'acs'|'acl'|'cs'|'cl'`) plus `track_id` and snapshot index; legacy ACS/ACL/CS/CL list-style inputs remain supported for compatibility.
 - When adding new 2D/3D variables, update the `alias_map` + `var_dims` dictionaries near `get_vertical_glorys`; ensure interpolation uses `RegularGridInterpolator` with masked arrays, matching existing error handling.
 - Vertical plots output into `plot_vertical_glorys/` by default; keep filenames consistent with the current `{dataset}{id}_vertical_{var}_YYYYMMDD_k*b*.png` template so downstream scripts can glob predictably.
 
@@ -55,5 +57,6 @@
   PY
   ```
 - Swap in `process_argo_txt_to_yearly_parquet_dask()` or `plot_argo_hotspots(...)` inside the same REPL snippet when testing ingestion or plotting; keep each invocation focused to avoid reloading multi-GB datasets unnecessarily.
+- Prefer lightweight validation first (single kind, narrow date/year range, optional `show_fig=False`) before launching full-region or multi-year runs.
 - Heavy Dask workflows will open dashboards—monitor saturation before tuning worker counts or `chunk_size`.
 - Plots and parquet outputs are written relative to the configured paths; clean up `_tmp` folders only after downstream consumers finish reading them.
