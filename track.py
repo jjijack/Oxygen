@@ -15,6 +15,7 @@ from matplotlib.colors import Normalize
 import glob
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
+from scipy.stats import pearsonr, spearmanr
 import copy
 import gsw
 from collections import defaultdict
@@ -556,8 +557,8 @@ def area_limit(DS, latmin, latmax, lonmin, lonmax):
     speed_contour_lon = DS.variables['speed_contour_longitude'][:].data
     speed_contour_lat = DS.variables['speed_contour_latitude'][:].data
 
-    mask = (center_lat >= latmin) & (center_lat <= latmax) & \
-           (center_lon >= lonmin) & (center_lon <= lonmax)
+    lon_mask = _region_lon_mask(center_lon, lonmin, lonmax)
+    mask = (center_lat >= latmin) & (center_lat <= latmax) & lon_mask
     indices = np.nonzero(mask)[0]
     ds = []
     current_track = None
@@ -725,8 +726,8 @@ def export_meta_tracks(ds: Dataset,
             if auto_skip:
                 sel = np.arange(n_chunk, dtype=int)
             else:
-                mask = (center_lat >= latmin) & (center_lat <= latmax) & \
-                       (center_lon >= lonmin) & (center_lon <= lonmax)
+                lon_mask = _region_lon_mask(center_lon, lonmin, lonmax)
+                mask = (center_lat >= latmin) & (center_lat <= latmax) & lon_mask
                 if not np.any(mask):
                     return 0
                 sel = np.nonzero(mask)[0]
@@ -7273,6 +7274,1196 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     needed_cols = [c for c in ['Profile_number','Longitude','Latitude','Year','Month','Day','depth','delta_do','do_value'] if c in anomalies_year.columns]
     anomalies_year = anomalies_year[needed_cols]
     return baseline, anomalies_year
+
+def _build_euler_grid_edges(grid_step_deg: float = 1.0) -> tuple[np.ndarray, np.ndarray, dict]:
+    """为当前区域构建欧拉统计网格边界（经纬度）。
+
+    返回:
+        lon_edges, lat_edges, grid_meta
+    说明:
+        - 对跨日界线区域，经度边界会转换为连续坐标（例如 137.5 -> 182.5）。
+        - 采用 floor/ceil 对齐规则，保证不同统计图层使用同一网格口径。
+    """
+    if grid_step_deg <= 0:
+        raise ValueError("grid_step_deg 必须大于 0")
+
+    lon_min_cfg = float(lonmin)
+    lon_max_cfg = float(lonmax)
+    lat_min_cfg = float(latmin)
+    lat_max_cfg = float(latmax)
+
+    lon_min_norm = float(_normalize_lon_array(lon_min_cfg))
+    lon_max_norm = float(_normalize_lon_array(lon_max_cfg))
+    crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lon_max_norm < lon_min_norm))
+
+    lon_start = lon_min_norm
+    lon_end = lon_max_norm + (360.0 if crosses_dateline else 0.0)
+
+    raw_span = abs(lon_max_cfg - lon_min_cfg)
+    eff_span = (lon_max_norm - lon_min_norm) % 360.0
+    is_global_lon = (raw_span >= 359.5) or (eff_span >= 359.5) or np.isclose(eff_span, 0.0, atol=1e-6)
+    if is_global_lon:
+        lon_start = -180.0
+        lon_end = 180.0
+        crosses_dateline = False
+
+    lon_floor = math.floor(lon_start / grid_step_deg) * grid_step_deg
+    lon_ceil = math.ceil(lon_end / grid_step_deg) * grid_step_deg
+    lat_floor = math.floor(lat_min_cfg / grid_step_deg) * grid_step_deg
+    lat_ceil = math.ceil(lat_max_cfg / grid_step_deg) * grid_step_deg
+
+    lon_edges = np.arange(lon_floor, lon_ceil + grid_step_deg * 0.5, grid_step_deg, dtype=float)
+    lat_edges = np.arange(lat_floor, lat_ceil + grid_step_deg * 0.5, grid_step_deg, dtype=float)
+
+    if lon_edges.size < 2:
+        lon_edges = np.array([lon_floor, lon_floor + grid_step_deg], dtype=float)
+    if lat_edges.size < 2:
+        lat_edges = np.array([lat_floor, lat_floor + grid_step_deg], dtype=float)
+
+    meta = {
+        'grid_step_deg': float(grid_step_deg),
+        'crosses_dateline': bool(crosses_dateline),
+        'lon_start_continuous': float(lon_floor),
+        'lon_end_continuous': float(lon_ceil),
+        'region_key': _current_region_key(),
+    }
+    return lon_edges, lat_edges, meta
+
+
+def _to_continuous_lon(lon_vals: np.ndarray, lon_ref: float, crosses_dateline: bool) -> np.ndarray:
+    """将经度转换到连续坐标，便于跨日界线网格分箱。"""
+    lon_norm = _normalize_lon_array(lon_vals)
+    if not crosses_dateline:
+        return lon_norm
+    lon_cont = lon_norm.copy()
+    lon_cont[lon_cont < lon_ref] += 360.0
+    return lon_cont
+
+
+def _build_ocean_mask_for_grid(
+    lon_edges: np.ndarray,
+    lat_edges: np.ndarray,
+    *,
+    crosses_dateline: bool,
+    lon_ref: float,
+) -> np.ndarray:
+    """基于 Natural Earth 陆地多边形构建海洋网格掩膜（True=海洋）。"""
+    n_lat = max(int(lat_edges.size - 1), 0)
+    n_lon = max(int(lon_edges.size - 1), 0)
+    if n_lat == 0 or n_lon == 0:
+        return np.zeros((n_lat, n_lon), dtype=bool)
+
+    lon_centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])
+    lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
+    lon_2d, lat_2d = np.meshgrid(lon_centers, lat_centers)
+
+    lon_plot = _normalize_lon_array(lon_2d.ravel()) if crosses_dateline else lon_2d.ravel()
+    lat_plot = lat_2d.ravel()
+
+    try:
+        world = _load_world_geodataframe()[['geometry']].copy()
+        if world.crs is not None and str(world.crs).lower() not in {'epsg:4326', '4326'}:
+            world = world.to_crs('EPSG:4326')
+
+        points = gpd.GeoDataFrame(
+            {'idx': np.arange(lon_plot.size, dtype=int)},
+            geometry=gpd.points_from_xy(lon_plot, lat_plot),
+            crs='EPSG:4326',
+        )
+
+        try:
+            joined = gpd.sjoin(points, world, how='left', predicate='within')
+        except TypeError:
+            joined = gpd.sjoin(points, world, how='left', op='within')
+
+        land_flat = joined['index_right'].notna().to_numpy(dtype=bool)
+        ocean_flat = ~land_flat
+        return ocean_flat.reshape(n_lat, n_lon)
+    except Exception as exc:
+        print(f"[ocean_mask] Failed to build land/ocean mask, fallback to all-ocean: {exc}")
+        return np.ones((n_lat, n_lon), dtype=bool)
+
+
+def _grid_count_from_points(
+    df: pd.DataFrame,
+    *,
+    lon_col: str,
+    lat_col: str,
+    lon_edges: np.ndarray,
+    lat_edges: np.ndarray,
+    crosses_dateline: bool,
+    lon_ref: float,
+    dedupe_cols: list[str] | None = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """将点数据按网格统计计数，可选按字段去重。"""
+    if df.empty:
+        shape = (max(lat_edges.size - 1, 0), max(lon_edges.size - 1, 0))
+        return np.zeros(shape, dtype=int), pd.DataFrame(columns=['lon_bin', 'lat_bin', 'count'])
+
+    work = df.copy()
+    lon_vals = work[lon_col].to_numpy(dtype=float, copy=False)
+    lat_vals = work[lat_col].to_numpy(dtype=float, copy=False)
+
+    lon_cont = _to_continuous_lon(lon_vals, lon_ref=lon_ref, crosses_dateline=crosses_dateline)
+    lon_bin = np.digitize(lon_cont, lon_edges, right=False) - 1
+    lat_bin = np.digitize(lat_vals, lat_edges, right=False) - 1
+
+    work['lon_bin'] = lon_bin
+    work['lat_bin'] = lat_bin
+
+    valid = (
+        (work['lon_bin'] >= 0) & (work['lon_bin'] < lon_edges.size - 1)
+        & (work['lat_bin'] >= 0) & (work['lat_bin'] < lat_edges.size - 1)
+    )
+    work = work[valid].copy()
+    if work.empty:
+        shape = (max(lat_edges.size - 1, 0), max(lon_edges.size - 1, 0))
+        return np.zeros(shape, dtype=int), pd.DataFrame(columns=['lon_bin', 'lat_bin', 'count'])
+
+    if dedupe_cols:
+        keep_cols = [c for c in dedupe_cols if c in work.columns]
+        keep_cols.extend(['lon_bin', 'lat_bin'])
+        work = work.drop_duplicates(subset=keep_cols, keep='first')
+
+    grouped = (
+        work.groupby(['lat_bin', 'lon_bin'], as_index=False)
+        .size()
+        .rename(columns={'size': 'count'})
+    )
+
+    mat = np.zeros((lat_edges.size - 1, lon_edges.size - 1), dtype=int)
+    if not grouped.empty:
+        mat[grouped['lat_bin'].to_numpy(), grouped['lon_bin'].to_numpy()] = grouped['count'].to_numpy(dtype=int)
+    return mat, grouped.rename(columns={'size': 'count'})
+
+
+def _load_meta_daily_points_for_years(
+    *,
+    kind: str,
+    start_year: int,
+    end_year: int,
+    meta_output_root: str | Path | None = None,
+) -> pd.DataFrame:
+    """读取指定 kind 的 META 日尺度记录，并按年份与当前区域做裁剪。"""
+    kind_l = str(kind).lower()
+    if kind_l not in {'acs', 'acl', 'cs', 'cl'}:
+        raise ValueError("kind 必须是 'acs'|'acl'|'cs'|'cl'")
+
+    region_slug = _current_region_key()
+    root = _ensure_meta_tracks_root(meta_output_root)
+    region_dir = Path(root) / region_slug
+    if not region_dir.exists():
+        raise FileNotFoundError(f"区域 META 目录不存在：{region_dir}")
+
+    file_candidate = region_dir / f"{kind_l}_daily.parquet"
+    dir_candidate = region_dir / f"{kind_l}_daily_tmp"
+    if file_candidate.exists() and file_candidate.is_file():
+        source = file_candidate
+    elif file_candidate.exists() and file_candidate.is_dir():
+        source = file_candidate
+    elif dir_candidate.exists() and dir_candidate.is_dir():
+        source = dir_candidate
+    else:
+        raise FileNotFoundError(f"未找到 daily 数据源：{file_candidate} 或 {dir_candidate}")
+
+    cols = ['track_id', 'time', 'center_lon', 'center_lat']
+    df = pd.read_parquet(source, columns=cols)
+    if df.empty:
+        return df
+
+    if np.issubdtype(df['time'].dtype, np.number):
+        time_int = pd.to_numeric(df['time'], errors='coerce').astype('Int64')
+        yyyymmdd_min = int(f"{start_year:04d}0101")
+        yyyymmdd_max = int(f"{end_year:04d}1231")
+        mask_time = (time_int >= yyyymmdd_min) & (time_int <= yyyymmdd_max)
+    else:
+        date_series = pd.to_datetime(df['time'], errors='coerce')
+        mask_time = (
+            date_series >= pd.Timestamp(year=start_year, month=1, day=1)
+        ) & (
+            date_series <= pd.Timestamp(year=end_year, month=12, day=31)
+        )
+
+    df = df[mask_time].copy()
+    if df.empty:
+        return df
+
+    date_series = convert_date(df['time'])
+    if isinstance(date_series, pd.Timestamp):
+        df['date'] = pd.Series([date_series] * len(df), index=df.index)
+    else:
+        df['date'] = pd.to_datetime(date_series, errors='coerce')
+    df = df[df['date'].notna()].copy()
+    if df.empty:
+        return df
+
+    lon_vals = df['center_lon'].to_numpy(dtype=float, copy=False)
+    lat_vals = df['center_lat'].to_numpy(dtype=float, copy=False)
+    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+    df = df[lon_mask & lat_mask].copy()
+    if df.empty:
+        return df
+
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    return df[['track_id', 'date', 'center_lon', 'center_lat']]
+
+
+def build_euler_grid_summary(
+    start_year: int,
+    end_year: int,
+    *,
+    grid_step_deg: float = 1.0,
+    meta_output_root: str | Path | None = None,
+    do_threshold: float | None = None,
+    salinity_threshold: float | None = None,
+    temperature_threshold: float | None = None,
+    depth_interval: float | None = None,
+    depth_merge_tolerance: float | None = None,
+    duplicate_depth_strategy: str | None = None,
+    anomaly_min_depth: float | None = None,
+) -> dict:
+    """构建欧拉网格汇总：ACE/CE 天数与高 DO 异常出现率。
+
+    统计口径：
+        1. 同日同网格同类型只计 1 天（按 date+grid 去重）。
+        2. 高 DO 剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
+        3. 使用同一套区域边界与网格边界，确保三图可直接比较。
+        4. 深度筛选仅使用最小深度阈值：depth >= anomaly_min_depth。
+        5. 关联分析默认使用异常出现率 high_do_profiles / argo_baseline_profiles（仅 baseline>0 网格）。
+    """
+    if end_year < start_year:
+        raise ValueError("end_year 必须大于等于 start_year")
+
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if salinity_threshold is None:
+        salinity_threshold = _default_salinity_threshold
+    if temperature_threshold is None:
+        temperature_threshold = _default_temperature_threshold
+    if depth_interval is None:
+        depth_interval = _default_depth_interval
+    if depth_merge_tolerance is None:
+        depth_merge_tolerance = _default_depth_merge_tolerance
+    if duplicate_depth_strategy is None:
+        duplicate_depth_strategy = _default_duplicate_depth_strategy
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
+
+    lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(grid_step_deg=grid_step_deg)
+    lon_ref = float(grid_meta['lon_start_continuous'])
+    crosses_dateline = bool(grid_meta['crosses_dateline'])
+
+    # 1) 涡旋网格天数
+    acl_df = _load_meta_daily_points_for_years(
+        kind='acl',
+        start_year=start_year,
+        end_year=end_year,
+        meta_output_root=meta_output_root,
+    )
+    acs_df = _load_meta_daily_points_for_years(
+        kind='acs',
+        start_year=start_year,
+        end_year=end_year,
+        meta_output_root=meta_output_root,
+    )
+    cl_df = _load_meta_daily_points_for_years(
+        kind='cl',
+        start_year=start_year,
+        end_year=end_year,
+        meta_output_root=meta_output_root,
+    )
+    cs_df = _load_meta_daily_points_for_years(
+        kind='cs',
+        start_year=start_year,
+        end_year=end_year,
+        meta_output_root=meta_output_root,
+    )
+
+    acl_grid, acl_grouped = _grid_count_from_points(
+        acl_df,
+        lon_col='center_lon',
+        lat_col='center_lat',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['date'],
+    )
+    acs_grid, acs_grouped = _grid_count_from_points(
+        acs_df,
+        lon_col='center_lon',
+        lat_col='center_lat',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['date'],
+    )
+    cl_grid, cl_grouped = _grid_count_from_points(
+        cl_df,
+        lon_col='center_lon',
+        lat_col='center_lat',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['date'],
+    )
+    cs_grid, cs_grouped = _grid_count_from_points(
+        cs_df,
+        lon_col='center_lon',
+        lat_col='center_lat',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['date'],
+    )
+
+    ace_grid = acl_grid + acs_grid
+    ce_grid = cl_grid + cs_grid
+
+    # 2) 高 DO 异常网格剖面数（仅最小深度阈值）+ Argo 观测机会网格
+    do_frames = []
+    baseline_frames = []
+    for year in range(start_year, end_year + 1):
+        try:
+            df_year = load_argo_data(year)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            print(f"[build_euler_grid_summary] 读取 Argo {year} 失败: {exc}")
+            continue
+
+        if df_year.empty:
+            continue
+        lon_vals = df_year['Longitude'].to_numpy(dtype=float, copy=False)
+        lat_vals = df_year['Latitude'].to_numpy(dtype=float, copy=False)
+        lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+        lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+        df_geo = df_year[lon_mask & lat_mask].copy()
+        if df_geo.empty:
+            continue
+
+        baseline_year = (
+            df_geo.sort_values(['Profile_number', 'Depth'])
+            .groupby('Profile_number', as_index=False)
+            .first()[['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day']]
+        )
+        baseline_year['profile_uid'] = (
+            baseline_year['Year'].astype(int).astype(str) + '-'
+            + baseline_year['Month'].astype(int).astype(str).str.zfill(2) + '-'
+            + baseline_year['Day'].astype(int).astype(str).str.zfill(2) + '-'
+            + baseline_year['Profile_number'].astype(str)
+        )
+        baseline_frames.append(baseline_year[['profile_uid', 'Longitude', 'Latitude']])
+
+        anomalies = calculate_delta_do(
+            df_geo,
+            depth_interval=depth_interval,
+            do_threshold=do_threshold,
+            salinity_threshold=salinity_threshold,
+            temperature_threshold=temperature_threshold,
+            anomaly_min_depth=None,
+            depth_merge_tolerance=depth_merge_tolerance,
+            duplicate_depth_strategy=duplicate_depth_strategy,
+            remove_outliers=True,
+            verbose=False,
+        )
+        if anomalies.empty:
+            continue
+
+        depth_col = 'depth' if 'depth' in anomalies.columns else None
+        if depth_col is None:
+            continue
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            anomalies = anomalies[anomalies[depth_col] >= anomaly_min_depth].copy()
+        if anomalies.empty:
+            continue
+
+        anomalies = anomalies.sort_values('delta_do', ascending=False)
+        anomalies = anomalies.drop_duplicates(subset='Profile_number', keep='first')
+
+        if all(c in anomalies.columns for c in ['Year', 'Month', 'Day']):
+            anomalies['profile_uid'] = (
+                anomalies['Year'].astype(int).astype(str) + '-'
+                + anomalies['Month'].astype(int).astype(str).str.zfill(2) + '-'
+                + anomalies['Day'].astype(int).astype(str).str.zfill(2) + '-'
+                + anomalies['Profile_number'].astype(str)
+            )
+        else:
+            anomalies['profile_uid'] = anomalies['Profile_number'].astype(str)
+
+        do_frames.append(
+            anomalies[['profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do', depth_col]].rename(
+                columns={depth_col: 'depth'}
+            )
+        )
+
+    do_df = pd.concat(do_frames, ignore_index=True) if do_frames else pd.DataFrame()
+    baseline_df = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
+
+    baseline_grid, baseline_grouped = _grid_count_from_points(
+        baseline_df,
+        lon_col='Longitude',
+        lat_col='Latitude',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['profile_uid'],
+    )
+
+    do_grid, do_grouped = _grid_count_from_points(
+        do_df,
+        lon_col='Longitude',
+        lat_col='Latitude',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['profile_uid'],
+    )
+
+    high_do_occurrence_ratio = np.full_like(do_grid, np.nan, dtype=float)
+    valid_baseline = baseline_grid > 0
+    if np.any(valid_baseline):
+        high_do_occurrence_ratio[valid_baseline] = do_grid[valid_baseline] / baseline_grid[valid_baseline]
+
+    ocean_mask = _build_ocean_mask_for_grid(
+        lon_edges,
+        lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+    )
+    observation_mask = baseline_grid > 0
+    analysis_mask = ocean_mask & observation_mask
+
+    return {
+        'meta': {
+            'region_key': _current_region_key(),
+            'start_year': int(start_year),
+            'end_year': int(end_year),
+            'grid_step_deg': float(grid_step_deg),
+            'anomaly_min_depth': float(anomaly_min_depth) if anomaly_min_depth is not None else np.nan,
+            'do_threshold': float(do_threshold),
+            'salinity_threshold': float(salinity_threshold),
+            'temperature_threshold': float(temperature_threshold),
+        },
+        'grid': {
+            'lon_edges': lon_edges,
+            'lat_edges': lat_edges,
+            **grid_meta,
+        },
+        'acl_days': acl_grid,
+        'acs_days': acs_grid,
+        'cl_days': cl_grid,
+        'cs_days': cs_grid,
+        'ace_days': ace_grid,
+        'ce_days': ce_grid,
+        'eddy_days_total': ace_grid + ce_grid,
+        'high_do_profiles': do_grid,
+        'high_do_occurrence_ratio': high_do_occurrence_ratio,
+        'argo_baseline_profiles': baseline_grid,
+        'acl_table': acl_grouped,
+        'acs_table': acs_grouped,
+        'cl_table': cl_grouped,
+        'cs_table': cs_grouped,
+        'argo_baseline_table': baseline_grouped,
+        'high_do_table': do_grouped,
+        'ocean_mask': ocean_mask,
+        'observation_mask': observation_mask,
+        'analysis_mask': analysis_mask,
+    }
+
+
+def plot_euler_grid_summary(
+    summary: dict,
+    *,
+    save_fig: bool = False,
+    show_fig: bool = True,
+    save_data: bool = False,
+    output_dir: str | Path | None = None,
+    output_prefix: str = 'Euler_Grid_EddyDays',
+    cmap_eddy: str = 'YlOrRd',
+    cmap_do: str = 'Reds',
+) -> dict:
+    """绘制欧拉网格三图：ACE 天数、CE 天数、高 DO 异常出现率。"""
+    grid = summary['grid']
+    meta = summary['meta']
+
+    lon_edges = np.asarray(grid['lon_edges'], dtype=float)
+    lat_edges = np.asarray(grid['lat_edges'], dtype=float)
+    ace_days = np.asarray(summary['ace_days'])
+    ce_days = np.asarray(summary['ce_days'])
+    high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
+
+    crosses_dateline = bool(grid.get('crosses_dateline', False))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(30, 9),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    grid_color = _BASEMAP_COLORS['grid']
+
+    vmax_eddy = float(max(np.nanmax(ace_days), np.nanmax(ce_days), 1.0))
+    vmax_do = float(np.nanmax(high_do)) if np.any(np.isfinite(high_do)) else 1.0
+    if not np.isfinite(vmax_do) or vmax_do <= 0:
+        vmax_do = 1.0
+
+    lon_extent_min = float(lon_edges[0])
+    lon_extent_max = float(lon_edges[-1])
+
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+    panel_defs = [
+        ('ACE Eddy Days', ace_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
+        ('CE Eddy Days', ce_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
+        (
+            (
+                f'High DO Occurrence Rate (depth >= {meta["anomaly_min_depth"]:.0f} m)'
+                if np.isfinite(meta.get('anomaly_min_depth', np.nan)) and meta.get('anomaly_min_depth', np.nan) > 0
+                else 'High DO Occurrence Rate'
+            ),
+            high_do,
+            cmap_do,
+            Normalize(vmin=0.0, vmax=vmax_do),
+        ),
+    ]
+
+    mappables = []
+    for ax, (title, mat, cmap, norm) in zip(axes, panel_defs):
+        ax.set_facecolor(base_ocean)
+        ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        hm = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            mat,
+            cmap=cmap,
+            norm=norm,
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        mappables.append(hm)
+        ax.set_title(title, fontsize=14)
+        ax.set_extent([lon_extent_min, lon_extent_max, float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+
+    cbar1 = fig.colorbar(mappables[0], ax=axes[:2], orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar1.set_label('Eddy Days per Grid Cell', fontsize=12)
+    cbar2 = fig.colorbar(mappables[2], ax=axes[2], orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar2.set_label('High DO Occurrence Rate per Grid Cell', fontsize=12)
+
+    fig.suptitle(
+        f"Euler Grid Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']}, {meta['grid_step_deg']:.1f}°)",
+        fontsize=16,
+    )
+
+    region_slug = _current_region_key()
+    if output_dir is None:
+        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+    else:
+        output_dir = Path(output_dir)
+    if save_fig or save_data:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix_safe = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_prefix).strip())
+    if not prefix_safe:
+        prefix_safe = 'Euler_Grid_EddyDays'
+
+    out = {}
+    if save_fig:
+        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        fname = output_dir / (
+            f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_"
+            f"{meta['grid_step_deg']:g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+        )
+        fig.savefig(fname, dpi=300, bbox_inches='tight')
+        out['figure'] = str(fname)
+        print(f"Figure saved: {fname}")
+
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+
+    if save_data:
+        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        npz_path = output_dir / (
+            f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_{meta['grid_step_deg']:g}deg_"
+            f"do{do_thr_tag}_depth{depth_thr_tag}.npz"
+        )
+        np.savez_compressed(
+            npz_path,
+            lon_edges=lon_edges,
+            lat_edges=lat_edges,
+            ace_days=ace_days,
+            ce_days=ce_days,
+            eddy_days_total=np.asarray(summary['eddy_days_total']),
+            high_do_profiles=high_do,
+            high_do_occurrence_ratio=np.asarray(summary.get('high_do_occurrence_ratio')),
+            argo_baseline_profiles=np.asarray(summary['argo_baseline_profiles']),
+            ocean_mask=np.asarray(summary['ocean_mask']),
+            observation_mask=np.asarray(summary['observation_mask']),
+            analysis_mask=np.asarray(summary['analysis_mask']),
+        )
+        out['npz'] = str(npz_path)
+        print(f"Grid data saved: {npz_path}")
+
+    return out
+
+
+def _single_eddy_do_association(
+    eddy_grid: np.ndarray,
+    high_do_grid: np.ndarray,
+    *,
+    active_day_threshold: float = 1.0,
+    do_rate_high_low_threshold: float | None = None,
+    analysis_mask: np.ndarray | None = None,
+    high_do_is_rate: bool = False,
+) -> dict:
+    """计算单一涡旋类型（ACE 或 CE）与高 DO 的双向关联统计。"""
+    x = np.asarray(eddy_grid, dtype=float).ravel()
+    y = np.asarray(high_do_grid, dtype=float).ravel()
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    if analysis_mask is not None:
+        am = np.asarray(analysis_mask, dtype=bool).ravel()
+        if am.size == finite_mask.size:
+            finite_mask = finite_mask & am
+    x = x[finite_mask]
+    y = y[finite_mask]
+
+    active = x >= float(active_day_threshold)
+    inactive = ~active
+
+    mean_active = np.nanmean(y[active]) if np.any(active) else np.nan
+    mean_inactive = np.nanmean(y[inactive]) if np.any(inactive) else np.nan
+
+    uplift_ratio = np.nan
+    uplift_pct = np.nan
+    if np.isfinite(mean_inactive) and mean_inactive > 0 and np.isfinite(mean_active):
+        uplift_ratio = mean_active / mean_inactive
+        uplift_pct = (uplift_ratio - 1.0) * 100.0
+
+    p_active = np.nanmean((y[active] > 0).astype(float)) if np.any(active) else np.nan
+    p_inactive = np.nanmean((y[inactive] > 0).astype(float)) if np.any(inactive) else np.nan
+    occurrence_ratio = np.nan
+    occurrence_uplift_pct = np.nan
+    if np.isfinite(p_inactive) and p_inactive > 0 and np.isfinite(p_active):
+        occurrence_ratio = p_active / p_inactive
+        occurrence_uplift_pct = (occurrence_ratio - 1.0) * 100.0
+
+    # 反向指标：按高DO出现率分组，比较两组涡旋天数均值
+    if do_rate_high_low_threshold is None:
+        positive_y = y[y > 0]
+        do_rate_threshold = float(np.quantile(positive_y, 0.5)) if positive_y.size > 0 else np.nan
+    else:
+        do_rate_threshold = float(do_rate_high_low_threshold)
+    high_do_rate_mask = (y >= do_rate_threshold) if np.isfinite(do_rate_threshold) else np.zeros_like(y, dtype=bool)
+    low_do_rate_mask = ~high_do_rate_mask
+
+    mean_eddy_high_do_rate = np.nanmean(x[high_do_rate_mask]) if np.any(high_do_rate_mask) else np.nan
+    mean_eddy_low_do_rate = np.nanmean(x[low_do_rate_mask]) if np.any(low_do_rate_mask) else np.nan
+
+    eddy_days_ratio_high_vs_low_do_rate = np.nan
+    eddy_days_uplift_pct_high_vs_low_do_rate = np.nan
+    if (
+        np.isfinite(mean_eddy_low_do_rate)
+        and mean_eddy_low_do_rate > 0
+        and np.isfinite(mean_eddy_high_do_rate)
+    ):
+        eddy_days_ratio_high_vs_low_do_rate = mean_eddy_high_do_rate / mean_eddy_low_do_rate
+        eddy_days_uplift_pct_high_vs_low_do_rate = (eddy_days_ratio_high_vs_low_do_rate - 1.0) * 100.0
+
+    spearman_rho = np.nan
+    spearman_p = np.nan
+    pearson_r = np.nan
+    pearson_p = np.nan
+    nz_mask = (x > 0) | (y > 0)
+    x_corr = x[nz_mask]
+    y_corr = y[nz_mask]
+    if x_corr.size >= 3 and np.nanstd(x_corr) > 0 and np.nanstd(y_corr) > 0:
+        try:
+            spearman_rho, spearman_p = spearmanr(x_corr, y_corr)
+        except Exception:
+            spearman_rho, spearman_p = np.nan, np.nan
+        try:
+            pearson_r, pearson_p = pearsonr(x_corr, y_corr)
+        except Exception:
+            pearson_r, pearson_p = np.nan, np.nan
+
+    # 网格关联强度图：标准化后逐格乘积，正值代表共同高/共同低
+    x2 = np.asarray(eddy_grid, dtype=float)
+    y2 = np.asarray(high_do_grid, dtype=float)
+    xlog = np.log1p(np.where(np.isfinite(x2), np.maximum(x2, 0.0), np.nan))
+    if high_do_is_rate:
+        ylog = np.where(np.isfinite(y2), np.maximum(y2, 0.0), np.nan)
+    else:
+        ylog = np.log1p(np.where(np.isfinite(y2), np.maximum(y2, 0.0), np.nan))
+    valid_map = np.isfinite(xlog) & np.isfinite(ylog)
+    if analysis_mask is not None:
+        am2 = np.asarray(analysis_mask, dtype=bool)
+        if am2.shape == valid_map.shape:
+            valid_map = valid_map & am2
+    assoc_map = np.full_like(xlog, np.nan, dtype=float)
+    if np.any(valid_map):
+        xmean = np.nanmean(xlog[valid_map])
+        ymean = np.nanmean(ylog[valid_map])
+        xstd = np.nanstd(xlog[valid_map])
+        ystd = np.nanstd(ylog[valid_map])
+        if xstd > 0 and ystd > 0:
+            zx = (xlog - xmean) / xstd
+            zy = (ylog - ymean) / ystd
+            assoc_map[valid_map] = zx[valid_map] * zy[valid_map]
+
+    return {
+        'n_cells_total': int(x.size),
+        'n_cells_active': int(np.count_nonzero(active)),
+        'n_cells_inactive': int(np.count_nonzero(inactive)),
+        'n_cells_eddy_active': int(np.count_nonzero(active)),
+        'n_cells_eddy_inactive': int(np.count_nonzero(inactive)),
+        'mean_high_do_active': float(mean_active) if np.isfinite(mean_active) else np.nan,
+        'mean_high_do_inactive': float(mean_inactive) if np.isfinite(mean_inactive) else np.nan,
+        'do_rate_mean_eddy_active': float(mean_active) if np.isfinite(mean_active) else np.nan,
+        'do_rate_mean_eddy_inactive': float(mean_inactive) if np.isfinite(mean_inactive) else np.nan,
+        'uplift_ratio_mean': float(uplift_ratio) if np.isfinite(uplift_ratio) else np.nan,
+        'uplift_pct_mean': float(uplift_pct) if np.isfinite(uplift_pct) else np.nan,
+        'do_rate_ratio_eddy_active_vs_inactive': float(uplift_ratio) if np.isfinite(uplift_ratio) else np.nan,
+        'do_rate_uplift_pct_eddy_active_vs_inactive': float(uplift_pct) if np.isfinite(uplift_pct) else np.nan,
+        'high_do_occurrence_active': float(p_active) if np.isfinite(p_active) else np.nan,
+        'high_do_occurrence_inactive': float(p_inactive) if np.isfinite(p_inactive) else np.nan,
+        'uplift_ratio_occurrence': float(occurrence_ratio) if np.isfinite(occurrence_ratio) else np.nan,
+        'uplift_pct_occurrence': float(occurrence_uplift_pct) if np.isfinite(occurrence_uplift_pct) else np.nan,
+        'do_rate_nonzero_ratio_eddy_active_vs_inactive': float(occurrence_ratio) if np.isfinite(occurrence_ratio) else np.nan,
+        'do_rate_nonzero_uplift_pct_eddy_active_vs_inactive': float(occurrence_uplift_pct) if np.isfinite(occurrence_uplift_pct) else np.nan,
+        'do_rate_threshold_for_high_group': float(do_rate_threshold) if np.isfinite(do_rate_threshold) else np.nan,
+        'n_cells_do_rate_high': int(np.count_nonzero(high_do_rate_mask)),
+        'n_cells_do_rate_low': int(np.count_nonzero(low_do_rate_mask)),
+        'eddy_days_mean_do_rate_high': float(mean_eddy_high_do_rate) if np.isfinite(mean_eddy_high_do_rate) else np.nan,
+        'eddy_days_mean_do_rate_low': float(mean_eddy_low_do_rate) if np.isfinite(mean_eddy_low_do_rate) else np.nan,
+        'eddy_days_ratio_do_rate_high_vs_low': (
+            float(eddy_days_ratio_high_vs_low_do_rate)
+            if np.isfinite(eddy_days_ratio_high_vs_low_do_rate)
+            else np.nan
+        ),
+        'eddy_days_uplift_pct_do_rate_high_vs_low': (
+            float(eddy_days_uplift_pct_high_vs_low_do_rate)
+            if np.isfinite(eddy_days_uplift_pct_high_vs_low_do_rate)
+            else np.nan
+        ),
+        'spearman_rho': float(spearman_rho) if np.isfinite(spearman_rho) else np.nan,
+        'spearman_p': float(spearman_p) if np.isfinite(spearman_p) else np.nan,
+        'pearson_r': float(pearson_r) if np.isfinite(pearson_r) else np.nan,
+        'pearson_p': float(pearson_p) if np.isfinite(pearson_p) else np.nan,
+        'association_map': assoc_map,
+    }
+
+
+def _scan_active_thresholds(
+    ace_days: np.ndarray,
+    ce_days: np.ndarray,
+    high_do_grid: np.ndarray,
+    analysis_mask: np.ndarray | None,
+    *,
+    min_group_cells: int = 20,
+) -> tuple[float, pd.DataFrame]:
+    """为 ACE/CE 共享扫描单一阈值并返回推荐值与诊断表。"""
+    ace = np.asarray(ace_days, dtype=float)
+    ce = np.asarray(ce_days, dtype=float)
+    y = np.asarray(high_do_grid, dtype=float)
+    mask = np.isfinite(ace) & np.isfinite(ce) & np.isfinite(y)
+    if analysis_mask is not None:
+        am = np.asarray(analysis_mask, dtype=bool)
+        if am.shape == mask.shape:
+            mask = mask & am
+
+    ace_v = ace[mask]
+    ce_v = ce[mask]
+    y_v = y[mask]
+
+    total = int(ace_v.size)
+    if total == 0:
+        diag = pd.DataFrame([
+            {
+                'threshold': 1.0,
+                'ace_active': 0,
+                'ace_inactive': 0,
+                'ce_active': 0,
+                'ce_inactive': 0,
+                'ace_inactive_nonzero': 0,
+                'ce_inactive_nonzero': 0,
+                'balance': 0,
+                'total_cells': 0,
+            }
+        ])
+        return 1.0, diag
+
+    pos = np.concatenate([ace_v[ace_v > 0], ce_v[ce_v > 0]])
+    if pos.size == 0:
+        diag = pd.DataFrame([
+            {
+                'threshold': 1.0,
+                'ace_active': 0,
+                'ace_inactive': total,
+                'ce_active': 0,
+                'ce_inactive': total,
+                'ace_inactive_nonzero': int(np.count_nonzero(y_v > 0)),
+                'ce_inactive_nonzero': int(np.count_nonzero(y_v > 0)),
+                'balance': 0,
+                'total_cells': total,
+            }
+        ])
+        return 1.0, diag
+
+    quantiles = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]
+    cand = sorted(set([1.0] + [float(np.quantile(pos, q)) for q in quantiles]))
+
+    rows = []
+    for thr in cand:
+        ace_active_mask = ace_v >= thr
+        ce_active_mask = ce_v >= thr
+
+        ace_active = int(np.count_nonzero(ace_active_mask))
+        ce_active = int(np.count_nonzero(ce_active_mask))
+        ace_inactive = total - ace_active
+        ce_inactive = total - ce_active
+
+        ace_inactive_nonzero = int(np.count_nonzero(y_v[~ace_active_mask] > 0)) if ace_inactive > 0 else 0
+        ce_inactive_nonzero = int(np.count_nonzero(y_v[~ce_active_mask] > 0)) if ce_inactive > 0 else 0
+
+        balance = min(ace_active, ace_inactive, ce_active, ce_inactive)
+        rows.append(
+            {
+                'threshold': float(thr),
+                'ace_active': ace_active,
+                'ace_inactive': ace_inactive,
+                'ce_active': ce_active,
+                'ce_inactive': ce_inactive,
+                'ace_inactive_nonzero': ace_inactive_nonzero,
+                'ce_inactive_nonzero': ce_inactive_nonzero,
+                'balance': int(balance),
+                'total_cells': total,
+            }
+        )
+
+    diag = pd.DataFrame(rows)
+    feasible = diag[
+        (diag['ace_active'] >= min_group_cells)
+        & (diag['ace_inactive'] >= min_group_cells)
+        & (diag['ce_active'] >= min_group_cells)
+        & (diag['ce_inactive'] >= min_group_cells)
+        & (diag['ace_inactive_nonzero'] > 0)
+        & (diag['ce_inactive_nonzero'] > 0)
+    ]
+    if not feasible.empty:
+        rec = float(
+            feasible.sort_values(
+                ['balance', 'ace_inactive_nonzero', 'ce_inactive_nonzero', 'threshold'],
+                ascending=[False, False, False, True],
+            ).iloc[0]['threshold']
+        )
+    else:
+        ok = diag[
+            (diag['ace_active'] >= min_group_cells)
+            & (diag['ace_inactive'] >= min_group_cells)
+            & (diag['ce_active'] >= min_group_cells)
+            & (diag['ce_inactive'] >= min_group_cells)
+        ]
+        if not ok.empty:
+            rec = float(
+                ok.sort_values(
+                    ['balance', 'ace_inactive_nonzero', 'ce_inactive_nonzero', 'threshold'],
+                    ascending=[False, False, False, True],
+                ).iloc[0]['threshold']
+            )
+        else:
+            rec = float(diag.sort_values(['balance', 'threshold'], ascending=[False, True]).iloc[0]['threshold'])
+
+    return rec, diag
+
+
+def analyze_euler_ace_ce_association(
+    summary: dict,
+    *,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    output_prefix: str = 'Euler_Grid_EddyDays',
+    active_day_threshold: float | str | None = 'auto',
+    do_rate_high_low_threshold: float | str | None = 'auto',
+    min_group_cells: int = 20,
+) -> dict:
+    """在同一网格上分析并绘制 ACE/CE 与 High DO 出现率的关联性。
+
+    输出重点：
+        - 关联地图（ACE-HighDO、CE-HighDO）
+        - 正向指标：涡旋活跃区 vs 非活跃区的高DO出现率提升
+        - 反向指标：高DO出现率高区 vs 低区的涡旋天数提升
+    """
+    ace_days = np.asarray(summary['ace_days'], dtype=float)
+    ce_days = np.asarray(summary['ce_days'], dtype=float)
+    high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
+    analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
+    meta = summary.get('meta', {})
+    grid = summary['grid']
+
+    threshold_scan = None
+    shared_threshold = float(active_day_threshold) if isinstance(active_day_threshold, (int, float)) else 1.0
+    if active_day_threshold is None or str(active_day_threshold).lower() == 'auto':
+        shared_threshold, threshold_scan = _scan_active_thresholds(
+            ace_days,
+            ce_days,
+            high_do,
+            analysis_mask,
+            min_group_cells=min_group_cells,
+        )
+
+    shared_do_rate_threshold = None
+    if not (do_rate_high_low_threshold is None or str(do_rate_high_low_threshold).lower() == 'auto'):
+        shared_do_rate_threshold = float(do_rate_high_low_threshold)
+    else:
+        y_for_thr = np.asarray(high_do, dtype=float)
+        if analysis_mask is not None and analysis_mask.shape == y_for_thr.shape:
+            y_for_thr = y_for_thr[np.asarray(analysis_mask, dtype=bool)]
+        y_for_thr = y_for_thr[np.isfinite(y_for_thr)]
+        y_for_thr = y_for_thr[y_for_thr > 0]
+        if y_for_thr.size > 0:
+            shared_do_rate_threshold = float(np.quantile(y_for_thr, 0.5))
+
+    ace_stats = _single_eddy_do_association(
+        ace_days,
+        high_do,
+        active_day_threshold=shared_threshold,
+        do_rate_high_low_threshold=shared_do_rate_threshold,
+        analysis_mask=analysis_mask,
+        high_do_is_rate=True,
+    )
+    ce_stats = _single_eddy_do_association(
+        ce_days,
+        high_do,
+        active_day_threshold=shared_threshold,
+        do_rate_high_low_threshold=shared_do_rate_threshold,
+        analysis_mask=analysis_mask,
+        high_do_is_rate=True,
+    )
+
+    lon_edges = np.asarray(grid['lon_edges'], dtype=float)
+    lat_edges = np.asarray(grid['lat_edges'], dtype=float)
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+
+    ace_map = ace_stats['association_map']
+    ce_map = ce_stats['association_map']
+
+    vmax = np.nanmax(np.abs(np.concatenate([
+        ace_map[np.isfinite(ace_map)],
+        ce_map[np.isfinite(ce_map)],
+    ]))) if (np.any(np.isfinite(ace_map)) or np.any(np.isfinite(ce_map))) else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    crosses_dateline = bool(grid.get('crosses_dateline', False))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(20, 8),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    grid_color = _BASEMAP_COLORS['grid']
+
+    panel_defs = [
+        ('ACE', ace_map, ace_stats),
+        ('CE', ce_map, ce_stats),
+    ]
+
+    mappables = []
+    for ax, (title, amap, st) in zip(axes, panel_defs):
+        ax.set_facecolor(base_ocean)
+        ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        hm = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            amap,
+            cmap='RdBu_r',
+            norm=Normalize(vmin=-vmax, vmax=vmax),
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        mappables.append(hm)
+        forward_uplift = st.get('do_rate_uplift_pct_eddy_active_vs_inactive', np.nan)
+        reverse_uplift = st.get('eddy_days_uplift_pct_do_rate_high_vs_low', np.nan)
+        ax.set_title(
+            (
+                f"{title}\n"
+                f"DO-rate uplift (eddy high vs low)={forward_uplift:.1f}%\n"
+                f"Eddy-days uplift (DO-rate high vs low)={reverse_uplift:.1f}% | "
+                f"rho={st['spearman_rho']:.3f}"
+            ),
+            fontsize=12,
+        )
+        ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+
+    cbar = fig.colorbar(mappables[0], ax=axes, orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar.set_label('Grid-wise Association Index (z(log1p(EddyDays))*z(HighDORate))', fontsize=11)
+
+    fig.suptitle(
+        (
+            f"Eddy - High DO Association ({meta.get('region_key', 'region')}, "
+            f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
+            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+            f" | eddy-days threshold ≥ {shared_threshold:g} day"
+            f" | DO-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
+        ),
+        fontsize=14,
+    )
+
+    region_slug = _current_region_key()
+    if output_dir is None:
+        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+    else:
+        output_dir = Path(output_dir)
+
+    prefix_safe = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_prefix).strip())
+    if not prefix_safe:
+        prefix_safe = 'Euler_Grid_EddyDays'
+
+    out = {
+        'active_day_threshold': float(shared_threshold),
+        'do_rate_high_low_threshold': float(shared_do_rate_threshold) if shared_do_rate_threshold is not None else np.nan,
+        'n_cells_analysis': int(np.count_nonzero(analysis_mask)) if analysis_mask is not None else int(np.size(high_do)),
+        'ace': {k: v for k, v in ace_stats.items() if k != 'association_map'},
+        'ce': {k: v for k, v in ce_stats.items() if k != 'association_map'},
+        'primary_metric_name': 'do_rate_uplift_pct_eddy_active_vs_inactive',
+        'reverse_metric_name': 'eddy_days_uplift_pct_do_rate_high_vs_low',
+        'metric': 'uplift_pct_mean_on_occurrence_rate',
+        'high_do_metric': 'occurrence_rate',
+    }
+    if threshold_scan is not None and not threshold_scan.empty:
+        out['threshold_scan'] = threshold_scan.to_dict(orient='records')
+
+    if save_fig:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        fname = output_dir / (
+            f"{prefix_safe}_Association_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+        )
+        fig.savefig(fname, dpi=300, bbox_inches='tight')
+        out['figure'] = str(fname)
+        print(f"Association figure saved: {fname}")
+
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def run_euler_grid_analysis(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    grid_step_deg: float = 1.0,
+    do_threshold: float | None = None,
+    output_prefix: str = 'Euler_Grid_EddyDays',
+    save_fig: bool = False,
+    show_fig: bool = True,
+    save_data: bool = False,
+    run_association: bool = True,
+    active_day_threshold: float | str | None = 'auto',
+    do_rate_high_low_threshold: float | str | None = 'auto',
+    min_group_cells: int = 20,
+    anomaly_min_depth: float | None = None,
+    meta_output_root: str | Path | None = None,
+) -> dict:
+    """执行欧拉网格统计与关联分析流程。
+
+    流程：
+      1. 调用 `build_euler_grid_summary` 生成 ACE/CE 天数与高 DO 出现率网格；
+      2. 调用 `plot_euler_grid_summary` 绘制/保存三联图与网格数据；
+      3. 可选调用 `analyze_euler_ace_ce_association` 生成关联图与统计指标。
+
+    参数：
+        start_year / end_year: 统计年份范围（闭区间）。
+        grid_step_deg: 网格分辨率（度）。
+        do_threshold: ΔDO 阈值；None 时使用配置默认值。
+        output_prefix: 输出文件名前缀（默认 'Euler_Grid_EddyDays'）。
+        save_fig / show_fig / save_data: 图像与数据输出控制。
+        run_association: 是否执行 ACE/CE 与高 DO 出现率关联分析。
+        active_day_threshold: 关联分析中 eddy-active 分组阈值；可传数值或 'auto'。
+        do_rate_high_low_threshold: 关联分析中 DO-rate 高低分组阈值；可传数值或 'auto'。
+        min_group_cells: 自动阈值扫描时每组最小网格数。
+        anomaly_min_depth: 异常最小深度阈值；None 时使用配置默认值。
+        meta_output_root: META 轨迹数据根目录（可选覆盖配置路径）。
+
+    返回：
+        dict: {
+            'summary': 网格统计结果（原始矩阵与元信息），
+            'outputs': 三联图/网格数据输出路径，
+            'association': 关联分析结果（若 run_association=False 则为 None）
+        }
+    """
+    summary = build_euler_grid_summary(
+        start_year=start_year,
+        end_year=end_year,
+        grid_step_deg=grid_step_deg,
+        do_threshold=do_threshold,
+        anomaly_min_depth=anomaly_min_depth,
+        meta_output_root=meta_output_root,
+    )
+    outputs = plot_euler_grid_summary(
+        summary,
+        save_fig=save_fig,
+        show_fig=show_fig,
+        save_data=save_data,
+        output_prefix=output_prefix,
+    )
+    assoc = None
+    if run_association:
+        assoc = analyze_euler_ace_ce_association(
+            summary,
+            show_fig=show_fig,
+            save_fig=save_fig,
+            output_prefix=output_prefix,
+            active_day_threshold=active_day_threshold,
+            do_rate_high_low_threshold=do_rate_high_low_threshold,
+            min_group_cells=min_group_cells,
+        )
+    return {'summary': summary, 'outputs': outputs, 'association': assoc}
 
 def calculate_delta_do(
     data: pd.DataFrame,
