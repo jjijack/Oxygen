@@ -1,17 +1,20 @@
 # 数据路径配置
+# version 1.3 变更：
+#   - 新增 glorys_processed：GLORYS 处理后产物目录（如 EKE zarr 缓存），默认 ./GLORYS_processed。
 # version 1.2 变更：
 #   - 新增 plots_output（绘图输出根目录；默认 ./plot_outputs）。
 #   - 新增 gpd_world_shp：本地 Natural Earth 底图路径（避免使用已弃用的 geopandas.datasets 并消除告警）。
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.2
+version: 1.3
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
   argo_parquet: ./Argo_data
   argo_mat_input: ./Argo_addFloat
   glorys_root: ../copernicus/GLORYS
+  glorys_processed: ./GLORYS_processed
   meta_root: ../META3.2_DT_allsat
   META_tracks_root: ./META_tracks
   plots_output: ./plot_outputs

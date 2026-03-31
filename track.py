@@ -93,6 +93,7 @@ tmp_parquet_path = Path(_PATHS_CFG.get('paths', {}).get('argo_intermediate', './
 argo_path = Path(_PATHS_CFG.get('paths', {}).get('argo_parquet', './Argo_data'))
 argo_mat_input_path = Path(_PATHS_CFG.get('paths', {}).get('argo_mat_input', './Argo_addFloat'))
 Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLORYS')
+glorys_processed_root = Path(_PATHS_CFG.get('paths', {}).get('glorys_processed', './GLORYS_processed'))
 META_root_path = Path(_PATHS_CFG.get('paths', {}).get('meta_root', '../META3.2_DT_allsat'))
 plots_output_root = Path(_PATHS_CFG.get('paths', {}).get('plots_output', './plot_outputs'))
 
@@ -7509,6 +7510,404 @@ def _load_meta_daily_points_for_years(
     return df[['track_id', 'date', 'center_lon', 'center_lat']]
 
 
+def build_glorys_eke_native_grid(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    depth: float | int = 0.0,
+    dask_scheduler: str = 'processes',
+    dask_workers: int | None = None,
+    dask_memory_limit: str | None = None,
+    dask_batch_size: int = 32,
+    verbose: bool = True,
+) -> dict:
+    """在 GLORYS 原始网格上计算时段平均 EKE。
+
+    功能:
+        按天读取 GLORYS 的 uo/vo，在目标深度层计算
+        EKE = 0.5 * (u'^2 + v'^2)，并在时间维上聚合。
+
+    参数:
+        start_year, end_year: 年份范围（闭区间）。
+        depth: 目标深度（米），按最近深度层提取。
+        dask_scheduler: distributed 模式调度器（'threads'|'processes'）。
+        dask_workers: worker 数；None 自动估计。
+        dask_memory_limit: 每 worker 内存上限（如 '4GB'、'6GB'）。
+        dask_batch_size: 分批提交任务大小，用于限制同时在队列中的 futures 数量。
+        verbose: 是否打印进度。
+
+    返回:
+        dict，含 'lon'、'lat'、'eke'、'count'、'meta'。
+    """
+    if end_year < start_year:
+        raise ValueError("end_year 必须大于等于 start_year")
+
+    dates = pd.date_range(
+        start=pd.Timestamp(year=int(start_year), month=1, day=1),
+        end=pd.Timestamp(year=int(end_year), month=12, day=31),
+        freq='D',
+    )
+
+    file_pairs: list[tuple[pd.Timestamp, str]] = []
+    for dt in dates:
+        try:
+            file_pairs.append((pd.Timestamp(dt), get_glorys_filepath(dt)))
+        except Exception:
+            continue
+
+    if not file_pairs:
+        raise RuntimeError("未找到可用 GLORYS 文件，无法计算 EKE")
+
+    lon_raw = None
+    lat_raw = None
+    for _, nc_path in file_pairs:
+        try:
+            with Dataset(nc_path, 'r') as ds0:
+                lon_raw = np.asarray(ds0.variables['longitude'][:], dtype=float)
+                lat_raw = np.asarray(ds0.variables['latitude'][:], dtype=float)
+                break
+        except Exception:
+            continue
+
+    if lon_raw is None or lat_raw is None:
+        raise RuntimeError("无法读取 GLORYS 网格坐标，无法计算 EKE")
+
+    def _daily_stats(nc_path: str, target_depth: float):
+        try:
+            with Dataset(nc_path, 'r') as ds:
+                gdep = np.asarray(ds.variables['depth'][:], dtype=float)
+                if gdep.size == 0:
+                    return None
+
+                k = int(np.argmin(np.abs(gdep - float(target_depth))))
+                u = np.asarray(np.ma.filled(ds.variables['uo'][0, k, :, :], np.nan), dtype=float)
+                v = np.asarray(np.ma.filled(ds.variables['vo'][0, k, :, :], np.nan), dtype=float)
+
+                valid = np.isfinite(u) & np.isfinite(v)
+                if not np.any(valid):
+                    return None
+
+                su = np.zeros_like(u, dtype=float)
+                sv = np.zeros_like(v, dtype=float)
+                su2 = np.zeros_like(u, dtype=float)
+                sv2 = np.zeros_like(v, dtype=float)
+                cc = np.zeros_like(u, dtype=float)
+                su[valid] = u[valid]
+                sv[valid] = v[valid]
+                su2[valid] = u[valid] * u[valid]
+                sv2[valid] = v[valid] * v[valid]
+                cc[valid] = 1.0
+                return su, sv, su2, sv2, cc
+        except Exception:
+            return None
+
+    sum_u = None
+    sum_v = None
+    sum_u2 = None
+    sum_v2 = None
+    count = None
+    n_used = 0
+    total_tasks = len(file_pairs)
+
+    def _accumulate(item):
+        nonlocal sum_u, sum_v, sum_u2, sum_v2, count, n_used
+        if item is None:
+            return
+        su, sv, su2, sv2, cc = item
+        if sum_u is None:
+            sum_u = np.zeros_like(su, dtype=float)
+            sum_v = np.zeros_like(sv, dtype=float)
+            sum_u2 = np.zeros_like(su2, dtype=float)
+            sum_v2 = np.zeros_like(sv2, dtype=float)
+            count = np.zeros_like(cc, dtype=float)
+        if su.shape != sum_u.shape:
+            return
+        sum_u += su
+        sum_v += sv
+        sum_u2 += su2
+        sum_v2 += sv2
+        count += cc
+        n_used += 1
+
+    depth_f = float(depth)
+    batch_size = max(1, int(dask_batch_size))
+    worker_count = int(dask_workers) if dask_workers is not None else max(1, (os.cpu_count() or 1))
+    sched = str(dask_scheduler).lower()
+    processes = (sched == 'processes')
+    cluster = LocalCluster(
+        n_workers=worker_count,
+        threads_per_worker=1,
+        processes=processes,
+        memory_limit=dask_memory_limit or 'auto',
+    )
+    client = Client(cluster)
+    pbar = tqdm(
+        total=total_tasks,
+        desc='EKE calculation',
+        unit='day',
+        dynamic_ncols=True,
+        disable=not verbose,
+    )
+    try:
+        done_tasks = 0
+        for i in range(0, len(file_pairs), batch_size):
+            batch = file_pairs[i:i + batch_size]
+            futures = [client.submit(_daily_stats, path, depth_f) for _, path in batch]
+            for fut in as_completed(futures):
+                done_tasks += 1
+                try:
+                    _accumulate(fut.result())
+                except Exception:
+                    pass
+                pbar.update(1)
+    finally:
+        pbar.close()
+        client.close()
+        cluster.close()
+
+    if sum_u is None or count is None:
+        raise RuntimeError("未读取到可用 GLORYS 数据，无法计算 EKE")
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean_u = np.where(count > 0, sum_u / count, np.nan)
+        mean_v = np.where(count > 0, sum_v / count, np.nan)
+        var_u = np.where(count > 0, sum_u2 / count - mean_u * mean_u, np.nan)
+        var_v = np.where(count > 0, sum_v2 / count - mean_v * mean_v, np.nan)
+        eke = 0.5 * (var_u + var_v)
+
+    eke = np.where(eke >= 0, eke, np.nan)
+
+    if verbose:
+        print(
+            f"[EKE] Native grid done: {start_year}-{end_year}, depth~{float(depth):g} m, "
+            f"valid days={n_used}"
+        )
+
+    return {
+        'lon': np.asarray(lon_raw, dtype=float),
+        'lat': np.asarray(lat_raw, dtype=float),
+        'eke': np.asarray(eke, dtype=float),
+        'count': np.asarray(count, dtype=float),
+        'meta': {
+            'start_year': int(start_year),
+            'end_year': int(end_year),
+            'depth': float(depth),
+            'n_days_used': int(n_used),
+            'dask_scheduler': str(dask_scheduler),
+            'dask_memory_limit': str(dask_memory_limit) if dask_memory_limit is not None else None,
+        },
+    }
+
+
+def remap_glorys_eke_to_euler_grid(
+    eke_native: dict,
+    *,
+    grid_step_deg: float = 1.0,
+    method: str = 'linear',
+) -> dict:
+    """将 GLORYS 原网格 EKE 插值到当前区域的欧拉网格（默认 1°）。"""
+    lon_src = np.asarray(eke_native['lon'], dtype=float)
+    lat_src = np.asarray(eke_native['lat'], dtype=float)
+    eke_src = np.asarray(eke_native['eke'], dtype=float)
+
+    if lon_src.ndim != 1 or lat_src.ndim != 1 or eke_src.ndim != 2:
+        raise ValueError("eke_native 的 lon/lat/eke 维度不正确")
+    if eke_src.shape != (lat_src.size, lon_src.size):
+        raise ValueError("eke_native['eke'] 形状必须为 (n_lat, n_lon)")
+
+    lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(grid_step_deg=grid_step_deg)
+    lon_ref = float(grid_meta['lon_start_continuous'])
+    crosses_dateline = bool(grid_meta['crosses_dateline'])
+
+    lon_norm = _normalize_lon_array(lon_src)
+    if crosses_dateline:
+        lon_work = lon_norm.copy()
+        lon_work[lon_work < lon_ref] += 360.0
+    else:
+        lon_work = lon_norm.copy()
+
+    sort_idx = np.argsort(lon_work)
+    lon_sorted = lon_work[sort_idx]
+    eke_sorted = eke_src[:, sort_idx]
+
+    lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
+    lon_centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])
+    tgt_lon_2d, tgt_lat_2d = np.meshgrid(lon_centers, lat_centers)
+
+    interp = RegularGridInterpolator(
+        (lat_src, lon_sorted),
+        eke_sorted,
+        method=method,
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    pts = np.column_stack([tgt_lat_2d.ravel(), tgt_lon_2d.ravel()])
+    eke_grid = interp(pts).reshape(tgt_lat_2d.shape)
+
+    lon_mask = _region_lon_mask(lon_centers, lonmin, lonmax)
+    lat_mask = (lat_centers >= latmin) & (lat_centers <= latmax)
+    region_mask = lat_mask[:, None] & lon_mask[None, :]
+    eke_grid = np.where(region_mask, eke_grid, np.nan)
+
+    return {
+        'eke_grid': np.asarray(eke_grid, dtype=float),
+        'grid': {
+            'lon_edges': lon_edges,
+            'lat_edges': lat_edges,
+            **grid_meta,
+        },
+        'meta': {
+            **eke_native.get('meta', {}),
+            'grid_step_deg': float(grid_step_deg),
+            'remap_method': str(method),
+        },
+    }
+
+
+def build_euler_eke_grid(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    depth: float | int = 0.0,
+    grid_step_deg: float = 1.0,
+    method: str = 'linear',
+    dask_scheduler: str = 'processes',
+    dask_workers: int | None = None,
+    dask_memory_limit: str | None = None,
+    dask_batch_size: int = 32,
+    verbose: bool = True,
+) -> dict:
+    """一站式计算：GLORYS 原网格 EKE -> 欧拉网格 EKE。"""
+    native = build_glorys_eke_native_grid(
+        start_year=start_year,
+        end_year=end_year,
+        depth=depth,
+        dask_scheduler=dask_scheduler,
+        dask_workers=dask_workers,
+        dask_memory_limit=dask_memory_limit,
+        dask_batch_size=dask_batch_size,
+        verbose=verbose,
+    )
+    remapped = remap_glorys_eke_to_euler_grid(
+        native,
+        grid_step_deg=grid_step_deg,
+        method=method,
+    )
+    return {
+        'native': native,
+        'euler': remapped,
+    }
+
+
+def export_glorys_eke_native_dask(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    depth: float | int = 0.0,
+    output_path: str | Path | None = None,
+    chunks: tuple[int, int] = (256, 256),
+    dask_scheduler: str = 'processes',
+    dask_workers: int | None = 8,
+    dask_memory_limit: str | None = '6GB',
+    dask_batch_size: int = 16,
+    overwrite: bool = False,
+    verbose: bool = True,
+) -> str:
+    """使用 Dask 计算 GLORYS 原始分辨率 EKE 并保存到本地 zarr。
+
+    功能:
+        先调用 build_glorys_eke_native_grid 计算原始分辨率 EKE，
+        再写入 zarr（默认 GLORYS_processed/eke.zarr）。
+        默认参数为 8核 + 内存受限预设。
+
+    参数:
+        start_year, end_year: 年份范围（闭区间）。
+        depth: 目标深度（米）。
+        output_path: 输出 zarr 路径；None 使用默认目录。
+        chunks: zarr 二维分块大小（lat, lon）。
+        dask_scheduler, dask_workers, dask_memory_limit,
+        dask_batch_size: 并行与内存控制参数。
+        overwrite: 输出已存在时是否覆盖。
+        verbose: 是否打印进度。
+    """
+    if output_path is None:
+        output_path = glorys_processed_root / 'eke.zarr'
+    out_path = Path(output_path)
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(f"EKE 文件已存在: {out_path}. 如需覆盖请设置 overwrite=True")
+
+    native = build_glorys_eke_native_grid(
+        start_year=start_year,
+        end_year=end_year,
+        depth=depth,
+        dask_scheduler=dask_scheduler,
+        dask_workers=dask_workers,
+        dask_memory_limit=dask_memory_limit,
+        dask_batch_size=dask_batch_size,
+        verbose=verbose,
+    )
+
+    try:
+        import zarr  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("zarr 未安装，无法写入 zarr 格式。") from exc
+
+    if out_path.exists():
+        if out_path.is_dir():
+            pass
+        else:
+            raise FileExistsError(f"输出路径已存在且不是目录: {out_path}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    root = zarr.open_group(out_path, mode='w')
+    lon_arr = np.asarray(native['lon'], dtype=float)
+    lat_arr = np.asarray(native['lat'], dtype=float)
+    eke_arr = np.asarray(native['eke'], dtype=float)
+    cnt_arr = np.asarray(native['count'], dtype=float)
+
+    # 显式提供 shape/dtype 以兼容 zarr v3 的 create_dataset 签名。
+    ds_lon = root.create_dataset('lon', shape=lon_arr.shape, dtype=lon_arr.dtype, chunks=(lon_arr.size,))
+    ds_lat = root.create_dataset('lat', shape=lat_arr.shape, dtype=lat_arr.dtype, chunks=(lat_arr.size,))
+    ds_eke = root.create_dataset('eke', shape=eke_arr.shape, dtype=eke_arr.dtype, chunks=chunks)
+    ds_count = root.create_dataset('count', shape=cnt_arr.shape, dtype=cnt_arr.dtype, chunks=chunks)
+
+    ds_lon[...] = lon_arr
+    ds_lat[...] = lat_arr
+    ds_eke[...] = eke_arr
+    ds_count[...] = cnt_arr
+    for key, val in native.get('meta', {}).items():
+        root.attrs[str(key)] = val
+
+    if verbose:
+        print(f"[EKE] Saved native file: {out_path}")
+    return str(out_path)
+
+
+def load_glorys_eke_native(file_path: str | Path) -> dict:
+    """从本地 zarr 文件加载 GLORYS 原始分辨率 EKE。"""
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"未找到本地 EKE 文件: {p}。请先运行 export_glorys_eke_native_dask(...) 生成。"
+        )
+    if not (p.is_dir() or p.suffix.lower() == '.zarr'):
+        raise ValueError("仅支持读取 zarr 目录作为 EKE 原始分辨率缓存。")
+
+    try:
+        import zarr  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("zarr 未安装，无法读取 zarr 格式。") from exc
+    root = zarr.open_group(p, mode='r')
+    meta = dict(root.attrs)
+    return {
+        'lon': np.asarray(root['lon'], dtype=float),
+        'lat': np.asarray(root['lat'], dtype=float),
+        'eke': np.asarray(root['eke'], dtype=float),
+        'count': np.asarray(root['count'], dtype=float),
+        'meta': meta,
+    }
+
+
 def build_euler_grid_summary(
     start_year: int,
     end_year: int,
@@ -7785,7 +8184,7 @@ def plot_euler_grid_summary(
     show_fig: bool = True,
     save_data: bool = False,
     output_dir: str | Path | None = None,
-    output_prefix: str = 'Euler_Grid_EddyDays',
+    output_prefix: str = 'EddyDays',
     cmap_eddy: str = 'YlOrRd',
     cmap_do: str = 'Reds',
 ) -> dict:
@@ -7829,16 +8228,7 @@ def plot_euler_grid_summary(
     panel_defs = [
         ('ACE Eddy Days', ace_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
         ('CE Eddy Days', ce_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
-        (
-            (
-                f'High DO Occurrence Rate (depth >= {meta["anomaly_min_depth"]:.0f} m)'
-                if np.isfinite(meta.get('anomaly_min_depth', np.nan)) and meta.get('anomaly_min_depth', np.nan) > 0
-                else 'High DO Occurrence Rate'
-            ),
-            high_do,
-            cmap_do,
-            Normalize(vmin=0.0, vmax=vmax_do),
-        ),
+        ('High DO Occurrence Rate', high_do, cmap_do, Normalize(vmin=0.0, vmax=vmax_do)),
     ]
 
     mappables = []
@@ -7872,7 +8262,12 @@ def plot_euler_grid_summary(
     cbar2.set_label('High DO Occurrence Rate per Grid Cell', fontsize=12)
 
     fig.suptitle(
-        f"Euler Grid Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']}, {meta['grid_step_deg']:.1f}°)",
+        (
+            f"EddyDays & High DO Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']})\n"
+            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+            f" | grid step = {meta['grid_step_deg']:.1f}°"
+        ),
         fontsize=16,
     )
 
@@ -7886,7 +8281,7 @@ def plot_euler_grid_summary(
 
     prefix_safe = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_prefix).strip())
     if not prefix_safe:
-        prefix_safe = 'Euler_Grid_EddyDays'
+        prefix_safe = 'EddyDays'
 
     out = {}
     if save_fig:
@@ -7931,16 +8326,237 @@ def plot_euler_grid_summary(
     return out
 
 
+def _compute_grid_association_core(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    *,
+    analysis_mask: np.ndarray | None = None,
+    active_threshold: float | str | None = 'auto',
+    active_quantile: float = 0.5,
+    active_positive_only: bool = True,
+    x_log_for_map: bool = True,
+    y_log_for_map: bool = True,
+) -> dict:
+    """通用网格双变量关联核心统计。"""
+
+    def _distance_correlation_1d(xv: np.ndarray, yv: np.ndarray) -> float:
+        """计算一维样本的距离相关系数 dCor（范围 [0, 1]）。"""
+        if xv.size < 3 or yv.size < 3:
+            return np.nan
+        a = np.abs(xv[:, None] - xv[None, :])
+        b = np.abs(yv[:, None] - yv[None, :])
+
+        A = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
+        B = b - b.mean(axis=0, keepdims=True) - b.mean(axis=1, keepdims=True) + b.mean()
+
+        dcov2 = float(np.mean(A * B))
+        dvarx2 = float(np.mean(A * A))
+        dvary2 = float(np.mean(B * B))
+        if dvarx2 <= 0 or dvary2 <= 0:
+            return np.nan
+
+        dcor = np.sqrt(max(dcov2, 0.0) / np.sqrt(dvarx2 * dvary2))
+        return float(dcor)
+
+    x2 = np.asarray(x_grid, dtype=float)
+    y2 = np.asarray(y_grid, dtype=float)
+    finite_mask = np.isfinite(x2) & np.isfinite(y2)
+    if analysis_mask is not None:
+        am = np.asarray(analysis_mask, dtype=bool)
+        if am.shape == finite_mask.shape:
+            finite_mask = finite_mask & am
+
+    x = x2[finite_mask]
+    y = y2[finite_mask]
+    if x.size == 0:
+        raise RuntimeError("无可用网格用于关联统计")
+
+    if active_threshold is None or str(active_threshold).lower() == 'auto':
+        if active_positive_only:
+            x_thr_base = x[x > 0]
+        else:
+            x_thr_base = x[np.isfinite(x)]
+        if x_thr_base.size > 0:
+            thr = float(np.quantile(x_thr_base, float(active_quantile)))
+        else:
+            thr = 0.0
+    else:
+        thr = float(active_threshold)
+
+    active = x >= thr
+    inactive = ~active
+    mean_active = np.nanmean(y[active]) if np.any(active) else np.nan
+    mean_inactive = np.nanmean(y[inactive]) if np.any(inactive) else np.nan
+
+    uplift_ratio = np.nan
+    uplift_pct = np.nan
+    if np.isfinite(mean_active) and np.isfinite(mean_inactive) and mean_inactive > 0:
+        uplift_ratio = mean_active / mean_inactive
+        uplift_pct = (uplift_ratio - 1.0) * 100.0
+
+    spearman_rho = np.nan
+    spearman_p = np.nan
+    pearson_r = np.nan
+    pearson_p = np.nan
+    distance_corr = np.nan
+    nz_mask = (x > 0) | (y > 0)
+    x_corr = x[nz_mask]
+    y_corr = y[nz_mask]
+    if x_corr.size >= 3 and np.nanstd(x_corr) > 0 and np.nanstd(y_corr) > 0:
+        try:
+            spearman_rho, spearman_p = spearmanr(x_corr, y_corr)
+        except Exception:
+            spearman_rho, spearman_p = np.nan, np.nan
+        try:
+            pearson_r, pearson_p = pearsonr(x_corr, y_corr)
+        except Exception:
+            pearson_r, pearson_p = np.nan, np.nan
+        try:
+            distance_corr = _distance_correlation_1d(x_corr, y_corr)
+        except Exception:
+            distance_corr = np.nan
+
+    xmap = np.asarray(x2, dtype=float)
+    ymap = np.asarray(y2, dtype=float)
+    xx = np.log1p(np.where(np.isfinite(xmap), np.maximum(xmap, 0.0), np.nan)) if x_log_for_map else np.where(np.isfinite(xmap), xmap, np.nan)
+    yy = np.log1p(np.where(np.isfinite(ymap), np.maximum(ymap, 0.0), np.nan)) if y_log_for_map else np.where(np.isfinite(ymap), ymap, np.nan)
+
+    valid_map = np.isfinite(xx) & np.isfinite(yy)
+    if analysis_mask is not None:
+        am2 = np.asarray(analysis_mask, dtype=bool)
+        if am2.shape == valid_map.shape:
+            valid_map = valid_map & am2
+
+    assoc_map = np.full_like(xx, np.nan, dtype=float)
+    if np.any(valid_map):
+        xmean = np.nanmean(xx[valid_map])
+        ymean = np.nanmean(yy[valid_map])
+        xstd = np.nanstd(xx[valid_map])
+        ystd = np.nanstd(yy[valid_map])
+        if xstd > 0 and ystd > 0:
+            zx = (xx - xmean) / xstd
+            zy = (yy - ymean) / ystd
+            assoc_map[valid_map] = zx[valid_map] * zy[valid_map]
+
+    return {
+        'x': x,
+        'y': y,
+        'active_threshold': float(thr),
+        'active_mask': active,
+        'inactive_mask': inactive,
+        'mean_y_active': float(mean_active) if np.isfinite(mean_active) else np.nan,
+        'mean_y_inactive': float(mean_inactive) if np.isfinite(mean_inactive) else np.nan,
+        'uplift_ratio': float(uplift_ratio) if np.isfinite(uplift_ratio) else np.nan,
+        'uplift_pct': float(uplift_pct) if np.isfinite(uplift_pct) else np.nan,
+        'spearman_rho': float(spearman_rho) if np.isfinite(spearman_rho) else np.nan,
+        'spearman_p': float(spearman_p) if np.isfinite(spearman_p) else np.nan,
+        'pearson_r': float(pearson_r) if np.isfinite(pearson_r) else np.nan,
+        'pearson_p': float(pearson_p) if np.isfinite(pearson_p) else np.nan,
+        'distance_corr': float(distance_corr) if np.isfinite(distance_corr) else np.nan,
+        'association_map': assoc_map,
+        'n_cells_total': int(x.size),
+        'n_cells_active': int(np.count_nonzero(active)),
+        'n_cells_inactive': int(np.count_nonzero(inactive)),
+    }
+
+
+def _plot_two_panel_association_figure(
+    *,
+    lon_edges: np.ndarray,
+    lat_edges: np.ndarray,
+    left_mat: np.ndarray,
+    right_mat: np.ndarray,
+    left_title: str,
+    right_title: str,
+    left_cmap: str,
+    right_cmap: str,
+    left_norm: Normalize,
+    right_norm: Normalize,
+    left_cbar_label: str,
+    right_cbar_label: str,
+    suptitle: str,
+) -> tuple[plt.Figure, np.ndarray]:
+    """通用双面板地理图绘制助手。"""
+    crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(20, 8),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    grid_color = _BASEMAP_COLORS['grid']
+
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+    panels = [
+        (left_mat, left_title, left_cmap, left_norm),
+        (right_mat, right_title, right_cmap, right_norm),
+    ]
+    mappables = []
+    for ax, (mat, title, cmap, norm) in zip(axes, panels):
+        ax.set_facecolor(base_ocean)
+        ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+        hm = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            mat,
+            cmap=cmap,
+            norm=norm,
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        mappables.append(hm)
+        ax.set_title(title, fontsize=12)
+        ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+
+    cbar0 = fig.colorbar(mappables[0], ax=axes[0], orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar0.set_label(left_cbar_label, fontsize=11)
+    cbar1 = fig.colorbar(mappables[1], ax=axes[1], orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar1.set_label(right_cbar_label, fontsize=11)
+
+    fig.suptitle(suptitle, fontsize=14)
+    return fig, axes
+
+
 def _single_eddy_do_association(
     eddy_grid: np.ndarray,
     high_do_grid: np.ndarray,
     *,
-    active_day_threshold: float = 1.0,
+    active_threshold: float = 1.0,
     do_rate_high_low_threshold: float | None = None,
     analysis_mask: np.ndarray | None = None,
     high_do_is_rate: bool = False,
 ) -> dict:
     """计算单一涡旋类型（ACE 或 CE）与高 DO 的双向关联统计。"""
+
+    def _distance_correlation_1d(xv: np.ndarray, yv: np.ndarray) -> float:
+        if xv.size < 3 or yv.size < 3:
+            return np.nan
+        a = np.abs(xv[:, None] - xv[None, :])
+        b = np.abs(yv[:, None] - yv[None, :])
+        A = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
+        B = b - b.mean(axis=0, keepdims=True) - b.mean(axis=1, keepdims=True) + b.mean()
+        dcov2 = float(np.mean(A * B))
+        dvarx2 = float(np.mean(A * A))
+        dvary2 = float(np.mean(B * B))
+        if dvarx2 <= 0 or dvary2 <= 0:
+            return np.nan
+        return float(np.sqrt(max(dcov2, 0.0) / np.sqrt(dvarx2 * dvary2)))
+
     x = np.asarray(eddy_grid, dtype=float).ravel()
     y = np.asarray(high_do_grid, dtype=float).ravel()
     finite_mask = np.isfinite(x) & np.isfinite(y)
@@ -7951,7 +8567,7 @@ def _single_eddy_do_association(
     x = x[finite_mask]
     y = y[finite_mask]
 
-    active = x >= float(active_day_threshold)
+    active = x >= float(active_threshold)
     inactive = ~active
 
     mean_active = np.nanmean(y[active]) if np.any(active) else np.nan
@@ -7997,6 +8613,7 @@ def _single_eddy_do_association(
     spearman_p = np.nan
     pearson_r = np.nan
     pearson_p = np.nan
+    distance_corr = np.nan
     nz_mask = (x > 0) | (y > 0)
     x_corr = x[nz_mask]
     y_corr = y[nz_mask]
@@ -8009,6 +8626,10 @@ def _single_eddy_do_association(
             pearson_r, pearson_p = pearsonr(x_corr, y_corr)
         except Exception:
             pearson_r, pearson_p = np.nan, np.nan
+        try:
+            distance_corr = _distance_correlation_1d(x_corr, y_corr)
+        except Exception:
+            distance_corr = np.nan
 
     # 网格关联强度图：标准化后逐格乘积，正值代表共同高/共同低
     x2 = np.asarray(eddy_grid, dtype=float)
@@ -8073,6 +8694,7 @@ def _single_eddy_do_association(
         'spearman_p': float(spearman_p) if np.isfinite(spearman_p) else np.nan,
         'pearson_r': float(pearson_r) if np.isfinite(pearson_r) else np.nan,
         'pearson_p': float(pearson_p) if np.isfinite(pearson_p) else np.nan,
+        'distance_corr': float(distance_corr) if np.isfinite(distance_corr) else np.nan,
         'association_map': assoc_map,
     }
 
@@ -8203,13 +8825,13 @@ def _scan_active_thresholds(
 def analyze_euler_ace_ce_association(
     summary: dict,
     *,
-    show_fig: bool = True,
-    save_fig: bool = False,
-    output_dir: str | Path | None = None,
-    output_prefix: str = 'Euler_Grid_EddyDays',
-    active_day_threshold: float | str | None = 'auto',
+    active_threshold: float | str | None = 'auto',
     do_rate_high_low_threshold: float | str | None = 'auto',
     min_group_cells: int = 20,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_prefix: str = 'EddyDays',
+    output_dir: str | Path | None = None,
 ) -> dict:
     """在同一网格上分析并绘制 ACE/CE 与 High DO 出现率的关联性。
 
@@ -8226,8 +8848,8 @@ def analyze_euler_ace_ce_association(
     grid = summary['grid']
 
     threshold_scan = None
-    shared_threshold = float(active_day_threshold) if isinstance(active_day_threshold, (int, float)) else 1.0
-    if active_day_threshold is None or str(active_day_threshold).lower() == 'auto':
+    shared_threshold = float(active_threshold) if isinstance(active_threshold, (int, float)) else 1.0
+    if active_threshold is None or str(active_threshold).lower() == 'auto':
         shared_threshold, threshold_scan = _scan_active_thresholds(
             ace_days,
             ce_days,
@@ -8251,7 +8873,7 @@ def analyze_euler_ace_ce_association(
     ace_stats = _single_eddy_do_association(
         ace_days,
         high_do,
-        active_day_threshold=shared_threshold,
+        active_threshold=shared_threshold,
         do_rate_high_low_threshold=shared_do_rate_threshold,
         analysis_mask=analysis_mask,
         high_do_is_rate=True,
@@ -8259,7 +8881,7 @@ def analyze_euler_ace_ce_association(
     ce_stats = _single_eddy_do_association(
         ce_days,
         high_do,
-        active_day_threshold=shared_threshold,
+        active_threshold=shared_threshold,
         do_rate_high_low_threshold=shared_do_rate_threshold,
         analysis_mask=analysis_mask,
         high_do_is_rate=True,
@@ -8325,12 +8947,18 @@ def analyze_euler_ace_ce_association(
         mappables.append(hm)
         forward_uplift = st.get('do_rate_uplift_pct_eddy_active_vs_inactive', np.nan)
         reverse_uplift = st.get('eddy_days_uplift_pct_do_rate_high_vs_low', np.nan)
+        rho = st.get('spearman_rho', np.nan)
+        rho_p = st.get('spearman_p', np.nan)
+        dcor = st.get('distance_corr', np.nan)
+        rho_p_label = "p=nan"
+        if np.isfinite(rho_p):
+            rho_p_label = "p<0.0001" if rho_p < 1e-4 else f"p={rho_p:.4f}"
         ax.set_title(
             (
                 f"{title}\n"
                 f"DO-rate uplift (eddy high vs low)={forward_uplift:.1f}%\n"
-                f"Eddy-days uplift (DO-rate high vs low)={reverse_uplift:.1f}% | "
-                f"rho={st['spearman_rho']:.3f}"
+                f"Eddy-days uplift (DO-rate high vs low)={reverse_uplift:.1f}%\n"
+                f"{rho_p_label} | rho={rho:.3f} | dCor={dcor:.3f}"
             ),
             fontsize=12,
         )
@@ -8359,21 +8987,68 @@ def analyze_euler_ace_ce_association(
 
     prefix_safe = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_prefix).strip())
     if not prefix_safe:
-        prefix_safe = 'Euler_Grid_EddyDays'
+        prefix_safe = 'EddyDays'
+
+    def _compact(st: dict) -> dict:
+        return {
+            'n_cells_active': int(st.get('n_cells_eddy_active', st.get('n_cells_active', 0))),
+            'n_cells_inactive': int(st.get('n_cells_eddy_inactive', st.get('n_cells_inactive', 0))),
+            'uplift': {
+                'do_rate_active_vs_inactive_ratio': float(st.get('do_rate_ratio_eddy_active_vs_inactive', np.nan)),
+                'do_rate_active_vs_inactive_pct': float(st.get('do_rate_uplift_pct_eddy_active_vs_inactive', np.nan)),
+                'eddy_days_do_rate_high_vs_low_ratio': float(st.get('eddy_days_ratio_do_rate_high_vs_low', np.nan)),
+                'eddy_days_do_rate_high_vs_low_pct': float(st.get('eddy_days_uplift_pct_do_rate_high_vs_low', np.nan)),
+            },
+            'corr': {
+                'spearman_rho': float(st.get('spearman_rho', np.nan)),
+                'spearman_p': float(st.get('spearman_p', np.nan)),
+                'pearson_r': float(st.get('pearson_r', np.nan)),
+                'pearson_p': float(st.get('pearson_p', np.nan)),
+                'distance_corr': float(st.get('distance_corr', np.nan)),
+            },
+        }
+
+    ace_compact = _compact(ace_stats)
+    ce_compact = _compact(ce_stats)
+    fwd_mean = float(np.nanmean([
+        ace_compact['uplift']['do_rate_active_vs_inactive_pct'],
+        ce_compact['uplift']['do_rate_active_vs_inactive_pct'],
+    ]))
+    rev_mean = float(np.nanmean([
+        ace_compact['uplift']['eddy_days_do_rate_high_vs_low_pct'],
+        ce_compact['uplift']['eddy_days_do_rate_high_vs_low_pct'],
+    ]))
 
     out = {
-        'active_day_threshold': float(shared_threshold),
-        'do_rate_high_low_threshold': float(shared_do_rate_threshold) if shared_do_rate_threshold is not None else np.nan,
+        'target': 'eddy_days',
+        'thresholds': {
+            'active': float(shared_threshold),
+            'do_rate_high_low': float(shared_do_rate_threshold) if shared_do_rate_threshold is not None else np.nan,
+        },
         'n_cells_analysis': int(np.count_nonzero(analysis_mask)) if analysis_mask is not None else int(np.size(high_do)),
-        'ace': {k: v for k, v in ace_stats.items() if k != 'association_map'},
-        'ce': {k: v for k, v in ce_stats.items() if k != 'association_map'},
-        'primary_metric_name': 'do_rate_uplift_pct_eddy_active_vs_inactive',
-        'reverse_metric_name': 'eddy_days_uplift_pct_do_rate_high_vs_low',
-        'metric': 'uplift_pct_mean_on_occurrence_rate',
-        'high_do_metric': 'occurrence_rate',
+        'uplift': {
+            'do_rate_active_vs_inactive_pct_mean': fwd_mean,
+            'eddy_days_do_rate_high_vs_low_pct_mean': rev_mean,
+        },
+        'corr': {
+            'spearman_rho_mean': float(np.nanmean([
+                ace_compact['corr']['spearman_rho'],
+                ce_compact['corr']['spearman_rho'],
+            ])),
+            'pearson_r_mean': float(np.nanmean([
+                ace_compact['corr']['pearson_r'],
+                ce_compact['corr']['pearson_r'],
+            ])),
+            'distance_corr_mean': float(np.nanmean([
+                ace_compact['corr']['distance_corr'],
+                ce_compact['corr']['distance_corr'],
+            ])),
+        },
+        'by_type': {
+            'ace': ace_compact,
+            'ce': ce_compact,
+        },
     }
-    if threshold_scan is not None and not threshold_scan.empty:
-        out['threshold_scan'] = threshold_scan.to_dict(orient='records')
 
     if save_fig:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -8393,77 +9068,397 @@ def analyze_euler_ace_ce_association(
     return out
 
 
+def analyze_euler_eke_do_association(
+    summary: dict,
+    eke_euler: dict | np.ndarray,
+    *,
+    active_threshold: float | str | None = 'auto',
+    do_rate_high_low_threshold: float | str | None = 'auto',
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_prefix: str = 'EKE',
+    output_dir: str | Path | None = None,
+) -> dict:
+    """分析欧拉网格 EKE 与高 DO 出现率之间的关系并绘图。
+
+    输出两张图：
+        1) EKE 与 High DO Occurrence Rate 概览图；
+        2) EKE-DO Association 图。
+    同时输出双向 uplift：
+        - 正向：DO-rate uplift (EKE active vs inactive)
+        - 反向：EKE uplift (DO-rate high vs low)
+    """
+    grid = summary['grid']
+    meta = summary.get('meta', {})
+    high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
+    base_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else np.ones_like(high_do, dtype=bool)
+
+    if isinstance(eke_euler, dict):
+        if 'eke_grid' in eke_euler:
+            eke_grid = np.asarray(eke_euler['eke_grid'], dtype=float)
+        elif 'euler' in eke_euler and isinstance(eke_euler['euler'], dict) and 'eke_grid' in eke_euler['euler']:
+            eke_grid = np.asarray(eke_euler['euler']['eke_grid'], dtype=float)
+        else:
+            raise ValueError("eke_euler 字典中未找到 `eke_grid`")
+    else:
+        eke_grid = np.asarray(eke_euler, dtype=float)
+
+    if eke_grid.shape != high_do.shape:
+        raise ValueError("EKE 网格与 high_do 网格形状不一致")
+
+    analysis_mask = base_mask & np.isfinite(eke_grid) & np.isfinite(high_do)
+    core = _compute_grid_association_core(
+        eke_grid,
+        high_do,
+        analysis_mask=analysis_mask,
+        active_threshold=active_threshold,
+        active_quantile=0.5,
+        active_positive_only=True,
+        x_log_for_map=False,
+        y_log_for_map=False,
+    )
+    active_thr = core['active_threshold']
+    mean_active = core['mean_y_active']
+    mean_inactive = core['mean_y_inactive']
+    uplift_pct = core['uplift_pct']
+    uplift_ratio = core['uplift_ratio']
+    spearman_rho = core['spearman_rho']
+    spearman_p = core['spearman_p']
+    pearson_r = core['pearson_r']
+    pearson_p = core['pearson_p']
+    distance_corr = core.get('distance_corr', np.nan)
+    assoc_map = np.asarray(core['association_map'], dtype=float)
+
+    # 反向指标：按 DO-rate 高低分组，比较两组 EKE 均值
+    if do_rate_high_low_threshold is None or str(do_rate_high_low_threshold).lower() == 'auto':
+        y_for_thr = np.asarray(high_do, dtype=float)
+        y_for_thr = y_for_thr[analysis_mask]
+        y_for_thr = y_for_thr[np.isfinite(y_for_thr)]
+        y_for_thr = y_for_thr[y_for_thr > 0]
+        do_rate_thr = float(np.quantile(y_for_thr, 0.5)) if y_for_thr.size > 0 else np.nan
+    else:
+        do_rate_thr = float(do_rate_high_low_threshold)
+
+    if np.isfinite(do_rate_thr):
+        do_high_mask = analysis_mask & (high_do >= do_rate_thr)
+    else:
+        do_high_mask = np.zeros_like(high_do, dtype=bool)
+    do_low_mask = analysis_mask & (~do_high_mask)
+
+    mean_eke_do_rate_high = np.nanmean(eke_grid[do_high_mask]) if np.any(do_high_mask) else np.nan
+    mean_eke_do_rate_low = np.nanmean(eke_grid[do_low_mask]) if np.any(do_low_mask) else np.nan
+    eke_uplift_ratio = np.nan
+    eke_uplift_pct = np.nan
+    if np.isfinite(mean_eke_do_rate_low) and mean_eke_do_rate_low > 0 and np.isfinite(mean_eke_do_rate_high):
+        eke_uplift_ratio = mean_eke_do_rate_high / mean_eke_do_rate_low
+        eke_uplift_pct = (eke_uplift_ratio - 1.0) * 100.0
+
+    lon_edges = np.asarray(grid['lon_edges'], dtype=float)
+    lat_edges = np.asarray(grid['lat_edges'], dtype=float)
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+
+    # 图1：EKE + High DO 出现率概览
+    eke_vals = eke_grid[analysis_mask]
+    eke_vals = eke_vals[np.isfinite(eke_vals)]
+    eke_vmax = float(np.nanquantile(eke_vals, 0.99)) if eke_vals.size > 0 else np.nan
+    if not np.isfinite(eke_vmax) or eke_vmax <= 0:
+        eke_vmax = float(np.nanmax(eke_grid)) if np.any(np.isfinite(eke_grid)) else 1.0
+    if not np.isfinite(eke_vmax) or eke_vmax <= 0:
+        eke_vmax = 1.0
+
+    do_vmax = float(np.nanmax(high_do)) if np.any(np.isfinite(high_do)) else np.nan
+    if not np.isfinite(do_vmax) or do_vmax <= 0:
+        do_vmax = 1.0
+
+    suptitle_summary = (
+        f"EKE & High DO Summary ({meta.get('region_key', 'region')}, "
+        f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
+        f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+        f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+        f" | EKE threshold ≥ {active_thr:.4e}"
+        f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}"
+    )
+    fig_summary, _ = _plot_two_panel_association_figure(
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        left_mat=eke_grid,
+        right_mat=high_do,
+        left_title='EKE (m² s⁻²)',
+        right_title='High DO Occurrence Rate',
+        left_cmap='YlOrRd',
+        right_cmap='Reds',
+        left_norm=Normalize(vmin=0.0, vmax=eke_vmax),
+        right_norm=Normalize(vmin=0.0, vmax=do_vmax),
+        left_cbar_label='EKE (m² s⁻²)',
+        right_cbar_label='High DO Occurrence Rate per Grid Cell',
+        suptitle=suptitle_summary,
+    )
+
+    # 图2：EKE-DO 关联图
+    vmax_assoc = np.nanmax(np.abs(assoc_map[np.isfinite(assoc_map)])) if np.any(np.isfinite(assoc_map)) else 1.0
+    if not np.isfinite(vmax_assoc) or vmax_assoc <= 0:
+        vmax_assoc = 1.0
+    crosses_dateline = bool(grid.get('crosses_dateline', False))
+    central_lon = 180 if crosses_dateline else 0
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=central_lon)
+
+    fig_assoc, ax = plt.subplots(
+        1,
+        1,
+        figsize=(11, 8),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    grid_color = _BASEMAP_COLORS['grid']
+
+    ax.set_facecolor(base_ocean)
+    ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    hm = ax.pcolormesh(
+        lon_mesh,
+        lat_mesh,
+        assoc_map,
+        cmap='RdBu_r',
+        norm=Normalize(vmin=-vmax_assoc, vmax=vmax_assoc),
+        shading='auto',
+        transform=data_crs,
+        zorder=2,
+    )
+    ax.set_title('EKE-DO Association', fontsize=12)
+    ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+    cbar_assoc = fig_assoc.colorbar(hm, ax=ax, orientation='horizontal', fraction=0.05, pad=0.08)
+    cbar_assoc.set_label('z(EKE) * z(High DO Rate)', fontsize=11)
+    spearman_p_label = "p=nan"
+    if np.isfinite(spearman_p):
+        spearman_p_label = "p<0.0001" if spearman_p < 1e-4 else f"p={spearman_p:.4f}"
+    fig_assoc.suptitle(
+        (
+            f"EKE - High DO Association ({meta.get('region_key', 'region')}, "
+            f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
+            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+            f" | EKE threshold ≥ {active_thr:.4e}"
+            f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}\n"
+            f"DO-rate uplift (EKE high vs low)={uplift_pct:.1f}%"
+            f" | EKE uplift (DO-rate high vs low)={eke_uplift_pct:.1f}%\n"
+            f"{spearman_p_label} | rho={spearman_rho:.3f} | dCor={distance_corr:.3f}"
+        ),
+        fontsize=14,
+    )
+
+    region_slug = _current_region_key()
+    if output_dir is None:
+        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+    else:
+        output_dir = Path(output_dir)
+
+    prefix_safe = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_prefix).strip())
+    if not prefix_safe:
+        prefix_safe = 'EKE'
+
+    out = {
+        'target': 'eke',
+        'thresholds': {
+            'active': float(active_thr),
+            'do_rate_high_low': float(do_rate_thr) if np.isfinite(do_rate_thr) else np.nan,
+        },
+        'n_cells_analysis': int(np.count_nonzero(analysis_mask)),
+        'uplift': {
+            'do_rate_active_vs_inactive_ratio': float(uplift_ratio) if np.isfinite(uplift_ratio) else np.nan,
+            'do_rate_active_vs_inactive_pct': float(uplift_pct) if np.isfinite(uplift_pct) else np.nan,
+            'eke_do_rate_high_vs_low_ratio': float(eke_uplift_ratio) if np.isfinite(eke_uplift_ratio) else np.nan,
+            'eke_do_rate_high_vs_low_pct': float(eke_uplift_pct) if np.isfinite(eke_uplift_pct) else np.nan,
+        },
+        'means': {
+            'do_rate_active': float(mean_active) if np.isfinite(mean_active) else np.nan,
+            'do_rate_inactive': float(mean_inactive) if np.isfinite(mean_inactive) else np.nan,
+            'eke_do_rate_high': float(mean_eke_do_rate_high) if np.isfinite(mean_eke_do_rate_high) else np.nan,
+            'eke_do_rate_low': float(mean_eke_do_rate_low) if np.isfinite(mean_eke_do_rate_low) else np.nan,
+        },
+        'corr': {
+            'spearman_rho': float(spearman_rho) if np.isfinite(spearman_rho) else np.nan,
+            'spearman_p': float(spearman_p) if np.isfinite(spearman_p) else np.nan,
+            'pearson_r': float(pearson_r) if np.isfinite(pearson_r) else np.nan,
+            'pearson_p': float(pearson_p) if np.isfinite(pearson_p) else np.nan,
+            'distance_corr': float(distance_corr) if np.isfinite(distance_corr) else np.nan,
+        },
+    }
+
+    if save_fig:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        fname_summary = output_dir / (
+            f"{prefix_safe}_Summary_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+        )
+        fname_assoc = output_dir / (
+            f"{prefix_safe}_Association_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+        )
+        fig_summary.savefig(fname_summary, dpi=300, bbox_inches='tight')
+        fig_assoc.savefig(fname_assoc, dpi=300, bbox_inches='tight')
+        out['figure_summary'] = str(fname_summary)
+        out['figure_association'] = str(fname_assoc)
+        out['figure'] = str(fname_assoc)
+        print(f"EKE summary figure saved: {fname_summary}")
+        print(f"EKE-DO association figure saved: {fname_assoc}")
+
+    if show_fig:
+        plt.show()
+    plt.close(fig_summary)
+    plt.close(fig_assoc)
+    return out
+
+
 def run_euler_grid_analysis(
     start_year: int = 2002,
     end_year: int = 2022,
     *,
+    analysis_targets: str | list[str] | tuple[str, ...] = ('eke',),
+    run_association: bool = True,
     grid_step_deg: float = 1.0,
     do_threshold: float | None = None,
-    output_prefix: str = 'Euler_Grid_EddyDays',
-    save_fig: bool = False,
-    show_fig: bool = True,
-    save_data: bool = False,
-    run_association: bool = True,
-    active_day_threshold: float | str | None = 'auto',
+    analysis_depth: float | int | None = None,
+    active_threshold: float | str | None = 'auto',
     do_rate_high_low_threshold: float | str | None = 'auto',
     min_group_cells: int = 20,
-    anomaly_min_depth: float | None = None,
+    eke_file_path: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    save_data: bool = False,
+    output_prefix: str = 'EddyDays',
+    eke_output_prefix: str = 'EKE',
     meta_output_root: str | Path | None = None,
 ) -> dict:
     """执行欧拉网格统计与关联分析流程。
 
-    流程：
-      1. 调用 `build_euler_grid_summary` 生成 ACE/CE 天数与高 DO 出现率网格；
-      2. 调用 `plot_euler_grid_summary` 绘制/保存三联图与网格数据；
-      3. 可选调用 `analyze_euler_ace_ce_association` 生成关联图与统计指标。
+        流程：
+            1. 调用 `build_euler_grid_summary` 生成网格统计底图；
+            2. 当 targets 包含 `eddy_days` 时绘制 ACE/CE 三联图；
+            3. 按 `analysis_targets` 可选执行 eddy-days 与 EKE 关联分析。
 
     参数：
         start_year / end_year: 统计年份范围（闭区间）。
+        analysis_targets: 分析内容开关。可选 'eddy_days'、'eke'；支持字符串或列表。
+        run_association: 是否执行关联分析。
         grid_step_deg: 网格分辨率（度）。
         do_threshold: ΔDO 阈值；None 时使用配置默认值。
-        output_prefix: 输出文件名前缀（默认 'Euler_Grid_EddyDays'）。
-        save_fig / show_fig / save_data: 图像与数据输出控制。
-        run_association: 是否执行 ACE/CE 与高 DO 出现率关联分析。
-        active_day_threshold: 关联分析中 eddy-active 分组阈值；可传数值或 'auto'。
+        analysis_depth: 统一分析深度（m），同时用于 DO 异常筛选深度与 EKE 采样深度；None 回退配置默认值。
+        active_threshold: 关联分析中 active 分组阈值；可传数值或 'auto'。
         do_rate_high_low_threshold: 关联分析中 DO-rate 高低分组阈值；可传数值或 'auto'。
         min_group_cells: 自动阈值扫描时每组最小网格数。
-        anomaly_min_depth: 异常最小深度阈值；None 时使用配置默认值。
+        eke_file_path: 本地 EKE 原始分辨率 zarr 路径；None 时默认读取 GLORYS_processed/eke.zarr。
+        show_fig / save_fig / save_data: 图像与数据输出控制。
+        output_prefix: eddy-days 输出文件名前缀（默认 'EddyDays'）。
+        eke_output_prefix: EKE 关联图输出前缀。
         meta_output_root: META 轨迹数据根目录（可选覆盖配置路径）。
 
     返回：
         dict: {
             'summary': 网格统计结果（原始矩阵与元信息），
-            'outputs': 三联图/网格数据输出路径，
-            'association': 关联分析结果（若 run_association=False 则为 None）
+            'outputs': eddy-days 三联图/网格数据输出路径（若未启用则为空字典），
+            'association':
+                - 单目标时：直接返回该目标的关联结果；
+                - 多目标时：返回 {'eddy_days': ..., 'eke': ...} 平级字典；
+            'eke': EKE 网格结果（若未启用则为 None）
         }
     """
+    if isinstance(analysis_targets, str):
+        targets = {analysis_targets.lower().strip()}
+    else:
+        targets = {str(t).lower().strip() for t in analysis_targets}
+    if not targets:
+        targets = {'eke'}
+
+    unified_depth = float(analysis_depth) if analysis_depth is not None else float(_cfg_anomaly_min_depth)
+
     summary = build_euler_grid_summary(
         start_year=start_year,
         end_year=end_year,
         grid_step_deg=grid_step_deg,
         do_threshold=do_threshold,
-        anomaly_min_depth=anomaly_min_depth,
+        anomaly_min_depth=unified_depth,
         meta_output_root=meta_output_root,
     )
-    outputs = plot_euler_grid_summary(
-        summary,
-        save_fig=save_fig,
-        show_fig=show_fig,
-        save_data=save_data,
-        output_prefix=output_prefix,
-    )
-    assoc = None
-    if run_association:
-        assoc = analyze_euler_ace_ce_association(
+    outputs: dict = {}
+    if 'eddy_days' in targets:
+        outputs = plot_euler_grid_summary(
             summary,
-            show_fig=show_fig,
             save_fig=save_fig,
+            show_fig=show_fig,
+            save_data=save_data,
             output_prefix=output_prefix,
-            active_day_threshold=active_day_threshold,
-            do_rate_high_low_threshold=do_rate_high_low_threshold,
-            min_group_cells=min_group_cells,
         )
-    return {'summary': summary, 'outputs': outputs, 'association': assoc}
+
+    if eke_file_path is None:
+        eke_file_path = glorys_processed_root / 'eke.zarr'
+
+    associations: dict[str, dict] = {}
+    eke_bundle = None
+    requested_assoc_targets = [k for k in ('eddy_days', 'eke') if k in targets]
+    if run_association:
+        if 'eddy_days' in targets:
+            eddy_assoc = analyze_euler_ace_ce_association(
+                summary,
+                show_fig=show_fig,
+                save_fig=save_fig,
+                output_prefix=output_prefix,
+                active_threshold=active_threshold,
+                do_rate_high_low_threshold=do_rate_high_low_threshold,
+                min_group_cells=min_group_cells,
+            )
+            associations['eddy_days'] = eddy_assoc
+
+        if 'eke' in targets:
+            eke_native = load_glorys_eke_native(file_path=eke_file_path)
+            eke_euler = remap_glorys_eke_to_euler_grid(
+                eke_native,
+                grid_step_deg=grid_step_deg,
+                method='linear',
+            )
+            eke_bundle = {
+                'source_file': str(eke_file_path),
+                'native': eke_native,
+                'euler': eke_euler,
+            }
+            eke_assoc = analyze_euler_eke_do_association(
+                summary,
+                eke_euler,
+                active_threshold=active_threshold,
+                do_rate_high_low_threshold=do_rate_high_low_threshold,
+                show_fig=show_fig,
+                save_fig=save_fig,
+                output_prefix=eke_output_prefix,
+            )
+            associations['eke'] = eke_assoc
+
+    association_out = None
+    if run_association:
+        if len(requested_assoc_targets) == 1:
+            association_out = associations.get(requested_assoc_targets[0])
+        elif len(requested_assoc_targets) > 1:
+            association_out = {
+                k: associations[k]
+                for k in requested_assoc_targets
+                if k in associations
+            }
+
+    return {
+        'summary': summary,
+        'outputs': outputs,
+        'association': association_out,
+        'eke': eke_bundle,
+    }
 
 def calculate_delta_do(
     data: pd.DataFrame,

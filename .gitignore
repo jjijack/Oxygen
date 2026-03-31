@@ -6,12 +6,14 @@
 *.npy
 *.txt
 *.mat
+*.zarr
 
 Argo_addFloat/
 Argo_data/
 Argo_origin/
 Mat_data_results/
 META_tracks/
+GLORYS_processed/
 *tmp*/
 __pycache__/
 external/
