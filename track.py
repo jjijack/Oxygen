@@ -7908,6 +7908,99 @@ def load_glorys_eke_native(file_path: str | Path) -> dict:
     }
 
 
+def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按年份处理 Euler summary 的 baseline 与高 DO 异常（支持 Dask 并行）。"""
+    (
+        year,
+        depth_interval,
+        do_threshold,
+        salinity_threshold,
+        temperature_threshold,
+        anomaly_min_depth,
+        depth_merge_tolerance,
+        duplicate_depth_strategy,
+        lon_min_bound,
+        lon_max_bound,
+        lat_min_bound,
+        lat_max_bound,
+    ) = args
+
+    try:
+        df_year = load_argo_data(int(year))
+    except FileNotFoundError:
+        return pd.DataFrame(), pd.DataFrame()
+    except Exception as exc:
+        print(f"[build_euler_grid_summary] 读取 Argo {year} 失败: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    if df_year.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    lon_vals = df_year['Longitude'].to_numpy(dtype=float, copy=False)
+    lat_vals = df_year['Latitude'].to_numpy(dtype=float, copy=False)
+    lon_mask = _region_lon_mask(lon_vals, lon_min_bound, lon_max_bound)
+    lat_mask = (lat_vals >= lat_min_bound) & (lat_vals <= lat_max_bound)
+    df_geo = df_year[lon_mask & lat_mask].copy()
+    if df_geo.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    baseline_year = (
+        df_geo.sort_values(['Profile_number', 'Depth'])
+        .groupby('Profile_number', as_index=False)
+        .first()[['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day']]
+    )
+    baseline_year['profile_uid'] = (
+        baseline_year['Year'].astype(int).astype(str) + '-'
+        + baseline_year['Month'].astype(int).astype(str).str.zfill(2) + '-'
+        + baseline_year['Day'].astype(int).astype(str).str.zfill(2) + '-'
+        + baseline_year['Profile_number'].astype(str)
+    )
+    baseline_out = baseline_year[['profile_uid', 'Longitude', 'Latitude']]
+
+    anomalies = calculate_delta_do(
+        df_geo,
+        depth_interval=depth_interval,
+        do_threshold=do_threshold,
+        salinity_threshold=salinity_threshold,
+        temperature_threshold=temperature_threshold,
+        anomaly_min_depth=None,
+        depth_merge_tolerance=depth_merge_tolerance,
+        duplicate_depth_strategy=duplicate_depth_strategy,
+        remove_outliers=True,
+        verbose=False,
+    )
+    if anomalies.empty:
+        return baseline_out, pd.DataFrame()
+
+    depth_col = 'depth' if 'depth' in anomalies.columns else None
+    if depth_col is None:
+        return baseline_out, pd.DataFrame()
+
+    if anomaly_min_depth is not None and anomaly_min_depth > 0:
+        anomalies = anomalies[anomalies[depth_col] >= anomaly_min_depth].copy()
+    if anomalies.empty:
+        return baseline_out, pd.DataFrame()
+
+    anomalies = anomalies.sort_values('delta_do', ascending=False)
+    anomalies = anomalies.drop_duplicates(subset='Profile_number', keep='first')
+
+    if all(c in anomalies.columns for c in ['Year', 'Month', 'Day']):
+        anomalies['profile_uid'] = (
+            anomalies['Year'].astype(int).astype(str) + '-'
+            + anomalies['Month'].astype(int).astype(str).str.zfill(2) + '-'
+            + anomalies['Day'].astype(int).astype(str).str.zfill(2) + '-'
+            + anomalies['Profile_number'].astype(str)
+        )
+    else:
+        anomalies['profile_uid'] = anomalies['Profile_number'].astype(str)
+
+    do_out = anomalies[
+        ['profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do', depth_col]
+    ].rename(columns={depth_col: 'depth'})
+
+    return baseline_out, do_out
+
+
 def build_euler_grid_summary(
     start_year: int,
     end_year: int,
@@ -7921,6 +8014,10 @@ def build_euler_grid_summary(
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
     anomaly_min_depth: float | None = None,
+    use_dask: bool = True,
+    dask_scheduler: str = 'processes',
+    dask_workers: int | None = None,
+    dask_show_progress: bool = True,
 ) -> dict:
     """构建欧拉网格汇总：ACE/CE 天数与高 DO 异常出现率。
 
@@ -8026,79 +8123,51 @@ def build_euler_grid_summary(
     # 2) 高 DO 异常网格剖面数（仅最小深度阈值）+ Argo 观测机会网格
     do_frames = []
     baseline_frames = []
-    for year in range(start_year, end_year + 1):
+    year_args = [
+        (
+            year,
+            depth_interval,
+            do_threshold,
+            salinity_threshold,
+            temperature_threshold,
+            anomaly_min_depth,
+            depth_merge_tolerance,
+            duplicate_depth_strategy,
+            lonmin,
+            lonmax,
+            latmin,
+            latmax,
+        )
+        for year in range(start_year, end_year + 1)
+    ]
+
+    year_results: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    if use_dask and len(year_args) > 1:
+        scheduler = str(dask_scheduler).lower().strip()
+        if scheduler not in {'threads', 'processes', 'synchronous'}:
+            scheduler = 'processes'
+        compute_kwargs: dict = {'scheduler': scheduler}
+        if dask_workers is not None and scheduler in {'threads', 'processes'}:
+            compute_kwargs['num_workers'] = max(1, int(dask_workers))
+
+        delayed_tasks = [delayed(_euler_summary_year_worker)(arg) for arg in year_args]
         try:
-            df_year = load_argo_data(year)
-        except FileNotFoundError:
-            continue
+            if dask_show_progress:
+                with ProgressBar():
+                    year_results = list(compute(*delayed_tasks, **compute_kwargs))
+            else:
+                year_results = list(compute(*delayed_tasks, **compute_kwargs))
         except Exception as exc:
-            print(f"[build_euler_grid_summary] 读取 Argo {year} 失败: {exc}")
-            continue
+            print(f"[build_euler_grid_summary] Dask 并行失败，回退串行: {exc}")
+            year_results = [_euler_summary_year_worker(arg) for arg in year_args]
+    else:
+        year_results = [_euler_summary_year_worker(arg) for arg in year_args]
 
-        if df_year.empty:
-            continue
-        lon_vals = df_year['Longitude'].to_numpy(dtype=float, copy=False)
-        lat_vals = df_year['Latitude'].to_numpy(dtype=float, copy=False)
-        lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
-        lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
-        df_geo = df_year[lon_mask & lat_mask].copy()
-        if df_geo.empty:
-            continue
-
-        baseline_year = (
-            df_geo.sort_values(['Profile_number', 'Depth'])
-            .groupby('Profile_number', as_index=False)
-            .first()[['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day']]
-        )
-        baseline_year['profile_uid'] = (
-            baseline_year['Year'].astype(int).astype(str) + '-'
-            + baseline_year['Month'].astype(int).astype(str).str.zfill(2) + '-'
-            + baseline_year['Day'].astype(int).astype(str).str.zfill(2) + '-'
-            + baseline_year['Profile_number'].astype(str)
-        )
-        baseline_frames.append(baseline_year[['profile_uid', 'Longitude', 'Latitude']])
-
-        anomalies = calculate_delta_do(
-            df_geo,
-            depth_interval=depth_interval,
-            do_threshold=do_threshold,
-            salinity_threshold=salinity_threshold,
-            temperature_threshold=temperature_threshold,
-            anomaly_min_depth=None,
-            depth_merge_tolerance=depth_merge_tolerance,
-            duplicate_depth_strategy=duplicate_depth_strategy,
-            remove_outliers=True,
-            verbose=False,
-        )
-        if anomalies.empty:
-            continue
-
-        depth_col = 'depth' if 'depth' in anomalies.columns else None
-        if depth_col is None:
-            continue
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            anomalies = anomalies[anomalies[depth_col] >= anomaly_min_depth].copy()
-        if anomalies.empty:
-            continue
-
-        anomalies = anomalies.sort_values('delta_do', ascending=False)
-        anomalies = anomalies.drop_duplicates(subset='Profile_number', keep='first')
-
-        if all(c in anomalies.columns for c in ['Year', 'Month', 'Day']):
-            anomalies['profile_uid'] = (
-                anomalies['Year'].astype(int).astype(str) + '-'
-                + anomalies['Month'].astype(int).astype(str).str.zfill(2) + '-'
-                + anomalies['Day'].astype(int).astype(str).str.zfill(2) + '-'
-                + anomalies['Profile_number'].astype(str)
-            )
-        else:
-            anomalies['profile_uid'] = anomalies['Profile_number'].astype(str)
-
-        do_frames.append(
-            anomalies[['profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do', depth_col]].rename(
-                columns={depth_col: 'depth'}
-            )
-        )
+    for baseline_year, do_year in year_results:
+        if not baseline_year.empty:
+            baseline_frames.append(baseline_year)
+        if not do_year.empty:
+            do_frames.append(do_year)
 
     do_df = pd.concat(do_frames, ignore_index=True) if do_frames else pd.DataFrame()
     baseline_df = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
@@ -9339,6 +9408,10 @@ def run_euler_grid_analysis(
     output_prefix: str = 'EddyDays',
     eke_output_prefix: str = 'EKE',
     meta_output_root: str | Path | None = None,
+    use_dask: bool = True,
+    dask_scheduler: str = 'processes',
+    dask_workers: int | None = None,
+    dask_show_progress: bool = True,
 ) -> dict:
     """执行欧拉网格统计与关联分析流程。
 
@@ -9362,6 +9435,10 @@ def run_euler_grid_analysis(
         output_prefix: eddy-days 输出文件名前缀（默认 'EddyDays'）。
         eke_output_prefix: EKE 关联图输出前缀。
         meta_output_root: META 轨迹数据根目录（可选覆盖配置路径）。
+        use_dask: 是否对按年 Argo 处理启用 Dask 并行（默认 True）。
+        dask_scheduler: Dask 调度器（'processes'|'threads'|'synchronous'）。
+        dask_workers: Dask worker 数（None 采用 Dask 默认）。
+        dask_show_progress: 并行计算时是否显示 Dask 进度条。
 
     返回：
         dict: {
@@ -9389,6 +9466,10 @@ def run_euler_grid_analysis(
         do_threshold=do_threshold,
         anomaly_min_depth=unified_depth,
         meta_output_root=meta_output_root,
+        use_dask=use_dask,
+        dask_scheduler=dask_scheduler,
+        dask_workers=dask_workers,
+        dask_show_progress=dask_show_progress,
     )
     outputs: dict = {}
     if 'eddy_days' in targets:
