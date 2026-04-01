@@ -64,6 +64,7 @@ def _load_region_config(config_path: str | Path = 'config/regions.yml', region: 
         for k, v in fallback.items():
             region_dict.setdefault(k, v)
         region_dict['_fallback'] = False
+        region_dict['_region_key'] = str(region)
         return region_dict
     except Exception:
         return fallback
@@ -470,7 +471,11 @@ def ellipse_patch_for_eddy(lon0: float, lat0: float, radius_m: float, enlarge: f
     default_kwargs.update(kwargs)
     return Ellipse((lon0, lat0), width=2*dlon, height=2*dlat, **default_kwargs)
 
-def switch_region(region_name: str, config_path: str | Path = 'config/regions.yml'):
+def switch_region(
+    region_name: str,
+    config_path: str | Path = 'config/regions.yml',
+    verbose: bool = True,
+):
     """在运行时切换默认区域（无需改 YAML），并刷新全局经纬度。
 
     更新内容: `lonmin, lonmax, latmin, latmax, _REGION_CFG`。
@@ -486,6 +491,7 @@ def switch_region(region_name: str, config_path: str | Path = 'config/regions.ym
     参数:
         region_name: 在 regions.yml 中定义的区域 key。
         config_path: 配置文件路径，默认 'config/regions.yml'。
+        verbose: 是否打印区域切换提示。默认 True；并行 worker 中可传 False 以避免刷屏。
 
     异常:
         KeyError: 区域未找到或加载失败（进入 fallback）。
@@ -497,10 +503,11 @@ def switch_region(region_name: str, config_path: str | Path = 'config/regions.ym
     _REGION_CFG = new_cfg
     lonmin, lonmax = _REGION_CFG['lon_min'], _REGION_CFG['lon_max']
     latmin, latmax = _REGION_CFG['lat_min'], _REGION_CFG['lat_max']
-    if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
-        print(f"[RegionConfig] Region '{region_name}' crosses dateline; implement split-range filtering if needed.")
-    else:
-        print(f"[RegionConfig] Switched to region '{region_name}': lon[{lonmin}, {lonmax}], lat[{latmin}, {latmax}]")
+    if verbose:
+        if _REGION_CFG.get('crosses_dateline') and (lonmax < lonmin):
+            print(f"[RegionConfig] Region '{region_name}' crosses dateline; implement split-range filtering if needed.")
+        else:
+            print(f"[RegionConfig] Switched to region '{region_name}': lon[{lonmin}, {lonmax}], lat[{latmin}, {latmax}]")
 
 def load_meta_data(path: str | os.PathLike | None = None, version: float = 3.2):
     '''
@@ -596,6 +603,14 @@ def _current_region_key() -> str:
     name = _REGION_CFG.get('name') or 'region'
     slug = name.lower().replace(' ', '_')
     return slug
+
+
+def _current_region_config_key() -> str | None:
+    """返回当前区域在 regions.yml 中的配置 key（如 global、kuroshio_extension）。"""
+    key = _REGION_CFG.get('_region_key')
+    if key is None:
+        return None
+    return str(key)
 
 def export_meta_tracks(ds: Dataset,
                        kind: str,
@@ -7086,6 +7101,8 @@ def plot_argo_hotspots(
             'data_list': combined_data
         })
 
+    saved_figure_paths: list[str] = []
+
     for p_cfg in plots_to_generate:
         fig = plt.figure(figsize=(40, 30))
         ax = fig.add_subplot(1, 1, 1, projection=map_crs)
@@ -7172,12 +7189,14 @@ def plot_argo_hotspots(
                 depth_suffix = f"_depth{depth_str}m"
             fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}{p_cfg['file_suffix']}.png"
             plt.savefig(fname, dpi=300, bbox_inches='tight')
+            saved_figure_paths.append(str(fname))
             print(f"Figure saved: {fname}")
         if show_fig:
             plt.show()
         plt.close(fig)
 
     # 保存 anomalies 为 Parquet（高效压缩存储）
+    saved_anomalies_path: str | None = None
     if save_data and not anomalies.empty:
         region_slug_for_path = _current_region_key()
         out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
@@ -7190,11 +7209,53 @@ def plot_argo_hotspots(
         pq_path = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
         try:
             anomalies.to_parquet(pq_path, index=False)
+            saved_anomalies_path = str(pq_path)
             print(f"Anomalies saved to: {pq_path}")
         except Exception as e:
             print(f"[WARN] Failed to save anomalies parquet: {e}")
 
-    return None
+    total_argo_profiles = int(len(baseline_profiles))
+    selected_argo_profiles = int(len(anomalies))
+    selected_ratio = (
+        float(selected_argo_profiles) / float(total_argo_profiles)
+        if total_argo_profiles > 0 else np.nan
+    )
+
+    selected_delta_do_max = np.nan
+    selected_delta_do_mean = np.nan
+    selected_depth_max = np.nan
+    selected_depth_mean = np.nan
+    if not anomalies.empty:
+        if 'delta_do' in anomalies.columns:
+            delta_vals = pd.to_numeric(anomalies['delta_do'], errors='coerce').to_numpy(dtype=float)
+            valid_delta = np.isfinite(delta_vals)
+            if valid_delta.any():
+                selected_delta_do_max = float(np.nanmax(delta_vals[valid_delta]))
+                selected_delta_do_mean = float(np.nanmean(delta_vals[valid_delta]))
+        if 'depth' in anomalies.columns:
+            depth_vals = pd.to_numeric(anomalies['depth'], errors='coerce').to_numpy(dtype=float)
+            valid_depth = np.isfinite(depth_vals)
+            if valid_depth.any():
+                selected_depth_max = float(np.nanmax(depth_vals[valid_depth]))
+                selected_depth_mean = float(np.nanmean(depth_vals[valid_depth]))
+
+    summary = {
+        'total_argo_profiles': total_argo_profiles,
+        'selected_argo_profiles': selected_argo_profiles,
+        'selected_ratio': float(selected_ratio) if np.isfinite(selected_ratio) else np.nan,
+        'selected_delta_do_max': selected_delta_do_max,
+        'selected_delta_do_mean': selected_delta_do_mean,
+        'selected_depth_max': selected_depth_max,
+        'selected_depth_mean': selected_depth_mean,
+        'all_argo_depth_mean': np.nan,
+        'all_argo_do_mean': np.nan,
+    }
+
+    return {
+        'summary': summary,
+        'figure_paths': saved_figure_paths,
+        'anomalies_path': saved_anomalies_path,
+    }
 
 def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     """模块级 worker，支持 multiprocessing pickling。
