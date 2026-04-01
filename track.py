@@ -6844,6 +6844,11 @@ def plot_argo_hotspots(
     start_year: int,
     end_year: int,
     do_threshold: float | None = None,
+    do_threshold_mode: str = 'absolute',
+    do_threshold_percentile: float = 99.0,
+    do_threshold_grid_step_deg: float | None = None,
+    do_threshold_percentile_min_samples: int = 5,
+    do_threshold_percentile_window_size: int = 5,
     salinity_threshold: float | None = None,
     temperature_threshold: float | None = None,
     depth_interval: float | None = None,
@@ -6877,6 +6882,11 @@ def plot_argo_hotspots(
         start_year / end_year: 年度范围（闭区间）。
         do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy:
             传给 calculate_delta_do；当为 None 时从 processing.yml 读取默认值。
+        do_threshold_mode: ΔDO 阈值模式，'absolute' 或 'grid_percentile'。
+        do_threshold_percentile: 网格百分位阈值（可传 90 或 0.9），仅 grid_percentile 模式生效。
+        do_threshold_grid_step_deg: 百分位筛选使用的 Euler 网格分辨率（度）；None 时使用 1.0°。
+        do_threshold_percentile_min_samples: 邻域样本数不足时回退 absolute 阈值的最小样本数。
+        do_threshold_percentile_window_size: 百分位筛选邻域窗口尺寸（奇数）；1=单格，3=3x3，5=5x5（默认）。
         anomaly_min_depth: 仅保留异常深度 >= 该值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
         plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
         fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
@@ -6895,10 +6905,22 @@ def plot_argo_hotspots(
     输出:
         - 图像（可选）：`plot_outputs/<region>/plot_argo_hotspots/Argo_DeltaDO_Hotspots_*.png`
         - 异常数据（Parquet，可选）：`plot_outputs/<region>/plot_argo_hotspots/anomalies_{start}_{end}_thr{thr}[_depth{d}m].parquet`
+    返回:
+        dict: 运行统计与输出路径摘要。
     """
     # 从配置读取默认值
     if do_threshold is None:
         do_threshold = _default_delta_do_threshold
+    do_mode_norm = str(do_threshold_mode or 'absolute').strip().lower()
+    if do_mode_norm in {'absolute', 'fixed'}:
+        do_mode_norm = 'absolute'
+    elif do_mode_norm in {'grid_percentile', 'percentile', 'euler_grid_percentile'}:
+        do_mode_norm = 'grid_percentile'
+    else:
+        raise ValueError("do_threshold_mode 仅支持 'absolute' 或 'grid_percentile'")
+    do_threshold_percentile_window_size = _validate_percentile_window_size(do_threshold_percentile_window_size)
+    if do_threshold_grid_step_deg is None:
+        do_threshold_grid_step_deg = 1.0
     if salinity_threshold is None:
         salinity_threshold = _default_salinity_threshold
     if temperature_threshold is None:
@@ -6911,6 +6933,14 @@ def plot_argo_hotspots(
         duplicate_depth_strategy = _default_duplicate_depth_strategy
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
+
+    # --- 模式标签（标题与文件名） ---
+    if do_mode_norm == 'grid_percentile':
+        do_mode_title = f"P{float(do_threshold_percentile):g}"
+        do_mode_tag = f"p{float(do_threshold_percentile):g}".replace('.', 'p')
+    else:
+        do_mode_title = f"ΔDO ≥ {float(do_threshold):g} μmol kg⁻¹"
+        do_mode_tag = f"thr{float(do_threshold):g}".replace('.', 'p')
 
     # --- 尝试加载交互 Argo 文件（若启用） ---
     interacting_argo_ids: set[int] = set()
@@ -6946,25 +6976,24 @@ def plot_argo_hotspots(
     # --- 按年份加载策略：串行或并行 ---
     years = list(range(start_year, end_year + 1))
     # Worker 参数打包列表（避免闭包，支持多进程 pickling）
-    # 捕获当前区域边界到参数中，避免在 Dask 子进程中重新导入模块后回退默认区域
-    current_lon_min = float(lonmin)
-    current_lon_max = float(lonmax)
-    current_lat_min = float(latmin)
-    current_lat_max = float(latmax)
+    # 传入 regions.yml 的配置 key；worker 内部切换区域，避免子进程回退默认区域
+    current_region_cfg_key = _current_region_config_key()
     worker_args_list = [
         (
             y,
+            current_region_cfg_key,
             depth_interval,
             do_threshold,
+            do_mode_norm,
+            do_threshold_percentile,
+            do_threshold_grid_step_deg,
+            do_threshold_percentile_min_samples,
+            do_threshold_percentile_window_size,
             salinity_threshold,
             temperature_threshold,
             anomaly_min_depth,
             depth_merge_tolerance,
             duplicate_depth_strategy,
-            current_lon_min,
-            current_lon_max,
-            current_lat_min,
-            current_lat_max,
         )
         for y in years
     ]
@@ -6991,16 +7020,57 @@ def plot_argo_hotspots(
             client = None
 
     delayed_tasks = [delayed(_hotspot_year_worker)(args) for args in worker_args_list]
+
+    # 统计聚合器
+    stats_agg = {
+        'total_argo_profiles': 0,
+        'all_argo_depth_sum': 0.0,
+        'all_argo_depth_count': 0,
+        'all_argo_do_sum': 0.0,
+        'all_argo_do_count': 0,
+        'selected_argo_profiles': 0,
+        'selected_delta_do_sum': 0.0,
+        'selected_delta_do_count': 0,
+        'selected_depth_sum': 0.0,
+        'selected_depth_count': 0,
+        'selected_delta_do_max': np.nan,
+        'selected_depth_max': np.nan,
+    }
+
+    def _accumulate_stats(year_stats: dict | None) -> None:
+        if not year_stats:
+            return
+        stats_agg['total_argo_profiles'] += int(year_stats.get('total_argo_profiles', 0))
+        stats_agg['all_argo_depth_sum'] += float(year_stats.get('all_argo_depth_sum', 0.0))
+        stats_agg['all_argo_depth_count'] += int(year_stats.get('all_argo_depth_count', 0))
+        stats_agg['all_argo_do_sum'] += float(year_stats.get('all_argo_do_sum', 0.0))
+        stats_agg['all_argo_do_count'] += int(year_stats.get('all_argo_do_count', 0))
+        stats_agg['selected_argo_profiles'] += int(year_stats.get('selected_argo_profiles', 0))
+        stats_agg['selected_delta_do_sum'] += float(year_stats.get('selected_delta_do_sum', 0.0))
+        stats_agg['selected_delta_do_count'] += int(year_stats.get('selected_delta_do_count', 0))
+        stats_agg['selected_depth_sum'] += float(year_stats.get('selected_depth_sum', 0.0))
+        stats_agg['selected_depth_count'] += int(year_stats.get('selected_depth_count', 0))
+
+        year_delta_max = year_stats.get('selected_delta_do_max', np.nan)
+        if np.isfinite(year_delta_max):
+            curr = stats_agg['selected_delta_do_max']
+            stats_agg['selected_delta_do_max'] = float(year_delta_max) if not np.isfinite(curr) else max(float(curr), float(year_delta_max))
+
+        year_depth_max = year_stats.get('selected_depth_max', np.nan)
+        if np.isfinite(year_depth_max):
+            curr = stats_agg['selected_depth_max']
+            stats_agg['selected_depth_max'] = float(year_depth_max) if not np.isfinite(curr) else max(float(curr), float(year_depth_max))
     # 显示进度：优先使用 distributed.as_completed + tqdm；否则回退到 ProgressBar
     if client is not None:
         try:
             futures = client.compute(delayed_tasks)
             for fut in tqdm(as_completed(futures), total=len(futures), desc="hotspots(dask)"):
                 try:
-                    baseline_year, anomalies_year = fut.result()
+                    baseline_year, anomalies_year, year_stats = fut.result()
                 except Exception as e:
                     print(f"[hotspots] Dask task failed: {e}")
                     continue
+                _accumulate_stats(year_stats)
                 if not baseline_year.empty:
                     baselines_list.append(baseline_year)
                 if not anomalies_year.empty:
@@ -7017,7 +7087,8 @@ def plot_argo_hotspots(
                 results = compute(*delayed_tasks, scheduler=sched)
         except Exception:
             results = compute(*delayed_tasks, scheduler=sched)
-        for baseline_year, anomalies_year in results:
+        for baseline_year, anomalies_year, year_stats in results:
+            _accumulate_stats(year_stats)
             if not baseline_year.empty:
                 baselines_list.append(baseline_year)
             if not anomalies_year.empty:
@@ -7025,7 +7096,22 @@ def plot_argo_hotspots(
 
     if not baselines_list and not anomalies_list:
         print("No data loaded after filtering; abort.")
-        return None
+        return {
+            'mode': str(do_mode_norm),
+            'summary': {
+                'total_argo_profiles': int(stats_agg['total_argo_profiles']),
+                'selected_argo_profiles': int(stats_agg['selected_argo_profiles']),
+                'selected_ratio': np.nan,
+                'selected_delta_do_max': np.nan,
+                'selected_delta_do_mean': np.nan,
+                'selected_depth_max': np.nan,
+                'selected_depth_mean': np.nan,
+                'all_argo_depth_mean': np.nan,
+                'all_argo_do_mean': np.nan,
+            },
+            'figure_paths': [],
+            'anomalies_path': None,
+        }
 
     baseline_profiles = pd.concat(baselines_list, ignore_index=True) if baselines_list else pd.DataFrame()
     anomalies = pd.concat(anomalies_list, ignore_index=True) if anomalies_list else pd.DataFrame()
@@ -7071,7 +7157,7 @@ def plot_argo_hotspots(
             'title_extra': ' (Interacting)',
             'file_suffix': '_interacting',
             'data_list': [
-                {'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4}
+                {'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({do_mode_title})', 's': 100, 'zorder': 4}
             ]
         })
         plots_to_generate.append({
@@ -7079,20 +7165,20 @@ def plot_argo_hotspots(
             'title_extra': ' (Non-interacting)',
             'file_suffix': '_non_interacting',
             'data_list': [
-                {'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': f'Non-interacting (ΔDO ≥ {do_threshold})', 's': 60, 'zorder': 3}
+                {'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': f'Non-interacting ({do_mode_title})', 's': 60, 'zorder': 3}
             ]
         })
     else:
         # 合并模式
         combined_data = []
         if not anom_others.empty:
-            label_str = f'ΔDO ≥ {do_threshold} μmol kg⁻¹'
+            label_str = do_mode_title
             if use_interacting_argo and interacting_argo_ids:
-                label_str = f'Non-interacting (ΔDO ≥ {do_threshold})'
+                label_str = f'Non-interacting ({do_mode_title})'
             combined_data.append({'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': label_str, 's': 60, 'zorder': 3})
         
         if not anom_interacting.empty:
-            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4})
+            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({do_mode_title})', 's': 100, 'zorder': 4})
             
         plots_to_generate.append({
             'name': 'combined',
@@ -7102,7 +7188,6 @@ def plot_argo_hotspots(
         })
 
     saved_figure_paths: list[str] = []
-
     for p_cfg in plots_to_generate:
         fig = plt.figure(figsize=(40, 30))
         ax = fig.add_subplot(1, 1, 1, projection=map_crs)
@@ -7111,7 +7196,7 @@ def plot_argo_hotspots(
             f' (depth ≥ {anomaly_min_depth} m)'
             if anomaly_min_depth is not None and anomaly_min_depth > 0 else ''
         )
-        thr_title = f' (ΔDO ≥ {do_threshold:g} μmol kg⁻¹)'
+        thr_title = f' ({do_mode_title})'
         ax.set_title(f'Argo ΔDO Anomalies {start_year}-{end_year}{thr_title}{depth_title}{p_cfg["title_extra"]}', fontsize=20)
 
         # Basemap features
@@ -7182,12 +7267,11 @@ def plot_argo_hotspots(
             region_slug_for_path = _current_region_key()
             out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
             out_dir.mkdir(exist_ok=True, parents=True)
-            thr_str = f"{do_threshold:g}".replace('.', 'p')
             depth_suffix = ''
             if anomaly_min_depth is not None and anomaly_min_depth > 0:
                 depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
                 depth_suffix = f"_depth{depth_str}m"
-            fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}{p_cfg['file_suffix']}.png"
+            fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_{do_mode_tag}{depth_suffix}{p_cfg['file_suffix']}.png"
             plt.savefig(fname, dpi=300, bbox_inches='tight')
             saved_figure_paths.append(str(fname))
             print(f"Figure saved: {fname}")
@@ -7201,12 +7285,11 @@ def plot_argo_hotspots(
         region_slug_for_path = _current_region_key()
         out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
         out_dir.mkdir(exist_ok=True, parents=True)
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
         depth_suffix = ''
         if anomaly_min_depth is not None and anomaly_min_depth > 0:
             depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
             depth_suffix = f"_depth{depth_str}m"
-        pq_path = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        pq_path = out_dir / f"anomalies_{start_year}_{end_year}_{do_mode_tag}{depth_suffix}.parquet"
         try:
             anomalies.to_parquet(pq_path, index=False)
             saved_anomalies_path = str(pq_path)
@@ -7214,111 +7297,185 @@ def plot_argo_hotspots(
         except Exception as e:
             print(f"[WARN] Failed to save anomalies parquet: {e}")
 
-    total_argo_profiles = int(len(baseline_profiles))
-    selected_argo_profiles = int(len(anomalies))
     selected_ratio = (
-        float(selected_argo_profiles) / float(total_argo_profiles)
-        if total_argo_profiles > 0 else np.nan
+        float(stats_agg['selected_argo_profiles']) / float(stats_agg['total_argo_profiles'])
+        if stats_agg['total_argo_profiles'] > 0 else np.nan
+    )
+    selected_delta_do_mean = (
+        float(stats_agg['selected_delta_do_sum']) / float(stats_agg['selected_delta_do_count'])
+        if stats_agg['selected_delta_do_count'] > 0 else np.nan
+    )
+    selected_depth_mean = (
+        float(stats_agg['selected_depth_sum']) / float(stats_agg['selected_depth_count'])
+        if stats_agg['selected_depth_count'] > 0 else np.nan
+    )
+    all_argo_depth_mean = (
+        float(stats_agg['all_argo_depth_sum']) / float(stats_agg['all_argo_depth_count'])
+        if stats_agg['all_argo_depth_count'] > 0 else np.nan
+    )
+    all_argo_do_mean = (
+        float(stats_agg['all_argo_do_sum']) / float(stats_agg['all_argo_do_count'])
+        if stats_agg['all_argo_do_count'] > 0 else np.nan
     )
 
-    selected_delta_do_max = np.nan
-    selected_delta_do_mean = np.nan
-    selected_depth_max = np.nan
-    selected_depth_mean = np.nan
-    if not anomalies.empty:
-        if 'delta_do' in anomalies.columns:
-            delta_vals = pd.to_numeric(anomalies['delta_do'], errors='coerce').to_numpy(dtype=float)
-            valid_delta = np.isfinite(delta_vals)
-            if valid_delta.any():
-                selected_delta_do_max = float(np.nanmax(delta_vals[valid_delta]))
-                selected_delta_do_mean = float(np.nanmean(delta_vals[valid_delta]))
-        if 'depth' in anomalies.columns:
-            depth_vals = pd.to_numeric(anomalies['depth'], errors='coerce').to_numpy(dtype=float)
-            valid_depth = np.isfinite(depth_vals)
-            if valid_depth.any():
-                selected_depth_max = float(np.nanmax(depth_vals[valid_depth]))
-                selected_depth_mean = float(np.nanmean(depth_vals[valid_depth]))
-
     summary = {
-        'total_argo_profiles': total_argo_profiles,
-        'selected_argo_profiles': selected_argo_profiles,
+        'total_argo_profiles': int(stats_agg['total_argo_profiles']),
+        'selected_argo_profiles': int(stats_agg['selected_argo_profiles']),
         'selected_ratio': float(selected_ratio) if np.isfinite(selected_ratio) else np.nan,
-        'selected_delta_do_max': selected_delta_do_max,
-        'selected_delta_do_mean': selected_delta_do_mean,
-        'selected_depth_max': selected_depth_max,
-        'selected_depth_mean': selected_depth_mean,
-        'all_argo_depth_mean': np.nan,
-        'all_argo_do_mean': np.nan,
+        'selected_delta_do_max': float(stats_agg['selected_delta_do_max']) if np.isfinite(stats_agg['selected_delta_do_max']) else np.nan,
+        'selected_delta_do_mean': float(selected_delta_do_mean) if np.isfinite(selected_delta_do_mean) else np.nan,
+        'selected_depth_max': float(stats_agg['selected_depth_max']) if np.isfinite(stats_agg['selected_depth_max']) else np.nan,
+        'selected_depth_mean': float(selected_depth_mean) if np.isfinite(selected_depth_mean) else np.nan,
+        'all_argo_depth_mean': float(all_argo_depth_mean) if np.isfinite(all_argo_depth_mean) else np.nan,
+        'all_argo_do_mean': float(all_argo_do_mean) if np.isfinite(all_argo_do_mean) else np.nan,
     }
 
+    print(
+        "[Hotspots Summary] "
+        f"total_argo_profiles={summary['total_argo_profiles']}, "
+        f"selected_argo_profiles={summary['selected_argo_profiles']}, "
+        f"selected_ratio={summary['selected_ratio']:.4f}" if np.isfinite(summary['selected_ratio'])
+        else "[Hotspots Summary] selected_ratio=nan"
+    )
+    print(
+        "[Hotspots Summary] "
+        f"selected_delta_do(max/mean)=({summary['selected_delta_do_max']:.3f}, {summary['selected_delta_do_mean']:.3f}), "
+        f"selected_depth(max/mean)=({summary['selected_depth_max']:.3f}, {summary['selected_depth_mean']:.3f})"
+        if np.isfinite(summary['selected_delta_do_mean']) and np.isfinite(summary['selected_depth_mean'])
+        else "[Hotspots Summary] selected_delta_do/depth stats unavailable"
+    )
+    print(
+        "[Hotspots Summary] "
+        f"all_argo_depth_mean={summary['all_argo_depth_mean']:.3f}, "
+        f"all_argo_do_mean={summary['all_argo_do_mean']:.3f}"
+        if np.isfinite(summary['all_argo_depth_mean']) and np.isfinite(summary['all_argo_do_mean'])
+        else "[Hotspots Summary] all_argo mean stats unavailable"
+    )
+
     return {
+        'mode': str(do_mode_norm),
         'summary': summary,
         'figure_paths': saved_figure_paths,
         'anomalies_path': saved_anomalies_path,
     }
 
-def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """模块级 worker，支持 multiprocessing pickling。
 
     参数 args: (
         year,
+        region_cfg_key,
         depth_interval,
         do_threshold,
+        do_threshold_mode,
+        do_threshold_percentile,
+        do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size,
         salinity_threshold,
         temperature_threshold,
         anomaly_min_depth,
         depth_merge_tolerance,
         duplicate_depth_strategy,
-        lon_min_bound,
-        lon_max_bound,
-        lat_min_bound,
-        lat_max_bound,
     )
-    返回: (baseline_df, anomalies_df)
+    返回: (baseline_df, anomalies_df, year_stats)
     baseline_df: 每个剖面第一条记录的基本信息
     anomalies_df: 该年筛选出的 ΔDO 异常（每剖面保留最大 delta_do 一条）
+    year_stats: 年度统计聚合信息
     """
     (
         year,
+        region_cfg_key,
         depth_interval,
         do_threshold,
+        do_threshold_mode,
+        do_threshold_percentile,
+        do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size,
         salinity_threshold,
         temperature_threshold,
         anomaly_min_depth,
         depth_merge_tolerance,
         duplicate_depth_strategy,
-        lon_min_bound,
-        lon_max_bound,
-        lat_min_bound,
-        lat_max_bound,
     ) = args
+
+    if region_cfg_key:
+        try:
+            switch_region(str(region_cfg_key), verbose=False)
+        except Exception as exc:
+            print(f"[hotspots] Failed to switch region '{region_cfg_key}': {exc}")
+            return pd.DataFrame(), pd.DataFrame(), {}
+
     try:
         df_y = load_argo_data(year=year)
     except FileNotFoundError:
         print(f"[hotspots] Missing year {year}, skip.")
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
     except Exception as e:
         print(f"[hotspots] Error loading year {year}: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
     # 地理过滤
     lon_vals = df_y['Longitude'].to_numpy(dtype=float, copy=False)
     lat_vals = df_y['Latitude'].to_numpy(dtype=float, copy=False)
-    lon_mask = _region_lon_mask(lon_vals, lon_min_bound, lon_max_bound)
-    lat_mask = (lat_vals >= lat_min_bound) & (lat_vals <= lat_max_bound)
+    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
     geo_mask = lon_mask & lat_mask
     df_geo = df_y[geo_mask].copy()
     if df_geo.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
     # baseline
     baseline = (
         df_geo.sort_values(['Profile_number','Depth'])
         .groupby('Profile_number', as_index=False)
         .first()[['Profile_number','Longitude','Latitude','Year','Month','Day']]
     )
+
+    depth_col_all = 'Depth' if 'Depth' in df_geo.columns else ('depth' if 'depth' in df_geo.columns else None)
+    do_col_all = 'DO' if 'DO' in df_geo.columns else ('do_value' if 'do_value' in df_geo.columns else None)
+
+    if depth_col_all is not None:
+        depth_vals_all = pd.to_numeric(df_geo[depth_col_all], errors='coerce').to_numpy(dtype=float)
+        depth_valid_all = np.isfinite(depth_vals_all)
+        all_argo_depth_sum = float(np.nansum(depth_vals_all[depth_valid_all])) if depth_valid_all.any() else 0.0
+        all_argo_depth_count = int(depth_valid_all.sum())
+    else:
+        all_argo_depth_sum = 0.0
+        all_argo_depth_count = 0
+
+    if do_col_all is not None:
+        do_vals_all = pd.to_numeric(df_geo[do_col_all], errors='coerce').to_numpy(dtype=float)
+        do_valid_all = np.isfinite(do_vals_all)
+        all_argo_do_sum = float(np.nansum(do_vals_all[do_valid_all])) if do_valid_all.any() else 0.0
+        all_argo_do_count = int(do_valid_all.sum())
+    else:
+        all_argo_do_sum = 0.0
+        all_argo_do_count = 0
+
+    year_stats = {
+        'total_argo_profiles': int(len(baseline)),
+        'all_argo_depth_sum': all_argo_depth_sum,
+        'all_argo_depth_count': all_argo_depth_count,
+        'all_argo_do_sum': all_argo_do_sum,
+        'all_argo_do_count': all_argo_do_count,
+        'selected_argo_profiles': 0,
+        'selected_delta_do_sum': 0.0,
+        'selected_delta_do_count': 0,
+        'selected_depth_sum': 0.0,
+        'selected_depth_count': 0,
+        'selected_delta_do_max': np.nan,
+        'selected_depth_max': np.nan,
+    }
+
     anomalies_year = calculate_delta_do(
         df_geo,
         depth_interval=depth_interval,
         do_threshold=do_threshold,
+        do_threshold_mode=do_threshold_mode,
+        do_threshold_percentile=do_threshold_percentile,
+        do_threshold_grid_step_deg=do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples=do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size=do_threshold_percentile_window_size,
         salinity_threshold=salinity_threshold,
         temperature_threshold=temperature_threshold,
         anomaly_min_depth=anomaly_min_depth,
@@ -7328,16 +7485,45 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
         verbose=False
     )
     if anomalies_year.empty:
-        return baseline, pd.DataFrame()
+        return baseline, pd.DataFrame(), year_stats
     anomalies_year = (
         anomalies_year.sort_values('delta_do', ascending=False)
         .drop_duplicates(subset='Profile_number', keep='first')
     )
+
+    if 'delta_do' in anomalies_year.columns:
+        sel_delta = pd.to_numeric(anomalies_year['delta_do'], errors='coerce').to_numpy(dtype=float)
+    else:
+        sel_delta = np.array([], dtype=float)
+    if 'depth' in anomalies_year.columns:
+        sel_depth = pd.to_numeric(anomalies_year['depth'], errors='coerce').to_numpy(dtype=float)
+    else:
+        sel_depth = np.array([], dtype=float)
+
+    delta_valid = np.isfinite(sel_delta)
+    depth_valid = np.isfinite(sel_depth)
+    year_stats['selected_argo_profiles'] = int(len(anomalies_year))
+    year_stats['selected_delta_do_sum'] = float(np.nansum(sel_delta[delta_valid])) if delta_valid.any() else 0.0
+    year_stats['selected_delta_do_count'] = int(delta_valid.sum())
+    year_stats['selected_depth_sum'] = float(np.nansum(sel_depth[depth_valid])) if depth_valid.any() else 0.0
+    year_stats['selected_depth_count'] = int(depth_valid.sum())
+    year_stats['selected_delta_do_max'] = float(np.nanmax(sel_delta[delta_valid])) if delta_valid.any() else np.nan
+    year_stats['selected_depth_max'] = float(np.nanmax(sel_depth[depth_valid])) if depth_valid.any() else np.nan
+
     needed_cols = [c for c in ['Profile_number','Longitude','Latitude','Year','Month','Day','depth','delta_do','do_value'] if c in anomalies_year.columns]
     anomalies_year = anomalies_year[needed_cols]
-    return baseline, anomalies_year
+    return baseline, anomalies_year, year_stats
 
-def _build_euler_grid_edges(grid_step_deg: float = 1.0) -> tuple[np.ndarray, np.ndarray, dict]:
+def _build_euler_grid_edges(
+    grid_step_deg: float = 1.0,
+    *,
+    lon_min_cfg: float | None = None,
+    lon_max_cfg: float | None = None,
+    lat_min_cfg: float | None = None,
+    lat_max_cfg: float | None = None,
+    crosses_dateline: bool | None = None,
+    region_key: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """为当前区域构建欧拉统计网格边界（经纬度）。
 
     返回:
@@ -7349,14 +7535,25 @@ def _build_euler_grid_edges(grid_step_deg: float = 1.0) -> tuple[np.ndarray, np.
     if grid_step_deg <= 0:
         raise ValueError("grid_step_deg 必须大于 0")
 
-    lon_min_cfg = float(lonmin)
-    lon_max_cfg = float(lonmax)
-    lat_min_cfg = float(latmin)
-    lat_max_cfg = float(latmax)
+    using_global_region = (
+        lon_min_cfg is None and lon_max_cfg is None and lat_min_cfg is None and lat_max_cfg is None
+    )
+    if lon_min_cfg is None:
+        lon_min_cfg = float(lonmin)
+    if lon_max_cfg is None:
+        lon_max_cfg = float(lonmax)
+    if lat_min_cfg is None:
+        lat_min_cfg = float(latmin)
+    if lat_max_cfg is None:
+        lat_max_cfg = float(latmax)
 
     lon_min_norm = float(_normalize_lon_array(lon_min_cfg))
     lon_max_norm = float(_normalize_lon_array(lon_max_cfg))
-    crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lon_max_norm < lon_min_norm))
+    if crosses_dateline is None:
+        if using_global_region:
+            crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lon_max_norm < lon_min_norm))
+        else:
+            crosses_dateline = bool(lon_max_norm < lon_min_norm)
 
     lon_start = lon_min_norm
     lon_end = lon_max_norm + (360.0 if crosses_dateline else 0.0)
@@ -7387,7 +7584,7 @@ def _build_euler_grid_edges(grid_step_deg: float = 1.0) -> tuple[np.ndarray, np.
         'crosses_dateline': bool(crosses_dateline),
         'lon_start_continuous': float(lon_floor),
         'lon_end_continuous': float(lon_ceil),
-        'region_key': _current_region_key(),
+        'region_key': str(region_key) if region_key else _current_region_key(),
     }
     return lon_edges, lat_edges, meta
 
@@ -7969,22 +8166,198 @@ def load_glorys_eke_native(file_path: str | Path) -> dict:
     }
 
 
+def _normalize_percentile_to_quantile(percentile: float) -> float:
+    """将百分位参数标准化到 [0,1] 分位数。"""
+    pct = float(percentile)
+    if pct > 1.0:
+        pct = pct / 100.0
+    if pct < 0.0 or pct > 1.0:
+        raise ValueError("百分位参数必须在 [0,1] 或 [0,100] 范围内")
+    return pct
+
+
+def _validate_percentile_window_size(window_size: int) -> int:
+    """校验邻域窗口尺寸，要求为正奇数。"""
+    ws = int(window_size)
+    if ws < 1:
+        raise ValueError("do_threshold_percentile_window_size 必须 >= 1")
+    if ws % 2 == 0:
+        raise ValueError("do_threshold_percentile_window_size 必须是奇数（例如 1, 3, 5）")
+    return ws
+
+
+def _apply_grid_percentile_do_filter(
+    results_df: pd.DataFrame,
+    *,
+    do_percentile: float,
+    grid_step_deg: float,
+    fallback_threshold: float,
+    min_samples: int = 5,
+    percentile_window_size: int = 3,
+    lon_col: str = 'Longitude',
+    lat_col: str = 'Latitude',
+    region_lon_min: float | None = None,
+    region_lon_max: float | None = None,
+    region_lat_min: float | None = None,
+    region_lat_max: float | None = None,
+    region_crosses_dateline: bool | None = None,
+    region_key: str | None = None,
+) -> pd.DataFrame:
+    """在 Euler 网格邻域内按 ΔDO 百分位阈值过滤异常点。"""
+    if results_df.empty:
+        return results_df
+    if 'delta_do' not in results_df.columns:
+        return pd.DataFrame(columns=results_df.columns)
+
+    q = _normalize_percentile_to_quantile(do_percentile)
+    min_samples = max(1, int(min_samples))
+    window_size = _validate_percentile_window_size(percentile_window_size)
+    half_win = window_size // 2
+    work = results_df.copy()
+    work = work[np.isfinite(work['delta_do'])].copy()
+    if work.empty:
+        return work
+
+    if lon_col not in work.columns or lat_col not in work.columns:
+        kept = work[work['delta_do'] >= float(fallback_threshold)].copy()
+        if kept.empty:
+            return kept
+        kept['do_threshold_effective'] = float(fallback_threshold)
+        kept['do_threshold_source'] = 'absolute_fallback_no_geo'
+        return kept
+
+    lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(
+        grid_step_deg=float(grid_step_deg),
+        lon_min_cfg=region_lon_min,
+        lon_max_cfg=region_lon_max,
+        lat_min_cfg=region_lat_min,
+        lat_max_cfg=region_lat_max,
+        crosses_dateline=region_crosses_dateline,
+        region_key=region_key,
+    )
+    lon_ref = float(grid_meta['lon_start_continuous'])
+    crosses_dateline = bool(grid_meta['crosses_dateline'])
+
+    lon_vals = work[lon_col].to_numpy(dtype=float, copy=False)
+    lat_vals = work[lat_col].to_numpy(dtype=float, copy=False)
+    lon_cont = _to_continuous_lon(lon_vals, lon_ref=lon_ref, crosses_dateline=crosses_dateline)
+
+    work['lon_bin'] = np.digitize(lon_cont, lon_edges, right=False) - 1
+    work['lat_bin'] = np.digitize(lat_vals, lat_edges, right=False) - 1
+
+    valid_bin = (
+        (work['lon_bin'] >= 0) & (work['lon_bin'] < lon_edges.size - 1)
+        & (work['lat_bin'] >= 0) & (work['lat_bin'] < lat_edges.size - 1)
+    )
+    work = work[valid_bin].copy()
+    if work.empty:
+        return work
+
+    cell_values: dict[tuple[int, int], np.ndarray] = {}
+    grouped = work.groupby(['lat_bin', 'lon_bin'])['delta_do']
+    for (lat_bin, lon_bin), series in grouped:
+        cell_values[(int(lat_bin), int(lon_bin))] = series.to_numpy(dtype=float)
+
+    stat_rows = []
+    for (lat_bin, lon_bin), _vals in cell_values.items():
+        neighbor_arrays = []
+        for di in range(-half_win, half_win + 1):
+            for dj in range(-half_win, half_win + 1):
+                arr = cell_values.get((lat_bin + di, lon_bin + dj))
+                if arr is not None and arr.size > 0:
+                    neighbor_arrays.append(arr)
+
+        if neighbor_arrays:
+            if len(neighbor_arrays) == 1:
+                neighbor_vals = neighbor_arrays[0]
+            else:
+                neighbor_vals = np.concatenate(neighbor_arrays)
+            sample_count = int(neighbor_vals.size)
+        else:
+            neighbor_vals = np.array([], dtype=float)
+            sample_count = 0
+
+        if sample_count >= min_samples:
+            thr = float(np.nanquantile(neighbor_vals, q))
+            source = f'grid_percentile_window_{window_size}x{window_size}'
+        else:
+            thr = float(fallback_threshold)
+            source = f'absolute_fallback_sparse_window_{window_size}x{window_size}'
+
+        stat_rows.append(
+            {
+                'lat_bin': int(lat_bin),
+                'lon_bin': int(lon_bin),
+                'neighbor_sample_count': sample_count,
+                'do_threshold_effective': thr,
+                'do_threshold_source': source,
+            }
+        )
+
+    group_stats = pd.DataFrame(stat_rows)
+
+    work = work.merge(
+        group_stats[['lat_bin', 'lon_bin', 'do_threshold_effective', 'do_threshold_source']],
+        on=['lat_bin', 'lon_bin'],
+        how='left',
+    )
+
+    keep_mask = work['delta_do'] >= work['do_threshold_effective']
+    kept = work[keep_mask].copy()
+    if kept.empty:
+        return kept
+
+    kept.drop(columns=['lon_bin', 'lat_bin'], inplace=True, errors='ignore')
+    return kept
+
+
+def _format_do_threshold_label(meta: dict) -> str:
+    """根据阈值模式返回统一的标题文本。"""
+    mode = str(meta.get('do_threshold_mode', 'absolute')).lower()
+    if mode == 'grid_percentile':
+        pct = float(meta.get('do_threshold_percentile', 99.0))
+        return f"ΔDO ≥ P{pct:g}"
+    return f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+
+
+def _format_do_threshold_tag(meta: dict) -> str:
+    """根据阈值模式生成文件名标签。"""
+    mode = str(meta.get('do_threshold_mode', 'absolute')).lower()
+    if mode == 'grid_percentile':
+        pct = float(meta.get('do_threshold_percentile', 99.0))
+        grid_step = float(meta.get('do_threshold_grid_step_deg', meta.get('grid_step_deg', 1.0)))
+        fallback = float(meta.get('do_threshold', np.nan))
+        window_size = int(meta.get('do_threshold_percentile_window_size', 5))
+        tag = f"q{pct:g}_grid{grid_step:g}_w{window_size}_fb{fallback:g}"
+        return tag.replace('.', 'p')
+    return str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+
+
 def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     """按年份处理 Euler summary 的 baseline 与高 DO 异常（支持 Dask 并行）。"""
     (
         year,
+        region_cfg_key,
         depth_interval,
         do_threshold,
+        do_threshold_mode,
+        do_threshold_percentile,
+        do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size,
         salinity_threshold,
         temperature_threshold,
         anomaly_min_depth,
         depth_merge_tolerance,
         duplicate_depth_strategy,
-        lon_min_bound,
-        lon_max_bound,
-        lat_min_bound,
-        lat_max_bound,
     ) = args
+
+    if region_cfg_key:
+        try:
+            switch_region(str(region_cfg_key), verbose=False)
+        except Exception as exc:
+            print(f"[build_euler_grid_summary] 切换区域失败 ({region_cfg_key}): {exc}")
+            return pd.DataFrame(), pd.DataFrame()
 
     try:
         df_year = load_argo_data(int(year))
@@ -7999,8 +8372,8 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
 
     lon_vals = df_year['Longitude'].to_numpy(dtype=float, copy=False)
     lat_vals = df_year['Latitude'].to_numpy(dtype=float, copy=False)
-    lon_mask = _region_lon_mask(lon_vals, lon_min_bound, lon_max_bound)
-    lat_mask = (lat_vals >= lat_min_bound) & (lat_vals <= lat_max_bound)
+    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
     df_geo = df_year[lon_mask & lat_mask].copy()
     if df_geo.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -8022,6 +8395,11 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
         df_geo,
         depth_interval=depth_interval,
         do_threshold=do_threshold,
+        do_threshold_mode=do_threshold_mode,
+        do_threshold_percentile=do_threshold_percentile,
+        do_threshold_grid_step_deg=do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples=do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size=do_threshold_percentile_window_size,
         salinity_threshold=salinity_threshold,
         temperature_threshold=temperature_threshold,
         anomaly_min_depth=None,
@@ -8069,6 +8447,11 @@ def build_euler_grid_summary(
     grid_step_deg: float = 1.0,
     meta_output_root: str | Path | None = None,
     do_threshold: float | None = None,
+    do_threshold_mode: str = 'absolute',
+    do_threshold_percentile: float = 99.0,
+    do_threshold_grid_step_deg: float | None = None,
+    do_threshold_percentile_min_samples: int = 5,
+    do_threshold_percentile_window_size: int = 5,
     salinity_threshold: float | None = None,
     temperature_threshold: float | None = None,
     depth_interval: float | None = None,
@@ -8094,6 +8477,16 @@ def build_euler_grid_summary(
 
     if do_threshold is None:
         do_threshold = _default_delta_do_threshold
+    mode_norm = str(do_threshold_mode or 'absolute').strip().lower()
+    if mode_norm in {'absolute', 'fixed'}:
+        mode_norm = 'absolute'
+    elif mode_norm in {'grid_percentile', 'percentile', 'euler_grid_percentile'}:
+        mode_norm = 'grid_percentile'
+    else:
+        raise ValueError("do_threshold_mode 仅支持 'absolute' 或 'grid_percentile'")
+    if do_threshold_grid_step_deg is None:
+        do_threshold_grid_step_deg = grid_step_deg
+    do_threshold_percentile_window_size = _validate_percentile_window_size(do_threshold_percentile_window_size)
     if salinity_threshold is None:
         salinity_threshold = _default_salinity_threshold
     if temperature_threshold is None:
@@ -8184,20 +8577,23 @@ def build_euler_grid_summary(
     # 2) 高 DO 异常网格剖面数（仅最小深度阈值）+ Argo 观测机会网格
     do_frames = []
     baseline_frames = []
+    current_region_cfg_key = _current_region_config_key()
     year_args = [
         (
             year,
+            current_region_cfg_key,
             depth_interval,
             do_threshold,
+            mode_norm,
+            do_threshold_percentile,
+            do_threshold_grid_step_deg,
+            do_threshold_percentile_min_samples,
+            do_threshold_percentile_window_size,
             salinity_threshold,
             temperature_threshold,
             anomaly_min_depth,
             depth_merge_tolerance,
             duplicate_depth_strategy,
-            lonmin,
-            lonmax,
-            latmin,
-            latmax,
         )
         for year in range(start_year, end_year + 1)
     ]
@@ -8277,6 +8673,11 @@ def build_euler_grid_summary(
             'grid_step_deg': float(grid_step_deg),
             'anomaly_min_depth': float(anomaly_min_depth) if anomaly_min_depth is not None else np.nan,
             'do_threshold': float(do_threshold),
+            'do_threshold_mode': str(mode_norm),
+            'do_threshold_percentile': float(do_threshold_percentile),
+            'do_threshold_grid_step_deg': float(do_threshold_grid_step_deg),
+            'do_threshold_percentile_min_samples': int(do_threshold_percentile_min_samples),
+            'do_threshold_percentile_window_size': int(do_threshold_percentile_window_size),
             'salinity_threshold': float(salinity_threshold),
             'temperature_threshold': float(temperature_threshold),
         },
@@ -8394,7 +8795,7 @@ def plot_euler_grid_summary(
     fig.suptitle(
         (
             f"EddyDays & High DO Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"{_format_do_threshold_label(meta)}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | grid step = {meta['grid_step_deg']:.1f}°"
         ),
@@ -8415,7 +8816,7 @@ def plot_euler_grid_summary(
 
     out = {}
     if save_fig:
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        do_thr_tag = _format_do_threshold_tag(meta)
         depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         fname = output_dir / (
             f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_"
@@ -8430,7 +8831,7 @@ def plot_euler_grid_summary(
     plt.close(fig)
 
     if save_data:
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        do_thr_tag = _format_do_threshold_tag(meta)
         depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         npz_path = output_dir / (
             f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_{meta['grid_step_deg']:g}deg_"
@@ -9101,7 +9502,7 @@ def analyze_euler_ace_ce_association(
         (
             f"Eddy - High DO Association ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"{_format_do_threshold_label(meta)}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | eddy-days threshold ≥ {shared_threshold:g} day"
             f" | DO-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
@@ -9182,7 +9583,7 @@ def analyze_euler_ace_ce_association(
 
     if save_fig:
         output_dir.mkdir(parents=True, exist_ok=True)
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        do_thr_tag = _format_do_threshold_tag(meta)
         depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         fname = output_dir / (
             f"{prefix_safe}_Association_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
@@ -9303,7 +9704,7 @@ def analyze_euler_eke_do_association(
     suptitle_summary = (
         f"EKE & High DO Summary ({meta.get('region_key', 'region')}, "
         f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-        f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+        f"{_format_do_threshold_label(meta)}"
         f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
         f" | EKE threshold ≥ {active_thr:.4e}"
         f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}"
@@ -9374,7 +9775,7 @@ def analyze_euler_eke_do_association(
         (
             f"EKE - High DO Association ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"{_format_do_threshold_label(meta)}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | EKE threshold ≥ {active_thr:.4e}"
             f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}\n"
@@ -9425,7 +9826,7 @@ def analyze_euler_eke_do_association(
 
     if save_fig:
         output_dir.mkdir(parents=True, exist_ok=True)
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
+        do_thr_tag = _format_do_threshold_tag(meta)
         depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         fname_summary = output_dir / (
             f"{prefix_safe}_Summary_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
@@ -9458,6 +9859,11 @@ def run_euler_grid_analysis(
     run_association: bool = True,
     grid_step_deg: float = 1.0,
     do_threshold: float | None = None,
+    do_threshold_mode: str = 'absolute',
+    do_threshold_percentile: float = 99.0,
+    do_threshold_grid_step_deg: float | None = None,
+    do_threshold_percentile_min_samples: int = 5,
+    do_threshold_percentile_window_size: int = 5,
     analysis_depth: float | int | None = None,
     active_threshold: float | str | None = 'auto',
     do_rate_high_low_threshold: float | str | None = 'auto',
@@ -9487,6 +9893,11 @@ def run_euler_grid_analysis(
         run_association: 是否执行关联分析。
         grid_step_deg: 网格分辨率（度）。
         do_threshold: ΔDO 阈值；None 时使用配置默认值。
+        do_threshold_mode: ΔDO 筛选模式：'absolute'（固定阈值）或 'grid_percentile'（按网格百分位）。
+        do_threshold_percentile: 当 do_threshold_mode='grid_percentile' 时使用的百分位（可传 90 或 0.9）。
+        do_threshold_grid_step_deg: 百分位筛选分箱网格分辨率；None 时与 grid_step_deg 一致。
+        do_threshold_percentile_min_samples: 网格内样本数少于该值时回退到 absolute 阈值。
+        do_threshold_percentile_window_size: 百分位筛选邻域窗口尺寸（奇数）；1=单格，3=3x3，5=5x5（默认）。
         analysis_depth: 统一分析深度（m），同时用于 DO 异常筛选深度与 EKE 采样深度；None 回退配置默认值。
         active_threshold: 关联分析中 active 分组阈值；可传数值或 'auto'。
         do_rate_high_low_threshold: 关联分析中 DO-rate 高低分组阈值；可传数值或 'auto'。
@@ -9525,6 +9936,11 @@ def run_euler_grid_analysis(
         end_year=end_year,
         grid_step_deg=grid_step_deg,
         do_threshold=do_threshold,
+        do_threshold_mode=do_threshold_mode,
+        do_threshold_percentile=do_threshold_percentile,
+        do_threshold_grid_step_deg=do_threshold_grid_step_deg,
+        do_threshold_percentile_min_samples=do_threshold_percentile_min_samples,
+        do_threshold_percentile_window_size=do_threshold_percentile_window_size,
         anomaly_min_depth=unified_depth,
         meta_output_root=meta_output_root,
         use_dask=use_dask,
@@ -9610,6 +10026,11 @@ def calculate_delta_do(
     temperature_col: str = 'Temperature',
     depth_interval: float | None = None,
     do_threshold: float | None = None,
+    do_threshold_mode: str = 'absolute',
+    do_threshold_percentile: float = 99.0,
+    do_threshold_grid_step_deg: float | None = None,
+    do_threshold_percentile_min_samples: int = 5,
+    do_threshold_percentile_window_size: int = 5,
     salinity_threshold: float | None = None,
     temperature_threshold: float | None = None,
     anomaly_min_depth: float | None = None,
@@ -9626,7 +10047,10 @@ def calculate_delta_do(
     2. 计算 DO 随深度的一阶导数，定位 DO 的正峰值（代表可能的表层富氧水体俯冲信号）；
     3. 以 DO 峰深度为中心，取窗口 [p-Δp, p+Δp]，用两端点连线构造参考剖面；
     4. 在峰值同一深度计算 ΔDO、ΔSalinity 与 ΔTemperature（原始值减参考线值）；
-    5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
+    5. 支持两种 ΔDO 筛选模式：
+       - absolute：以 ΔDO ≥ do_threshold 作为必要条件；
+       - grid_percentile：先保留候选，再按 Euler 网格邻域窗口内 ΔDO 百分位阈值筛选；
+       salinity_threshold / temperature_threshold > 0 时可附加 |ΔSalinity/ΔTemperature| 过滤；
     6. 若 anomaly_min_depth > 0，仅保留深度不小于该阈值的异常；
     7. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
 
@@ -9638,6 +10062,11 @@ def calculate_delta_do(
         temperature_col (str): 温度列名，默认 'Temperature'。
         depth_interval (float | None): 深度窗口半宽；None → 全局 `_default_depth_interval`。
         do_threshold (float | None): ΔDO 阈值；None → `_default_delta_do_threshold`。
+        do_threshold_mode (str): ΔDO 阈值模式，'absolute' 或 'grid_percentile'。
+        do_threshold_percentile (float): 网格百分位阈值（可传 90 或 0.9）。
+        do_threshold_grid_step_deg (float | None): 百分位筛选使用的 Euler 网格分辨率（度）；None 时使用 1.0°。
+        do_threshold_percentile_min_samples (int): 单网格样本不足时回退 absolute 阈值的最小样本数。
+        do_threshold_percentile_window_size (int): 百分位筛选邻域窗口尺寸（奇数）；1=单格，3=3x3，5=5x5。
         salinity_threshold (float | None): 盐度阈值；None → `_default_salinity_threshold`；≤0 不启用过滤。
         temperature_threshold (float | None): 温度阈值；None → `_default_temperature_threshold`；≤0 不启用过滤。
         anomaly_min_depth (float | None): ΔDO 异常最小深度；≤0 表示不做深度过滤；None 表示使用 processing.yml 的 anomaly_min_depth。
@@ -9694,6 +10123,18 @@ def calculate_delta_do(
         duplicate_depth_strategy = _default_duplicate_depth_strategy
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
+
+    threshold_mode = str(do_threshold_mode or 'absolute').strip().lower()
+    if threshold_mode in {'absolute', 'fixed'}:
+        threshold_mode = 'absolute'
+    elif threshold_mode in {'grid_percentile', 'percentile', 'euler_grid_percentile'}:
+        threshold_mode = 'grid_percentile'
+    else:
+        raise ValueError("do_threshold_mode 仅支持 'absolute' 或 'grid_percentile'")
+
+    percentile_grid_step_deg = float(do_threshold_grid_step_deg) if do_threshold_grid_step_deg is not None else 1.0
+    percentile_min_samples = max(1, int(do_threshold_percentile_min_samples))
+    percentile_window_size = _validate_percentile_window_size(do_threshold_percentile_window_size)
 
     for profile_num, profile_data in profile_groups:
         # 质量控制：移除异常值和质量标记不良的数据
@@ -9860,7 +10301,10 @@ def calculate_delta_do(
             delta_temperature = temperature_range[target_idx] - temperature_ref_values[target_idx]
 
             # 判定：ΔDO 为必需条件；ΔSalinity/ΔTemperature 在各自阈值>0时作为附加过滤（与条件）
-            cond = (delta_do >= do_threshold)
+            if threshold_mode == 'grid_percentile':
+                cond = np.isfinite(delta_do) and (delta_do > 0)
+            else:
+                cond = (delta_do >= do_threshold)
             if use_salinity_filter:
                 cond = cond and (not np.isnan(delta_salinity)) and (abs(delta_salinity) >= salinity_threshold)
             if use_temperature_filter:
@@ -9933,6 +10377,36 @@ def calculate_delta_do(
     results_df = pd.DataFrame(all_results)
     if anomaly_min_depth is not None and anomaly_min_depth > 0 and 'depth' in results_df.columns:
         results_df = results_df[results_df['depth'] >= anomaly_min_depth]
+    if threshold_mode == 'grid_percentile':
+        try:
+            results_df = _apply_grid_percentile_do_filter(
+                results_df,
+                do_percentile=do_threshold_percentile,
+                grid_step_deg=percentile_grid_step_deg,
+                fallback_threshold=float(do_threshold),
+                min_samples=percentile_min_samples,
+                percentile_window_size=percentile_window_size,
+                lon_col='Longitude',
+                lat_col='Latitude',
+            )
+            if not results_df.empty:
+                results_df['do_threshold_mode'] = 'grid_percentile'
+                results_df['do_threshold_percentile'] = float(do_threshold_percentile)
+                results_df['do_threshold_grid_step_deg'] = float(percentile_grid_step_deg)
+                results_df['do_threshold_percentile_min_samples'] = int(percentile_min_samples)
+                results_df['do_threshold_percentile_window_size'] = int(percentile_window_size)
+        except Exception as exc:
+            if verbose:
+                print(f"[calculate_delta_do] grid_percentile 筛选失败，回退 absolute: {exc}")
+            results_df = results_df[results_df['delta_do'] >= float(do_threshold)].copy()
+            if not results_df.empty:
+                results_df['do_threshold_effective'] = float(do_threshold)
+                results_df['do_threshold_source'] = 'absolute_fallback_error'
+                results_df['do_threshold_mode'] = 'absolute'
+    elif not results_df.empty:
+        results_df['do_threshold_effective'] = float(do_threshold)
+        results_df['do_threshold_source'] = 'absolute'
+        results_df['do_threshold_mode'] = 'absolute'
     if verbose:
         print(f"总共检测到 {len(results_df)} 个潜在的DO异常信号，来自 {len(results_df['Profile_number'].unique())} 个剖面")
 
