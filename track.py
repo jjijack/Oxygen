@@ -7361,6 +7361,518 @@ def plot_argo_hotspots(
         'anomalies_path': saved_anomalies_path,
     }
 
+
+def plot_hotspot_anomaly_vertical_profiles(
+    start_year: int | None = None,
+    end_year: int | None = None,
+    anomalies_path: str | Path | None = None,
+    do_threshold: float | None = None,
+    anomaly_min_depth: float | None = None,
+    variables: list = ['DO', 'Temp', 'Salinity'],
+    remove_outliers: bool = True,
+    annotate_delta_ts: bool = False,
+    save_fig: bool = True,
+    show_fig: bool = False,
+    clear_output_dir: bool = True,
+    max_profiles: int | None = None,
+    argo_data_dir: str | Path | None = None,
+) -> dict:
+    """基于 hotspots 异常文件批量绘制 Argo 垂向剖面。
+
+    说明:
+        1. 输入 anomalies parquet 仅包含异常摘要，不含完整剖面；本函数会按 Year+Profile_number 回查原始 Argo 年数据。
+        2. 绘图阶段复用 plot_vertical 的单剖面画线内核，并可通过 remove_outliers 控制基础 QC。
+
+    参数:
+        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
+        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        do_threshold / anomaly_min_depth: 仅用于自动定位文件名；None 回退配置默认值。
+        variables: 每幅图绘制的变量列表，默认 ['DO','Temp','Salinity']。
+        remove_outliers: True 时按基础 QC 剔除异常值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
+        annotate_delta_ts: 是否额外计算并在图上标注 ΔTemperature 与 ΔSalinity（默认 False）。
+        save_fig / show_fig: 输出控制。
+        clear_output_dir: 保存图片时是否在本次运行开始前清空输出目录，默认 True。
+        max_profiles: 最多绘制多少个异常剖面；None 表示全部。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+
+    返回:
+        dict: 包含 total_candidates/plotted_profiles/skipped_profiles/output_dir/anomalies_path。
+    """
+
+    def _to_int_or_none(val):
+        try:
+            if pd.isna(val):
+                return None
+            return int(val)
+        except Exception:
+            return None
+
+    if do_threshold is None:
+        do_threshold = _default_delta_do_threshold
+    if anomaly_min_depth is None:
+        anomaly_min_depth = _cfg_anomaly_min_depth
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+
+    if anomalies_path is None:
+        if start_year is None or end_year is None:
+            raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
+        region_slug = _current_region_key()
+        hotspot_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots"
+        thr_str = f"{do_threshold:g}".replace('.', 'p')
+        depth_suffix = ''
+        if anomaly_min_depth is not None and anomaly_min_depth > 0:
+            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
+            depth_suffix = f"_depth{depth_str}m"
+        anomalies_path = hotspot_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+    else:
+        anomalies_path = Path(anomalies_path)
+
+    if not Path(anomalies_path).exists():
+        raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
+
+    anomalies = pd.read_parquet(anomalies_path)
+    if anomalies.empty:
+        print(f"[*] No anomalies in file: {anomalies_path}")
+        return {
+            'total_candidates': 0,
+            'plotted_profiles': 0,
+            'skipped_profiles': 0,
+            'output_dir': None,
+            'anomalies_path': str(anomalies_path),
+        }
+
+    required_cols = ['Year', 'Profile_number']
+    missing_cols = [c for c in required_cols if c not in anomalies.columns]
+    if missing_cols:
+        raise ValueError(f"Anomalies file missing required columns: {missing_cols}")
+
+    work = anomalies.copy()
+    work['_year'] = pd.to_numeric(work['Year'], errors='coerce')
+    work['_profile'] = pd.to_numeric(work['Profile_number'], errors='coerce')
+    work = work.dropna(subset=['_year', '_profile']).copy()
+    work['_year'] = work['_year'].astype(int)
+    work['_profile'] = work['_profile'].astype(int)
+
+    if max_profiles is not None and max_profiles > 0:
+        if 'delta_do' in work.columns:
+            work = work.sort_values('delta_do', ascending=False).head(int(max_profiles)).copy()
+        else:
+            work = work.head(int(max_profiles)).copy()
+
+    region_slug = _current_region_key()
+    output_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots_vertical_profiles"
+    if save_fig:
+        if clear_output_dir and output_dir.exists():
+            try:
+                shutil.rmtree(output_dir)
+            except Exception as exc:
+                print(f"[WARN] Failed to clear output directory {output_dir}: {exc}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    year_cache: dict[int, pd.DataFrame] = {}
+    total_candidates = int(len(work))
+    plotted_profiles = 0
+    skipped_profiles = 0
+
+    row_iter = tqdm(work.iterrows(), total=total_candidates, desc="hotspot vertical profiles", unit="profile")
+
+    for _, row in row_iter:
+        year_val = int(row['_year'])
+        profile_num = int(row['_profile'])
+
+        if year_val not in year_cache:
+            try:
+                year_cache[year_val] = load_argo_data(year_val, data_dir=argo_data_dir)
+            except FileNotFoundError:
+                print(f"[WARN] Missing Argo yearly file for {year_val}, skip profile {profile_num}.")
+                year_cache[year_val] = pd.DataFrame()
+            except Exception as exc:
+                print(f"[WARN] Failed loading Argo {year_val}: {exc}")
+                year_cache[year_val] = pd.DataFrame()
+
+        df_year = year_cache[year_val]
+        if df_year.empty:
+            skipped_profiles += 1
+            continue
+
+        profile_rows = df_year[df_year['Profile_number'] == profile_num].copy()
+        if profile_rows.empty:
+            print(f"[WARN] No raw profile found for Year={year_val}, Profile_number={profile_num}.")
+            skipped_profiles += 1
+            continue
+
+        month_val = _to_int_or_none(row.get('Month'))
+        day_val = _to_int_or_none(row.get('Day'))
+        if month_val is not None and day_val is not None:
+            day_rows = profile_rows[
+                (pd.to_numeric(profile_rows['Month'], errors='coerce') == month_val)
+                & (pd.to_numeric(profile_rows['Day'], errors='coerce') == day_val)
+            ].copy()
+            if not day_rows.empty:
+                profile_rows = day_rows
+
+        platform_val = None
+        if 'Platform_number' in profile_rows.columns:
+            platforms = pd.to_numeric(profile_rows['Platform_number'], errors='coerce').dropna().astype(int).unique()
+            if platforms.size > 0:
+                platform_val = int(platforms[0])
+                if platforms.size > 1:
+                    print(
+                        f"[WARN] Multiple platforms found for Year={year_val}, Profile={profile_num}; "
+                        f"using Platform_number={platform_val}."
+                    )
+                    profile_rows = profile_rows[
+                        pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == platform_val
+                    ].copy()
+
+        if profile_rows.empty:
+            skipped_profiles += 1
+            continue
+
+        profile_rows = profile_rows.sort_values('Depth').copy()
+
+        delta_temp_text = ""
+        delta_salinity_text = ""
+        if annotate_delta_ts:
+            try:
+                deltas = calculate_delta_do(
+                    profile_rows.copy(),
+                    do_threshold=float('-inf'),
+                    salinity_threshold=0.0,
+                    temperature_threshold=0.0,
+                    anomaly_min_depth=0.0,
+                    remove_outliers=remove_outliers,
+                    verbose=False,
+                )
+                if not deltas.empty and 'delta_temperature' in deltas.columns and 'delta_salinity' in deltas.columns:
+                    target_depth = pd.to_numeric(pd.Series([row.get('depth')]), errors='coerce').iloc[0]
+                    if np.isfinite(target_depth) and 'depth' in deltas.columns:
+                        target_idx = (pd.to_numeric(deltas['depth'], errors='coerce') - float(target_depth)).abs().idxmin()
+                        picked = deltas.loc[target_idx]
+                    else:
+                        picked = deltas.sort_values('delta_do', ascending=False).iloc[0]
+
+                    picked_dt = pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0]
+                    picked_ds = pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0]
+                    if np.isfinite(picked_dt):
+                        delta_temp_text = f", ΔTemp={float(picked_dt):.2f}"
+                    if np.isfinite(picked_ds):
+                        delta_salinity_text = f", ΔSalinity={float(picked_ds):.2f}"
+            except Exception as exc:
+                print(f"[WARN] Failed to compute ΔTemp/ΔSalinity for profile {profile_num}: {exc}")
+
+        num_variables = len(variables)
+        fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
+        if num_variables == 1:
+            axes = [axes]
+
+        line_color = plt.cm.coolwarm(0.15)
+        any_plotted = False
+
+        for var_name, ax in zip(variables, axes):
+            db_variable_name = _map_plot_variable_name(var_name)
+
+            if db_variable_name not in profile_rows.columns:
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"Variable '{db_variable_name}'\\nnot found in data.",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                    fontsize=16,
+                )
+                _apply_vertical_profile_axis_style(ax, var_name)
+                continue
+
+            did_plot = _plot_single_argo_profile_line(
+                ax,
+                profile_rows,
+                var_name,
+                line_color,
+                remove_outliers=remove_outliers,
+                alpha=0.9,
+            )
+            if not did_plot:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No valid data after QC.",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                    fontsize=14,
+                )
+            else:
+                any_plotted = True
+
+            _apply_vertical_profile_axis_style(ax, var_name)
+
+        axes[0].set_ylabel("Depth/m", fontsize=20)
+        axes[0].tick_params(axis='y', labelsize=16)
+        axes[0].invert_yaxis()
+
+        row_month = _to_int_or_none(row.get('Month'))
+        row_day = _to_int_or_none(row.get('Day'))
+        if row_month is not None and row_day is not None:
+            date_text = f"{year_val:04d}-{row_month:02d}-{row_day:02d}"
+        else:
+            first_row = profile_rows.iloc[0]
+            first_year = _to_int_or_none(first_row.get('Year'))
+            first_month = _to_int_or_none(first_row.get('Month'))
+            first_day = _to_int_or_none(first_row.get('Day'))
+            if first_year is not None and first_month is not None and first_day is not None:
+                date_text = f"{first_year:04d}-{first_month:02d}-{first_day:02d}"
+            else:
+                date_text = str(year_val)
+
+        delta_text = ""
+        try:
+            delta_val = float(pd.to_numeric(pd.Series([row.get('delta_do')]), errors='coerce').iloc[0])
+            if np.isfinite(delta_val):
+                delta_text = f", ΔDO={delta_val:.2f}"
+        except Exception:
+            delta_text = ""
+
+        platform_text = f", Platform={platform_val}" if platform_val is not None else ""
+        fig.suptitle(
+            f"Hotspots Profile {profile_num}{platform_text}, {date_text}{delta_text}{delta_temp_text}{delta_salinity_text}",
+            fontsize=24,
+            y=0.95,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+        if save_fig and any_plotted:
+            file_date = date_text.replace('-', '')
+            platform_suffix = f"_platform{platform_val}" if platform_val is not None else ""
+            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}.png"
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+
+        if any_plotted:
+            plotted_profiles += 1
+        else:
+            skipped_profiles += 1
+
+    print(
+        f"[*] Hotspots profile plotting complete: "
+        f"total={total_candidates}, plotted={plotted_profiles}, skipped={skipped_profiles}."
+    )
+
+    return {
+        'total_candidates': total_candidates,
+        'plotted_profiles': int(plotted_profiles),
+        'skipped_profiles': int(skipped_profiles),
+        'output_dir': str(output_dir) if save_fig else None,
+        'anomalies_path': str(anomalies_path),
+    }
+
+
+def plot_single_hotspot_profile(
+    profile_number: int,
+    year: int,
+    month: int | None = None,
+    day: int | None = None,
+    platform_number: int | None = None,
+    variables: list = ['DO', 'Temp', 'Salinity'],
+    xlim_overrides: dict[str, tuple[float, float]] | None = None,
+    remove_outliers: bool = True,
+    annotate_delta_ts: bool = True,
+    save_fig: bool = False,
+    show_fig: bool = True,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """重绘单个 Hotspots Profile，并支持按变量单独调节横轴范围。
+
+    参数:
+        profile_number: 目标剖面编号（Profile_number）。
+        year/month/day: 日期筛选；month/day 可选。
+        platform_number: 可选平台编号筛选。
+        variables: 绘制变量列表，默认 ['DO', 'Temp', 'Salinity']。
+        xlim_overrides: 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}。
+                        键可用 'Temp' 或 'Temperature'。
+        remove_outliers: 与 plot_vertical 同义；False 时会显示 QC 异常标记与红色桥接线。
+        annotate_delta_ts: 是否在标题追加 ADO/ATemp/ASalinity。
+        save_fig/show_fig: 输出控制。
+        argo_data_dir: 年度 Argo parquet 目录，None 使用配置默认。
+        output_dir: 自定义输出目录；None 使用 plot_outputs/<region>/plot_argo_hotspots_vertical_profiles_single。
+
+    返回:
+        dict: 包含 save_path/profile_number/platform_number/date/ado/atemp/asalinity。
+    """
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+
+    df_year = load_argo_data(int(year), data_dir=argo_data_dir)
+    if df_year.empty:
+        raise ValueError(f"No Argo data for year {year}.")
+
+    profile_rows = df_year[pd.to_numeric(df_year['Profile_number'], errors='coerce') == int(profile_number)].copy()
+    if profile_rows.empty:
+        raise ValueError(f"Profile_number={profile_number} not found in year {year}.")
+
+    if month is not None:
+        profile_rows = profile_rows[pd.to_numeric(profile_rows['Month'], errors='coerce') == int(month)].copy()
+    if day is not None:
+        profile_rows = profile_rows[pd.to_numeric(profile_rows['Day'], errors='coerce') == int(day)].copy()
+    if platform_number is not None:
+        profile_rows = profile_rows[pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == int(platform_number)].copy()
+
+    if profile_rows.empty:
+        raise ValueError("No rows left after month/day/platform filters.")
+
+    profile_rows = profile_rows.sort_values('Depth').copy()
+
+    # 若未指定平台，且仍有多个平台，默认取第一个以保持“单图单剖面”语义
+    platform_val = None
+    if 'Platform_number' in profile_rows.columns:
+        platforms = pd.to_numeric(profile_rows['Platform_number'], errors='coerce').dropna().astype(int).unique()
+        if platforms.size > 0:
+            platform_val = int(platforms[0])
+            if platform_number is None and platforms.size > 1:
+                profile_rows = profile_rows[
+                    pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == platform_val
+                ].copy()
+
+    num_variables = len(variables)
+    fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
+    if num_variables == 1:
+        axes = [axes]
+
+    line_color = plt.cm.coolwarm(0.15)
+    any_plotted = False
+
+    for var_name, ax in zip(variables, axes):
+        db_variable_name = _map_plot_variable_name(var_name)
+        if db_variable_name not in profile_rows.columns:
+            ax.text(
+                0.5,
+                0.5,
+                f"Variable '{db_variable_name}'\\nnot found in data.",
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=16,
+            )
+            _apply_vertical_profile_axis_style(ax, var_name)
+            continue
+
+        did_plot = _plot_single_argo_profile_line(
+            ax,
+            profile_rows,
+            var_name,
+            line_color,
+            remove_outliers=remove_outliers,
+            alpha=0.9,
+        )
+        if not did_plot:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid data after QC.",
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=14,
+            )
+        else:
+            any_plotted = True
+
+        _apply_vertical_profile_axis_style(ax, var_name)
+
+        if xlim_overrides:
+            override = None
+            if var_name in xlim_overrides:
+                override = xlim_overrides[var_name]
+            elif db_variable_name in xlim_overrides:
+                override = xlim_overrides[db_variable_name]
+            if override is not None and len(override) == 2:
+                try:
+                    ax.set_xlim(float(override[0]), float(override[1]))
+                except Exception:
+                    pass
+
+    axes[0].set_ylabel("Depth/m", fontsize=20)
+    axes[0].tick_params(axis='y', labelsize=16)
+    axes[0].invert_yaxis()
+
+    date_text = f"{int(year):04d}-{int(profile_rows.iloc[0]['Month']):02d}-{int(profile_rows.iloc[0]['Day']):02d}"
+    if month is not None and day is not None:
+        date_text = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+
+    delta_do_val = np.nan
+    delta_temp_val = np.nan
+    delta_salinity_val = np.nan
+    if annotate_delta_ts:
+        try:
+            deltas = calculate_delta_do(
+                profile_rows.copy(),
+                do_threshold=float('-inf'),
+                salinity_threshold=0.0,
+                temperature_threshold=0.0,
+                anomaly_min_depth=0.0,
+                remove_outliers=remove_outliers,
+                verbose=False,
+            )
+            if not deltas.empty:
+                picked = deltas.sort_values('delta_do', ascending=False).iloc[0]
+                delta_do_val = float(pd.to_numeric(pd.Series([picked.get('delta_do')]), errors='coerce').iloc[0])
+                delta_temp_val = float(pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0])
+                delta_salinity_val = float(pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0])
+        except Exception:
+            pass
+
+        if np.isfinite(delta_do_val):
+            delta_do_text = f", ΔDO={delta_do_val:.2f}"
+        if np.isfinite(delta_temp_val):
+            delta_temp_text = f", ΔTemp={delta_temp_val:.2f}"
+        if np.isfinite(delta_salinity_val):
+            delta_salinity_text = f", ΔSalinity={delta_salinity_val:.2f}"
+
+    platform_label = (
+        int(platform_number) if platform_number is not None
+        else (platform_val if platform_val is not None else None)
+    )
+    platform_text = f", Platform={platform_label}" if platform_label is not None else ""
+
+    fig.suptitle(
+        f"Hotspots Profile {int(profile_number)}{platform_text}, {date_text}{delta_do_text}{delta_temp_text}{delta_salinity_text}",
+        fontsize=24,
+        y=0.95,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+    saved_path = None
+    if save_fig and any_plotted:
+        if output_dir is None:
+            region_slug = _current_region_key()
+            output_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots_vertical_profiles_single"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        platform_suffix = f"_platform{platform_label}" if platform_label is not None else ""
+        filename = f"hotspot_profile_{date_text.replace('-', '')}_profile{int(profile_number)}{platform_suffix}_single.png"
+        saved_path = output_dir / filename
+        plt.savefig(saved_path, dpi=300, bbox_inches='tight')
+
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+
+    return {
+        'profile_number': int(profile_number),
+        'platform_number': int(platform_label) if platform_label is not None else None,
+        'date': date_text,
+        'delta_do': float(delta_do_val) if np.isfinite(delta_do_val) else np.nan,
+        'delta_temperature': float(delta_temp_val) if np.isfinite(delta_temp_val) else np.nan,
+        'delta_salinity': float(delta_salinity_val) if np.isfinite(delta_salinity_val) else np.nan,
+        'save_path': str(saved_path) if saved_path is not None else None,
+    }
+
 def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     """模块级 worker，支持 multiprocessing pickling。
 
