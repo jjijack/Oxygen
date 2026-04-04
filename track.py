@@ -2522,6 +2522,7 @@ def plot_track_variable_timeseries(
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
     anomaly_min_depth: float | None = None,
+    remove_outliers: bool = True,
     save_fig: bool = False,
     show_fig: bool = True,
 ):
@@ -2544,12 +2545,16 @@ def plot_track_variable_timeseries(
         salinity_threshold / temperature_threshold: 传递给 calculate_delta_do 的 ΔS/ΔT 条件，None 时使用 processing.yml 默认。
         depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传递给 calculate_delta_do 的参数，控制 ΔDO 计算窗口与合并方式。
         anomaly_min_depth: ΔDO 最小深度阈值（同 plot_all_tracks_in_range）；None 回退配置。
+        remove_outliers: 是否执行基础 QC（Flag 过滤 + DO<=1 过滤），默认 True。
         save_fig / show_fig: 控制图像输出。
     """
     print(f"[*] Building {variable} time series for eddy {no}...")
 
     if threshold is None:
         threshold = _default_delta_do_threshold
+
+    display_variable = variable
+    db_variable_name = _map_plot_variable_name(variable)
 
     def _normalize_date_input(value, label):
         if value is None:
@@ -2588,8 +2593,11 @@ def plot_track_variable_timeseries(
         print(f"  - Skip plotting {ds_name}{no}: no matched Argo profiles.")
         return
 
-    if variable not in argo_data.columns:
-        print(f"  - Column '{variable}' not found in matched Argo data.")
+    if db_variable_name not in argo_data.columns:
+        if db_variable_name == display_variable:
+            print(f"  - Column '{db_variable_name}' not found in matched Argo data.")
+        else:
+            print(f"  - Column '{display_variable}' (mapped to '{db_variable_name}') not found in matched Argo data.")
         return
 
     if depth_col not in argo_data.columns:
@@ -2636,7 +2644,7 @@ def plot_track_variable_timeseries(
             anomaly_min_depth=anomaly_min_depth,
             depth_merge_tolerance=depth_merge_tolerance,
             duplicate_depth_strategy=duplicate_depth_strategy,
-            remove_outliers=True,
+            remove_outliers=remove_outliers,
             verbose=False,
         )
         if anomalies.empty or 'Profile_number' not in anomalies.columns:
@@ -2654,7 +2662,10 @@ def plot_track_variable_timeseries(
             return
         anomaly_filtered = True
 
-    argo_data['_var'] = pd.to_numeric(argo_data[variable], errors='coerce')
+    if remove_outliers:
+        argo_data = _apply_basic_argo_qc(argo_data, db_variable_name)
+
+    argo_data['_var'] = pd.to_numeric(argo_data[db_variable_name], errors='coerce')
     argo_data['_depth'] = pd.to_numeric(argo_data[depth_col], errors='coerce')
     argo_data.dropna(subset=['date', '_depth'], inplace=True)
     if argo_data.empty:
@@ -2748,7 +2759,7 @@ def plot_track_variable_timeseries(
     ax.invert_yaxis()
     ax.set_ylabel('Depth (dbar)', fontsize=14)
     title_suffix = ' (thresholded)' if only_above_threshold else ' (all profiles)'
-    ax.set_title(f"{ds_name}{no} {variable} mean inside eddy{title_suffix}", fontsize=16)
+    ax.set_title(f"{ds_name}{no} {display_variable} mean inside eddy{title_suffix}", fontsize=16)
     ax.xaxis_date()
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
 
@@ -2766,7 +2777,7 @@ def plot_track_variable_timeseries(
         fraction=0.035,
         location='right'
     )
-    cbar.set_label(f'{variable} mean', fontsize=14)
+    cbar.set_label(f'{display_variable} mean', fontsize=14)
 
     if show_profile_hist:
         ax_hist.bar(hist_counts.index, hist_counts.values, width=0.8, color='gray')
@@ -2943,6 +2954,138 @@ def convert_eddy_number(
 
     return [_convert_one(v) for v in values]
 
+
+def _map_plot_variable_name(var_name: str) -> str:
+    """将绘图变量名映射到 Argo 标准列名。"""
+    return 'Temperature' if str(var_name) == 'Temp' else str(var_name)
+
+
+def _apply_basic_argo_qc(profile_rows: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """对单个变量执行基础 Argo 质控（Flag 过滤 + DO 规则过滤）。"""
+    rows_qc = profile_rows.copy()
+    qc_column_name = f"{value_col}_Flag"
+    if qc_column_name in rows_qc.columns:
+        good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+        bad_qc_mask = ~rows_qc[qc_column_name].isin(good_qc_flags)
+        rows_qc.loc[bad_qc_mask, value_col] = np.nan
+    if value_col == 'DO':
+        rows_qc.loc[rows_qc[value_col] <= 1.0, value_col] = np.nan
+    return rows_qc
+
+
+def _basic_argo_qc_bad_mask(profile_rows: pd.DataFrame, value_col: str) -> pd.Series:
+    """返回基础 QC 下的异常点掩膜（True 表示该点不通过 QC）。"""
+    bad_mask = pd.Series(False, index=profile_rows.index)
+    qc_column_name = f"{value_col}_Flag"
+
+    if qc_column_name in profile_rows.columns:
+        good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+        bad_mask = bad_mask | (~profile_rows[qc_column_name].isin(good_qc_flags))
+
+    if value_col == 'DO' and value_col in profile_rows.columns:
+        do_vals = pd.to_numeric(profile_rows[value_col], errors='coerce')
+        bad_mask = bad_mask | (do_vals <= 1.0)
+
+    return bad_mask.fillna(False)
+
+
+def _plot_single_argo_profile_line(
+    ax,
+    profile_rows: pd.DataFrame,
+    var_name: str,
+    color,
+    *,
+    remove_outliers: bool = True,
+    alpha: float = 0.7,
+) -> bool:
+    """在指定坐标轴上绘制单个 Argo 剖面单变量曲线，返回是否成功绘制。
+
+    行为:
+        - remove_outliers=True: 按基础 QC 剔除异常值后绘制。
+        - remove_outliers=False: 保留 QC 通过段为原色，并将本应断开的跨段连接用红线桥接；
+            同时用红色圆点标记不通过基础 QC 的点。
+    """
+    db_variable_name = _map_plot_variable_name(var_name)
+    if db_variable_name not in profile_rows.columns or 'Depth' not in profile_rows.columns:
+        return False
+
+    rows_to_plot = profile_rows.dropna(subset=[db_variable_name, 'Depth']).copy()
+    if rows_to_plot.empty:
+        return False
+    rows_to_plot = rows_to_plot.sort_values('Depth').reset_index(drop=True)
+
+    if remove_outliers:
+        rows_to_plot = _apply_basic_argo_qc(rows_to_plot, db_variable_name)
+
+        if not rows_to_plot[db_variable_name].notna().any():
+            return False
+
+        ax.plot(rows_to_plot[db_variable_name], rows_to_plot['Depth'], color=color, alpha=alpha)
+        return True
+
+    bad_mask = _basic_argo_qc_bad_mask(rows_to_plot, db_variable_name)
+    valid_mask = (~bad_mask) & rows_to_plot[db_variable_name].notna() & rows_to_plot['Depth'].notna()
+
+    plotted_any = False
+
+    # 先画“QC 通过”的原色曲线（坏点处自动断开）
+    x_valid = rows_to_plot[db_variable_name].where(valid_mask)
+    if x_valid.notna().any():
+        ax.plot(x_valid, rows_to_plot['Depth'], color=color, alpha=alpha)
+        plotted_any = True
+
+    # 再用红线重绘“本应断开”的跨段路径（包含中间坏点，保证红点落在红线上）
+    valid_positions = np.flatnonzero(valid_mask.to_numpy())
+    bridge_alpha = min(1.0, alpha + 0.15)
+    for left_pos, right_pos in zip(valid_positions[:-1], valid_positions[1:]):
+        if right_pos - left_pos <= 1:
+            continue
+        if not bool(bad_mask.iloc[left_pos + 1:right_pos].any()):
+            continue
+        segment = rows_to_plot.iloc[left_pos:right_pos + 1]
+        ax.plot(
+            segment[db_variable_name],
+            segment['Depth'],
+            color='#d62728',
+            alpha=bridge_alpha,
+            linewidth=2.0,
+            zorder=4,
+        )
+        plotted_any = True
+
+    if bad_mask.any():
+        flagged = rows_to_plot[bad_mask & rows_to_plot[db_variable_name].notna() & rows_to_plot['Depth'].notna()]
+        if not flagged.empty:
+            ax.scatter(
+                flagged[db_variable_name],
+                flagged['Depth'],
+                c='#d62728',
+                marker='o',
+                s=48,
+                linewidths=1.0,
+                alpha=min(1.0, alpha + 0.2),
+                zorder=5,
+            )
+            plotted_any = True
+
+    return plotted_any
+
+
+def _apply_vertical_profile_axis_style(ax, var_name: str):
+    """为 Argo 垂向曲线图应用通用坐标轴样式（可被多个绘图函数复用）。"""
+    db_variable_name = _map_plot_variable_name(var_name)
+    ax.set_ylim(-50, 2050)
+    if db_variable_name == 'DO':
+        ax.set_xlim(0, 350)
+    elif db_variable_name == 'Temperature':
+        ax.set_xlim(-2, 32)
+    elif db_variable_name == 'Salinity':
+        ax.set_xlim(32.5, 36.5)
+
+    ax.set_xlabel(var_name, fontsize=20)
+    ax.tick_params(axis='x', labelsize=16)
+    ax.grid(True)
+
 def plot_vertical(
     DS: list,
     no: int,
@@ -2969,7 +3112,7 @@ def plot_vertical(
         color_mode (str): 颜色模式，'distance' 或 'time'，默认 'distance'。
         variables (list): 需要绘制的变量名称，默认 ['DO', 'Temp', 'Salinity']。
         show_colorbar (bool): 是否显示颜色条，默认 False。
-        remove_outliers (bool): 是否执行 QC 过滤与规则法去极值，默认 True。
+        remove_outliers (bool): True 时执行 QC 过滤与规则法去极值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
         aggregated (bool): 是否进行跨平台聚合绘制，默认 False。
         argo_required (list | None): 平台过滤；None 表示不过滤；传入平台编号列表时仅保留指定平台。
         year_required (list | None): 年份过滤；None 表示不过滤；传入年份列表时仅保留指定年份。
@@ -2981,6 +3124,7 @@ def plot_vertical(
         - 曲线颜色可根据与涡旋中心的相对距离（distance）或采样时间（time）变化。
         - 可选显示颜色条；支持图片保存与显示。
         - remove_outliers=True 时执行基础质量控制（QC 仅保留 {1,2,5,8}；DO<=1 置为 NaN）。
+        - remove_outliers=False 时不剔除点：QC 通过段保持原色，本应断开的跨段连接用红线显示，并用红色圆点标记不通过基础 QC 的观测。
         - 可用 month_required 和 argo_required 对数据进行月份与平台筛选。
 
     模式差异:
@@ -3092,7 +3236,7 @@ def plot_vertical(
             for i, var_name in enumerate(variables):
                 ax = axes[i]
                 original_variable_name = var_name
-                db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
+                db_variable_name = _map_plot_variable_name(var_name)
 
                 if db_variable_name not in platform_data.columns:
                     ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
@@ -3104,29 +3248,10 @@ def plot_vertical(
                     if rows.empty:
                         continue
 
-                    rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
-                    if rows_to_plot.empty:
-                        continue
-
-                    if remove_outliers:
-                        qc_column_name = f"{db_variable_name}_Flag"
-                        if qc_column_name in rows_to_plot.columns:
-                            good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                            bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
-                            rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
-                        if db_variable_name == 'DO':
-                            bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
-                            rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
-
-                    if rows_to_plot.empty:
-                        continue
-
                     try:
                         current_profile_date = pd.Timestamp(year=int(rows.iloc[0]['Year']),
                                                             month=int(rows.iloc[0]['Month']),
                                                             day=int(rows.iloc[0]['Day']))
-                        if i == 0:
-                            profile_dates_for_title.append(current_profile_date)
                     except (ValueError, TypeError):
                         continue
 
@@ -3155,20 +3280,19 @@ def plot_vertical(
                             color_value_normalized = 0.0
 
                     color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-                    ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
+                    plotted = _plot_single_argo_profile_line(
+                        ax,
+                        rows,
+                        original_variable_name,
+                        color,
+                        remove_outliers=remove_outliers,
+                        alpha=0.7,
+                    )
+                    if plotted and i == 0:
+                        profile_dates_for_title.append(current_profile_date)
 
                 # 子图属性
-                ax.set_ylim(-50, 2050)
-                if db_variable_name == 'DO':
-                    ax.set_xlim(10, 350)
-                elif db_variable_name == 'Temperature':
-                    ax.set_xlim(1, 32)
-                elif db_variable_name == 'Salinity':
-                    ax.set_xlim(32.5, 35.5)
-
-                ax.set_xlabel(original_variable_name, fontsize=20)
-                ax.tick_params(axis='x', labelsize=16)
-                ax.grid(True)
+                _apply_vertical_profile_axis_style(ax, original_variable_name)
 
                 if show_colorbar:
                     norm_for_cbar = Normalize(vmin=0, vmax=1)
@@ -3250,7 +3374,7 @@ def plot_vertical(
     for i, var_name in enumerate(variables):
         ax = axes[i]
         original_variable_name = var_name
-        db_variable_name = 'Temperature' if var_name == 'Temp' else var_name
+        db_variable_name = _map_plot_variable_name(var_name)
 
         if db_variable_name not in argo_data_filtered.columns:
             ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
@@ -3261,23 +3385,6 @@ def plot_vertical(
 
         for profile_info in profiles_to_plot:
             rows = profile_info['rows']
-            rows_to_plot = rows.dropna(subset=[db_variable_name, "Depth"])
-            if rows_to_plot.empty:
-                continue
-
-            if remove_outliers:
-                qc_column_name = f"{db_variable_name}_Flag"
-                if qc_column_name in rows_to_plot.columns:
-                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                    bad_qc_mask = ~rows_to_plot[qc_column_name].isin(good_qc_flags)
-                    rows_to_plot.loc[bad_qc_mask, db_variable_name] = np.nan
-                if db_variable_name == 'DO':
-                    bad_value_mask = rows_to_plot[db_variable_name] <= 1.0
-                    rows_to_plot.loc[bad_value_mask, db_variable_name] = np.nan
-
-            if rows_to_plot.empty:
-                continue
-
             current_date = profile_info['date']
             color_value_normalized = 0.5
 
@@ -3306,20 +3413,17 @@ def plot_vertical(
                     color_value_normalized = 0.0
 
             color = cmap(np.clip(color_value_normalized, 0.0, 1.0))
-            ax.plot(rows_to_plot[db_variable_name], rows_to_plot["Depth"], color=color, alpha=0.7)
+            _plot_single_argo_profile_line(
+                ax,
+                rows,
+                original_variable_name,
+                color,
+                remove_outliers=remove_outliers,
+                alpha=0.7,
+            )
 
         # 子图属性
-        ax.set_ylim(-50, 2050)
-        if db_variable_name == 'DO':
-            ax.set_xlim(10, 350)
-        elif db_variable_name == 'Temperature':
-            ax.set_xlim(1, 32)
-        elif db_variable_name == 'Salinity':
-            ax.set_xlim(32.5, 35.5)
-
-        ax.set_xlabel(original_variable_name, fontsize=20)
-        ax.tick_params(axis='x', labelsize=16)
-        ax.grid(True)
+        _apply_vertical_profile_axis_style(ax, original_variable_name)
 
         if show_colorbar:
             norm = Normalize(vmin=0, vmax=1)

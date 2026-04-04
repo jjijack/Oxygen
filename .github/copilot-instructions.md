@@ -49,6 +49,7 @@
 - Use `local_xy_distance_m`/`great_circle_distance_m` helpers for any new metrics so that dateline handling stays consistent throughout the codebase.
 
 ## Running Things
+- For quick tests, prefer `conda activate plot` and run in that environment instead of creating a new virtual environment.
 - Workflows are invoked interactively; the typical pattern for exporting META tracks looks like:
   ```shell
   python - <<'PY'
