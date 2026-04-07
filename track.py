@@ -2960,6 +2960,72 @@ def _map_plot_variable_name(var_name: str) -> str:
     return 'Temperature' if str(var_name) == 'Temp' else str(var_name)
 
 
+def _prepare_vertical_plot_variables(
+    variables: list,
+    *,
+    combine_do_aou: bool = True,
+) -> tuple[list[str], bool]:
+    """根据 variables 生成实际子图变量列表，并决定 DO 轴是否叠加 AOU。
+
+    规则:
+        - combine_do_aou=True 且同时包含 DO 和 AOU: 合并为同一子图（DO 为主轴，AOU 顶部叠加）。
+        - combine_do_aou=False 且同时包含 DO 和 AOU: 分成两个子图（DO 与 AOU 分别绘制）。
+        - 仅包含 DO 或仅包含 AOU: 第一张图绘制对应变量。
+        - 其它变量保持原顺序，去重按标准列名进行。
+    """
+    if variables is None:
+        variables = []
+
+    normalized: list[str] = []
+    for item in variables:
+        name = str(item).strip()
+        if not name:
+            continue
+        normalized.append(name)
+
+    has_do = any(_map_plot_variable_name(v) == 'DO' for v in normalized)
+    has_aou = any(_map_plot_variable_name(v) == 'AOU' for v in normalized)
+
+    # 先放 DO/AOU 组，确保在第一张图。
+    plot_variables: list[str] = []
+    if combine_do_aou:
+        if has_do:
+            plot_variables.append('DO')
+        elif has_aou:
+            plot_variables.append('AOU')
+    else:
+        if has_do:
+            plot_variables.append('DO')
+        if has_aou:
+            plot_variables.append('AOU')
+
+    seen = set(_map_plot_variable_name(v) for v in plot_variables)
+    for raw_name in normalized:
+        mapped = _map_plot_variable_name(raw_name)
+        if mapped in ('DO', 'AOU'):
+            continue
+        if mapped in seen:
+            continue
+        plot_variables.append(raw_name)
+        seen.add(mapped)
+
+    if not plot_variables:
+        raise ValueError("variables cannot be empty")
+
+    overlay_aou_on_do = combine_do_aou and has_do and has_aou
+    return plot_variables, overlay_aou_on_do
+
+
+def _has_plottable_profile_variable(profile_rows: pd.DataFrame, value_col: str) -> bool:
+    """判断剖面是否具备可绘制变量（AOU 支持由 DO/Temperature/Salinity 推导）。"""
+    if value_col in profile_rows.columns:
+        return True
+    if value_col == 'AOU':
+        required = ['DO', 'Temperature', 'Salinity']
+        return all(c in profile_rows.columns for c in required)
+    return False
+
+
 def _apply_basic_argo_qc(profile_rows: pd.DataFrame, value_col: str) -> pd.DataFrame:
     """对单个变量执行基础 Argo 质控（Flag 过滤 + DO 规则过滤）。"""
     rows_qc = profile_rows.copy()
@@ -2989,6 +3055,219 @@ def _basic_argo_qc_bad_mask(profile_rows: pd.DataFrame, value_col: str) -> pd.Se
     return bad_mask.fillna(False)
 
 
+def _aou_qc_bad_mask(profile_rows: pd.DataFrame) -> pd.Series:
+    """返回 AOU 的基础 QC 异常掩膜（由 DO/Temperature/Salinity 任一异常触发）。"""
+    bad_mask = pd.Series(False, index=profile_rows.index)
+    for base_col in ('DO', 'Temperature', 'Salinity'):
+        if base_col in profile_rows.columns:
+            bad_mask = bad_mask | _basic_argo_qc_bad_mask(profile_rows, base_col)
+    return bad_mask.fillna(False)
+
+
+def _compute_aou_for_plot(
+    profile_rows: pd.DataFrame,
+    *,
+    remove_outliers: bool,
+) -> tuple[pd.Series, pd.Series]:
+    """为绘图准备 AOU 序列与异常掩膜（与 DO 同级 QC 口径）。"""
+    rows_for_aou = profile_rows.copy()
+    base_bad_mask = _aou_qc_bad_mask(profile_rows)
+    if remove_outliers:
+        for base_col in ('DO', 'Temperature', 'Salinity'):
+            if base_col in rows_for_aou.columns:
+                rows_for_aou = _apply_basic_argo_qc(rows_for_aou, base_col)
+        aou_vals = pd.to_numeric(_compute_profile_aou(rows_for_aou), errors='coerce')
+        # 即使源数据存在 AOU 列，也强制应用与 DO/Temp/Sal 一致的 QC 掩膜，避免跨坏点连线。
+        aou_vals = aou_vals.where(~base_bad_mask.reindex(aou_vals.index, fill_value=False), np.nan)
+        bad_mask = base_bad_mask.reindex(rows_for_aou.index, fill_value=False)
+    else:
+        aou_vals = pd.to_numeric(_compute_profile_aou(rows_for_aou), errors='coerce')
+        bad_mask = base_bad_mask.reindex(rows_for_aou.index, fill_value=False)
+
+    return aou_vals, bad_mask.fillna(False)
+
+
+def _compute_profile_aou(profile_rows: pd.DataFrame) -> pd.Series:
+    """计算单剖面的 AOU（若已有 AOU 列则优先直接使用）。"""
+    if 'AOU' in profile_rows.columns:
+        return pd.to_numeric(profile_rows['AOU'], errors='coerce')
+
+    required = ['DO', 'Temperature', 'Salinity']
+    if any(c not in profile_rows.columns for c in required):
+        return pd.Series(np.nan, index=profile_rows.index, dtype=float)
+
+    do_vals = pd.to_numeric(profile_rows['DO'], errors='coerce').to_numpy(dtype=float)
+    temp_vals = pd.to_numeric(profile_rows['Temperature'], errors='coerce').to_numpy(dtype=float)
+    sal_vals = pd.to_numeric(profile_rows['Salinity'], errors='coerce').to_numpy(dtype=float)
+
+    valid = np.isfinite(do_vals) & np.isfinite(temp_vals) & np.isfinite(sal_vals)
+    if not valid.any():
+        return pd.Series(np.nan, index=profile_rows.index, dtype=float)
+
+    sat_vals = np.full(do_vals.shape, np.nan, dtype=float)
+    try:
+        if hasattr(gsw, 'O2sol_SP_pt'):
+            sat_valid = gsw.O2sol_SP_pt(sal_vals[valid], temp_vals[valid])
+        else:
+            depth_vals = (
+                pd.to_numeric(profile_rows['Depth'], errors='coerce').to_numpy(dtype=float)
+                if 'Depth' in profile_rows.columns else np.zeros_like(do_vals)
+            )
+            lon_vals = (
+                pd.to_numeric(profile_rows['Longitude'], errors='coerce').to_numpy(dtype=float)
+                if 'Longitude' in profile_rows.columns else np.zeros_like(do_vals)
+            )
+            lat_vals = (
+                pd.to_numeric(profile_rows['Latitude'], errors='coerce').to_numpy(dtype=float)
+                if 'Latitude' in profile_rows.columns else np.zeros_like(do_vals)
+            )
+            depth_vals = np.nan_to_num(depth_vals, nan=0.0)
+            lon_vals = np.nan_to_num(lon_vals, nan=0.0)
+            lat_vals = np.nan_to_num(lat_vals, nan=0.0)
+            sa_vals = gsw.SA_from_SP(sal_vals[valid], depth_vals[valid], lon_vals[valid], lat_vals[valid])
+            ct_vals = gsw.CT_from_pt(sa_vals, temp_vals[valid])
+            sat_valid = gsw.O2sol(sa_vals, ct_vals, depth_vals[valid], lon_vals[valid], lat_vals[valid])
+
+        sat_vals[valid] = np.asarray(sat_valid, dtype=float)
+    except Exception:
+        return pd.Series(np.nan, index=profile_rows.index, dtype=float)
+
+    return pd.Series(sat_vals - do_vals, index=profile_rows.index, dtype=float)
+
+
+def _isolated_valid_mask(valid_mask: np.ndarray | pd.Series) -> np.ndarray:
+    """识别孤立有效点：本点有效且上下相邻点均无效。"""
+    arr = np.asarray(valid_mask, dtype=bool)
+    if arr.size == 0:
+        return arr
+    prev_valid = np.r_[False, arr[:-1]]
+    next_valid = np.r_[arr[1:], False]
+    return arr & (~prev_valid) & (~next_valid)
+
+
+def _anomaly_colors_for_variable(db_variable_name: str) -> tuple[str, str]:
+    """返回(异常桥接线颜色, 异常点颜色)。"""
+    if db_variable_name == 'AOU':
+        # 与 DO 的异常红保持同色系，但差异更明显
+        return ('#ad1457', '#ad1457')
+    return ('#d62728', '#d62728')
+
+
+_ANOMALY_POINT_SIZE = 40
+_SINGLETON_POINT_SIZE = _ANOMALY_POINT_SIZE
+
+
+def _overlay_aou_top_axis(
+    ax,
+    depth_vals: np.ndarray,
+    aou_vals: np.ndarray,
+    *,
+    alpha: float = 0.7,
+    color: str = '#1f77b4',
+    bad_mask: np.ndarray | pd.Series | None = None,
+    anomaly_color: str = '#c83f5a',
+    show_normal_scatter: bool = True,
+) -> bool:
+    """在 DO 子图顶部叠加 AOU 横轴与曲线（可选 QC 异常段高亮）。"""
+    depth_arr = np.asarray(depth_vals, dtype=float)
+    aou_arr = np.asarray(aou_vals, dtype=float)
+    finite = np.isfinite(depth_arr) & np.isfinite(aou_arr)
+    if not finite.any():
+        return False
+
+    if bad_mask is None:
+        bad_arr = np.zeros_like(finite, dtype=bool)
+    else:
+        bad_arr = np.asarray(bad_mask, dtype=bool)
+        if bad_arr.shape != finite.shape:
+            bad_arr = np.zeros_like(finite, dtype=bool)
+    bad_arr = bad_arr & finite
+    good_arr = finite & (~bad_arr)
+
+    aou_ax = getattr(ax, '_aou_top_axis', None)
+    if aou_ax is None:
+        aou_ax = ax.twiny()
+        aou_ax.xaxis.set_ticks_position('top')
+        aou_ax.xaxis.set_label_position('top')
+        aou_ax.set_xlabel('AOU', fontsize=16, color=color)
+        aou_ax.tick_params(axis='x', labelsize=12, colors=color)
+        aou_ax.grid(False)
+        setattr(ax, '_aou_top_axis', aou_ax)
+        setattr(ax, '_aou_xlim', None)
+
+    blue_alpha = min(1.0, alpha + 0.05)
+    if good_arr.any():
+        aou_plot = np.where(good_arr, aou_arr, np.nan)
+        aou_ax.plot(aou_plot, depth_arr, color=color, alpha=blue_alpha, linewidth=1.4, zorder=2)
+    else:
+        aou_plot = np.where(finite, aou_arr, np.nan)
+        aou_ax.plot(aou_plot, depth_arr, color=color, alpha=blue_alpha, linewidth=1.4, zorder=2)
+
+    singleton_good = _isolated_valid_mask(good_arr)
+    if show_normal_scatter and singleton_good.any():
+        aou_ax.scatter(
+            aou_arr[singleton_good],
+            depth_arr[singleton_good],
+            color=color,
+            marker='o',
+            s=_SINGLETON_POINT_SIZE,
+            linewidths=0.6,
+            alpha=min(1.0, alpha + 0.15),
+            zorder=6,
+        )
+
+    if bad_arr.any():
+        valid_positions = np.flatnonzero(good_arr)
+        bridge_alpha = min(1.0, alpha + 0.2)
+        for left_pos, right_pos in zip(valid_positions[:-1], valid_positions[1:]):
+            if right_pos - left_pos <= 1:
+                continue
+            if not bool(bad_arr[left_pos + 1:right_pos].any()):
+                continue
+            segment_depth = depth_arr[left_pos:right_pos + 1]
+            segment_aou = aou_arr[left_pos:right_pos + 1]
+            segment_finite = np.isfinite(segment_depth) & np.isfinite(segment_aou)
+            if not segment_finite.any():
+                continue
+            aou_ax.plot(
+                np.where(segment_finite, segment_aou, np.nan),
+                np.where(segment_finite, segment_depth, np.nan),
+                color=anomaly_color,
+                alpha=bridge_alpha,
+                linewidth=1.8,
+                zorder=4,
+            )
+
+        flagged = bad_arr & finite
+        if flagged.any():
+            aou_ax.scatter(
+                aou_arr[flagged],
+                depth_arr[flagged],
+                color=anomaly_color,
+                marker='o',
+                s=_ANOMALY_POINT_SIZE,
+                linewidths=1.2,
+                alpha=min(1.0, alpha + 0.2),
+                zorder=5,
+            )
+
+    xmin = float(np.nanmin(aou_arr[finite]))
+    xmax = float(np.nanmax(aou_arr[finite]))
+    old_xlim = getattr(ax, '_aou_xlim', None)
+    if old_xlim is None:
+        new_xlim = (xmin, xmax)
+    else:
+        new_xlim = (min(old_xlim[0], xmin), max(old_xlim[1], xmax))
+
+    if np.isclose(new_xlim[0], new_xlim[1]):
+        pad = max(1.0, abs(new_xlim[0]) * 0.05)
+    else:
+        pad = (new_xlim[1] - new_xlim[0]) * 0.05
+    aou_ax.set_xlim(new_xlim[0] - pad, new_xlim[1] + pad)
+    setattr(ax, '_aou_xlim', new_xlim)
+    return True
+
+
 def _plot_single_argo_profile_line(
     ax,
     profile_rows: pd.DataFrame,
@@ -2996,6 +3275,9 @@ def _plot_single_argo_profile_line(
     color,
     *,
     remove_outliers: bool = True,
+    show_normal_scatter: bool = True,
+    do_aux_layers: list[str] | tuple[str, ...] | str | None = None,
+    aou_aux_color: str = '#1f77b4',
     alpha: float = 0.7,
 ) -> bool:
     """在指定坐标轴上绘制单个 Argo 剖面单变量曲线，返回是否成功绘制。
@@ -3004,26 +3286,79 @@ def _plot_single_argo_profile_line(
         - remove_outliers=True: 按基础 QC 剔除异常值后绘制。
         - remove_outliers=False: 保留 QC 通过段为原色，并将本应断开的跨段连接用红线桥接；
             同时用红色圆点标记不通过基础 QC 的点。
+        - show_normal_scatter=True: 额外绘制“正常值孤立点”的散点标记；False 时不绘制该标记。
+        - do_aux_layers 包含 'aou' 且变量为 DO 时：在顶部横轴叠加 AOU 曲线。
+        - var_name='AOU' 时：优先使用 AOU 列；若缺失则由 DO/Temperature/Salinity 现场推导，
+            并沿用同一套 QC 过滤与异常段高亮逻辑。
     """
+    aux_layers_norm: tuple[str, ...]
+    if do_aux_layers is None:
+        aux_layers_norm = tuple()
+    elif isinstance(do_aux_layers, str):
+        aux_layers_norm = (str(do_aux_layers).strip().lower(),)
+    else:
+        aux_layers_norm = tuple(str(x).strip().lower() for x in do_aux_layers)
+    overlay_aou = ('aou' in aux_layers_norm)
+
     db_variable_name = _map_plot_variable_name(var_name)
-    if db_variable_name not in profile_rows.columns or 'Depth' not in profile_rows.columns:
+    if 'Depth' not in profile_rows.columns:
+        return False
+    if not _has_plottable_profile_variable(profile_rows, db_variable_name):
         return False
 
-    rows_to_plot = profile_rows.dropna(subset=[db_variable_name, 'Depth']).copy()
+    rows_to_plot = profile_rows.copy()
+    if db_variable_name == 'AOU':
+        # 先用原始 AOU（或由原始 DO/T/S 推导）建立可绘制骨架，
+        # 避免在 remove_outliers=True 时提前删掉坏点导致跨段相连。
+        rows_to_plot['AOU'] = pd.to_numeric(_compute_profile_aou(rows_to_plot), errors='coerce')
+
+    rows_to_plot = rows_to_plot.dropna(subset=[db_variable_name, 'Depth']).copy()
     if rows_to_plot.empty:
         return False
     rows_to_plot = rows_to_plot.sort_values('Depth').reset_index(drop=True)
 
     if remove_outliers:
-        rows_to_plot = _apply_basic_argo_qc(rows_to_plot, db_variable_name)
+        if db_variable_name == 'AOU':
+            rows_qc = rows_to_plot.copy()
+            rows_qc['AOU'], _ = _compute_aou_for_plot(rows_qc, remove_outliers=True)
+            rows_to_plot = rows_qc
+        else:
+            rows_to_plot = _apply_basic_argo_qc(rows_to_plot, db_variable_name)
 
         if not rows_to_plot[db_variable_name].notna().any():
             return False
 
         ax.plot(rows_to_plot[db_variable_name], rows_to_plot['Depth'], color=color, alpha=alpha)
+        valid_mask = rows_to_plot[db_variable_name].notna() & rows_to_plot['Depth'].notna()
+        singleton_valid = _isolated_valid_mask(valid_mask.to_numpy())
+        if show_normal_scatter and singleton_valid.any():
+            ax.scatter(
+                rows_to_plot.loc[singleton_valid, db_variable_name],
+                rows_to_plot.loc[singleton_valid, 'Depth'],
+                color=color,
+                marker='o',
+                s=_SINGLETON_POINT_SIZE,
+                linewidths=0.7,
+                alpha=min(1.0, alpha + 0.15),
+                zorder=6,
+            )
+        if overlay_aou and db_variable_name == 'DO':
+            aou_vals, _ = _compute_aou_for_plot(rows_to_plot, remove_outliers=True)
+            _overlay_aou_top_axis(
+                ax,
+                rows_to_plot['Depth'].to_numpy(dtype=float),
+                aou_vals.to_numpy(dtype=float),
+                alpha=alpha,
+                color=aou_aux_color,
+                anomaly_color=_anomaly_colors_for_variable('AOU')[0],
+                show_normal_scatter=show_normal_scatter,
+            )
         return True
 
-    bad_mask = _basic_argo_qc_bad_mask(rows_to_plot, db_variable_name)
+    if db_variable_name == 'AOU':
+        bad_mask = _aou_qc_bad_mask(rows_to_plot)
+    else:
+        bad_mask = _basic_argo_qc_bad_mask(rows_to_plot, db_variable_name)
     valid_mask = (~bad_mask) & rows_to_plot[db_variable_name].notna() & rows_to_plot['Depth'].notna()
 
     plotted_any = False
@@ -3034,9 +3369,24 @@ def _plot_single_argo_profile_line(
         ax.plot(x_valid, rows_to_plot['Depth'], color=color, alpha=alpha)
         plotted_any = True
 
+    singleton_valid = _isolated_valid_mask(valid_mask.to_numpy())
+    if show_normal_scatter and singleton_valid.any():
+        ax.scatter(
+            rows_to_plot.loc[singleton_valid, db_variable_name],
+            rows_to_plot.loc[singleton_valid, 'Depth'],
+            color=color,
+            marker='o',
+            s=_SINGLETON_POINT_SIZE,
+            linewidths=0.7,
+            alpha=min(1.0, alpha + 0.15),
+            zorder=6,
+        )
+        plotted_any = True
+
     # 再用红线重绘“本应断开”的跨段路径（包含中间坏点，保证红点落在红线上）
     valid_positions = np.flatnonzero(valid_mask.to_numpy())
     bridge_alpha = min(1.0, alpha + 0.15)
+    bridge_color, point_color = _anomaly_colors_for_variable(db_variable_name)
     for left_pos, right_pos in zip(valid_positions[:-1], valid_positions[1:]):
         if right_pos - left_pos <= 1:
             continue
@@ -3046,7 +3396,7 @@ def _plot_single_argo_profile_line(
         ax.plot(
             segment[db_variable_name],
             segment['Depth'],
-            color='#d62728',
+            color=bridge_color,
             alpha=bridge_alpha,
             linewidth=2.0,
             zorder=4,
@@ -3059,14 +3409,27 @@ def _plot_single_argo_profile_line(
             ax.scatter(
                 flagged[db_variable_name],
                 flagged['Depth'],
-                c='#d62728',
+                color=point_color,
                 marker='o',
-                s=48,
-                linewidths=1.0,
+                s=_ANOMALY_POINT_SIZE,
+                linewidths=1.2,
                 alpha=min(1.0, alpha + 0.2),
                 zorder=5,
             )
             plotted_any = True
+
+    if overlay_aou and db_variable_name == 'DO':
+        aou_vals, aou_bad_mask = _compute_aou_for_plot(rows_to_plot, remove_outliers=False)
+        _overlay_aou_top_axis(
+            ax,
+            rows_to_plot['Depth'].to_numpy(dtype=float),
+            aou_vals.to_numpy(dtype=float),
+            alpha=alpha,
+            bad_mask=aou_bad_mask.to_numpy(dtype=bool),
+            color=aou_aux_color,
+            anomaly_color=_anomaly_colors_for_variable('AOU')[0],
+            show_normal_scatter=show_normal_scatter,
+        )
 
     return plotted_any
 
@@ -3077,6 +3440,8 @@ def _apply_vertical_profile_axis_style(ax, var_name: str):
     ax.set_ylim(-50, 2050)
     if db_variable_name == 'DO':
         ax.set_xlim(0, 350)
+    elif db_variable_name == 'AOU':
+        ax.set_xlim(-50, 350)
     elif db_variable_name == 'Temperature':
         ax.set_xlim(-2, 32)
     elif db_variable_name == 'Salinity':
@@ -3095,11 +3460,12 @@ def plot_vertical(
     variables: list = ['DO', 'Temp', 'Salinity'],
     show_colorbar: bool = False,
     remove_outliers: bool = True,
+    plot_normal_scatter: bool = False,
     aggregated: bool = False,
     argo_required: list | None = None,
     year_required: list | None = None,
     month_required: list | None = None,
-    day_required: list | None = None
+    day_required: list | None = None,
 ):
     '''
     根据涡旋轨迹与匹配到的 Argo 剖面，绘制变量-深度的垂直剖面。
@@ -3113,6 +3479,7 @@ def plot_vertical(
         variables (list): 需要绘制的变量名称，默认 ['DO', 'Temp', 'Salinity']。
         show_colorbar (bool): 是否显示颜色条，默认 False。
         remove_outliers (bool): True 时执行 QC 过滤与规则法去极值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
+        plot_normal_scatter (bool): 是否绘制正常值的孤立散点标记。默认 False。
         aggregated (bool): 是否进行跨平台聚合绘制，默认 False。
         argo_required (list | None): 平台过滤；None 表示不过滤；传入平台编号列表时仅保留指定平台。
         year_required (list | None): 年份过滤；None 表示不过滤；传入年份列表时仅保留指定年份。
@@ -3121,10 +3488,13 @@ def plot_vertical(
 
     功能:
         - 为 variables 中的每个变量创建一个子图，按剖面绘制变量随深度变化的曲线。
+        - 当 variables 同时包含 DO 和 AOU 时：plot_vertical 会绘制两张独立子图（不做 DO 顶部 AOU 叠加）。
         - 曲线颜色可根据与涡旋中心的相对距离（distance）或采样时间（time）变化。
         - 可选显示颜色条；支持图片保存与显示。
         - remove_outliers=True 时执行基础质量控制（QC 仅保留 {1,2,5,8}；DO<=1 置为 NaN）。
         - remove_outliers=False 时不剔除点：QC 通过段保持原色，本应断开的跨段连接用红线显示，并用红色圆点标记不通过基础 QC 的观测。
+        - 当 DO 子图绘制 AOU 时，AOU 会复用 DO/Temp/Sal 的同等 QC 逻辑：
+            remove_outliers=True 时同样剔除；False 时同样以红色桥接线+红点标注 QC 异常段。
         - 可用 month_required 和 argo_required 对数据进行月份与平台筛选。
 
     模式差异:
@@ -3145,6 +3515,11 @@ def plot_vertical(
         msg = "plot vertical profiles." if not aggregated else "to plot aggregated vertical profiles."
         print(f"No Argo data found for eddy {ds_names}{no} {msg}")
         return
+
+    plot_variables, overlay_aou_on_do = _prepare_vertical_plot_variables(
+        variables,
+        combine_do_aou=False,
+    )
 
     # 统一的月份和平台过滤（在两种模式下共享）
     # 先处理平台过滤（argo_required）
@@ -3225,7 +3600,7 @@ def plot_vertical(
             min_profile_num = profile_num_agg['min']
             max_profile_num = profile_num_agg['max']
 
-            num_variables = len(variables)
+            num_variables = len(plot_variables)
             fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
             if num_variables == 1:
                 axes = [axes]
@@ -3233,15 +3608,17 @@ def plot_vertical(
             cmap = plt.cm.coolwarm
             profile_dates_for_title = []
 
-            for i, var_name in enumerate(variables):
+            for i, var_name in enumerate(plot_variables):
                 ax = axes[i]
-                original_variable_name = var_name
-                db_variable_name = _map_plot_variable_name(var_name)
+                plot_variable_name = var_name
+                is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
+                do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
+                db_variable_name = _map_plot_variable_name(plot_variable_name)
 
-                if db_variable_name not in platform_data.columns:
+                if not _has_plottable_profile_variable(platform_data, db_variable_name):
                     ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
                             ha='center', va='center', transform=ax.transAxes, fontsize=16)
-                    ax.set_title(f"Variable: {original_variable_name}", fontsize=20)
+                    ax.set_title(f"Variable: {plot_variable_name}", fontsize=20)
                     continue
 
                 for profile_num, rows in platform_data.groupby("Profile_number"):
@@ -3283,16 +3660,18 @@ def plot_vertical(
                     plotted = _plot_single_argo_profile_line(
                         ax,
                         rows,
-                        original_variable_name,
+                        plot_variable_name,
                         color,
                         remove_outliers=remove_outliers,
+                        show_normal_scatter=plot_normal_scatter,
+                        do_aux_layers=do_aux_layers,
                         alpha=0.7,
                     )
                     if plotted and i == 0:
                         profile_dates_for_title.append(current_profile_date)
 
                 # 子图属性
-                _apply_vertical_profile_axis_style(ax, original_variable_name)
+                _apply_vertical_profile_axis_style(ax, plot_variable_name)
 
                 if show_colorbar:
                     norm_for_cbar = Normalize(vmin=0, vmax=1)
@@ -3364,22 +3743,24 @@ def plot_vertical(
     all_dates = [p['date'] for p in profiles_to_plot]
     min_time_for_norm, max_time_for_norm = (min(all_dates), max(all_dates)) if all_dates else (None, None)
 
-    num_variables = len(variables)
+    num_variables = len(plot_variables)
     fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
     if num_variables == 1:
         axes = [axes]
 
     cmap = plt.cm.coolwarm
 
-    for i, var_name in enumerate(variables):
+    for i, var_name in enumerate(plot_variables):
         ax = axes[i]
-        original_variable_name = var_name
-        db_variable_name = _map_plot_variable_name(var_name)
+        plot_variable_name = var_name
+        is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
+        do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
+        db_variable_name = _map_plot_variable_name(plot_variable_name)
 
-        if db_variable_name not in argo_data_filtered.columns:
+        if not _has_plottable_profile_variable(argo_data_filtered, db_variable_name):
             ax.text(0.5, 0.5, f"Variable '{db_variable_name}'\nnot found in data.",
                     ha='center', va='center', transform=ax.transAxes, fontsize=16)
-            ax.set_xlabel(original_variable_name, fontsize=20)
+            ax.set_xlabel(plot_variable_name, fontsize=20)
             ax.grid(True)
             continue
 
@@ -3416,14 +3797,16 @@ def plot_vertical(
             _plot_single_argo_profile_line(
                 ax,
                 rows,
-                original_variable_name,
+                plot_variable_name,
                 color,
                 remove_outliers=remove_outliers,
+                show_normal_scatter=plot_normal_scatter,
+                do_aux_layers=do_aux_layers,
                 alpha=0.7,
             )
 
         # 子图属性
-        _apply_vertical_profile_axis_style(ax, original_variable_name)
+        _apply_vertical_profile_axis_style(ax, plot_variable_name)
 
         if show_colorbar:
             norm = Normalize(vmin=0, vmax=1)
@@ -7368,8 +7751,9 @@ def plot_hotspot_anomaly_vertical_profiles(
     anomalies_path: str | Path | None = None,
     do_threshold: float | None = None,
     anomaly_min_depth: float | None = None,
-    variables: list = ['DO', 'Temp', 'Salinity'],
+    variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     remove_outliers: bool = True,
+    plot_normal_scatter: bool = True,
     annotate_delta_ts: bool = False,
     save_fig: bool = True,
     show_fig: bool = False,
@@ -7387,9 +7771,10 @@ def plot_hotspot_anomaly_vertical_profiles(
         start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
         anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
         do_threshold / anomaly_min_depth: 仅用于自动定位文件名；None 回退配置默认值。
-        variables: 每幅图绘制的变量列表，默认 ['DO','Temp','Salinity']。
+        variables: 每幅图绘制的变量列表，默认 ['DO','AOU','Temp','Salinity']。
         remove_outliers: True 时按基础 QC 剔除异常值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
-        annotate_delta_ts: 是否额外计算并在图上标注 ΔTemperature 与 ΔSalinity（默认 False）。
+        plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
+        annotate_delta_ts: 是否额外计算并在图上标注 ΔTemperature、ΔAOU、ΔSalinity 及深度（默认 False）。
         save_fig / show_fig: 输出控制。
         clear_output_dir: 保存图片时是否在本次运行开始前清空输出目录，默认 True。
         max_profiles: 最多绘制多少个异常剖面；None 表示全部。
@@ -7413,6 +7798,8 @@ def plot_hotspot_anomaly_vertical_profiles(
         anomaly_min_depth = _cfg_anomaly_min_depth
     if argo_data_dir is None:
         argo_data_dir = argo_path
+
+    plot_variables, overlay_aou_on_do = _prepare_vertical_plot_variables(variables)
 
     if anomalies_path is None:
         if start_year is None or end_year is None:
@@ -7533,7 +7920,9 @@ def plot_hotspot_anomaly_vertical_profiles(
         profile_rows = profile_rows.sort_values('Depth').copy()
 
         delta_temp_text = ""
+        delta_aou_text = ""
         delta_salinity_text = ""
+        depth_text = ""
         if annotate_delta_ts:
             try:
                 deltas = calculate_delta_do(
@@ -7545,6 +7934,7 @@ def plot_hotspot_anomaly_vertical_profiles(
                     remove_outliers=remove_outliers,
                     verbose=False,
                 )
+                target_depth = np.nan
                 if not deltas.empty and 'delta_temperature' in deltas.columns and 'delta_salinity' in deltas.columns:
                     target_depth = pd.to_numeric(pd.Series([row.get('depth')]), errors='coerce').iloc[0]
                     if np.isfinite(target_depth) and 'depth' in deltas.columns:
@@ -7552,17 +7942,25 @@ def plot_hotspot_anomaly_vertical_profiles(
                         picked = deltas.loc[target_idx]
                     else:
                         picked = deltas.sort_values('delta_do', ascending=False).iloc[0]
+                        target_depth = pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0]
 
                     picked_dt = pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0]
                     picked_ds = pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0]
+                    picked_depth = pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0]
                     if np.isfinite(picked_dt):
-                        delta_temp_text = f", ΔTemp={float(picked_dt):.2f}"
+                        delta_temp_text = f", ΔTemperature={float(picked_dt):.2f}"
                     if np.isfinite(picked_ds):
                         delta_salinity_text = f", ΔSalinity={float(picked_ds):.2f}"
-            except Exception as exc:
-                print(f"[WARN] Failed to compute ΔTemp/ΔSalinity for profile {profile_num}: {exc}")
+                    if np.isfinite(picked_depth):
+                        depth_text = f" @{float(picked_depth):.1f}m"
 
-        num_variables = len(variables)
+                    picked_da = pd.to_numeric(pd.Series([picked.get('delta_aou')]), errors='coerce').iloc[0]
+                    if np.isfinite(picked_da):
+                        delta_aou_text = f", ΔAOU={float(picked_da):.2f}"
+            except Exception as exc:
+                print(f"[WARN] Failed to compute ΔTemp/ΔSalinity/ΔAOU for profile {profile_num}: {exc}")
+
+        num_variables = len(plot_variables)
         fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
         if num_variables == 1:
             axes = [axes]
@@ -7570,10 +7968,15 @@ def plot_hotspot_anomaly_vertical_profiles(
         line_color = plt.cm.coolwarm(0.15)
         any_plotted = False
 
-        for var_name, ax in zip(variables, axes):
-            db_variable_name = _map_plot_variable_name(var_name)
+        for var_name, ax in zip(plot_variables, axes):
+            plot_variable_name = var_name
+            is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
+            do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
 
-            if db_variable_name not in profile_rows.columns:
+            db_variable_name = _map_plot_variable_name(plot_variable_name)
+            plot_line_color = '#ff8c00' if db_variable_name == 'AOU' else line_color
+
+            if not _has_plottable_profile_variable(profile_rows, db_variable_name):
                 ax.text(
                     0.5,
                     0.5,
@@ -7589,9 +7992,12 @@ def plot_hotspot_anomaly_vertical_profiles(
             did_plot = _plot_single_argo_profile_line(
                 ax,
                 profile_rows,
-                var_name,
-                line_color,
+                plot_variable_name,
+                plot_line_color,
                 remove_outliers=remove_outliers,
+                show_normal_scatter=plot_normal_scatter,
+                do_aux_layers=do_aux_layers,
+                aou_aux_color='#ff8c00',
                 alpha=0.9,
             )
             if not did_plot:
@@ -7607,7 +8013,7 @@ def plot_hotspot_anomaly_vertical_profiles(
             else:
                 any_plotted = True
 
-            _apply_vertical_profile_axis_style(ax, var_name)
+            _apply_vertical_profile_axis_style(ax, plot_variable_name)
 
         axes[0].set_ylabel("Depth/m", fontsize=20)
         axes[0].tick_params(axis='y', labelsize=16)
@@ -7637,7 +8043,7 @@ def plot_hotspot_anomaly_vertical_profiles(
 
         platform_text = f", Platform={platform_val}" if platform_val is not None else ""
         fig.suptitle(
-            f"Hotspots Profile {profile_num}{platform_text}, {date_text}{delta_text}{delta_temp_text}{delta_salinity_text}",
+            f"Hotspots Profile {profile_num}{platform_text}, {date_text}{delta_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}",
             fontsize=24,
             y=0.95,
         )
@@ -7678,9 +8084,10 @@ def plot_single_hotspot_profile(
     month: int | None = None,
     day: int | None = None,
     platform_number: int | None = None,
-    variables: list = ['DO', 'Temp', 'Salinity'],
+    variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     xlim_overrides: dict[str, tuple[float, float]] | None = None,
     remove_outliers: bool = True,
+    plot_normal_scatter: bool = True,
     annotate_delta_ts: bool = True,
     save_fig: bool = False,
     show_fig: bool = True,
@@ -7693,11 +8100,12 @@ def plot_single_hotspot_profile(
         profile_number: 目标剖面编号（Profile_number）。
         year/month/day: 日期筛选；month/day 可选。
         platform_number: 可选平台编号筛选。
-        variables: 绘制变量列表，默认 ['DO', 'Temp', 'Salinity']。
+        variables: 绘制变量列表，默认 ['DO', 'AOU', 'Temp', 'Salinity']。
         xlim_overrides: 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}。
                         键可用 'Temp' 或 'Temperature'。
         remove_outliers: 与 plot_vertical 同义；False 时会显示 QC 异常标记与红色桥接线。
-        annotate_delta_ts: 是否在标题追加 ADO/ATemp/ASalinity。
+        plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
+        annotate_delta_ts: 是否在标题追加 ΔDO/ΔTemperature/ΔAOU/ΔSalinity及深度。
         save_fig/show_fig: 输出控制。
         argo_data_dir: 年度 Argo parquet 目录，None 使用配置默认。
         output_dir: 自定义输出目录；None 使用 plot_outputs/<region>/plot_argo_hotspots_vertical_profiles_single。
@@ -7728,6 +8136,8 @@ def plot_single_hotspot_profile(
 
     profile_rows = profile_rows.sort_values('Depth').copy()
 
+    plot_variables, overlay_aou_on_do = _prepare_vertical_plot_variables(variables)
+
     # 若未指定平台，且仍有多个平台，默认取第一个以保持“单图单剖面”语义
     platform_val = None
     if 'Platform_number' in profile_rows.columns:
@@ -7739,7 +8149,7 @@ def plot_single_hotspot_profile(
                     pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == platform_val
                 ].copy()
 
-    num_variables = len(variables)
+    num_variables = len(plot_variables)
     fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
     if num_variables == 1:
         axes = [axes]
@@ -7747,9 +8157,14 @@ def plot_single_hotspot_profile(
     line_color = plt.cm.coolwarm(0.15)
     any_plotted = False
 
-    for var_name, ax in zip(variables, axes):
-        db_variable_name = _map_plot_variable_name(var_name)
-        if db_variable_name not in profile_rows.columns:
+    for var_name, ax in zip(plot_variables, axes):
+        plot_variable_name = var_name
+        is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
+        do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
+
+        db_variable_name = _map_plot_variable_name(plot_variable_name)
+        plot_line_color = '#ff8c00' if db_variable_name == 'AOU' else line_color
+        if not _has_plottable_profile_variable(profile_rows, db_variable_name):
             ax.text(
                 0.5,
                 0.5,
@@ -7765,9 +8180,12 @@ def plot_single_hotspot_profile(
         did_plot = _plot_single_argo_profile_line(
             ax,
             profile_rows,
-            var_name,
-            line_color,
+            plot_variable_name,
+            plot_line_color,
             remove_outliers=remove_outliers,
+            show_normal_scatter=plot_normal_scatter,
+            do_aux_layers=do_aux_layers,
+            aou_aux_color='#ff8c00',
             alpha=0.9,
         )
         if not did_plot:
@@ -7783,7 +8201,7 @@ def plot_single_hotspot_profile(
         else:
             any_plotted = True
 
-        _apply_vertical_profile_axis_style(ax, var_name)
+        _apply_vertical_profile_axis_style(ax, plot_variable_name)
 
         if xlim_overrides:
             override = None
@@ -7805,9 +8223,16 @@ def plot_single_hotspot_profile(
     if month is not None and day is not None:
         date_text = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
 
+    delta_do_text = ""
+    delta_temp_text = ""
+    delta_aou_text = ""
+    delta_salinity_text = ""
+    depth_text = ""
     delta_do_val = np.nan
     delta_temp_val = np.nan
     delta_salinity_val = np.nan
+    delta_aou_val = np.nan
+    picked_depth = np.nan
     if annotate_delta_ts:
         try:
             deltas = calculate_delta_do(
@@ -7824,13 +8249,20 @@ def plot_single_hotspot_profile(
                 delta_do_val = float(pd.to_numeric(pd.Series([picked.get('delta_do')]), errors='coerce').iloc[0])
                 delta_temp_val = float(pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0])
                 delta_salinity_val = float(pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0])
+
+                delta_aou_val = float(pd.to_numeric(pd.Series([picked.get('delta_aou')]), errors='coerce').iloc[0])
+                picked_depth = float(pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0])
         except Exception:
             pass
 
         if np.isfinite(delta_do_val):
             delta_do_text = f", ΔDO={delta_do_val:.2f}"
         if np.isfinite(delta_temp_val):
-            delta_temp_text = f", ΔTemp={delta_temp_val:.2f}"
+            delta_temp_text = f", ΔTemperature={delta_temp_val:.2f}"
+        if np.isfinite(delta_aou_val):
+            delta_aou_text = f", ΔAOU={delta_aou_val:.2f}"
+        if np.isfinite(picked_depth):
+            depth_text = f" @{picked_depth:.1f}m"
         if np.isfinite(delta_salinity_val):
             delta_salinity_text = f", ΔSalinity={delta_salinity_val:.2f}"
 
@@ -7841,7 +8273,7 @@ def plot_single_hotspot_profile(
     platform_text = f", Platform={platform_label}" if platform_label is not None else ""
 
     fig.suptitle(
-        f"Hotspots Profile {int(profile_number)}{platform_text}, {date_text}{delta_do_text}{delta_temp_text}{delta_salinity_text}",
+        f"Hotspots Profile {int(profile_number)}{platform_text}, {date_text}{delta_do_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}",
         fontsize=24,
         y=0.95,
     )
@@ -7870,6 +8302,7 @@ def plot_single_hotspot_profile(
         'delta_do': float(delta_do_val) if np.isfinite(delta_do_val) else np.nan,
         'delta_temperature': float(delta_temp_val) if np.isfinite(delta_temp_val) else np.nan,
         'delta_salinity': float(delta_salinity_val) if np.isfinite(delta_salinity_val) else np.nan,
+        'delta_aou': float(delta_aou_val) if np.isfinite(delta_aou_val) else np.nan,
         'save_path': str(saved_path) if saved_path is not None else None,
     }
 
@@ -10231,6 +10664,7 @@ def calculate_delta_do(
     anomaly_min_depth: float | None = None,
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
+    include_aou: bool = True,
     remove_outliers: bool = True,
     verbose: bool = False
 ) -> pd.DataFrame:
@@ -10242,6 +10676,7 @@ def calculate_delta_do(
     2. 计算 DO 随深度的一阶导数，定位 DO 的正峰值（代表可能的表层富氧水体俯冲信号）；
     3. 以 DO 峰深度为中心，取窗口 [p-Δp, p+Δp]，用两端点连线构造参考剖面；
     4. 在峰值同一深度计算 ΔDO、ΔSalinity 与 ΔTemperature（原始值减参考线值）；
+        当 include_aou=True 时，同步计算该深度窗口下的 ΔAOU；
     5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
     6. 若 anomaly_min_depth > 0，仅保留深度不小于该阈值的异常；
     7. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
@@ -10259,6 +10694,7 @@ def calculate_delta_do(
         anomaly_min_depth (float | None): ΔDO 异常最小深度；≤0 表示不做深度过滤；None 表示使用 processing.yml 的 anomaly_min_depth。
         depth_merge_tolerance (float | None): 深度近邻合并阈值；None → `_default_depth_merge_tolerance`；≤0 不合并。
         duplicate_depth_strategy (str | None): 同深度多记录聚合策略；None → `_default_duplicate_depth_strategy`。
+        include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
         verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
 
@@ -10266,6 +10702,7 @@ def calculate_delta_do(
         pd.DataFrame: 每个满足条件的峰值一行，含
         Profile_number, depth, delta_do, delta_salinity, delta_temperature,
         do_value, salinity_value, temperature_value，
+        以及（可选）delta_aou（目前是在delta_do对应深度上计算得到的，而非基于AOU自身阈值确定的深度），
         以及 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）。
         若无满足条件记录，返回空表。
     
@@ -10414,6 +10851,13 @@ def calculate_delta_do(
         do_values = profile_data_clean[do_col].values
         salinity_values = profile_data_clean[salinity_col].values
         temperature_values = profile_data_clean[temperature_col].values
+        aou_values = None
+        if include_aou:
+            try:
+                aou_series, _ = _compute_aou_for_plot(profile_data_clean.copy(), remove_outliers=remove_outliers)
+                aou_values = pd.to_numeric(aou_series, errors='coerce').to_numpy(dtype=float)
+            except Exception:
+                aou_values = None
 
         # 使用中心差分法计算导数
         do_slopes = np.gradient(do_values, depth_values)
@@ -10474,6 +10918,22 @@ def calculate_delta_do(
             delta_do = do_range[target_idx] - do_ref_values[target_idx]
             delta_salinity = salinity_range[target_idx] - salinity_ref_values[target_idx]
             delta_temperature = temperature_range[target_idx] - temperature_ref_values[target_idx]
+            delta_aou = np.nan
+            if include_aou:
+                if aou_values is not None:
+                    aou_window_mask = depth_mask & np.isfinite(aou_values)
+                    if np.count_nonzero(aou_window_mask) >= 2:
+                        depth_range_aou = depth_values[aou_window_mask]
+                        aou_range = aou_values[aou_window_mask]
+                        if not np.isclose(depth_range_aou[0], depth_range_aou[-1]):
+                            aou_depth = float(target_depth)
+                            aou_val = float(np.interp(aou_depth, depth_range_aou, aou_range))
+                            aou_ref = float(np.interp(
+                                aou_depth,
+                                [depth_range_aou[0], depth_range_aou[-1]],
+                                [aou_range[0], aou_range[-1]],
+                            ))
+                            delta_aou = aou_val - aou_ref
 
             # 判定：ΔDO 为必需条件；ΔSalinity/ΔTemperature 在各自阈值>0时作为附加过滤（与条件）
             cond = (delta_do >= do_threshold)
@@ -10492,6 +10952,8 @@ def calculate_delta_do(
                     'salinity_value': salinity_range[target_idx],
                     'temperature_value': temperature_range[target_idx]
                 }
+                if include_aou:
+                    result['delta_aou'] = delta_aou
 
                 # 添加额外的剖面信息（如果存在）
                 if 'Year' in profile_data_clean.columns:
