@@ -11389,6 +11389,134 @@ def export_all_interacting_argo(
     else:
         print("No region profiles found.")
 
+
+def query_argo_inside_eddy(
+    profile_number: int,
+    year: int,
+    month: int | None = None,
+    day: int | None = None,
+    precomputed_file: str | Path | None = None,
+    region: str | None = None,
+    return_matches: bool = True,
+) -> dict:
+    """查询指定 Argo 剖面是否位于任一涡旋内部（基于export_all_interacting_argo预计算结果）。
+
+    说明:
+        - 本函数仅查询已落盘的交互记录，不做实时几何匹配。
+        - 默认优先读取
+          `plot_outputs/<region>/statistics/all_interacting_argo_*.parquet`。
+        - 使用 parquet 过滤条件（Profile_number + Year + 可选 Month/Day），
+          仅扫描少量行以实现快速判定。
+
+    参数:
+        profile_number: Argo 剖面编号（Profile_number）。
+        year/month/day: 日期过滤；month/day 可选。
+        precomputed_file: 可选，显式指定交互记录 parquet 路径。
+        region: 可选区域 slug；None 时使用当前 region。
+        return_matches: True 时返回命中的明细表（DataFrame）。
+
+    返回:
+        dict:
+            - inside_eddy (bool): 是否命中至少一条交互记录。
+            - hit_count (int): 命中记录数。
+            - source (str | None): 实际使用的数据源路径。
+            - message (str): 查询状态说明。
+            - matches (pd.DataFrame, optional): 命中的明细（去重后）。
+    """
+    pnum = int(profile_number)
+    y = int(year)
+    m = int(month) if month is not None else None
+    d = int(day) if day is not None else None
+
+    # 1) 解析候选数据源
+    candidate_files: list[Path] = []
+    if precomputed_file is not None:
+        p = Path(precomputed_file)
+        if p.exists() and p.is_file():
+            candidate_files = [p]
+    else:
+        region_slug = region or _current_region_key()
+        stats_dir = Path(plots_output_root) / region_slug / "statistics"
+        if stats_dir.exists():
+            candidate_files = sorted(stats_dir.glob("all_interacting_argo_*.parquet"))
+
+    if not candidate_files:
+        msg = (
+            "No precomputed interaction parquet found. "
+            "Run export_all_interacting_argo(...) first or pass precomputed_file."
+        )
+        result = {
+            'inside_eddy': False,
+            'hit_count': 0,
+            'source': None,
+            'message': msg,
+        }
+        if return_matches:
+            result['matches'] = pd.DataFrame(
+                columns=['Profile_number', 'Year', 'Month', 'Day', 'track_id', 'ds_name', 'method']
+            )
+        return result
+
+    # 2) 用 parquet 过滤条件快速查询（AND 条件）
+    filters: list[tuple[str, str, int]] = [
+        ('Profile_number', '==', pnum),
+        ('Year', '==', y),
+    ]
+    if m is not None:
+        filters.append(('Month', '==', m))
+    if d is not None:
+        filters.append(('Day', '==', d))
+
+    keep_cols = ['Profile_number', 'Year', 'Month', 'Day', 'track_id', 'ds_name', 'method']
+    hit_frames: list[pd.DataFrame] = []
+    used_sources: list[str] = []
+
+    for src in candidate_files:
+        try:
+            df_hit = pd.read_parquet(src, columns=keep_cols, filters=filters)
+        except Exception:
+            # 兼容极少数引擎不支持 filters 的情况
+            try:
+                df_hit = pd.read_parquet(src, columns=keep_cols)
+                cond = pd.to_numeric(df_hit['Profile_number'], errors='coerce').eq(pnum) & pd.to_numeric(df_hit['Year'], errors='coerce').eq(y)
+                if m is not None:
+                    cond = cond & pd.to_numeric(df_hit['Month'], errors='coerce').eq(m)
+                if d is not None:
+                    cond = cond & pd.to_numeric(df_hit['Day'], errors='coerce').eq(d)
+                df_hit = df_hit[cond].copy()
+            except Exception:
+                continue
+
+        if not df_hit.empty:
+            hit_frames.append(df_hit)
+            used_sources.append(str(src))
+
+    if hit_frames:
+        hits = pd.concat(hit_frames, ignore_index=True)
+        hits = hits.drop_duplicates(subset=keep_cols, keep='first')
+        if {'Year', 'Month', 'Day'}.issubset(hits.columns):
+            hits = hits.sort_values(['Year', 'Month', 'Day', 'ds_name', 'track_id'])
+        hit_count = int(len(hits))
+        result = {
+            'inside_eddy': True,
+            'hit_count': hit_count,
+            'source': ';'.join(used_sources),
+            'message': f'Found {hit_count} interacting record(s).',
+        }
+        if return_matches:
+            result['matches'] = hits.reset_index(drop=True)
+        return result
+
+    result = {
+        'inside_eddy': False,
+        'hit_count': 0,
+        'source': ';'.join(str(p) for p in candidate_files),
+        'message': 'No interacting records found for the given profile/date filter.',
+    }
+    if return_matches:
+        result['matches'] = pd.DataFrame(columns=keep_cols)
+    return result
+
 def calculate_interaction_statistics(
     start_year: int,
     end_year: int,
