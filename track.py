@@ -4511,9 +4511,11 @@ class LineDrawer:
         print("\n准备就绪，可继续点击绘制下一条直线。")
 
 def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variable: str = 'vorticity',
-                                   show_fig: bool = False, save_fig: bool = False, deep_argo: bool = False,
+                                   show_fig: bool = False, save_fig: bool = False,
                                    k: float | list[float] | None = None, b: float | list[float] | None = None, 
-                                   needed_depth: float | int = 0, inline_mode: bool = True):
+                                   needed_depth: float | int = 0, inline_mode: bool = True,
+                                   argo_do_threshold: float | None = 0.0,
+                                   argo_min_depth: float | None = None):
     '''
     绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
 
@@ -4528,12 +4530,18 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'vorticity'。
         show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
         save_fig (bool): 是否将生成的图像保存为文件。默认为 False。
-        deep_argo (bool): 是否使用深层Argo数据模式。默认为 False。
         k (float | list[float], optional): 直线方程 y=kx+b 的斜率或斜率列表。默认为 None。
         b (float | list[float], optional): 直线方程 y=kx+b 的截距或截距列表。默认为 None。
         needed_depth (float | int): 需要绘制的GLORYS数据深度，默认为0（表层）。
         inline_mode (bool): 是否为静态内联模式。默认为True。设为False以启用交互式widget模式的优化。
+        argo_do_threshold (float | None): Argo 筛选的 ΔDO 阈值；默认 0（尽量保留更多候选）。
+        argo_min_depth (float | None): Argo 筛选的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
     '''
+    if argo_do_threshold is None:
+        argo_do_threshold = 0.0
+    if argo_min_depth is None:
+        argo_min_depth = _cfg_anomaly_min_depth
+
     # 若从 widget 切回 inline，清理遗留的交互式 figure，避免被 inline 后端顺带渲染
     if inline_mode:
         plt.close('all')
@@ -4567,20 +4575,29 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
     argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
     argo_data_filtered = argo_data_filtered[pd.to_datetime(argo_data_filtered[['Year', 'Month', 'Day']])==dates[needed_idx]]
     
-    if deep_argo:
-        filtered_by_depth = argo_data_filtered[argo_data_filtered['Depth'] >= 500].copy()
-        if filtered_by_depth.empty:
-            print("Warning: No data found with Depth >= 500.")
-            needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
-        else:
-            idx_max_do = filtered_by_depth.groupby('Profile_number')['DO'].idxmax()
-            needed_data = filtered_by_depth.loc[idx_max_do]
-            needed_data.index.name = None
+    if argo_data_filtered.empty:
+        needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
     else:
-        if argo_data_filtered.empty:
+        deltas = calculate_delta_do(
+            argo_data_filtered,
+            do_threshold=argo_do_threshold,
+            salinity_threshold=0.0,
+            temperature_threshold=0.0,
+            anomaly_min_depth=argo_min_depth,
+            include_aou=False,
+            remove_outliers=True,
+            verbose=False,
+        )
+        if deltas.empty:
+            print(
+                f"Warning: No Argo points pass thresholds "
+                f"(ΔDO>={argo_do_threshold:g}, depth>={float(argo_min_depth):g}m)."
+            )
             needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
         else:
-            needed_data = argo_data_filtered.groupby('Profile_number').apply(lambda group: group.iloc[0])
+            deltas = deltas.sort_values('delta_do', ascending=False)
+            deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
+            needed_data = deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
             needed_data.index.name = None
 
     # 获取区域边界（覆盖整条轨迹，优先用全程轮廓，否则退回中心轨迹）
@@ -4619,7 +4636,20 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
         glorys_variable_filtered = zeta/f
     else:
         glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_idx, variables=[variable], depth=needed_depth)
-        glorys_variable_filtered = glorys_variables_filtered[variable]
+        variable_key_map = {
+            'so': 'salinity',
+            'uo': 'u',
+            'vo': 'v',
+            'zos': 'ssh',
+            'mlotst': 'mlt',
+        }
+        variable_key = variable_key_map.get(variable, variable)
+        if variable_key not in glorys_variables_filtered:
+            raise KeyError(
+                f"Variable '{variable}' resolved to '{variable_key}', but available keys are "
+                f"{list(glorys_variables_filtered.keys())}"
+            )
+        glorys_variable_filtered = glorys_variables_filtered[variable_key]
 
     ds_names = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
     colors_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -4661,14 +4691,12 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_idx: int, variab
 
     # 绘制Argo浮标数据
     if not needed_data.empty:
-        if deep_argo:
-            sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=120,
-                            vmin=150, vmax=240, edgecolors='black', linewidths=0.5, label='Argo with max DO under 500m', zorder=5)
-            cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=cbar_pad)
-            cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
-            cbar2.ax.tick_params(labelsize=cbar_tick_fs)
-        else:
-            ax.scatter(needed_data['Longitude'], needed_data['Latitude'], color='blue', s=120, label='Argo', zorder=5)
+        sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=120,
+                        vmin=150, vmax=240, edgecolors='black', linewidths=0.5,
+                        label=f'Argo max ΔDO point (ΔDO>={argo_do_threshold:g}, depth>={float(argo_min_depth):g}m)', zorder=5)
+        cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=cbar_pad)
+        cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
+        cbar2.ax.tick_params(labelsize=cbar_tick_fs)
         for idx, row in needed_data.iterrows():
             ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth'])}", fontsize=argo_text_fs, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
@@ -4776,28 +4804,61 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int | pd.Timestamp, var
     contour_lat = np.concatenate(lat_flat)
 
     if type(needed_idx) is int:
-        glorys_filepaths_dict = find_track_glorys_filepath(DS, no)
-        needed_glorys_data = Dataset(list(glorys_filepaths_dict.values())[needed_idx], 'r')
+        idx = int(needed_idx)
+        if idx < 0 or idx >= len(wanted_track):
+            raise IndexError(f"needed_idx={idx} out of range for track length {len(wanted_track)}")
+        center_lon_ref = float(wanted_track.iloc[idx]['center_lon'])
+        if 'date' in wanted_track.columns:
+            target_date = pd.Timestamp(wanted_track.iloc[idx]['date'])
+        else:
+            target_date = pd.Timestamp(convert_date(wanted_track.iloc[idx]['time']))
+        needed_glorys_data = Dataset(get_glorys_filepath(target_date), 'r')
     elif isinstance(needed_idx, pd.Timestamp):
-        glorys_filepaths_dict = {needed_idx: get_glorys_filepath(needed_idx)}
-        needed_glorys_data = Dataset(glorys_filepaths_dict[needed_idx], 'r')
+        target_ts = pd.Timestamp(needed_idx)
+        track_dates = wanted_track['date'] if 'date' in wanted_track.columns else convert_date(wanted_track['time'])
+        track_dates = pd.to_datetime(track_dates, errors='coerce')
+        same_day_idx = np.nonzero(track_dates.dt.normalize().to_numpy() == target_ts.normalize().to_datetime64())[0]
+        if same_day_idx.size:
+            ref_idx = int(same_day_idx[0])
+        else:
+            valid_idx = np.nonzero(track_dates.notna().to_numpy())[0]
+            if valid_idx.size == 0:
+                raise ValueError("Track dates are all invalid; cannot resolve GLORYS reference longitude.")
+            dt_seconds = np.abs((track_dates.iloc[valid_idx] - target_ts).dt.total_seconds().to_numpy())
+            ref_idx = int(valid_idx[np.argmin(dt_seconds)])
+        center_lon_ref = float(wanted_track.iloc[ref_idx]['center_lon'])
+        needed_glorys_data = Dataset(get_glorys_filepath(target_ts), 'r')
     else:
         raise ValueError("needed_idx must be an integer index or a pd.Timestamp.")
 
-    contour_lon_filtered = np.ma.masked_equal(contour_lon, 180.0)
-    contour_lat_filtered = np.ma.masked_equal(contour_lat, 0.0)
+    contour_lon_arr = np.asarray(contour_lon, dtype=float)
+    contour_lat_arr = np.asarray(contour_lat, dtype=float)
+    contour_valid_mask = (
+        np.isfinite(contour_lon_arr)
+        & np.isfinite(contour_lat_arr)
+        & (contour_lon_arr != 180.0)
+        & (contour_lat_arr != 0.0)
+    )
+    if not np.any(contour_valid_mask):
+        needed_glorys_data.close()
+        raise ValueError("No valid contour coordinates remain after cleaning.")
+
+    contour_lon_valid = contour_lon_arr[contour_valid_mask]
+    contour_lat_valid = contour_lat_arr[contour_valid_mask]
+    contour_lon_local = center_lon_ref + _minimal_lon_diff_deg(contour_lon_valid, center_lon_ref)
 
     pad_deg = 0.5
-    glorys_lon_min = np.min(contour_lon_filtered) - pad_deg
-    glorys_lon_max = np.max(contour_lon_filtered) + pad_deg
-    glorys_lat_min = np.min(contour_lat_filtered) - pad_deg
-    glorys_lat_max = np.max(contour_lat_filtered) + pad_deg
+    glorys_lon_min = np.min(contour_lon_local) - pad_deg
+    glorys_lon_max = np.max(contour_lon_local) + pad_deg
+    glorys_lat_min = np.min(contour_lat_valid) - pad_deg
+    glorys_lat_max = np.max(contour_lat_valid) + pad_deg
 
     glorys_lon = needed_glorys_data.variables['longitude'][:]
     glorys_lat = needed_glorys_data.variables['latitude'][:]
     glorys_depth = needed_glorys_data.variables['depth'][:]
+    glorys_lon_local = center_lon_ref + _minimal_lon_diff_deg(glorys_lon, center_lon_ref)
 
-    glorys_lon_mask = (glorys_lon >= glorys_lon_min) & (glorys_lon <= glorys_lon_max)
+    glorys_lon_mask = (glorys_lon_local >= glorys_lon_min) & (glorys_lon_local <= glorys_lon_max)
     glorys_lat_mask = (glorys_lat >= glorys_lat_min) & (glorys_lat <= glorys_lat_max)
     if depth is not None:
         glorys_depth_mask = np.zeros_like(glorys_depth, dtype=bool)
@@ -4806,6 +4867,10 @@ def get_track_area_glorys(DS: list, no: int, needed_idx: int | pd.Timestamp, var
             glorys_depth_mask[k] = True
     else:
         glorys_depth_mask = (glorys_depth >= 0) & (glorys_depth <= 2000)
+
+    if not np.any(glorys_lon_mask) or not np.any(glorys_lat_mask):
+        needed_glorys_data.close()
+        raise ValueError("No GLORYS grid points fall inside the dateline-safe local window.")
         
     glorys_lon_filtered = glorys_lon[glorys_lon_mask]
     glorys_lat_filtered = glorys_lat[glorys_lat_mask]
@@ -5103,6 +5168,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
 
     lon_flat: list[np.ndarray] = []
     lat_flat: list[np.ndarray] = []
+    current_center_lon_ref = float(center_lon_arr[int(needed_idx)])
     for lon_arr, lat_arr in zip(contour_lon_col, contour_lat_col):
         try:
             lon_np = np.asarray(lon_arr, dtype=float).ravel()
@@ -5110,7 +5176,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         except Exception:
             continue
         if lon_np.size and lat_np.size:
-            lon_flat.append(lon_np)
+            lon_local = current_center_lon_ref + _minimal_lon_diff_deg(lon_np, current_center_lon_ref)
+            lon_flat.append(lon_local)
             lat_flat.append(lat_np)
 
     pad_deg = 0.5
@@ -5132,6 +5199,26 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_data_raw = get_track_area_glorys(
         DS, no, needed_idx, variables=list(raw_vars_to_fetch)
     )
+
+    # 在当前中心经度参考系下构造连续经度轴，避免跨日界线导致插值坐标断裂
+    if glorys_lon_raw.size:
+        glorys_lon_local = current_center_lon_ref + _minimal_lon_diff_deg(glorys_lon_raw, current_center_lon_ref)
+        lon_order = np.argsort(glorys_lon_local)
+        glorys_lon_raw = glorys_lon_local[lon_order]
+
+        for _name, _arr in list(glorys_data_raw.items()):
+            if _arr is None:
+                continue
+            arr_ma = np.ma.array(_arr, copy=False)
+            if arr_ma.ndim >= 2 and arr_ma.shape[-1] == len(lon_order):
+                glorys_data_raw[_name] = arr_ma[..., lon_order]
+
+    if glorys_lon_raw.size:
+        glorys_lon_min = float(np.min(glorys_lon_raw))
+        glorys_lon_max = float(np.max(glorys_lon_raw))
+    if glorys_lat_raw.size:
+        glorys_lat_min = float(np.min(glorys_lat_raw))
+        glorys_lat_max = float(np.max(glorys_lat_raw))
     
     if glorys_depth_raw.size == 0 and not all(var_dims.get(alias_map.get(v, v)) == 2 for v in variables):
         return [{} for _ in k_list]
@@ -5155,7 +5242,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
                 continue
 
         dlat_deg = np.diff(profile_lats)
-        dlon_deg = np.diff(profile_lons) # 假设不跨日界线，因为是局部剖面
+        dlon_deg = _minimal_lon_diff_deg(profile_lons[1:], profile_lons[:-1])
         mid_lats_deg = (profile_lats[:-1] + profile_lats[1:]) / 2
         
         scale_mid = approximate_degree_length(mid_lats_deg)
@@ -5171,7 +5258,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         else:
             xp = (current_center_lon + k_val * current_center_lat - k_val * b_val) / (1 + k_val**2)
             yp = k_val * xp + b_val
-        center_idx_on_profile = np.argmin((profile_lons - xp)**2 + (profile_lats - yp)**2)
+        center_idx_on_profile = np.argmin(_minimal_lon_diff_deg(profile_lons, xp)**2 + (profile_lats - yp)**2)
         y_coords_recenter = y_coords_raw - y_coords_raw[center_idx_on_profile]
 
         # --- 2. 区分维度，计算剖面数据 ---
@@ -5188,7 +5275,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
                     profile_data_dict[standard_name] = np.ma.masked_all(len(profile_lons))
                     continue
                 
-                interp_func_2d = RegularGridInterpolator((glorys_lat_raw, glorys_lon_raw), data_2d.filled(np.nan), 
+                data_2d_filled = np.ma.filled(np.ma.array(data_2d, copy=False), np.nan)
+                interp_func_2d = RegularGridInterpolator((glorys_lat_raw, glorys_lon_raw), data_2d_filled,
                                                          method='linear', bounds_error=False, fill_value=np.nan)
                 interpolated_1d = interp_func_2d(list(zip(profile_lats, profile_lons)))
                 profile_data_dict[standard_name] = np.ma.masked_invalid(interpolated_1d)
@@ -5215,7 +5303,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
             _, query_lons = np.meshgrid(z_coords, profile_lons, indexing='ij')
             xi_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
             
-            interp_func = RegularGridInterpolator((z_coords, glorys_lat_raw, glorys_lon_raw), glorys_variable_3d.filled(np.nan), method='linear', bounds_error=False, fill_value=np.nan)
+            variable_3d_filled = np.ma.filled(np.ma.array(glorys_variable_3d, copy=False), np.nan)
+            interp_func = RegularGridInterpolator((z_coords, glorys_lat_raw, glorys_lon_raw), variable_3d_filled, method='linear', bounds_error=False, fill_value=np.nan)
             interpolated_values_flat = interp_func(xi_points)
             profile_data_dict[standard_name] = np.ma.masked_invalid(interpolated_values_flat.reshape(len(z_coords), len(profile_lons)))
 
@@ -5226,15 +5315,16 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         C = current_center_lon**2 + (b_val - current_center_lat)**2 - effective_radius_deg**2
         discriminant = B**2 - 4*A*C
         radius_intersections_lon = [(-B + s * np.sqrt(discriminant)) / (2*A) for s in [-1, 1]] if discriminant >= 0 else []
-        radius_proj_dists = [y_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - (k_val*lon_i + b_val))**2)] - y_coords_raw[center_idx_on_profile] for lon_i in radius_intersections_lon]
+        radius_proj_dists = [y_coords_raw[np.argmin(_minimal_lon_diff_deg(profile_lons, lon_i)**2 + (profile_lats - (k_val*lon_i + b_val))**2)] - y_coords_raw[center_idx_on_profile] for lon_i in radius_intersections_lon]
 
         curr_contour_lon = np.asarray(contour_lon_col[needed_idx], dtype=float).ravel()
         curr_contour_lat = np.asarray(contour_lat_col[needed_idx], dtype=float).ravel()
         valid_mask = (curr_contour_lon != 180.0) & (curr_contour_lat != 0.0)
         curr_contour_lon = curr_contour_lon[valid_mask]
         curr_contour_lat = curr_contour_lat[valid_mask]
+        curr_contour_lon = current_center_lon + _minimal_lon_diff_deg(curr_contour_lon, current_center_lon)
         contour_intersections_xy = find_polygon_line_intersections(curr_contour_lon, curr_contour_lat, profile_lons, profile_lats)
-        contour_proj_dists = [y_coords_raw[np.argmin((profile_lons - lon_i)**2 + (profile_lats - lat_i)**2)] - y_coords_raw[center_idx_on_profile] for lon_i, lat_i in contour_intersections_xy]
+        contour_proj_dists = [y_coords_raw[np.argmin(_minimal_lon_diff_deg(profile_lons, lon_i)**2 + (profile_lats - lat_i)**2)] - y_coords_raw[center_idx_on_profile] for lon_i, lat_i in contour_intersections_xy]
 
         projections_dict = {'radius': sorted(radius_proj_dists), 'contour': sorted(contour_proj_dists)}
         
@@ -5265,7 +5355,10 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
                          show_fig: bool = False, save_fig: bool = False, 
                          xmin: float = None, xmax: float = None,
                          ymin: float = None, ymax: float = None,
-                         plot_mlt: bool = False):
+                         plot_mlt: bool = False,
+                         plot_argo_projection: bool = False,
+                         argo_projection_do_threshold: float | None = None,
+                         argo_projection_min_depth: float | None = None):
     '''
     绘制指定涡旋在特定时刻，沿一条或多条剖面线 (y = kx + b) 的物理量垂直剖面图。
 
@@ -5280,6 +5373,9 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         save_fig (bool): 是否保存图像。
         xmin, xmax, ymin, ymax (float): 坐标轴范围。
         plot_mlt (bool): 是否在图上绘制混合层深度分界线。默认为 False。
+        plot_argo_projection (bool): 是否将“所选时刻、涡旋内部”的 Argo 观测映射到垂直剖面平面。默认为 False。
+        argo_projection_do_threshold (float | None): Argo 映射层使用的 ΔDO 阈值；None 回退 0（不筛选）。
+        argo_projection_min_depth (float | None): Argo 映射层使用的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
     '''
     # --- 1. 获取所有计算好的剖面数据包 ---
     
@@ -5293,6 +5389,83 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         print(f"警告: get_vertical_glorys 未能返回任何数据。绘图已取消。")
         return
 
+    # Argo 投影层视觉参数
+    _ARGO_MARKER_MAX_SIZE = 180.0
+    _ARGO_MARKER_MIN_SIZE = 10.0
+
+    # Argo 投影层阈值参数（默认回退全局配置，常见为 ΔDO=50、depth=300m）
+    if argo_projection_do_threshold is None:
+        argo_projection_do_threshold = 0.0
+    if argo_projection_min_depth is None:
+        argo_projection_min_depth = _cfg_anomaly_min_depth
+
+    # --- 1.1 按需准备 Argo 映射数据（仅针对 needed_idx 当天） ---
+    projected_argo_rows = pd.DataFrame()
+    default_distance_scale_km: float | None = None
+    if plot_argo_projection:
+        try:
+            track_df_overlay, _ds_name_overlay, ds_source_for_filter = _resolve_track_context(
+                DS,
+                no,
+                include_contours=True
+            )
+
+            if not track_df_overlay.empty:
+                if 'date' in track_df_overlay.columns:
+                    track_dates_overlay = pd.to_datetime(track_df_overlay['date'], errors='coerce')
+                else:
+                    track_dates_overlay = pd.to_datetime(convert_date(track_df_overlay['time']), errors='coerce')
+
+                target_date = None
+                idx_int = int(needed_idx)
+                if 0 <= idx_int < len(track_df_overlay):
+                    target_date = pd.Timestamp(track_dates_overlay.iloc[idx_int]).normalize()
+                    if default_distance_scale_km is None:
+                        radius_m = pd.to_numeric(track_df_overlay['radius'], errors='coerce').iloc[idx_int]
+                        if pd.notna(radius_m) and float(radius_m) > 0:
+                            default_distance_scale_km = float(radius_m) / 1000.0
+
+                argo_all = filtered_float_data(ds_source_for_filter, no, track=track_df_overlay)
+                if not argo_all.empty:
+                    argo_all = argo_all.copy()
+                    argo_all['date'] = pd.to_datetime(argo_all[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+                    if target_date is not None:
+                        projected_argo_rows = argo_all[argo_all['date'] == target_date].copy()
+                    else:
+                        projected_argo_rows = argo_all.copy()
+
+                    projected_argo_rows['Longitude'] = pd.to_numeric(projected_argo_rows['Longitude'], errors='coerce')
+                    projected_argo_rows['Latitude'] = pd.to_numeric(projected_argo_rows['Latitude'], errors='coerce')
+                    projected_argo_rows['Depth'] = pd.to_numeric(projected_argo_rows['Depth'], errors='coerce')
+                    projected_argo_rows['DO'] = pd.to_numeric(projected_argo_rows.get('DO', np.nan), errors='coerce')
+                    projected_argo_rows = projected_argo_rows.dropna(subset=['Longitude', 'Latitude', 'Depth'])
+
+                    # 每个 Profile 仅保留一个代表点：按 ΔDO/深度阈值筛选后取最大 ΔDO。
+                    if not projected_argo_rows.empty and 'Profile_number' in projected_argo_rows.columns:
+                        projected_argo_rows['Profile_number'] = pd.to_numeric(projected_argo_rows['Profile_number'], errors='coerce')
+                        projected_argo_rows = projected_argo_rows.dropna(subset=['Profile_number']).copy()
+
+                        if not projected_argo_rows.empty:
+                            deltas = calculate_delta_do(
+                                projected_argo_rows,
+                                do_threshold=argo_projection_do_threshold,
+                                salinity_threshold=0.0,
+                                temperature_threshold=0.0,
+                                anomaly_min_depth=argo_projection_min_depth,
+                                include_aou=False,
+                                remove_outliers=True,
+                                verbose=False,
+                            )
+                            if not deltas.empty:
+                                deltas = deltas.sort_values('delta_do', ascending=False)
+                                deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
+                                projected_argo_rows = deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
+                            else:
+                                projected_argo_rows = pd.DataFrame()
+        except Exception as exc:
+            print(f"注意: Argo 剖面映射准备失败，已跳过投影层。原因: {exc}")
+            projected_argo_rows = pd.DataFrame()
+
     # --- 开始循环，为每一个数据包生成一张图 ---
     for data_package in all_data_packages:
         if not data_package:
@@ -5305,7 +5478,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
             standard_name = alias_map.get(variable, variable)
             profile_variable_2d = data_package['profile_data'].get(standard_name)
 
-        if profile_variable_2d is None or np.all(getattr(profile_variable_2d, 'mask', True)):
+        if profile_variable_2d is None or np.all(np.ma.getmaskarray(np.ma.array(profile_variable_2d, copy=False))):
             k_meta, b_meta = data_package.get('metadata', {}).get('k'), data_package.get('metadata', {}).get('b')
             print(f"警告: 变量 '{variable}' 在剖面 k={k_meta}, b={b_meta} 上的数据无效。绘图已取消。")
             continue
@@ -5333,14 +5506,16 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         Y_mesh, Z_mesh = np.meshgrid(y_coords, z_coords)
         
         # 设置变量相关的绘图属性
+        clim = None
         if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
         elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
         elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
         elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
-        else: cbar_label, cmap, clim = variable, 'viridis', None
+        else: cbar_label, cmap = variable, 'viridis'
         
-        if 'clim' not in locals() or clim is None:
-            valid_values = profile_variable_2d[~profile_variable_2d.mask]
+        if clim is None:
+            prof_ma = np.ma.array(profile_variable_2d, copy=False)
+            valid_values = prof_ma.compressed()
             clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
             if variable in ['u', 'v', 'uo', 'vo']:
                 max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
@@ -5374,7 +5549,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         mld_lines = () # 创建一个空元组，用于存放MLD的两条线
         if plot_mlt:
             mlt_data = data_package['profile_data'].get('mlt')
-            if mlt_data is not None and not np.all(getattr(mlt_data, 'mask', True)):
+            if mlt_data is not None and not np.all(np.ma.getmaskarray(np.ma.array(mlt_data, copy=False))):
                 # **捕获两条线的艺术家对象**
                 # 注意 plot 返回的是一个列表，所以我们用 l, 来解包
                 black_line, = ax.plot(y_coords, mlt_data, color='black', linewidth=2.5, zorder=3)
@@ -5383,9 +5558,100 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
             else:
                 print(f"注意: 未能在剖面 k={metadata['k']}, b={metadata['b']} 上找到有效的混合层深度数据。")
 
+        # 按需绘制 Argo 三维点在剖面平面的投影
+        argo_scatter = None
+        argo_has_do = False
+        if plot_argo_projection and not projected_argo_rows.empty:
+            try:
+                k_line = float(metadata.get('k'))
+                b_line = float(metadata.get('b'))
+
+                line_lons = np.asarray(data_package.get('lon_coords', []), dtype=float)
+                line_lats = np.asarray(data_package.get('lat_coords', []), dtype=float)
+                line_y = np.asarray(y_coords, dtype=float)
+
+                if line_lons.size > 1 and line_lats.size == line_lons.size and line_y.size >= line_lons.size:
+                    line_y = line_y[:line_lons.size]
+
+                    pts_lon = projected_argo_rows['Longitude'].to_numpy(dtype=float)
+                    pts_lat = projected_argo_rows['Latitude'].to_numpy(dtype=float)
+                    pts_depth = projected_argo_rows['Depth'].to_numpy(dtype=float)
+                    pts_do = projected_argo_rows['DO'].to_numpy(dtype=float)
+
+                    # 将地理点正交投影到剖面直线 y = kx + b（经纬度坐标）
+                    denom = 1.0 + k_line ** 2
+                    proj_lon = (pts_lon + k_line * (pts_lat - b_line)) / denom
+                    proj_lat = k_line * proj_lon + b_line
+
+                    # 在采样剖面线上寻找最近点，以读取剖面横轴坐标（km）
+                    dist2 = (line_lons[None, :] - proj_lon[:, None]) ** 2 + (line_lats[None, :] - proj_lat[:, None]) ** 2
+                    nearest_idx = np.argmin(dist2, axis=1)
+                    proj_y = line_y[nearest_idx]
+
+                    scale_ref = approximate_degree_length(np.nanmean(line_lats))
+                    dlon_deg = _minimal_lon_diff_deg(pts_lon, proj_lon)
+                    dx_m = dlon_deg * scale_ref['meters_per_degree_lon']
+                    dy_m = (pts_lat - proj_lat) * scale_ref['meters_per_degree_lat']
+                    dist_to_line_km = np.hypot(dx_m, dy_m) / 1000.0
+
+                    scale_km = default_distance_scale_km
+                    if scale_km is None or (not np.isfinite(scale_km)) or scale_km <= 0:
+                        finite_span = np.asarray(line_y[np.isfinite(line_y)], dtype=float)
+                        if finite_span.size:
+                            scale_km = max(20.0, float(np.nanmax(np.abs(finite_span))))
+                        else:
+                            scale_km = 50.0
+
+                    marker_max = max(float(_ARGO_MARKER_MAX_SIZE), 1.0)
+                    marker_min = max(float(_ARGO_MARKER_MIN_SIZE), 1.0)
+                    if marker_min > marker_max:
+                        marker_min, marker_max = marker_max, marker_min
+
+                    weight = 1.0 - np.clip(dist_to_line_km / scale_km, 0.0, 1.0)
+                    marker_sizes = marker_min + (marker_max - marker_min) * (weight ** 1.2)
+
+                    valid_pts = np.isfinite(proj_y) & np.isfinite(pts_depth)
+                    if np.any(valid_pts):
+                        if np.isfinite(pts_do[valid_pts]).any():
+                            argo_scatter = ax.scatter(
+                                proj_y[valid_pts],
+                                pts_depth[valid_pts],
+                                c=pts_do[valid_pts],
+                                cmap='bwr',
+                                vmin=150,
+                                vmax=240,
+                                s=marker_sizes[valid_pts],
+                                edgecolors='black',
+                                linewidths=0.4,
+                                alpha=0.9,
+                                zorder=6,
+                                label='Projected Argo (one point/profile)',
+                            )
+                            argo_has_do = True
+                        else:
+                            argo_scatter = ax.scatter(
+                                proj_y[valid_pts],
+                                pts_depth[valid_pts],
+                                color='blue',
+                                s=marker_sizes[valid_pts],
+                                edgecolors='black',
+                                linewidths=0.4,
+                                alpha=0.9,
+                                zorder=6,
+                                label='Projected Argo (one point/profile)',
+                            )
+            except Exception as exc:
+                print(f"注意: Argo 映射层绘制失败 (k={metadata.get('k')}, b={metadata.get('b')}): {exc}")
+
         ax.set_ylim(z_coords.max(), z_coords.min())
         if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
         if ymin is not None and ymax is not None: ax.set_ylim(ymax, ymin)
+
+        # Argo DO 色标（与水平图一致：bwr + 150~240）
+        if argo_scatter is not None and argo_has_do:
+            cbar2 = fig.colorbar(argo_scatter, ax=ax, orientation='horizontal', fraction=0.046, pad=0.12)
+            cbar2.set_label('DO/μmol·kg⁻¹', fontsize=14)
+            cbar2.ax.tick_params(labelsize=12)
         
         # --- 构建并自定义图例 ---
         handles, labels = ax.get_legend_handles_labels()
@@ -5659,7 +5925,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
         return
         
     profile_variable_2d = data_package['profile_data'].get(variable)
-    if profile_variable_2d is None or np.all(profile_variable_2d.mask):
+    if profile_variable_2d is None or np.all(np.ma.getmaskarray(np.ma.array(profile_variable_2d, copy=False))):
         print(f"警告: 变量 '{variable}' 的剖面数据无效，无法绘图。")
         return
 
@@ -5690,14 +5956,16 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
 
     Y_mesh, Z_mesh = np.meshgrid(y_coords, z_coords)
     
+    clim = None
     if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
     elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
     elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
     elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
-    else: cbar_label, cmap, clim = variable, 'viridis', None
+    else: cbar_label, cmap = variable, 'viridis'
     
-    if 'clim' not in locals() or clim is None:
-        valid_values = profile_variable_2d[~profile_variable_2d.mask]
+    if clim is None:
+        prof_ma = np.ma.array(profile_variable_2d, copy=False)
+        valid_values = prof_ma.compressed()
         clim = (valid_values.min(), valid_values.max()) if valid_values.size > 0 else (0,1)
         if variable in ['u', 'v', 'uo', 'vo']:
             max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
