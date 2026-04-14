@@ -2102,6 +2102,75 @@ def filtered_float_data(
     
     return final_argo_data
 
+def get_argo_profile_numbers_on_day(
+    DS: list | str | tuple | dict,
+    track_id: int,
+    date: str | int | float | pd.Timestamp,
+    *,
+    sort_result: bool = True,
+) -> list[int]:
+    """返回指定涡旋在指定日期命中的全部 Argo Profile_number（唯一值）。
+
+    说明:
+        - 复用 `filtered_float_data` 的匹配口径（同日 + 轮廓内或扩圈半径内）。
+        - 本函数只返回唯一 Profile 编号列表，不返回完整剖面数据。
+
+    参数:
+        DS: legacy 列表、kind 字符串、kind 序列或数据集字典。
+        track_id: 涡旋编号。
+        date: 目标日期；支持 'YYYY-MM-DD'、YYYYMMDD、days-since-1950、Timestamp。
+        sort_result: 是否按升序返回，默认 True。
+
+    返回:
+        list[int]: 该日命中的唯一 Profile_number 列表；若无命中返回空列表。
+    """
+    try:
+        track_df, _ds_name, ds_source_for_filter = _resolve_track_context(DS, int(track_id), include_contours=True)
+    except Exception:
+        return []
+
+    try:
+        if isinstance(date, (str, bytes, np.str_)):
+            parsed = pd.to_datetime(date, errors='coerce')
+            if pd.isna(parsed):
+                target_date = convert_date(date)
+                if isinstance(target_date, pd.Series):
+                    if target_date.empty or target_date.isna().all():
+                        return []
+                    target_ts = pd.Timestamp(target_date.iloc[0]).normalize()
+                else:
+                    if pd.isna(target_date):
+                        return []
+                    target_ts = pd.Timestamp(target_date).normalize()
+            else:
+                target_ts = pd.Timestamp(parsed).normalize()
+        else:
+            target_date = convert_date(date)
+            if isinstance(target_date, pd.Series):
+                if target_date.empty or target_date.isna().all():
+                    return []
+                target_ts = pd.Timestamp(target_date.iloc[0]).normalize()
+            else:
+                if pd.isna(target_date):
+                    return []
+                target_ts = pd.Timestamp(target_date).normalize()
+    except Exception:
+        return []
+
+    argo_rows = filtered_float_data(ds_source_for_filter, int(track_id), track=track_df)
+    if argo_rows.empty or 'Profile_number' not in argo_rows.columns:
+        return []
+
+    date_col = pd.to_datetime(argo_rows[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+    day_rows = argo_rows.loc[date_col == target_ts]
+    if day_rows.empty:
+        return []
+
+    pnums = pd.to_numeric(day_rows['Profile_number'], errors='coerce').dropna().astype(int).unique().tolist()
+    if sort_result:
+        pnums.sort()
+    return pnums
+
 def _resolve_track_context(
     DS_input: list | str | tuple | dict,
     track_id: int,
@@ -5070,8 +5139,9 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     '''
     计算并返回指定涡旋在特定时刻沿一条或多条 y=kx+b 剖面的物理量数据。
 
-    该函数封装了从GLORYS数据场中提取剖面数据的核心插值计算，并以字典列表的形式返回结果。
-    它能正确处理三维变量（如温度，返回二维垂直剖面）和二维变量（如混合层深度，返回一维水平剖面）。
+        该函数封装了从GLORYS数据场中提取剖面数据的核心插值计算，并以字典列表的形式返回结果。
+        它能正确处理三维变量（如温度，返回二维垂直剖面）和二维变量（如混合层深度，返回一维水平剖面）。
+        其中派生变量 `density` / `sigma` / `sigma0` 统一表示势密度异常 σ0 (kg/m³)。
     无论输入变量使用何种别名，输出字典中的键都将是标准化的变量名。
 
     参数:
@@ -5132,6 +5202,7 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     alias_map = {
         'thetao': 'thetao',
         'salinity': 'salinity', 'so': 'salinity',
+        'density': 'sigma', 'sigma': 'sigma', 'sigma0': 'sigma',
         'u': 'u', 'uo': 'u',
         'v': 'v', 'vo': 'v',
         'ssh': 'ssh', 'zos': 'ssh',
@@ -5139,14 +5210,19 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
         'vorticity': 'vorticity'
     }
     var_dims = {
-        'thetao': 3, 'salinity': 3, 'u': 3, 'v': 3, 'vorticity': 3,
+        'thetao': 3, 'salinity': 3, 'sigma': 3, 'u': 3, 'v': 3, 'vorticity': 3,
         'ssh': 2, 'mlt': 2
     }
 
     raw_vars_to_fetch = set()
     for var in variables:
-        if var == 'vorticity': raw_vars_to_fetch.update(['u', 'v'])
-        else: raw_vars_to_fetch.add(var)
+        standard_name = alias_map.get(var, var)
+        if standard_name == 'vorticity':
+            raw_vars_to_fetch.update(['u', 'v'])
+        elif standard_name == 'sigma':
+            raw_vars_to_fetch.update(['salinity', 'thetao'])
+        else:
+            raw_vars_to_fetch.add(var)
 
     try:
         track_df, ds_name, _ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
@@ -5223,6 +5299,44 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
     if glorys_depth_raw.size == 0 and not all(var_dims.get(alias_map.get(v, v)) == 2 for v in variables):
         return [{} for _ in k_list]
 
+    sigma_3d_cache = None
+    if any(alias_map.get(v, v) == 'sigma' for v in variables):
+        sal_3d = glorys_data_raw.get('salinity')
+        theta_3d = glorys_data_raw.get('thetao')
+        if sal_3d is not None and theta_3d is not None:
+            sal_ma = np.ma.array(sal_3d, copy=False)
+            theta_ma = np.ma.array(theta_3d, copy=False)
+            if sal_ma.ndim == 2:
+                sal_ma = sal_ma[np.newaxis, :, :]
+            if theta_ma.ndim == 2:
+                theta_ma = theta_ma[np.newaxis, :, :]
+
+            if sal_ma.shape == theta_ma.shape and sal_ma.ndim == 3:
+                try:
+                    z3, lat3, lon3 = np.meshgrid(
+                        glorys_depth_raw,
+                        glorys_lat_raw,
+                        _normalize_lon_array(glorys_lon_raw),
+                        indexing='ij'
+                    )
+                    sal_filled = np.ma.filled(sal_ma, np.nan)
+                    theta_filled = np.ma.filled(theta_ma, np.nan)
+                    p3 = gsw.p_from_z(-z3, lat3)
+                    SA = gsw.SA_from_SP(sal_filled, p3, lon3, lat3)
+                    CT = gsw.CT_from_pt(SA, theta_filled)
+                    sigma0 = gsw.sigma0(SA, CT)
+
+                    input_mask = np.ma.getmaskarray(sal_ma) | np.ma.getmaskarray(theta_ma)
+                    sigma_3d_cache = np.ma.masked_invalid(sigma0)
+                    if input_mask.any():
+                        sigma_3d_cache = np.ma.array(
+                            sigma_3d_cache,
+                            mask=np.ma.getmaskarray(sigma_3d_cache) | input_mask,
+                            copy=False,
+                        )
+                except Exception:
+                    sigma_3d_cache = None
+
     all_profiles_data = []
 
     # --- 开始循环，为每一对 k, b 计算一个剖面 ---
@@ -5290,6 +5404,8 @@ def get_vertical_glorys(DS: list, no: int, needed_idx: int,
                     if u.ndim == 2: u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
                     zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
                     glorys_variable_3d = zeta_3d / f_3d
+            elif standard_name == 'sigma':
+                glorys_variable_3d = sigma_3d_cache
             else:
                 glorys_variable_3d = glorys_data_raw.get(standard_name)
 
@@ -5355,10 +5471,18 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
                          show_fig: bool = False, save_fig: bool = False, 
                          xmin: float = None, xmax: float = None,
                          ymin: float = None, ymax: float = None,
+                         color_vmin: float | None = None,
+                         color_vmax: float | None = None,
                          plot_mlt: bool = False,
                          plot_argo_projection: bool = False,
                          argo_projection_do_threshold: float | None = None,
-                         argo_projection_min_depth: float | None = None):
+                         argo_projection_min_depth: float | None = None,
+                         plot_isolines: bool = False,
+                         isoline_levels: int | list[float] | np.ndarray | None = None,
+                         isoline_color: str = 'black',
+                         isoline_linewidth: float = 0.8,
+                         isoline_alpha: float = 0.45,
+                         label_isolines: bool = False):
     '''
     绘制指定涡旋在特定时刻，沿一条或多条剖面线 (y = kx + b) 的物理量垂直剖面图。
 
@@ -5372,10 +5496,22 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         show_fig (bool): 是否显示图像。
         save_fig (bool): 是否保存图像。
         xmin, xmax, ymin, ymax (float): 坐标轴范围。
+        color_vmin, color_vmax (float | None): 主色斑图色标下/上限。
+            - 默认 None：按当前剖面数据自适应；
+            - 指定后：覆盖自动范围（可只给其中一个，另一个保持自动）。
         plot_mlt (bool): 是否在图上绘制混合层深度分界线。默认为 False。
         plot_argo_projection (bool): 是否将“所选时刻、涡旋内部”的 Argo 观测映射到垂直剖面平面。默认为 False。
         argo_projection_do_threshold (float | None): Argo 映射层使用的 ΔDO 阈值；None 回退 0（不筛选）。
         argo_projection_min_depth (float | None): Argo 映射层使用的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
+        plot_isolines (bool): 是否在色斑图上叠加变量等值线。默认 False。
+        isoline_levels (int | list[float] | np.ndarray | None): 等值线级别。
+            - None: 自动按色标范围生成 9 条线；
+            - int: 生成该数量的等间隔级别；
+            - list/ndarray: 直接使用给定级别。
+        isoline_color (str): 等值线颜色，默认 'black'。
+        isoline_linewidth (float): 等值线线宽，默认 0.8。
+        isoline_alpha (float): 等值线透明度，默认 0.45。
+        label_isolines (bool): 是否标注等值线数值，默认 False。
     '''
     # --- 1. 获取所有计算好的剖面数据包 ---
     
@@ -5474,7 +5610,13 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
             
         profile_variable_2d = data_package['profile_data'].get(variable)
         if profile_variable_2d is None:
-            alias_map = {'so': 'salinity', 'uo': 'u', 'vo': 'v'}
+            alias_map = {
+                'so': 'salinity',
+                'uo': 'u',
+                'vo': 'v',
+                'density': 'sigma',
+                'sigma0': 'sigma',
+            }
             standard_name = alias_map.get(variable, variable)
             profile_variable_2d = data_package['profile_data'].get(standard_name)
 
@@ -5510,6 +5652,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
         elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
         elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
+        elif variable in ['density', 'sigma', 'sigma0']: cbar_label, cmap = 'Potential Density Anomaly (σ0, kg/m³)', 'RdBu_r'
         elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
         else: cbar_label, cmap = variable, 'viridis'
         
@@ -5520,6 +5663,13 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
             if variable in ['u', 'v', 'uo', 'vo']:
                 max_abs = np.max(np.abs(valid_values)) if valid_values.size > 0 else 1
                 clim = (-max_abs, max_abs)
+
+        # 手动色标覆盖（默认保持自适应）
+        vmin = float(color_vmin) if color_vmin is not None else float(clim[0])
+        vmax = float(color_vmax) if color_vmax is not None else float(clim[1])
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+            raise ValueError(f"Invalid color range: color_vmin={color_vmin}, color_vmax={color_vmax}")
+        clim = (vmin, vmax)
 
         # --- 3. 执行绘图 ---
         fig, ax = plt.subplots(figsize=(20, 15))
@@ -5535,6 +5685,40 @@ def plot_vertical_glorys(DS: list, no: int, needed_idx: int,
         ax.tick_params(labelsize=14)
         
         pc = ax.pcolormesh(Y_mesh, Z_mesh, profile_variable_2d, cmap=cmap, shading='auto', vmin=clim[0], vmax=clim[1])
+
+        if plot_isolines:
+            prof_filled = np.ma.filled(np.ma.array(profile_variable_2d, copy=False), np.nan)
+            finite_vals = prof_filled[np.isfinite(prof_filled)]
+            if finite_vals.size > 0:
+                levels_to_use = None
+                if isoline_levels is None:
+                    levels_to_use = np.linspace(clim[0], clim[1], 9)
+                elif isinstance(isoline_levels, (int, np.integer)):
+                    n_levels = int(isoline_levels)
+                    if n_levels >= 2:
+                        levels_to_use = np.linspace(clim[0], clim[1], n_levels)
+                else:
+                    levels_to_use = np.asarray(isoline_levels, dtype=float)
+
+                if levels_to_use is not None:
+                    levels_to_use = np.asarray(levels_to_use, dtype=float)
+                    levels_to_use = levels_to_use[np.isfinite(levels_to_use)]
+                    levels_to_use = np.unique(levels_to_use)
+
+                if levels_to_use is not None and levels_to_use.size >= 2:
+                    contour_set = ax.contour(
+                        Y_mesh,
+                        Z_mesh,
+                        prof_filled,
+                        levels=levels_to_use,
+                        colors=isoline_color,
+                        linewidths=float(isoline_linewidth),
+                        alpha=float(isoline_alpha),
+                        zorder=5,
+                    )
+                    if label_isolines:
+                        ax.clabel(contour_set, inline=True, fontsize=10, fmt='%.2g')
+
         cbar = fig.colorbar(pc, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
         cbar.set_label(cbar_label, fontsize=18)
         cbar.ax.tick_params(labelsize=14)
@@ -5960,6 +6144,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     if variable == 'vorticity': cbar_label, cmap, clim = r'$\zeta/f$', 'seismic', (-0.3, 0.3)
     elif variable in ['thetao']: cbar_label, cmap = 'Temperature (°C)', 'rainbow'
     elif variable in ['salinity', 'so']: cbar_label, cmap = 'Salinity (psu)', 'viridis'
+    elif variable in ['density', 'sigma', 'sigma0']: cbar_label, cmap = 'Potential Density Anomaly (σ0, kg/m³)', 'RdBu_r'
     elif variable in ['u', 'v', 'uo', 'vo']: cbar_label, cmap = 'Velocity (m/s)', 'RdBu_r'
     else: cbar_label, cmap = variable, 'viridis'
     
