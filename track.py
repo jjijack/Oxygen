@@ -4498,8 +4498,9 @@ class LineDrawer:
     一个用于在matplotlib图像上通过点击两点来交互式绘制直线的辅助类。
     新增了撤回功能：按 'z' 键可以撤回上一个点击的点或已绘制的直线。
     """
-    def __init__(self, ax):
+    def __init__(self, ax, legend_loc: str = 'best'):
         self.ax = ax
+        self.legend_loc = legend_loc
         self.points = []  # 用于存储用户点击的坐标
         self.lines = []   # 用于存储已绘制的直线对象
         self.markers = [] # 用于存储用户点击时产生的临时视觉标记
@@ -4521,7 +4522,7 @@ class LineDrawer:
         marker = self.ax.plot(event.xdata, event.ydata, 'm+', markersize=12, markeredgewidth=2)
         self.markers.extend(marker)
         # 触发一次完整的重绘，确保标记点被永久画上
-        self.ax.figure.canvas.draw()
+        self.ax.figure.canvas.draw_idle()
 
         # 当记录的点达到两个时，开始绘制直线
         if len(self.points) == 2:
@@ -4543,8 +4544,8 @@ class LineDrawer:
                 # 移除上一条绘制的直线
                 last_line = self.lines.pop()
                 last_line.remove()
-                self.ax.legend() # 更新图例
-                self.ax.figure.canvas.draw()
+                self.ax.legend(loc=self.legend_loc) # 更新图例
+                self.ax.figure.canvas.draw_idle()
                 print("上一条线已撤回。")
             else:
                 print("没有可撤回的操作。")
@@ -4580,8 +4581,8 @@ class LineDrawer:
         self.points.clear()
 
         # 更新图例并重绘图像
-        self.ax.legend()
-        self.ax.figure.canvas.draw()
+        self.ax.legend(loc=self.legend_loc)
+        self.ax.figure.canvas.draw_idle()
         print("\n准备就绪，可继续点击绘制下一条直线。")
 
 def _reduce_argo_profiles_by_delta(
@@ -4692,7 +4693,7 @@ def _plot_horizontal_profile_lines(
         )
 
 def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, variable: str = 'vorticity',
-                                 show_fig: bool = False, save_fig: bool = False,
+                                 show_fig: bool = True, save_fig: bool = False,
                                  k: float | list[float] | None = None, b: float | list[float] | None = None,
                                  needed_depth: float | int = 0, inline_mode: bool = True,
                                  argo_do_threshold: float | None = 0.0,
@@ -4914,8 +4915,11 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     if show_fig:
         # 仅在非内联模式（即交互模式）下，激活直线绘制器
         if not inline_mode:
-            line_drawer = LineDrawer(ax)
-            fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+            line_drawer = LineDrawer(ax, legend_loc='best')
+            cid_click = fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+            # 绑定到 figure，避免局部变量被回收导致交互回调偶发失效
+            fig._interactive_line_drawer = line_drawer
+            fig._interactive_line_drawer_click_cid = cid_click
             try:
                 plt.show(block=False)
             except TypeError:
@@ -5576,7 +5580,7 @@ def plot_argo_horizontal_glorys(
     profile_time: int | str | pd.Timestamp,
     platform_number: int | None = None,
     variable: str = 'vorticity',
-    show_fig: bool = False,
+    show_fig: bool = True,
     save_fig: bool = False,
     k: float | list[float] | None = None,
     b: float | list[float] | None = None,
@@ -5625,6 +5629,13 @@ def plot_argo_horizontal_glorys(
         argo_do_threshold = 0.0
     if argo_min_depth is None:
         argo_min_depth = _cfg_anomaly_min_depth
+
+    if not inline_mode:
+        backend_name = str(plt.get_backend()).lower()
+        if 'inline' in backend_name:
+            print("Warning: current matplotlib backend is inline; click interaction may appear unresponsive. "
+                  "Use %matplotlib widget or a GUI backend for stable interaction.")
+
     if inline_mode:
         plt.close('all')
 
@@ -5759,7 +5770,7 @@ def plot_argo_horizontal_glorys(
     )
     ax.set_xlabel('Longitude', fontsize=label_fs)
     ax.set_ylabel('Latitude', fontsize=label_fs)
-    ax.legend(fontsize=legend_fs)
+    ax.legend(fontsize=legend_fs, loc='best')
     ax.set_xlim(lon_min_local, lon_max_local)
     ax.set_ylim(lat_min, lat_max)
     ax.set_aspect('equal')
@@ -5779,8 +5790,11 @@ def plot_argo_horizontal_glorys(
 
     if show_fig:
         if not inline_mode:
-            line_drawer = LineDrawer(ax)
-            fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+            line_drawer = LineDrawer(ax, legend_loc='best')
+            cid_click = fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+            # 绑定到 figure，避免局部变量被回收导致交互回调偶发失效
+            fig._interactive_line_drawer = line_drawer
+            fig._interactive_line_drawer_click_cid = cid_click
             try:
                 plt.show(block=False)
             except TypeError:
@@ -6675,16 +6689,16 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
 def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, needed_date: str | pd.Timestamp,
                      k: float | list[float], b: float | list[float],
                      variable: str = 'vorticity',
-                     show_fig: bool = False, save_fig: bool = False,
+                     show_fig: bool = True, save_fig: bool = False,
                      xmin: float = -400.0, xmax: float = 400.0,
                      ymin: float = 0.0, ymax: float = 1000.0,
                      color_vmin: float | None = None,
                      color_vmax: float | None = None,
                      plot_mlt: bool = False,
-                     plot_argo_projection: bool = False,
+                     plot_argo_projection: bool = True,
                      argo_projection_do_threshold: float | None = None,
                      argo_projection_min_depth: float | None = None,
-                     plot_isolines: bool = False,
+                     plot_isolines: bool = True,
                      isoline_levels: int | list[float] | np.ndarray | None = None,
                      isoline_color: str = 'black',
                      isoline_linewidth: float = 0.8,
@@ -6725,7 +6739,7 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
         plot_argo_projection (bool): 是否叠加“同日期、涡旋内部”的 Argo 点投影。
         argo_projection_do_threshold (float | None): Argo 映射层使用的 ΔDO 阈值；None 回退 0（不筛选）。
         argo_projection_min_depth (float | None): Argo 映射层使用的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
-        plot_isolines (bool): 是否在色斑图上叠加变量等值线。默认 False。
+        plot_isolines (bool): 是否在色斑图上叠加变量等值线。默认 True。
         isoline_levels (int | list[float] | np.ndarray | None): 等值线级别。
             - None: 自动按色标范围生成 9 条线；
             - int: 生成该数量的等间隔级别；
@@ -7147,16 +7161,16 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
 def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
                                k: float | list[float], b: float | list[float],
                                variable: str = 'vorticity',
-                               show_fig: bool = False, save_fig: bool = False,
+                               show_fig: bool = True, save_fig: bool = False,
                                xmin: float = -400.0, xmax: float = 400.0,
                                ymin: float = 0.0, ymax: float = 1000.0,
                                color_vmin: float | None = None,
                                color_vmax: float | None = None,
                                plot_mlt: bool = False,
-                               plot_argo_projection: bool = False,
+                               plot_argo_projection: bool = True,
                                argo_projection_do_threshold: float | None = None,
                                argo_projection_min_depth: float | None = None,
-                               plot_isolines: bool = False,
+                               plot_isolines: bool = True,
                                isoline_levels: int | list[float] | np.ndarray | None = None,
                                isoline_color: str = 'black',
                                isoline_linewidth: float = 0.8,
@@ -7234,7 +7248,7 @@ def plot_argo_vertical_glorys(
     b: float | list[float],
     platform_number: int | None = None,
     variable: str = 'vorticity',
-    show_fig: bool = False,
+    show_fig: bool = True,
     save_fig: bool = False,
     xmin: float = -400.0,
     xmax: float = 400.0,
@@ -7243,10 +7257,10 @@ def plot_argo_vertical_glorys(
     color_vmin: float | None = None,
     color_vmax: float | None = None,
     plot_mlt: bool = False,
-    plot_argo_projection: bool = False,
+    plot_argo_projection: bool = True,
     argo_projection_do_threshold: float | None = None,
     argo_projection_min_depth: float | None = None,
-    plot_isolines: bool = False,
+    plot_isolines: bool = True,
     isoline_levels: int | list[float] | np.ndarray | None = None,
     isoline_color: str = 'black',
     isoline_linewidth: float = 0.8,
@@ -7399,6 +7413,694 @@ def plot_argo_vertical_glorys(
         x_axis_label='Distance from Profile Center (km)',
         save_subdir='plot_argo_vertical_glorys',
         title_subject='',
+    )
+
+
+def _normalize_profile_lines(
+    k: float | list[float],
+    b: float | list[float],
+) -> tuple[list[float], list[float]]:
+    """标准化剖面线参数，返回等长的 k/b 列表。"""
+    if k is None or b is None:
+        raise ValueError("k 和 b 必须同时提供。")
+
+    k_list = [float(k)] if isinstance(k, (int, float, np.integer, np.floating)) else [float(v) for v in k]
+    b_list = [float(b)] if isinstance(b, (int, float, np.integer, np.floating)) else [float(v) for v in b]
+    if len(k_list) != len(b_list):
+        raise ValueError("k 和 b 的列表长度必须一致。")
+    if len(k_list) == 0:
+        raise ValueError("至少需要一条剖面线参数。")
+    return k_list, b_list
+
+
+def _normalize_overview_vertical_variables(variables: list[str] | None) -> list[str]:
+    """规范化 overview 的 2x2 vertical 变量顺序。"""
+    base_order = ['vorticity', 'sigma', 'thetao', 'salinity']
+    if variables is None:
+        return base_order
+
+    alias_map = {
+        'vorticity': 'vorticity',
+        'thetao': 'thetao',
+        'temp': 'thetao',
+        'temperature': 'thetao',
+        'density': 'sigma',
+        'sigma': 'sigma',
+        'sigma0': 'sigma',
+        'salinity': 'salinity',
+        'so': 'salinity',
+    }
+    mapped = {
+        alias_map.get(str(var).strip().lower())
+        for var in variables
+    }
+    mapped.discard(None)
+
+    ordered = [k for k in base_order if k in mapped]
+    for k in base_order:
+        if k not in ordered:
+            ordered.append(k)
+    return ordered[:4]
+
+
+def _overview_var_style(var_key: str) -> tuple[str, str, str, tuple[float, float] | None]:
+    """返回变量的标题、色标标签、配色和默认色标范围。"""
+    if var_key == 'vorticity':
+        return ('Vorticity', r'$\zeta/f$', 'seismic', (-0.7, 0.7))
+    if var_key == 'thetao':
+        return ('Temperature', 'Temperature (°C)', 'rainbow', None)
+    if var_key == 'sigma':
+        return ('Density', 'Potential Density Anomaly (kg/m³)', 'RdBu_r', None)
+    if var_key == 'salinity':
+        return ('Salinity', 'Salinity (psu)', 'viridis', None)
+    return (var_key, var_key, 'viridis', None)
+
+
+def _auto_clim(data: np.ndarray | np.ma.MaskedArray, fallback: tuple[float, float] = (0.0, 1.0)) -> tuple[float, float]:
+    """按有效数据自动计算色标范围。"""
+    arr = np.ma.array(data, copy=False)
+    vals = arr.compressed()
+    if vals.size == 0:
+        return fallback
+    vmin = float(np.nanmin(vals))
+    vmax = float(np.nanmax(vals))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return fallback
+    if np.isclose(vmin, vmax):
+        span = abs(vmin) * 0.05 + 1e-6
+        return (vmin - span, vmax + span)
+    return (vmin, vmax)
+
+
+def _project_argo_rows_to_profile_for_overview(
+    data_package: dict,
+    projected_argo_rows: pd.DataFrame,
+    *,
+    distance_scale_km: float | None = None,
+) -> pd.DataFrame:
+    """将 Argo 代表点投影到指定剖面，返回用于绘制的坐标与点大小。"""
+    if projected_argo_rows is None or projected_argo_rows.empty:
+        return pd.DataFrame()
+
+    line_lons = np.asarray(data_package.get('lon_coords', []), dtype=float)
+    line_lats = np.asarray(data_package.get('lat_coords', []), dtype=float)
+    line_y = np.asarray(data_package.get('y_coords', []), dtype=float)
+    metadata = data_package.get('metadata', {})
+
+    if line_lons.size < 2 or line_lats.size != line_lons.size or line_y.size < line_lons.size:
+        return pd.DataFrame()
+
+    line_y = line_y[:line_lons.size]
+    try:
+        k_line = float(metadata.get('k'))
+        b_line = float(metadata.get('b'))
+    except Exception:
+        return pd.DataFrame()
+
+    rows = projected_argo_rows.copy()
+    rows['Longitude'] = pd.to_numeric(rows['Longitude'], errors='coerce')
+    rows['Latitude'] = pd.to_numeric(rows['Latitude'], errors='coerce')
+    rows['Depth'] = pd.to_numeric(rows['Depth'], errors='coerce')
+    rows['DO'] = pd.to_numeric(rows.get('DO', np.nan), errors='coerce')
+    rows = rows.dropna(subset=['Longitude', 'Latitude', 'Depth'])
+    if rows.empty:
+        return pd.DataFrame()
+
+    pts_lon = rows['Longitude'].to_numpy(dtype=float)
+    pts_lat = rows['Latitude'].to_numpy(dtype=float)
+    pts_depth = rows['Depth'].to_numpy(dtype=float)
+    pts_do = rows['DO'].to_numpy(dtype=float)
+
+    denom = 1.0 + k_line ** 2
+    proj_lon = (pts_lon + k_line * (pts_lat - b_line)) / denom
+    proj_lat = k_line * proj_lon + b_line
+
+    dist2 = (line_lons[None, :] - proj_lon[:, None]) ** 2 + (line_lats[None, :] - proj_lat[:, None]) ** 2
+    nearest_idx = np.argmin(dist2, axis=1)
+    proj_y = line_y[nearest_idx]
+
+    scale_ref = approximate_degree_length(np.nanmean(line_lats))
+    dlon_deg = _minimal_lon_diff_deg(pts_lon, proj_lon)
+    dx_m = dlon_deg * scale_ref['meters_per_degree_lon']
+    dy_m = (pts_lat - proj_lat) * scale_ref['meters_per_degree_lat']
+    dist_to_line_km = np.hypot(dx_m, dy_m) / 1000.0
+
+    scale_km = None
+    if distance_scale_km is not None and np.isfinite(float(distance_scale_km)) and float(distance_scale_km) > 0:
+        scale_km = float(distance_scale_km)
+    if scale_km is None:
+        finite_span = np.asarray(line_y[np.isfinite(line_y)], dtype=float)
+        scale_km = max(20.0, float(np.nanmax(np.abs(finite_span)))) if finite_span.size else 50.0
+
+    marker_max = 126.0
+    marker_min = 7.0
+    weight = 1.0 - np.clip(dist_to_line_km / scale_km, 0.0, 1.0)
+    marker_sizes = marker_min + (marker_max - marker_min) * (weight ** 1.2)
+
+    out = pd.DataFrame({
+        'proj_y': proj_y,
+        'Depth': pts_depth,
+        'DO': pts_do,
+        'marker_size': marker_sizes,
+    })
+    out = out[np.isfinite(out['proj_y']) & np.isfinite(out['Depth'])].copy()
+    return out
+
+
+def _prepare_overview_projection_rows(
+    rows: pd.DataFrame,
+    *,
+    do_threshold: float,
+    min_depth: float,
+) -> pd.DataFrame:
+    """清洗 Argo 行并按 ΔDO/深度阈值筛选代表点。"""
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+
+    cleaned = rows.copy()
+    cleaned['Longitude'] = pd.to_numeric(cleaned.get('Longitude'), errors='coerce')
+    cleaned['Latitude'] = pd.to_numeric(cleaned.get('Latitude'), errors='coerce')
+    cleaned['Depth'] = pd.to_numeric(cleaned.get('Depth'), errors='coerce')
+    cleaned['DO'] = pd.to_numeric(cleaned.get('DO', np.nan), errors='coerce')
+    cleaned = cleaned.dropna(subset=['Longitude', 'Latitude', 'Depth'])
+    if cleaned.empty:
+        return pd.DataFrame()
+
+    if 'Profile_number' in cleaned.columns:
+        cleaned['Profile_number'] = pd.to_numeric(cleaned['Profile_number'], errors='coerce')
+        cleaned = cleaned.dropna(subset=['Profile_number'])
+        if cleaned.empty:
+            return pd.DataFrame()
+
+    deltas = _reduce_argo_profiles_by_delta(
+        cleaned,
+        do_threshold=float(do_threshold),
+        min_depth=float(min_depth),
+    )
+    return deltas if not deltas.empty else pd.DataFrame()
+
+
+def _plot_glorys_overview_vertical_2x2(
+    *,
+    vertical_package: dict,
+    variables: list[str],
+    k_val: float,
+    b_val: float,
+    subject_label: str,
+    date_label: str,
+    xmin: float | None,
+    xmax: float | None,
+    ymin: float | None,
+    ymax: float | None,
+    projected_argo_profile: pd.DataFrame | None = None,
+    plot_mlt: bool = False,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+):
+    """绘制 overview 的 2x2 vertical 图。"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    axes_flat = axes.ravel()
+
+    y_coords = np.asarray(vertical_package.get('y_coords', []), dtype=float)
+    z_coords = np.asarray(vertical_package.get('z_coords', []), dtype=float)
+    projections = vertical_package.get('projections', {})
+    metadata = vertical_package.get('metadata', {})
+    draw_reference_lines = bool(metadata.get('draw_reference_lines', True))
+    mlt_profile = None
+    if plot_mlt:
+        mlt_raw = vertical_package.get('profile_data', {}).get('mlt')
+        if mlt_raw is not None:
+            mlt_arr = np.ma.array(mlt_raw, copy=False)
+            if mlt_arr.ndim == 1:
+                mlt_profile = np.asarray(np.ma.filled(mlt_arr, np.nan), dtype=float)
+            elif mlt_arr.ndim == 2 and 1 in mlt_arr.shape:
+                mlt_profile = np.asarray(np.ma.filled(mlt_arr.reshape(-1), np.nan), dtype=float)
+
+    for i, var_key in enumerate(variables[:4]):
+        ax = axes_flat[i]
+        title_txt, cbar_label, cmap_name, fixed_clim = _overview_var_style(var_key)
+
+        v_field = np.ma.array(vertical_package.get('profile_data', {}).get(var_key), copy=False)
+        if v_field.ndim != 2 or y_coords.size < 2 or z_coords.size < 2:
+            ax.text(0.5, 0.5, f"No valid {title_txt}", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f"Vertical {title_txt}")
+            continue
+
+        nz = min(v_field.shape[0], len(z_coords))
+        ny = min(v_field.shape[1], len(y_coords))
+        v_field = v_field[:nz, :ny]
+        z_plot = z_coords[:nz]
+        y_plot = y_coords[:ny]
+
+        Y_mesh, Z_mesh = np.meshgrid(y_plot, z_plot)
+        v_clim = fixed_clim if fixed_clim is not None else _auto_clim(v_field)
+        pc = ax.pcolormesh(Y_mesh, Z_mesh, v_field, cmap=cmap_name, shading='auto', vmin=v_clim[0], vmax=v_clim[1])
+
+        if plot_isolines:
+            prof_filled = np.ma.filled(np.ma.array(v_field, copy=False), np.nan)
+            finite_vals = prof_filled[np.isfinite(prof_filled)]
+            if finite_vals.size > 0:
+                levels_to_use = None
+                if isoline_levels is None:
+                    levels_to_use = np.linspace(v_clim[0], v_clim[1], 9)
+                elif isinstance(isoline_levels, (int, np.integer)):
+                    n_levels = int(isoline_levels)
+                    if n_levels >= 2:
+                        levels_to_use = np.linspace(v_clim[0], v_clim[1], n_levels)
+                else:
+                    levels_to_use = np.asarray(isoline_levels, dtype=float)
+
+                if levels_to_use is not None:
+                    levels_to_use = np.asarray(levels_to_use, dtype=float)
+                    levels_to_use = levels_to_use[np.isfinite(levels_to_use)]
+                    levels_to_use = np.unique(levels_to_use)
+
+                if levels_to_use is not None and levels_to_use.size >= 2:
+                    contour_set = ax.contour(
+                        Y_mesh,
+                        Z_mesh,
+                        prof_filled,
+                        levels=levels_to_use,
+                        colors=isoline_color,
+                        linewidths=float(isoline_linewidth),
+                        alpha=float(isoline_alpha),
+                        zorder=5,
+                    )
+                    if label_isolines:
+                        ax.clabel(contour_set, inline=True, fontsize=9, fmt='%.2g')
+
+        if draw_reference_lines:
+            ax.axvline(0.0, color='black', linestyle='--', linewidth=1.6, label='Center Projection' if i == 0 else None)
+            for j, dist in enumerate(projections.get('radius', [])):
+                ax.axvline(dist, color='r', linestyle='--', linewidth=1.2, label='Radius Projection' if (i == 0 and j == 0) else None)
+            for j, dist in enumerate(projections.get('contour', [])):
+                ax.axvline(dist, color='tab:blue', linestyle=':', linewidth=1.2, label='Contour Projection' if (i == 0 and j == 0) else None)
+
+        mlt_drawn = False
+        if plot_mlt and mlt_profile is not None and mlt_profile.size >= ny:
+            mlt_line = mlt_profile[:ny]
+            valid_mlt = np.isfinite(mlt_line)
+            if np.any(valid_mlt):
+                ax.plot(y_plot[valid_mlt], mlt_line[valid_mlt], color='black', linewidth=2.0, zorder=6)
+                ax.plot(
+                    y_plot[valid_mlt],
+                    mlt_line[valid_mlt],
+                    color='white',
+                    linewidth=1.2,
+                    zorder=7,
+                    label='Mixed Layer Depth' if i == 0 else None,
+                )
+                mlt_drawn = True
+
+        if projected_argo_profile is not None and not projected_argo_profile.empty:
+            valid_pts = np.isfinite(projected_argo_profile['proj_y'].to_numpy(dtype=float)) & np.isfinite(projected_argo_profile['Depth'].to_numpy(dtype=float))
+            if np.any(valid_pts):
+                do_vals = projected_argo_profile['DO'].to_numpy(dtype=float)
+                if np.isfinite(do_vals[valid_pts]).any():
+                    ax.scatter(
+                        projected_argo_profile['proj_y'].to_numpy(dtype=float)[valid_pts],
+                        projected_argo_profile['Depth'].to_numpy(dtype=float)[valid_pts],
+                        c=do_vals[valid_pts],
+                        cmap='bwr',
+                        vmin=150,
+                        vmax=240,
+                        s=projected_argo_profile['marker_size'].to_numpy(dtype=float)[valid_pts],
+                        edgecolors='black',
+                        linewidths=0.35,
+                        alpha=0.9,
+                        zorder=6,
+                        label='Projected Argo' if i == 0 else None,
+                    )
+                else:
+                    ax.scatter(
+                        projected_argo_profile['proj_y'].to_numpy(dtype=float)[valid_pts],
+                        projected_argo_profile['Depth'].to_numpy(dtype=float)[valid_pts],
+                        color='blue',
+                        s=projected_argo_profile['marker_size'].to_numpy(dtype=float)[valid_pts],
+                        edgecolors='black',
+                        linewidths=0.35,
+                        alpha=0.9,
+                        zorder=6,
+                        label='Projected Argo' if i == 0 else None,
+                    )
+
+        ax.set_ylim(z_plot.max(), z_plot.min())
+        if xmin is not None and xmax is not None:
+            ax.set_xlim(float(xmin), float(xmax))
+        if ymin is not None and ymax is not None:
+            ax.set_ylim(float(ymax), float(ymin))
+
+        ax.set_title(f"Vertical {title_txt}", fontsize=12)
+        ax.set_xlabel('Distance (km)')
+        ax.set_ylabel('Depth (m)')
+        cbar = fig.colorbar(pc, ax=ax, orientation='vertical', fraction=0.045, pad=0.02)
+        cbar.set_label(cbar_label, fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+        if i == 0 and (draw_reference_lines or mlt_drawn or (projected_argo_profile is not None and not projected_argo_profile.empty)):
+            ax.legend(fontsize=9, loc='best')
+
+    fig.suptitle(
+        f"{subject_label} GLORYS Vertical Overview on {date_label}, y={k_val:.2f}x{b_val:+.2f}",
+        fontsize=16,
+        y=1.02,
+    )
+    return fig
+
+
+def _run_vertical_overview_batch(
+    *,
+    vertical_packages: list[dict],
+    k_list: list[float],
+    b_list: list[float],
+    vertical_vars: list[str],
+    target_date: pd.Timestamp,
+    subject_label: str,
+    save_name_prefix: str,
+    save_subdir: str,
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    projected_argo_rows: pd.DataFrame,
+    projection_distance_scale_km: float | None,
+    plot_argo_projection: bool,
+    plot_mlt: bool,
+    plot_isolines: bool,
+    isoline_levels: int | list[float] | np.ndarray | None,
+    isoline_color: str,
+    isoline_linewidth: float,
+    isoline_alpha: float,
+    label_isolines: bool,
+    show_fig: bool,
+    save_fig: bool,
+) -> list[dict]:
+    """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
+    results: list[dict] = []
+    region_slug = _current_region_key()
+    out_dir = Path(plots_output_root) / region_slug / save_subdir
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    date_str = target_date.strftime('%Y-%m-%d')
+    date_tag = target_date.strftime('%Y%m%d')
+
+    for i, (k_val, b_val) in enumerate(zip(k_list, b_list)):
+        pkg = vertical_packages[i] if i < len(vertical_packages) else {}
+        if not pkg:
+            print(f"Warning: empty vertical package for line {i+1} (k={k_val}, b={b_val}), skipped.")
+            continue
+
+        proj_profile = _project_argo_rows_to_profile_for_overview(
+            pkg,
+            projected_argo_rows,
+            distance_scale_km=projection_distance_scale_km,
+        ) if plot_argo_projection else pd.DataFrame()
+
+        fig = _plot_glorys_overview_vertical_2x2(
+            vertical_package=pkg,
+            variables=vertical_vars,
+            k_val=k_val,
+            b_val=b_val,
+            subject_label=subject_label,
+            date_label=date_str,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=ymax,
+            projected_argo_profile=proj_profile,
+            plot_mlt=plot_mlt,
+            plot_isolines=plot_isolines,
+            isoline_levels=isoline_levels,
+            isoline_color=isoline_color,
+            isoline_linewidth=isoline_linewidth,
+            isoline_alpha=isoline_alpha,
+            label_isolines=label_isolines,
+        )
+
+        save_path = None
+        if save_fig:
+            save_path = out_dir / (
+                f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}.png"
+            )
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Figure saved to: {save_path}")
+
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+
+        results.append({'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None})
+
+    return results
+
+
+def plot_track_vertical_glorys_overview(
+    DS: list | str | tuple | dict,
+    no: int,
+    needed_date: str | pd.Timestamp,
+    k: float | list[float],
+    b: float | list[float],
+    *,
+    variables: list[str] | None = None,
+    needed_depth: float | int = 0,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    plot_mlt: bool = False,
+    plot_argo_projection: bool = True,
+    argo_projection_do_threshold: float | None = None,
+    argo_projection_min_depth: float | None = None,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+    show_fig: bool = True,
+    save_fig: bool = False,
+) -> list[dict]:
+    """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。"""
+    vertical_vars = _normalize_overview_vertical_variables(variables)
+    k_list, b_list = _normalize_profile_lines(k, b)
+    vars_to_fetch = set(vertical_vars)
+    if plot_mlt:
+        vars_to_fetch.add('mlt')
+
+    track_df, ds_name, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
+    if track_df.empty:
+        raise ValueError(f"Track {no} has no data.")
+
+    dates = track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time'])
+    dates = pd.to_datetime(dates, errors='coerce')
+    target_ts = pd.Timestamp(needed_date).normalize()
+    same_day_idx = np.nonzero(dates.dt.normalize().to_numpy() == target_ts.to_datetime64())[0]
+    if same_day_idx.size == 0:
+        raise ValueError(f"Date {target_ts.strftime('%Y-%m-%d')} not found in track {no}.")
+    needed_idx = int(same_day_idx[0])
+    target_date = pd.Timestamp(dates.iloc[needed_idx])
+
+    radius_arr = pd.to_numeric(track_df['radius'], errors='coerce').to_numpy(dtype=float)
+    projection_distance_scale_km = None
+    if 0 <= needed_idx < len(radius_arr) and np.isfinite(radius_arr[needed_idx]) and float(radius_arr[needed_idx]) > 0:
+        projection_distance_scale_km = float(radius_arr[needed_idx]) / 1000.0
+
+    vertical_packages = get_vertical_glorys(
+        DS,
+        no,
+        target_date,
+        k_list,
+        b_list,
+        variables=list(vars_to_fetch),
+        x_min_km=xmin,
+        x_max_km=xmax,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+    )
+
+    projected_argo_rows = pd.DataFrame()
+    if plot_argo_projection:
+        if argo_projection_do_threshold is None:
+            argo_projection_do_threshold = 0.0
+        if argo_projection_min_depth is None:
+            argo_projection_min_depth = _cfg_anomaly_min_depth
+
+        argo_all = filtered_float_data(ds_source_for_filter, no, track=track_df)
+        if not argo_all.empty:
+            argo_all = argo_all.copy()
+            argo_all['date'] = pd.to_datetime(argo_all[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+            projected_argo_rows = argo_all[argo_all['date'] == target_date.normalize()].copy()
+            if not projected_argo_rows.empty:
+                projected_argo_rows = _prepare_overview_projection_rows(
+                    projected_argo_rows,
+                    do_threshold=float(argo_projection_do_threshold),
+                    min_depth=float(argo_projection_min_depth),
+                )
+
+    ds_name_upper = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
+
+    return _run_vertical_overview_batch(
+        vertical_packages=vertical_packages,
+        k_list=k_list,
+        b_list=b_list,
+        vertical_vars=vertical_vars,
+        target_date=target_date,
+        subject_label=f"Track {ds_name_upper}{int(no)}",
+        save_name_prefix=f"{ds_name_upper}{int(no)}",
+        save_subdir='plot_track_vertical_glorys_overview',
+        xmin=xmin,
+        xmax=xmax,
+        ymin=ymin,
+        ymax=ymax,
+        projected_argo_rows=projected_argo_rows,
+        projection_distance_scale_km=projection_distance_scale_km,
+        plot_argo_projection=plot_argo_projection,
+        plot_mlt=plot_mlt,
+        plot_isolines=plot_isolines,
+        isoline_levels=isoline_levels,
+        isoline_color=isoline_color,
+        isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha,
+        label_isolines=label_isolines,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_argo_vertical_glorys_overview(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    k: float | list[float],
+    b: float | list[float],
+    *,
+    platform_number: int | None = None,
+    variables: list[str] | None = None,
+    needed_depth: float | int = 0,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    plot_mlt: bool = False,
+    plot_argo_projection: bool = True,
+    argo_projection_do_threshold: float | None = None,
+    argo_projection_min_depth: float | None = None,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+    argo_data_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+) -> list[dict]:
+    """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。"""
+    vertical_vars = _normalize_overview_vertical_variables(variables)
+    k_list, b_list = _normalize_profile_lines(k, b)
+    vars_to_fetch = set(vertical_vars)
+    if plot_mlt:
+        vars_to_fetch.add('mlt')
+
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+        argo_data_dir=argo_data_dir,
+    )
+    center_lon = float(info['center_lon'])
+    center_lat = float(info['center_lat'])
+    target_date = pd.Timestamp(info['target_date'])
+
+    window_half_size_km = max(abs(float(xmin)), abs(float(xmax)))
+
+    vertical_packages = get_vertical_glorys_from_center(
+        center_lon=center_lon,
+        center_lat=center_lat,
+        needed_date=target_date,
+        k=k_list,
+        b=b_list,
+        variables=list(vars_to_fetch),
+        x_min_km=xmin,
+        x_max_km=xmax,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+        window_half_size_km=window_half_size_km,
+        profile_id=int(profile_number),
+        ds_name='ARGO',
+    )
+
+    projected_argo_rows = pd.DataFrame()
+    if plot_argo_projection:
+        if argo_projection_do_threshold is None:
+            argo_projection_do_threshold = 0.0
+        if argo_projection_min_depth is None:
+            argo_projection_min_depth = _cfg_anomaly_min_depth
+
+        df_year = info['year_df']
+        day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+        day_rows = df_year.loc[day_ts == target_date.normalize()].copy()
+        if not day_rows.empty:
+            day_rows['Longitude'] = pd.to_numeric(day_rows['Longitude'], errors='coerce')
+            day_rows['Latitude'] = pd.to_numeric(day_rows['Latitude'], errors='coerce')
+            day_rows = day_rows.dropna(subset=['Longitude', 'Latitude'])
+
+            lon_min_local, lon_max_local, lat_min_local, lat_max_local = _window_bounds_from_center_km(
+                center_lon,
+                center_lat,
+                float(window_half_size_km),
+            )
+            day_lon_local = center_lon + _minimal_lon_diff_deg(day_rows['Longitude'].to_numpy(dtype=float), center_lon)
+            mask_window = (
+                (day_lon_local >= lon_min_local)
+                & (day_lon_local <= lon_max_local)
+                & (day_rows['Latitude'].to_numpy(dtype=float) >= lat_min_local)
+                & (day_rows['Latitude'].to_numpy(dtype=float) <= lat_max_local)
+            )
+            day_window = day_rows.loc[mask_window].copy()
+            if not day_window.empty:
+                projected_argo_rows = _prepare_overview_projection_rows(
+                    day_window,
+                    do_threshold=float(argo_projection_do_threshold),
+                    min_depth=float(argo_projection_min_depth),
+                )
+
+    return _run_vertical_overview_batch(
+        vertical_packages=vertical_packages,
+        k_list=k_list,
+        b_list=b_list,
+        vertical_vars=vertical_vars,
+        target_date=target_date,
+        subject_label=f"Profile {int(profile_number)}",
+        save_name_prefix=f"ARGO_profile{int(profile_number)}",
+        save_subdir='plot_argo_vertical_glorys_overview',
+        xmin=xmin,
+        xmax=xmax,
+        ymin=ymin,
+        ymax=ymax,
+        projected_argo_rows=projected_argo_rows,
+        projection_distance_scale_km=float(window_half_size_km),
+        plot_argo_projection=plot_argo_projection,
+        plot_mlt=plot_mlt,
+        plot_isolines=plot_isolines,
+        isoline_levels=isoline_levels,
+        isoline_color=isoline_color,
+        isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha,
+        label_isolines=label_isolines,
+        show_fig=show_fig,
+        save_fig=save_fig,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
