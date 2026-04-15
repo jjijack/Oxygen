@@ -4776,9 +4776,21 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     center_lon_arr = track_df['center_lon'].to_numpy()
     center_lat_arr = track_df['center_lat'].to_numpy()
     radius_arr = track_df['radius'].to_numpy()
+    plot_anchor_lon = float(center_lon_arr[needed_idx])
+    center_lon_plot = plot_anchor_lon + _minimal_lon_diff_deg(np.asarray(center_lon_arr, dtype=float), plot_anchor_lon)
     # 当前时刻（needed_idx）的轮廓坐标
     curr_contour_lon = track_df.iloc[needed_idx]['contour_lon']
     curr_contour_lat = track_df.iloc[needed_idx]['contour_lat']
+    curr_contour_lon = np.asarray(curr_contour_lon, dtype=float).ravel()
+    curr_contour_lat = np.asarray(curr_contour_lat, dtype=float).ravel()
+    contour_now_valid = (
+        np.isfinite(curr_contour_lon)
+        & np.isfinite(curr_contour_lat)
+        & (curr_contour_lon != 180.0)
+        & (curr_contour_lat != 0.0)
+    )
+    curr_contour_lon_plot = plot_anchor_lon + _minimal_lon_diff_deg(curr_contour_lon[contour_now_valid], plot_anchor_lon)
+    curr_contour_lat_plot = curr_contour_lat[contour_now_valid]
 
     # 获取Argo浮标数据（复用已读取轨迹，避免重复 I/O）
     argo_data_filtered = filtered_float_data(ds_source_for_filter, no, track=track_df)
@@ -4819,17 +4831,30 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     if all_contour_lon and all_contour_lat:
         lon_stack = np.concatenate(all_contour_lon)
         lat_stack = np.concatenate(all_contour_lat)
-        lon_stack = lon_stack[lon_stack != 180.0]
-        lat_stack = lat_stack[lat_stack != 0.0]
-        glorys_lon_min = lon_stack.min() - pad_deg
-        glorys_lon_max = lon_stack.max() + pad_deg
-        glorys_lat_min = lat_stack.min() - pad_deg
-        glorys_lat_max = lat_stack.max() + pad_deg
+        valid_stack = (
+            np.isfinite(lon_stack)
+            & np.isfinite(lat_stack)
+            & (lon_stack != 180.0)
+            & (lat_stack != 0.0)
+        )
+        lon_stack = lon_stack[valid_stack]
+        lat_stack = lat_stack[valid_stack]
+        if lon_stack.size > 0 and lat_stack.size > 0:
+            lon_stack_plot = plot_anchor_lon + _minimal_lon_diff_deg(lon_stack, plot_anchor_lon)
+            glorys_lon_min = float(np.nanmin(lon_stack_plot) - pad_deg)
+            glorys_lon_max = float(np.nanmax(lon_stack_plot) + pad_deg)
+            glorys_lat_min = float(np.nanmin(lat_stack) - pad_deg)
+            glorys_lat_max = float(np.nanmax(lat_stack) + pad_deg)
+        else:
+            glorys_lon_min = float(np.nanmin(center_lon_plot) - pad_deg)
+            glorys_lon_max = float(np.nanmax(center_lon_plot) + pad_deg)
+            glorys_lat_min = float(np.nanmin(center_lat_arr) - pad_deg)
+            glorys_lat_max = float(np.nanmax(center_lat_arr) + pad_deg)
     else:
-        glorys_lon_min = center_lon_arr.min() - pad_deg
-        glorys_lon_max = center_lon_arr.max() + pad_deg
-        glorys_lat_min = center_lat_arr.min() - pad_deg
-        glorys_lat_max = center_lat_arr.max() + pad_deg
+        glorys_lon_min = float(np.nanmin(center_lon_plot) - pad_deg)
+        glorys_lon_max = float(np.nanmax(center_lon_plot) + pad_deg)
+        glorys_lat_min = float(np.nanmin(center_lat_arr) - pad_deg)
+        glorys_lat_max = float(np.nanmax(center_lat_arr) + pad_deg)
 
     # 获取背景场数据（共享底层）
     glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variable_filtered = _compute_horizontal_glorys_field(
@@ -4843,6 +4868,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
             depth=depth_req,
         ),
     )
+    glorys_lon_plot = plot_anchor_lon + _minimal_lon_diff_deg(np.asarray(glorys_lon_filtered, dtype=float), plot_anchor_lon)
 
     ds_names = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
     colors_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -4858,26 +4884,33 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     ax.tick_params(axis='both', which='major', labelsize=tick_fs)
 
     # 绘制涡旋轨迹
-    ax.plot(center_lon_arr, center_lat_arr, color=colors, linewidth=track_lw, label='Center Track')
-    ax.plot(center_lon_arr[0], center_lat_arr[0], marker='o', color=colors, markersize=8)
-    ax.plot(center_lon_arr[-1], center_lat_arr[-1], marker='x', color=colors, markersize=8)
+    ax.plot(center_lon_plot, center_lat_arr, color=colors, linewidth=track_lw, label='Center Track')
+    ax.plot(center_lon_plot[0], center_lat_arr[0], marker='o', color=colors, markersize=8)
+    ax.plot(center_lon_plot[-1], center_lat_arr[-1], marker='x', color=colors, markersize=8)
 
     # 绘制背景场
-    pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
+    pc = ax.pcolormesh(glorys_lon_plot, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.06)
     _style_horizontal_colorbar(pc, cbar, variable, cbar_label_fs)
     cbar.ax.tick_params(labelsize=cbar_tick_fs)
 
     # 绘制Argo浮标数据
     if not needed_data.empty:
-        sc = ax.scatter(needed_data['Longitude'], needed_data['Latitude'], c=needed_data['DO'], cmap = 'bwr', s=120,
+        needed_lon_plot = plot_anchor_lon + _minimal_lon_diff_deg(pd.to_numeric(needed_data['Longitude'], errors='coerce').to_numpy(dtype=float), plot_anchor_lon)
+        needed_lat_plot = pd.to_numeric(needed_data['Latitude'], errors='coerce').to_numpy(dtype=float)
+        needed_do_plot = pd.to_numeric(needed_data['DO'], errors='coerce').to_numpy(dtype=float)
+        needed_depth_plot = pd.to_numeric(needed_data['Depth'], errors='coerce').to_numpy(dtype=float)
+        valid_argo = np.isfinite(needed_lon_plot) & np.isfinite(needed_lat_plot)
+        sc = ax.scatter(needed_lon_plot[valid_argo], needed_lat_plot[valid_argo], c=needed_do_plot[valid_argo], cmap = 'bwr', s=120,
                         vmin=150, vmax=240, edgecolors='black', linewidths=0.5,
                         label=f'Argo max ΔDO point (ΔDO>={argo_do_threshold:g}, depth>={float(argo_min_depth):g}m)', zorder=5)
         cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=cbar_pad)
         cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
         cbar2.ax.tick_params(labelsize=cbar_tick_fs)
-        for idx, row in needed_data.iterrows():
-            ax.text(row['Longitude'], row['Latitude'], f"{int(row['Depth'])}", fontsize=argo_text_fs, fontweight='bold', ha='center', va='center', color='black', zorder=6)
+        for lon_i, lat_i, dep_i, ok_i in zip(needed_lon_plot, needed_lat_plot, needed_depth_plot, valid_argo):
+            if not ok_i or not np.isfinite(dep_i):
+                continue
+            ax.text(lon_i, lat_i, f"{int(dep_i)}", fontsize=argo_text_fs, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
         print(f"No Argo data available for eddy {ds_names}{no} on {dates.iloc[needed_idx].strftime('%Y-%m-%d')}.")
 
@@ -4885,18 +4918,26 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     scale_now = approximate_degree_length(center_lat_arr[needed_idx])
     deg_h = radius_arr[needed_idx] / scale_now['meters_per_degree_lat']
     deg_w = radius_arr[needed_idx] / scale_now['meters_per_degree_lon']
-    ell_now = Ellipse((center_lon_arr[needed_idx], center_lat_arr[needed_idx]), width=2*deg_w, height=2*deg_h,
+    ell_now = Ellipse((center_lon_plot[needed_idx], center_lat_arr[needed_idx]), width=2*deg_w, height=2*deg_h,
                       edgecolor='r', facecolor='none', linestyle='--', alpha=0.2, linewidth=circle_lw, label='Effective Radius')
     ax.add_patch(ell_now)
-    ax.scatter(center_lon_arr[needed_idx], center_lat_arr[needed_idx], color='black', s=16, label='Eddy Center', zorder=5)
-    ax.plot(curr_contour_lon, curr_contour_lat, color=colors, linewidth=contour_lw, alpha=0.5, label='Effective Contour')
+    ax.scatter(center_lon_plot[needed_idx], center_lat_arr[needed_idx], color='black', s=16, label='Eddy Center', zorder=5)
+    ax.plot(curr_contour_lon_plot, curr_contour_lat_plot, color=colors, linewidth=contour_lw, alpha=0.5, label='Effective Contour')
 
     _plot_horizontal_profile_lines(ax, k, b, glorys_lon_min, glorys_lon_max, line_lw=line_lw)
 
     ax.legend(fontsize=legend_fs)
     ax.set_xlim(glorys_lon_min, glorys_lon_max)
     ax.set_ylim(glorys_lat_min, glorys_lat_max)
-    ax.set_aspect('equal')
+    # 显示层统一为 [-180, 180] 经度习惯，底层仍使用连续经度以保证几何连贯。
+    ax.xaxis.set_major_formatter(lambda x, _pos: f"{float(_normalize_lon_array(x)):.0f}")
+    lon_span = abs(float(glorys_lon_max - glorys_lon_min))
+    lat_span = abs(float(glorys_lat_max - glorys_lat_min))
+    if lat_span > 0 and (lon_span / lat_span) > 20.0:
+        # 全球长条窗口下保持 equal 会触发超宽画布，导致 Agg 渲染失败。
+        ax.set_aspect('auto')
+    else:
+        ax.set_aspect('equal')
 
     # 紧凑布局，消除多余空白
     plt.tight_layout()
@@ -7502,13 +7543,20 @@ def _project_argo_rows_to_profile_for_overview(
     if projected_argo_rows is None or projected_argo_rows.empty:
         return pd.DataFrame()
 
-    line_lons = np.asarray(data_package.get('lon_coords', []), dtype=float)
+    line_lons_raw = np.asarray(data_package.get('lon_coords', []), dtype=float)
     line_lats = np.asarray(data_package.get('lat_coords', []), dtype=float)
     line_y = np.asarray(data_package.get('y_coords', []), dtype=float)
     metadata = data_package.get('metadata', {})
 
-    if line_lons.size < 2 or line_lats.size != line_lons.size or line_y.size < line_lons.size:
+    if line_lons_raw.size < 2 or line_lats.size != line_lons_raw.size or line_y.size < line_lons_raw.size:
         return pd.DataFrame()
+
+    valid_line_lons = np.isfinite(line_lons_raw)
+    if not np.any(valid_line_lons):
+        return pd.DataFrame()
+    lon_anchor = float(np.nanmean(line_lons_raw[valid_line_lons]))
+    # 统一经度域，避免 0~360 与 -180~180 混用导致投影偏离。
+    line_lons = lon_anchor + _minimal_lon_diff_deg(line_lons_raw, lon_anchor)
 
     line_y = line_y[:line_lons.size]
     try:
@@ -7526,7 +7574,8 @@ def _project_argo_rows_to_profile_for_overview(
     if rows.empty:
         return pd.DataFrame()
 
-    pts_lon = rows['Longitude'].to_numpy(dtype=float)
+    pts_lon_raw = rows['Longitude'].to_numpy(dtype=float)
+    pts_lon = lon_anchor + _minimal_lon_diff_deg(pts_lon_raw, lon_anchor)
     pts_lat = rows['Latitude'].to_numpy(dtype=float)
     pts_depth = rows['Depth'].to_numpy(dtype=float)
     pts_do = rows['DO'].to_numpy(dtype=float)
