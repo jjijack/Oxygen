@@ -1594,6 +1594,9 @@ def find_track(
         if missing:
             raise ValueError(f"Track not found for id(s): {missing}")
 
+        ACS, ACL, CS, CL = load_meta_data()
+        meta_map = {'ACS': ACS, 'ACL': ACL, 'CS': CS, 'CL': CL}
+
         if not multi:
             tid = next(iter(id_set))
             track = id_to_track[tid]
@@ -1607,9 +1610,7 @@ def find_track(
                 df['date'] = convert_date(df['time'])
             except Exception:
                 df['date'] = pd.NaT
-            
-            ACS, ACL, CS, CL = load_meta_data()
-            # 匹配传入列表变量名对应的 META 数据集（ACS/ACL/CS/CL）
+
             matched_ds_name = 'UNKNOWN'
             try:
                 caller_locals = inspect.currentframe().f_back.f_locals
@@ -1620,7 +1621,6 @@ def find_track(
             except Exception:
                 matched_ds_name = 'UNKNOWN'
 
-            meta_map = {'ACS': ACS, 'ACL': ACL, 'CS': CS, 'CL': CL}
             matched_meta = meta_map.get(matched_ds_name)
 
             df['track_id'] = matched_meta['track'][df['index_org']] if matched_meta is not None else int(tid)
@@ -1639,8 +1639,6 @@ def find_track(
                 except Exception:
                     df['date'] = pd.NaT
 
-                ACS, ACL, CS, CL = load_meta_data()
-                # 匹配传入列表变量名对应的 META 数据集（ACS/ACL/CS/CL）
                 matched_ds_name = 'UNKNOWN'
                 try:
                     caller_locals = inspect.currentframe().f_back.f_locals
@@ -1651,7 +1649,6 @@ def find_track(
                 except Exception:
                     matched_ds_name = 'UNKNOWN'
 
-                meta_map = {'ACS': ACS, 'ACL': ACL, 'CS': CS, 'CL': CL}
                 matched_meta = meta_map.get(matched_ds_name)
 
                 df['track_id'] = matched_meta['track'][df['index_org']] if matched_meta is not None else int(tid)
@@ -4587,32 +4584,155 @@ class LineDrawer:
         self.ax.figure.canvas.draw()
         print("\n准备就绪，可继续点击绘制下一条直线。")
 
-def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, variable: str = 'vorticity',
-                                   show_fig: bool = False, save_fig: bool = False,
-                                   k: float | list[float] | None = None, b: float | list[float] | None = None, 
-                                   needed_depth: float | int = 0, inline_mode: bool = True,
-                                   argo_do_threshold: float | None = 0.0,
-                                   argo_min_depth: float | None = None):
-    '''
-    绘制指定涡旋在特定时刻的表层物理场快照及相关的Argo浮标数据。
+def _reduce_argo_profiles_by_delta(
+    rows: pd.DataFrame,
+    do_threshold: float,
+    min_depth: float,
+) -> pd.DataFrame:
+    """按 ΔDO/最小深度阈值筛选，并为每个 Profile 仅保留最大 ΔDO 的代表点。"""
+    if rows is None or rows.empty:
+        return pd.DataFrame()
 
-    该函数支持两种模式：
-    1. inline_mode=True (默认): 适用于静态图表生成和高分辨率保存，行为与原始版本完全一致。
-    2. inline_mode=False: 适用于在Jupyter Notebook中使用 %matplotlib widget 进行交互式分析。
+    deltas = calculate_delta_do(
+        rows,
+        do_threshold=float(do_threshold),
+        salinity_threshold=0.0,
+        temperature_threshold=0.0,
+        anomaly_min_depth=float(min_depth),
+        include_aou=False,
+        remove_outliers=True,
+        verbose=False,
+    )
+    if deltas is None or deltas.empty:
+        return pd.DataFrame()
+
+    if 'Profile_number' in deltas.columns:
+        deltas = deltas.sort_values('delta_do', ascending=False)
+        deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
+    return deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
+
+def _compute_horizontal_glorys_field(
+    variable: str,
+    needed_depth: float | int,
+    loader,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | np.ma.MaskedArray]:
+    """共享的水平背景场提取逻辑。loader(variables, depth) 由上层注入。"""
+    if variable == 'vorticity':
+        glorys_lon, glorys_lat, glorys_depth, glorys_vars = loader(['u', 'v'], needed_depth)
+        zeta, f = calculate_vorticity(glorys_lon, glorys_lat, glorys_vars['u'], glorys_vars['v'])
+        field = zeta / f
+        return glorys_lon, glorys_lat, glorys_depth, field
+
+    glorys_lon, glorys_lat, glorys_depth, glorys_vars = loader([variable], needed_depth)
+    key_map = {
+        'so': 'salinity',
+        'uo': 'u',
+        'vo': 'v',
+        'zos': 'ssh',
+        'mlotst': 'mlt',
+    }
+    var_key = key_map.get(variable, variable)
+    if var_key not in glorys_vars:
+        raise KeyError(
+            f"Variable '{variable}' resolved to '{var_key}', but available keys are "
+            f"{list(glorys_vars.keys())}"
+        )
+    return glorys_lon, glorys_lat, glorys_depth, glorys_vars[var_key]
+
+def _style_horizontal_colorbar(
+    pc,
+    cbar,
+    variable: str,
+    cbar_label_fs: float,
+):
+    """统一水平图色标文本与默认范围设置。"""
+    if variable == 'vorticity':
+        cbar.set_label(r'$\zeta/f$', fontsize=cbar_label_fs)
+        pc.set_clim(-0.7, 0.7)
+    elif variable == 'thetao':
+        cbar.set_label('Temperature (°C)', fontsize=cbar_label_fs)
+    elif variable in ['so', 'salinity']:
+        cbar.set_label('Salinity (psu)', fontsize=cbar_label_fs)
+    elif variable in ['u', 'uo']:
+        cbar.set_label('Zonal Velocity (m/s)', fontsize=cbar_label_fs)
+    elif variable in ['v', 'vo']:
+        cbar.set_label('Meridional Velocity (m/s)', fontsize=cbar_label_fs)
+    elif variable in ['ssh', 'zos']:
+        cbar.set_label('Sea Surface Height (m)', fontsize=cbar_label_fs)
+    else:
+        cbar.set_label(variable, fontsize=cbar_label_fs)
+
+def _plot_horizontal_profile_lines(
+    ax,
+    k: float | list[float] | None,
+    b: float | list[float] | None,
+    lon_min: float,
+    lon_max: float,
+    line_lw: float = 2.0,
+):
+    """在水平图上绘制一条或多条剖面线 y=kx+b。"""
+    if k is None or b is None:
+        return
+
+    k_list = [k] if isinstance(k, (int, float)) else k
+    b_list = [b] if isinstance(b, (int, float)) else b
+    if len(k_list) != len(b_list):
+        raise ValueError("The lists for k and b must have the same length.")
+
+    line_x = np.array([lon_min, lon_max], dtype=float)
+    for i, (k_val, b_val) in enumerate(zip(k_list, b_list)):
+        line_y = k_val * line_x + b_val
+        ax.plot(
+            line_x,
+            line_y,
+            color='purple',
+            linestyle='-',
+            linewidth=line_lw,
+            label=f'Profile Line {i+1}: y={k_val:.2f}x{b_val:+.2f}',
+        )
+
+def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, variable: str = 'vorticity',
+                                 show_fig: bool = False, save_fig: bool = False,
+                                 k: float | list[float] | None = None, b: float | list[float] | None = None,
+                                 needed_depth: float | int = 0, inline_mode: bool = True,
+                                 argo_do_threshold: float | None = 0.0,
+                                 argo_min_depth: float | None = None):
+    '''
+    绘制指定涡旋在指定日期的 GLORYS 水平快照，并叠加同日 Argo 异常点。
+
+    该函数是 track 场景下的水平可视化入口：
+    - 背景场来自目标日期与目标深度的 GLORYS 子区域；
+    - 叠加涡旋轨迹、当日有效半径和轮廓；
+    - 对同日匹配 Argo 按 ΔDO 与最小深度阈值筛选后，仅保留每个 Profile 的最大 ΔDO 代表点。
 
     参数:
-        DS (list): 包含所有涡旋轨迹信息的数据集。
-        no (int): 需要绘制的涡旋的唯一编号。
-        needed_date (str | pd.Timestamp): 涡旋轨迹日期（'YYYY-MM-DD' 或时间戳）。
-        variable (str): 作为背景场绘制的GLORYS物理变量。默认为 'vorticity'。
-        show_fig (bool): 是否在运行时显示生成的图像。默认为 False。
-        save_fig (bool): 是否将生成的图像保存为文件。默认为 False。
-        k (float | list[float], optional): 直线方程 y=kx+b 的斜率或斜率列表。默认为 None。
-        b (float | list[float], optional): 直线方程 y=kx+b 的截距或截距列表。默认为 None。
-        needed_depth (float | int): 需要绘制的GLORYS数据深度，默认为0（表层）。
-        inline_mode (bool): 是否为静态内联模式。默认为True。设为False以启用交互式widget模式的优化。
-        argo_do_threshold (float | None): Argo 筛选的 ΔDO 阈值；默认 0（尽量保留更多候选）。
-        argo_min_depth (float | None): Argo 筛选的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
+        DS (list | str | tuple | dict): 轨迹数据输入。
+            常见可用值：'acs'/'acl'/'cs'/'cl'，或 legacy 轨迹列表结构。
+        no (int): 轨迹编号（track id）。
+        needed_date (str | pd.Timestamp): 目标日期。
+            支持 'YYYY-MM-DD' 字符串或 pandas 时间戳；会按日精度匹配轨迹时间。
+        variable (str): 背景变量名。
+            常用值：'vorticity'、'thetao'、'so'、'u'、'v'、'ssh'。
+        show_fig (bool): 是否显示图像。
+        save_fig (bool): 是否保存图像到输出目录。
+        k, b (float | list[float] | None): 可选剖面线参数，满足 y = kx + b。
+            传入等长列表时会叠加多条线；若仅传其一或长度不一致会报错。
+        needed_depth (float | int): GLORYS 读取深度（m），默认 0（表层）。
+        inline_mode (bool): 是否使用内联静态模式。
+            - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
+            - False: 交互模式，保留图窗句柄，可配合 LineDrawer 手动点选剖面线。
+        argo_do_threshold (float | None): Argo 筛选的 ΔDO 阈值，None 等价 0。
+        argo_min_depth (float | None): Argo 筛选最小深度阈值（m），None 回退全局配置。
+
+    返回:
+        tuple: (fig, ax)，便于调用侧继续叠加绘图或交互操作。
+
+    可能抛出:
+        ValueError: 当 needed_date 无法解析，或该日期不在目标轨迹时间范围内。
+
+    显示模式:
+        - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
+        - inline_mode=False: 交互模式，可在图窗中继续点选与分析。
     '''
     if argo_do_threshold is None:
         argo_do_threshold = 0.0
@@ -4666,15 +4786,10 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
     if argo_data_filtered.empty:
         needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
     else:
-        deltas = calculate_delta_do(
+        deltas = _reduce_argo_profiles_by_delta(
             argo_data_filtered,
-            do_threshold=argo_do_threshold,
-            salinity_threshold=0.0,
-            temperature_threshold=0.0,
-            anomaly_min_depth=argo_min_depth,
-            include_aou=False,
-            remove_outliers=True,
-            verbose=False,
+            do_threshold=float(argo_do_threshold),
+            min_depth=float(argo_min_depth),
         )
         if deltas.empty:
             print(
@@ -4683,9 +4798,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
             )
             needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
         else:
-            deltas = deltas.sort_values('delta_do', ascending=False)
-            deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
-            needed_data = deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
+            needed_data = deltas
             needed_data.index.name = None
 
     # 获取区域边界（覆盖整条轨迹，优先用全程轮廓，否则退回中心轨迹）
@@ -4717,27 +4830,18 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
         glorys_lat_min = center_lat_arr.min() - pad_deg
         glorys_lat_max = center_lat_arr.max() + pad_deg
 
-    #获取背景场数据
-    if variable == 'vorticity':
-        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_date, variables=['u', 'v'], depth=needed_depth)
-        zeta, f = calculate_vorticity(glorys_lon_filtered, glorys_lat_filtered, glorys_variables_filtered['u'], glorys_variables_filtered['v'])
-        glorys_variable_filtered = zeta/f
-    else:
-        glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered = get_track_area_glorys(DS, no, needed_date, variables=[variable], depth=needed_depth)
-        variable_key_map = {
-            'so': 'salinity',
-            'uo': 'u',
-            'vo': 'v',
-            'zos': 'ssh',
-            'mlotst': 'mlt',
-        }
-        variable_key = variable_key_map.get(variable, variable)
-        if variable_key not in glorys_variables_filtered:
-            raise KeyError(
-                f"Variable '{variable}' resolved to '{variable_key}', but available keys are "
-                f"{list(glorys_variables_filtered.keys())}"
-            )
-        glorys_variable_filtered = glorys_variables_filtered[variable_key]
+    # 获取背景场数据（共享底层）
+    glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variable_filtered = _compute_horizontal_glorys_field(
+        variable=variable,
+        needed_depth=needed_depth,
+        loader=lambda vars_req, depth_req: get_track_area_glorys(
+            DS,
+            no,
+            needed_date,
+            variables=vars_req,
+            depth=depth_req,
+        ),
+    )
 
     ds_names = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
     colors_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -4760,21 +4864,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
     # 绘制背景场
     pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
     cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.06)
-    if variable == 'vorticity':
-        cbar.set_label(r'$\zeta/f$', fontsize=cbar_label_fs)
-        pc.set_clim(-0.7,0.7)
-    elif variable == 'thetao':
-        cbar.set_label('Temperature (°C)', fontsize=cbar_label_fs)
-    elif variable == 'so':
-        cbar.set_label('Salinity (psu)', fontsize=cbar_label_fs)
-    elif variable == 'u':
-        cbar.set_label('Zonal Velocity (m/s)', fontsize=cbar_label_fs)
-    elif variable == 'v':
-        cbar.set_label('Meridional Velocity (m/s)', fontsize=cbar_label_fs)
-    elif variable == 'ssh':
-        cbar.set_label('Sea Surface Height (m)', fontsize=cbar_label_fs)
-    else:
-        cbar.set_label(variable, fontsize=cbar_label_fs)
+    _style_horizontal_colorbar(pc, cbar, variable, cbar_label_fs)
     cbar.ax.tick_params(labelsize=cbar_tick_fs)
 
     # 绘制Argo浮标数据
@@ -4800,19 +4890,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
     ax.scatter(center_lon_arr[needed_idx], center_lat_arr[needed_idx], color='black', s=16, label='Eddy Center', zorder=5)
     ax.plot(curr_contour_lon, curr_contour_lat, color=colors, linewidth=contour_lw, alpha=0.5, label='Effective Contour')
 
-    # 绘制 y = kx + b 直线
-    if k is not None and b is not None:
-        k_list = [k] if isinstance(k, (int, float)) else k
-        b_list = [b] if isinstance(b, (int, float)) else b
-
-        if len(k_list) != len(b_list):
-            raise ValueError("The lists for k and b must have the same length.")
-
-        line_x = np.array([glorys_lon_min, glorys_lon_max])
-
-        for i, (k_val, b_val) in enumerate(zip(k_list, b_list)):
-            line_y = k_val * line_x + b_val
-            ax.plot(line_x, line_y, color='purple', linestyle='-', linewidth=line_lw, label=f'Profile Line {i+1}: y={k_val:.2f}x{b_val:+.2f}')
+    _plot_horizontal_profile_lines(ax, k, b, glorys_lon_min, glorys_lon_max, line_lw=line_lw)
 
     ax.legend(fontsize=legend_fs)
     ax.set_xlim(glorys_lon_min, glorys_lon_max)
@@ -4825,7 +4903,7 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
     # 保存图片
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_track_area_horizontal_glorys"
+        output_dir = Path(plots_output_root) / region_slug / "plot_track_horizontal_glorys"
         output_dir.mkdir(parents=True, exist_ok=True)
         base_filename = f"{ds_names}{no}_{glorys_depth_filtered[0]:.2f}m_{variable}_{dates.iloc[needed_idx].strftime('%Y%m%d')}.png"
         save_path = output_dir / base_filename
@@ -4850,6 +4928,869 @@ def plot_track_area_horizontal_glorys(DS: list, no: int, needed_date: str | pd.T
         plt.close(fig)
 
     # 返回句柄便于调用侧自行管理或重复展示
+    return fig, ax
+
+def _resolve_argo_profile_center(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    platform_number: int | None = None,
+    argo_data_dir: str | Path | None = None,
+) -> dict:
+    """按 profile + 时间输入（年份或日期）定位单个 Argo 剖面的中心位置与日期。"""
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+
+    target_date: pd.Timestamp | None = None
+    if isinstance(profile_time, (int, np.integer)):
+        year = int(profile_time)
+    elif isinstance(profile_time, str) and profile_time.strip().isdigit() and len(profile_time.strip()) == 4:
+        year = int(profile_time.strip())
+    else:
+        try:
+            parsed_time = pd.Timestamp(profile_time)
+        except Exception as exc:
+            raise ValueError(
+                f"profile_time={profile_time!r} is not valid. "
+                "Use year (e.g. 2014) or a date/timestamp (e.g. '2014-05-09')."
+            ) from exc
+        if pd.isna(parsed_time):
+            raise ValueError(
+                f"profile_time={profile_time!r} is not valid. "
+                "Use year (e.g. 2014) or a date/timestamp (e.g. '2014-05-09')."
+            )
+        year = int(parsed_time.year)
+        target_date = parsed_time.normalize()
+
+    df_year = load_argo_data(int(year), data_dir=argo_data_dir)
+    if df_year.empty:
+        raise ValueError(f"No Argo data for year {year}.")
+
+    work = df_year.copy()
+    work['Profile_number'] = pd.to_numeric(work.get('Profile_number'), errors='coerce')
+    work = work[work['Profile_number'] == int(profile_number)].copy()
+    if work.empty:
+        raise ValueError(f"Profile_number={profile_number} not found in year={year}.")
+    if platform_number is not None:
+        work = work[pd.to_numeric(work.get('Platform_number'), errors='coerce') == int(platform_number)].copy()
+
+    if work.empty:
+        raise ValueError("No rows left after month/day/platform filters.")
+
+    for col in ['Longitude', 'Latitude', 'Depth']:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors='coerce')
+
+    work['_date'] = pd.to_datetime(work[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+    work = work.dropna(subset=['Longitude', 'Latitude', '_date']).copy()
+    if work.empty:
+        raise ValueError("Profile rows have no valid Longitude/Latitude/Date.")
+
+    if target_date is not None:
+        work = work[work['_date'] == target_date].copy()
+        if work.empty:
+            raise ValueError(
+                f"Profile_number={profile_number} not found on {target_date.strftime('%Y-%m-%d')} in year={year}."
+            )
+
+    if platform_number is None and 'Platform_number' in work.columns:
+        pvals = pd.to_numeric(work['Platform_number'], errors='coerce').dropna().astype(int).unique()
+        if pvals.size > 0:
+            work = work[pd.to_numeric(work['Platform_number'], errors='coerce') == int(pvals[0])].copy()
+
+    unique_dates = sorted(pd.to_datetime(work['_date'], errors='coerce').dropna().dt.normalize().unique())
+    if len(unique_dates) == 0:
+        raise ValueError("Cannot resolve target date from profile rows.")
+    if target_date is None and len(unique_dates) > 1:
+        raise ValueError(
+            f"Profile_number={profile_number} in year={year} spans multiple dates. "
+            "Please pass a specific date/timestamp as profile_time."
+        )
+
+    if target_date is None:
+        target_date = pd.Timestamp(unique_dates[0]).normalize()
+    rows_day = work[work['_date'] == target_date].copy()
+    if rows_day.empty:
+        raise ValueError("No rows for resolved target date.")
+
+    if 'Depth' in rows_day.columns:
+        rows_day = rows_day.sort_values('Depth', kind='mergesort')
+    center_row = rows_day.iloc[0]
+
+    platform_val = None
+    if 'Platform_number' in center_row.index:
+        try:
+            platform_val = int(pd.to_numeric(center_row['Platform_number'], errors='coerce'))
+        except Exception:
+            platform_val = None
+
+    return {
+        'year_df': df_year,
+        'profile_rows': rows_day,
+        'center_lon': float(center_row['Longitude']),
+        'center_lat': float(center_row['Latitude']),
+        'target_date': target_date,
+        'platform_number': platform_val,
+        'profile_number': int(profile_number),
+    }
+
+def _window_bounds_from_center_km(center_lon: float, center_lat: float, window_half_size_km: float) -> tuple[float, float, float, float]:
+    """由中心点与半窗口尺寸（km）生成局地经纬窗口边界。"""
+    half_km = float(window_half_size_km)
+    if (not np.isfinite(half_km)) or half_km <= 0:
+        raise ValueError(f"window_half_size_km must be a positive finite number, got {window_half_size_km}.")
+
+    scale = approximate_degree_length(float(center_lat))
+    lon_half_deg = (half_km * 1000.0) / float(scale['meters_per_degree_lon'])
+    lat_half_deg = (half_km * 1000.0) / float(scale['meters_per_degree_lat'])
+    return (
+        float(center_lon - lon_half_deg),
+        float(center_lon + lon_half_deg),
+        float(center_lat - lat_half_deg),
+        float(center_lat + lat_half_deg),
+    )
+
+def _load_glorys_window_by_center(
+    needed_date: str | pd.Timestamp,
+    center_lon_ref: float,
+    lon_min_local: float,
+    lon_max_local: float,
+    lat_min: float,
+    lat_max: float,
+    variables: list,
+    depth: float | int | None = None,
+):
+    """按中心点局地窗口直接读取 GLORYS 子区域（不依赖 META 轨迹）。"""
+    try:
+        target_ts = pd.Timestamp(needed_date)
+    except Exception as exc:
+        raise ValueError(f"needed_date={needed_date!r} is not a valid date.") from exc
+
+    needed_glorys_data = Dataset(get_glorys_filepath(target_ts), 'r')
+    try:
+        glorys_lon = needed_glorys_data.variables['longitude'][:]
+        glorys_lat = needed_glorys_data.variables['latitude'][:]
+        glorys_depth = needed_glorys_data.variables['depth'][:]
+
+        glorys_lon_local = center_lon_ref + _minimal_lon_diff_deg(glorys_lon, center_lon_ref)
+        glorys_lon_mask = (glorys_lon_local >= lon_min_local) & (glorys_lon_local <= lon_max_local)
+        glorys_lat_mask = (glorys_lat >= lat_min) & (glorys_lat <= lat_max)
+
+        if depth is not None:
+            glorys_depth_mask = np.zeros_like(glorys_depth, dtype=bool)
+            if glorys_depth.size > 0:
+                k = np.argmin(np.abs(glorys_depth - depth))
+                glorys_depth_mask[k] = True
+        else:
+            glorys_depth_mask = (glorys_depth >= 0) & (glorys_depth <= 2000)
+
+        if not np.any(glorys_lon_mask) or not np.any(glorys_lat_mask):
+            raise ValueError("No GLORYS grid points fall inside the requested Argo-centered window.")
+
+        glorys_lon_filtered = glorys_lon_local[glorys_lon_mask]
+        glorys_lat_filtered = glorys_lat[glorys_lat_mask]
+        glorys_depth_filtered = glorys_depth[glorys_depth_mask]
+
+        lon_order = np.argsort(glorys_lon_filtered)
+        glorys_lon_filtered = glorys_lon_filtered[lon_order]
+
+        glorys_variables_filtered = {}
+        for var in variables:
+            if var == 'thetao':
+                arr = needed_glorys_data.variables['thetao'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+                if depth is not None:
+                    arr = arr[0, :, :]
+                glorys_variables_filtered['thetao'] = arr[..., lon_order]
+            elif var == 'salinity' or var == 'so':
+                arr = needed_glorys_data.variables['so'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+                if depth is not None:
+                    arr = arr[0, :, :]
+                glorys_variables_filtered['salinity'] = arr[..., lon_order]
+            elif var == 'u' or var == 'uo':
+                arr = needed_glorys_data.variables['uo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+                if depth is not None:
+                    arr = arr[0, :, :]
+                glorys_variables_filtered['u'] = arr[..., lon_order]
+            elif var == 'v' or var == 'vo':
+                arr = needed_glorys_data.variables['vo'][0, glorys_depth_mask, glorys_lat_mask, glorys_lon_mask]
+                if depth is not None:
+                    arr = arr[0, :, :]
+                glorys_variables_filtered['v'] = arr[..., lon_order]
+            elif var == 'ssh' or var == 'zos':
+                arr = needed_glorys_data.variables['zos'][0, glorys_lat_mask, glorys_lon_mask]
+                glorys_variables_filtered['ssh'] = arr[..., lon_order]
+            elif var == 'mlt' or var == 'mlotst':
+                arr = needed_glorys_data.variables['mlotst'][0, glorys_lat_mask, glorys_lon_mask]
+                glorys_variables_filtered['mlt'] = arr[..., lon_order]
+            else:
+                raise ValueError(
+                    f"Unsupported variable: {var}. Supported variables are: "
+                    "'thetao', 'so', 'uo', 'vo', 'zos', 'mlotst'."
+                )
+
+        return glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variables_filtered
+    finally:
+        needed_glorys_data.close()
+
+def get_vertical_glorys_from_center(
+    center_lon: float,
+    center_lat: float,
+    needed_date: str | pd.Timestamp,
+    k: float | list[float],
+    b: float | list[float],
+    *,
+    variables: list = ['vorticity'],
+    x_min_km: float | None = None,
+    x_max_km: float | None = None,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    window_half_size_km: float | None = None,
+    profile_id: int | None = None,
+    ds_name: str = 'ARGO',
+) -> list[dict]:
+    """按给定中心点与剖面线参数计算 GLORYS 垂向剖面数据包。"""
+    if k is None or b is None:
+        raise ValueError("k 和 b 必须提供以计算垂直剖面。")
+
+    k_list = [k] if isinstance(k, (int, float)) else k
+    b_list = [b] if isinstance(b, (int, float)) else b
+    if len(k_list) != len(b_list):
+        raise ValueError("k 和 b 的列表长度必须一致。")
+
+    if profile_spacing_km is None:
+        profile_spacing_km = _default_vertical_profile_spacing_km
+    profile_spacing_km = float(profile_spacing_km)
+    if (not np.isfinite(profile_spacing_km)) or profile_spacing_km <= 0:
+        raise ValueError(f"profile_spacing_km must be a positive finite number, got {profile_spacing_km}.")
+
+    interpolate_z = bool(interpolate_z)
+    if interpolate_z:
+        if profile_depth_spacing_m is None:
+            profile_depth_spacing_m = _default_vertical_profile_depth_spacing_m
+        profile_depth_spacing_m = float(profile_depth_spacing_m)
+        if (not np.isfinite(profile_depth_spacing_m)) or profile_depth_spacing_m <= 0:
+            raise ValueError(
+                f"profile_depth_spacing_m must be a positive finite number, got {profile_depth_spacing_m}."
+            )
+
+    try:
+        needed_ts = pd.Timestamp(needed_date).normalize()
+    except Exception as exc:
+        raise ValueError(f"needed_date={needed_date!r} is not a valid date.") from exc
+
+    if x_min_km is not None and x_max_km is not None:
+        half_from_x = max(abs(float(x_min_km)), abs(float(x_max_km)))
+    else:
+        half_from_x = 0.0
+
+    if window_half_size_km is None:
+        window_half_size_km = half_from_x if half_from_x > 0 else 400.0
+    window_half_size_km = float(window_half_size_km)
+    if (not np.isfinite(window_half_size_km)) or window_half_size_km <= 0:
+        raise ValueError(f"window_half_size_km must be a positive finite number, got {window_half_size_km}.")
+    if half_from_x > window_half_size_km:
+        window_half_size_km = half_from_x
+
+    alias_map = {
+        'thetao': 'thetao',
+        'salinity': 'salinity', 'so': 'salinity',
+        'density': 'sigma', 'sigma': 'sigma', 'sigma0': 'sigma',
+        'u': 'u', 'uo': 'u',
+        'v': 'v', 'vo': 'v',
+        'ssh': 'ssh', 'zos': 'ssh',
+        'mlt': 'mlt', 'mlotst': 'mlt',
+        'vorticity': 'vorticity'
+    }
+    var_dims = {
+        'thetao': 3, 'salinity': 3, 'sigma': 3, 'u': 3, 'v': 3, 'vorticity': 3,
+        'ssh': 2, 'mlt': 2
+    }
+
+    raw_vars_to_fetch = set()
+    for var in variables:
+        standard_name = alias_map.get(var, var)
+        if standard_name == 'vorticity':
+            raw_vars_to_fetch.update(['u', 'v'])
+        elif standard_name == 'sigma':
+            raw_vars_to_fetch.update(['salinity', 'thetao'])
+        else:
+            raw_vars_to_fetch.add(var)
+
+    lon_min_local, lon_max_local, lat_min, lat_max = _window_bounds_from_center_km(
+        float(center_lon),
+        float(center_lat),
+        window_half_size_km,
+    )
+
+    glorys_lon_raw, glorys_lat_raw, glorys_depth_raw, glorys_data_raw = _load_glorys_window_by_center(
+        needed_ts,
+        float(center_lon),
+        lon_min_local,
+        lon_max_local,
+        lat_min,
+        lat_max,
+        variables=list(raw_vars_to_fetch),
+        depth=None,
+    )
+
+    if glorys_depth_raw.size == 0 and not all(var_dims.get(alias_map.get(v, v)) == 2 for v in variables):
+        return [{} for _ in k_list]
+
+    radius_m = window_half_size_km * 1000.0
+    scale_center = approximate_degree_length(float(center_lat))
+    lon_radius_deg = radius_m / float(scale_center['meters_per_degree_lon'])
+    lat_radius_deg = radius_m / float(scale_center['meters_per_degree_lat'])
+    theta = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+    contour_lon = np.asarray(float(center_lon) + lon_radius_deg * np.cos(theta), dtype=float)
+    contour_lat = np.asarray(float(center_lat) + lat_radius_deg * np.sin(theta), dtype=float)
+
+    sigma_3d_cache = None
+    if any(alias_map.get(v, v) == 'sigma' for v in variables):
+        sal_3d = glorys_data_raw.get('salinity')
+        theta_3d = glorys_data_raw.get('thetao')
+        if sal_3d is not None and theta_3d is not None:
+            sal_ma = np.ma.array(sal_3d, copy=False)
+            theta_ma = np.ma.array(theta_3d, copy=False)
+            if sal_ma.ndim == 2:
+                sal_ma = sal_ma[np.newaxis, :, :]
+            if theta_ma.ndim == 2:
+                theta_ma = theta_ma[np.newaxis, :, :]
+
+            if sal_ma.shape == theta_ma.shape and sal_ma.ndim == 3:
+                try:
+                    z3, lat3, lon3 = np.meshgrid(
+                        glorys_depth_raw,
+                        glorys_lat_raw,
+                        _normalize_lon_array(glorys_lon_raw),
+                        indexing='ij'
+                    )
+                    sal_filled = np.ma.filled(sal_ma, np.nan)
+                    theta_filled = np.ma.filled(theta_ma, np.nan)
+                    p3 = gsw.p_from_z(-z3, lat3)
+                    SA = gsw.SA_from_SP(sal_filled, p3, lon3, lat3)
+                    CT = gsw.CT_from_pt(SA, theta_filled)
+                    sigma0 = gsw.sigma0(SA, CT)
+
+                    input_mask = np.ma.getmaskarray(sal_ma) | np.ma.getmaskarray(theta_ma)
+                    sigma_3d_cache = np.ma.masked_invalid(sigma0)
+                    if input_mask.any():
+                        sigma_3d_cache = np.ma.array(
+                            sigma_3d_cache,
+                            mask=np.ma.getmaskarray(sigma_3d_cache) | input_mask,
+                            copy=False,
+                        )
+                except Exception:
+                    sigma_3d_cache = None
+
+    glorys_lon_min = float(np.min(glorys_lon_raw))
+    glorys_lon_max = float(np.max(glorys_lon_raw))
+    glorys_lat_min = float(np.min(glorys_lat_raw))
+    glorys_lat_max = float(np.max(glorys_lat_raw))
+
+    all_profiles_data = []
+    for k_val, b_val in zip(k_list, b_list):
+        intersection_pts: list[tuple[float, float]] = []
+        tol = 1e-10
+
+        if np.isclose(k_val, 0.0, atol=1e-12):
+            if glorys_lat_min - tol <= b_val <= glorys_lat_max + tol:
+                intersection_pts = [(float(glorys_lon_min), float(b_val)), (float(glorys_lon_max), float(b_val))]
+        else:
+            lat_left = k_val * glorys_lon_min + b_val
+            if glorys_lat_min - tol <= lat_left <= glorys_lat_max + tol:
+                intersection_pts.append((float(glorys_lon_min), float(lat_left)))
+
+            lat_right = k_val * glorys_lon_max + b_val
+            if glorys_lat_min - tol <= lat_right <= glorys_lat_max + tol:
+                intersection_pts.append((float(glorys_lon_max), float(lat_right)))
+
+            lon_bottom = (glorys_lat_min - b_val) / k_val
+            if glorys_lon_min - tol <= lon_bottom <= glorys_lon_max + tol:
+                intersection_pts.append((float(lon_bottom), float(glorys_lat_min)))
+
+            lon_top = (glorys_lat_max - b_val) / k_val
+            if glorys_lon_min - tol <= lon_top <= glorys_lon_max + tol:
+                intersection_pts.append((float(lon_top), float(glorys_lat_max)))
+
+        unique_pts: list[tuple[float, float]] = []
+        for p_lon, p_lat in intersection_pts:
+            duplicated = any(
+                abs(float(_minimal_lon_diff_deg(p_lon, q_lon))) < 1e-8 and abs(p_lat - q_lat) < 1e-8
+                for q_lon, q_lat in unique_pts
+            )
+            if not duplicated:
+                unique_pts.append((p_lon, p_lat))
+
+        if len(unique_pts) < 2:
+            all_profiles_data.append({})
+            continue
+
+        if len(unique_pts) == 2:
+            p0, p1 = unique_pts[0], unique_pts[1]
+        else:
+            best_pair = None
+            best_dist = -np.inf
+            for i in range(len(unique_pts) - 1):
+                for j in range(i + 1, len(unique_pts)):
+                    d_ij = local_xy_distance_m(
+                        unique_pts[j][0],
+                        unique_pts[j][1],
+                        unique_pts[i][0],
+                        unique_pts[i][1],
+                        wrap_dateline=True,
+                    )
+                    if np.isfinite(d_ij) and d_ij > best_dist:
+                        best_dist = float(d_ij)
+                        best_pair = (unique_pts[i], unique_pts[j])
+
+            if best_pair is None:
+                all_profiles_data.append({})
+                continue
+            p0, p1 = best_pair
+
+        dlon_p0_to_p1 = float(_minimal_lon_diff_deg(p1[0], p0[0]))
+        if dlon_p0_to_p1 < 0 or (abs(dlon_p0_to_p1) <= 1e-12 and p1[1] < p0[1]):
+            p0, p1 = p1, p0
+
+        segment_len_m = local_xy_distance_m(p1[0], p1[1], p0[0], p0[1], wrap_dateline=True)
+        if (not np.isfinite(segment_len_m)) or segment_len_m <= 0:
+            all_profiles_data.append({})
+            continue
+
+        n_samples = max(2, int(np.ceil(segment_len_m / (profile_spacing_km * 1000.0))) + 1)
+        t = np.linspace(0.0, 1.0, n_samples)
+        dlon_total = float(_minimal_lon_diff_deg(p1[0], p0[0]))
+        if dlon_total < 0:
+            p0, p1 = p1, p0
+            dlon_total = float(_minimal_lon_diff_deg(p1[0], p0[0]))
+
+        profile_lons_full = p0[0] + t * dlon_total
+        profile_lats_full = p0[1] + t * (p1[1] - p0[1])
+
+        dlat_deg = np.diff(profile_lats_full)
+        dlon_deg = _minimal_lon_diff_deg(profile_lons_full[1:], profile_lons_full[:-1])
+        mid_lats_deg = (profile_lats_full[:-1] + profile_lats_full[1:]) / 2
+        scale_mid = approximate_degree_length(mid_lats_deg)
+        dist_segments = np.hypot(
+            dlon_deg * scale_mid['meters_per_degree_lon'],
+            dlat_deg * scale_mid['meters_per_degree_lat']
+        )
+        y_coords_raw_full = np.insert(np.cumsum(dist_segments), 0, 0) / 1000.0
+
+        current_center_lon = float(center_lon)
+        current_center_lat = float(center_lat)
+        if k_val == 0:
+            xp, yp = current_center_lon, b_val
+        else:
+            xp = (current_center_lon + k_val * current_center_lat - k_val * b_val) / (1 + k_val ** 2)
+            yp = k_val * xp + b_val
+        center_idx_on_profile = np.argmin(_minimal_lon_diff_deg(profile_lons_full, xp) ** 2 + (profile_lats_full - yp) ** 2)
+        y_coords_recenter_full = y_coords_raw_full - y_coords_raw_full[center_idx_on_profile]
+
+        profile_lons = profile_lons_full
+        profile_lats = profile_lats_full
+        y_coords_recenter = y_coords_recenter_full
+        if x_min_km is not None and x_max_km is not None:
+            x_left = float(min(x_min_km, x_max_km))
+            x_right = float(max(x_min_km, x_max_km))
+            span_km = x_right - x_left
+            n_steps = int(np.floor(span_km / profile_spacing_km))
+            if n_steps < 1:
+                all_profiles_data.append({})
+                continue
+
+            y_target = x_left + np.arange(n_steps + 1) * profile_spacing_km
+            y_full_min = float(np.nanmin(y_coords_recenter_full))
+            y_full_max = float(np.nanmax(y_coords_recenter_full))
+            valid_target = (y_target >= y_full_min) & (y_target <= y_full_max)
+            if np.count_nonzero(valid_target) < 2:
+                all_profiles_data.append({})
+                continue
+
+            y_coords_recenter = y_target[valid_target]
+            profile_lons = np.interp(y_coords_recenter, y_coords_recenter_full, profile_lons_full)
+            profile_lats = np.interp(y_coords_recenter, y_coords_recenter_full, profile_lats_full)
+
+        z_coords_native = glorys_depth_raw
+        profile_data_dict = {}
+        for var in variables:
+            standard_name = alias_map.get(var, var)
+            dimension = var_dims.get(standard_name, 3)
+
+            if dimension == 2:
+                data_2d = glorys_data_raw.get(standard_name)
+                if data_2d is None or data_2d.size == 0 or np.all(np.ma.getmask(data_2d)):
+                    profile_data_dict[standard_name] = np.ma.masked_all(len(profile_lons))
+                    continue
+
+                data_2d_filled = np.ma.filled(np.ma.array(data_2d, copy=False), np.nan)
+                interp_func_2d = RegularGridInterpolator(
+                    (glorys_lat_raw, glorys_lon_raw),
+                    data_2d_filled,
+                    method='linear',
+                    bounds_error=False,
+                    fill_value=np.nan,
+                )
+                interpolated_1d = interp_func_2d(list(zip(profile_lats, profile_lons)))
+                profile_data_dict[standard_name] = np.ma.masked_invalid(interpolated_1d)
+                continue
+
+            glorys_variable_3d = None
+            if standard_name == 'vorticity':
+                u, v = glorys_data_raw.get('u'), glorys_data_raw.get('v')
+                if u is not None and v is not None and u.size > 0 and v.size > 0:
+                    if u.ndim == 2:
+                        u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
+                    zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
+                    glorys_variable_3d = zeta_3d / f_3d
+            elif standard_name == 'sigma':
+                glorys_variable_3d = sigma_3d_cache
+            else:
+                glorys_variable_3d = glorys_data_raw.get(standard_name)
+
+            if glorys_variable_3d is None or glorys_variable_3d.size == 0 or np.all(np.ma.getmask(glorys_variable_3d)):
+                profile_data_dict[standard_name] = np.ma.masked_all((len(z_coords_native), len(profile_lons)))
+                continue
+
+            if glorys_variable_3d.ndim == 2:
+                glorys_variable_3d = glorys_variable_3d[np.newaxis, :, :]
+
+            query_depths, query_lats = np.meshgrid(z_coords_native, profile_lats, indexing='ij')
+            _, query_lons = np.meshgrid(z_coords_native, profile_lons, indexing='ij')
+            xi_points = np.vstack([query_depths.ravel(), query_lats.ravel(), query_lons.ravel()]).T
+
+            variable_3d_filled = np.ma.filled(np.ma.array(glorys_variable_3d, copy=False), np.nan)
+            interp_func = RegularGridInterpolator(
+                (z_coords_native, glorys_lat_raw, glorys_lon_raw),
+                variable_3d_filled,
+                method='linear',
+                bounds_error=False,
+                fill_value=np.nan,
+            )
+            interpolated_values_flat = interp_func(xi_points)
+            profile_data_dict[standard_name] = np.ma.masked_invalid(
+                interpolated_values_flat.reshape(len(z_coords_native), len(profile_lons))
+            )
+
+        z_coords = z_coords_native
+        if interpolate_z and z_coords_native.size >= 2:
+            z_min = float(z_coords_native[0])
+            z_max = float(z_coords_native[-1])
+            z_span = z_max - z_min
+            n_steps_z = int(np.floor(z_span / profile_depth_spacing_m))
+            if n_steps_z >= 1:
+                z_coords_target = z_min + np.arange(n_steps_z + 1) * profile_depth_spacing_m
+
+                zz_grid, yy_grid = np.meshgrid(z_coords_target, y_coords_recenter, indexing='ij')
+                query_points_2d = np.vstack([zz_grid.ravel(), yy_grid.ravel()]).T
+
+                for key_name, var_data in list(profile_data_dict.items()):
+                    var_ma = np.ma.array(var_data, copy=False)
+                    if var_ma.ndim != 2 or var_ma.shape[0] != len(z_coords_native):
+                        continue
+                    if np.ma.getmaskarray(var_ma).all():
+                        profile_data_dict[key_name] = np.ma.masked_all((len(z_coords_target), len(y_coords_recenter)))
+                        continue
+
+                    interp_func_2d = RegularGridInterpolator(
+                        (z_coords_native, y_coords_recenter),
+                        np.ma.filled(var_ma, np.nan),
+                        method='linear',
+                        bounds_error=False,
+                        fill_value=np.nan,
+                    )
+                    new_vals_flat = interp_func_2d(query_points_2d)
+                    profile_data_dict[key_name] = np.ma.masked_invalid(
+                        new_vals_flat.reshape(len(z_coords_target), len(y_coords_recenter))
+                    )
+
+                z_coords = z_coords_target
+
+        scale_line = approximate_degree_length(current_center_lat)
+        semi_axis_lon_deg = radius_m / float(scale_line['meters_per_degree_lon'])
+        semi_axis_lat_deg = radius_m / float(scale_line['meters_per_degree_lat'])
+
+        radius_intersections_lon: list[float] = []
+        if semi_axis_lon_deg > 0 and semi_axis_lat_deg > 0 and np.isfinite(semi_axis_lon_deg) and np.isfinite(semi_axis_lat_deg):
+            inv_a2 = 1.0 / (semi_axis_lon_deg ** 2)
+            inv_b2 = 1.0 / (semi_axis_lat_deg ** 2)
+            dy0 = b_val - current_center_lat
+
+            A = inv_a2 + (k_val ** 2) * inv_b2
+            B = -2.0 * current_center_lon * inv_a2 + 2.0 * k_val * dy0 * inv_b2
+            C = (current_center_lon ** 2) * inv_a2 + (dy0 ** 2) * inv_b2 - 1.0
+
+            discriminant = B ** 2 - 4.0 * A * C
+            if discriminant >= -1e-12 and A > 0:
+                discriminant = max(0.0, float(discriminant))
+                sqrt_disc = float(np.sqrt(discriminant))
+                radius_intersections_lon = [
+                    (-B + sqrt_disc) / (2.0 * A),
+                    (-B - sqrt_disc) / (2.0 * A),
+                ]
+
+        radius_proj_dists = [
+            y_coords_raw_full[np.argmin(_minimal_lon_diff_deg(profile_lons_full, lon_i) ** 2 + (profile_lats_full - (k_val * lon_i + b_val)) ** 2)]
+            - y_coords_raw_full[center_idx_on_profile]
+            for lon_i in radius_intersections_lon
+        ]
+
+        curr_contour_lon = np.asarray(contour_lon, dtype=float).ravel()
+        curr_contour_lat = np.asarray(contour_lat, dtype=float).ravel()
+        valid_mask = np.isfinite(curr_contour_lon) & np.isfinite(curr_contour_lat)
+        curr_contour_lon = curr_contour_lon[valid_mask]
+        curr_contour_lat = curr_contour_lat[valid_mask]
+        curr_contour_lon = current_center_lon + _minimal_lon_diff_deg(curr_contour_lon, current_center_lon)
+        contour_intersections_xy = find_polygon_line_intersections(curr_contour_lon, curr_contour_lat, profile_lons_full, profile_lats_full)
+        contour_proj_dists = [
+            y_coords_raw_full[np.argmin(_minimal_lon_diff_deg(profile_lons_full, lon_i) ** 2 + (profile_lats_full - lat_i) ** 2)]
+            - y_coords_raw_full[center_idx_on_profile]
+            for lon_i, lat_i in contour_intersections_xy
+        ]
+
+        projections_dict = {'radius': sorted(radius_proj_dists), 'contour': sorted(contour_proj_dists)}
+
+        single_profile_result = {
+            'profile_data': profile_data_dict,
+            'y_coords': y_coords_recenter,
+            'z_coords': z_coords,
+            'lon_coords': profile_lons,
+            'lat_coords': profile_lats,
+            'projections': projections_dict,
+            'metadata': {
+                'eddy_no': int(profile_id) if profile_id is not None else -1,
+                'date_str': needed_ts.strftime("%Y-%m-%d"),
+                'k': k_val,
+                'b': b_val,
+                'ds_name': str(ds_name).upper(),
+                'entity_label': f"Profile {int(profile_id)}" if profile_id is not None else 'Profile',
+                'draw_reference_lines': False,
+            }
+        }
+        all_profiles_data.append(single_profile_result)
+
+    return all_profiles_data
+
+def plot_argo_horizontal_glorys(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    platform_number: int | None = None,
+    variable: str = 'vorticity',
+    show_fig: bool = False,
+    save_fig: bool = False,
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
+    needed_depth: float | int = 0,
+    inline_mode: bool = True,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    argo_do_threshold: float | None = 0.0,
+    argo_min_depth: float | None = None,
+    argo_data_dir: str | Path | None = None,
+):
+    """以单个 Argo 剖面为中心绘制 GLORYS 水平快照图。
+
+    该函数会先根据 ``profile_number`` 与 ``profile_time`` 定位目标剖面中心，
+    再在给定窗口内读取同日 GLORYS 场并叠加同口径筛选后的 Argo 异常点。
+
+    参数:
+        profile_number (int): 目标 Argo 剖面编号。
+        profile_time (int | str | pd.Timestamp): 时间输入，支持：
+            - 年份（如 ``2014`` 或 ``"2014"``）；
+            - 具体日期/时间戳（如 ``"2014-05-09"``）。
+            若仅给年份且该剖面在该年对应多个日期，会提示需要传具体日期。
+        platform_number (int | None): 可选平台号过滤；None 表示自动选择该剖面对应平台。
+        variable (str): 背景变量名；常用 ``'vorticity'``、``'thetao'``、``'so'``、``'u'``、``'v'``、``'ssh'``。
+        show_fig (bool): 是否显示图像。
+        save_fig (bool): 是否保存图像到输出目录。
+        k, b (float | list[float] | None): 可选剖面线参数，按 ``y = kx + b`` 叠加到水平图。
+            传列表时需等长，会逐条绘制。
+        needed_depth (float | int): GLORYS 读取深度（m）；默认 0 表层。
+        inline_mode (bool): 是否使用内联静态模式。
+            - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
+            - False: 保留图窗句柄，便于后续交互或外部继续操作。
+        xmin, xmax (float): 局地窗口横向范围（km，中心为 0），用于确定经纬子区域读取范围。
+        argo_do_threshold (float | None): 叠加点的 ΔDO 阈值；None 等价 0。
+        argo_min_depth (float | None): 叠加点最小深度阈值（m）；None 回退配置项。
+        argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
+
+    返回:
+        tuple: ``(fig, ax)``，便于调用侧进一步自定义或复用。
+
+    显示模式:
+        - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
+        - inline_mode=False: 交互模式，适合 Notebook 实时查看与二次操作。
+    """
+    if argo_do_threshold is None:
+        argo_do_threshold = 0.0
+    if argo_min_depth is None:
+        argo_min_depth = _cfg_anomaly_min_depth
+    if inline_mode:
+        plt.close('all')
+
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+        argo_data_dir=argo_data_dir,
+    )
+    center_lon = float(info['center_lon'])
+    center_lat = float(info['center_lat'])
+    needed_date = pd.Timestamp(info['target_date'])
+    df_year = info['year_df']
+
+    if xmin is None or xmax is None:
+        xmin = -400.0
+        xmax = 400.0
+    x_left = float(min(xmin, xmax))
+    x_right = float(max(xmin, xmax))
+    window_half_size_km = max(abs(x_left), abs(x_right))
+
+    lon_min_local, lon_max_local, lat_min, lat_max = _window_bounds_from_center_km(
+        center_lon,
+        center_lat,
+        window_half_size_km,
+    )
+
+    glorys_lon_filtered, glorys_lat_filtered, glorys_depth_filtered, glorys_variable_filtered = _compute_horizontal_glorys_field(
+        variable=variable,
+        needed_depth=needed_depth,
+        loader=lambda vars_req, depth_req: _load_glorys_window_by_center(
+            needed_date,
+            center_lon,
+            lon_min_local,
+            lon_max_local,
+            lat_min,
+            lat_max,
+            variables=vars_req,
+            depth=depth_req,
+        ),
+    )
+
+    # 同日 Argo，按窗口粗筛后沿用与旧水平图相同的 ΔDO 筛选与“每剖面取最大 ΔDO”规则
+    day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+    day_rows = df_year.loc[day_ts == needed_date.normalize()].copy()
+    if not day_rows.empty:
+        day_rows['Longitude'] = pd.to_numeric(day_rows['Longitude'], errors='coerce')
+        day_rows['Latitude'] = pd.to_numeric(day_rows['Latitude'], errors='coerce')
+        day_rows = day_rows.dropna(subset=['Longitude', 'Latitude'])
+
+    needed_data = pd.DataFrame()
+    if not day_rows.empty:
+        day_lon_local = center_lon + _minimal_lon_diff_deg(day_rows['Longitude'].to_numpy(dtype=float), center_lon)
+        mask_window = (
+            (day_lon_local >= lon_min_local)
+            & (day_lon_local <= lon_max_local)
+            & (day_rows['Latitude'].to_numpy(dtype=float) >= lat_min)
+            & (day_rows['Latitude'].to_numpy(dtype=float) <= lat_max)
+        )
+        day_window = day_rows.loc[mask_window].copy()
+        if not day_window.empty:
+            deltas = _reduce_argo_profiles_by_delta(
+                day_window,
+                do_threshold=float(argo_do_threshold),
+                min_depth=float(argo_min_depth),
+            )
+            if not deltas.empty:
+                needed_data = deltas
+                needed_data['Longitude_local'] = center_lon + _minimal_lon_diff_deg(
+                    pd.to_numeric(needed_data['Longitude'], errors='coerce').to_numpy(dtype=float),
+                    center_lon,
+                )
+
+    figsize = (12, 10)
+    title_fs, label_fs, tick_fs, legend_fs = 16, 14, 12, 10
+    cbar_label_fs, cbar_tick_fs = 12, 10
+    argo_text_fs = 6
+    line_lw = 2.0
+
+    fig, ax = plt.subplots(figsize=figsize)
+    world = _load_world_geodataframe()
+    world.plot(color='green', ax=ax)
+    ax.tick_params(axis='both', which='major', labelsize=tick_fs)
+
+    pc = ax.pcolormesh(glorys_lon_filtered, glorys_lat_filtered, glorys_variable_filtered, cmap='seismic', shading='auto', alpha=0.5)
+    cbar = plt.colorbar(pc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.06)
+    _style_horizontal_colorbar(pc, cbar, variable, cbar_label_fs)
+    cbar.ax.tick_params(labelsize=cbar_tick_fs)
+
+    _plot_horizontal_profile_lines(ax, k, b, lon_min_local, lon_max_local, line_lw=line_lw)
+
+    # 叠加通过同标准筛选的 Argo
+    if not needed_data.empty:
+        sc = ax.scatter(
+            needed_data['Longitude_local'],
+            needed_data['Latitude'],
+            c=needed_data['DO'],
+            cmap='bwr',
+            s=120,
+            vmin=150,
+            vmax=240,
+            edgecolors='black',
+            linewidths=0.5,
+            label=f'Argo max ΔDO point (ΔDO>={float(argo_do_threshold):g}, depth>={float(argo_min_depth):g}m)',
+            zorder=7,
+        )
+        cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.16)
+        cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
+        cbar2.ax.tick_params(labelsize=cbar_tick_fs)
+        for _, row in needed_data.iterrows():
+            ax.text(
+                row['Longitude_local'],
+                row['Latitude'],
+                f"{int(row['Depth'])}",
+                fontsize=argo_text_fs,
+                fontweight='bold',
+                ha='center',
+                va='center',
+                color='black',
+                zorder=8,
+            )
+    else:
+        print(
+            f"No Argo anomalies in window on {needed_date.strftime('%Y-%m-%d')} "
+            f"(ΔDO>={float(argo_do_threshold):g}, depth>={float(argo_min_depth):g}m)."
+        )
+
+    ax.set_title(
+        f"Profile {int(profile_number)} GLORYS snapshot at {float(glorys_depth_filtered[0]):.2f}m, "
+        f"{needed_date.strftime('%Y-%m-%d')}",
+        fontsize=title_fs,
+    )
+    ax.set_xlabel('Longitude', fontsize=label_fs)
+    ax.set_ylabel('Latitude', fontsize=label_fs)
+    ax.legend(fontsize=legend_fs)
+    ax.set_xlim(lon_min_local, lon_max_local)
+    ax.set_ylim(lat_min, lat_max)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+
+    if save_fig:
+        region_slug = _current_region_key()
+        output_dir = Path(plots_output_root) / region_slug / "plot_argo_horizontal_glorys"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fname = (
+            f"ARGO_profile{int(profile_number)}_{float(glorys_depth_filtered[0]):.2f}m_{variable}_"
+            f"{needed_date.strftime('%Y%m%d')}.png"
+        )
+        save_path = output_dir / fname
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+
+    if show_fig:
+        if not inline_mode:
+            line_drawer = LineDrawer(ax)
+            fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+            try:
+                plt.show(block=False)
+            except TypeError:
+                plt.show()
+        else:
+            plt.show()
+
+    if inline_mode:
+        plt.close(fig)
+
     return fig, ax
 
 def get_track_area_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, variables: list = ['thetao'],
@@ -5731,31 +6672,37 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
     # --- 5. 返回所有剖面的结果列表 ---
     return all_profiles_data
 
-def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, 
-                         k: float | list[float], b: float | list[float], 
-                         variable: str = 'vorticity',
-                         show_fig: bool = False, save_fig: bool = False, 
-                         xmin: float = None, xmax: float = None,
-                         ymin: float = None, ymax: float = None,
-                         color_vmin: float | None = None,
-                         color_vmax: float | None = None,
-                         plot_mlt: bool = False,
-                         plot_argo_projection: bool = False,
-                         argo_projection_do_threshold: float | None = None,
-                         argo_projection_min_depth: float | None = None,
-                         plot_isolines: bool = False,
-                         isoline_levels: int | list[float] | np.ndarray | None = None,
-                         isoline_color: str = 'black',
-                         isoline_linewidth: float = 0.8,
-                         isoline_alpha: float = 0.45,
-                         label_isolines: bool = False,
-                         profile_spacing_km: float | None = None,
-                         interpolate_z: bool = True,
-                         profile_depth_spacing_m: float | None = None):
+def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, needed_date: str | pd.Timestamp,
+                     k: float | list[float], b: float | list[float],
+                     variable: str = 'vorticity',
+                     show_fig: bool = False, save_fig: bool = False,
+                     xmin: float = -400.0, xmax: float = 400.0,
+                     ymin: float = 0.0, ymax: float = 1000.0,
+                     color_vmin: float | None = None,
+                     color_vmax: float | None = None,
+                     plot_mlt: bool = False,
+                     plot_argo_projection: bool = False,
+                     argo_projection_do_threshold: float | None = None,
+                     argo_projection_min_depth: float | None = None,
+                     plot_isolines: bool = False,
+                     isoline_levels: int | list[float] | np.ndarray | None = None,
+                     isoline_color: str = 'black',
+                     isoline_linewidth: float = 0.8,
+                     isoline_alpha: float = 0.45,
+                     label_isolines: bool = False,
+                     profile_spacing_km: float | None = None,
+                     interpolate_z: bool = True,
+                     profile_depth_spacing_m: float | None = None,
+                     precomputed_data_packages: list[dict] | None = None,
+                     precomputed_projected_argo_rows: pd.DataFrame | None = None,
+                     projection_distance_scale_km: float | None = None,
+                     x_axis_label: str = 'Distance from Eddy Center Projection (km)',
+                     save_subdir: str = 'plot_track_vertical_glorys',
+                     title_subject: str = 'Track'):
     '''
-    绘制指定涡旋在特定时刻，沿一条或多条剖面线 (y = kx + b) 的物理量垂直剖面图。
+    共享的垂向剖面绘图核心：获取剖面数据并完成可视化。
 
-    该函数内部调用 get_vertical_glorys 获取剖面数据并完成可视化。
+    供 track/argo 两类入口函数复用，避免上层函数彼此委托。
     当 k 和 b 为列表时，会为每一对 (k, b) 分别绘制一张图。
 
     参数:
@@ -5801,39 +6748,45 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
     vars_to_fetch = {variable}
     if plot_mlt:
         vars_to_fetch.add('mlt')
-        
+
     sampling_xmin = xmin if (xmin is not None and xmax is not None) else None
     sampling_xmax = xmax if (xmin is not None and xmax is not None) else None
-    track_df_for_date, _ds_name_for_date, _ds_source_for_date = _resolve_track_context(DS, no, include_contours=True)
-    if 'date' in track_df_for_date.columns:
-        track_dates_for_date = pd.to_datetime(track_df_for_date['date'], errors='coerce')
-    else:
-        track_dates_for_date = pd.to_datetime(convert_date(track_df_for_date['time']), errors='coerce')
+    track_df_for_date = pd.DataFrame()
+    needed_idx = 0
 
     try:
         needed_ts = pd.Timestamp(needed_date).normalize()
     except Exception as exc:
         raise ValueError(f"needed_date={needed_date!r} is not a valid date.") from exc
 
-    same_day_idx = np.nonzero(track_dates_for_date.dt.normalize().to_numpy() == needed_ts.to_datetime64())[0]
-    if same_day_idx.size == 0:
-        raise ValueError(f"Date {needed_ts.strftime('%Y-%m-%d')} not found in track {no}.")
-    needed_idx = int(same_day_idx[0])
-    needed_ts = pd.Timestamp(track_dates_for_date.iloc[needed_idx])
+    if precomputed_data_packages is not None:
+        all_data_packages = precomputed_data_packages
+    else:
+        track_df_for_date, _ds_name_for_date, _ds_source_for_date = _resolve_track_context(DS, no, include_contours=True)
+        if 'date' in track_df_for_date.columns:
+            track_dates_for_date = pd.to_datetime(track_df_for_date['date'], errors='coerce')
+        else:
+            track_dates_for_date = pd.to_datetime(convert_date(track_df_for_date['time']), errors='coerce')
 
-    all_data_packages = get_vertical_glorys(
-        DS,
-        no,
-        needed_ts,
-        k,
-        b,
-        variables=list(vars_to_fetch),
-        x_min_km=sampling_xmin,
-        x_max_km=sampling_xmax,
-        profile_spacing_km=profile_spacing_km,
-        interpolate_z=interpolate_z,
-        profile_depth_spacing_m=profile_depth_spacing_m,
-    )
+        same_day_idx = np.nonzero(track_dates_for_date.dt.normalize().to_numpy() == needed_ts.to_datetime64())[0]
+        if same_day_idx.size == 0:
+            raise ValueError(f"Date {needed_ts.strftime('%Y-%m-%d')} not found in track {no}.")
+        needed_idx = int(same_day_idx[0])
+        needed_ts = pd.Timestamp(track_dates_for_date.iloc[needed_idx])
+
+        all_data_packages = get_vertical_glorys(
+            DS,
+            no,
+            needed_ts,
+            k,
+            b,
+            variables=list(vars_to_fetch),
+            x_min_km=sampling_xmin,
+            x_max_km=sampling_xmax,
+            profile_spacing_km=profile_spacing_km,
+            interpolate_z=interpolate_z,
+            profile_depth_spacing_m=profile_depth_spacing_m,
+        )
 
     if not all_data_packages:
         print(f"警告: get_vertical_glorys 未能返回任何数据。绘图已取消。")
@@ -5851,8 +6804,22 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
 
     # --- 1.1 按需准备 Argo 映射数据（仅针对 needed_date 当天） ---
     projected_argo_rows = pd.DataFrame()
-    default_distance_scale_km: float | None = None
-    if plot_argo_projection:
+    default_distance_scale_km: float | None = (
+        float(projection_distance_scale_km)
+        if projection_distance_scale_km is not None and np.isfinite(float(projection_distance_scale_km)) and float(projection_distance_scale_km) > 0
+        else None
+    )
+
+    if precomputed_projected_argo_rows is not None:
+        projected_argo_rows = precomputed_projected_argo_rows.copy()
+        if not projected_argo_rows.empty:
+            projected_argo_rows['Longitude'] = pd.to_numeric(projected_argo_rows['Longitude'], errors='coerce')
+            projected_argo_rows['Latitude'] = pd.to_numeric(projected_argo_rows['Latitude'], errors='coerce')
+            projected_argo_rows['Depth'] = pd.to_numeric(projected_argo_rows['Depth'], errors='coerce')
+            projected_argo_rows['DO'] = pd.to_numeric(projected_argo_rows.get('DO', np.nan), errors='coerce')
+            projected_argo_rows = projected_argo_rows.dropna(subset=['Longitude', 'Latitude', 'Depth'])
+
+    elif plot_argo_projection and precomputed_data_packages is None:
         try:
             track_df_overlay, _ds_name_overlay, ds_source_for_filter = _resolve_track_context(
                 DS,
@@ -5896,20 +6863,13 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
                         projected_argo_rows = projected_argo_rows.dropna(subset=['Profile_number']).copy()
 
                         if not projected_argo_rows.empty:
-                            deltas = calculate_delta_do(
+                            deltas = _reduce_argo_profiles_by_delta(
                                 projected_argo_rows,
-                                do_threshold=argo_projection_do_threshold,
-                                salinity_threshold=0.0,
-                                temperature_threshold=0.0,
-                                anomaly_min_depth=argo_projection_min_depth,
-                                include_aou=False,
-                                remove_outliers=True,
-                                verbose=False,
+                                do_threshold=float(argo_projection_do_threshold),
+                                min_depth=float(argo_projection_min_depth),
                             )
                             if not deltas.empty:
-                                deltas = deltas.sort_values('delta_do', ascending=False)
-                                deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
-                                projected_argo_rows = deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
+                                projected_argo_rows = deltas
                             else:
                                 projected_argo_rows = pd.DataFrame()
         except Exception as exc:
@@ -5989,12 +6949,16 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         fig, ax = plt.subplots(figsize=(20, 15))
         
         date_str = metadata['date_str']
+        entity_label = metadata.get('entity_label')
+        if not entity_label:
+            entity_label = f"{ds_name}{metadata['eddy_no']}"
+        subject_label = f"{title_subject} {entity_label}".strip()
         title = (
-            f"Vertical Profile of {cbar_label} for Track {ds_name}{metadata['eddy_no']} "
+            f"Vertical Profile of {cbar_label} for {subject_label} "
             f"on {date_str}, y={metadata['k']:.2f}x{metadata['b']:+.2f}"
         )
         ax.set_title(title, fontsize=20)
-        ax.set_xlabel('Distance from Eddy Center Projection (km)', fontsize=18)
+        ax.set_xlabel(x_axis_label, fontsize=18)
         ax.set_ylabel('Depth (m)', fontsize=18)
         ax.tick_params(labelsize=14)
         
@@ -6037,11 +7001,13 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         cbar.set_label(cbar_label, fontsize=18)
         cbar.ax.tick_params(labelsize=14)
 
-        ax.axvline(0, color='black', linestyle='--', linewidth=2, label='Eddy Center Projection')
-        for i, dist in enumerate(projections['radius']): 
-            ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if i == 0 else "")
-        for i, dist in enumerate(projections['contour']): 
-            ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if i == 0 else "")
+        draw_reference_lines = bool(metadata.get('draw_reference_lines', True))
+        if draw_reference_lines:
+            ax.axvline(0, color='black', linestyle='--', linewidth=2, label='Eddy Center Projection')
+            for i, dist in enumerate(projections['radius']):
+                ax.axvline(dist, color='r', linestyle='--', linewidth=2, label='Effective Radius Projection' if i == 0 else "")
+            for i, dist in enumerate(projections['contour']):
+                ax.axvline(dist, color=eddy_color, linestyle=':', linewidth=2, label='Effective Contour Projection' if i == 0 else "")
             
         # 绘制混合层深度
         mld_lines = () # 创建一个空元组，用于存放MLD的两条线
@@ -6164,7 +7130,7 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         # --- 4. 保存和显示 ---
         if save_fig:
             region_slug = _current_region_key()
-            output_dir = Path(plots_output_root) / region_slug / "plot_vertical_glorys"
+            output_dir = Path(plots_output_root) / region_slug / str(save_subdir)
             output_dir.mkdir(parents=True, exist_ok=True)
             date_fn = date_str.replace('-', '')
             base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
@@ -6177,6 +7143,263 @@ def plot_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
             plt.show()
 
         plt.close(fig)
+
+def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
+                               k: float | list[float], b: float | list[float],
+                               variable: str = 'vorticity',
+                               show_fig: bool = False, save_fig: bool = False,
+                               xmin: float = -400.0, xmax: float = 400.0,
+                               ymin: float = 0.0, ymax: float = 1000.0,
+                               color_vmin: float | None = None,
+                               color_vmax: float | None = None,
+                               plot_mlt: bool = False,
+                               plot_argo_projection: bool = False,
+                               argo_projection_do_threshold: float | None = None,
+                               argo_projection_min_depth: float | None = None,
+                               plot_isolines: bool = False,
+                               isoline_levels: int | list[float] | np.ndarray | None = None,
+                               isoline_color: str = 'black',
+                               isoline_linewidth: float = 0.8,
+                               isoline_alpha: float = 0.45,
+                               label_isolines: bool = False,
+                               profile_spacing_km: float | None = None,
+                               interpolate_z: bool = True,
+                               profile_depth_spacing_m: float | None = None):
+    """绘制指定涡旋在指定日期的 GLORYS 垂向剖面图（实际业务入口）。
+
+    该函数是基于轨迹数据（META/legacy）的垂向可视化入口，内部复用共享绘图核心。
+    与 Argo 入口相比，本函数会保留 eddy 语义的参考信息（中心/半径/轮廓投影线）。
+
+    参数:
+        DS (list | str | tuple | dict): 轨迹数据输入。
+            常见可用值：``'acs'``/``'acl'``/``'cs'``/``'cl'``，或 legacy 列表结构。
+        no (int): 轨迹编号（track id）。
+        needed_date (str | pd.Timestamp): 目标日期。
+        k, b (float | list[float]): 剖面线参数 ``y = kx + b``；可传多条线。
+        variable (str): 主绘变量。
+        show_fig, save_fig (bool): 显示/保存控制。
+        xmin, xmax (float): 横向显示与采样范围（km）。
+        ymin, ymax (float): 纵向深度显示范围（m）。
+        color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
+        plot_mlt (bool): 是否叠加混合层深度线。
+        plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层。
+        argo_projection_do_threshold (float | None): 投影点 ΔDO 阈值。
+        argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
+        plot_isolines (bool): 是否叠加变量等值线。
+        isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
+            等值线级别与样式参数。
+        profile_spacing_km (float | None): 水平采样步长（km）。
+        interpolate_z (bool): 是否将深度轴重采样到等间距网格。
+        profile_depth_spacing_m (float | None): 深度重采样步长（m）。
+
+    返回:
+        None。函数内部完成绘图与可选保存。
+    """
+    return _plot_vertical_glorys_core(
+        DS,
+        no,
+        needed_date,
+        k=k,
+        b=b,
+        variable=variable,
+        show_fig=show_fig,
+        save_fig=save_fig,
+        xmin=xmin,
+        xmax=xmax,
+        ymin=ymin,
+        ymax=ymax,
+        color_vmin=color_vmin,
+        color_vmax=color_vmax,
+        plot_mlt=plot_mlt,
+        plot_argo_projection=plot_argo_projection,
+        argo_projection_do_threshold=argo_projection_do_threshold,
+        argo_projection_min_depth=argo_projection_min_depth,
+        plot_isolines=plot_isolines,
+        isoline_levels=isoline_levels,
+        isoline_color=isoline_color,
+        isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha,
+        label_isolines=label_isolines,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+        save_subdir='plot_track_vertical_glorys',
+        title_subject='Track',
+    )
+
+def plot_argo_vertical_glorys(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    k: float | list[float],
+    b: float | list[float],
+    platform_number: int | None = None,
+    variable: str = 'vorticity',
+    show_fig: bool = False,
+    save_fig: bool = False,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    color_vmin: float | None = None,
+    color_vmax: float | None = None,
+    plot_mlt: bool = False,
+    plot_argo_projection: bool = False,
+    argo_projection_do_threshold: float | None = None,
+    argo_projection_min_depth: float | None = None,
+    plot_isolines: bool = False,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    argo_data_dir: str | Path | None = None,
+):
+    """以单个 Argo 剖面为中心绘制 GLORYS 垂向剖面图。
+
+    基于 Argo 剖面中心和剖面线 ``y = kx + b`` 计算垂向切片。
+    图中默认不绘制 eddy 语义参考竖线（中心/半径/轮廓）。
+
+    参数:
+        profile_number (int): 目标 Argo 剖面编号。
+        profile_time (int | str | pd.Timestamp): 时间输入，支持年份或具体日期时间。
+            - 给年份时：在该年内定位该剖面；若对应多个日期会要求给具体日期；
+            - 给日期时：直接定位到该日对应的剖面数据。
+        k, b (float | list[float]): 剖面线参数，满足 ``y = kx + b``。
+            可传标量或等长列表（多条剖面线分别出图）。
+        platform_number (int | None): 可选平台号过滤。
+        variable (str): 主绘变量，常用 ``'vorticity'``、``'thetao'``、``'so'``、``'u'``、``'v'``、``'density'``。
+        show_fig, save_fig (bool): 显示/保存控制。
+        xmin, xmax (float): 横向显示与采样范围（km）。
+        ymin, ymax (float): 纵向深度显示范围（m）。
+        color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
+        plot_mlt (bool): 是否叠加混合层深度线。
+        plot_argo_projection (bool): 是否叠加同日 Argo 点投影层。
+        argo_projection_do_threshold (float | None): 投影点 ΔDO 阈值。
+        argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
+        plot_isolines (bool): 是否叠加变量等值线。
+        isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
+            等值线级别与样式参数。
+        profile_spacing_km (float | None): 水平采样步长（km）。
+        interpolate_z (bool): 是否将深度轴重采样到等间距网格。
+        profile_depth_spacing_m (float | None): 深度重采样步长（m）。
+        argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
+
+    返回:
+        None。函数内部完成绘图与可选保存。
+    """
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+        argo_data_dir=argo_data_dir,
+    )
+
+    center_lon = float(info['center_lon'])
+    center_lat = float(info['center_lat'])
+    target_date = pd.Timestamp(info['target_date'])
+    df_year = info['year_df']
+
+    if xmin is None or xmax is None:
+        xmin = -400.0
+        xmax = 400.0
+    window_half_size_km = max(abs(float(xmin)), abs(float(xmax)))
+
+    all_data_packages = get_vertical_glorys_from_center(
+        center_lon=center_lon,
+        center_lat=center_lat,
+        needed_date=target_date,
+        k=k,
+        b=b,
+        variables=[variable] + (['mlt'] if plot_mlt else []),
+        x_min_km=xmin,
+        x_max_km=xmax,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+        window_half_size_km=float(window_half_size_km),
+        profile_id=int(profile_number),
+        ds_name='ARGO',
+    )
+
+    projected_argo_rows = pd.DataFrame()
+    if plot_argo_projection:
+        if argo_projection_do_threshold is None:
+            argo_projection_do_threshold = 0.0
+        if argo_projection_min_depth is None:
+            argo_projection_min_depth = _cfg_anomaly_min_depth
+
+        day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+        day_rows = df_year.loc[day_ts == target_date.normalize()].copy()
+        if not day_rows.empty:
+            day_rows['Longitude'] = pd.to_numeric(day_rows['Longitude'], errors='coerce')
+            day_rows['Latitude'] = pd.to_numeric(day_rows['Latitude'], errors='coerce')
+            day_rows['Depth'] = pd.to_numeric(day_rows.get('Depth'), errors='coerce')
+            day_rows['DO'] = pd.to_numeric(day_rows.get('DO', np.nan), errors='coerce')
+            day_rows = day_rows.dropna(subset=['Longitude', 'Latitude', 'Depth'])
+
+            lon_min_local, lon_max_local, lat_min, lat_max = _window_bounds_from_center_km(
+                center_lon,
+                center_lat,
+                float(window_half_size_km),
+            )
+            day_lon_local = center_lon + _minimal_lon_diff_deg(day_rows['Longitude'].to_numpy(dtype=float), center_lon)
+            mask_window = (
+                (day_lon_local >= lon_min_local)
+                & (day_lon_local <= lon_max_local)
+                & (day_rows['Latitude'].to_numpy(dtype=float) >= lat_min)
+                & (day_rows['Latitude'].to_numpy(dtype=float) <= lat_max)
+            )
+            day_window = day_rows.loc[mask_window].copy()
+            if not day_window.empty:
+                if 'Profile_number' in day_window.columns:
+                    day_window['Profile_number'] = pd.to_numeric(day_window['Profile_number'], errors='coerce')
+                    day_window = day_window.dropna(subset=['Profile_number'])
+                deltas = _reduce_argo_profiles_by_delta(
+                    day_window,
+                    do_threshold=float(argo_projection_do_threshold),
+                    min_depth=float(argo_projection_min_depth),
+                )
+                if not deltas.empty:
+                    projected_argo_rows = deltas
+
+    return _plot_vertical_glorys_core(
+        None,
+        int(profile_number),
+        target_date,
+        k=k,
+        b=b,
+        variable=variable,
+        show_fig=show_fig,
+        save_fig=save_fig,
+        xmin=xmin,
+        xmax=xmax,
+        ymin=ymin,
+        ymax=ymax,
+        color_vmin=color_vmin,
+        color_vmax=color_vmax,
+        plot_mlt=plot_mlt,
+        plot_argo_projection=plot_argo_projection,
+        argo_projection_do_threshold=argo_projection_do_threshold,
+        argo_projection_min_depth=argo_projection_min_depth,
+        plot_isolines=plot_isolines,
+        isoline_levels=isoline_levels,
+        isoline_color=isoline_color,
+        isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha,
+        label_isolines=label_isolines,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+        precomputed_data_packages=all_data_packages,
+        precomputed_projected_argo_rows=projected_argo_rows,
+        projection_distance_scale_km=float(window_half_size_km),
+        x_axis_label='Distance from Profile Center (km)',
+        save_subdir='plot_argo_vertical_glorys',
+        title_subject='',
+    )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
 def _orientation(p, q, r):
@@ -6462,7 +7685,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
         y_coords = y_coords[y_order]
         profile_variable_2d = profile_variable_2d[:, y_order]
 
-    # 与 plot_vertical_glorys 一致：当给定 x 范围时，先在该范围重建等步长 y 网格再绘图。
+    # 与 plot_track_vertical_glorys 一致：当给定 x 范围时，先在该范围重建等步长 y 网格再绘图。
     xlim_to_apply = None
     if xmin is not None and xmax is not None:
         x_left = float(min(xmin, xmax))
@@ -6579,7 +7802,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     # --- 5. 保存和显示 ---
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_vertical_glorys"
+        output_dir = Path(plots_output_root) / region_slug / "plot_track_vertical_glorys"
         output_dir.mkdir(parents=True, exist_ok=True)
         date_fn = metadata['date_str'].replace('-', '')
         
@@ -8918,9 +10141,7 @@ def plot_hotspot_anomaly_vertical_profiles(
 
 def plot_single_hotspot_profile(
     profile_number: int,
-    year: int,
-    month: int | None = None,
-    day: int | None = None,
+    profile_time: int | str | pd.Timestamp,
     platform_number: int | None = None,
     variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     xlim_overrides: dict[str, tuple[float, float]] | None = None,
@@ -8936,7 +10157,7 @@ def plot_single_hotspot_profile(
 
     参数:
         profile_number: 目标剖面编号（Profile_number）。
-        year/month/day: 日期筛选；month/day 可选。
+        profile_time: 时间输入，支持年份（如 2014）或日期/时间戳（如 '2014-05-09'）。
         platform_number: 可选平台编号筛选。
         variables: 绘制变量列表，默认 ['DO', 'AOU', 'Temp', 'Salinity']。
         xlim_overrides: 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}。
@@ -8954,25 +10175,15 @@ def plot_single_hotspot_profile(
     if argo_data_dir is None:
         argo_data_dir = argo_path
 
-    df_year = load_argo_data(int(year), data_dir=argo_data_dir)
-    if df_year.empty:
-        raise ValueError(f"No Argo data for year {year}.")
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+        argo_data_dir=argo_data_dir,
+    )
 
-    profile_rows = df_year[pd.to_numeric(df_year['Profile_number'], errors='coerce') == int(profile_number)].copy()
-    if profile_rows.empty:
-        raise ValueError(f"Profile_number={profile_number} not found in year {year}.")
-
-    if month is not None:
-        profile_rows = profile_rows[pd.to_numeric(profile_rows['Month'], errors='coerce') == int(month)].copy()
-    if day is not None:
-        profile_rows = profile_rows[pd.to_numeric(profile_rows['Day'], errors='coerce') == int(day)].copy()
-    if platform_number is not None:
-        profile_rows = profile_rows[pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == int(platform_number)].copy()
-
-    if profile_rows.empty:
-        raise ValueError("No rows left after month/day/platform filters.")
-
-    profile_rows = profile_rows.sort_values('Depth').copy()
+    profile_rows = info['profile_rows'].sort_values('Depth').copy()
+    target_date = pd.Timestamp(info['target_date']).normalize()
 
     plot_variables, overlay_aou_on_do = _prepare_vertical_plot_variables(variables)
 
@@ -9057,9 +10268,7 @@ def plot_single_hotspot_profile(
     axes[0].tick_params(axis='y', labelsize=16)
     axes[0].invert_yaxis()
 
-    date_text = f"{int(year):04d}-{int(profile_rows.iloc[0]['Month']):02d}-{int(profile_rows.iloc[0]['Day']):02d}"
-    if month is not None and day is not None:
-        date_text = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    date_text = target_date.strftime('%Y-%m-%d')
 
     delta_do_text = ""
     delta_temp_text = ""
