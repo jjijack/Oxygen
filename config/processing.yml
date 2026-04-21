@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.6 变更：
+#   - 新增 anomaly_max_depth，限制 calculate_delta_do 仅保留该深度以内峰值。
+#   - 新增 do_near_zero_threshold / do_near_zero_max_count，近零 DO 点过多时整剖面跳过。
 # version 1.5 变更：
 #   - 新增 vertical_profile_spacing_km，用于垂向剖面按距离等密度采样。
 #   - 新增 vertical_profile_depth_spacing_m，控制 get_vertical_glorys 默认 z 轴等间距插值步长。
@@ -11,7 +14,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.5
+version: 1.6
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -21,6 +24,9 @@ processing:
   depth_merge_tolerance: 10.0
   duplicate_depth_strategy: best_qc
   anomaly_min_depth: 300.0          # ΔDO 异常最小深度（m）；设为 0 表示不限制
+  anomaly_max_depth: 1500.0         # ΔDO 峰值最大深度（m）；设为 0 表示不限制
+  do_near_zero_threshold: 1.0       # 近零 DO 判定阈值（DO <= 该值）
+  do_near_zero_max_count: 7         # 单剖面近零 DO 超过该数量时，整剖面跳过
   adaptive_lat_threshold: 70.0          # |lat0|>=该值直接大圆距离
   adaptive_distance_threshold_km: 300.0 # 平面最大距离超出触发大圆
   vertical_profile_spacing_km: 2.0      # 垂向剖面横向采样步长（km）

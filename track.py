@@ -122,6 +122,15 @@ _default_duplicate_depth_strategy = _PROC_CFG.get('processing', {}).get('duplica
 _cfg_anomaly_min_depth = float(
     _PROC_CFG.get('processing', {}).get('anomaly_min_depth', 300.0)
 )
+_cfg_anomaly_max_depth = float(
+    _PROC_CFG.get('processing', {}).get('anomaly_max_depth', 1500.0)
+)
+_cfg_do_near_zero_threshold = float(
+    _PROC_CFG.get('processing', {}).get('do_near_zero_threshold', 1.0)
+)
+_cfg_do_near_zero_max_count = int(
+    _PROC_CFG.get('processing', {}).get('do_near_zero_max_count', 7)
+)
 _default_adaptive_lat_threshold = float(
     _PROC_CFG.get('processing', {}).get('adaptive_lat_threshold', 70.0)
 )
@@ -186,6 +195,9 @@ def print_current_processing_defaults():
         print(f"  depth_merge_tolerance     : {_default_depth_merge_tolerance}")
         print(f"  duplicate_depth_strategy  : {_default_duplicate_depth_strategy}")
         print(f"  anomaly_min_depth         : {_cfg_anomaly_min_depth}")
+        print(f"  anomaly_max_depth         : {_cfg_anomaly_max_depth}")
+        print(f"  do_near_zero_threshold    : {_cfg_do_near_zero_threshold}")
+        print(f"  do_near_zero_max_count    : {_cfg_do_near_zero_max_count}")
         print(f"  vertical_profile_spacing_km: {_default_vertical_profile_spacing_km}")
         print(f"  vertical_profile_depth_spacing_m: {_default_vertical_profile_depth_spacing_m}")
 
@@ -10854,12 +10866,31 @@ def plot_hotspot_anomaly_vertical_profiles(
             delta_text = ""
 
         platform_text = f", Platform={platform_val}" if platform_val is not None else ""
-        fig.suptitle(
-            f"Hotspots Profile {profile_num}{platform_text}, {date_text}{delta_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}",
-            fontsize=24,
-            y=0.95,
+        lon_text = ""
+        lat_text = ""
+        lon_val = pd.to_numeric(pd.Series([row.get('Longitude')]), errors='coerce').iloc[0]
+        lat_val = pd.to_numeric(pd.Series([row.get('Latitude')]), errors='coerce').iloc[0]
+        if not np.isfinite(lon_val) or not np.isfinite(lat_val):
+            first_row = profile_rows.iloc[0]
+            lon_val = pd.to_numeric(pd.Series([first_row.get('Longitude')]), errors='coerce').iloc[0]
+            lat_val = pd.to_numeric(pd.Series([first_row.get('Latitude')]), errors='coerce').iloc[0]
+        if np.isfinite(lon_val):
+            lon_text = f"Lon={float(_normalize_lon_array(lon_val)):.3f}"
+        if np.isfinite(lat_val):
+            lat_text = f"Lat={float(lat_val):.3f}"
+        location_text = ", ".join([t for t in [lon_text, lat_text] if t])
+
+        title_line1 = (
+            f"Hotspots Profile {profile_num}{platform_text}, "
+            f"{date_text}{delta_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}"
         )
-        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        title_line2 = location_text if location_text else "Lon/Lat unavailable"
+        fig.suptitle(
+            f"{title_line1}\n{title_line2}",
+            fontsize=24,
+            y=0.97,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.90])
 
         if save_fig and any_plotted:
             file_date = date_text.replace('-', '')
@@ -11070,12 +11101,28 @@ def plot_single_hotspot_profile(
     )
     platform_text = f", Platform={platform_label}" if platform_label is not None else ""
 
-    fig.suptitle(
-        f"Hotspots Profile {int(profile_number)}{platform_text}, {date_text}{delta_do_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}",
-        fontsize=24,
-        y=0.95,
+    lon_text = ""
+    lat_text = ""
+    lon_val = pd.to_numeric(pd.Series([profile_rows.iloc[0].get('Longitude')]), errors='coerce').iloc[0]
+    lat_val = pd.to_numeric(pd.Series([profile_rows.iloc[0].get('Latitude')]), errors='coerce').iloc[0]
+    if np.isfinite(lon_val):
+        lon_text = f"Lon={float(_normalize_lon_array(lon_val)):.3f}"
+    if np.isfinite(lat_val):
+        lat_text = f"Lat={float(lat_val):.3f}"
+    location_text = ", ".join([t for t in [lon_text, lat_text] if t])
+
+    title_line1 = (
+        f"Hotspots Profile {int(profile_number)}{platform_text}, "
+        f"{date_text}{delta_do_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}"
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    title_line2 = location_text if location_text else "Lon/Lat unavailable"
+
+    fig.suptitle(
+        f"{title_line1}\n{title_line2}",
+        fontsize=24,
+        y=0.97,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
 
     saved_path = None
     if save_fig and any_plotted:
@@ -13460,8 +13507,11 @@ def calculate_delta_do(
     salinity_threshold: float | None = None,
     temperature_threshold: float | None = None,
     anomaly_min_depth: float | None = None,
+    anomaly_max_depth: float | None = None,
     depth_merge_tolerance: float | None = None,
     duplicate_depth_strategy: str | None = None,
+    do_near_zero_threshold: float | None = None,
+    do_near_zero_max_count: int | None = None,
     include_aou: bool = True,
     remove_outliers: bool = True,
     verbose: bool = False
@@ -13477,7 +13527,9 @@ def calculate_delta_do(
         当 include_aou=True 时，同步计算该深度窗口下的 ΔAOU；
     5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
     6. 若 anomaly_min_depth > 0，仅保留深度不小于该阈值的异常；
-    7. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
+    7. 若 anomaly_max_depth > 0，忽略深度大于该阈值的峰值（默认 1500 m）；
+    8. 当 remove_outliers=True 且某剖面中 DO <= do_near_zero_threshold 的点数超过 do_near_zero_max_count 时，整条剖面跳过；
+    9. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
 
     参数：
         data (pd.DataFrame): 包含多个剖面数据的表；需包含 Profile_number、深度、DO、盐度等列。
@@ -13490,8 +13542,11 @@ def calculate_delta_do(
         salinity_threshold (float | None): 盐度阈值；None → `_default_salinity_threshold`；≤0 不启用过滤。
         temperature_threshold (float | None): 温度阈值；None → `_default_temperature_threshold`；≤0 不启用过滤。
         anomaly_min_depth (float | None): ΔDO 异常最小深度；≤0 表示不做深度过滤；None 表示使用 processing.yml 的 anomaly_min_depth。
+        anomaly_max_depth (float | None): ΔDO 峰值最大深度；≤0 表示不做上限过滤；None 表示使用 processing.yml 的 anomaly_max_depth。
         depth_merge_tolerance (float | None): 深度近邻合并阈值；None → `_default_depth_merge_tolerance`；≤0 不合并。
         duplicate_depth_strategy (str | None): 同深度多记录聚合策略；None → `_default_duplicate_depth_strategy`。
+        do_near_zero_threshold (float | None): 判定“近零 DO”阈值；None → processing.yml 的 do_near_zero_threshold。
+        do_near_zero_max_count (int | None): 单剖面允许的近零 DO 最大个数；超过则整剖面跳过；None → processing.yml 的 do_near_zero_max_count。
         include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
         verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
@@ -13545,6 +13600,14 @@ def calculate_delta_do(
         duplicate_depth_strategy = _default_duplicate_depth_strategy
     if anomaly_min_depth is None:
         anomaly_min_depth = _cfg_anomaly_min_depth
+    if anomaly_max_depth is None:
+        anomaly_max_depth = _cfg_anomaly_max_depth
+    if do_near_zero_threshold is None:
+        do_near_zero_threshold = _cfg_do_near_zero_threshold
+    if do_near_zero_max_count is None:
+        do_near_zero_max_count = _cfg_do_near_zero_max_count
+    if do_near_zero_max_count is not None:
+        do_near_zero_max_count = int(do_near_zero_max_count)
 
     for profile_num, profile_data in profile_groups:
         # 质量控制：移除异常值和质量标记不良的数据
@@ -13559,7 +13622,12 @@ def calculate_delta_do(
             
             # 规则法：移除已知的错误值
             if do_col in profile_data.columns:
-                bad_do_mask = profile_data[do_col] <= 1.0
+                do_numeric = pd.to_numeric(profile_data[do_col], errors='coerce')
+                bad_do_mask = do_numeric <= do_near_zero_threshold
+                if do_near_zero_max_count is not None and do_near_zero_max_count >= 0:
+                    bad_do_count = int(np.count_nonzero(bad_do_mask.to_numpy()))
+                    if bad_do_count > do_near_zero_max_count:
+                        continue
                 profile_data.loc[bad_do_mask, do_col] = np.nan
         
         # 移除包含NaN值的行
@@ -13683,6 +13751,8 @@ def calculate_delta_do(
         profile_results = []
 
         for do_idx, do_type, target_depth in do_peaks:
+            if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
+                continue
             # 定义窗口 [p-Δp, p+Δp]
             depth_lower = max(0, target_depth - depth_interval)
             depth_upper = target_depth + depth_interval
