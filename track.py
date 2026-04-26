@@ -4989,7 +4989,8 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
                                  k: float | list[float] | None = None, b: float | list[float] | None = None,
                                  needed_depth: float | int = 0, inline_mode: bool = True,
                                  argo_detection_config: DetectionConfig | None = None,
-                                 argo_min_depth: float | None = None):
+                                 argo_min_depth: float | None = None,
+                                 verbose: bool = True):
     '''
     绘制指定涡旋在指定日期的 GLORYS 水平快照，并叠加同日 Argo 异常点。
 
@@ -5016,6 +5017,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
             - False: 交互模式，保留图窗句柄，可配合 LineDrawer 手动点选剖面线。
         argo_detection_config: Argo 异常点筛选配置。
         argo_min_depth (float | None): Argo 筛选最小深度阈值（m），None 回退全局配置。
+        verbose (bool): 是否打印保存路径与提示信息。
 
     返回:
         tuple: (fig, ax)，便于调用侧继续叠加绘图或交互操作。
@@ -5096,10 +5098,11 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
             detection_config=argo_detection_config,
         )
         if deltas.empty:
-            print(
-                f"Warning: No Argo points pass thresholds "
-                f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
-            )
+            if verbose:
+                print(
+                    f"Warning: No Argo points pass thresholds "
+                    f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
+                )
             needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
         else:
             needed_data = deltas
@@ -5203,7 +5206,8 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
                 continue
             ax.text(lon_i, lat_i, f"{int(dep_i)}", fontsize=argo_text_fs, fontweight='bold', ha='center', va='center', color='black', zorder=6)
     else:
-        print(f"No Argo data available for eddy {ds_names}{no} on {dates.iloc[needed_idx].strftime('%Y-%m-%d')}.")
+        if verbose:
+            print(f"No Argo data available for eddy {ds_names}{no} on {dates.iloc[needed_idx].strftime('%Y-%m-%d')}.")
 
     # 绘制当前时刻涡旋
     scale_now = approximate_degree_length(center_lat_arr[needed_idx])
@@ -5245,7 +5249,8 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
         )
         save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"\nFigure saved to: {save_path}")
+        if verbose:
+            print(f"\nFigure saved to: {save_path}")
 
     # 显示图像
     if show_fig:
@@ -5902,7 +5907,7 @@ def get_vertical_glorys_from_center(
                 'date_str': needed_ts.strftime("%Y-%m-%d"),
                 'k': k_val,
                 'b': b_val,
-                'ds_name': str(ds_name).upper(),
+                'ds_name': 'Argo' if str(ds_name).lower() == 'argo' else str(ds_name).upper(),
                 'entity_label': f"Profile {int(profile_id)}" if profile_id is not None else 'Profile',
                 'draw_reference_lines': False,
             }
@@ -5927,6 +5932,8 @@ def plot_argo_horizontal_glorys(
     argo_detection_config: DetectionConfig | None = None,
     argo_min_depth: float | None = None,
     argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
 ):
     """以单个 Argo 剖面为中心绘制 GLORYS 水平快照图。
 
@@ -5953,6 +5960,8 @@ def plot_argo_horizontal_glorys(
         argo_detection_config: 叠加点异常筛选配置。
         argo_min_depth (float | None): 叠加点最小深度阈值（m）；None 回退配置项。
         argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
+        output_dir (str | Path | None): 保存目录覆盖；None 使用默认输出目录。
+        verbose (bool): 是否打印保存路径与提示信息。
 
     返回:
         tuple: ``(fig, ax)``，便于调用侧进一步自定义或复用。
@@ -5969,8 +5978,9 @@ def plot_argo_horizontal_glorys(
     if not inline_mode:
         backend_name = str(plt.get_backend()).lower()
         if 'inline' in backend_name:
-            print("Warning: current matplotlib backend is inline; click interaction may appear unresponsive. "
-                  "Use %matplotlib widget or a GUI backend for stable interaction.")
+            if verbose:
+                print("Warning: current matplotlib backend is inline; click interaction may appear unresponsive. "
+                      "Use %matplotlib widget or a GUI backend for stable interaction.")
 
     if inline_mode:
         plt.close('all')
@@ -6093,10 +6103,11 @@ def plot_argo_horizontal_glorys(
                 zorder=8,
             )
     else:
-        print(
-            f"No Argo anomalies in window on {needed_date.strftime('%Y-%m-%d')} "
-            f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
-        )
+        if verbose:
+            print(
+                f"No Argo anomalies in window on {needed_date.strftime('%Y-%m-%d')} "
+                f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
+            )
 
     ax.set_title(
         f"Profile {int(profile_number)} GLORYS snapshot at {float(glorys_depth_filtered[0]):.2f}m, "
@@ -6114,15 +6125,20 @@ def plot_argo_horizontal_glorys(
     if save_fig:
         region_slug = _current_region_key()
         run_tag = argo_detection_config.file_stem()
-        output_dir = argo_detection_config.output_dir("plot_argo_horizontal_glorys", region_slug)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        fname = (
-            f"ARGO_profile{int(profile_number)}_{float(glorys_depth_filtered[0]):.2f}m_{variable}_"
-            f"{needed_date.strftime('%Y%m%d')}_{run_tag}.png"
+        save_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else argo_detection_config.output_dir("plot_argo_horizontal_glorys", region_slug)
         )
-        save_path = output_dir / fname
+        save_dir.mkdir(parents=True, exist_ok=True)
+        fname = (
+            f"Argo_{needed_date.strftime('%Y%m%d')}_profile{int(profile_number)}_"
+            f"{float(glorys_depth_filtered[0]):.2f}m_{variable}_{run_tag}.png"
+        )
+        save_path = save_dir / fname
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
+        if verbose:
+            print(f"Figure saved to: {save_path}")
 
     if show_fig:
         if not inline_mode:
@@ -7260,7 +7276,7 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
                 _, ds_name, _ = _resolve_track_context(DS, no, include_contours=False)
             except Exception:
                 ds_name = "UNKNOWN"
-        ds_name = ds_name.upper() if isinstance(ds_name, str) else str(ds_name)
+        ds_name = ('Argo' if ds_name.lower() == 'argo' else ds_name.upper()) if isinstance(ds_name, str) else str(ds_name)
 
         prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
@@ -7483,8 +7499,14 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
             output_dir = argo_projection_config.output_dir(str(save_subdir), region_slug)
             output_dir.mkdir(parents=True, exist_ok=True)
             date_fn = date_str.replace('-', '')
-            base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
-                             f"k{metadata['k']:.2f}b{metadata['b']:.2f}_{run_tag}.png")
+            if ds_name == 'Argo':
+                base_filename = (
+                    f"Argo_{date_fn}_profile{metadata['eddy_no']}_vertical_{variable}_"
+                    f"k{metadata['k']:.2f}b{metadata['b']:.2f}_{run_tag}.png"
+                )
+            else:
+                base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
+                                 f"k{metadata['k']:.2f}b{metadata['b']:.2f}_{run_tag}.png")
             save_path = output_dir / base_filename
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Figure saved to: {save_path}")
@@ -8139,13 +8161,15 @@ def _run_vertical_overview_batch(
     detection_config: DetectionConfig | None,
     show_fig: bool,
     save_fig: bool,
+    output_dir: str | Path | None,
+    verbose: bool,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
     results: list[dict] = []
     region_slug = _current_region_key()
     cfg = _resolve_detection_config(detection_config)
     run_tag = cfg.file_stem()
-    out_dir = cfg.output_dir(save_subdir, region_slug)
+    out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir(save_subdir, region_slug)
     if save_fig:
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -8187,11 +8211,19 @@ def _run_vertical_overview_batch(
 
         save_path = None
         if save_fig:
+            if '{date}' in save_name_prefix:
+                filename_core = save_name_prefix.format(date=date_tag)
+                filename = f"{filename_core}_overview_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+            else:
+                filename = (
+                    f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                )
             save_path = out_dir / (
-                f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                filename
             )
             fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Figure saved to: {save_path}")
+            if verbose:
+                print(f"Figure saved to: {save_path}")
 
         if show_fig:
             plt.show()
@@ -8230,8 +8262,13 @@ def plot_track_vertical_glorys_overview(
     label_isolines: bool = False,
     show_fig: bool = True,
     save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
 ) -> list[dict]:
-    """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。"""
+    """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
+
+    verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
+    """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
@@ -8316,6 +8353,8 @@ def plot_track_vertical_glorys_overview(
         detection_config=argo_projection_config,
         show_fig=show_fig,
         save_fig=save_fig,
+        output_dir=output_dir,
+        verbose=verbose,
     )
 
 
@@ -8348,8 +8387,13 @@ def plot_argo_vertical_glorys_overview(
     argo_data_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
 ) -> list[dict]:
-    """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。"""
+    """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
+
+    verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
+    """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
@@ -8426,7 +8470,7 @@ def plot_argo_vertical_glorys_overview(
         vertical_vars=vertical_vars,
         target_date=target_date,
         subject_label=f"Profile {int(profile_number)}",
-        save_name_prefix=f"ARGO_profile{int(profile_number)}",
+        save_name_prefix=f"Argo_{{date}}_profile{int(profile_number)}",
         save_subdir='plot_argo_vertical_glorys_overview',
         xmin=xmin,
         xmax=xmax,
@@ -8445,6 +8489,8 @@ def plot_argo_vertical_glorys_overview(
         detection_config=argo_projection_config,
         show_fig=show_fig,
         save_fig=save_fig,
+        output_dir=output_dir,
+        verbose=verbose,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -8780,7 +8826,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
                 ds_name = "UNKNOWN"
         else:
             ds_name = "UNKNOWN"
-    ds_name = ds_name.upper() if isinstance(ds_name, str) else str(ds_name)
+    ds_name = ('Argo' if ds_name.lower() == 'argo' else ds_name.upper()) if isinstance(ds_name, str) else str(ds_name)
 
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
     eddy_color = prop_colors[1] if 'AC' in ds_name else prop_colors[0]
@@ -8853,9 +8899,17 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
         if k_val is not None and b_val is not None:
             k_str = f"k{k_val:.2f}"
             b_str = f"b{b_val:.2f}"
-            base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_{k_str}{b_str}.png")
+            if ds_name == 'Argo':
+                base_filename = (
+                    f"Argo_{date_fn}_profile{metadata['eddy_no']}_vertical_{variable}_{k_str}{b_str}.png"
+                )
+            else:
+                base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_{k_str}{b_str}.png")
         else:
-            base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}.png")
+            if ds_name == 'Argo':
+                base_filename = f"Argo_{date_fn}_profile{metadata['eddy_no']}_vertical_{variable}.png"
+            else:
+                base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}.png")
 
         save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -11049,6 +11103,381 @@ def plot_hotspot_anomaly_vertical_profiles(
         'skipped_profiles': int(skipped_profiles),
         'output_dir': str(output_dir) if save_fig else None,
         'anomalies_path': str(anomalies_path),
+    }
+
+
+def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
+    """单个 hotspot Argo profile 的 GLORYS 水平图与 vertical overview 绘图 worker。"""
+    task_index = int(args.get('task_index', -1))
+    year_val = int(args['year'])
+    profile_num = int(args['profile_number'])
+    month_val = args.get('month')
+    day_val = args.get('day')
+    platform_val = args.get('platform_number')
+
+    if month_val is not None and day_val is not None:
+        profile_time = pd.Timestamp(year=year_val, month=int(month_val), day=int(day_val))
+    else:
+        profile_time = year_val
+
+    record = {
+        'task_index': task_index,
+        'year': year_val,
+        'profile_number': profile_num,
+        'platform_number': platform_val,
+        'profile_time': str(profile_time),
+        'line_strategy': 'zonal',
+        'k': 0.0,
+        'b': np.nan,
+        'center_lon': np.nan,
+        'center_lat': np.nan,
+        'target_date': None,
+        'horizontal_status': 'not_started',
+        'vertical_status': 'not_started',
+        'vertical_save_paths': None,
+        'status': 'failed',
+        'error': None,
+    }
+
+    try:
+        region_config_key = args.get('region_config_key')
+        if region_config_key:
+            switch_region(str(region_config_key), verbose=False)
+
+        if bool(args.get('force_agg_backend', False)):
+            try:
+                plt.switch_backend('Agg')
+            except Exception:
+                pass
+        if not bool(args.get('show_fig', False)):
+            plt.ioff()
+        plt.close('all')
+
+        cfg = args['detection_config']
+        info = _resolve_argo_profile_center(
+            profile_number=profile_num,
+            profile_time=profile_time,
+            platform_number=platform_val,
+            argo_data_dir=args.get('argo_data_dir'),
+        )
+        center_lon = float(info['center_lon'])
+        center_lat = float(info['center_lat'])
+        target_date = pd.Timestamp(info['target_date']).normalize()
+        platform_resolved = info.get('platform_number')
+        if platform_val is None and platform_resolved is not None:
+            platform_val = int(platform_resolved)
+
+        k_val = 0.0
+        b_val = center_lat
+        record.update({
+            'platform_number': platform_val,
+            'profile_time': target_date.strftime('%Y-%m-%d'),
+            'b': float(b_val),
+            'center_lon': center_lon,
+            'center_lat': center_lat,
+            'target_date': target_date.strftime('%Y-%m-%d'),
+        })
+
+        plot_argo_horizontal_glorys(
+            profile_number=profile_num,
+            profile_time=target_date,
+            platform_number=platform_val,
+            variable=args.get('horizontal_variable', 'vorticity'),
+            show_fig=bool(args.get('show_fig', False)),
+            save_fig=bool(args.get('save_fig', True)),
+            k=k_val,
+            b=b_val,
+            needed_depth=args.get('needed_depth', 0),
+            inline_mode=bool(args.get('inline_mode', True)),
+            xmin=args.get('xmin', -400.0),
+            xmax=args.get('xmax', 400.0),
+            argo_detection_config=cfg,
+            argo_min_depth=args.get('argo_min_depth'),
+            argo_data_dir=args.get('argo_data_dir'),
+            output_dir=args.get('horizontal_output_dir'),
+            verbose=bool(args.get('verbose', False)),
+        )
+        record['horizontal_status'] = 'ok'
+
+        vertical_results = plot_argo_vertical_glorys_overview(
+            profile_number=profile_num,
+            profile_time=target_date,
+            k=k_val,
+            b=b_val,
+            platform_number=platform_val,
+            variables=args.get('vertical_variables'),
+            needed_depth=args.get('needed_depth', 0),
+            xmin=args.get('xmin', -400.0),
+            xmax=args.get('xmax', 400.0),
+            ymin=args.get('ymin', 0.0),
+            ymax=args.get('ymax', 1000.0),
+            profile_spacing_km=args.get('profile_spacing_km'),
+            interpolate_z=bool(args.get('interpolate_z', True)),
+            profile_depth_spacing_m=args.get('profile_depth_spacing_m'),
+            plot_mlt=bool(args.get('plot_mlt', False)),
+            plot_argo_projection=bool(args.get('plot_argo_projection', True)),
+            argo_projection_config=cfg,
+            argo_projection_min_depth=args.get('argo_projection_min_depth'),
+            plot_isolines=bool(args.get('plot_isolines', True)),
+            isoline_levels=args.get('isoline_levels'),
+            isoline_color=args.get('isoline_color', 'black'),
+            isoline_linewidth=float(args.get('isoline_linewidth', 0.8)),
+            isoline_alpha=float(args.get('isoline_alpha', 0.45)),
+            label_isolines=bool(args.get('label_isolines', False)),
+            argo_data_dir=args.get('argo_data_dir'),
+            show_fig=bool(args.get('show_fig', False)),
+            save_fig=bool(args.get('save_fig', True)),
+            output_dir=args.get('vertical_output_dir'),
+            verbose=bool(args.get('verbose', False)),
+        )
+        record['vertical_status'] = 'ok' if vertical_results else 'empty'
+        record['vertical_save_paths'] = ";".join(
+            [str(item.get('save_path')) for item in vertical_results if item.get('save_path')]
+        ) or None
+        record['status'] = 'ok' if record['vertical_status'] == 'ok' else 'partial'
+
+    except Exception as exc:
+        record['error'] = str(exc)
+    finally:
+        plt.close('all')
+
+    return record
+
+
+def plot_hotspot_anomaly_argo_glorys_overviews(
+    start_year: int | None = None,
+    end_year: int | None = None,
+    anomalies_path: str | Path | None = None,
+    detection_config: DetectionConfig | None = None,
+    *,
+    horizontal_variable: str = 'vorticity',
+    vertical_variables: list[str] | None = None,
+    needed_depth: float | int = 0,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    plot_mlt: bool = False,
+    plot_argo_projection: bool = True,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+    argo_min_depth: float | None = None,
+    argo_projection_min_depth: float | None = None,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    clear_output_dir: bool = True,
+    save_fig: bool = True,
+    show_fig: bool = False,
+    inline_mode: bool = True,
+    verbose: bool = False,
+    use_multiprocessing: bool = True,
+    num_workers: int | None = None,
+    maxtasksperchild: int | None = 4,
+) -> dict:
+    """为 hotspots 异常剖面批量绘制 Argo-centered GLORYS 水平图与垂向总览图。
+
+    第一版使用固定的纬向剖面线：每个剖面都取经过 Argo 点的 ``y = lat``，
+    即 ``k=0, b=center_lat``。输入 anomalies parquet 的定位规则与
+    ``plot_hotspot_anomaly_vertical_profiles`` 保持一致；每个剖面的 GLORYS 图
+    分别交给 ``plot_argo_horizontal_glorys`` 与
+    ``plot_argo_vertical_glorys_overview`` 生成。
+
+    参数:
+        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
+        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        detection_config: 异常识别配置；同时用于水平图异常点与垂向图投影点筛选。
+        horizontal_variable: 水平 GLORYS 背景变量，默认 'vorticity'。
+        vertical_variables: 垂向总览变量；None 时使用 overview 默认 ['vorticity','sigma','thetao','salinity']。
+        needed_depth: 水平图读取深度，默认 0 m。
+        xmin/xmax/ymin/ymax: 垂向图显示范围；xmin/xmax 也决定 Argo-centered GLORYS 读取窗口。
+        profile_spacing_km / interpolate_z / profile_depth_spacing_m: 传递给垂向 GLORYS 插值。
+        plot_mlt / plot_argo_projection / plot_isolines: 垂向总览图附加层控制。
+        argo_min_depth / argo_projection_min_depth: 分别覆盖水平图异常点与垂向投影点的最小深度阈值。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
+        clear_output_dir: 保存图片时是否在本次运行开始前清空批处理专属输出目录。
+        save_fig / show_fig / inline_mode: 输出控制；默认保存图片且不显示图窗。
+        verbose: 是否打印底层单图保存路径等详细信息；批处理默认关闭。
+        use_multiprocessing: 是否用多进程并行处理 profile；默认 True。
+        num_workers: worker 数；None 时自动取 min(profile数, CPU数, 4)。
+        maxtasksperchild: 每个 worker 处理多少个任务后重启；None 表示不自动重启。
+
+    返回:
+        dict: 包含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/results。
+    """
+
+    def _to_int_or_none(val):
+        try:
+            if pd.isna(val):
+                return None
+            return int(val)
+        except Exception:
+            return None
+
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    region_slug = _current_region_key()
+    batch_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else cfg.output_dir("plot_hotspot_anomaly_argo_glorys_overviews", region_slug)
+    )
+
+    if anomalies_path is None:
+        if start_year is None or end_year is None:
+            raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
+        anomalies_path = cfg.output_dir("plot_argo_hotspots", region_slug) / (
+            f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+    else:
+        anomalies_path = Path(anomalies_path)
+
+    if not Path(anomalies_path).exists():
+        raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
+
+    anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+        total_count = len(anomalies)
+        mismatch_count = int((~method_mask).sum())
+        if mismatch_count > 0:
+            print(f"[WARN] Mixed detection_method found: expected={method_name}, mismatched={mismatch_count}/{total_count}.")
+        elif verbose:
+            print(f"[*] Method={method_name}, records={total_count}")
+        anomalies = anomalies[method_mask].copy()
+
+    if anomalies.empty:
+        print(f"[*] No anomalies in file: {anomalies_path}")
+        return {
+            'total_candidates': 0,
+            'processed_profiles': 0,
+            'skipped_profiles': 0,
+            'output_dir': str(batch_output_dir) if save_fig else None,
+            'anomalies_path': str(anomalies_path),
+            'results': [],
+        }
+
+    required_cols = ['Year', 'Profile_number']
+    missing_cols = [c for c in required_cols if c not in anomalies.columns]
+    if missing_cols:
+        raise ValueError(f"Anomalies file missing required columns: {missing_cols}")
+
+    work = anomalies.copy()
+    work['_year'] = pd.to_numeric(work['Year'], errors='coerce')
+    work['_profile'] = pd.to_numeric(work['Profile_number'], errors='coerce')
+    work = work.dropna(subset=['_year', '_profile']).copy()
+    work['_year'] = work['_year'].astype(int)
+    work['_profile'] = work['_profile'].astype(int)
+
+    horizontal_output_dir = batch_output_dir / "horizontal"
+    vertical_output_dir = batch_output_dir / "vertical_overview"
+    if save_fig:
+        if clear_output_dir and batch_output_dir.exists():
+            try:
+                shutil.rmtree(batch_output_dir)
+            except Exception as exc:
+                print(f"[WARN] Failed to clear output directory {batch_output_dir}: {exc}")
+        horizontal_output_dir.mkdir(parents=True, exist_ok=True)
+        vertical_output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_candidates = int(len(work))
+    worker_count = 1
+    if use_multiprocessing and total_candidates > 1:
+        worker_count = int(num_workers) if num_workers is not None else min(total_candidates, os.cpu_count() or 1, 4)
+        worker_count = max(1, worker_count)
+
+    region_config_key = _current_region_config_key()
+    worker_args: list[dict] = []
+    for task_index, (_, row) in enumerate(work.iterrows()):
+        worker_args.append({
+            'task_index': int(task_index),
+            'year': int(row['_year']),
+            'profile_number': int(row['_profile']),
+            'month': _to_int_or_none(row.get('Month')),
+            'day': _to_int_or_none(row.get('Day')),
+            'platform_number': _to_int_or_none(row.get('Platform_number')),
+            'detection_config': cfg,
+            'region_config_key': region_config_key,
+            'horizontal_variable': horizontal_variable,
+            'vertical_variables': vertical_variables,
+            'needed_depth': needed_depth,
+            'xmin': xmin,
+            'xmax': xmax,
+            'ymin': ymin,
+            'ymax': ymax,
+            'profile_spacing_km': profile_spacing_km,
+            'interpolate_z': interpolate_z,
+            'profile_depth_spacing_m': profile_depth_spacing_m,
+            'plot_mlt': plot_mlt,
+            'plot_argo_projection': plot_argo_projection,
+            'plot_isolines': plot_isolines,
+            'isoline_levels': isoline_levels,
+            'isoline_color': isoline_color,
+            'isoline_linewidth': isoline_linewidth,
+            'isoline_alpha': isoline_alpha,
+            'label_isolines': label_isolines,
+            'argo_min_depth': argo_min_depth,
+            'argo_projection_min_depth': argo_projection_min_depth,
+            'argo_data_dir': argo_data_dir,
+            'save_fig': save_fig,
+            'show_fig': show_fig,
+            'inline_mode': inline_mode,
+            'horizontal_output_dir': horizontal_output_dir if save_fig else None,
+            'vertical_output_dir': vertical_output_dir if save_fig else None,
+            'verbose': verbose,
+            'force_agg_backend': bool(worker_count > 1 and not show_fig),
+        })
+
+    if worker_count > 1:
+        print(f"[*] Hotspots Argo GLORYS multiprocessing: workers={worker_count}, profiles={total_candidates}.")
+        pool_kwargs = {'processes': worker_count}
+        if maxtasksperchild is not None:
+            pool_kwargs['maxtasksperchild'] = max(1, int(maxtasksperchild))
+        with multiprocessing.Pool(**pool_kwargs) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_plot_hotspot_argo_glorys_profile_worker, worker_args),
+                total=total_candidates,
+                desc="hotspot argo GLORYS",
+                unit="profile",
+            ))
+        results = sorted(results, key=lambda item: int(item.get('task_index', 0)))
+    else:
+        results = [
+            _plot_hotspot_argo_glorys_profile_worker(args)
+            for args in tqdm(worker_args, total=total_candidates, desc="hotspot argo GLORYS", unit="profile")
+        ]
+
+    processed_profiles = int(sum(1 for item in results if item.get('status') in {'ok', 'partial'}))
+    skipped_profiles = int(sum(1 for item in results if item.get('status') == 'failed'))
+    for item in results:
+        if item.get('status') == 'failed':
+            print(
+                f"[WARN] Failed hotspot Argo GLORYS for "
+                f"Year={item.get('year')}, Profile={item.get('profile_number')}: {item.get('error')}"
+            )
+
+    print(
+        f"[*] Hotspots Argo GLORYS plotting complete: "
+        f"total={total_candidates}, processed={processed_profiles}, skipped={skipped_profiles}."
+    )
+
+    return {
+        'total_candidates': total_candidates,
+        'processed_profiles': int(processed_profiles),
+        'skipped_profiles': int(skipped_profiles),
+        'output_dir': str(batch_output_dir) if save_fig else None,
+        'anomalies_path': str(anomalies_path),
+        'results': results,
     }
 
 
