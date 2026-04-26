@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.7 变更：
+#   - 新增 subduction_detection_method，统一选择 do/aou/trim 三种异常识别模式。
+#   - 新增 aou_* 与 trim_* 参数，供 DetectionConfig / calculate_delta_do 读取。
+#   - 新增 cbar_defaults，按识别方法配置异常散点色标默认范围。
 # version 1.6 变更：
 #   - 新增 anomaly_max_depth，限制 calculate_delta_do 仅保留该深度以内峰值。
 #   - 新增 do_near_zero_threshold / do_near_zero_max_count，近零 DO 点过多时整剖面跳过。
@@ -14,7 +18,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.6
+version: 1.7
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -27,6 +31,26 @@ processing:
   anomaly_max_depth: 1500.0         # ΔDO 峰值最大深度（m）；设为 0 表示不限制
   do_near_zero_threshold: 1.0       # 近零 DO 判定阈值（DO <= 该值）
   do_near_zero_max_count: 7         # 单剖面近零 DO 超过该数量时，整剖面跳过
+  subduction_detection_method: do   # 默认异常识别方法：do | aou | trim
+  aou_threshold: -10.0              # aou 模式：ΔAOU 阈值（越负越强）
+  pi_threshold: 0.05                # aou 模式：|ΔPI| 阈值
+  aou_pi_depth_tolerance: 30.0      # aou 模式：AOU 峰与 PI 峰配对深度容差
+  trim_cutoff: 1.96                 # trim 模式：鲁棒标准化残差阈值
+  trim_window: 60.0                 # trim 模式：梯度符号检查窗口（±m）
+  trim_bin_width_outlier: 40.0      # trim 模式：候选检测分箱宽度
+  trim_bin_width_check: 20.0        # trim 模式：梯度检查分箱宽度
+  trim_depth_min: 200.0             # trim 模式：候选最小深度
+  trim_depth_max: 1000.0            # trim 模式：候选最大深度
+  cbar_defaults:
+    do:
+      min: 50.0
+      max: 150.0
+    aou:
+      min: -60.0
+      max: -10.0
+    trim:
+      min: 2.0
+      max: 6.0
   adaptive_lat_threshold: 70.0          # |lat0|>=该值直接大圆距离
   adaptive_distance_threshold_km: 300.0 # 平面最大距离超出触发大圆
   vertical_profile_spacing_km: 2.0      # 垂向剖面横向采样步长（km）

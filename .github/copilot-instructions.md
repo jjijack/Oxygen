@@ -31,16 +31,17 @@
 - Massive joins should work on yearly parquet files instead of loading everything in memory—follow the pattern in `filtered_float_data` (lazy loading only the needed years).
 
 ## GLORYS & Vertical Diagnostics
-- GLORYS fields are pulled with `get_track_area_glorys(...)` and interpolated via `get_vertical_glorys`/`plot_vertical_glorys`.
+- GLORYS fields are pulled with `get_track_area_glorys(...)` and interpolated via `get_vertical_glorys`; plotting entry points are split across track/Argo horizontal and vertical helpers (`plot_track_horizontal_glorys`, `plot_argo_horizontal_glorys`, `plot_track_vertical_glorys`, `plot_argo_vertical_glorys`, plus overview variants).
 - Prefer passing kind strings (`'acs'|'acl'|'cs'|'cl'`) plus `track_id` and snapshot index; legacy ACS/ACL/CS/CL list-style inputs remain supported for compatibility.
 - When adding new 2D/3D variables, update the `alias_map` + `var_dims` dictionaries near `get_vertical_glorys`; ensure interpolation uses `RegularGridInterpolator` with masked arrays, matching existing error handling.
-- Vertical plots output into `plot_vertical_glorys/` by default; keep filenames consistent with the current `{dataset}{id}_vertical_{var}_YYYYMMDD_k*b*.png` template so downstream scripts can glob predictably.
+- GLORYS diagnostic plots that depend on anomaly detection/projection config write under `plot_outputs/<method>/<region>/...`; method-independent replay plots from `plot_data_package(..., save_fig=True)` write under `plot_outputs/shared/<region>/plot_track_vertical_glorys/`. Keep filenames consistent with the current `{dataset}{id}_vertical_{var}_YYYYMMDD_k*b*.png` template so downstream scripts can glob predictably.
 
 ## Float/Eddy Analytics
 - `filtered_float_data` is the shared matcher between META tracks and Argo profiles; it first date-joins, then applies both polygon containment (`is_point_in_contour`) and radius checks (`adaptive_distance_m`). Reuse these helpers whenever proximity logic is needed.
-- ΔDO processing lives in `calculate_delta_do`; thresholds (ΔDO, salinity, temperature, depth windows, QC handling) all default to `processing.yml`. When changing defaults, expose them there and call `print_current_processing_defaults()` during debugging.
-- `plot_track` orchestrates everything—loading a track, matching floats, computing ΔDO anomalies, and plotting; new visual embellishments should hook into the existing Matplotlib legend/grid patterns and honor `plot_radius`, `plot_unrelated_argo`, and colorbar settings.
-- Regional anomaly maps are produced via `plot_argo_hotspots`, which spins up Dask tasks per year, writes plots to `plot_outputs/<region>/plot_argo_hotspots/`, and can persist anomalies to parquet; keep additions streaming-friendly.
+- Argo anomaly detection lives in `calculate_delta_do` and is configured through `DetectionConfig` / `make_detection_config(...)`; detection defaults and plotting defaults come from `processing.yml`. When changing defaults, expose them there and call `print_current_processing_defaults()` during debugging.
+- `plot_track` orchestrates everything—loading a track, matching floats, computing Argo anomalies, and plotting; new visual embellishments should hook into the existing Matplotlib legend/grid patterns and honor `plot_radius`, `plot_unrelated_argo`, and colorbar settings.
+- Regional anomaly maps are produced via `plot_argo_hotspots`, which spins up Dask tasks per year, writes plots to `plot_outputs/<method>/<region>/plot_argo_hotspots/`, and can persist anomalies to parquet; keep additions streaming-friendly.
+- Method-independent outputs, such as baseline Argo/eddy interaction parquet files and generic profile/relative-position diagnostics, belong under `plot_outputs/shared/<region>/...`, not directly under `plot_outputs/<region>/...`.
 
 ## Geospatial Conventions
 - Distances default to planar approximations adjusted by latitude (`approximate_degree_length`); switch to true great-circle calculations by toggling `force_great_circle` or the adaptive thresholds instead of reimplementing Haversine.

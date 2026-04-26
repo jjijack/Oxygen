@@ -23,6 +23,7 @@ import multiprocessing
 import h5py
 import time as tm
 import shutil
+from dataclasses import dataclass, field
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 import dask.dataframe as dd
@@ -131,6 +132,38 @@ _cfg_do_near_zero_threshold = float(
 _cfg_do_near_zero_max_count = int(
     _PROC_CFG.get('processing', {}).get('do_near_zero_max_count', 7)
 )
+_default_subduction_detection_method = str(
+    _PROC_CFG.get('processing', {}).get('subduction_detection_method', 'do')
+).strip().lower()
+if _default_subduction_detection_method not in {'do', 'aou', 'trim'}:
+    _default_subduction_detection_method = 'do'
+_default_aou_threshold = float(
+    _PROC_CFG.get('processing', {}).get('aou_threshold', -10.0)
+)
+_default_pi_threshold = float(
+    _PROC_CFG.get('processing', {}).get('pi_threshold', 0.05)
+)
+_default_aou_pi_depth_tolerance = float(
+    _PROC_CFG.get('processing', {}).get('aou_pi_depth_tolerance', 30.0)
+)
+_default_trim_cutoff = float(
+    _PROC_CFG.get('processing', {}).get('trim_cutoff', 1.96)
+)
+_default_trim_window = float(
+    _PROC_CFG.get('processing', {}).get('trim_window', 60.0)
+)
+_default_trim_bin_width_outlier = float(
+    _PROC_CFG.get('processing', {}).get('trim_bin_width_outlier', 40.0)
+)
+_default_trim_bin_width_check = float(
+    _PROC_CFG.get('processing', {}).get('trim_bin_width_check', 20.0)
+)
+_default_trim_depth_min = float(
+    _PROC_CFG.get('processing', {}).get('trim_depth_min', 200.0)
+)
+_default_trim_depth_max = float(
+    _PROC_CFG.get('processing', {}).get('trim_depth_max', 1000.0)
+)
 _default_adaptive_lat_threshold = float(
     _PROC_CFG.get('processing', {}).get('adaptive_lat_threshold', 70.0)
 )
@@ -143,6 +176,281 @@ _default_vertical_profile_spacing_km = float(
 _default_vertical_profile_depth_spacing_m = float(
     _PROC_CFG.get('processing', {}).get('vertical_profile_depth_spacing_m', 5.0)
 )
+
+_DETECTION_METHODS = {'do', 'aou', 'trim'}
+_cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
+_CBAR_FALLBACK = {
+    'do': (50.0, 150.0),
+    'aou': (-60.0, -10.0),
+    'trim': (2.0, 6.0),
+}
+
+def _format_detection_value(value) -> str:
+    """文件名安全的短数字串。"""
+    try:
+        if value is None or pd.isna(value):
+            return 'NA'
+    except Exception:
+        if value is None:
+            return 'NA'
+    try:
+        return f"{float(value):g}".replace('.', 'p').replace('-', 'n')
+    except Exception:
+        return str(value).replace('.', 'p').replace('-', 'n').replace(' ', '')
+
+def _normalize_detection_method(method: str | None) -> str:
+    method_norm = str(method or _default_subduction_detection_method).strip().lower()
+    if method_norm not in _DETECTION_METHODS:
+        raise ValueError(
+            f"method must be one of {sorted(_DETECTION_METHODS)}, got {method!r}."
+        )
+    return method_norm
+
+def _method_cbar_defaults(method: str) -> tuple[float, float]:
+    """按识别方法返回默认色标上下限。"""
+    method_norm = _normalize_detection_method(method)
+    defaults = _cfg_cbar_defaults.get(method_norm, {}) if isinstance(_cfg_cbar_defaults, dict) else {}
+    fallback_lo, fallback_hi = _CBAR_FALLBACK.get(method_norm, (0.0, 100.0))
+    if isinstance(defaults, dict):
+        lo = defaults.get('min', fallback_lo)
+        hi = defaults.get('max', fallback_hi)
+    else:
+        lo, hi = fallback_lo, fallback_hi
+    return float(lo), float(hi)
+
+@dataclass
+class DetectionConfig:
+    """单一异常识别配置对象，贯穿 calculate_delta_do 及其下游流程。"""
+
+    method: str = field(default_factory=lambda: _default_subduction_detection_method)
+
+    # DO 模式
+    do_threshold: float = field(default_factory=lambda: _default_delta_do_threshold)
+
+    # AOU 模式
+    aou_threshold: float = field(default_factory=lambda: _default_aou_threshold)
+    pi_threshold: float = field(default_factory=lambda: _default_pi_threshold)
+    aou_pi_depth_tolerance: float = field(default_factory=lambda: _default_aou_pi_depth_tolerance)
+
+    # TRIM 模式
+    trim_cutoff: float = field(default_factory=lambda: _default_trim_cutoff)
+    trim_window: float = field(default_factory=lambda: _default_trim_window)
+    trim_bin_width_outlier: float = field(default_factory=lambda: _default_trim_bin_width_outlier)
+    trim_bin_width_check: float = field(default_factory=lambda: _default_trim_bin_width_check)
+    trim_depth_min: float = field(default_factory=lambda: _default_trim_depth_min)
+    trim_depth_max: float = field(default_factory=lambda: _default_trim_depth_max)
+
+    # 通用预处理与过滤
+    depth_interval: float = field(default_factory=lambda: _default_depth_interval)
+    salinity_threshold: float = field(default_factory=lambda: _default_salinity_threshold)
+    temperature_threshold: float = field(default_factory=lambda: _default_temperature_threshold)
+    anomaly_min_depth: float = field(default_factory=lambda: _cfg_anomaly_min_depth)
+    anomaly_max_depth: float = field(default_factory=lambda: _cfg_anomaly_max_depth)
+    depth_merge_tolerance: float = field(default_factory=lambda: _default_depth_merge_tolerance)
+    duplicate_depth_strategy: str = field(default_factory=lambda: _default_duplicate_depth_strategy)
+    do_near_zero_threshold: float = field(default_factory=lambda: _cfg_do_near_zero_threshold)
+    do_near_zero_max_count: int = field(default_factory=lambda: _cfg_do_near_zero_max_count)
+
+    # 绘图显示
+    cbar_min: float | None = None
+    cbar_max: float | None = None
+    cbar_ticks: list | None = None
+
+    def __post_init__(self):
+        self.method = _normalize_detection_method(self.method)
+
+    def resolved_cbar(self) -> tuple[float, float]:
+        lo_default, hi_default = _method_cbar_defaults(self.method)
+        lo = self.cbar_min if self.cbar_min is not None else lo_default
+        hi = self.cbar_max if self.cbar_max is not None else hi_default
+        return float(lo), float(hi)
+
+    def score_col(self) -> str:
+        return 'anomaly_score'
+
+    def color_col(self) -> str:
+        if self.method == 'aou':
+            return 'delta_aou'
+        if self.method == 'trim':
+            return 'trim_score'
+        return 'delta_do'
+
+    def timeseries_variable(self) -> str:
+        if self.method in {'aou', 'trim'}:
+            return 'AOU'
+        return 'DO'
+
+    def color_label(self) -> str:
+        if self.method == 'aou':
+            return 'ΔAOU / μmol·kg⁻¹'
+        if self.method == 'trim':
+            return 'Trim residual score / σ'
+        return 'ΔDO / μmol·kg⁻¹'
+
+    def cmap(self) -> str:
+        if self.method == 'aou':
+            return 'Blues_r'
+        if self.method == 'trim':
+            return 'magma'
+        return 'Reds'
+
+    def threshold_label(self) -> str:
+        if self.method == 'aou':
+            return (
+                f"ΔAOU ≤ {self.aou_threshold:g} μmol kg⁻¹, "
+                f"|ΔPI| ≥ {self.pi_threshold:g}"
+            )
+        if self.method == 'trim':
+            return f"trim residual > {self.trim_cutoff:g}σ"
+        return f"ΔDO ≥ {self.do_threshold:g} μmol kg⁻¹"
+
+    def file_stem(self) -> str:
+        if self.method == 'aou':
+            core = (
+                f"aou{_format_detection_value(self.aou_threshold)}"
+                f"_pi{_format_detection_value(self.pi_threshold)}"
+            )
+        elif self.method == 'trim':
+            core = f"trim{_format_detection_value(self.trim_cutoff)}"
+        else:
+            core = f"do{_format_detection_value(self.do_threshold)}"
+
+        depth = ''
+        if self.anomaly_min_depth is not None and float(self.anomaly_min_depth) > 0:
+            depth = f"_depth{_format_detection_value(self.anomaly_min_depth)}m"
+        return f"{core}{depth}"
+
+    def output_dir(self, fn_name: str, region_slug: str | None = None, plots_root: str | Path | None = None) -> Path:
+        slug = region_slug or _current_region_key()
+        base = Path(plots_root) if plots_root is not None else Path(plots_output_root)
+        return base / self.method / slug / fn_name
+
+def _shared_output_dir(
+    fn_name: str,
+    region_slug: str | None = None,
+    plots_root: str | Path | None = None,
+) -> Path:
+    """返回与异常判定方法无关的共享输出目录。"""
+    slug = region_slug or _current_region_key()
+    base = Path(plots_root) if plots_root is not None else Path(plots_output_root)
+    return base / 'shared' / str(slug) / fn_name
+
+def _detection_output_dir_from_meta(
+    fn_name: str,
+    meta: dict | None = None,
+    *,
+    region_slug: str | None = None,
+    plots_root: str | Path | None = None,
+) -> Path:
+    """根据 summary 元信息返回带异常判定方法的输出目录。"""
+    meta = meta or {}
+    method = _normalize_detection_method(meta.get('detection_method') or 'do')
+    slug = region_slug or meta.get('region_key') or _current_region_key()
+    base = Path(plots_root) if plots_root is not None else Path(plots_output_root)
+    return base / method / str(slug) / fn_name
+
+def make_detection_config(
+    method: str | DetectionConfig | None = None,
+    **overrides,
+) -> DetectionConfig:
+    """从全局默认配置构建 DetectionConfig，并应用临时覆盖。"""
+    if isinstance(method, DetectionConfig):
+        values = method.__dict__.copy()
+        values.update(overrides)
+        return DetectionConfig(**values)
+    method_norm = _normalize_detection_method(method)
+    return DetectionConfig(method=method_norm, **overrides)
+
+def _resolve_detection_config(
+    detection_config: DetectionConfig | None = None,
+    **overrides,
+) -> DetectionConfig:
+    """公共入口的 DetectionConfig 解析器；None 时使用 processing.yml 默认值。"""
+    if detection_config is not None and not isinstance(detection_config, DetectionConfig):
+        raise TypeError("detection_config 必须是 DetectionConfig；请先用 make_detection_config(...) 构建。")
+    return make_detection_config(
+        detection_config,
+        **{k: v for k, v in overrides.items() if v is not None},
+    )
+
+def _keep_best_anomaly_per_profile(anomalies: pd.DataFrame, detection_config: DetectionConfig | None = None) -> pd.DataFrame:
+    """每个 Profile_number 只保留统一 anomaly_score 最大的一行。"""
+    if anomalies is None or anomalies.empty or 'Profile_number' not in anomalies.columns:
+        return pd.DataFrame() if anomalies is None else anomalies
+    score_col = (detection_config.score_col() if detection_config is not None else 'anomaly_score')
+    if score_col not in anomalies.columns:
+        fallback_col = 'delta_do' if 'delta_do' in anomalies.columns else None
+        if fallback_col is None:
+            return anomalies.drop_duplicates(subset='Profile_number', keep='first')
+        score_col = fallback_col
+    return (
+        anomalies.sort_values(score_col, ascending=False)
+        .drop_duplicates(subset='Profile_number', keep='first')
+    )
+
+def _color_values_for_anomalies(anomalies: pd.DataFrame, detection_config: DetectionConfig) -> tuple[pd.Series | None, str, str, str]:
+    """返回 anomalies 的着色列、列名、色标标签和 cmap。"""
+    col = detection_config.color_col()
+    if col not in anomalies.columns and detection_config.score_col() in anomalies.columns:
+        col = detection_config.score_col()
+    if col not in anomalies.columns:
+        return None, col, detection_config.color_label(), detection_config.cmap()
+    return pd.to_numeric(anomalies[col], errors='coerce'), col, detection_config.color_label(), detection_config.cmap()
+
+def _apply_detection_colorbar_ticks(cbar, detection_config: DetectionConfig, cbar_min: float, cbar_max: float):
+    if detection_config.cbar_ticks is not None:
+        cbar.set_ticks(detection_config.cbar_ticks)
+        return
+    rng = float(cbar_max) - float(cbar_min)
+    if rng > 30:
+        mid = (float(cbar_min) + float(cbar_max)) / 2.0
+        cbar.set_ticks([cbar_min, mid, cbar_max])
+    else:
+        cbar.set_ticks([cbar_min, cbar_max])
+
+def _num_from_record(record, key: str) -> float:
+    try:
+        val = pd.to_numeric(pd.Series([record.get(key)]), errors='coerce').iloc[0]
+        return float(val) if np.isfinite(val) else np.nan
+    except Exception:
+        return np.nan
+
+def _annotation_text_from_anomaly_record(record, detection_config: DetectionConfig) -> tuple[str, str]:
+    """从异常记录生成简短的标题指标文本与深度文本。"""
+    parts = []
+    if detection_config.method == 'aou':
+        delta_aou = _num_from_record(record, 'delta_aou')
+        delta_pi = _num_from_record(record, 'delta_pi')
+        if np.isfinite(delta_aou):
+            parts.append(f"ΔAOU={delta_aou:.2f}")
+        if np.isfinite(delta_pi):
+            parts.append(f"ΔPI={delta_pi:.3f}")
+    elif detection_config.method == 'trim':
+        trim_score = _num_from_record(record, 'trim_score')
+        score_aou = _num_from_record(record, 'trim_scale_res_rob_aou')
+        score_sal = _num_from_record(record, 'trim_scale_res_rob_abs_sal')
+        if np.isfinite(trim_score):
+            parts.append(f"trim score={trim_score:.2f}σ")
+        if np.isfinite(score_aou):
+            parts.append(f"AOU res={score_aou:.2f}σ")
+        if np.isfinite(score_sal):
+            parts.append(f"SA res={score_sal:.2f}σ")
+    else:
+        delta_do = _num_from_record(record, 'delta_do')
+        if np.isfinite(delta_do):
+            parts.append(f"ΔDO={delta_do:.2f}")
+
+    delta_temp = _num_from_record(record, 'delta_temperature')
+    delta_sal = _num_from_record(record, 'delta_salinity')
+    if np.isfinite(delta_temp):
+        parts.append(f"ΔTemperature={delta_temp:.2f}")
+    if np.isfinite(delta_sal):
+        parts.append(f"ΔSalinity={delta_sal:.2f}")
+
+    depth_val = _num_from_record(record, 'depth')
+    depth_text = f" @{depth_val:.1f}m" if np.isfinite(depth_val) else ""
+    metric_text = ", " + ", ".join(parts) if parts else ""
+    return metric_text, depth_text
 
 def _load_basemap_colors() -> dict:
     """加载底图颜色配置。
@@ -181,7 +489,8 @@ def print_current_processing_defaults():
         包含：
             circle_enlargement_factor,
             distance_deg_per_meter,
-            delta_do_threshold / salinity_threshold / temperature_threshold,
+            subduction_detection_method 与 do/aou/trim 识别参数，
+            salinity_threshold / temperature_threshold,
             depth_interval / depth_merge_tolerance / duplicate_depth_strategy。
 
         目的：调试与运行时确认当前配置，无返回值。
@@ -198,6 +507,16 @@ def print_current_processing_defaults():
         print(f"  anomaly_max_depth         : {_cfg_anomaly_max_depth}")
         print(f"  do_near_zero_threshold    : {_cfg_do_near_zero_threshold}")
         print(f"  do_near_zero_max_count    : {_cfg_do_near_zero_max_count}")
+        print(f"  subduction_detection_method: {_default_subduction_detection_method}")
+        print(f"  aou_threshold             : {_default_aou_threshold}")
+        print(f"  pi_threshold              : {_default_pi_threshold}")
+        print(f"  aou_pi_depth_tolerance    : {_default_aou_pi_depth_tolerance}")
+        print(f"  trim_cutoff               : {_default_trim_cutoff}")
+        print(f"  trim_window               : {_default_trim_window}")
+        print(f"  trim_bin_width_outlier    : {_default_trim_bin_width_outlier}")
+        print(f"  trim_bin_width_check      : {_default_trim_bin_width_check}")
+        print(f"  trim_depth_min            : {_default_trim_depth_min}")
+        print(f"  trim_depth_max            : {_default_trim_depth_max}")
         print(f"  vertical_profile_spacing_km: {_default_vertical_profile_spacing_km}")
         print(f"  vertical_profile_depth_spacing_m: {_default_vertical_profile_depth_spacing_m}")
 
@@ -2194,7 +2513,7 @@ def _resolve_track_context(
     *,
     include_contours: bool = True,
 ) -> tuple[pd.DataFrame, str, list | str | tuple | dict]:
-    """Normalize various dataset inputs into a track DataFrame and metadata."""
+    """将多种轨迹数据输入统一解析为轨迹 DataFrame 与元信息。"""
 
     def _infer_dataset_name_from_caller(obj) -> str:
         frame = inspect.currentframe()
@@ -2309,29 +2628,23 @@ def plot_track(
     show_fig: bool = True,
     plot_radius: bool = False,
     connection_threshold_days: int = 5,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     plot_unrelated_argo: bool = True,
-    fix_delta_do_colorbar: bool = True,
-    delta_do_cbar_min: float = 50.0,
-    delta_do_cbar_max: float = 100.0,
-    delta_do_cbar_ticks: list | None = None,
+    fix_colorbar: bool = True,
+    cbar_min: float | None = None,
+    cbar_max: float | None = None,
+    cbar_ticks: list | None = None,
     min_anomaly_count: int = 0
 ):
     """
-    绘制指定编号涡旋的详细轨迹，并智能高亮显示与 Argo 剖面的 ΔDO 异常交互情况。
+    绘制指定编号涡旋的详细轨迹，并高亮显示与 Argo 异常剖面的交互情况。
 
     功能:
         1. 自动加载并筛选与指定涡旋匹配的Argo数据。
         2. 绘制涡旋的完整轨迹（虚线）。
         3. 智能高亮Argo浮标存在的时期：当浮标存在日的间隔小于阈值时，
            会将这段完整的涡旋轨迹绘制为连续实线（孤立的单日则标记为点）。
-        4. 使用 calculate_delta_do 识别 ΔDO 异常（取每个剖面最大 ΔDO 一条，支持按最小深度过滤），并按 ΔDO 着色。
+        4. 使用 calculate_delta_do 按 detection_config 识别异常（每个剖面保留 anomaly_score 最强一条），并按当前方法的主变量着色。
         5. 可选地绘制涡旋在交互日的有效半径和轮廓。
 
     参数:
@@ -2350,37 +2663,24 @@ def plot_track(
             是否以圆的形式绘制涡旋在交互日的有效半径。默认为 False。
         connection_threshold_days (int, optional):
             连接 Argo 交互点的最大天数阈值。默认为 5 天。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 
-            传递给 calculate_delta_do；若为 None 则回退到全局配置默认。
-        anomaly_min_depth (float | None): 
-            ΔDO 异常最小深度限制；≤0 表示不限制；None 表示使用 processing.yml 的 anomaly_min_depth 配置值。
         plot_unrelated_argo (bool): 
-            是否绘制被 ΔDO 筛选掉的所有匹配 Argo 剖面基准位置（空心灰圈）。
-        fix_delta_do_colorbar (bool): 
-            是否固定 ΔDO 色标范围。
-        delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 
-            色标范围与刻度设置。
+            是否绘制未被当前方法判定为异常的匹配 Argo 剖面基准位置（空心灰圈）。
+        detection_config:
+            异常识别配置；None 时使用 processing.yml 默认值。
+        fix_colorbar / cbar_min / cbar_max / cbar_ticks:
+            是否固定异常主变量色标及其范围/刻度。
         min_anomaly_count (int): 
-            若 >0：要求 ΔDO 异常数量 ≥ 该值才绘图；=0 表示不做数量阈值过滤（默认 0）。
+            若 >0：要求异常数量 ≥ 该值才绘图；=0 表示不做数量阈值过滤（默认 0）。
     """
     # --- 1. 准备涡旋和Argo数据 ---
     print(f"[*] Preparing data for eddy ID {no}...")
 
-    # 参数回退
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None:
-        salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None:
-        temperature_threshold = _default_temperature_threshold
-    if depth_interval is None:
-        depth_interval = _default_depth_interval
-    if depth_merge_tolerance is None:
-        depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None:
-        duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(
+        detection_config,
+        cbar_min=cbar_min,
+        cbar_max=cbar_max,
+        cbar_ticks=cbar_ticks,
+    )
     
     try:
         track_df, ds_name, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=True)
@@ -2413,22 +2713,12 @@ def plot_track(
         )
         anomalies = calculate_delta_do(
             argo_data_filtered,
-            depth_interval=depth_interval,
-            do_threshold=do_threshold,
-            salinity_threshold=salinity_threshold,
-            temperature_threshold=temperature_threshold,
-            anomaly_min_depth=anomaly_min_depth,
-            depth_merge_tolerance=depth_merge_tolerance,
-            duplicate_depth_strategy=duplicate_depth_strategy,
+            detection_config=cfg,
             remove_outliers=True,
             verbose=False
         )
         if not anomalies.empty:
-            # 每个剖面取最大 ΔDO
-            anomalies = (
-                anomalies.sort_values('delta_do', ascending=False)
-                .drop_duplicates(subset='Profile_number', keep='first')
-            )
+            anomalies = _keep_best_anomaly_per_profile(anomalies, cfg)
 
     # 若异常数量不足阈值，直接跳过
     anomaly_count = 0 if anomalies.empty else len(anomalies)
@@ -2532,34 +2822,30 @@ def plot_track(
 
     if not anomalies.empty:
         scatter_kwargs = {}
-        if fix_delta_do_colorbar:
-            scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+        if fix_colorbar:
+            cbar_lo, cbar_hi = cfg.resolved_cbar()
+            scatter_kwargs.update(dict(vmin=cbar_lo, vmax=cbar_hi))
         depth_label = (
-            f' @ depth ≥ {anomaly_min_depth} m'
-            if anomaly_min_depth is not None and anomaly_min_depth > 0
+            f' @ depth ≥ {cfg.anomaly_min_depth} m'
+            if cfg.anomaly_min_depth is not None and cfg.anomaly_min_depth > 0
             else ''
         )
+        color_values, _, color_label, cmap_name = _color_values_for_anomalies(anomalies, cfg)
+        if color_values is None:
+            color_values = pd.Series(np.arange(len(anomalies)), index=anomalies.index)
         sc = ax.scatter(
             anomalies['Longitude'], anomalies['Latitude'],
-            c=anomalies['delta_do'], cmap='Reds', s=90,
+            c=color_values, cmap=cmap_name, s=90,
             edgecolors='black', linewidths=0.6,
-            label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹{depth_label}',
+            label=f'{cfg.threshold_label()}{depth_label}',
             zorder=10,
             **scatter_kwargs
         )
         cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.08)
-        cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=18)
+        cbar.set_label(color_label, fontsize=18)
         cbar.ax.tick_params(labelsize=14)
-        if fix_delta_do_colorbar:
-            if delta_do_cbar_ticks is not None:
-                cbar.set_ticks(delta_do_cbar_ticks)
-            else:
-                rng = delta_do_cbar_max - delta_do_cbar_min
-                if rng > 30:
-                    mid = (delta_do_cbar_min + delta_do_cbar_max) / 2
-                    cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
-                else:
-                    cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
+        if fix_colorbar:
+            _apply_detection_colorbar_ticks(cbar, cfg, cbar_lo, cbar_hi)
 
     # --- 6. 最终化绘图设置 ---
     # 设定边界时排除META中错误的contour数据
@@ -2576,9 +2862,10 @@ def plot_track(
     # --- 7. 输出控制 ---
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_track"
+        run_tag = cfg.file_stem()
+        output_dir = cfg.output_dir("plot_track", region_slug)
         output_dir.mkdir(exist_ok=True, parents=True)
-        base_filename = f"Track_Analysis_{ds_name}{num}.png"
+        base_filename = f"Track_Analysis_{ds_name}{num}_{run_tag}.png"
         save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
@@ -2591,9 +2878,8 @@ def plot_track(
 def plot_track_variable_timeseries(
     DS: list | str | tuple | dict,
     no: int,
-    variable: str = 'DO',
-    threshold: float | None = None,
-    only_above_threshold: bool = True,
+    variable: str | None = None,
+    only_anomaly_profiles: bool = True,
     depth_col: str = 'Depth',
     max_depth: float | None = 1000.0,
     depth_bin_size: float = 25.0,
@@ -2602,12 +2888,7 @@ def plot_track_variable_timeseries(
     start_date: str | int | float | pd.Timestamp | None = None,
     end_date: str | int | float | pd.Timestamp | None = None,
     platform_number: int | str | list | tuple | set | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     remove_outliers: bool = True,
     save_fig: bool = False,
     show_fig: bool = True,
@@ -2618,29 +2899,29 @@ def plot_track_variable_timeseries(
     参数:
         DS: legacy轨迹列表、kind字符串、字符串序列或数据集字典。
         no: 涡旋编号。
-        variable: 需要统计的变量列名，默认 'DO'。
-        threshold: 变量阈值；only_above_threshold=True 时用于筛选，None 回退到 `_default_delta_do_threshold`。
-        only_above_threshold: True 时仅统计变量值 ≥ threshold 的剖面；False 使用全部可用剖面。
+        variable: 需要统计的变量列名；None 时按 detection_config 自动选择
+            do->'DO'，aou/trim->'AOU'。
+        only_anomaly_profiles: True 时先按 detection_config 筛出异常剖面，再绘制这些剖面的变量场；
+            False 时使用全部匹配剖面。
         depth_col: 深度列名，默认 'Depth'。
         max_depth: 最大深度（单位与 depth_col 一致），默认 1000 dbar；None 表示使用观测最大值。
         depth_bin_size: 深度分箱大小（dbar），默认 25。
         cmap: 色标名称，默认 'RdYlBu_r'。
         show_profile_hist: 是否在底部显示每日剖面数柱状条，默认 True。
         start_date / end_date: 限制横轴开始/结束日期，可传 pandas.Timestamp、YYYYMMDD 整数、days-since-1950、ISO 字符串。
-        platform_number: 可选，仅绘制指定 Argo 浮标（单个或列表/集合），先于 ΔDO 筛选过滤。
-        salinity_threshold / temperature_threshold: 传递给 calculate_delta_do 的 ΔS/ΔT 条件，None 时使用 processing.yml 默认。
-        depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传递给 calculate_delta_do 的参数，控制 ΔDO 计算窗口与合并方式。
-        anomaly_min_depth: ΔDO 最小深度阈值（同 plot_all_tracks_in_range）；None 回退配置。
+        platform_number: 可选，仅绘制指定 Argo 浮标（单个或列表/集合），先于异常筛选过滤。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
         remove_outliers: 是否执行基础 QC（Flag 过滤 + DO<=1 过滤），默认 True。
         save_fig / show_fig: 控制图像输出。
     """
+    cfg = _resolve_detection_config(detection_config)
+    if variable is None:
+        variable = cfg.timeseries_variable()
+
     print(f"[*] Building {variable} time series for eddy {no}...")
 
-    if threshold is None:
-        threshold = _default_delta_do_threshold
-
     display_variable = variable
-    db_variable_name = _map_plot_variable_name(variable)
+    db_variable_name = _map_plot_variable_name(display_variable)
 
     def _normalize_date_input(value, label):
         if value is None:
@@ -2679,7 +2960,13 @@ def plot_track_variable_timeseries(
         print(f"  - Skip plotting {ds_name}{no}: no matched Argo profiles.")
         return
 
-    if db_variable_name not in argo_data.columns:
+    if db_variable_name == 'AOU':
+        if not _has_plottable_profile_variable(argo_data, 'AOU'):
+            print("  - Column 'AOU' not found and cannot be derived from DO/Temperature/Salinity.")
+            return
+        argo_data = argo_data.copy()
+        argo_data['AOU'] = pd.to_numeric(_compute_profile_aou(argo_data), errors='coerce')
+    elif db_variable_name not in argo_data.columns:
         if db_variable_name == display_variable:
             print(f"  - Column '{db_variable_name}' not found in matched Argo data.")
         else:
@@ -2715,41 +3002,37 @@ def plot_track_variable_timeseries(
         return
 
     if 'Profile_number' not in argo_data.columns:
-        print("  - Column 'Profile_number' is required to align with ΔDO anomaly filtering.")
+        print("  - Column 'Profile_number' is required to align with anomaly filtering.")
         return
 
     anomaly_filtered = False
-    if only_above_threshold:
+    if only_anomaly_profiles:
         anomalies = calculate_delta_do(
             argo_data,
+            detection_config=cfg,
             depth_col=depth_col,
-            depth_interval=depth_interval,
-            do_threshold=threshold,
-            salinity_threshold=salinity_threshold,
-            temperature_threshold=temperature_threshold,
-            anomaly_min_depth=anomaly_min_depth,
-            depth_merge_tolerance=depth_merge_tolerance,
-            duplicate_depth_strategy=duplicate_depth_strategy,
             remove_outliers=remove_outliers,
             verbose=False,
         )
         if anomalies.empty or 'Profile_number' not in anomalies.columns:
-            print("  - No profiles satisfy the ΔDO anomaly criteria.")
+            print(f"  - No profiles satisfy the anomaly criteria ({cfg.threshold_label()}).")
             return
-        anomalies_sorted = anomalies.sort_values(by='delta_do', ascending=False)
-        anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
+        anomalies_unique = _keep_best_anomaly_per_profile(anomalies, cfg)
         qualifying_profiles = anomalies_unique['Profile_number'].dropna().unique()
         if qualifying_profiles.size == 0:
-            print("  - No profiles satisfy the ΔDO anomaly criteria.")
+            print(f"  - No profiles satisfy the anomaly criteria ({cfg.threshold_label()}).")
             return
         argo_data = argo_data[argo_data['Profile_number'].isin(qualifying_profiles)].copy()
         if argo_data.empty:
-            print("  - No profiles remain after applying ΔDO anomaly filter.")
+            print("  - No profiles remain after applying anomaly filter.")
             return
         anomaly_filtered = True
 
     if remove_outliers:
-        argo_data = _apply_basic_argo_qc(argo_data, db_variable_name)
+        if db_variable_name == 'AOU':
+            argo_data['AOU'], _ = _compute_aou_for_plot(argo_data, remove_outliers=True)
+        else:
+            argo_data = _apply_basic_argo_qc(argo_data, db_variable_name)
 
     argo_data['_var'] = pd.to_numeric(argo_data[db_variable_name], errors='coerce')
     argo_data['_depth'] = pd.to_numeric(argo_data[depth_col], errors='coerce')
@@ -2759,13 +3042,11 @@ def plot_track_variable_timeseries(
         return
 
     mask = ~argo_data['_var'].isna()
-    if not anomaly_filtered and threshold is not None:
-        mask &= argo_data['_var'] >= threshold
     if max_depth is not None:
         mask &= argo_data['_depth'] <= max_depth
     selected = argo_data.loc[mask]
     if selected.empty:
-        print("  - No profiles satisfy the selected threshold/variable conditions.")
+        print("  - No profiles satisfy the selected variable/depth conditions.")
         return
 
     if depth_bin_size <= 0:
@@ -2844,7 +3125,7 @@ def plot_track_variable_timeseries(
     cf = ax.contourf(date_vals, depth_vals, Z, levels=levels, cmap=cmap)
     ax.invert_yaxis()
     ax.set_ylabel('Depth (dbar)', fontsize=14)
-    title_suffix = ' (thresholded)' if only_above_threshold else ' (all profiles)'
+    title_suffix = ' (anomaly profiles)' if only_anomaly_profiles else ' (all profiles)'
     ax.set_title(f"{ds_name}{no} {display_variable} mean inside eddy{title_suffix}", fontsize=16)
     ax.xaxis_date()
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
@@ -2883,13 +3164,12 @@ def plot_track_variable_timeseries(
 
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_track_timeseries"
+        run_tag = cfg.file_stem()
+        output_dir = cfg.output_dir("plot_track_timeseries", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
-        thr_suffix = ''
-        if only_above_threshold and threshold is not None:
-            thr_suffix = f"_thr{str(threshold).replace('.', 'p')}"
+        profile_suffix = "_anomaly_profiles" if only_anomaly_profiles else "_all_profiles"
         depth_suffix = f"_depth{str(max_depth).replace('.', 'p')}" if max_depth is not None else ''
-        base_filename = f"{ds_name}{no}_{variable}_timeseries{thr_suffix}{depth_suffix}.png"
+        base_filename = f"{ds_name}{no}_{variable}_timeseries{profile_suffix}{depth_suffix}_{run_tag}.png"
         save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
@@ -3790,7 +4070,7 @@ def plot_vertical(
 
             if save_fig:
                 region_slug = _current_region_key()
-                output_dir = Path(plots_output_root) / region_slug / "plot_vertical_profiles"
+                output_dir = _shared_output_dir("plot_vertical_profiles", region_slug)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 save_path = output_dir / f"{ds_names}{no}_Platform_{int(platform_id_val)}.png"
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -3918,7 +4198,7 @@ def plot_vertical(
 
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_vertical_monthly_aggregated"
+        output_dir = _shared_output_dir("plot_vertical_monthly_aggregated", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
         month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
         filename = f"{ds_names}{no}_months_{month_suffix}_aggregated.png"
@@ -4187,7 +4467,7 @@ def plot_relative_position(
         
             if save_fig:
                 region_slug = _current_region_key()
-                output_dir = Path(plots_output_root) / region_slug / "plot_relative_position"
+                output_dir = _shared_output_dir("plot_relative_position", region_slug)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 save_path = output_dir / f"{ds_names}{no}RP{int(platform_id_val)}.png"
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -4362,7 +4642,7 @@ def plot_relative_position(
     # 保存/显示
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_relative_position_monthly_aggregated"
+        output_dir = _shared_output_dir("plot_relative_position_monthly_aggregated", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
         month_suffix = "all" if not month_required or (month_required and len(month_required) > 6) else "_".join(map(str, month_required))
         base_filename = f"{ds_names}{no}_RP_months_{month_suffix}_aggregated.png"
@@ -4597,31 +4877,31 @@ class LineDrawer:
         self.ax.figure.canvas.draw_idle()
         print("\n准备就绪，可继续点击绘制下一条直线。")
 
-def _reduce_argo_profiles_by_delta(
+def _reduce_argo_profiles_by_anomaly(
     rows: pd.DataFrame,
-    do_threshold: float,
-    min_depth: float,
+    detection_config: DetectionConfig | None = None,
+    min_depth: float | None = None,
 ) -> pd.DataFrame:
-    """按 ΔDO/最小深度阈值筛选，并为每个 Profile 仅保留最大 ΔDO 的代表点。"""
+    """按 DetectionConfig 筛选异常，并为每个 Profile 保留最强代表点。"""
     if rows is None or rows.empty:
         return pd.DataFrame()
 
+    overrides = {}
+    if min_depth is not None:
+        overrides['anomaly_min_depth'] = float(min_depth)
+    cfg = _resolve_detection_config(detection_config, **overrides)
+
     deltas = calculate_delta_do(
         rows,
-        do_threshold=float(do_threshold),
-        salinity_threshold=0.0,
-        temperature_threshold=0.0,
-        anomaly_min_depth=float(min_depth),
-        include_aou=False,
+        detection_config=cfg,
+        include_aou=(cfg.method != 'do'),
         remove_outliers=True,
         verbose=False,
     )
     if deltas is None or deltas.empty:
         return pd.DataFrame()
 
-    if 'Profile_number' in deltas.columns:
-        deltas = deltas.sort_values('delta_do', ascending=False)
-        deltas = deltas.drop_duplicates(subset='Profile_number', keep='first')
+    deltas = _keep_best_anomaly_per_profile(deltas, cfg)
     return deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
 
 def _compute_horizontal_glorys_field(
@@ -4708,7 +4988,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
                                  show_fig: bool = True, save_fig: bool = False,
                                  k: float | list[float] | None = None, b: float | list[float] | None = None,
                                  needed_depth: float | int = 0, inline_mode: bool = True,
-                                 argo_do_threshold: float | None = 0.0,
+                                 argo_detection_config: DetectionConfig | None = None,
                                  argo_min_depth: float | None = None):
     '''
     绘制指定涡旋在指定日期的 GLORYS 水平快照，并叠加同日 Argo 异常点。
@@ -4716,7 +4996,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     该函数是 track 场景下的水平可视化入口：
     - 背景场来自目标日期与目标深度的 GLORYS 子区域；
     - 叠加涡旋轨迹、当日有效半径和轮廓；
-    - 对同日匹配 Argo 按 ΔDO 与最小深度阈值筛选后，仅保留每个 Profile 的最大 ΔDO 代表点。
+    - 对同日匹配 Argo 按 argo_detection_config 识别异常后，仅保留每个 Profile 的最强异常代表点。
 
     参数:
         DS (list | str | tuple | dict): 轨迹数据输入。
@@ -4734,7 +5014,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
         inline_mode (bool): 是否使用内联静态模式。
             - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
             - False: 交互模式，保留图窗句柄，可配合 LineDrawer 手动点选剖面线。
-        argo_do_threshold (float | None): Argo 筛选的 ΔDO 阈值，None 等价 0。
+        argo_detection_config: Argo 异常点筛选配置。
         argo_min_depth (float | None): Argo 筛选最小深度阈值（m），None 回退全局配置。
 
     返回:
@@ -4747,10 +5027,10 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
         - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
         - inline_mode=False: 交互模式，可在图窗中继续点选与分析。
     '''
-    if argo_do_threshold is None:
-        argo_do_threshold = 0.0
-    if argo_min_depth is None:
-        argo_min_depth = _cfg_anomaly_min_depth
+    argo_detection_config = _resolve_detection_config(
+        argo_detection_config,
+        anomaly_min_depth=argo_min_depth,
+    )
 
     # 若从 widget 切回 inline，清理遗留的交互式 figure，避免被 inline 后端顺带渲染
     if inline_mode:
@@ -4811,15 +5091,14 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     if argo_data_filtered.empty:
         needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
     else:
-        deltas = _reduce_argo_profiles_by_delta(
+        deltas = _reduce_argo_profiles_by_anomaly(
             argo_data_filtered,
-            do_threshold=float(argo_do_threshold),
-            min_depth=float(argo_min_depth),
+            detection_config=argo_detection_config,
         )
         if deltas.empty:
             print(
                 f"Warning: No Argo points pass thresholds "
-                f"(ΔDO>={argo_do_threshold:g}, depth>={float(argo_min_depth):g}m)."
+                f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
             )
             needed_data = pd.DataFrame(columns=argo_data_filtered.columns)
         else:
@@ -4915,7 +5194,7 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
         valid_argo = np.isfinite(needed_lon_plot) & np.isfinite(needed_lat_plot)
         sc = ax.scatter(needed_lon_plot[valid_argo], needed_lat_plot[valid_argo], c=needed_do_plot[valid_argo], cmap = 'bwr', s=120,
                         vmin=150, vmax=240, edgecolors='black', linewidths=0.5,
-                        label=f'Argo max ΔDO point (ΔDO>={argo_do_threshold:g}, depth>={float(argo_min_depth):g}m)', zorder=5)
+                        label=f'Argo anomaly point ({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)', zorder=5)
         cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=cbar_pad)
         cbar2.set_label('DO/μmol·kg⁻¹', fontsize=cbar_label_fs)
         cbar2.ax.tick_params(labelsize=cbar_tick_fs)
@@ -4957,9 +5236,13 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     # 保存图片
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_track_horizontal_glorys"
+        run_tag = argo_detection_config.file_stem()
+        output_dir = argo_detection_config.output_dir("plot_track_horizontal_glorys", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
-        base_filename = f"{ds_names}{no}_{glorys_depth_filtered[0]:.2f}m_{variable}_{dates.iloc[needed_idx].strftime('%Y%m%d')}.png"
+        base_filename = (
+            f"{ds_names}{no}_{glorys_depth_filtered[0]:.2f}m_{variable}_"
+            f"{dates.iloc[needed_idx].strftime('%Y%m%d')}_{run_tag}.png"
+        )
         save_path = output_dir / base_filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"\nFigure saved to: {save_path}")
@@ -5641,7 +5924,7 @@ def plot_argo_horizontal_glorys(
     inline_mode: bool = True,
     xmin: float = -400.0,
     xmax: float = 400.0,
-    argo_do_threshold: float | None = 0.0,
+    argo_detection_config: DetectionConfig | None = None,
     argo_min_depth: float | None = None,
     argo_data_dir: str | Path | None = None,
 ):
@@ -5667,7 +5950,7 @@ def plot_argo_horizontal_glorys(
             - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
             - False: 保留图窗句柄，便于后续交互或外部继续操作。
         xmin, xmax (float): 局地窗口横向范围（km，中心为 0），用于确定经纬子区域读取范围。
-        argo_do_threshold (float | None): 叠加点的 ΔDO 阈值；None 等价 0。
+        argo_detection_config: 叠加点异常筛选配置。
         argo_min_depth (float | None): 叠加点最小深度阈值（m）；None 回退配置项。
         argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
 
@@ -5678,10 +5961,10 @@ def plot_argo_horizontal_glorys(
         - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
         - inline_mode=False: 交互模式，适合 Notebook 实时查看与二次操作。
     """
-    if argo_do_threshold is None:
-        argo_do_threshold = 0.0
-    if argo_min_depth is None:
-        argo_min_depth = _cfg_anomaly_min_depth
+    argo_detection_config = _resolve_detection_config(
+        argo_detection_config,
+        anomaly_min_depth=argo_min_depth,
+    )
 
     if not inline_mode:
         backend_name = str(plt.get_backend()).lower()
@@ -5731,7 +6014,7 @@ def plot_argo_horizontal_glorys(
         ),
     )
 
-    # 同日 Argo，按窗口粗筛后沿用与旧水平图相同的 ΔDO 筛选与“每剖面取最大 ΔDO”规则
+    # 同日 Argo，按窗口粗筛后沿用当前 DetectionConfig 的异常筛选与“每剖面取最强异常”规则
     day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
     day_rows = df_year.loc[day_ts == needed_date.normalize()].copy()
     if not day_rows.empty:
@@ -5750,10 +6033,9 @@ def plot_argo_horizontal_glorys(
         )
         day_window = day_rows.loc[mask_window].copy()
         if not day_window.empty:
-            deltas = _reduce_argo_profiles_by_delta(
+            deltas = _reduce_argo_profiles_by_anomaly(
                 day_window,
-                do_threshold=float(argo_do_threshold),
-                min_depth=float(argo_min_depth),
+                detection_config=argo_detection_config,
             )
             if not deltas.empty:
                 needed_data = deltas
@@ -5792,7 +6074,7 @@ def plot_argo_horizontal_glorys(
             vmax=240,
             edgecolors='black',
             linewidths=0.5,
-            label=f'Argo max ΔDO point (ΔDO>={float(argo_do_threshold):g}, depth>={float(argo_min_depth):g}m)',
+            label=f'Argo anomaly point ({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)',
             zorder=7,
         )
         cbar2 = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.16)
@@ -5813,7 +6095,7 @@ def plot_argo_horizontal_glorys(
     else:
         print(
             f"No Argo anomalies in window on {needed_date.strftime('%Y-%m-%d')} "
-            f"(ΔDO>={float(argo_do_threshold):g}, depth>={float(argo_min_depth):g}m)."
+            f"({argo_detection_config.threshold_label()}, depth>={float(argo_detection_config.anomaly_min_depth):g}m)."
         )
 
     ax.set_title(
@@ -5831,11 +6113,12 @@ def plot_argo_horizontal_glorys(
 
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_argo_horizontal_glorys"
+        run_tag = argo_detection_config.file_stem()
+        output_dir = argo_detection_config.output_dir("plot_argo_horizontal_glorys", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
         fname = (
             f"ARGO_profile{int(profile_number)}_{float(glorys_depth_filtered[0]):.2f}m_{variable}_"
-            f"{needed_date.strftime('%Y%m%d')}.png"
+            f"{needed_date.strftime('%Y%m%d')}_{run_tag}.png"
         )
         save_path = output_dir / fname
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -6749,7 +7032,7 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
                      color_vmax: float | None = None,
                      plot_mlt: bool = False,
                      plot_argo_projection: bool = True,
-                     argo_projection_do_threshold: float | None = None,
+                     argo_projection_config: DetectionConfig | None = None,
                      argo_projection_min_depth: float | None = None,
                      plot_isolines: bool = True,
                      isoline_levels: int | list[float] | np.ndarray | None = None,
@@ -6790,7 +7073,7 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
             - 指定后：覆盖自动范围（可只给其中一个，另一个保持自动）。
         plot_mlt (bool): 是否叠加混合层深度线（MLD）。
         plot_argo_projection (bool): 是否叠加“同日期、涡旋内部”的 Argo 点投影。
-        argo_projection_do_threshold (float | None): Argo 映射层使用的 ΔDO 阈值；None 回退 0（不筛选）。
+        argo_projection_config: Argo 映射层异常筛选配置。
         argo_projection_min_depth (float | None): Argo 映射层使用的最小深度阈值；None 回退 `_cfg_anomaly_min_depth`。
         plot_isolines (bool): 是否在色斑图上叠加变量等值线。默认 True。
         isoline_levels (int | list[float] | np.ndarray | None): 等值线级别。
@@ -6863,11 +7146,11 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
     _ARGO_MARKER_MAX_SIZE = 180.0
     _ARGO_MARKER_MIN_SIZE = 10.0
 
-    # Argo 投影层阈值参数（默认回退全局配置，常见为 ΔDO=50、depth=300m）
-    if argo_projection_do_threshold is None:
-        argo_projection_do_threshold = 0.0
-    if argo_projection_min_depth is None:
-        argo_projection_min_depth = _cfg_anomaly_min_depth
+    # Argo 投影层阈值参数
+    argo_projection_config = _resolve_detection_config(
+        argo_projection_config,
+        anomaly_min_depth=argo_projection_min_depth,
+    )
 
     # --- 1.1 按需准备 Argo 映射数据（仅针对 needed_date 当天） ---
     projected_argo_rows = pd.DataFrame()
@@ -6924,16 +7207,15 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
                     projected_argo_rows['DO'] = pd.to_numeric(projected_argo_rows.get('DO', np.nan), errors='coerce')
                     projected_argo_rows = projected_argo_rows.dropna(subset=['Longitude', 'Latitude', 'Depth'])
 
-                    # 每个 Profile 仅保留一个代表点：按 ΔDO/深度阈值筛选后取最大 ΔDO。
+                    # 每个 Profile 仅保留一个代表点：按当前异常配置筛选后取 anomaly_score 最强一条。
                     if not projected_argo_rows.empty and 'Profile_number' in projected_argo_rows.columns:
                         projected_argo_rows['Profile_number'] = pd.to_numeric(projected_argo_rows['Profile_number'], errors='coerce')
                         projected_argo_rows = projected_argo_rows.dropna(subset=['Profile_number']).copy()
 
                         if not projected_argo_rows.empty:
-                            deltas = _reduce_argo_profiles_by_delta(
+                            deltas = _reduce_argo_profiles_by_anomaly(
                                 projected_argo_rows,
-                                do_threshold=float(argo_projection_do_threshold),
-                                min_depth=float(argo_projection_min_depth),
+                                detection_config=argo_projection_config,
                             )
                             if not deltas.empty:
                                 projected_argo_rows = deltas
@@ -7197,11 +7479,12 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
         # --- 4. 保存和显示 ---
         if save_fig:
             region_slug = _current_region_key()
-            output_dir = Path(plots_output_root) / region_slug / str(save_subdir)
+            run_tag = argo_projection_config.file_stem()
+            output_dir = argo_projection_config.output_dir(str(save_subdir), region_slug)
             output_dir.mkdir(parents=True, exist_ok=True)
             date_fn = date_str.replace('-', '')
             base_filename = (f"{ds_name}{metadata['eddy_no']}_vertical_{variable}_{date_fn}_"
-                             f"k{metadata['k']:.2f}b{metadata['b']:.2f}.png")
+                             f"k{metadata['k']:.2f}b{metadata['b']:.2f}_{run_tag}.png")
             save_path = output_dir / base_filename
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Figure saved to: {save_path}")
@@ -7221,8 +7504,8 @@ def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestam
                                color_vmax: float | None = None,
                                plot_mlt: bool = False,
                                plot_argo_projection: bool = True,
-                               argo_projection_do_threshold: float | None = None,
-                               argo_projection_min_depth: float | None = None,
+                               argo_projection_config: DetectionConfig | None = None,
+                                         argo_projection_min_depth: float | None = None,
                                plot_isolines: bool = True,
                                isoline_levels: int | list[float] | np.ndarray | None = None,
                                isoline_color: str = 'black',
@@ -7250,7 +7533,7 @@ def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestam
         color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
         plot_mlt (bool): 是否叠加混合层深度线。
         plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层。
-        argo_projection_do_threshold (float | None): 投影点 ΔDO 阈值。
+        argo_projection_config: 投影点异常筛选配置。
         argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
         plot_isolines (bool): 是否叠加变量等值线。
         isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
@@ -7279,7 +7562,7 @@ def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestam
         color_vmax=color_vmax,
         plot_mlt=plot_mlt,
         plot_argo_projection=plot_argo_projection,
-        argo_projection_do_threshold=argo_projection_do_threshold,
+        argo_projection_config=argo_projection_config,
         argo_projection_min_depth=argo_projection_min_depth,
         plot_isolines=plot_isolines,
         isoline_levels=isoline_levels,
@@ -7311,7 +7594,7 @@ def plot_argo_vertical_glorys(
     color_vmax: float | None = None,
     plot_mlt: bool = False,
     plot_argo_projection: bool = True,
-    argo_projection_do_threshold: float | None = None,
+    argo_projection_config: DetectionConfig | None = None,
     argo_projection_min_depth: float | None = None,
     plot_isolines: bool = True,
     isoline_levels: int | list[float] | np.ndarray | None = None,
@@ -7344,7 +7627,7 @@ def plot_argo_vertical_glorys(
         color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
         plot_mlt (bool): 是否叠加混合层深度线。
         plot_argo_projection (bool): 是否叠加同日 Argo 点投影层。
-        argo_projection_do_threshold (float | None): 投影点 ΔDO 阈值。
+        argo_projection_config: 投影点异常筛选配置。
         argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
         plot_isolines (bool): 是否叠加变量等值线。
         isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
@@ -7393,10 +7676,10 @@ def plot_argo_vertical_glorys(
 
     projected_argo_rows = pd.DataFrame()
     if plot_argo_projection:
-        if argo_projection_do_threshold is None:
-            argo_projection_do_threshold = 0.0
-        if argo_projection_min_depth is None:
-            argo_projection_min_depth = _cfg_anomaly_min_depth
+        argo_projection_config = _resolve_detection_config(
+            argo_projection_config,
+            anomaly_min_depth=argo_projection_min_depth,
+        )
 
         day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
         day_rows = df_year.loc[day_ts == target_date.normalize()].copy()
@@ -7424,10 +7707,9 @@ def plot_argo_vertical_glorys(
                 if 'Profile_number' in day_window.columns:
                     day_window['Profile_number'] = pd.to_numeric(day_window['Profile_number'], errors='coerce')
                     day_window = day_window.dropna(subset=['Profile_number'])
-                deltas = _reduce_argo_profiles_by_delta(
+                deltas = _reduce_argo_profiles_by_anomaly(
                     day_window,
-                    do_threshold=float(argo_projection_do_threshold),
-                    min_depth=float(argo_projection_min_depth),
+                    detection_config=argo_projection_config,
                 )
                 if not deltas.empty:
                     projected_argo_rows = deltas
@@ -7449,7 +7731,7 @@ def plot_argo_vertical_glorys(
         color_vmax=color_vmax,
         plot_mlt=plot_mlt,
         plot_argo_projection=plot_argo_projection,
-        argo_projection_do_threshold=argo_projection_do_threshold,
+        argo_projection_config=argo_projection_config,
         argo_projection_min_depth=argo_projection_min_depth,
         plot_isolines=plot_isolines,
         isoline_levels=isoline_levels,
@@ -7631,10 +7913,9 @@ def _project_argo_rows_to_profile_for_overview(
 def _prepare_overview_projection_rows(
     rows: pd.DataFrame,
     *,
-    do_threshold: float,
-    min_depth: float,
+    detection_config: DetectionConfig,
 ) -> pd.DataFrame:
-    """清洗 Argo 行并按 ΔDO/深度阈值筛选代表点。"""
+    """清洗 Argo 行并按统一异常配置筛选代表点。"""
     if rows is None or rows.empty:
         return pd.DataFrame()
 
@@ -7653,10 +7934,9 @@ def _prepare_overview_projection_rows(
         if cleaned.empty:
             return pd.DataFrame()
 
-    deltas = _reduce_argo_profiles_by_delta(
+    deltas = _reduce_argo_profiles_by_anomaly(
         cleaned,
-        do_threshold=float(do_threshold),
-        min_depth=float(min_depth),
+        detection_config=detection_config,
     )
     return deltas if not deltas.empty else pd.DataFrame()
 
@@ -7856,13 +8136,16 @@ def _run_vertical_overview_batch(
     isoline_linewidth: float,
     isoline_alpha: float,
     label_isolines: bool,
+    detection_config: DetectionConfig | None,
     show_fig: bool,
     save_fig: bool,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
     results: list[dict] = []
     region_slug = _current_region_key()
-    out_dir = Path(plots_output_root) / region_slug / save_subdir
+    cfg = _resolve_detection_config(detection_config)
+    run_tag = cfg.file_stem()
+    out_dir = cfg.output_dir(save_subdir, region_slug)
     if save_fig:
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -7905,7 +8188,7 @@ def _run_vertical_overview_batch(
         save_path = None
         if save_fig:
             save_path = out_dir / (
-                f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}.png"
+                f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
             )
             fig.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Figure saved to: {save_path}")
@@ -7937,7 +8220,7 @@ def plot_track_vertical_glorys_overview(
     profile_depth_spacing_m: float | None = None,
     plot_mlt: bool = False,
     plot_argo_projection: bool = True,
-    argo_projection_do_threshold: float | None = None,
+    argo_projection_config: DetectionConfig | None = None,
     argo_projection_min_depth: float | None = None,
     plot_isolines: bool = True,
     isoline_levels: int | list[float] | np.ndarray | None = None,
@@ -7989,10 +8272,10 @@ def plot_track_vertical_glorys_overview(
 
     projected_argo_rows = pd.DataFrame()
     if plot_argo_projection:
-        if argo_projection_do_threshold is None:
-            argo_projection_do_threshold = 0.0
-        if argo_projection_min_depth is None:
-            argo_projection_min_depth = _cfg_anomaly_min_depth
+        argo_projection_config = _resolve_detection_config(
+            argo_projection_config,
+            anomaly_min_depth=argo_projection_min_depth,
+        )
 
         argo_all = filtered_float_data(ds_source_for_filter, no, track=track_df)
         if not argo_all.empty:
@@ -8002,8 +8285,7 @@ def plot_track_vertical_glorys_overview(
             if not projected_argo_rows.empty:
                 projected_argo_rows = _prepare_overview_projection_rows(
                     projected_argo_rows,
-                    do_threshold=float(argo_projection_do_threshold),
-                    min_depth=float(argo_projection_min_depth),
+                    detection_config=argo_projection_config,
                 )
 
     ds_name_upper = ds_name.upper() if isinstance(ds_name, str) else "UNKNOWN"
@@ -8031,6 +8313,7 @@ def plot_track_vertical_glorys_overview(
         isoline_linewidth=isoline_linewidth,
         isoline_alpha=isoline_alpha,
         label_isolines=label_isolines,
+        detection_config=argo_projection_config,
         show_fig=show_fig,
         save_fig=save_fig,
     )
@@ -8054,7 +8337,7 @@ def plot_argo_vertical_glorys_overview(
     profile_depth_spacing_m: float | None = None,
     plot_mlt: bool = False,
     plot_argo_projection: bool = True,
-    argo_projection_do_threshold: float | None = None,
+    argo_projection_config: DetectionConfig | None = None,
     argo_projection_min_depth: float | None = None,
     plot_isolines: bool = True,
     isoline_levels: int | list[float] | np.ndarray | None = None,
@@ -8104,10 +8387,10 @@ def plot_argo_vertical_glorys_overview(
 
     projected_argo_rows = pd.DataFrame()
     if plot_argo_projection:
-        if argo_projection_do_threshold is None:
-            argo_projection_do_threshold = 0.0
-        if argo_projection_min_depth is None:
-            argo_projection_min_depth = _cfg_anomaly_min_depth
+        argo_projection_config = _resolve_detection_config(
+            argo_projection_config,
+            anomaly_min_depth=argo_projection_min_depth,
+        )
 
         df_year = info['year_df']
         day_ts = pd.to_datetime(df_year[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
@@ -8133,8 +8416,7 @@ def plot_argo_vertical_glorys_overview(
             if not day_window.empty:
                 projected_argo_rows = _prepare_overview_projection_rows(
                     day_window,
-                    do_threshold=float(argo_projection_do_threshold),
-                    min_depth=float(argo_projection_min_depth),
+                    detection_config=argo_projection_config,
                 )
 
     return _run_vertical_overview_batch(
@@ -8160,6 +8442,7 @@ def plot_argo_vertical_glorys_overview(
         isoline_linewidth=isoline_linewidth,
         isoline_alpha=isoline_alpha,
         label_isolines=label_isolines,
+        detection_config=argo_projection_config,
         show_fig=show_fig,
         save_fig=save_fig,
     )
@@ -8178,9 +8461,8 @@ def _on_segment(p, q, r):
 # 核心帮助函数：计算两条线段的交点
 def _line_segment_intersect(p1, q1, p2, q2):
     """
-    Finds the intersection point of two line segments (p1, q1) and (p2, q2).
-    Returns the intersection point as (x, y) if they intersect, otherwise None.
-    Handles collinear cases where segments overlap.
+    计算两条线段 (p1, q1) 与 (p2, q2) 的交点。
+    若相交则返回 (x, y)，否则返回 None；共线且重叠的情况会返回重叠端点。
     """
     o1 = _orientation(p1, q1, p2)
     o2 = _orientation(p1, q1, q2)
@@ -8214,18 +8496,17 @@ def _line_segment_intersect(p1, q1, p2, q2):
 # 寻找多边形和线段的交点
 def find_polygon_line_intersections(polygon_lon, polygon_lat, line_lons, line_lats, tolerance=1e-6):
     """
-    Finds intersection points of a line (defined by line_lons, line_lats)
-    with a closed polygon (defined by polygon_lon, polygon_lat).
+    计算一条折线与闭合多边形边界的交点。
 
-    Args:
-        polygon_lon (array): Longitudes of polygon vertices.
-        polygon_lat (array): Latitudes of polygon vertices.
-        line_lons (array): Longitudes of line points.
-        line_lats (array): Latitudes of line points.
-        tolerance (float): Tolerance for checking duplicate intersection points.
+    参数:
+        polygon_lon (array): 多边形顶点经度。
+        polygon_lat (array): 多边形顶点纬度。
+        line_lons (array): 折线点经度。
+        line_lats (array): 折线点纬度。
+        tolerance (float): 判定重复交点的容差。
 
-    Returns:
-        list: A list of (lon, lat) tuples for intersection points.
+    返回:
+        list: 交点的 (lon, lat) 元组列表。
     """
     intersections = []
     
@@ -8565,7 +8846,7 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     # --- 5. 保存和显示 ---
     if save_fig:
         region_slug = _current_region_key()
-        output_dir = Path(plots_output_root) / region_slug / "plot_track_vertical_glorys"
+        output_dir = _shared_output_dir("plot_track_vertical_glorys", region_slug)
         output_dir.mkdir(parents=True, exist_ok=True)
         date_fn = metadata['date_str'].replace('-', '')
         
@@ -9049,31 +9330,25 @@ def plot_all_tracks_in_range(
     show_labels: bool = True,
     show_fig: bool = True,
     circle_enlargement_factor: float | None = None,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
-    anomaly_color_by: str = 'delta_do',
-    fix_delta_do_colorbar: bool = True,
-    delta_do_cbar_min: float = 50.0,
-    delta_do_cbar_max: float = 100.0,
-    delta_do_cbar_ticks: list | None = None,
+    detection_config: DetectionConfig | None = None,
+    anomaly_color_by: str = 'auto',
+    fix_colorbar: bool = True,
+    cbar_min: float | None = None,
+    cbar_max: float | None = None,
+    cbar_ticks: list | None = None,
     meta_output_root: str | Path | None = None,
     save_interacted_eddies: bool = False,
     save_interacting_argo: bool = False,
 ):
-    """(核心绘图) 指定时间段内涡旋轨迹 + Argo ΔDO 异常代表点（仅采用 ΔDO 方法）。
+    """(核心绘图) 指定时间段内涡旋轨迹 + Argo 异常代表点（支持 do/aou/trim）。
 
     依赖 Cartopy 进行制图，自动处理跨国际日期变更线的轨迹连线。
 
     工作流程：
-      1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 计算 ΔDO 异常。
-      2. 若 anomaly_min_depth > 0，则按该阈值过滤异常深度。
-      3. 每个剖面保留 delta_do（或 do_value）最大的一条。
-      4. 按 anomaly_color_by 着色：'delta_do' (默认) 或 'do_value'。
+      1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 按 detection_config 计算异常。
+      2. 深度限制由 DetectionConfig 统一管理。
+      3. 每个剖面保留 anomaly_score 最强的一条。
+      4. anomaly_color_by='auto' 时按当前方法的主变量着色。
 
     参数:
         start_date_str, end_date_str: 日期范围。
@@ -9086,39 +9361,29 @@ def plot_all_tracks_in_range(
         save_fig, show_fig: 输出控制。
         skip_save_if_empty: 若为 True 且本图中未绘制任何涡旋（不含底图/Argo点），则跳过保存；默认 False（单次绘图默认不跳过）。
         show_labels: 是否绘制轨迹文本标签（如 ACLXXXX）。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy: 传给 calculate_delta_do。
-        anomaly_min_depth: (可选) 仅保留异常深度 >= 此值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
-        anomaly_color_by: 'delta_do' 或 'do_value'。
-        fix_delta_do_colorbar: 若为 True 且按 delta_do 着色，则强制使用 [delta_do_cbar_min, delta_do_cbar_max] 作为色标范围。
-        delta_do_cbar_min / delta_do_cbar_max: ΔDO 色标固定范围上下限（仅在 fix_delta_do_colorbar=True 且 anomaly_color_by='delta_do' 时生效）。
-        delta_do_cbar_ticks: 自定义 ΔDO 色标刻度列表（None 自动：若只提供上下限则显示两端；若范围>30 添加中点）。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
+        anomaly_color_by: 'auto'、'primary_value'、'anomaly_score'，或异常表中的任意数值列名。
+        fix_colorbar / cbar_min / cbar_max / cbar_ticks: 异常主变量色标控制。
         meta_output_root: 指定 META_tracks 根目录（可覆盖配置默认）。
         save_interacted_eddies (bool): True 时保存本期交互涡旋标签（NPY）；默认 False。
-        save_interacting_argo (bool): True 时保存本期交互 Argo 明细（Parquet）；默认 False，输出目录固定为按阈值划分的子目录。
+        save_interacting_argo (bool): True 时保存本期交互 Argo 明细（Parquet）；默认 False，输出目录按 detection_config.file_stem() 划分。
 
-    输出（按阈值子目录 thr{thr}[_depth{d}m] 保存）：
+    输出（保存到 plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/）：
         - All_Tracks_{start}_to_{end}.png
-        - Interacted_Eddies_{start}_{end}_thr{thr}[_depth{d}m}.npy（当 save_interacted_eddies=True 时）
-        - Interacting_Argo_{start}_{end}_thr{thr}[_depth{d}m}.parquet（当 save_interacting_argo=True 时）
+        - Interacted_Eddies_{start}_{end}_{detection_config.file_stem()}.npy（当 save_interacted_eddies=True 时）
+        - Interacting_Argo_{start}_{end}_{detection_config.file_stem()}.parquet（当 save_interacting_argo=True 时）
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
     if circle_enlargement_factor is None:
         circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None:
-        salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None:
-        temperature_threshold = _default_temperature_threshold
-    if depth_interval is None:
-        depth_interval = _default_depth_interval
-    if depth_merge_tolerance is None:
-        depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None:
-        duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(
+        detection_config,
+        cbar_min=cbar_min,
+        cbar_max=cbar_max,
+        cbar_ticks=cbar_ticks,
+    )
+    method_name = cfg.method
     # 若未显式提供，则在并行 worker 中从全局共享获得
     if local_eddy_datasets is None:
         try:
@@ -9178,28 +9443,21 @@ def plot_all_tracks_in_range(
             )
             anomalies = calculate_delta_do(
                 argo_in_geo_range,
-                depth_interval=depth_interval,
-                do_threshold=do_threshold,
-                salinity_threshold=salinity_threshold,
-                temperature_threshold=temperature_threshold,
-                anomaly_min_depth=anomaly_min_depth,
-                depth_merge_tolerance=depth_merge_tolerance,
-                duplicate_depth_strategy=duplicate_depth_strategy,
+                detection_config=cfg,
                 remove_outliers=True,
                 verbose=False
             )
             if not anomalies.empty:
-                sort_field = 'delta_do' if (
-                    anomaly_color_by == 'delta_do' and 'delta_do' in anomalies.columns
-                ) else 'do_value'
-                anomalies_sorted = anomalies.sort_values(by=[sort_field], ascending=False)
-                anomalies_unique = anomalies_sorted.drop_duplicates(subset='Profile_number', keep='first')
+                anomalies_unique = _keep_best_anomaly_per_profile(anomalies, cfg)
                 needed_argo_data = anomalies_unique.rename(columns={'depth': 'Anomaly_depth'})
 
     argo_by_date = defaultdict(list)
     if not needed_argo_data.empty:
         for _, row in needed_argo_data.iterrows():
             date_key = pd.Timestamp(year=int(row['Year']), month=int(row['Month']), day=int(row['Day']))
+            row_method = row.get('detection_method', method_name)
+            if pd.isna(row_method):
+                row_method = method_name
             argo_by_date[date_key].append({
                 'Profile_number': row.get('Profile_number'),
                 'Longitude': float(row.get('Longitude')),
@@ -9208,8 +9466,12 @@ def plot_all_tracks_in_range(
                 'Month': int(row.get('Month')),
                 'Day': int(row.get('Day')),
                 'delta_do': float(row.get('delta_do')) if 'delta_do' in row else np.nan,
+                'delta_aou': float(row.get('delta_aou')) if 'delta_aou' in row else np.nan,
+                'trim_score': float(row.get('trim_score')) if 'trim_score' in row else np.nan,
+                'anomaly_score': float(row.get('anomaly_score')) if 'anomaly_score' in row else np.nan,
                 'do_value': float(row.get('do_value')) if 'do_value' in row else (float(row.get('DO')) if 'DO' in row else np.nan),
                 'Anomaly_depth': float(row.get('Anomaly_depth')) if 'Anomaly_depth' in row else np.nan,
+                'detection_method': str(row_method).lower(),
             })
 
     # --- 3. 检查所有涡旋轨迹 ---
@@ -9245,10 +9507,12 @@ def plot_all_tracks_in_range(
     data_crs = ccrs.PlateCarree()
     map_crs = ccrs.PlateCarree(central_longitude=central_lon)
 
+    criteria_label = cfg.threshold_label()
+
     fig = plt.figure(figsize=(40, 30))
     ax = fig.add_subplot(1, 1, 1, projection=map_crs)
     ax.set_title(
-        f"Eddy Tracks and Argo ΔDO Anomalies ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})",
+        f"Eddy Tracks and Argo Anomalies ({cfg.method}; {criteria_label}; {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})",
         fontsize=20
     )
 
@@ -9351,63 +9615,52 @@ def plot_all_tracks_in_range(
             transform=data_crs,
         )
 
+    anomaly_legend_label = criteria_label
+
     if not needed_argo_data.empty:
-        if anomaly_color_by == 'delta_do' and 'delta_do' in needed_argo_data.columns:
-            # 应用固定色标（可选）
-            scatter_kwargs = {}
-            if fix_delta_do_colorbar:
-                scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
-            depth_label = (
-                f' @ depth ≥ {anomaly_min_depth} m'
-                if anomaly_min_depth is not None and anomaly_min_depth > 0
-                else ''
-            )
-            sc = ax.scatter(
-                needed_argo_data['Longitude'], needed_argo_data['Latitude'],
-                c=needed_argo_data['delta_do'], cmap='Reds', s=70,
-                edgecolors='black', linewidths=0.5,
-                label=f'ΔDO ≥ {do_threshold} μmol kg⁻¹{depth_label}', zorder=3,
-                transform=data_crs,
-                **scatter_kwargs
-            )
-            cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-            cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
-            # 自动或用户自定义刻度
-            if fix_delta_do_colorbar:
-                if delta_do_cbar_ticks is not None:
-                    cbar.set_ticks(delta_do_cbar_ticks)
-                else:
-                    # 默认：只显示上下限；若范围较大则加中点
-                    rng = delta_do_cbar_max - delta_do_cbar_min
-                    if rng > 30:
-                        mid = (delta_do_cbar_max + delta_do_cbar_min) / 2
-                        cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
-                    else:
-                        cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
-        else:
-            color_values = needed_argo_data.get('do_value') if 'do_value' in needed_argo_data.columns else needed_argo_data.get('DO')
-            sc = ax.scatter(
-                needed_argo_data['Longitude'], needed_argo_data['Latitude'],
-                c=color_values, cmap='bwr', s=60, vmin=150, vmax=240,
-                edgecolors='black', linewidths=0.5,
-                label='Argo DO Anomaly Profiles',
-                zorder=3,
-                transform=data_crs,
-            )
-            cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
-            cbar.set_label('DO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
+        scatter_kwargs = {}
+        if fix_colorbar:
+            cbar_lo, cbar_hi = cfg.resolved_cbar()
+            scatter_kwargs.update(dict(vmin=cbar_lo, vmax=cbar_hi))
+        depth_label = (
+            f' @ depth ≥ {cfg.anomaly_min_depth} m'
+            if cfg.anomaly_min_depth is not None and cfg.anomaly_min_depth > 0
+            else ''
+        )
+        color_values, _, color_label, cmap_name = _color_values_for_anomalies(needed_argo_data, cfg)
+        if anomaly_color_by not in {'auto', None} and anomaly_color_by in needed_argo_data.columns:
+            color_values = pd.to_numeric(needed_argo_data[anomaly_color_by], errors='coerce')
+            color_label = anomaly_color_by
+        if color_values is None:
+            color_values = pd.Series(np.arange(len(needed_argo_data)), index=needed_argo_data.index)
+        sc = ax.scatter(
+            needed_argo_data['Longitude'], needed_argo_data['Latitude'],
+            c=color_values, cmap=cmap_name, s=70,
+            edgecolors='black', linewidths=0.5,
+            label=f'{anomaly_legend_label}{depth_label}', zorder=3,
+            transform=data_crs,
+            **scatter_kwargs
+        )
+        cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+        cbar.set_label(color_label, fontsize=20); cbar.ax.tick_params(labelsize=14)
+        if fix_colorbar:
+            _apply_detection_colorbar_ticks(cbar, cfg, cbar_lo, cbar_hi)
 
     legend_elements = [
         Line2D([0], [0], color=eddy_colors['ACE'], lw=2, label='ACE Track'),
         Line2D([0], [0], color=eddy_colors['CE'], lw=2, label='CE Track')
     ]
     handles, labels = ax.get_legend_handles_labels()
-    extra_labels = [f"Argo ΔDO ≥ {do_threshold}", 'Argo DO Anomaly Profiles', 'All Argo Profiles (baseline)']
     added = None
-    for lab in extra_labels:
-        if lab in labels:
-            added = handles[labels.index(lab)]
+    for h, lab in zip(handles, labels):
+        if lab.startswith(anomaly_legend_label) or lab == 'Argo Anomaly Profiles':
+            added = h
             break
+    if added is None:
+        for h, lab in zip(handles, labels):
+            if lab == 'All Argo Profiles (baseline)':
+                added = h
+                break
     if added is not None:
         ax.legend(handles=legend_elements + [added], fontsize=18, loc='upper left')
     else:
@@ -9546,15 +9799,11 @@ def plot_all_tracks_in_range(
     ax.set_ylim(orig_ylim)
 
     # --- 5. 输出控制 ---
+    region_slug_for_path = _current_region_key()
+    run_tag = cfg.file_stem()
+    run_output_dir = cfg.output_dir("plot_all_tracks_in_range", region_slug_for_path) / run_tag
     if save_fig:
-        # 使用阈值子目录
-        region_slug_for_path = _current_region_key()
-        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
-        thr_dir = f"thr{thr_str}"
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            thr_dir += f"_depth{depth_str}m"
-        output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
+        output_dir = run_output_dir
         output_dir.mkdir(exist_ok=True, parents=True)
         base_filename = f"All_Tracks_{start_date_str}_to_{end_date_str}.png"
         save_path = output_dir / base_filename
@@ -9586,20 +9835,9 @@ def plot_all_tracks_in_range(
                 interacting_argo_records.append(rec2)
 
     if save_interacting_argo and interacting_argo_records:
-        region_slug_for_path = _current_region_key()
-        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
-        thr_dir = f"thr{thr_str}"
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            thr_dir += f"_depth{depth_str}m"
-        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
+        out_dir = run_output_dir
         out_dir.mkdir(exist_ok=True, parents=True)
-        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-        fname_pq = out_dir / f"Interacting_Argo_{start_date_str}_to_{end_date_str}_thr{thr_str}{depth_suffix}.parquet"
+        fname_pq = out_dir / f"Interacting_Argo_{start_date_str}_to_{end_date_str}_{run_tag}.parquet"
         try:
             df_out = pd.DataFrame(interacting_argo_records)
             df_out.to_parquet(fname_pq, index=False)
@@ -9609,21 +9847,10 @@ def plot_all_tracks_in_range(
 
     # 保存交互涡旋标签（每期）为 NPY，并不返回
     try:
-        region_slug_for_path = _current_region_key()
-        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
-        thr_dir = f"thr{thr_str}"
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            thr_dir += f"_depth{depth_str}m"
-        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir
+        out_dir = run_output_dir
         out_dir.mkdir(exist_ok=True, parents=True)
-        thr_str = f"{do_threshold:g}".replace('.', 'p') if isinstance(do_threshold, (int,float)) else str(do_threshold)
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
         if save_interacted_eddies and interacted_eddies:
-            eddies_npy = out_dir / f"Interacted_Eddies_{start_date_str}_to_{end_date_str}_thr{thr_str}{depth_suffix}.npy"
+            eddies_npy = out_dir / f"Interacted_Eddies_{start_date_str}_to_{end_date_str}_{run_tag}.npy"
             # 保存为标准 Unicode 字符串数组，避免 object 导致读取需 allow_pickle=True
             labels = sorted(set(interacted_eddies))
             np.save(eddies_npy, np.array(labels, dtype=str))
@@ -9866,10 +10093,10 @@ def _load_eddy_datasets_for_range(
 def worker_wrapper(args: tuple):
     """multiprocessing worker 包装函数。
     参数:
-        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels, save_interacting_argo, save_interacted_eddies, do_threshold, anomaly_min_depth)
+        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels, save_interacting_argo, save_interacted_eddies, cfg)
     返回: None（结果由子函数写盘保存）。
     """
-    start_d, end_d, unrelated_flag, skip_empty, show_labels, save_interacting_argo_flag, save_eddies_flag, do_thr, anom_depth = args
+    start_d, end_d, unrelated_flag, skip_empty, show_labels, save_interacting_argo_flag, save_eddies_flag, cfg = args
     try:
         plot_all_tracks_in_range(
             start_date_str=start_d,
@@ -9881,8 +10108,7 @@ def worker_wrapper(args: tuple):
             show_fig=False,
             save_interacting_argo=bool(save_interacting_argo_flag),
             save_interacted_eddies=bool(save_eddies_flag),
-            do_threshold=do_thr,
-            anomaly_min_depth=anom_depth,
+            detection_config=cfg,
         )
         return None
     except Exception as e:
@@ -9897,8 +10123,7 @@ def run_batch_plotting_multiprocessing(
     plot_unrelated_eddies: bool = False,
     skip_save_if_empty: bool = True,
     show_labels: bool | None = None,
-    do_threshold: float | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     save_interacted_eddies: bool = False,
     save_interacting_argo: bool = False,
 ):
@@ -9918,19 +10143,18 @@ def run_batch_plotting_multiprocessing(
         plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
         skip_save_if_empty (bool): 批处理默认 True（空图不保存）；当传入 False 时，将把 False 透传至 worker，空图也会保存。
         show_labels (bool | None): 是否绘制轨迹标签；None 表示使用智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
-        do_threshold (float | None): ΔDO 阈值；None 使用配置默认。
-        anomaly_min_depth (float | None): 最小深度阈值；None 使用配置默认；≤0 表示不限制。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
         save_interacted_eddies (bool): True 时各月份写出 `Interacted_Eddies_*.npy` 并在末尾汇总；默认 False。
         save_interacting_argo (bool): True 时各月份写出 `Interacting_Argo_*.parquet` 并在末尾聚合；默认 False。
 
         输出:
-                - 每月图像写入 `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/`。
+                - 每月图像写入 `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/`。
                 - 当 save_interacted_eddies=True：整期交互涡旋标签汇总保存为带阈值后缀的 NPY：
-                    `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/eddy_list_thr{thr}[_depth{d}m].npy`。
+                    `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/eddy_list_<detection_config.file_stem()>.npy`。
                 - 当 save_interacting_argo=True 时，额外保存整期交互 Argo 汇总（Parquet）：
-                    `plot_outputs/<region>/plot_all_tracks_in_range/<thr_dir>/interacting_argo_all_thr{thr}[_depth{d}m].parquet`。
+                    `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/interacting_argo_all_<detection_config.file_stem()>.parquet`。
         清理:
-                - 批处理开始前仅清空对应阈值子目录 `<thr_dir>`，不会清空整个 `plot_all_tracks_in_range` 目录。
+                - 批处理开始前仅清空当前 detection_config.file_stem() 子目录，不会清空其它方法或参数目录。
     """
     print("="*60)
     print("      Multiprocessing Batch Plotting with Progress Bar      ")
@@ -9940,14 +10164,9 @@ def run_batch_plotting_multiprocessing(
     # --- 1. 创建按月切分的任务列表 ---
     month_starts = pd.date_range(start=start_date_str, end=end_date_str, freq='MS')
     region_slug_for_path = _current_region_key()
-    # 计算生效阈值并确定阈值子目录名
-    eff_do_thr = do_threshold if do_threshold is not None else _default_delta_do_threshold
-    eff_anom_depth = anomaly_min_depth if anomaly_min_depth is not None else _cfg_anomaly_min_depth
-    thr_str = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int, float)) else str(eff_do_thr)
-    thr_dir = f"thr{thr_str}"
-    if eff_anom_depth is not None and eff_anom_depth > 0:
-        depth_str = f"{eff_anom_depth:g}".replace('.', 'p')
-        thr_dir += f"_depth{depth_str}m"
+    cfg = _resolve_detection_config(detection_config)
+    print(f"Mode: {cfg.method}")
+    run_tag = cfg.file_stem()
     effective_show_labels = show_labels
     if show_labels is None:
         if plot_unrelated_eddies and region_slug_for_path.lower() in {'global', 'world', 'global_ocean', 'all'}:
@@ -9964,8 +10183,7 @@ def run_batch_plotting_multiprocessing(
             effective_show_labels,
             save_interacting_argo,
             save_interacted_eddies,
-            eff_do_thr,
-            eff_anom_depth,
+            cfg,
         )
         for start_date in month_starts
     ]
@@ -9973,8 +10191,8 @@ def run_batch_plotting_multiprocessing(
     print(f"[*] Created {len(tasks)} monthly plotting tasks to be processed by {num_workers} cores.")
 
     # 在批量任务开始前清理输出目录
-    base_output_dir = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range"
-    output_dir = base_output_dir / thr_dir
+    base_output_dir = cfg.output_dir("plot_all_tracks_in_range", region_slug_for_path)
+    output_dir = base_output_dir / run_tag
     try:
         if output_dir.exists():
             shutil.rmtree(output_dir)
@@ -10018,23 +10236,9 @@ def run_batch_plotting_multiprocessing(
         if unique_interacted:
             preview = ", ".join(unique_interacted[:20])
             print(f"Sample (first 20): {preview}{' ...' if len(unique_interacted)>20 else ''}")
-        # 不再保存未带阈值后缀的 eddy_list.npy，改为仅保存带阈值后缀版本（见后续输出）
-        # 另存带阈值后缀的汇总版本（从文件名解析 thr 与 depth）
-        thr_tag = None
-        depth_tag = None
-        if monthly_eddy_files:
-            m = re.search(r"_thr([A-Za-z0-9p]+)(?:_depth([A-Za-z0-9p]+)m)?\\.npy$", monthly_eddy_files[0].name)
-            if m:
-                thr_tag = m.group(1)
-                depth_tag = m.group(2)
-        if thr_tag:
-            suffix = f"_thr{thr_tag}"
-            if depth_tag:
-                suffix += f"_depth{depth_tag}m"
-            eddy_list_suffixed = output_dir / f"eddy_list{suffix}.npy"
-            # 使用标准 Unicode 字符串数组，避免后续读取需要 allow_pickle
-            np.save(eddy_list_suffixed, np.array(unique_interacted, dtype=str))
-            print(f"Eddy list (with thresholds) saved to: {eddy_list_suffixed}")
+        eddy_list_suffixed = output_dir / f"eddy_list_{run_tag}.npy"
+        np.save(eddy_list_suffixed, np.array(unique_interacted, dtype=str))
+        print(f"Eddy list saved to: {eddy_list_suffixed}")
     except Exception as e:
         print(f"[WARN] Failed to aggregate eddy labels: {e}")
 
@@ -10062,12 +10266,7 @@ def run_batch_plotting_multiprocessing(
                         df_all.sort_values(by=['Profile_number', '_date'], inplace=True)
                         df_all = df_all.drop_duplicates(subset=['Profile_number', '_date', 'track_label'], keep='first')
                         df_all.drop(columns=['_date'], inplace=True)
-                thr_str2 = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int,float)) else str(eff_do_thr)
-                depth_suffix2 = ''
-                if eff_anom_depth is not None and eff_anom_depth > 0:
-                    depth_str2 = f"{eff_anom_depth:g}".replace('.', 'p')
-                    depth_suffix2 = f"_depth{depth_str2}m"
-                argo_parquet = output_dir / f"interacting_argo_all_thr{thr_str2}{depth_suffix2}.parquet"
+                argo_parquet = output_dir / f"interacting_argo_all_{run_tag}.parquet"
                 df_all.to_parquet(argo_parquet, index=False)
                 print(f"Interacting Argo (all) saved to: {argo_parquet}")
         except Exception as e:
@@ -10075,6 +10274,7 @@ def run_batch_plotting_multiprocessing(
 
 def load_combined_eddy_list(
     region: str | None = None,
+    detection_config: DetectionConfig | None = None,
     thr_dir: str | Path | None = None,
     plots_root: str | Path | None = None,
     include_monthly: bool = True,
@@ -10085,7 +10285,8 @@ def load_combined_eddy_list(
 
     参数:
         region: 区域 slug；None 时复用当前 `switch_region` 的配置。
-        thr_dir: 阈值子目录名称或路径；None 时自动扫描 `thr*` 目录并要求只存在一个候选目录。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
+        thr_dir: 参数子目录名称或路径；None 时自动扫描 do/aou/trim 参数目录并要求只存在一个候选目录。
         plots_root: 可选自定义 `plot_outputs` 根路径；None 使用配置 `plots_output_root`。
         include_monthly: True 时若目录缺少汇总 `eddy_list*.npy`，会退回加载 `Interacted_Eddies_*.npy`（逐月文件）。
         deduplicate: True 返回去重并排序后的唯一列表；False 按读取顺序返回。
@@ -10095,8 +10296,9 @@ def load_combined_eddy_list(
         list[str]: 聚合后的涡旋标签列表；当没有匹配文件时返回空列表。
     """
     region_slug = region or _current_region_key()
+    cfg = _resolve_detection_config(detection_config)
     plots_base = Path(plots_root) if plots_root is not None else Path(plots_output_root)
-    base_dir = plots_base / region_slug / "plot_all_tracks_in_range"
+    base_dir = plots_base / cfg.method / region_slug / "plot_all_tracks_in_range"
     if not base_dir.exists():
         raise FileNotFoundError(f"Plot outputs directory not found: {base_dir}")
 
@@ -10108,7 +10310,8 @@ def load_combined_eddy_list(
             raise FileNotFoundError(f"阈值目录不存在：{target_dir}")
     else:
         candidate_dirs = sorted(
-            p for p in base_dir.iterdir() if p.is_dir() and p.name.lower().startswith('thr')
+            p for p in base_dir.iterdir()
+            if p.is_dir() and p.name.lower().split('_', 1)[0] in {'do', 'aou', 'trim'}
         )
         if not candidate_dirs:
             print(f"[load_combined_eddy_list] No threshold directories found under {base_dir}.")
@@ -10154,18 +10357,12 @@ def load_combined_eddy_list(
 def plot_argo_hotspots(
     start_year: int,
     end_year: int,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     plot_unrelated_argo: bool = True,
-    fix_delta_do_colorbar: bool = True,
-    delta_do_cbar_min: float = 10.0,
-    delta_do_cbar_max: float = 100.0,
-    delta_do_cbar_ticks: list | None = None,
+    fix_colorbar: bool = True,
+    cbar_min: float | None = None,
+    cbar_max: float | None = None,
+    cbar_ticks: list | None = None,
     save_fig: bool = False,
     show_fig: bool = True,
     save_data: bool = True,
@@ -10173,27 +10370,24 @@ def plot_argo_hotspots(
     dask_workers: int | None = None,
     dask_memory_limit: str | None = None,
     use_interacting_argo: bool = False,
-    split_plots: bool = False
+    split_plots: bool = False,
 ):
-    """以 ΔDO 异常方法绘制多年期 Argo 异常分布。
+    """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
 
     流程：
       1. 逐年加载 Argo 年度数据并合并；可利用全局 lonmin/latmin/lonmax/latmax 做空间裁剪；
-      2. 用 calculate_delta_do 检测每个剖面潜在 ΔDO 异常；
-      3. 若 anomaly_min_depth > 0，则按该阈值过滤；
-      4. 每个剖面保留最大 ΔDO 一条记录；
-      5. 绘制 ΔDO 异常散点（可选固定色标范围），并可选绘制所有匹配剖面基线位置（空心灰圈）。
+      2. 用 calculate_delta_do 按 detection_config 检测每个剖面的潜在异常；
+      3. 深度限制由 DetectionConfig 统一管理；
+      4. 每个剖面保留 anomaly_score 最强的一条记录；
+      5. 绘制异常散点（可选固定色标范围），并可选绘制所有匹配剖面基线位置（空心灰圈）。
 
     参数:
         start_year / end_year: 年度范围（闭区间）。
-        do_threshold / salinity_threshold / temperature_threshold / depth_interval / depth_merge_tolerance / duplicate_depth_strategy:
-            传给 calculate_delta_do；当为 None 时从 processing.yml 读取默认值。
-        anomaly_min_depth: 仅保留异常深度 >= 该值；≤0 不限制；None 表示使用 processing.yml 的 anomaly_min_depth。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
         plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
-        fix_delta_do_colorbar: 是否固定 ΔDO 色标范围。
-        delta_do_cbar_min / delta_do_cbar_max / delta_do_cbar_ticks: 色标范围与刻度配置。
+        fix_colorbar / cbar_min / cbar_max / cbar_ticks: 异常主变量色标控制。
         save_fig / show_fig: 输出控制。
-        save_data (bool): True 时保存 anomalies 为 Parquet；False 不保存数据，输出路径固定为 `plot_outputs/<region>/plot_argo_hotspots/`。
+        save_data (bool): True 时保存 anomalies 为 Parquet；False 不保存数据，输出路径固定为 `plot_outputs/<method>/<region>/plot_argo_hotspots/`。
         dask_scheduler (str | None): Dask 调度器，'threads'|'processes'|'single'，None 默认 'processes'。
         dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
         dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 '4GB'；None 不限制。
@@ -10204,46 +10398,41 @@ def plot_argo_hotspots(
                             默认 False。
 
     输出:
-        - 图像（可选）：`plot_outputs/<region>/plot_argo_hotspots/Argo_DeltaDO_Hotspots_*.png`
-        - 异常数据（Parquet，可选）：`plot_outputs/<region>/plot_argo_hotspots/anomalies_{start}_{end}_thr{thr}[_depth{d}m].parquet`
+        - 图像（可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/Argo_Anomaly_Hotspots_*.png`
+        - 异常数据（Parquet，可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/anomalies_{start}_{end}_{detection_config.file_stem()}.parquet`
     """
-    # 从配置读取默认值
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None:
-        salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None:
-        temperature_threshold = _default_temperature_threshold
-    if depth_interval is None:
-        depth_interval = _default_depth_interval
-    if depth_merge_tolerance is None:
-        depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None:
-        duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(
+        detection_config,
+        cbar_min=cbar_min,
+        cbar_max=cbar_max,
+        cbar_ticks=cbar_ticks,
+    )
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
 
     # --- 尝试加载交互 Argo 文件（若启用） ---
     interacting_argo_ids: set[int] = set()
     if use_interacting_argo:
         region_slug_for_path = _current_region_key()
-        eff_do_thr = do_threshold
-        eff_anom_depth = anomaly_min_depth
-        
-        thr_str = f"{eff_do_thr:g}".replace('.', 'p') if isinstance(eff_do_thr, (int, float)) else str(eff_do_thr)
-        thr_dir_name = f"thr{thr_str}"
-        depth_suffix = ""
-        if eff_anom_depth is not None and eff_anom_depth > 0:
-            d_str = f"{eff_anom_depth:g}".replace('.', 'p')
-            thr_dir_name += f"_depth{d_str}m"
-            depth_suffix = f"_depth{d_str}m"
-            
-        interacting_file = Path(plots_output_root) / region_slug_for_path / "plot_all_tracks_in_range" / thr_dir_name / f"interacting_argo_all_thr{thr_str}{depth_suffix}.parquet"
+        interacting_file = (
+            cfg.output_dir("plot_all_tracks_in_range", region_slug_for_path)
+            / run_tag
+            / f"interacting_argo_all_{run_tag}.parquet"
+        )
         
         if interacting_file.exists():
             print(f"[*] Loading interacting Argo from: {interacting_file}")
             try:
                 df_int = pd.read_parquet(interacting_file)
+                if 'detection_method' in df_int.columns:
+                    method_mask = df_int['detection_method'].astype(str).str.lower().eq(method_name)
+                    total_count = len(df_int)
+                    mismatch_count = int((~method_mask).sum())
+                    if mismatch_count > 0:
+                        print(f"[WARN] Mixed detection_method found: expected={method_name}, mismatched={mismatch_count}/{total_count}.")
+                    else:
+                        print(f"[*] Method={method_name}, records={total_count}")
+                    df_int = df_int[method_mask].copy()
                 if 'Profile_number' in df_int.columns:
                     interacting_argo_ids = set(df_int['Profile_number'].unique())
                 print(f"[*] Loaded {len(interacting_argo_ids)} unique interacting profiles.")
@@ -10252,7 +10441,7 @@ def plot_argo_hotspots(
         else:
             print(f"[WARN] Interacting Argo file not found: {interacting_file}")
 
-    print(f"--- Building Argo ΔDO Anomaly Map {start_year}-{end_year} ---")
+    print(f"--- Building Argo anomaly map {start_year}-{end_year} (method={method_name}) ---")
 
     # --- 按年份加载策略：串行或并行 ---
     years = list(range(start_year, end_year + 1))
@@ -10265,13 +10454,7 @@ def plot_argo_hotspots(
     worker_args_list = [
         (
             y,
-            depth_interval,
-            do_threshold,
-            salinity_threshold,
-            temperature_threshold,
-            anomaly_min_depth,
-            depth_merge_tolerance,
-            duplicate_depth_strategy,
+            cfg,
             current_lon_min,
             current_lon_max,
             current_lat_min,
@@ -10345,7 +10528,7 @@ def plot_argo_hotspots(
     if baseline_profiles.empty:
         print("No baseline profiles after filtering.")
     if anomalies.empty:
-        print("No ΔDO anomalies detected.")
+        print("No anomalies detected.")
 
     # 绘图
     crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
@@ -10359,8 +10542,9 @@ def plot_argo_hotspots(
     scatter_kwargs = {}
     
     if not anomalies.empty:
-        if fix_delta_do_colorbar:
-            scatter_kwargs.update(dict(vmin=delta_do_cbar_min, vmax=delta_do_cbar_max))
+        if fix_colorbar:
+            cbar_lo, cbar_hi = cfg.resolved_cbar()
+            scatter_kwargs.update(dict(vmin=cbar_lo, vmax=cbar_hi))
 
         anom_others = anomalies.copy()
         if use_interacting_argo and interacting_argo_ids:
@@ -10375,6 +10559,8 @@ def plot_argo_hotspots(
             print(f"[Plot Info] Anomalies: {total_anom}, Interacting: {count_int} ({pct:.1f}%)")
 
     # 定义绘图任务
+    base_anomaly_label = cfg.threshold_label()
+    title_threshold_label = cfg.threshold_label()
     plots_to_generate = []
     if split_plots and use_interacting_argo:
         plots_to_generate.append({
@@ -10382,7 +10568,7 @@ def plot_argo_hotspots(
             'title_extra': ' (Interacting)',
             'file_suffix': '_interacting',
             'data_list': [
-                {'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4}
+                {'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({base_anomaly_label})', 's': 100, 'zorder': 4}
             ]
         })
         plots_to_generate.append({
@@ -10390,20 +10576,20 @@ def plot_argo_hotspots(
             'title_extra': ' (Non-interacting)',
             'file_suffix': '_non_interacting',
             'data_list': [
-                {'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': f'Non-interacting (ΔDO ≥ {do_threshold})', 's': 60, 'zorder': 3}
+                {'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': f'Non-interacting ({base_anomaly_label})', 's': 60, 'zorder': 3}
             ]
         })
     else:
         # 合并模式
         combined_data = []
         if not anom_others.empty:
-            label_str = f'ΔDO ≥ {do_threshold} μmol kg⁻¹'
+            label_str = base_anomaly_label
             if use_interacting_argo and interacting_argo_ids:
-                label_str = f'Non-interacting (ΔDO ≥ {do_threshold})'
+                label_str = f'Non-interacting ({base_anomaly_label})'
             combined_data.append({'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': label_str, 's': 60, 'zorder': 3})
         
         if not anom_interacting.empty:
-            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting (ΔDO ≥ {do_threshold})', 's': 100, 'zorder': 4})
+            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({base_anomaly_label})', 's': 100, 'zorder': 4})
             
         plots_to_generate.append({
             'name': 'combined',
@@ -10419,11 +10605,11 @@ def plot_argo_hotspots(
         ax = fig.add_subplot(1, 1, 1, projection=map_crs)
         
         depth_title = (
-            f' (depth ≥ {anomaly_min_depth} m)'
-            if anomaly_min_depth is not None and anomaly_min_depth > 0 else ''
+            f' (depth ≥ {cfg.anomaly_min_depth} m)'
+            if cfg.anomaly_min_depth is not None and cfg.anomaly_min_depth > 0 else ''
         )
-        thr_title = f' (ΔDO ≥ {do_threshold:g} μmol kg⁻¹)'
-        ax.set_title(f'Argo ΔDO Anomalies {start_year}-{end_year}{thr_title}{depth_title}{p_cfg["title_extra"]}', fontsize=20)
+        thr_title = f' ({title_threshold_label})'
+        ax.set_title(f'Argo anomalies {start_year}-{end_year} (method={cfg.method}){thr_title}{depth_title}{p_cfg["title_extra"]}', fontsize=20)
 
         # Basemap features
         base_ocean = _BASEMAP_COLORS['ocean']
@@ -10458,10 +10644,13 @@ def plot_argo_hotspots(
             data = d_cfg['data']
             if data.empty: continue
             has_anom_plot = True
+            color_values, _, color_label, cmap_name = _color_values_for_anomalies(data, cfg)
+            if color_values is None:
+                color_values = pd.Series(np.arange(len(data)), index=data.index)
             
             sc_curr = ax.scatter(
                 data['Longitude'], data['Latitude'],
-                c=data['delta_do'], cmap='Reds', s=d_cfg['s'],
+                c=color_values, cmap=cmap_name, s=d_cfg['s'],
                 marker=d_cfg['marker'],
                 edgecolors=d_cfg['edgecolor'], linewidths=0.5 if d_cfg['marker']=='o' else 1.0,
                 label=d_cfg['label'], zorder=d_cfg['zorder'],
@@ -10471,34 +10660,21 @@ def plot_argo_hotspots(
             sc = sc_curr
 
         if not has_anom_plot and anomalies.empty:
-             ax.text(0.5, 0.5, 'No ΔDO anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
+               ax.text(0.5, 0.5, 'No anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
 
         if sc is not None:
             cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
-            cbar.set_label('ΔDO / μmol·kg⁻¹', fontsize=20); cbar.ax.tick_params(labelsize=14)
-            if fix_delta_do_colorbar:
-                if delta_do_cbar_ticks is not None:
-                    cbar.set_ticks(delta_do_cbar_ticks)
-                else:
-                    rng = delta_do_cbar_max - delta_do_cbar_min
-                    if rng > 30:
-                        mid = (delta_do_cbar_min + delta_do_cbar_max)/2
-                        cbar.set_ticks([delta_do_cbar_min, mid, delta_do_cbar_max])
-                    else:
-                        cbar.set_ticks([delta_do_cbar_min, delta_do_cbar_max])
+            cbar.set_label(color_label, fontsize=20); cbar.ax.tick_params(labelsize=14)
+            if fix_colorbar:
+                _apply_detection_colorbar_ticks(cbar, cfg, cbar_lo, cbar_hi)
 
         ax.legend(fontsize=18, loc='upper left')
 
         if save_fig:
             region_slug_for_path = _current_region_key()
-            out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+            out_dir = cfg.output_dir("plot_argo_hotspots", region_slug_for_path)
             out_dir.mkdir(exist_ok=True, parents=True)
-            thr_str = f"{do_threshold:g}".replace('.', 'p')
-            depth_suffix = ''
-            if anomaly_min_depth is not None and anomaly_min_depth > 0:
-                depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-                depth_suffix = f"_depth{depth_str}m"
-            fname = out_dir / f"Argo_DeltaDO_Hotspots_{start_year}_{end_year}_thr{thr_str}{depth_suffix}{p_cfg['file_suffix']}.png"
+            fname = out_dir / f"Argo_Anomaly_Hotspots_{start_year}_{end_year}_{run_tag}{p_cfg['file_suffix']}.png"
             plt.savefig(fname, dpi=300, bbox_inches='tight')
             saved_figure_paths.append(str(fname))
             print(f"Figure saved: {fname}")
@@ -10510,14 +10686,9 @@ def plot_argo_hotspots(
     saved_anomalies_path: str | None = None
     if save_data and not anomalies.empty:
         region_slug_for_path = _current_region_key()
-        out_dir = Path(plots_output_root) / region_slug_for_path / "plot_argo_hotspots"
+        out_dir = cfg.output_dir("plot_argo_hotspots", region_slug_for_path)
         out_dir.mkdir(exist_ok=True, parents=True)
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-        pq_path = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        pq_path = out_dir / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
         try:
             anomalies.to_parquet(pq_path, index=False)
             saved_anomalies_path = str(pq_path)
@@ -10573,8 +10744,7 @@ def plot_hotspot_anomaly_vertical_profiles(
     start_year: int | None = None,
     end_year: int | None = None,
     anomalies_path: str | Path | None = None,
-    do_threshold: float | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     remove_outliers: bool = True,
     plot_normal_scatter: bool = True,
@@ -10594,11 +10764,11 @@ def plot_hotspot_anomaly_vertical_profiles(
     参数:
         start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
         anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
-        do_threshold / anomaly_min_depth: 仅用于自动定位文件名；None 回退配置默认值。
+        detection_config: 异常识别配置；用于自动定位模式子目录与 detection_config.file_stem() 文件名。
         variables: 每幅图绘制的变量列表，默认 ['DO','AOU','Temp','Salinity']。
         remove_outliers: True 时按基础 QC 剔除异常值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
         plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
-        annotate_delta_ts: 是否额外计算并在图上标注 ΔTemperature、ΔAOU、ΔSalinity 及深度（默认 False）。
+        annotate_delta_ts: 是否在标题标注当前异常方法的判别变量、辅助 ΔT/ΔS 及深度（默认 False）。
         save_fig / show_fig: 输出控制。
         clear_output_dir: 保存图片时是否在本次运行开始前清空输出目录，默认 True。
         max_profiles: 最多绘制多少个异常剖面；None 表示全部。
@@ -10616,10 +10786,9 @@ def plot_hotspot_anomaly_vertical_profiles(
         except Exception:
             return None
 
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
     if argo_data_dir is None:
         argo_data_dir = argo_path
 
@@ -10629,13 +10798,8 @@ def plot_hotspot_anomaly_vertical_profiles(
         if start_year is None or end_year is None:
             raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
         region_slug = _current_region_key()
-        hotspot_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots"
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-        anomalies_path = hotspot_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        mode_path = cfg.output_dir("plot_argo_hotspots", region_slug) / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        anomalies_path = mode_path
     else:
         anomalies_path = Path(anomalies_path)
 
@@ -10643,6 +10807,15 @@ def plot_hotspot_anomaly_vertical_profiles(
         raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
 
     anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+        total_count = len(anomalies)
+        mismatch_count = int((~method_mask).sum())
+        if mismatch_count > 0:
+            print(f"[WARN] Mixed detection_method found: expected={method_name}, mismatched={mismatch_count}/{total_count}.")
+        else:
+            print(f"[*] Method={method_name}, records={total_count}")
+        anomalies = anomalies[method_mask].copy()
     if anomalies.empty:
         print(f"[*] No anomalies in file: {anomalies_path}")
         return {
@@ -10666,13 +10839,15 @@ def plot_hotspot_anomaly_vertical_profiles(
     work['_profile'] = work['_profile'].astype(int)
 
     if max_profiles is not None and max_profiles > 0:
-        if 'delta_do' in work.columns:
+        if cfg.score_col() in work.columns:
+            work = work.sort_values(cfg.score_col(), ascending=False).head(int(max_profiles)).copy()
+        elif 'delta_do' in work.columns:
             work = work.sort_values('delta_do', ascending=False).head(int(max_profiles)).copy()
         else:
             work = work.head(int(max_profiles)).copy()
 
     region_slug = _current_region_key()
-    output_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots_vertical_profiles"
+    output_dir = cfg.output_dir("plot_argo_hotspots_vertical_profiles", region_slug)
     if save_fig:
         if clear_output_dir and output_dir.exists():
             try:
@@ -10743,46 +10918,10 @@ def plot_hotspot_anomaly_vertical_profiles(
 
         profile_rows = profile_rows.sort_values('Depth').copy()
 
-        delta_temp_text = ""
-        delta_aou_text = ""
-        delta_salinity_text = ""
+        annotation_text = ""
         depth_text = ""
         if annotate_delta_ts:
-            try:
-                deltas = calculate_delta_do(
-                    profile_rows.copy(),
-                    do_threshold=float('-inf'),
-                    salinity_threshold=0.0,
-                    temperature_threshold=0.0,
-                    anomaly_min_depth=0.0,
-                    remove_outliers=remove_outliers,
-                    verbose=False,
-                )
-                target_depth = np.nan
-                if not deltas.empty and 'delta_temperature' in deltas.columns and 'delta_salinity' in deltas.columns:
-                    target_depth = pd.to_numeric(pd.Series([row.get('depth')]), errors='coerce').iloc[0]
-                    if np.isfinite(target_depth) and 'depth' in deltas.columns:
-                        target_idx = (pd.to_numeric(deltas['depth'], errors='coerce') - float(target_depth)).abs().idxmin()
-                        picked = deltas.loc[target_idx]
-                    else:
-                        picked = deltas.sort_values('delta_do', ascending=False).iloc[0]
-                        target_depth = pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0]
-
-                    picked_dt = pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0]
-                    picked_ds = pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0]
-                    picked_depth = pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0]
-                    if np.isfinite(picked_dt):
-                        delta_temp_text = f", ΔTemperature={float(picked_dt):.2f}"
-                    if np.isfinite(picked_ds):
-                        delta_salinity_text = f", ΔSalinity={float(picked_ds):.2f}"
-                    if np.isfinite(picked_depth):
-                        depth_text = f" @{float(picked_depth):.1f}m"
-
-                    picked_da = pd.to_numeric(pd.Series([picked.get('delta_aou')]), errors='coerce').iloc[0]
-                    if np.isfinite(picked_da):
-                        delta_aou_text = f", ΔAOU={float(picked_da):.2f}"
-            except Exception as exc:
-                print(f"[WARN] Failed to compute ΔTemp/ΔSalinity/ΔAOU for profile {profile_num}: {exc}")
+            annotation_text, depth_text = _annotation_text_from_anomaly_record(row, cfg)
 
         num_variables = len(plot_variables)
         fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
@@ -10857,14 +10996,6 @@ def plot_hotspot_anomaly_vertical_profiles(
             else:
                 date_text = str(year_val)
 
-        delta_text = ""
-        try:
-            delta_val = float(pd.to_numeric(pd.Series([row.get('delta_do')]), errors='coerce').iloc[0])
-            if np.isfinite(delta_val):
-                delta_text = f", ΔDO={delta_val:.2f}"
-        except Exception:
-            delta_text = ""
-
         platform_text = f", Platform={platform_val}" if platform_val is not None else ""
         lon_text = ""
         lat_text = ""
@@ -10882,7 +11013,7 @@ def plot_hotspot_anomaly_vertical_profiles(
 
         title_line1 = (
             f"Hotspots Profile {profile_num}{platform_text}, "
-            f"{date_text}{delta_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}"
+            f"{date_text}{annotation_text}{depth_text}"
         )
         title_line2 = location_text if location_text else "Lon/Lat unavailable"
         fig.suptitle(
@@ -10895,7 +11026,7 @@ def plot_hotspot_anomaly_vertical_profiles(
         if save_fig and any_plotted:
             file_date = date_text.replace('-', '')
             platform_suffix = f"_platform{platform_val}" if platform_val is not None else ""
-            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}.png"
+            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}_{run_tag}.png"
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
         if show_fig:
@@ -10925,6 +11056,7 @@ def plot_single_hotspot_profile(
     profile_number: int,
     profile_time: int | str | pd.Timestamp,
     platform_number: int | None = None,
+    detection_config: DetectionConfig | None = None,
     variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     xlim_overrides: dict[str, tuple[float, float]] | None = None,
     remove_outliers: bool = True,
@@ -10941,21 +11073,23 @@ def plot_single_hotspot_profile(
         profile_number: 目标剖面编号（Profile_number）。
         profile_time: 时间输入，支持年份（如 2014）或日期/时间戳（如 '2014-05-09'）。
         platform_number: 可选平台编号筛选。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
         variables: 绘制变量列表，默认 ['DO', 'AOU', 'Temp', 'Salinity']。
         xlim_overrides: 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}。
                         键可用 'Temp' 或 'Temperature'。
         remove_outliers: 与 plot_vertical 同义；False 时会显示 QC 异常标记与红色桥接线。
         plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
-        annotate_delta_ts: 是否在标题追加 ΔDO/ΔTemperature/ΔAOU/ΔSalinity及深度。
+        annotate_delta_ts: 是否在标题追加当前异常方法的判别变量、辅助 ΔT/ΔS 及深度。
         save_fig/show_fig: 输出控制。
         argo_data_dir: 年度 Argo parquet 目录，None 使用配置默认。
-        output_dir: 自定义输出目录；None 使用 plot_outputs/<region>/plot_argo_hotspots_vertical_profiles_single。
+        output_dir: 自定义输出目录；None 使用 plot_outputs/<method>/<region>/plot_argo_hotspots_vertical_profiles_single。
 
     返回:
         dict: 包含 save_path/profile_number/platform_number/date/ado/atemp/asalinity。
     """
     if argo_data_dir is None:
         argo_data_dir = argo_path
+    cfg = _resolve_detection_config(detection_config)
 
     info = _resolve_argo_profile_center(
         profile_number=int(profile_number),
@@ -11052,48 +11186,43 @@ def plot_single_hotspot_profile(
 
     date_text = target_date.strftime('%Y-%m-%d')
 
-    delta_do_text = ""
-    delta_temp_text = ""
-    delta_aou_text = ""
-    delta_salinity_text = ""
+    annotation_text = ""
     depth_text = ""
     delta_do_val = np.nan
     delta_temp_val = np.nan
     delta_salinity_val = np.nan
     delta_aou_val = np.nan
+    delta_pi_val = np.nan
+    trim_score_val = np.nan
+    anomaly_score_val = np.nan
+    primary_metric = None
+    primary_value = np.nan
     picked_depth = np.nan
     if annotate_delta_ts:
         try:
             deltas = calculate_delta_do(
                 profile_rows.copy(),
-                do_threshold=float('-inf'),
-                salinity_threshold=0.0,
-                temperature_threshold=0.0,
-                anomaly_min_depth=0.0,
+                detection_config=cfg,
                 remove_outliers=remove_outliers,
                 verbose=False,
             )
             if not deltas.empty:
-                picked = deltas.sort_values('delta_do', ascending=False).iloc[0]
-                delta_do_val = float(pd.to_numeric(pd.Series([picked.get('delta_do')]), errors='coerce').iloc[0])
-                delta_temp_val = float(pd.to_numeric(pd.Series([picked.get('delta_temperature')]), errors='coerce').iloc[0])
-                delta_salinity_val = float(pd.to_numeric(pd.Series([picked.get('delta_salinity')]), errors='coerce').iloc[0])
+                picked_df = _keep_best_anomaly_per_profile(deltas, cfg)
+                picked = picked_df.sort_values(cfg.score_col(), ascending=False).iloc[0]
+                annotation_text, depth_text = _annotation_text_from_anomaly_record(picked, cfg)
 
-                delta_aou_val = float(pd.to_numeric(pd.Series([picked.get('delta_aou')]), errors='coerce').iloc[0])
-                picked_depth = float(pd.to_numeric(pd.Series([picked.get('depth')]), errors='coerce').iloc[0])
-        except Exception:
-            pass
-
-        if np.isfinite(delta_do_val):
-            delta_do_text = f", ΔDO={delta_do_val:.2f}"
-        if np.isfinite(delta_temp_val):
-            delta_temp_text = f", ΔTemperature={delta_temp_val:.2f}"
-        if np.isfinite(delta_aou_val):
-            delta_aou_text = f", ΔAOU={delta_aou_val:.2f}"
-        if np.isfinite(picked_depth):
-            depth_text = f" @{picked_depth:.1f}m"
-        if np.isfinite(delta_salinity_val):
-            delta_salinity_text = f", ΔSalinity={delta_salinity_val:.2f}"
+                delta_do_val = _num_from_record(picked, 'delta_do')
+                delta_temp_val = _num_from_record(picked, 'delta_temperature')
+                delta_salinity_val = _num_from_record(picked, 'delta_salinity')
+                delta_aou_val = _num_from_record(picked, 'delta_aou')
+                delta_pi_val = _num_from_record(picked, 'delta_pi')
+                trim_score_val = _num_from_record(picked, 'trim_score')
+                anomaly_score_val = _num_from_record(picked, 'anomaly_score')
+                picked_depth = _num_from_record(picked, 'depth')
+                primary_metric = picked.get('primary_metric')
+                primary_value = _num_from_record(picked, 'primary_value')
+        except Exception as exc:
+            print(f"[WARN] Failed to compute anomaly annotation for profile {profile_number}: {exc}")
 
     platform_label = (
         int(platform_number) if platform_number is not None
@@ -11113,7 +11242,7 @@ def plot_single_hotspot_profile(
 
     title_line1 = (
         f"Hotspots Profile {int(profile_number)}{platform_text}, "
-        f"{date_text}{delta_do_text}{delta_aou_text}{delta_temp_text}{delta_salinity_text}{depth_text}"
+        f"{date_text}{annotation_text}{depth_text}"
     )
     title_line2 = location_text if location_text else "Lon/Lat unavailable"
 
@@ -11128,11 +11257,15 @@ def plot_single_hotspot_profile(
     if save_fig and any_plotted:
         if output_dir is None:
             region_slug = _current_region_key()
-            output_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots_vertical_profiles_single"
+            output_dir = cfg.output_dir("plot_argo_hotspots_vertical_profiles_single", region_slug)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        run_tag = cfg.file_stem()
         platform_suffix = f"_platform{platform_label}" if platform_label is not None else ""
-        filename = f"hotspot_profile_{date_text.replace('-', '')}_profile{int(profile_number)}{platform_suffix}_single.png"
+        filename = (
+            f"hotspot_profile_{date_text.replace('-', '')}_profile{int(profile_number)}"
+            f"{platform_suffix}_{run_tag}_single.png"
+        )
         saved_path = output_dir / filename
         plt.savefig(saved_path, dpi=300, bbox_inches='tight')
 
@@ -11148,6 +11281,12 @@ def plot_single_hotspot_profile(
         'delta_temperature': float(delta_temp_val) if np.isfinite(delta_temp_val) else np.nan,
         'delta_salinity': float(delta_salinity_val) if np.isfinite(delta_salinity_val) else np.nan,
         'delta_aou': float(delta_aou_val) if np.isfinite(delta_aou_val) else np.nan,
+        'delta_pi': float(delta_pi_val) if np.isfinite(delta_pi_val) else np.nan,
+        'trim_score': float(trim_score_val) if np.isfinite(trim_score_val) else np.nan,
+        'anomaly_score': float(anomaly_score_val) if np.isfinite(anomaly_score_val) else np.nan,
+        'primary_metric': primary_metric,
+        'primary_value': float(primary_value) if np.isfinite(primary_value) else np.nan,
+        'detection_method': cfg.method,
         'save_path': str(saved_path) if saved_path is not None else None,
     }
 
@@ -11156,13 +11295,7 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     参数 args: (
         year,
-        depth_interval,
-        do_threshold,
-        salinity_threshold,
-        temperature_threshold,
-        anomaly_min_depth,
-        depth_merge_tolerance,
-        duplicate_depth_strategy,
+        cfg,
         lon_min_bound,
         lon_max_bound,
         lat_min_bound,
@@ -11170,17 +11303,11 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     返回: (baseline_df, anomalies_df)
     baseline_df: 每个剖面第一条记录的基本信息
-    anomalies_df: 该年筛选出的 ΔDO 异常（每剖面保留最大 delta_do 一条）
+    anomalies_df: 该年筛选出的 Argo 异常（每剖面保留 anomaly_score 最强一条）
     """
     (
         year,
-        depth_interval,
-        do_threshold,
-        salinity_threshold,
-        temperature_threshold,
-        anomaly_min_depth,
-        depth_merge_tolerance,
-        duplicate_depth_strategy,
+        cfg,
         lon_min_bound,
         lon_max_bound,
         lat_min_bound,
@@ -11211,23 +11338,22 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     anomalies_year = calculate_delta_do(
         df_geo,
-        depth_interval=depth_interval,
-        do_threshold=do_threshold,
-        salinity_threshold=salinity_threshold,
-        temperature_threshold=temperature_threshold,
-        anomaly_min_depth=anomaly_min_depth,
-        depth_merge_tolerance=depth_merge_tolerance,
-        duplicate_depth_strategy=duplicate_depth_strategy,
+        detection_config=cfg,
         remove_outliers=True,
         verbose=False
     )
     if anomalies_year.empty:
         return baseline, pd.DataFrame()
-    anomalies_year = (
-        anomalies_year.sort_values('delta_do', ascending=False)
-        .drop_duplicates(subset='Profile_number', keep='first')
-    )
-    needed_cols = [c for c in ['Profile_number','Longitude','Latitude','Year','Month','Day','depth','delta_do','do_value'] if c in anomalies_year.columns]
+    anomalies_year = _keep_best_anomaly_per_profile(anomalies_year, cfg)
+    needed_cols = [
+        c for c in [
+            'Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day',
+            'depth', 'delta_do', 'delta_aou', 'delta_pi', 'trim_score',
+            'anomaly_score', 'primary_metric', 'primary_value', 'do_value',
+            'aou_value', 'detection_method'
+        ]
+        if c in anomalies_year.columns
+    ]
     anomalies_year = anomalies_year[needed_cols]
     return baseline, anomalies_year
 
@@ -11864,16 +11990,10 @@ def load_glorys_eke_native(file_path: str | Path) -> dict:
 
 
 def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """按年份处理 Euler summary 的 baseline 与高 DO 异常（支持 Dask 并行）。"""
+    """按年份处理 Euler summary 的 baseline 与统一异常子集（支持 Dask 并行）。"""
     (
         year,
-        depth_interval,
-        do_threshold,
-        salinity_threshold,
-        temperature_threshold,
-        anomaly_min_depth,
-        depth_merge_tolerance,
-        duplicate_depth_strategy,
+        cfg,
         lon_min_bound,
         lon_max_bound,
         lat_min_bound,
@@ -11914,13 +12034,7 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
 
     anomalies = calculate_delta_do(
         df_geo,
-        depth_interval=depth_interval,
-        do_threshold=do_threshold,
-        salinity_threshold=salinity_threshold,
-        temperature_threshold=temperature_threshold,
-        anomaly_min_depth=None,
-        depth_merge_tolerance=depth_merge_tolerance,
-        duplicate_depth_strategy=duplicate_depth_strategy,
+        detection_config=cfg,
         remove_outliers=True,
         verbose=False,
     )
@@ -11931,13 +12045,12 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
     if depth_col is None:
         return baseline_out, pd.DataFrame()
 
-    if anomaly_min_depth is not None and anomaly_min_depth > 0:
-        anomalies = anomalies[anomalies[depth_col] >= anomaly_min_depth].copy()
+    if cfg.anomaly_min_depth is not None and cfg.anomaly_min_depth > 0:
+        anomalies = anomalies[anomalies[depth_col] >= cfg.anomaly_min_depth].copy()
     if anomalies.empty:
         return baseline_out, pd.DataFrame()
 
-    anomalies = anomalies.sort_values('delta_do', ascending=False)
-    anomalies = anomalies.drop_duplicates(subset='Profile_number', keep='first')
+    anomalies = _keep_best_anomaly_per_profile(anomalies, cfg)
 
     if all(c in anomalies.columns for c in ['Year', 'Month', 'Day']):
         anomalies['profile_uid'] = (
@@ -11949,9 +12062,15 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
     else:
         anomalies['profile_uid'] = anomalies['Profile_number'].astype(str)
 
-    do_out = anomalies[
-        ['profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do', depth_col]
-    ].rename(columns={depth_col: 'depth'})
+    keep_cols = [
+        c for c in [
+            'profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do',
+            'delta_aou', 'trim_score', 'anomaly_score', 'primary_metric',
+            'primary_value', depth_col
+        ]
+        if c in anomalies.columns
+    ]
+    do_out = anomalies[keep_cols].rename(columns={depth_col: 'depth'})
 
     return baseline_out, do_out
 
@@ -11962,44 +12081,25 @@ def build_euler_grid_summary(
     *,
     grid_step_deg: float = 1.0,
     meta_output_root: str | Path | None = None,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     use_dask: bool = True,
     dask_scheduler: str = 'processes',
     dask_workers: int | None = None,
     dask_show_progress: bool = True,
 ) -> dict:
-    """构建欧拉网格汇总：ACE/CE 天数与高 DO 异常出现率。
+    """构建欧拉网格汇总：ACE/CE 天数与 Argo 异常出现率。
 
     统计口径：
         1. 同日同网格同类型只计 1 天（按 date+grid 去重）。
-        2. 高 DO 剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
+        2. 异常剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
         3. 使用同一套区域边界与网格边界，确保三图可直接比较。
-        4. 深度筛选仅使用最小深度阈值：depth >= anomaly_min_depth。
-        5. 关联分析默认使用异常出现率 high_do_profiles / argo_baseline_profiles（仅 baseline>0 网格）。
+        4. 深度筛选由 DetectionConfig 统一管理。
+        5. 关联分析默认使用异常出现率 anomaly_profiles / argo_baseline_profiles（仅 baseline>0 网格）。
     """
     if end_year < start_year:
         raise ValueError("end_year 必须大于等于 start_year")
 
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None:
-        salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None:
-        temperature_threshold = _default_temperature_threshold
-    if depth_interval is None:
-        depth_interval = _default_depth_interval
-    if depth_merge_tolerance is None:
-        depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None:
-        duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(detection_config)
 
     lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(grid_step_deg=grid_step_deg)
     lon_ref = float(grid_meta['lon_start_continuous'])
@@ -12075,19 +12175,13 @@ def build_euler_grid_summary(
     ace_grid = acl_grid + acs_grid
     ce_grid = cl_grid + cs_grid
 
-    # 2) 高 DO 异常网格剖面数（仅最小深度阈值）+ Argo 观测机会网格
+    # 2) Argo 异常网格剖面数 + Argo 观测机会网格
     do_frames = []
     baseline_frames = []
     year_args = [
         (
             year,
-            depth_interval,
-            do_threshold,
-            salinity_threshold,
-            temperature_threshold,
-            anomaly_min_depth,
-            depth_merge_tolerance,
-            duplicate_depth_strategy,
+            cfg,
             lonmin,
             lonmax,
             latmin,
@@ -12169,10 +12263,13 @@ def build_euler_grid_summary(
             'start_year': int(start_year),
             'end_year': int(end_year),
             'grid_step_deg': float(grid_step_deg),
-            'anomaly_min_depth': float(anomaly_min_depth) if anomaly_min_depth is not None else np.nan,
-            'do_threshold': float(do_threshold),
-            'salinity_threshold': float(salinity_threshold),
-            'temperature_threshold': float(temperature_threshold),
+            'detection_method': cfg.method,
+            'detection_label': cfg.threshold_label(),
+            'detection_file_stem': cfg.file_stem(),
+            'anomaly_min_depth': float(cfg.anomaly_min_depth) if cfg.anomaly_min_depth is not None else np.nan,
+            'do_threshold': float(cfg.do_threshold),
+            'salinity_threshold': float(cfg.salinity_threshold),
+            'temperature_threshold': float(cfg.temperature_threshold),
         },
         'grid': {
             'lon_edges': lon_edges,
@@ -12186,6 +12283,8 @@ def build_euler_grid_summary(
         'ace_days': ace_grid,
         'ce_days': ce_grid,
         'eddy_days_total': ace_grid + ce_grid,
+        'anomaly_profiles': do_grid,
+        'anomaly_occurrence_ratio': high_do_occurrence_ratio,
         'high_do_profiles': do_grid,
         'high_do_occurrence_ratio': high_do_occurrence_ratio,
         'argo_baseline_profiles': baseline_grid,
@@ -12194,6 +12293,7 @@ def build_euler_grid_summary(
         'cl_table': cl_grouped,
         'cs_table': cs_grouped,
         'argo_baseline_table': baseline_grouped,
+        'anomaly_table': do_grouped,
         'high_do_table': do_grouped,
         'ocean_mask': ocean_mask,
         'observation_mask': observation_mask,
@@ -12212,7 +12312,7 @@ def plot_euler_grid_summary(
     cmap_eddy: str = 'YlOrRd',
     cmap_do: str = 'Reds',
 ) -> dict:
-    """绘制欧拉网格三图：ACE 天数、CE 天数、高 DO 异常出现率。"""
+    """绘制欧拉网格三图：ACE 天数、CE 天数、Argo 异常出现率。"""
     grid = summary['grid']
     meta = summary['meta']
 
@@ -12220,7 +12320,10 @@ def plot_euler_grid_summary(
     lat_edges = np.asarray(grid['lat_edges'], dtype=float)
     ace_days = np.asarray(summary['ace_days'])
     ce_days = np.asarray(summary['ce_days'])
-    high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
+    anomaly_rate = np.asarray(
+        summary.get('anomaly_occurrence_ratio', summary.get('high_do_occurrence_ratio', summary['high_do_profiles'])),
+        dtype=float,
+    )
 
     crosses_dateline = bool(grid.get('crosses_dateline', False))
     central_lon = 180 if crosses_dateline else 0
@@ -12241,9 +12344,9 @@ def plot_euler_grid_summary(
     grid_color = _BASEMAP_COLORS['grid']
 
     vmax_eddy = float(max(np.nanmax(ace_days), np.nanmax(ce_days), 1.0))
-    vmax_do = float(np.nanmax(high_do)) if np.any(np.isfinite(high_do)) else 1.0
-    if not np.isfinite(vmax_do) or vmax_do <= 0:
-        vmax_do = 1.0
+    vmax_anom = float(np.nanmax(anomaly_rate)) if np.any(np.isfinite(anomaly_rate)) else 1.0
+    if not np.isfinite(vmax_anom) or vmax_anom <= 0:
+        vmax_anom = 1.0
 
     lon_extent_min = float(lon_edges[0])
     lon_extent_max = float(lon_edges[-1])
@@ -12252,7 +12355,7 @@ def plot_euler_grid_summary(
     panel_defs = [
         ('ACE Eddy Days', ace_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
         ('CE Eddy Days', ce_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
-        ('High DO Occurrence Rate', high_do, cmap_do, Normalize(vmin=0.0, vmax=vmax_do)),
+        ('Anomaly Occurrence Rate', anomaly_rate, cmap_do, Normalize(vmin=0.0, vmax=vmax_anom)),
     ]
 
     mappables = []
@@ -12283,21 +12386,23 @@ def plot_euler_grid_summary(
     cbar1 = fig.colorbar(mappables[0], ax=axes[:2], orientation='horizontal', fraction=0.05, pad=0.08)
     cbar1.set_label('Eddy Days per Grid Cell', fontsize=12)
     cbar2 = fig.colorbar(mappables[2], ax=axes[2], orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar2.set_label('High DO Occurrence Rate per Grid Cell', fontsize=12)
+    cbar2.set_label('Anomaly Occurrence Rate per Grid Cell', fontsize=12)
 
+    detection_label = meta.get('detection_label')
+    if not detection_label:
+        detection_label = f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
     fig.suptitle(
         (
-            f"EddyDays & High DO Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"EddyDays & Anomaly Summary ({meta['region_key']}, {meta['start_year']}-{meta['end_year']})\n"
+            f"{detection_label}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | grid step = {meta['grid_step_deg']:.1f}°"
         ),
         fontsize=16,
     )
 
-    region_slug = _current_region_key()
     if output_dir is None:
-        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+        output_dir = _detection_output_dir_from_meta('plot_euler_grid_summary', meta)
     else:
         output_dir = Path(output_dir)
     if save_fig or save_data:
@@ -12308,12 +12413,11 @@ def plot_euler_grid_summary(
         prefix_safe = 'EddyDays'
 
     out = {}
+    run_tag = str(meta.get('detection_file_stem') or f"do{_format_detection_value(meta.get('do_threshold', 'NA'))}_depth{_format_detection_value(meta.get('anomaly_min_depth', 'NA'))}m")
     if save_fig:
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
-        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         fname = output_dir / (
             f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_"
-            f"{meta['grid_step_deg']:g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+            f"{meta['grid_step_deg']:g}deg_{run_tag}.png"
         )
         fig.savefig(fname, dpi=300, bbox_inches='tight')
         out['figure'] = str(fname)
@@ -12324,11 +12428,9 @@ def plot_euler_grid_summary(
     plt.close(fig)
 
     if save_data:
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
-        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
         npz_path = output_dir / (
             f"{prefix_safe}_Summary_{meta['start_year']}_{meta['end_year']}_{meta['grid_step_deg']:g}deg_"
-            f"do{do_thr_tag}_depth{depth_thr_tag}.npz"
+            f"{run_tag}.npz"
         )
         np.savez_compressed(
             npz_path,
@@ -12337,7 +12439,9 @@ def plot_euler_grid_summary(
             ace_days=ace_days,
             ce_days=ce_days,
             eddy_days_total=np.asarray(summary['eddy_days_total']),
-            high_do_profiles=high_do,
+            anomaly_profiles=np.asarray(summary.get('anomaly_profiles', summary.get('high_do_profiles'))),
+            anomaly_occurrence_ratio=np.asarray(summary.get('anomaly_occurrence_ratio', summary.get('high_do_occurrence_ratio'))),
+            high_do_profiles=np.asarray(summary.get('high_do_profiles', summary.get('anomaly_profiles'))),
             high_do_occurrence_ratio=np.asarray(summary.get('high_do_occurrence_ratio')),
             argo_baseline_profiles=np.asarray(summary['argo_baseline_profiles']),
             ocean_mask=np.asarray(summary['ocean_mask']),
@@ -12565,7 +12669,7 @@ def _single_eddy_do_association(
     analysis_mask: np.ndarray | None = None,
     high_do_is_rate: bool = False,
 ) -> dict:
-    """计算单一涡旋类型（ACE 或 CE）与高 DO 的双向关联统计。"""
+    """计算单一涡旋类型（ACE 或 CE）与 Argo 异常出现率的双向关联统计。"""
 
     def _distance_correlation_1d(xv: np.ndarray, yv: np.ndarray) -> float:
         if xv.size < 3 or yv.size < 3:
@@ -12611,7 +12715,7 @@ def _single_eddy_do_association(
         occurrence_ratio = p_active / p_inactive
         occurrence_uplift_pct = (occurrence_ratio - 1.0) * 100.0
 
-    # 反向指标：按高DO出现率分组，比较两组涡旋天数均值
+    # 反向指标：按异常出现率分组，比较两组涡旋天数均值
     if do_rate_high_low_threshold is None:
         positive_y = y[y > 0]
         do_rate_threshold = float(np.quantile(positive_y, 0.5)) if positive_y.size > 0 else np.nan
@@ -12857,12 +12961,12 @@ def analyze_euler_ace_ce_association(
     output_prefix: str = 'EddyDays',
     output_dir: str | Path | None = None,
 ) -> dict:
-    """在同一网格上分析并绘制 ACE/CE 与 High DO 出现率的关联性。
+    """在同一网格上分析并绘制 ACE/CE 与 Argo 异常出现率的关联性。
 
     输出重点：
-        - 关联地图（ACE-HighDO、CE-HighDO）
-        - 正向指标：涡旋活跃区 vs 非活跃区的高DO出现率提升
-        - 反向指标：高DO出现率高区 vs 低区的涡旋天数提升
+        - 关联地图（ACE-Anomaly、CE-Anomaly）
+        - 正向指标：涡旋活跃区 vs 非活跃区的异常出现率提升
+        - 反向指标：异常出现率高区 vs 低区的涡旋天数提升
     """
     ace_days = np.asarray(summary['ace_days'], dtype=float)
     ce_days = np.asarray(summary['ce_days'], dtype=float)
@@ -12870,6 +12974,9 @@ def analyze_euler_ace_ce_association(
     analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
     meta = summary.get('meta', {})
     grid = summary['grid']
+    detection_label = meta.get('detection_label')
+    if not detection_label:
+        detection_label = f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
 
     threshold_scan = None
     shared_threshold = float(active_threshold) if isinstance(active_threshold, (int, float)) else 1.0
@@ -12980,8 +13087,8 @@ def analyze_euler_ace_ce_association(
         ax.set_title(
             (
                 f"{title}\n"
-                f"DO-rate uplift (eddy high vs low)={forward_uplift:.1f}%\n"
-                f"Eddy-days uplift (DO-rate high vs low)={reverse_uplift:.1f}%\n"
+                f"Anomaly-rate uplift (eddy high vs low)={forward_uplift:.1f}%\n"
+                f"Eddy-days uplift (anomaly-rate high vs low)={reverse_uplift:.1f}%\n"
                 f"{rho_p_label} | rho={rho:.3f} | dCor={dcor:.3f}"
             ),
             fontsize=12,
@@ -12989,23 +13096,22 @@ def analyze_euler_ace_ce_association(
         ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
 
     cbar = fig.colorbar(mappables[0], ax=axes, orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar.set_label('Grid-wise Association Index (z(log1p(EddyDays))*z(HighDORate))', fontsize=11)
+    cbar.set_label('Grid-wise Association Index (z(log1p(EddyDays))*z(AnomalyRate))', fontsize=11)
 
     fig.suptitle(
         (
-            f"Eddy - High DO Association ({meta.get('region_key', 'region')}, "
+            f"Eddy - Argo Anomaly Association ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"{detection_label}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | eddy-days threshold ≥ {shared_threshold:g} day"
-            f" | DO-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
+            f" | anomaly-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
         ),
         fontsize=14,
     )
 
-    region_slug = _current_region_key()
     if output_dir is None:
-        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+        output_dir = _detection_output_dir_from_meta('plot_euler_grid_summary', meta)
     else:
         output_dir = Path(output_dir)
 
@@ -13076,11 +13182,10 @@ def analyze_euler_ace_ce_association(
 
     if save_fig:
         output_dir.mkdir(parents=True, exist_ok=True)
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
-        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        run_tag = str(meta.get('detection_file_stem') or f"do{_format_detection_value(meta.get('do_threshold', 'NA'))}")
         fname = output_dir / (
             f"{prefix_safe}_Association_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
-            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_{run_tag}.png"
         )
         fig.savefig(fname, dpi=300, bbox_inches='tight')
         out['figure'] = str(fname)
@@ -13103,17 +13208,20 @@ def analyze_euler_eke_do_association(
     output_prefix: str = 'EKE',
     output_dir: str | Path | None = None,
 ) -> dict:
-    """分析欧拉网格 EKE 与高 DO 出现率之间的关系并绘图。
+    """分析欧拉网格 EKE 与 Argo 异常出现率之间的关系并绘图。
 
     输出两张图：
-        1) EKE 与 High DO Occurrence Rate 概览图；
-        2) EKE-DO Association 图。
+        1) EKE 与 Argo Anomaly Occurrence Rate 概览图；
+        2) EKE-Anomaly Association 图。
     同时输出双向 uplift：
-        - 正向：DO-rate uplift (EKE active vs inactive)
-        - 反向：EKE uplift (DO-rate high vs low)
+        - 正向：anomaly-rate uplift (EKE active vs inactive)
+        - 反向：EKE uplift (anomaly-rate high vs low)
     """
     grid = summary['grid']
     meta = summary.get('meta', {})
+    detection_label = meta.get('detection_label')
+    if not detection_label:
+        detection_label = f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
     high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
     base_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else np.ones_like(high_do, dtype=bool)
 
@@ -13153,7 +13261,7 @@ def analyze_euler_eke_do_association(
     distance_corr = core.get('distance_corr', np.nan)
     assoc_map = np.asarray(core['association_map'], dtype=float)
 
-    # 反向指标：按 DO-rate 高低分组，比较两组 EKE 均值
+    # 反向指标：按异常出现率高低分组，比较两组 EKE 均值
     if do_rate_high_low_threshold is None or str(do_rate_high_low_threshold).lower() == 'auto':
         y_for_thr = np.asarray(high_do, dtype=float)
         y_for_thr = y_for_thr[analysis_mask]
@@ -13181,7 +13289,7 @@ def analyze_euler_eke_do_association(
     lat_edges = np.asarray(grid['lat_edges'], dtype=float)
     lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
 
-    # 图1：EKE + High DO 出现率概览
+    # 图1：EKE + Argo 异常出现率概览
     eke_vals = eke_grid[analysis_mask]
     eke_vals = eke_vals[np.isfinite(eke_vals)]
     eke_vmax = float(np.nanquantile(eke_vals, 0.99)) if eke_vals.size > 0 else np.nan
@@ -13195,12 +13303,12 @@ def analyze_euler_eke_do_association(
         do_vmax = 1.0
 
     suptitle_summary = (
-        f"EKE & High DO Summary ({meta.get('region_key', 'region')}, "
+        f"EKE & Argo Anomaly Summary ({meta.get('region_key', 'region')}, "
         f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-        f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+        f"{detection_label}"
         f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
         f" | EKE threshold ≥ {active_thr:.4e}"
-        f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}"
+        f" | anomaly-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}"
     )
     fig_summary, _ = _plot_two_panel_association_figure(
         lon_edges=lon_edges,
@@ -13208,17 +13316,17 @@ def analyze_euler_eke_do_association(
         left_mat=eke_grid,
         right_mat=high_do,
         left_title='EKE (m² s⁻²)',
-        right_title='High DO Occurrence Rate',
+        right_title='Argo Anomaly Occurrence Rate',
         left_cmap='YlOrRd',
         right_cmap='Reds',
         left_norm=Normalize(vmin=0.0, vmax=eke_vmax),
         right_norm=Normalize(vmin=0.0, vmax=do_vmax),
         left_cbar_label='EKE (m² s⁻²)',
-        right_cbar_label='High DO Occurrence Rate per Grid Cell',
+        right_cbar_label='Argo Anomaly Occurrence Rate per Grid Cell',
         suptitle=suptitle_summary,
     )
 
-    # 图2：EKE-DO 关联图
+    # 图2：EKE-Anomaly 关联图
     vmax_assoc = np.nanmax(np.abs(assoc_map[np.isfinite(assoc_map)])) if np.any(np.isfinite(assoc_map)) else 1.0
     if not np.isfinite(vmax_assoc) or vmax_assoc <= 0:
         vmax_assoc = 1.0
@@ -13257,31 +13365,30 @@ def analyze_euler_eke_do_association(
         transform=data_crs,
         zorder=2,
     )
-    ax.set_title('EKE-DO Association', fontsize=12)
+    ax.set_title('EKE-Anomaly Association', fontsize=12)
     ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
     cbar_assoc = fig_assoc.colorbar(hm, ax=ax, orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar_assoc.set_label('z(EKE) * z(High DO Rate)', fontsize=11)
+    cbar_assoc.set_label('z(EKE) * z(AnomalyRate)', fontsize=11)
     spearman_p_label = "p=nan"
     if np.isfinite(spearman_p):
         spearman_p_label = "p<0.0001" if spearman_p < 1e-4 else f"p={spearman_p:.4f}"
     fig_assoc.suptitle(
         (
-            f"EKE - High DO Association ({meta.get('region_key', 'region')}, "
+            f"EKE - Argo Anomaly Association ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
+            f"{detection_label}"
             f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | EKE threshold ≥ {active_thr:.4e}"
-            f" | DO-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}\n"
-            f"DO-rate uplift (EKE high vs low)={uplift_pct:.1f}%"
-            f" | EKE uplift (DO-rate high vs low)={eke_uplift_pct:.1f}%\n"
+            f" | anomaly-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}\n"
+            f"Anomaly-rate uplift (EKE high vs low)={uplift_pct:.1f}%"
+            f" | EKE uplift (anomaly-rate high vs low)={eke_uplift_pct:.1f}%\n"
             f"{spearman_p_label} | rho={spearman_rho:.3f} | dCor={distance_corr:.3f}"
         ),
         fontsize=14,
     )
 
-    region_slug = _current_region_key()
     if output_dir is None:
-        output_dir = Path(plots_output_root) / region_slug / 'plot_euler_grid_summary'
+        output_dir = _detection_output_dir_from_meta('plot_euler_grid_summary', meta)
     else:
         output_dir = Path(output_dir)
 
@@ -13319,15 +13426,14 @@ def analyze_euler_eke_do_association(
 
     if save_fig:
         output_dir.mkdir(parents=True, exist_ok=True)
-        do_thr_tag = str(meta.get('do_threshold', 'NA')).replace('.', 'p')
-        depth_thr_tag = str(meta.get('anomaly_min_depth', 'NA')).replace('.', 'p')
+        run_tag = str(meta.get('detection_file_stem') or f"do{_format_detection_value(meta.get('do_threshold', 'NA'))}")
         fname_summary = output_dir / (
             f"{prefix_safe}_Summary_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
-            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_{run_tag}.png"
         )
         fname_assoc = output_dir / (
             f"{prefix_safe}_Association_{meta.get('start_year', 'NA')}_{meta.get('end_year', 'NA')}_"
-            f"{meta.get('grid_step_deg', 1.0):g}deg_do{do_thr_tag}_depth{depth_thr_tag}.png"
+            f"{meta.get('grid_step_deg', 1.0):g}deg_{run_tag}.png"
         )
         fig_summary.savefig(fname_summary, dpi=300, bbox_inches='tight')
         fig_assoc.savefig(fname_assoc, dpi=300, bbox_inches='tight')
@@ -13335,7 +13441,7 @@ def analyze_euler_eke_do_association(
         out['figure_association'] = str(fname_assoc)
         out['figure'] = str(fname_assoc)
         print(f"EKE summary figure saved: {fname_summary}")
-        print(f"EKE-DO association figure saved: {fname_assoc}")
+        print(f"EKE-Anomaly association figure saved: {fname_assoc}")
 
     if show_fig:
         plt.show()
@@ -13351,7 +13457,7 @@ def run_euler_grid_analysis(
     analysis_targets: str | list[str] | tuple[str, ...] = ('eke',),
     run_association: bool = True,
     grid_step_deg: float = 1.0,
-    do_threshold: float | None = None,
+    detection_config: DetectionConfig | None = None,
     analysis_depth: float | int | None = None,
     active_threshold: float | str | None = 'auto',
     do_rate_high_low_threshold: float | str | None = 'auto',
@@ -13380,10 +13486,10 @@ def run_euler_grid_analysis(
         analysis_targets: 分析内容开关。可选 'eddy_days'、'eke'；支持字符串或列表。
         run_association: 是否执行关联分析。
         grid_step_deg: 网格分辨率（度）。
-        do_threshold: ΔDO 阈值；None 时使用配置默认值。
-        analysis_depth: 统一分析深度（m），同时用于 DO 异常筛选深度与 EKE 采样深度；None 回退配置默认值。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
+        analysis_depth: 统一分析深度（m），用于 DetectionConfig 的异常深度筛选与 EKE 采样深度；None 回退配置默认值。
         active_threshold: 关联分析中 active 分组阈值；可传数值或 'auto'。
-        do_rate_high_low_threshold: 关联分析中 DO-rate 高低分组阈值；可传数值或 'auto'。
+        do_rate_high_low_threshold: 关联分析中异常出现率高低分组阈值；可传数值或 'auto'。
         min_group_cells: 自动阈值扫描时每组最小网格数。
         eke_file_path: 本地 EKE 原始分辨率 zarr 路径；None 时默认读取 GLORYS_processed/eke.zarr。
         show_fig / save_fig / save_data: 图像与数据输出控制。
@@ -13412,14 +13518,14 @@ def run_euler_grid_analysis(
     if not targets:
         targets = {'eke'}
 
-    unified_depth = float(analysis_depth) if analysis_depth is not None else float(_cfg_anomaly_min_depth)
+    unified_depth = float(analysis_depth) if analysis_depth is not None else None
+    cfg = _resolve_detection_config(detection_config, anomaly_min_depth=unified_depth)
 
     summary = build_euler_grid_summary(
         start_year=start_year,
         end_year=end_year,
         grid_step_deg=grid_step_deg,
-        do_threshold=do_threshold,
-        anomaly_min_depth=unified_depth,
+        detection_config=cfg,
         meta_output_root=meta_output_root,
         use_dask=use_dask,
         dask_scheduler=dask_scheduler,
@@ -13498,184 +13604,168 @@ def run_euler_grid_analysis(
 
 def calculate_delta_do(
     data: pd.DataFrame,
+    detection_config: DetectionConfig | None = None,
     depth_col: str = 'Depth',
     do_col: str = 'DO',
     salinity_col: str = 'Salinity',
     temperature_col: str = 'Temperature',
-    depth_interval: float | None = None,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    anomaly_min_depth: float | None = None,
-    anomaly_max_depth: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    do_near_zero_threshold: float | None = None,
-    do_near_zero_max_count: int | None = None,
+    pi_col: str = 'PI',
     include_aou: bool = True,
     remove_outliers: bool = True,
-    verbose: bool = False
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """
-    参考论文方法计算亚表层异常信号（以 DO 为主）。
+     计算 Argo 垂向剖面中的“潜在俯冲异常”并支持多种识别模式。
 
-    步骤概述：
-    1. 按 Profile_number 分组，分别处理每个剖面；
-    2. 计算 DO 随深度的一阶导数，定位 DO 的正峰值（代表可能的表层富氧水体俯冲信号）；
-    3. 以 DO 峰深度为中心，取窗口 [p-Δp, p+Δp]，用两端点连线构造参考剖面；
-    4. 在峰值同一深度计算 ΔDO、ΔSalinity 与 ΔTemperature（原始值减参考线值）；
-        当 include_aou=True 时，同步计算该深度窗口下的 ΔAOU；
-    5. 以 ΔDO ≥ do_threshold 作为必要条件；如设置了 salinity_threshold 或 temperature_threshold > 0，可附加 |ΔSalinity/ΔTemperature| 过滤；
-    6. 若 anomaly_min_depth > 0，仅保留深度不小于该阈值的异常；
-    7. 若 anomaly_max_depth > 0，忽略深度大于该阈值的峰值（默认 1500 m）；
-    8. 当 remove_outliers=True 且某剖面中 DO <= do_near_zero_threshold 的点数超过 do_near_zero_max_count 时，整条剖面跳过；
-    9. 同一剖面内若有相距很近的多个候选深度（常见于峰值上下各一点），按 depth_merge_tolerance（dbar）合并，仅保留 delta_do 较大的记录。
+     模式介绍：
+     1. do（基线模式）
+         - 先在每条剖面中找 DO 正峰（导数由正到负）。
+         - 以峰深度为中心，在 [p-Δp, p+Δp] 内用两端点连线构造参考值。
+         - 计算同深度的 delta_do / delta_salinity / delta_temperature。
+         - 以 delta_do >= do_threshold 为主判据；盐度与温度阈值（若 >0）为附加过滤。
+     2. aou（论文式 AOU+π 模式）
+         - 找 AOU 负峰，并在给定深度容差内配对最近的 π 峰。
+         - 在上下窗口分别取极值点连线，计算 delta_aou 与 delta_pi。
+         - 以 delta_aou <= aou_threshold 且 abs(delta_pi) >= pi_threshold 作为判据。
+     3. trim（分箱 + trimmed mean 模式）
+         - 先对 AOU 与绝对盐度做分箱降采样（候选检测分箱、梯度检查分箱）。
+         - 用 rolling trimmed mean 构造鲁棒残差并标准化，筛选异常候选。
+         - 再做局地梯度符号变化检查，最后回原剖面输出 delta_* 指标。
 
     参数：
         data (pd.DataFrame): 包含多个剖面数据的表；需包含 Profile_number、深度、DO、盐度等列。
+        detection_config (DetectionConfig | None): 异常识别配置；None 时由 make_detection_config() 使用 processing.yml 默认值。
         depth_col (str): 深度列名，默认 'Depth'。
         do_col (str): 溶解氧列名，默认 'DO'。
         salinity_col (str): 盐度列名，默认 'Salinity'。
         temperature_col (str): 温度列名，默认 'Temperature'。
-        depth_interval (float | None): 深度窗口半宽；None → 全局 `_default_depth_interval`。
-        do_threshold (float | None): ΔDO 阈值；None → `_default_delta_do_threshold`。
-        salinity_threshold (float | None): 盐度阈值；None → `_default_salinity_threshold`；≤0 不启用过滤。
-        temperature_threshold (float | None): 温度阈值；None → `_default_temperature_threshold`；≤0 不启用过滤。
-        anomaly_min_depth (float | None): ΔDO 异常最小深度；≤0 表示不做深度过滤；None 表示使用 processing.yml 的 anomaly_min_depth。
-        anomaly_max_depth (float | None): ΔDO 峰值最大深度；≤0 表示不做上限过滤；None 表示使用 processing.yml 的 anomaly_max_depth。
-        depth_merge_tolerance (float | None): 深度近邻合并阈值；None → `_default_depth_merge_tolerance`；≤0 不合并。
-        duplicate_depth_strategy (str | None): 同深度多记录聚合策略；None → `_default_duplicate_depth_strategy`。
-        do_near_zero_threshold (float | None): 判定“近零 DO”阈值；None → processing.yml 的 do_near_zero_threshold。
-        do_near_zero_max_count (int | None): 单剖面允许的近零 DO 最大个数；超过则整剖面跳过；None → processing.yml 的 do_near_zero_max_count。
+        pi_col (str): aou 模式下优先使用的 π 列名；缺失时现场由 T/S/P 计算 surface-referenced potential spiciness。
         include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True。
+            在 do 模式中，delta_aou 是在 delta_do 对应深度上按同一参考线计算得到，
+            并非“基于 AOU 自身阈值先确定深度”得到的结果。
         remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
         verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
 
     返回：
-        pd.DataFrame: 每个满足条件的峰值一行，含
-        Profile_number, depth, delta_do, delta_salinity, delta_temperature,
-        do_value, salinity_value, temperature_value，
-        以及（可选）delta_aou（目前是在delta_do对应深度上计算得到的，而非基于AOU自身阈值确定的深度），
+        pd.DataFrame: 每个满足条件的候选一行；始终包含
+        Profile_number, depth, detection_method, primary_metric, primary_value, anomaly_score。
+        do 模式会返回 delta_do、delta_salinity、delta_temperature、do_value 等字段；
+        aou/trim 模式会额外返回 delta_aou、delta_pi、aou_value、pi_value、trim_* 等字段。
         以及 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）。
         若无满足条件记录，返回空表。
-    
-    提示:
-        可调用 `print_current_processing_defaults()` 查看当前全局默认阈值与处理参数，
-        以便核对本函数 None 回退所采用的配置来源。
     """
-    
-    # 检查必要的列是否存在
-    required_cols = [depth_col, do_col, salinity_col, 'Profile_number']
-    missing_cols = [col for col in required_cols if col not in data.columns]
-    if missing_cols:
-        print(f"警告：缺少必要的列: {missing_cols}")
-        return pd.DataFrame()
-    
-    # 复制数据以避免修改原始数据
-    input_data = data.copy()
-    
-    # 存储所有剖面的结果
-    all_results = []
-    
-    # 按Profile_number分组处理
-    profile_groups = input_data.groupby('Profile_number')
-    total_profiles = len(profile_groups)
-    if verbose:
-        print(f"开始处理 {total_profiles} 个剖面...")
-    
-    processed_profiles = 0
-    
-    # 参数回退（放在循环外，避免每个剖面重复判定）
-    if depth_interval is None:
-        depth_interval = _default_depth_interval
-    if do_threshold is None:
-        do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None:
-        salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None:
-        temperature_threshold = _default_temperature_threshold
-    if depth_merge_tolerance is None:
-        depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None:
-        duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None:
-        anomaly_min_depth = _cfg_anomaly_min_depth
-    if anomaly_max_depth is None:
-        anomaly_max_depth = _cfg_anomaly_max_depth
-    if do_near_zero_threshold is None:
-        do_near_zero_threshold = _cfg_do_near_zero_threshold
-    if do_near_zero_max_count is None:
-        do_near_zero_max_count = _cfg_do_near_zero_max_count
-    if do_near_zero_max_count is not None:
-        do_near_zero_max_count = int(do_near_zero_max_count)
 
-    for profile_num, profile_data in profile_groups:
-        # 质量控制：移除异常值和质量标记不良的数据
-        if remove_outliers:
-            # 应用Argo QC标准：仅保留等级为{1,2,5,8}的观测
-            for var in [do_col, salinity_col, temperature_col]:
-                qc_column_name = f"{var}_Flag"
-                if qc_column_name in profile_data.columns:
-                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                    bad_qc_mask = ~profile_data[qc_column_name].isin(good_qc_flags)
-                    profile_data.loc[bad_qc_mask, var] = np.nan
-            
-            # 规则法：移除已知的错误值
-            if do_col in profile_data.columns:
-                do_numeric = pd.to_numeric(profile_data[do_col], errors='coerce')
-                bad_do_mask = do_numeric <= do_near_zero_threshold
-                if do_near_zero_max_count is not None and do_near_zero_max_count >= 0:
-                    bad_do_count = int(np.count_nonzero(bad_do_mask.to_numpy()))
-                    if bad_do_count > do_near_zero_max_count:
-                        continue
-                profile_data.loc[bad_do_mask, do_col] = np.nan
-        
-        # 移除包含NaN值的行
-        drop_subset = [depth_col, do_col, salinity_col, temperature_col]
-        profile_data_clean = profile_data.dropna(subset=drop_subset)
-        
-        if len(profile_data_clean) < 5:  # 需要至少5个数据点来计算导数和峰值
-            continue  # 跳过数据点太少的剖面
+    def _append_profile_metadata(result: dict, profile_df: pd.DataFrame) -> dict:
+        for c in ('Year', 'Month', 'Day', 'Longitude', 'Latitude', 'Platform_number'):
+            if c in profile_df.columns:
+                result[c] = profile_df[c].iloc[0]
+        return result
 
-        # 按深度排序
-        profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
+    def _compute_profile_pi_surface(profile_rows: pd.DataFrame) -> np.ndarray:
+        if pi_col in profile_rows.columns:
+            return pd.to_numeric(profile_rows[pi_col], errors='coerce').to_numpy(dtype=float)
 
-        # 处理重复或非严格递增的深度值以避免 np.gradient 内部出现除零 (dx1 或 dx2 = 0)
-        # 策略：对同一深度的多条记录按 duplicate_depth_strategy 聚合为单条
-        def _best_qc_pick(group: pd.DataFrame) -> pd.Series:
-            qccol = f"{do_col}_Flag"
-            priority = {1: 0, 2: 1, 5: 2, 8: 3}
-            def rank(v):
-                try:
-                    iv = int(v)
-                except Exception:
-                    return 999
-                return priority.get(iv, 999)
-            if qccol in group.columns:
-                ranks = group[qccol].apply(rank)
-                min_rank = ranks.min()
-                picked = group.loc[ranks[ranks == min_rank].index]
-                # 并列时优先 DO 非空，随后保留第一条
-                picked = picked[pd.notna(picked[do_col])] if do_col in picked.columns else picked
-                return picked.iloc[0]
-            # 无 QC 列则退化为 first
-            return group.iloc[0]
+        needed = [salinity_col, temperature_col, depth_col]
+        if any(c not in profile_rows.columns for c in needed):
+            return np.full(len(profile_rows), np.nan, dtype=float)
 
-        def _mean_pick(group: pd.DataFrame) -> pd.Series:
-            # 对核心变量取均值，其他元数据取首个
-            first = group.iloc[0].copy()
-            for c in [do_col, salinity_col, temperature_col]:
-                if c in group.columns:
-                    first[c] = group[c].astype(float).mean()
-            return first
+        sal_vals = pd.to_numeric(profile_rows[salinity_col], errors='coerce').to_numpy(dtype=float)
+        temp_vals = pd.to_numeric(profile_rows[temperature_col], errors='coerce').to_numpy(dtype=float)
+        pres_vals = pd.to_numeric(profile_rows[depth_col], errors='coerce').to_numpy(dtype=float)
+        lon_vals = (
+            pd.to_numeric(profile_rows['Longitude'], errors='coerce').to_numpy(dtype=float)
+            if 'Longitude' in profile_rows.columns else np.zeros_like(sal_vals)
+        )
+        lat_vals = (
+            pd.to_numeric(profile_rows['Latitude'], errors='coerce').to_numpy(dtype=float)
+            if 'Latitude' in profile_rows.columns else np.zeros_like(sal_vals)
+        )
 
-        if profile_data_clean[depth_col].duplicated().any():
+        valid = np.isfinite(sal_vals) & np.isfinite(temp_vals) & np.isfinite(pres_vals)
+        out = np.full(len(profile_rows), np.nan, dtype=float)
+        if not valid.any():
+            return out
+
+        try:
+            sa = gsw.SA_from_SP(sal_vals[valid], pres_vals[valid], lon_vals[valid], lat_vals[valid])
+            ct = gsw.CT_from_t(sa, temp_vals[valid], pres_vals[valid])
+            if not hasattr(gsw, 'spiciness0'):
+                return out
+            out[valid] = np.asarray(gsw.spiciness0(sa, ct), dtype=float)
+        except Exception:
+            return out
+        return out
+
+    def _compute_profile_abs_sal(profile_rows: pd.DataFrame) -> np.ndarray:
+        needed = [salinity_col, depth_col]
+        if any(c not in profile_rows.columns for c in needed):
+            return np.full(len(profile_rows), np.nan, dtype=float)
+
+        sal_vals = pd.to_numeric(profile_rows[salinity_col], errors='coerce').to_numpy(dtype=float)
+        pres_vals = pd.to_numeric(profile_rows[depth_col], errors='coerce').to_numpy(dtype=float)
+        lon_vals = (
+            pd.to_numeric(profile_rows['Longitude'], errors='coerce').to_numpy(dtype=float)
+            if 'Longitude' in profile_rows.columns else np.zeros_like(sal_vals)
+        )
+        lat_vals = (
+            pd.to_numeric(profile_rows['Latitude'], errors='coerce').to_numpy(dtype=float)
+            if 'Latitude' in profile_rows.columns else np.zeros_like(sal_vals)
+        )
+
+        valid = np.isfinite(sal_vals) & np.isfinite(pres_vals)
+        out = np.full(len(profile_rows), np.nan, dtype=float)
+        if not valid.any():
+            return out
+
+        try:
+            out[valid] = np.asarray(
+                gsw.SA_from_SP(sal_vals[valid], pres_vals[valid], lon_vals[valid], lat_vals[valid]),
+                dtype=float,
+            )
+        except Exception:
+            return out
+        return out
+
+    def _best_qc_pick(group: pd.DataFrame) -> pd.Series:
+        qccol = f"{do_col}_Flag"
+        priority = {1: 0, 2: 1, 5: 2, 8: 3}
+
+        def rank(v):
+            try:
+                iv = int(v)
+            except Exception:
+                return 999
+            return priority.get(iv, 999)
+
+        if qccol in group.columns:
+            ranks = group[qccol].apply(rank)
+            min_rank = ranks.min()
+            picked = group.loc[ranks[ranks == min_rank].index]
+            if do_col in picked.columns:
+                picked = picked[pd.notna(picked[do_col])]
+                if picked.empty:
+                    picked = group.loc[ranks[ranks == min_rank].index]
+            return picked.iloc[0]
+        return group.iloc[0]
+
+    def _mean_pick(group: pd.DataFrame) -> pd.Series:
+        first = group.iloc[0].copy()
+        for c in [do_col, salinity_col, temperature_col]:
+            if c in group.columns:
+                first[c] = pd.to_numeric(group[c], errors='coerce').mean()
+        return first
+
+    def _dedupe_profile_depth(profile_df: pd.DataFrame) -> pd.DataFrame:
+        df = profile_df.copy()
+
+        if df[depth_col].duplicated().any():
             strategy = (duplicate_depth_strategy or 'best_qc').lower()
-            if strategy not in {'best_qc','first','mean','max','min'}:
+            if strategy not in {'best_qc', 'first', 'mean', 'max', 'min'}:
                 strategy = 'best_qc'
-            grouped = list(profile_data_clean.groupby(depth_col, sort=False))
+
+            grouped = list(df.groupby(depth_col, sort=False))
             picked_rows = []
-            for depth_val, grp in grouped:
+            for _, grp in grouped:
                 if len(grp) == 1:
                     picked_rows.append(grp.iloc[0])
                     continue
@@ -13686,174 +13776,613 @@ def calculate_delta_do(
                 elif strategy == 'mean':
                     picked_rows.append(_mean_pick(grp))
                 elif strategy == 'max':
-                    picked_rows.append(grp.loc[grp[do_col].idxmax()])
+                    picked_rows.append(grp.loc[pd.to_numeric(grp[do_col], errors='coerce').idxmax()])
                 elif strategy == 'min':
-                    picked_rows.append(grp.loc[grp[do_col].idxmin()])
-            profile_data_clean = pd.DataFrame(picked_rows)
-            # 可能破坏原索引，重排并按深度排序
-            profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
-        depth_series = profile_data_clean[depth_col].values
-        # 若仍非严格递增（可能存在逆序或噪声导致深度减小），尝试再次排序并去除 <= 前一值 的点
-        # （二次排序保证顺序，随后用 np.diff > 0 过滤）
-        if np.any(np.diff(depth_series) <= 0):
-            # 先强制排序（已经排序过, 这里是保险）
-            profile_data_clean = profile_data_clean.sort_values(by=depth_col).reset_index(drop=True)
-            # 过滤掉与前一个深度差 <= 0 的观测
-            cleaned_rows = [0]
-            last_depth = profile_data_clean.loc[0, depth_col]
-            for ridx in range(1, len(profile_data_clean)):
-                dval = profile_data_clean.loc[ridx, depth_col]
-                if dval > last_depth:  # 严格递增才保留
-                    cleaned_rows.append(ridx)
+                    picked_rows.append(grp.loc[pd.to_numeric(grp[do_col], errors='coerce').idxmin()])
+
+            df = pd.DataFrame(picked_rows)
+
+        df = df.sort_values(by=depth_col).reset_index(drop=True)
+        depth_arr = pd.to_numeric(df[depth_col], errors='coerce').to_numpy(dtype=float)
+        if len(depth_arr) == 0:
+            return df
+
+        if np.any(np.diff(depth_arr) <= 0):
+            keep_idx = [0]
+            last_depth = depth_arr[0]
+            for ridx in range(1, len(depth_arr)):
+                dval = depth_arr[ridx]
+                if np.isfinite(dval) and dval > last_depth:
+                    keep_idx.append(ridx)
                     last_depth = dval
-            profile_data_clean = profile_data_clean.iloc[cleaned_rows].reset_index(drop=True)
-            depth_series = profile_data_clean[depth_col].values
-        # 若清理后点数不足或仍不严格递增则跳过
-        if len(profile_data_clean) < 5 or (len(depth_series) > 1 and np.any(np.diff(depth_series) <= 0)):
+            df = df.iloc[keep_idx].reset_index(drop=True)
+        return df
+
+    def _find_peaks_by_slope(values: np.ndarray, depth_values: np.ndarray) -> list[tuple[int, str, float]]:
+        if len(values) < 3:
+            return []
+        slopes = np.gradient(values, depth_values)
+        peaks: list[tuple[int, str, float]] = []
+        for i in range(1, len(slopes) - 1):
+            prev_s = slopes[i - 1]
+            next_s = slopes[i + 1]
+            if not (np.isfinite(prev_s) and np.isfinite(next_s)):
+                continue
+            if prev_s > 0 and next_s < 0:
+                peaks.append((i, 'positive', float(depth_values[i])))
+            elif prev_s < 0 and next_s > 0:
+                peaks.append((i, 'negative', float(depth_values[i])))
+        return peaks
+
+    def _endpoint_delta(
+        depth_values: np.ndarray,
+        values: np.ndarray,
+        target_depth: float,
+        half_window: float,
+    ) -> tuple[float, float, float, float, float]:
+        d_lower = max(0.0, float(target_depth) - float(half_window))
+        d_upper = float(target_depth) + float(half_window)
+
+        mask = (
+            np.isfinite(depth_values)
+            & np.isfinite(values)
+            & (depth_values >= d_lower)
+            & (depth_values <= d_upper)
+        )
+        if np.count_nonzero(mask) < 2:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        d = depth_values[mask]
+        v = values[mask]
+        order = np.argsort(d)
+        d = d[order]
+        v = v[order]
+        if len(d) < 2 or np.isclose(d[0], d[-1]):
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        obs = float(np.interp(target_depth, d, v))
+        ref = float(np.interp(target_depth, [d[0], d[-1]], [v[0], v[-1]]))
+        return obs - ref, obs, ref, float(d[0]), float(d[-1])
+
+    def _window_extrema_delta(
+        depth_values: np.ndarray,
+        values: np.ndarray,
+        target_depth: float,
+        half_window: float,
+        peak_type: str,
+    ) -> tuple[float, float, float, float, float]:
+        up_mask = (
+            np.isfinite(depth_values)
+            & np.isfinite(values)
+            & (depth_values >= (target_depth - half_window))
+            & (depth_values <= target_depth)
+        )
+        lo_mask = (
+            np.isfinite(depth_values)
+            & np.isfinite(values)
+            & (depth_values >= target_depth)
+            & (depth_values <= (target_depth + half_window))
+        )
+
+        if np.count_nonzero(up_mask) < 1 or np.count_nonzero(lo_mask) < 1:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        up_d = depth_values[up_mask]
+        up_v = values[up_mask]
+        lo_d = depth_values[lo_mask]
+        lo_v = values[lo_mask]
+
+        try:
+            if peak_type == 'negative':
+                up_idx = int(np.nanargmax(up_v))
+                lo_idx = int(np.nanargmax(lo_v))
+            else:
+                up_idx = int(np.nanargmin(up_v))
+                lo_idx = int(np.nanargmin(lo_v))
+        except ValueError:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        d1 = float(up_d[up_idx])
+        v1 = float(up_v[up_idx])
+        d2 = float(lo_d[lo_idx])
+        v2 = float(lo_v[lo_idx])
+        if np.isclose(d1, d2):
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        if d1 > d2:
+            d1, d2 = d2, d1
+            v1, v2 = v2, v1
+
+        valid_all = np.isfinite(depth_values) & np.isfinite(values)
+        if np.count_nonzero(valid_all) < 2:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+
+        d_all = depth_values[valid_all]
+        v_all = values[valid_all]
+        order = np.argsort(d_all)
+        d_all = d_all[order]
+        v_all = v_all[order]
+
+        obs = float(np.interp(target_depth, d_all, v_all))
+        ref = float(np.interp(target_depth, [d1, d2], [v1, v2]))
+        return obs - ref, obs, ref, d1, d2
+
+    def _trimmed_mean_20_80(x: np.ndarray) -> float:
+        arr = np.asarray(x, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.nan
+        q20 = np.nanquantile(arr, 0.2)
+        q80 = np.nanquantile(arr, 0.8)
+        subset = arr[(arr >= q20) & (arr <= q80)]
+        if subset.size == 0:
+            return np.nan
+        return float(np.nanmean(subset))
+
+    def _downscale_profile(
+        profile_df: pd.DataFrame,
+        var_cols: list[str],
+        bin_width: float,
+    ) -> pd.DataFrame:
+        if bin_width <= 0:
+            return pd.DataFrame(columns=[depth_col, *var_cols])
+
+        work = profile_df[[depth_col, *var_cols]].copy()
+        work[depth_col] = pd.to_numeric(work[depth_col], errors='coerce')
+        for c in var_cols:
+            work[c] = pd.to_numeric(work[c], errors='coerce')
+
+        work = work[np.isfinite(work[depth_col])].copy()
+        if work.empty:
+            return pd.DataFrame(columns=[depth_col, *var_cols])
+
+        dmin = float(work[depth_col].min())
+        dmax = float(work[depth_col].max())
+        if not np.isfinite(dmin) or not np.isfinite(dmax):
+            return pd.DataFrame(columns=[depth_col, *var_cols])
+
+        left = np.floor(dmin / bin_width) * bin_width
+        right = np.ceil(dmax / bin_width) * bin_width
+        if right <= left:
+            right = left + bin_width
+        bins = np.arange(left, right + bin_width, bin_width)
+        if bins.size < 2:
+            bins = np.array([left, left + bin_width], dtype=float)
+
+        work['_bin'] = pd.cut(work[depth_col], bins=bins, include_lowest=True, labels=False)
+        work = work.dropna(subset=['_bin'])
+        if work.empty:
+            return pd.DataFrame(columns=[depth_col, *var_cols])
+
+        work['_bin'] = work['_bin'].astype(int)
+        grouped = work.groupby('_bin', as_index=False)[var_cols].mean(numeric_only=True)
+        centers = ((bins[grouped['_bin'].to_numpy(dtype=int)] + bins[grouped['_bin'].to_numpy(dtype=int) + 1]) / 2.0)
+        grouped[depth_col] = centers
+        grouped = grouped[[depth_col, *var_cols]].sort_values(depth_col).reset_index(drop=True)
+        return grouped
+
+    def _scaled_residual(values: np.ndarray) -> np.ndarray:
+        s = pd.Series(values, dtype=float)
+        tm9 = s.rolling(window=9, center=True, min_periods=9).apply(_trimmed_mean_20_80, raw=True)
+        rob_res_raw = s - tm9
+
+        arr = rob_res_raw.to_numpy(dtype=float)
+        finite = np.isfinite(arr)
+        out = np.full(arr.shape, np.nan, dtype=float)
+        if np.count_nonzero(finite) < 3:
+            return out
+
+        p75 = np.nanpercentile(arr[finite], 75)
+        p25 = np.nanpercentile(arr[finite], 25)
+        iqrn = (p75 - p25) / 1.349
+        if not np.isfinite(iqrn) or iqrn <= 0:
+            return out
+
+        nz = arr[finite & (arr != 0)]
+        median_res = float(np.nanmedian(nz)) if nz.size else 0.0
+
+        zero_mask = np.isfinite(arr) & (arr == 0)
+        nz_mask = np.isfinite(arr) & (arr != 0)
+        out[zero_mask] = 0.0
+        out[nz_mask] = (arr[nz_mask] - median_res) / iqrn
+        return out
+
+    def _gradient_sign_change(
+        depth_values: np.ndarray,
+        values: np.ndarray,
+        target_depth: float,
+        window: float,
+    ) -> bool:
+        mask = (
+            np.isfinite(depth_values)
+            & np.isfinite(values)
+            & (depth_values >= (target_depth - window))
+            & (depth_values <= (target_depth + window))
+        )
+        if np.count_nonzero(mask) < 3:
+            return False
+
+        d = depth_values[mask]
+        v = values[mask]
+        order = np.argsort(d)
+        d = d[order]
+        v = v[order]
+        if len(d) < 3:
+            return False
+
+        keep = np.r_[True, np.diff(d) > 0]
+        d = d[keep]
+        v = v[keep]
+        if len(d) < 3:
+            return False
+
+        dv = np.diff(v) / np.diff(d)
+        dv = dv[np.isfinite(dv)]
+        if dv.size < 2:
+            return False
+
+        signs = np.sign(dv)
+        return bool(np.any(np.diff(signs) != 0))
+    
+    # 检查必要的列是否存在
+    required_cols = [depth_col, do_col, salinity_col, temperature_col, 'Profile_number']
+    missing_cols = [col for col in required_cols if col not in data.columns]
+    if missing_cols:
+        print(f"警告：缺少必要的列: {missing_cols}")
+        return pd.DataFrame()
+
+    # 复制数据以避免修改原始数据
+    input_data = data.copy()
+
+    # 存储所有剖面的结果
+    all_results = []
+
+    # 按Profile_number分组处理
+    profile_groups = input_data.groupby('Profile_number')
+    total_profiles = len(profile_groups)
+    if verbose:
+        print(f"开始处理 {total_profiles} 个剖面...")
+
+    processed_profiles = 0
+
+    # 参数集中来自 DetectionConfig，避免下游函数签名按方法膨胀。
+    cfg = _resolve_detection_config(detection_config)
+    depth_interval = cfg.depth_interval
+    do_threshold = cfg.do_threshold
+    salinity_threshold = cfg.salinity_threshold
+    temperature_threshold = cfg.temperature_threshold
+    depth_merge_tolerance = cfg.depth_merge_tolerance
+    duplicate_depth_strategy = cfg.duplicate_depth_strategy
+    anomaly_min_depth = cfg.anomaly_min_depth
+    anomaly_max_depth = cfg.anomaly_max_depth
+    do_near_zero_threshold = cfg.do_near_zero_threshold
+    do_near_zero_max_count = cfg.do_near_zero_max_count
+    if do_near_zero_max_count is not None:
+        do_near_zero_max_count = int(do_near_zero_max_count)
+
+    method_norm = cfg.method
+    aou_threshold = cfg.aou_threshold
+    pi_threshold = cfg.pi_threshold
+    aou_pi_depth_tolerance = cfg.aou_pi_depth_tolerance
+    trim_cutoff = cfg.trim_cutoff
+    trim_window = cfg.trim_window
+    trim_bin_width_outlier = cfg.trim_bin_width_outlier
+    trim_bin_width_check = cfg.trim_bin_width_check
+    trim_depth_min = cfg.trim_depth_min
+    trim_depth_max = cfg.trim_depth_max
+
+    for profile_num, profile_data in profile_groups:
+        profile_data = profile_data.copy()
+
+        # 先统一为数值，避免字符串导致比较失败。
+        for c in [depth_col, do_col, salinity_col, temperature_col]:
+            if c in profile_data.columns:
+                profile_data[c] = pd.to_numeric(profile_data[c], errors='coerce')
+
+        # 质量控制：移除异常值和质量标记不良的数据
+        if remove_outliers:
+            # 应用Argo QC标准：仅保留等级为{1,2,5,8}的观测
+            for var in [do_col, salinity_col, temperature_col]:
+                qc_column_name = f"{var}_Flag"
+                if qc_column_name in profile_data.columns:
+                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+                    bad_qc_mask = ~profile_data[qc_column_name].isin(good_qc_flags)
+                    profile_data.loc[bad_qc_mask, var] = np.nan
+
+            # 规则法：移除已知的错误值
+            if do_col in profile_data.columns:
+                do_numeric = pd.to_numeric(profile_data[do_col], errors='coerce')
+                bad_do_mask = do_numeric <= do_near_zero_threshold
+                if do_near_zero_max_count is not None and do_near_zero_max_count >= 0:
+                    bad_do_count = int(np.count_nonzero(bad_do_mask.to_numpy()))
+                    if bad_do_count > do_near_zero_max_count:
+                        continue
+                profile_data.loc[bad_do_mask, do_col] = np.nan
+
+        # 移除包含NaN值的行
+        drop_subset = [depth_col, do_col, salinity_col, temperature_col]
+        profile_data_clean = profile_data.dropna(subset=drop_subset)
+        if len(profile_data_clean) < 5:
             continue
 
-        # 计算深度对DO和Salinity的斜率（一阶导数）
-        depth_values = profile_data_clean[depth_col].values  # 已保证严格递增
-        do_values = profile_data_clean[do_col].values
-        salinity_values = profile_data_clean[salinity_col].values
-        temperature_values = profile_data_clean[temperature_col].values
+        profile_data_clean = _dedupe_profile_depth(profile_data_clean)
+        if len(profile_data_clean) < 5:
+            continue
+
+        depth_values = pd.to_numeric(profile_data_clean[depth_col], errors='coerce').to_numpy(dtype=float)
+        do_values = pd.to_numeric(profile_data_clean[do_col], errors='coerce').to_numpy(dtype=float)
+        salinity_values = pd.to_numeric(profile_data_clean[salinity_col], errors='coerce').to_numpy(dtype=float)
+        temperature_values = pd.to_numeric(profile_data_clean[temperature_col], errors='coerce').to_numpy(dtype=float)
+
+        if len(depth_values) < 5 or np.any(np.diff(depth_values) <= 0):
+            continue
+
+        need_aou = include_aou or (method_norm in {'aou', 'trim'})
         aou_values = None
-        if include_aou:
+        if need_aou:
             try:
                 aou_series, _ = _compute_aou_for_plot(profile_data_clean.copy(), remove_outliers=remove_outliers)
                 aou_values = pd.to_numeric(aou_series, errors='coerce').to_numpy(dtype=float)
             except Exception:
                 aou_values = None
 
-        # 使用中心差分法计算导数
-        do_slopes = np.gradient(do_values, depth_values)
+        if method_norm in {'aou', 'trim'}:
+            if aou_values is None or np.count_nonzero(np.isfinite(aou_values)) < 5:
+                continue
 
-        # 重要说明：坐标系差异
-        # 图像坐标系（海洋学习惯）：深度向下为正，图像上正斜率表示随深度增加变量增大
-        # 数据计算坐标系：np.gradient计算dVar/dDepth，图像正斜率对应数值负斜率(<0)
-        # 峰值识别：图像上斜率从正变负为负峰值，从负变正为正峰值
-        # 因此代码中的判断条件与图像描述看似相反，但逻辑正确
-
-        # 仅定位 DO 的峰值（保留正峰值作为俯冲信号候选）
-        do_peaks = []
-        for i in range(1, len(do_slopes) - 1):
-            # DO 正峰值：图像上斜率从负变正（数值上从正变负）
-            if do_slopes[i-1] > 0 and do_slopes[i+1] < 0:
-                do_peaks.append((i, 'positive', depth_values[i]))
-            # DO 负峰值：如需扩展也可纳入；当前仅保留正峰值
-
-        if not do_peaks:
-            continue
-
-        # 对每个 DO 正峰，按同一深度计算 ΔDO、ΔSalinity、ΔTemperature
-        use_salinity_filter = (salinity_threshold is not None and salinity_threshold > 0)
-        use_temperature_filter = (temperature_threshold is not None and temperature_threshold > 0)
         profile_results = []
 
-        for do_idx, do_type, target_depth in do_peaks:
-            if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
-                continue
-            # 定义窗口 [p-Δp, p+Δp]
-            depth_lower = max(0, target_depth - depth_interval)
-            depth_upper = target_depth + depth_interval
-
-            depth_mask = (depth_values >= depth_lower) & (depth_values <= depth_upper)
-            if not np.any(depth_mask):
+        if method_norm == 'do':
+            # 重要说明：坐标系差异
+            # 图像坐标系（海洋学习惯）：深度向下为正，图像上正斜率表示随深度增加变量增大。
+            # 数据计算坐标系：np.gradient 计算 dVar/dDepth；图像上的“正斜率”在数值上对应负斜率。
+            # 因此峰值条件看起来会和图像描述方向相反，但逻辑上是一致的。
+            do_peaks = [pk for pk in _find_peaks_by_slope(do_values, depth_values) if pk[1] == 'positive']
+            if not do_peaks:
                 continue
 
-            depth_range = depth_values[depth_mask]
-            do_range = do_values[depth_mask]
-            salinity_range = salinity_values[depth_mask]
-            temperature_range = temperature_values[depth_mask]
+            use_salinity_filter = (salinity_threshold is not None and salinity_threshold > 0)
+            use_temperature_filter = (temperature_threshold is not None and temperature_threshold > 0)
 
-            if len(depth_range) < 2:
-                continue
+            for do_idx, _, target_depth in do_peaks:
+                if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
+                    continue
 
-            # 线性参考剖面（两端点连线）
-            do_ref_values = np.interp(
-                depth_range, [depth_range[0], depth_range[-1]], [do_range[0], do_range[-1]]
-            )
-            salinity_ref_values = np.interp(
-                depth_range, [depth_range[0], depth_range[-1]], [salinity_range[0], salinity_range[-1]]
-            )
-            temperature_ref_values = np.interp(
-                depth_range, [depth_range[0], depth_range[-1]], [temperature_range[0], temperature_range[-1]]
-            )
+                delta_do, do_obs, _, _, _ = _endpoint_delta(depth_values, do_values, target_depth, depth_interval)
+                if not np.isfinite(delta_do):
+                    continue
 
-            # 取最接近目标深度的观测点
-            target_idx = np.argmin(np.abs(depth_range - target_depth))
+                delta_salinity, sal_obs, _, _, _ = _endpoint_delta(
+                    depth_values, salinity_values, target_depth, depth_interval
+                )
+                delta_temperature, temp_obs, _, _, _ = _endpoint_delta(
+                    depth_values, temperature_values, target_depth, depth_interval
+                )
 
-            delta_do = do_range[target_idx] - do_ref_values[target_idx]
-            delta_salinity = salinity_range[target_idx] - salinity_ref_values[target_idx]
-            delta_temperature = temperature_range[target_idx] - temperature_ref_values[target_idx]
-            delta_aou = np.nan
-            if include_aou:
-                if aou_values is not None:
-                    aou_window_mask = depth_mask & np.isfinite(aou_values)
-                    if np.count_nonzero(aou_window_mask) >= 2:
-                        depth_range_aou = depth_values[aou_window_mask]
-                        aou_range = aou_values[aou_window_mask]
-                        if not np.isclose(depth_range_aou[0], depth_range_aou[-1]):
-                            aou_depth = float(target_depth)
-                            aou_val = float(np.interp(aou_depth, depth_range_aou, aou_range))
-                            aou_ref = float(np.interp(
-                                aou_depth,
-                                [depth_range_aou[0], depth_range_aou[-1]],
-                                [aou_range[0], aou_range[-1]],
-                            ))
-                            delta_aou = aou_val - aou_ref
+                delta_aou = np.nan
+                if include_aou and aou_values is not None:
+                    delta_aou, _, _, _, _ = _endpoint_delta(depth_values, aou_values, target_depth, depth_interval)
 
-            # 判定：ΔDO 为必需条件；ΔSalinity/ΔTemperature 在各自阈值>0时作为附加过滤（与条件）
-            cond = (delta_do >= do_threshold)
-            if use_salinity_filter:
-                cond = cond and (not np.isnan(delta_salinity)) and (abs(delta_salinity) >= salinity_threshold)
-            if use_temperature_filter:
-                cond = cond and (not np.isnan(delta_temperature)) and (abs(delta_temperature) >= temperature_threshold)
-            if cond:
+                cond = (delta_do >= do_threshold)
+                if use_salinity_filter:
+                    cond = cond and np.isfinite(delta_salinity) and (abs(delta_salinity) >= salinity_threshold)
+                if use_temperature_filter:
+                    cond = cond and np.isfinite(delta_temperature) and (abs(delta_temperature) >= temperature_threshold)
+
+                if not cond:
+                    continue
+
                 result = {
                     'Profile_number': profile_num,
-                    'depth': target_depth,
-                    'delta_do': delta_do,
-                    'delta_salinity': delta_salinity,
-                    'delta_temperature': delta_temperature,
-                    'do_value': do_values[do_idx],
-                    'salinity_value': salinity_range[target_idx],
-                    'temperature_value': temperature_range[target_idx]
+                    'depth': float(target_depth),
+                    'delta_do': float(delta_do),
+                    'delta_salinity': float(delta_salinity),
+                    'delta_temperature': float(delta_temperature),
+                    'do_value': float(do_obs),
+                    'salinity_value': float(sal_obs),
+                    'temperature_value': float(temp_obs),
+                    'detection_method': method_norm,
+                    'primary_metric': 'delta_do',
+                    'primary_value': float(delta_do),
+                    'anomaly_score': float(delta_do),
+                    '_rank_score': float(delta_do),
                 }
                 if include_aou:
-                    result['delta_aou'] = delta_aou
+                    result['delta_aou'] = float(delta_aou)
+                profile_results.append(_append_profile_metadata(result, profile_data_clean))
 
-                # 添加额外的剖面信息（如果存在）
-                if 'Year' in profile_data_clean.columns:
-                    result['Year'] = profile_data_clean['Year'].iloc[0]
-                if 'Month' in profile_data_clean.columns:
-                    result['Month'] = profile_data_clean['Month'].iloc[0]
-                if 'Day' in profile_data_clean.columns:
-                    result['Day'] = profile_data_clean['Day'].iloc[0]
-                if 'Longitude' in profile_data_clean.columns:
-                    result['Longitude'] = profile_data_clean['Longitude'].iloc[0]
-                if 'Latitude' in profile_data_clean.columns:
-                    result['Latitude'] = profile_data_clean['Latitude'].iloc[0]
-                if 'Platform_number' in profile_data_clean.columns:
-                    result['Platform_number'] = profile_data_clean['Platform_number'].iloc[0]
+        elif method_norm == 'aou':
+            pi_values = _compute_profile_pi_surface(profile_data_clean)
+            if np.count_nonzero(np.isfinite(pi_values)) < 5:
+                continue
 
-                profile_results.append(result)
+            aou_neg_peaks = [pk for pk in _find_peaks_by_slope(aou_values, depth_values) if pk[1] == 'negative']
+            pi_peaks = _find_peaks_by_slope(pi_values, depth_values)
+            if not aou_neg_peaks or not pi_peaks:
+                continue
 
-        # 剖面内“深度近邻合并”：按 delta_do 降序贪心选取，避免在峰上下方重复取点
+            for aou_idx, _, target_depth in aou_neg_peaks:
+                if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
+                    continue
+
+                near_pi = [pk for pk in pi_peaks if abs(pk[2] - target_depth) <= aou_pi_depth_tolerance]
+                if not near_pi:
+                    continue
+                near_pi.sort(key=lambda x: abs(x[2] - target_depth))
+                pi_idx, pi_peak_type, pi_peak_depth = near_pi[0]
+
+                delta_aou, aou_obs, _, _, _ = _window_extrema_delta(
+                    depth_values,
+                    aou_values,
+                    target_depth,
+                    depth_interval,
+                    peak_type='negative',
+                )
+                if not np.isfinite(delta_aou):
+                    continue
+
+                delta_pi, pi_obs, _, _, _ = _window_extrema_delta(
+                    depth_values,
+                    pi_values,
+                    target_depth,
+                    depth_interval,
+                    peak_type=pi_peak_type,
+                )
+                if not np.isfinite(delta_pi):
+                    continue
+
+                if not (delta_aou <= aou_threshold and abs(delta_pi) >= pi_threshold):
+                    continue
+
+                delta_do, do_obs, _, _, _ = _endpoint_delta(depth_values, do_values, target_depth, depth_interval)
+                delta_salinity, sal_obs, _, _, _ = _endpoint_delta(
+                    depth_values, salinity_values, target_depth, depth_interval
+                )
+                delta_temperature, temp_obs, _, _, _ = _endpoint_delta(
+                    depth_values, temperature_values, target_depth, depth_interval
+                )
+
+                result = {
+                    'Profile_number': profile_num,
+                    'depth': float(target_depth),
+                    'delta_do': float(delta_do),
+                    'delta_aou': float(delta_aou),
+                    'delta_pi': float(delta_pi),
+                    'delta_salinity': float(delta_salinity),
+                    'delta_temperature': float(delta_temperature),
+                    'do_value': float(do_obs),
+                    'aou_value': float(aou_obs),
+                    'pi_value': float(pi_obs),
+                    'salinity_value': float(sal_obs),
+                    'temperature_value': float(temp_obs),
+                    'pi_peak_type': pi_peak_type,
+                    'pi_peak_depth': float(pi_peak_depth),
+                    'aou_peak_depth': float(target_depth),
+                    'peak_depth_offset': float(pi_peak_depth - target_depth),
+                    'detection_method': method_norm,
+                    'primary_metric': 'delta_aou',
+                    'primary_value': float(delta_aou),
+                    'anomaly_score': float(-delta_aou),
+                    '_rank_score': float(-delta_aou),
+                }
+                profile_results.append(_append_profile_metadata(result, profile_data_clean))
+
+        elif method_norm == 'trim':
+            abs_sal_values = _compute_profile_abs_sal(profile_data_clean)
+            if np.count_nonzero(np.isfinite(abs_sal_values)) < 5:
+                continue
+
+            base_profile = pd.DataFrame(
+                {
+                    depth_col: depth_values,
+                    'AOU_WORK': aou_values,
+                    'ABS_SAL_WORK': abs_sal_values,
+                }
+            )
+
+            down40 = _downscale_profile(base_profile, ['AOU_WORK', 'ABS_SAL_WORK'], trim_bin_width_outlier)
+            down20 = _downscale_profile(base_profile, ['AOU_WORK', 'ABS_SAL_WORK'], trim_bin_width_check)
+            if down40.empty or down20.empty:
+                continue
+
+            down40['SCALE_RES_ROB_AOU'] = _scaled_residual(
+                pd.to_numeric(down40['AOU_WORK'], errors='coerce').to_numpy(dtype=float)
+            )
+            down40['SCALE_RES_ROB_ABS_SAL'] = _scaled_residual(
+                pd.to_numeric(down40['ABS_SAL_WORK'], errors='coerce').to_numpy(dtype=float)
+            )
+
+            candidates = down40[
+                np.isfinite(pd.to_numeric(down40['SCALE_RES_ROB_AOU'], errors='coerce'))
+                & np.isfinite(pd.to_numeric(down40['SCALE_RES_ROB_ABS_SAL'], errors='coerce'))
+                & (np.abs(pd.to_numeric(down40['SCALE_RES_ROB_AOU'], errors='coerce')) > trim_cutoff)
+                & (np.abs(pd.to_numeric(down40['SCALE_RES_ROB_ABS_SAL'], errors='coerce')) > trim_cutoff)
+                & (pd.to_numeric(down40['SCALE_RES_ROB_AOU'], errors='coerce') < 0)
+            ].copy()
+
+            if trim_depth_min is not None:
+                candidates = candidates[pd.to_numeric(candidates[depth_col], errors='coerce') >= float(trim_depth_min)]
+            if trim_depth_max is not None and trim_depth_max > 0:
+                candidates = candidates[pd.to_numeric(candidates[depth_col], errors='coerce') <= float(trim_depth_max)]
+
+            if candidates.empty:
+                continue
+
+            d20 = pd.to_numeric(down20[depth_col], errors='coerce').to_numpy(dtype=float)
+            a20 = pd.to_numeric(down20['AOU_WORK'], errors='coerce').to_numpy(dtype=float)
+            s20 = pd.to_numeric(down20['ABS_SAL_WORK'], errors='coerce').to_numpy(dtype=float)
+
+            for _, row in candidates.iterrows():
+                target_depth = float(pd.to_numeric(pd.Series([row.get(depth_col)]), errors='coerce').iloc[0])
+                if not np.isfinite(target_depth):
+                    continue
+                if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
+                    continue
+
+                if not _gradient_sign_change(d20, a20, target_depth, trim_window):
+                    continue
+                if not _gradient_sign_change(d20, s20, target_depth, trim_window):
+                    continue
+
+                delta_do, do_obs, _, _, _ = _endpoint_delta(depth_values, do_values, target_depth, depth_interval)
+                delta_salinity, sal_obs, _, _, _ = _endpoint_delta(
+                    depth_values, salinity_values, target_depth, depth_interval
+                )
+                delta_temperature, temp_obs, _, _, _ = _endpoint_delta(
+                    depth_values, temperature_values, target_depth, depth_interval
+                )
+                delta_aou, aou_obs, _, _, _ = _endpoint_delta(
+                    depth_values, aou_values, target_depth, depth_interval
+                )
+
+                score_aou = float(pd.to_numeric(pd.Series([row.get('SCALE_RES_ROB_AOU')]), errors='coerce').iloc[0])
+                score_sal = float(pd.to_numeric(pd.Series([row.get('SCALE_RES_ROB_ABS_SAL')]), errors='coerce').iloc[0])
+                trim_score = float(min(abs(score_aou), abs(score_sal)))
+
+                result = {
+                    'Profile_number': profile_num,
+                    'depth': float(target_depth),
+                    'delta_do': float(delta_do),
+                    'delta_aou': float(delta_aou),
+                    'delta_salinity': float(delta_salinity),
+                    'delta_temperature': float(delta_temperature),
+                    'do_value': float(do_obs),
+                    'aou_value': float(aou_obs),
+                    'salinity_value': float(sal_obs),
+                    'temperature_value': float(temp_obs),
+                    'trim_scale_res_rob_aou': score_aou,
+                    'trim_scale_res_rob_abs_sal': score_sal,
+                    'trim_score': trim_score,
+                    'detection_method': method_norm,
+                    'primary_metric': 'trim_score',
+                    'primary_value': trim_score,
+                    'anomaly_score': trim_score,
+                    '_rank_score': trim_score,
+                }
+                profile_results.append(_append_profile_metadata(result, profile_data_clean))
+
+        # 剖面内“深度近邻合并”：按模式得分降序贪心选取，避免近邻重复取点。
         if profile_results:
             if anomaly_min_depth is not None and anomaly_min_depth > 0:
-                filtered_results = []
-                for rec in profile_results:
-                    depth_val = rec.get('depth')
-                    if depth_val is None or np.isnan(depth_val):
-                        continue
-                    if depth_val >= anomaly_min_depth:
-                        filtered_results.append(rec)
-                profile_results = filtered_results
+                profile_results = [
+                    rec for rec in profile_results
+                    if np.isfinite(rec.get('depth', np.nan)) and rec.get('depth', np.nan) >= anomaly_min_depth
+                ]
+            if anomaly_max_depth is not None and anomaly_max_depth > 0:
+                profile_results = [
+                    rec for rec in profile_results
+                    if np.isfinite(rec.get('depth', np.nan)) and rec.get('depth', np.nan) <= anomaly_max_depth
+                ]
             if not profile_results:
                 continue
+
             if depth_merge_tolerance is not None and depth_merge_tolerance > 0:
-                profile_results.sort(key=lambda r: (np.nan_to_num(r['delta_do'], nan=-np.inf)), reverse=True)
+                profile_results.sort(
+                    key=lambda r: np.nan_to_num(
+                        r.get('_rank_score', r.get('delta_do', np.nan)), nan=-np.inf
+                    ),
+                    reverse=True,
+                )
                 kept = []
                 kept_depths = []
                 for rec in profile_results:
@@ -13866,21 +14395,29 @@ def calculate_delta_do(
                 all_results.extend(kept)
             else:
                 all_results.extend(profile_results)
-        
+
         processed_profiles += 1
         if processed_profiles % 100 == 0 and verbose:
             print(f"已处理 {processed_profiles}/{total_profiles} 个剖面...")
-    
+
     if not all_results:
         if verbose:
-            print("未检测到满足阈值条件的DO异常信号。")
+            print(f"未检测到满足条件的异常信号（method={method_norm}）。")
         return pd.DataFrame()
-    
+
     results_df = pd.DataFrame(all_results)
+    if '_rank_score' in results_df.columns:
+        results_df = results_df.drop(columns=['_rank_score'])
+
     if anomaly_min_depth is not None and anomaly_min_depth > 0 and 'depth' in results_df.columns:
         results_df = results_df[results_df['depth'] >= anomaly_min_depth]
+    if anomaly_max_depth is not None and anomaly_max_depth > 0 and 'depth' in results_df.columns:
+        results_df = results_df[results_df['depth'] <= anomaly_max_depth]
     if verbose:
-        print(f"总共检测到 {len(results_df)} 个潜在的DO异常信号，来自 {len(results_df['Profile_number'].unique())} 个剖面")
+        print(
+            f"总共检测到 {len(results_df)} 个潜在异常信号，"
+            f"来自 {len(results_df['Profile_number'].unique())} 个剖面（method={method_norm}）"
+        )
 
     return results_df
 
@@ -14185,7 +14722,7 @@ def export_all_interacting_argo(
         end_year (int): 结束年份。
         eddy_datasets (list, optional): 指定使用的涡旋数据集列表（如 ['acl', 'acs', 'cyclonic', 'anticyclonic']）。默认为 None，使用所有可用数据集。
         circle_enlargement_factor (float, optional): 涡旋边界放大系数。默认为从 processing.yml 中读取。
-        output_path (str | Path, optional): 结果文件保存路径。默认为 `plot_outputs/<region>/statistics/all_interacting_argo_<years>.parquet`。
+        output_path (str | Path, optional): 结果文件保存路径。默认为 `plot_outputs/shared/<region>/statistics/all_interacting_argo_<years>.parquet`。
         num_workers (int): 并行进程数。默认为 1。
 
     输出:
@@ -14196,7 +14733,7 @@ def export_all_interacting_argo(
     
     region_slug = _current_region_key()
     if output_path is None:
-        out_dir = Path(plots_output_root) / region_slug / "statistics"
+        out_dir = _shared_output_dir("statistics", region_slug)
         out_dir.mkdir(parents=True, exist_ok=True)
         output_path = out_dir / f"all_interacting_argo_{start_year}_{end_year}.parquet"
     else:
@@ -14272,7 +14809,7 @@ def query_argo_inside_eddy(
     说明:
         - 本函数仅查询已落盘的交互记录，不做实时几何匹配。
         - 默认优先读取
-          `plot_outputs/<region>/statistics/all_interacting_argo_*.parquet`。
+          `plot_outputs/shared/<region>/statistics/all_interacting_argo_*.parquet`。
         - 使用 parquet 过滤条件（Profile_number + Year + 可选 Month/Day），
           仅扫描少量行以实现快速判定。
 
@@ -14304,7 +14841,7 @@ def query_argo_inside_eddy(
             candidate_files = [p]
     else:
         region_slug = region or _current_region_key()
-        stats_dir = Path(plots_output_root) / region_slug / "statistics"
+        stats_dir = _shared_output_dir("statistics", region_slug)
         if stats_dir.exists():
             candidate_files = sorted(stats_dir.glob("all_interacting_argo_*.parquet"))
 
@@ -14389,13 +14926,7 @@ def calculate_interaction_statistics(
     start_year: int,
     end_year: int,
     eddy_datasets: dict | list[str] | tuple[str, ...] | None = None,
-    do_threshold: float | None = None,
-    salinity_threshold: float | None = None,
-    temperature_threshold: float | None = None,
-    depth_interval: float | None = None,
-    depth_merge_tolerance: float | None = None,
-    duplicate_depth_strategy: str | None = None,
-    anomaly_min_depth: float | None = None,
+    detection_config: DetectionConfig | None = None,
     circle_enlargement_factor: float | None = None,
     save_report: bool = True,
     precomputed_file: str | Path | None = None,
@@ -14410,19 +14941,14 @@ def calculate_interaction_statistics(
         2. 加载预计算的交互记录文件（由 export_all_interacting_argo 生成）。
            注意：必须先运行 export_all_interacting_argo 生成该文件，否则报错。
         3. 计算 Baseline：所有 Argo 剖面中，有多少比例落在涡旋内。
-        4. 计算 Anomalies：筛选出 ΔDO 异常剖面，计算其中有多少比例落在涡旋内。
+        4. 计算 Anomalies：按 detection_config 筛选异常剖面，计算其中有多少比例落在涡旋内。
            - 若 use_precomputed_anomalies=True (默认)，会自动尝试查找 plot_argo_hotspots 生成的异常文件。
            - 若找到文件，直接读取；若未找到或读取失败，回退到实时调用 calculate_delta_do 计算。
         5. 输出对比报告。
     """
-    # 参数回退
-    if do_threshold is None: do_threshold = _default_delta_do_threshold
-    if salinity_threshold is None: salinity_threshold = _default_salinity_threshold
-    if temperature_threshold is None: temperature_threshold = _default_temperature_threshold
-    if depth_interval is None: depth_interval = _default_depth_interval
-    if depth_merge_tolerance is None: depth_merge_tolerance = _default_depth_merge_tolerance
-    if duplicate_depth_strategy is None: duplicate_depth_strategy = _default_duplicate_depth_strategy
-    if anomaly_min_depth is None: anomaly_min_depth = _cfg_anomaly_min_depth
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
     if circle_enlargement_factor is None: circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
 
     print(f"--- Calculating Interaction Statistics {start_year}-{end_year} ---")
@@ -14434,7 +14960,7 @@ def calculate_interaction_statistics(
     region_slug = _current_region_key()
     if precomputed_file is None:
         # 尝试默认路径
-        default_file = Path(plots_output_root) / region_slug / "statistics" / f"all_interacting_argo_{start_year}_{end_year}.parquet"
+        default_file = _shared_output_dir("statistics", region_slug) / f"all_interacting_argo_{start_year}_{end_year}.parquet"
         if default_file.exists():
             precomputed_file = default_file
             
@@ -14454,7 +14980,7 @@ def calculate_interaction_statistics(
     baseline_profiles = pd.DataFrame()
     loaded_baseline_file = False
     
-    default_baseline_file = Path(plots_output_root) / region_slug / "statistics" / f"all_region_argo_{start_year}_{end_year}.parquet"
+    default_baseline_file = _shared_output_dir("statistics", region_slug) / f"all_region_argo_{start_year}_{end_year}.parquet"
     if default_baseline_file.exists():
         print(f"[*] Loading precomputed region profiles from: {default_baseline_file}")
         try:
@@ -14515,15 +15041,8 @@ def calculate_interaction_statistics(
     # 自动查找默认异常文件
     if anomalies_file is None and use_precomputed_anomalies:
         region_slug = _current_region_key()
-        out_dir = Path(plots_output_root) / region_slug / "plot_argo_hotspots"
-        
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-            
-        default_anomalies_file = out_dir / f"anomalies_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.parquet"
+        out_dir = cfg.output_dir("plot_argo_hotspots", region_slug)
+        default_anomalies_file = out_dir / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
         if default_anomalies_file.exists():
             anomalies_file = default_anomalies_file
             print(f"[*] Found default precomputed anomalies file: {anomalies_file}")
@@ -14535,6 +15054,15 @@ def calculate_interaction_statistics(
         print(f"[*] Loading precomputed anomalies from: {anomalies_file}")
         try:
             anomalies = pd.read_parquet(anomalies_file)
+            if 'detection_method' in anomalies.columns:
+                method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+                total_count = len(anomalies)
+                mismatch_count = int((~method_mask).sum())
+                if mismatch_count > 0:
+                    print(f"[WARN] Mixed detection_method found: expected={method_name}, mismatched={mismatch_count}/{total_count}.")
+                else:
+                    print(f"[*] Method={method_name}, records={total_count}")
+                anomalies = anomalies[method_mask].copy()
             # 确保只统计当前区域内的异常（如果文件包含更多区域）
             # 使用 Profile_number 与 baseline_profiles (已过滤区域) 取交集最稳妥
             valid_ids = set(baseline_profiles['Profile_number'])
@@ -14572,13 +15100,7 @@ def calculate_interaction_statistics(
         if not argo_geo.empty:
             anomalies = calculate_delta_do(
                 argo_geo,
-                depth_interval=depth_interval,
-                do_threshold=do_threshold,
-                salinity_threshold=salinity_threshold,
-                temperature_threshold=temperature_threshold,
-                anomaly_min_depth=anomaly_min_depth,
-                depth_merge_tolerance=depth_merge_tolerance,
-                duplicate_depth_strategy=duplicate_depth_strategy,
+                detection_config=cfg,
                 remove_outliers=True,
                 verbose=False
             )
@@ -14613,14 +15135,15 @@ def calculate_interaction_statistics(
         f"Interaction Statistics Report ({start_year}-{end_year})\n"
         f"Region: {_current_region_key()}\n"
         f"Source: {source_str}\n"
-        f"Thresholds: ΔDO>={do_threshold}, Depth>={anomaly_min_depth}m\n"
+        f"Method: {cfg.method}\n"
+        f"Criteria: {cfg.threshold_label()}, Depth>={cfg.anomaly_min_depth}m\n"
         f"----------------------------------------\n"
         f"[Baseline] All Argo Profiles:\n"
         f"  Total Profiles:       {total_baseline}\n"
         f"  Inside Eddies:        {interacted_baseline}\n"
         f"  Interaction Rate:     {pct_baseline:.2f}%\n"
         f"----------------------------------------\n"
-        f"[Subset] ΔDO Anomalies:\n"
+        f"[Subset] Anomalies:\n"
         f"  Total Anomalies:      {total_anom}\n"
         f"  Inside Eddies:        {interacted_anom}\n"
         f"  Interaction Rate:     {pct_anom:.2f}%\n"
@@ -14633,16 +15156,9 @@ def calculate_interaction_statistics(
     
     if save_report:
         region_slug = _current_region_key()
-        out_dir = Path(plots_output_root) / region_slug / "statistics"
+        out_dir = cfg.output_dir("statistics", region_slug)
         out_dir.mkdir(parents=True, exist_ok=True)
-        
-        thr_str = f"{do_threshold:g}".replace('.', 'p')
-        depth_suffix = ''
-        if anomaly_min_depth is not None and anomaly_min_depth > 0:
-            depth_str = f"{anomaly_min_depth:g}".replace('.', 'p')
-            depth_suffix = f"_depth{depth_str}m"
-            
-        fname = out_dir / f"interaction_stats_{start_year}_{end_year}_thr{thr_str}{depth_suffix}.txt"
+        fname = out_dir / f"interaction_stats_{start_year}_{end_year}_{run_tag}.txt"
         with open(fname, 'w') as f:
             f.write(report)
         print(f"Report saved to: {fname}")
