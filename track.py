@@ -7963,6 +7963,188 @@ def _prepare_overview_projection_rows(
     return deltas if not deltas.empty else pd.DataFrame()
 
 
+def _as_profile_2d_array(values, expected_shape: tuple[int, int] | None = None) -> np.ndarray | None:
+    """将剖面变量转为 float 2D ndarray，masked 值填为 NaN。"""
+    if values is None:
+        return None
+    arr = np.ma.filled(np.ma.array(values, copy=False), np.nan)
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim != 2:
+        return None
+    if expected_shape is not None and arr.shape != expected_shape:
+        return None
+    return arr
+
+
+def _nan_stat(values: np.ndarray, op: str) -> float:
+    """NaN-safe scalar statistic helper."""
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    if op == 'mean':
+        return float(np.nanmean(vals))
+    if op == 'median':
+        return float(np.nanmedian(vals))
+    if op == 'max':
+        return float(np.nanmax(vals))
+    if op == 'p95':
+        return float(np.nanpercentile(vals, 95))
+    if op == 'min':
+        return float(np.nanmin(vals))
+    raise ValueError(f"Unknown statistic op: {op}")
+
+
+def _format_scientific_mathtext(value: float, precision: int = 2) -> str:
+    """Format a scalar as Matplotlib mathtext scientific notation."""
+    try:
+        value_f = float(value)
+    except Exception:
+        return r"\mathrm{NaN}"
+    if not np.isfinite(value_f):
+        return r"\mathrm{NaN}"
+
+    mantissa, exponent_text = f"{value_f:.{precision}e}".split("e")
+    exponent = int(exponent_text)
+    return rf"{mantissa}\times10^{{{exponent}}}"
+
+
+def calculate_glorys_vertical_profile_diagnostics(
+    data_package: dict,
+    *,
+    projection_x_km: float = 0.0,
+    projection_depth_m: float | None = None,
+    x_window_km: float = 25.0,
+    z_window_m: float | None = 100.0,
+    depth_range_m: tuple[float, float] | None = (0.0, 1000.0),
+    rho0: float = 1025.0,
+    gravity: float = 9.81,
+) -> dict:
+    """计算 GLORYS 垂向剖面在 Argo 投影位置附近的 N2 层化指标。
+
+    指标定义:
+        - 直接读取 ``data_package['profile_data']['sigma']``，不在此处重新计算密度。
+        - 使用近似 ``N2 = g/rho0 * d(sigma0)/dDepth``。
+          深度坐标采用向下为正，稳定层化通常对应正 N2。
+        - 若给定 ``projection_depth_m``，局地窗口为 ``projection_depth_m ± z_window_m``；
+          否则使用 ``depth_range_m``。
+
+    返回:
+        dict: 少量 N2 诊断指标，用于绘图标题标注或批处理运行日志。
+    """
+    try:
+        x0 = float(projection_x_km)
+    except Exception:
+        x0 = np.nan
+    try:
+        depth0 = float(projection_depth_m) if projection_depth_m is not None else np.nan
+    except Exception:
+        depth0 = np.nan
+
+    out = {
+        'projection_x_km': x0 if np.isfinite(x0) else np.nan,
+        'projection_depth_m': depth0 if np.isfinite(depth0) else np.nan,
+        'n2_x_window_km': float(x_window_km),
+        'n2_z_window_m': float(z_window_m) if z_window_m is not None else np.nan,
+        'n2_valid_fraction': np.nan,
+        'glorys_n2_local': np.nan,
+        'glorys_n2_p95': np.nan,
+        'n2_error': None,
+    }
+
+    if not data_package:
+        out['n2_error'] = 'empty_data_package'
+        return out
+
+    y_coords = np.asarray(data_package.get('y_coords', []), dtype=float)
+    z_coords = np.asarray(data_package.get('z_coords', []), dtype=float)
+    if y_coords.size < 2 or z_coords.size < 2:
+        out['n2_error'] = 'insufficient_coordinates'
+        return out
+
+    finite_y = np.isfinite(y_coords)
+    finite_z = np.isfinite(z_coords)
+    if np.count_nonzero(finite_y) < 2 or np.count_nonzero(finite_z) < 2:
+        out['n2_error'] = 'nonfinite_coordinates'
+        return out
+
+    y_idx = np.nonzero(finite_y)[0]
+    z_idx = np.nonzero(finite_z)[0]
+    y_use = y_coords[y_idx]
+    z_use = z_coords[z_idx]
+    y_order = np.argsort(y_use)
+    z_order = np.argsort(z_use)
+    y_idx = y_idx[y_order]
+    z_idx = z_idx[z_order]
+    y_use = y_use[y_order]
+    z_use = z_use[z_order]
+
+    expected_shape = (len(z_coords), len(y_coords))
+    sigma_full = _as_profile_2d_array(data_package.get('profile_data', {}).get('sigma'), expected_shape=expected_shape)
+    if sigma_full is None:
+        out['n2_error'] = 'sigma_unavailable'
+        return out
+
+    sigma = sigma_full[np.ix_(z_idx, y_idx)]
+    if sigma.shape != (z_use.size, y_use.size):
+        out['n2_error'] = 'sigma_shape_mismatch'
+        return out
+
+    if not np.isfinite(x0):
+        x0 = 0.0
+    try:
+        x_half = abs(float(x_window_km))
+    except Exception:
+        x_half = 25.0
+    x_mask = np.abs(y_use - x0) <= x_half
+    if not np.any(x_mask):
+        x_mask[np.nanargmin(np.abs(y_use - x0))] = True
+
+    if np.isfinite(depth0) and z_window_m is not None:
+        z_half = abs(float(z_window_m))
+        z_mask = np.abs(z_use - depth0) <= z_half
+        if not np.any(z_mask):
+            z_mask[np.nanargmin(np.abs(z_use - depth0))] = True
+    elif depth_range_m is not None and len(depth_range_m) == 2:
+        z_min = float(min(depth_range_m))
+        z_max = float(max(depth_range_m))
+        z_mask = (z_use >= z_min) & (z_use <= z_max)
+        if not np.any(z_mask):
+            z_mask = np.ones_like(z_use, dtype=bool)
+    else:
+        z_mask = np.ones_like(z_use, dtype=bool)
+
+    local_mask = z_mask[:, None] & x_mask[None, :]
+    local_sigma = sigma[local_mask]
+    out['n2_valid_fraction'] = (
+        float(np.count_nonzero(np.isfinite(local_sigma)) / local_sigma.size)
+        if local_sigma.size > 0 else np.nan
+    )
+
+    try:
+        d_sigma_dz = np.gradient(sigma, z_use, axis=0)
+    except Exception:
+        d_sigma_dz = np.full_like(sigma, np.nan, dtype=float)
+
+    n2 = (float(gravity) / float(rho0)) * d_sigma_dz
+    n2_positive = np.where(n2 > 0, n2, np.nan)
+
+    nearest_y_idx = int(np.nanargmin(np.abs(y_use - x0)))
+    if np.isfinite(depth0):
+        nearest_z_idx = int(np.nanargmin(np.abs(z_use - depth0)))
+    elif np.any(z_mask):
+        z_candidates = np.nonzero(z_mask)[0]
+        nearest_z_idx = int(z_candidates[len(z_candidates) // 2])
+    else:
+        nearest_z_idx = 0
+
+    n2_local = n2[nearest_z_idx, nearest_y_idx]
+    out['glorys_n2_local'] = float(n2_local) if np.isfinite(n2_local) else np.nan
+    out['glorys_n2_p95'] = _nan_stat(n2_positive[local_mask], 'p95')
+
+    return out
+
+
 def _plot_glorys_overview_vertical_2x2(
     *,
     vertical_package: dict,
@@ -7983,6 +8165,7 @@ def _plot_glorys_overview_vertical_2x2(
     isoline_linewidth: float = 0.8,
     isoline_alpha: float = 0.45,
     label_isolines: bool = False,
+    title_extra: str = '',
 ):
     """绘制 overview 的 2x2 vertical 图。"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
@@ -8126,8 +8309,9 @@ def _plot_glorys_overview_vertical_2x2(
         if i == 0 and (draw_reference_lines or mlt_drawn or (projected_argo_profile is not None and not projected_argo_profile.empty)):
             ax.legend(fontsize=9, loc='best')
 
+    extra_text = f", {title_extra}" if title_extra else ""
     fig.suptitle(
-        f"{subject_label} GLORYS Vertical Overview on {date_label}, y={k_val:.2f}x{b_val:+.2f}",
+        f"{subject_label} GLORYS Vertical Overview on {date_label}, y={k_val:.2f}x{b_val:+.2f}{extra_text}",
         fontsize=16,
         y=1.02,
     )
@@ -8163,6 +8347,10 @@ def _run_vertical_overview_batch(
     save_fig: bool,
     output_dir: str | Path | None,
     verbose: bool,
+    n2_projection_depth_m: float | None = None,
+    n2_x_window_km: float = 25.0,
+    n2_z_window_m: float | None = 100.0,
+    annotate_n2: bool = False,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
     results: list[dict] = []
@@ -8188,6 +8376,19 @@ def _run_vertical_overview_batch(
             distance_scale_km=projection_distance_scale_km,
         ) if plot_argo_projection else pd.DataFrame()
 
+        n2_diag = calculate_glorys_vertical_profile_diagnostics(
+            pkg,
+            projection_x_km=0.0,
+            projection_depth_m=n2_projection_depth_m,
+            x_window_km=n2_x_window_km,
+            z_window_m=n2_z_window_m,
+        ) if annotate_n2 else {}
+        n2_title_extra = ''
+        if annotate_n2 and n2_diag:
+            n2_val = n2_diag.get('glorys_n2_p95')
+            if n2_val is not None and np.isfinite(float(n2_val)):
+                n2_title_extra = rf"$N^2={_format_scientific_mathtext(n2_val)}\,\mathrm{{s}}^{{-2}}$"
+
         fig = _plot_glorys_overview_vertical_2x2(
             vertical_package=pkg,
             variables=vertical_vars,
@@ -8207,6 +8408,7 @@ def _run_vertical_overview_batch(
             isoline_linewidth=isoline_linewidth,
             isoline_alpha=isoline_alpha,
             label_isolines=label_isolines,
+            title_extra=n2_title_extra,
         )
 
         save_path = None
@@ -8229,7 +8431,10 @@ def _run_vertical_overview_batch(
             plt.show()
         plt.close(fig)
 
-        results.append({'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None})
+        result_item = {'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None}
+        if n2_diag:
+            result_item.update(n2_diag)
+        results.append(result_item)
 
     return results
 
@@ -8264,6 +8469,10 @@ def plot_track_vertical_glorys_overview(
     save_fig: bool = False,
     output_dir: str | Path | None = None,
     verbose: bool = True,
+    n2_projection_depth_m: float | None = None,
+    n2_x_window_km: float = 25.0,
+    n2_z_window_m: float | None = 100.0,
+    annotate_n2: bool = False,
 ) -> list[dict]:
     """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
@@ -8272,6 +8481,8 @@ def plot_track_vertical_glorys_overview(
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
+    if annotate_n2:
+        vars_to_fetch.add('sigma')
     if plot_mlt:
         vars_to_fetch.add('mlt')
 
@@ -8355,6 +8566,10 @@ def plot_track_vertical_glorys_overview(
         save_fig=save_fig,
         output_dir=output_dir,
         verbose=verbose,
+        n2_projection_depth_m=n2_projection_depth_m,
+        n2_x_window_km=n2_x_window_km,
+        n2_z_window_m=n2_z_window_m,
+        annotate_n2=annotate_n2,
     )
 
 
@@ -8389,14 +8604,21 @@ def plot_argo_vertical_glorys_overview(
     save_fig: bool = False,
     output_dir: str | Path | None = None,
     verbose: bool = True,
+    n2_projection_depth_m: float | None = None,
+    n2_x_window_km: float = 25.0,
+    n2_z_window_m: float | None = 100.0,
+    annotate_n2: bool = False,
 ) -> list[dict]:
     """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
     verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
+    annotate_n2=True 时会在标题显示 Argo 投影位置附近的 GLORYS N2。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
+    if annotate_n2:
+        vars_to_fetch.add('sigma')
     if plot_mlt:
         vars_to_fetch.add('mlt')
 
@@ -8491,6 +8713,10 @@ def plot_argo_vertical_glorys_overview(
         save_fig=save_fig,
         output_dir=output_dir,
         verbose=verbose,
+        n2_projection_depth_m=n2_projection_depth_m,
+        n2_x_window_km=n2_x_window_km,
+        n2_z_window_m=n2_z_window_m,
+        annotate_n2=annotate_n2,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -11114,6 +11340,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
     month_val = args.get('month')
     day_val = args.get('day')
     platform_val = args.get('platform_number')
+    n2_projection_depth_m = args.get('n2_projection_depth_m')
 
     if month_val is not None and day_val is not None:
         profile_time = pd.Timestamp(year=year_val, month=int(month_val), day=int(day_val))
@@ -11132,6 +11359,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
         'center_lon': np.nan,
         'center_lat': np.nan,
         'target_date': None,
+        'anomaly_depth_m': n2_projection_depth_m,
         'horizontal_status': 'not_started',
         'vertical_status': 'not_started',
         'vertical_save_paths': None,
@@ -11229,11 +11457,29 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             save_fig=bool(args.get('save_fig', True)),
             output_dir=args.get('vertical_output_dir'),
             verbose=bool(args.get('verbose', False)),
+            n2_projection_depth_m=n2_projection_depth_m,
+            n2_x_window_km=float(args.get('n2_x_window_km', 25.0)),
+            n2_z_window_m=args.get('n2_z_window_m', 100.0),
+            annotate_n2=bool(args.get('annotate_n2', False)),
         )
         record['vertical_status'] = 'ok' if vertical_results else 'empty'
         record['vertical_save_paths'] = ";".join(
             [str(item.get('save_path')) for item in vertical_results if item.get('save_path')]
         ) or None
+        if vertical_results:
+            first_vertical = vertical_results[0]
+            for key in [
+                'projection_depth_m',
+                'n2_x_window_km',
+                'n2_z_window_m',
+                'n2_valid_fraction',
+                'glorys_n2_local',
+                'glorys_n2_p95',
+                'n2_error',
+            ]:
+                if key in first_vertical:
+                    value = first_vertical[key]
+                    record[key] = value
         record['status'] = 'ok' if record['vertical_status'] == 'ok' else 'partial'
 
     except Exception as exc:
@@ -11280,6 +11526,12 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     use_multiprocessing: bool = True,
     num_workers: int | None = None,
     maxtasksperchild: int | None = 4,
+    n2_x_window_km: float = 25.0,
+    n2_z_window_m: float | None = 100.0,
+    annotate_n2: bool = False,
+    return_details: bool = False,
+    save_summary_data: bool = True,
+    summary_data_path: str | Path | None = None,
 ) -> dict:
     """为 hotspots 异常剖面批量绘制 Argo-centered GLORYS 水平图与垂向总览图。
 
@@ -11308,9 +11560,14 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         use_multiprocessing: 是否用多进程并行处理 profile；默认 True。
         num_workers: worker 数；None 时自动取 min(profile数, CPU数, 4)。
         maxtasksperchild: 每个 worker 处理多少个任务后重启；None 表示不自动重启。
+        n2_x_window_km / n2_z_window_m: N2 局地窗口半宽。
+        annotate_n2: 是否在 vertical overview 标题中显示 N2。
+        return_details: 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
+        save_summary_data: 是否保存逐 profile GLORYS/N2 明细 parquet，默认 True。
+        summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
 
     返回:
-        dict: 包含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/results。
+        dict: 默认包含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/summary_data_path 等摘要。
     """
 
     def _to_int_or_none(val):
@@ -11320,6 +11577,32 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             return int(val)
         except Exception:
             return None
+
+    def _to_float_or_none(val):
+        try:
+            if pd.isna(val):
+                return None
+            out_val = float(val)
+            return out_val if np.isfinite(out_val) else None
+        except Exception:
+            return None
+
+    def _first_float_from_row(row: pd.Series, names: list[str]) -> float | None:
+        for name in names:
+            if name in row.index:
+                value = _to_float_or_none(row.get(name))
+                if value is not None:
+                    return value
+        return None
+
+    def _infer_year_tag(path_obj: Path | None = None) -> str:
+        if start_year is not None and end_year is not None:
+            return f"{int(start_year)}_{int(end_year)}"
+        if path_obj is not None:
+            match = re.search(r'anomalies_(\d{4})_(\d{4})_', path_obj.name)
+            if match:
+                return f"{match.group(1)}_{match.group(2)}"
+        return "custom"
 
     cfg = _resolve_detection_config(detection_config)
     method_name = cfg.method
@@ -11345,6 +11628,13 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     if not Path(anomalies_path).exists():
         raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
 
+    year_tag = _infer_year_tag(Path(anomalies_path))
+    resolved_summary_data_path = (
+        Path(summary_data_path)
+        if summary_data_path is not None
+        else batch_output_dir / f"hotspot_anomaly_argo_glorys_overviews_summary_{year_tag}_{run_tag}.parquet"
+    )
+
     anomalies = pd.read_parquet(anomalies_path)
     if 'detection_method' in anomalies.columns:
         method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
@@ -11358,14 +11648,53 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
 
     if anomalies.empty:
         print(f"[*] No anomalies in file: {anomalies_path}")
-        return {
+        saved_summary_data_path = None
+        if save_summary_data:
+            try:
+                resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
+                empty_cols = [
+                    'task_index',
+                    'year',
+                    'profile_number',
+                    'platform_number',
+                    'profile_time',
+                    'line_strategy',
+                    'k',
+                    'b',
+                    'center_lon',
+                    'center_lat',
+                    'target_date',
+                    'anomaly_depth_m',
+                    'horizontal_status',
+                    'vertical_status',
+                    'vertical_save_paths',
+                    'status',
+                    'error',
+                    'projection_depth_m',
+                    'n2_x_window_km',
+                    'n2_z_window_m',
+                    'n2_valid_fraction',
+                    'glorys_n2_local',
+                    'glorys_n2_p95',
+                    'n2_error',
+                ]
+                pd.DataFrame(columns=empty_cols).to_parquet(resolved_summary_data_path, index=False)
+                saved_summary_data_path = str(resolved_summary_data_path)
+            except Exception as exc:
+                print(f"[WARN] Failed to save empty GLORYS summary data: {exc}")
+        empty_summary = {
             'total_candidates': 0,
             'processed_profiles': 0,
             'skipped_profiles': 0,
             'output_dir': str(batch_output_dir) if save_fig else None,
             'anomalies_path': str(anomalies_path),
-            'results': [],
+            'summary_data_path': saved_summary_data_path,
+            'n2_diagnostics': bool(annotate_n2),
+            'annotate_n2': bool(annotate_n2),
         }
+        if return_details:
+            empty_summary['results'] = []
+        return empty_summary
 
     required_cols = ['Year', 'Profile_number']
     missing_cols = [c for c in required_cols if c not in anomalies.columns]
@@ -11387,6 +11716,9 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
                 shutil.rmtree(batch_output_dir)
             except Exception as exc:
                 print(f"[WARN] Failed to clear output directory {batch_output_dir}: {exc}")
+    if save_fig or save_summary_data:
+        batch_output_dir.mkdir(parents=True, exist_ok=True)
+    if save_fig:
         horizontal_output_dir.mkdir(parents=True, exist_ok=True)
         vertical_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -11406,6 +11738,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'month': _to_int_or_none(row.get('Month')),
             'day': _to_int_or_none(row.get('Day')),
             'platform_number': _to_int_or_none(row.get('Platform_number')),
+            'n2_projection_depth_m': _first_float_from_row(row, ['depth', 'Depth', 'Anomaly_depth']),
             'detection_config': cfg,
             'region_config_key': region_config_key,
             'horizontal_variable': horizontal_variable,
@@ -11436,6 +11769,9 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'vertical_output_dir': vertical_output_dir if save_fig else None,
             'verbose': verbose,
             'force_agg_backend': bool(worker_count > 1 and not show_fig),
+            'n2_x_window_km': n2_x_window_km,
+            'n2_z_window_m': n2_z_window_m,
+            'annotate_n2': annotate_n2,
         })
 
     if worker_count > 1:
@@ -11471,14 +11807,32 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         f"total={total_candidates}, processed={processed_profiles}, skipped={skipped_profiles}."
     )
 
-    return {
+    saved_summary_data_path = None
+    if save_summary_data:
+        try:
+            resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(results).to_parquet(resolved_summary_data_path, index=False)
+            saved_summary_data_path = str(resolved_summary_data_path)
+            if verbose:
+                print(f"Summary data saved to: {resolved_summary_data_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to save GLORYS summary data: {exc}")
+
+    summary = {
         'total_candidates': total_candidates,
         'processed_profiles': int(processed_profiles),
         'skipped_profiles': int(skipped_profiles),
         'output_dir': str(batch_output_dir) if save_fig else None,
+        'horizontal_output_dir': str(horizontal_output_dir) if save_fig else None,
+        'vertical_output_dir': str(vertical_output_dir) if save_fig else None,
         'anomalies_path': str(anomalies_path),
-        'results': results,
+        'summary_data_path': saved_summary_data_path,
+        'n2_diagnostics': bool(annotate_n2),
+        'annotate_n2': bool(annotate_n2),
     }
+    if return_details:
+        summary['results'] = results
+    return summary
 
 
 def plot_single_hotspot_profile(
