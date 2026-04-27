@@ -8387,7 +8387,7 @@ def _run_vertical_overview_batch(
         if annotate_n2 and n2_diag:
             n2_val = n2_diag.get('glorys_n2_p95')
             if n2_val is not None and np.isfinite(float(n2_val)):
-                n2_title_extra = rf"$N^2={_format_scientific_mathtext(n2_val)}\,\mathrm{{s}}^{{-2}}$"
+                n2_title_extra = rf"$N^2_{{95}}={_format_scientific_mathtext(n2_val)}\,\mathrm{{s}}^{{-2}}$"
 
         fig = _plot_glorys_overview_vertical_2x2(
             vertical_package=pkg,
@@ -10964,13 +10964,21 @@ def plot_argo_hotspots(
 
     # 保存 anomalies 为 Parquet（高效压缩存储）
     saved_anomalies_path: str | None = None
-    if save_data and not anomalies.empty:
+    if save_data:
         region_slug_for_path = _current_region_key()
         out_dir = cfg.output_dir("plot_argo_hotspots", region_slug_for_path)
         out_dir.mkdir(exist_ok=True, parents=True)
         pq_path = out_dir / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
         try:
-            anomalies.to_parquet(pq_path, index=False)
+            anomalies_out = anomalies.copy()
+            preferred_cols = _hotspot_anomaly_output_columns()
+            if anomalies_out.empty:
+                anomalies_out = pd.DataFrame(columns=preferred_cols)
+            else:
+                ordered_cols = [c for c in preferred_cols if c in anomalies_out.columns]
+                extra_cols = [c for c in anomalies_out.columns if c not in ordered_cols]
+                anomalies_out = anomalies_out[ordered_cols + extra_cols]
+            anomalies_out.to_parquet(pq_path, index=False)
             saved_anomalies_path = str(pq_path)
             print(f"Anomalies saved to: {pq_path}")
         except Exception as e:
@@ -11179,10 +11187,19 @@ def plot_hotspot_anomaly_vertical_profiles(
                 profile_rows = day_rows
 
         platform_val = None
+        row_platform_val = _to_int_or_none(row.get('Platform_number'))
+        if row_platform_val is not None and 'Platform_number' in profile_rows.columns:
+            platform_rows = profile_rows[
+                pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == row_platform_val
+            ].copy()
+            if not platform_rows.empty:
+                profile_rows = platform_rows
+                platform_val = row_platform_val
+
         if 'Platform_number' in profile_rows.columns:
             platforms = pd.to_numeric(profile_rows['Platform_number'], errors='coerce').dropna().astype(int).unique()
             if platforms.size > 0:
-                platform_val = int(platforms[0])
+                platform_val = platform_val if platform_val is not None else int(platforms[0])
                 if platforms.size > 1:
                     print(
                         f"[WARN] Multiple platforms found for Year={year_val}, Profile={profile_num}; "
@@ -11835,6 +11852,564 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     return summary
 
 
+def export_hotspot_anomaly_summary_table(
+    vertical_profiles_result: dict | None = None,
+    argo_glorys_result: dict | None = None,
+    start_year: int | None = None,
+    end_year: int | None = None,
+    anomalies_path: str | Path | None = None,
+    detection_config: DetectionConfig | None = None,
+    *,
+    argo_glorys_summary_data_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    output_format: str | None = None,
+    save_table: bool = True,
+    n2_threshold: float | None = 2e-5,
+    compact_columns: bool = True,
+    require_glorys_details: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """导出 hotspot anomaly 检查用 summary 表。
+
+    该函数不重新做异常检测或 GLORYS 绘图。基础剖面信息与异常指标来自
+    ``plot_argo_hotspots`` 保存的 anomalies parquet；N2 与 GLORYS 绘图状态优先来自
+    ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值，若未传返回值则读取该函数默认保存的
+    summary parquet。若 N2 详情缺失，会在表中保留空值并给出提示。
+
+    参数:
+        vertical_profiles_result: ``plot_hotspot_anomaly_vertical_profiles`` 的返回值。
+            仅用于兼容旧调用：若其中包含 ``anomalies_path``，可用来定位输入 parquet。
+        argo_glorys_result: ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值。
+            若包含 ``results``，会合并 GLORYS 状态和 N2 字段。
+        start_year / end_year / anomalies_path: 当返回值中没有 anomalies_path 时用于定位输入 parquet。
+        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
+        argo_glorys_summary_data_path: ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的明细 parquet。
+        output_path: 保存路径；None 时写到当前 method/region 的默认 summary 目录。
+        output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
+        save_table: 是否保存表格文件，默认 True。
+        n2_threshold: N2 分类阈值，默认 2e-5；设为 None 时不新增 ``n2_strong`` 列。
+        compact_columns: 是否删除人工检查中冗余的固定/重复列，默认 True。
+        require_glorys_details: True 时若缺少 GLORYS details/N2 信息则报错。
+        verbose: 是否打印保存路径和缺失提示。
+
+    返回:
+        dict: 包含 ``summary_table``、``output_path``、``n_rows``、``warnings``。
+    """
+
+    def _result_path(result: dict | None, key: str) -> Path | None:
+        if not isinstance(result, dict):
+            return None
+        val = result.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        return Path(val)
+
+    def _to_int_or_none(val) -> int | None:
+        try:
+            if pd.isna(val):
+                return None
+            return int(val)
+        except Exception:
+            return None
+
+    def _date_key_from_parts(year_val, month_val=None, day_val=None) -> str | None:
+        try:
+            if month_val is None or day_val is None or pd.isna(month_val) or pd.isna(day_val):
+                return None
+            return pd.Timestamp(
+                year=int(year_val),
+                month=int(month_val),
+                day=int(day_val),
+            ).strftime('%Y-%m-%d')
+        except Exception:
+            return None
+
+    def _date_key_from_value(val) -> str | None:
+        try:
+            if val is None or pd.isna(val):
+                return None
+        except Exception:
+            pass
+        try:
+            return pd.Timestamp(val).normalize().strftime('%Y-%m-%d')
+        except Exception:
+            return None
+
+    def _record_keys(year_val, profile_val, date_key=None, platform_val=None) -> list[tuple]:
+        year_key = _to_int_or_none(year_val)
+        profile_key = _to_int_or_none(profile_val)
+        if year_key is None or profile_key is None:
+            return []
+        platform_key = _to_int_or_none(platform_val)
+        keys = []
+        if date_key and platform_key is not None:
+            keys.append((year_key, profile_key, date_key, platform_key))
+        if date_key:
+            keys.append((year_key, profile_key, date_key, None))
+        if platform_key is not None:
+            keys.append((year_key, profile_key, None, platform_key))
+        keys.append((year_key, profile_key, None, None))
+        return keys
+
+    def _infer_years_from_path(path_obj: Path | None) -> tuple[int | None, int | None]:
+        if path_obj is None:
+            return None, None
+        match = re.search(r'anomalies_(\d{4})_(\d{4})_', path_obj.name)
+        if not match:
+            return None, None
+        return int(match.group(1)), int(match.group(2))
+
+    def _copy_first_available(src: pd.DataFrame, dst: pd.DataFrame, target: str, names: list[str]):
+        for name in names:
+            if name in src.columns:
+                dst[target] = src[name]
+                return
+        dst[target] = np.nan
+
+    def _read_first_existing_parquet(paths: list[Path]) -> tuple[list[dict], Path | None, str | None]:
+        for path_obj in paths:
+            if path_obj is None:
+                continue
+            path_obj = Path(path_obj)
+            if not path_obj.exists():
+                continue
+            try:
+                df_obj = pd.read_parquet(path_obj)
+                return df_obj.to_dict('records'), path_obj, None
+            except Exception as exc:
+                return [], path_obj, str(exc)
+        return [], None, None
+
+    def _series_constant(series: pd.Series) -> bool:
+        vals = series.dropna()
+        if vals.empty:
+            return True
+        return vals.astype(str).nunique(dropna=True) <= 1
+
+    def _numeric_columns_equal(left: pd.Series, right: pd.Series) -> bool:
+        left_vals = pd.to_numeric(left, errors='coerce')
+        right_vals = pd.to_numeric(right, errors='coerce')
+        both_nan = left_vals.isna() & right_vals.isna()
+        comparable = ~(both_nan)
+        if not comparable.any():
+            return True
+        return bool(np.allclose(
+            left_vals[comparable].to_numpy(dtype=float),
+            right_vals[comparable].to_numpy(dtype=float),
+            equal_nan=True,
+            rtol=0.0,
+            atol=1e-8,
+        ))
+
+    def _compact_summary_columns(table_in: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+        table_out = table_in.copy()
+        drop_cols: list[str] = []
+
+        constant_drop_candidates = [
+            'detection_method',
+            'depth_interval_m',
+            'glorys_status',
+            'glorys_error',
+            'glorys_horizontal_status',
+            'glorys_vertical_status',
+            'glorys_line_strategy',
+            'glorys_k',
+            'n2_x_window_km',
+            'n2_z_window_m',
+            'n2_error',
+        ]
+        for col_name in constant_drop_candidates:
+            if col_name in table_out.columns and _series_constant(table_out[col_name]):
+                drop_cols.append(col_name)
+
+        duplicate_pairs = [
+            ('n2_projection_depth_m', 'anomaly_depth_m'),
+            ('glorys_center_lon', 'Longitude'),
+            ('glorys_center_lat', 'Latitude'),
+            ('glorys_b', 'Latitude'),
+        ]
+        for duplicate_col, source_col in duplicate_pairs:
+            if (
+                duplicate_col in table_out.columns
+                and source_col in table_out.columns
+                and _numeric_columns_equal(table_out[duplicate_col], table_out[source_col])
+            ):
+                drop_cols.append(duplicate_col)
+
+        if drop_cols:
+            drop_cols = [c for c in dict.fromkeys(drop_cols) if c in table_out.columns]
+            table_out = table_out.drop(columns=drop_cols)
+        return table_out, drop_cols
+
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
+    region_slug = _current_region_key()
+    warnings_list: list[str] = []
+
+    candidate_paths = []
+    if anomalies_path is not None:
+        candidate_paths.append(Path(anomalies_path))
+    for result in (vertical_profiles_result, argo_glorys_result):
+        path_val = _result_path(result, 'anomalies_path')
+        if path_val is not None:
+            candidate_paths.append(path_val)
+
+    if not candidate_paths and start_year is not None and end_year is not None:
+        candidate_paths.append(
+            cfg.output_dir("plot_argo_hotspots", region_slug)
+            / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+
+    if not candidate_paths:
+        raise ValueError(
+            "缺少 anomalies_path。请先运行 plot_argo_hotspots，"
+            "或显式传入 anomalies_path/start_year/end_year。"
+        )
+
+    resolved_anomalies_path = candidate_paths[0]
+    for path_val in candidate_paths[1:]:
+        if Path(path_val) != resolved_anomalies_path:
+            warnings_list.append(
+                f"收到多个 anomalies_path，使用 {resolved_anomalies_path}，忽略 {path_val}。"
+            )
+            break
+
+    if not resolved_anomalies_path.exists():
+        raise FileNotFoundError(f"Anomalies file not found: {resolved_anomalies_path}")
+
+    inferred_start, inferred_end = _infer_years_from_path(resolved_anomalies_path)
+    start_tag = start_year if start_year is not None else inferred_start
+    end_tag = end_year if end_year is not None else inferred_end
+    year_tag = f"{start_tag}_{end_tag}" if start_tag is not None and end_tag is not None else "custom"
+
+    anomalies = pd.read_parquet(resolved_anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+        mismatch_count = int((~method_mask).sum())
+        if mismatch_count > 0:
+            warnings_list.append(
+                f"anomalies 中存在非 {method_name} 方法记录，已过滤 {mismatch_count} 行。"
+            )
+        anomalies = anomalies[method_mask].copy()
+
+    if anomalies.empty:
+        warnings_list.append(f"No anomalies in file: {resolved_anomalies_path}")
+
+    required_cols = ['Year', 'Profile_number']
+    missing_cols = [c for c in required_cols if c not in anomalies.columns]
+    if missing_cols:
+        raise ValueError(f"Anomalies file missing required columns: {missing_cols}")
+
+    work = anomalies.copy()
+    work['_year'] = pd.to_numeric(work['Year'], errors='coerce')
+    work['_profile'] = pd.to_numeric(work['Profile_number'], errors='coerce')
+    work = work.dropna(subset=['_year', '_profile']).copy()
+    work['_year'] = work['_year'].astype(int)
+    work['_profile'] = work['_profile'].astype(int)
+
+    table = pd.DataFrame(index=work.index)
+    table['detection_method'] = str(method_name)
+    table['date'] = [
+        _date_key_from_parts(row.get('Year'), row.get('Month'), row.get('Day'))
+        for _, row in work.iterrows()
+    ]
+    _copy_first_available(work, table, 'Year', ['Year'])
+    _copy_first_available(work, table, 'Month', ['Month'])
+    _copy_first_available(work, table, 'Day', ['Day'])
+    _copy_first_available(work, table, 'Profile_number', ['Profile_number'])
+    _copy_first_available(work, table, 'Platform_number', ['Platform_number'])
+    _copy_first_available(work, table, 'Longitude', ['Longitude'])
+    _copy_first_available(work, table, 'Latitude', ['Latitude'])
+    _copy_first_available(work, table, 'anomaly_depth_m', ['depth', 'Depth', 'Anomaly_depth'])
+
+    for col_name in [
+        'primary_metric',
+        'primary_value',
+        'anomaly_score',
+        'delta_do',
+        'do_value',
+        'delta_aou',
+        'aou_value',
+        'delta_pi',
+        'pi_value',
+        'trim_score',
+        'trim_scale_res_rob_aou',
+        'trim_scale_res_rob_abs_sal',
+        'delta_temperature',
+        'delta_salinity',
+    ]:
+        if col_name in work.columns:
+            table[col_name] = work[col_name]
+
+    table['anomaly_min_depth_m'] = (
+        float(cfg.anomaly_min_depth)
+        if cfg.anomaly_min_depth is not None else np.nan
+    )
+    table['anomaly_max_depth_m'] = (
+        float(cfg.anomaly_max_depth)
+        if cfg.anomaly_max_depth is not None else np.nan
+    )
+    table['depth_interval_m'] = float(cfg.depth_interval)
+
+    if method_name == 'do':
+        table['do_threshold'] = float(cfg.do_threshold)
+        if cfg.salinity_threshold is not None and float(cfg.salinity_threshold) > 0:
+            table['salinity_threshold'] = float(cfg.salinity_threshold)
+        if cfg.temperature_threshold is not None and float(cfg.temperature_threshold) > 0:
+            table['temperature_threshold'] = float(cfg.temperature_threshold)
+    elif method_name == 'aou':
+        table['aou_threshold'] = float(cfg.aou_threshold)
+        table['pi_threshold'] = float(cfg.pi_threshold)
+        table['aou_pi_depth_tolerance_m'] = float(cfg.aou_pi_depth_tolerance)
+    elif method_name == 'trim':
+        table['trim_cutoff_sigma'] = float(cfg.trim_cutoff)
+        table['trim_depth_min_m'] = float(cfg.trim_depth_min)
+        table['trim_depth_max_m'] = float(cfg.trim_depth_max)
+
+    glorys_records = []
+    glorys_summary_path_used = None
+    if isinstance(argo_glorys_result, dict) and isinstance(argo_glorys_result.get('results'), list):
+        glorys_records = argo_glorys_result.get('results') or []
+        glorys_summary_path_used = _result_path(argo_glorys_result, 'summary_data_path')
+    else:
+        glorys_summary_candidates: list[Path] = []
+        if argo_glorys_summary_data_path is not None:
+            glorys_summary_candidates.append(Path(argo_glorys_summary_data_path))
+        result_glorys_summary_path = _result_path(argo_glorys_result, 'summary_data_path')
+        if result_glorys_summary_path is not None:
+            glorys_summary_candidates.append(result_glorys_summary_path)
+        glorys_summary_candidates.append(
+            cfg.output_dir("plot_hotspot_anomaly_argo_glorys_overviews", region_slug)
+            / f"hotspot_anomaly_argo_glorys_overviews_summary_{year_tag}_{run_tag}.parquet"
+        )
+        glorys_records, glorys_summary_path_used, glorys_summary_error = _read_first_existing_parquet(
+            glorys_summary_candidates
+        )
+        if glorys_summary_error is not None:
+            warnings_list.append(
+                f"读取 GLORYS summary parquet 失败: {glorys_summary_path_used}: {glorys_summary_error}"
+            )
+        if not glorys_records and len(table) > 0:
+            if glorys_summary_path_used is None and argo_glorys_result is None:
+                warnings_list.append(
+                    "未收到 plot_hotspot_anomaly_argo_glorys_overviews 的返回值，也未找到默认 GLORYS summary parquet；"
+                    "N2 与 GLORYS 绘图状态将为空。"
+                )
+            elif glorys_summary_path_used is None:
+                warnings_list.append(
+                    "plot_hotspot_anomaly_argo_glorys_overviews 返回值中没有 results，且未找到可读 summary parquet。"
+                )
+            else:
+                warnings_list.append(
+                    f"已找到 GLORYS summary parquet，但其中没有逐 profile 记录: {glorys_summary_path_used}"
+                )
+
+    if require_glorys_details and len(table) > 0 and not glorys_records:
+        raise ValueError(
+            "缺少 GLORYS details。请先运行 "
+            "plot_hotspot_anomaly_argo_glorys_overviews(..., annotate_n2=True)。"
+        )
+    glorys_by_key: dict[tuple, dict] = {}
+    for rec in glorys_records:
+        if not isinstance(rec, dict):
+            continue
+        date_key = _date_key_from_value(rec.get('target_date')) or _date_key_from_value(rec.get('profile_time'))
+        for key in _record_keys(
+            rec.get('year'),
+            rec.get('profile_number'),
+            date_key,
+            rec.get('platform_number'),
+        ):
+            glorys_by_key.setdefault(key, rec)
+
+    glorys_cols = [
+        ('glorys_status', 'status'),
+        ('glorys_error', 'error'),
+        ('glorys_horizontal_status', 'horizontal_status'),
+        ('glorys_vertical_status', 'vertical_status'),
+        ('glorys_line_strategy', 'line_strategy'),
+        ('glorys_k', 'k'),
+        ('glorys_b', 'b'),
+        ('glorys_center_lon', 'center_lon'),
+        ('glorys_center_lat', 'center_lat'),
+        ('n2_projection_depth_m', 'projection_depth_m'),
+        ('n2_x_window_km', 'n2_x_window_km'),
+        ('n2_z_window_m', 'n2_z_window_m'),
+        ('n2_valid_fraction', 'n2_valid_fraction'),
+        ('glorys_n2_local', 'glorys_n2_local'),
+        ('glorys_n2_p95', 'glorys_n2_p95'),
+        ('n2_error', 'n2_error'),
+    ]
+
+    matched_records = []
+    for _, row in work.iterrows():
+        date_key = _date_key_from_parts(row.get('Year'), row.get('Month'), row.get('Day'))
+        matched = None
+        for key in _record_keys(row.get('Year'), row.get('Profile_number'), date_key, row.get('Platform_number')):
+            matched = glorys_by_key.get(key)
+            if matched is not None:
+                break
+        matched_records.append(matched or {})
+
+    for out_col, rec_col in glorys_cols:
+        table[out_col] = [rec.get(rec_col, np.nan) for rec in matched_records]
+
+    if glorys_records and table['glorys_n2_p95'].isna().all():
+        warnings_list.append(
+            "GLORYS details 中没有可用 N2。若需要 N2，请使用 annotate_n2=True 重新运行 "
+            "plot_hotspot_anomaly_argo_glorys_overviews。"
+        )
+        if require_glorys_details:
+            raise ValueError(warnings_list[-1])
+
+    if n2_threshold is not None:
+        threshold_val = float(n2_threshold)
+        n2_vals = pd.to_numeric(table['glorys_n2_p95'], errors='coerce')
+        table['n2_threshold'] = threshold_val
+        table['n2_strong'] = pd.Series(
+            np.where(n2_vals.notna(), n2_vals >= threshold_val, pd.NA),
+            index=table.index,
+            dtype='boolean',
+        )
+
+    for col_name in [
+        'Year', 'Month', 'Day', 'Profile_number', 'Platform_number',
+        'Longitude', 'Latitude', 'anomaly_depth_m',
+        'primary_value', 'anomaly_score', 'delta_do', 'do_value',
+        'delta_aou', 'aou_value', 'delta_pi', 'pi_value',
+        'trim_score', 'trim_scale_res_rob_aou', 'trim_scale_res_rob_abs_sal',
+        'delta_temperature', 'delta_salinity',
+        'glorys_k', 'glorys_b', 'glorys_center_lon', 'glorys_center_lat',
+        'n2_projection_depth_m', 'n2_x_window_km', 'n2_z_window_m',
+        'n2_valid_fraction', 'glorys_n2_local', 'glorys_n2_p95',
+    ]:
+        if col_name in table.columns:
+            table[col_name] = pd.to_numeric(table[col_name], errors='coerce')
+
+    sort_cols = [c for c in ['Year', 'Month', 'Day', 'Profile_number', 'Platform_number'] if c in table.columns]
+    if sort_cols:
+        table = table.sort_values(sort_cols).reset_index(drop=True)
+    else:
+        table = table.reset_index(drop=True)
+
+    dropped_summary_columns: list[str] = []
+    if compact_columns:
+        table, dropped_summary_columns = _compact_summary_columns(table)
+
+    saved_path = None
+    if save_table:
+        if output_path is None:
+            fmt = str(output_format or 'csv').lower().lstrip('.')
+            if fmt == 'excel':
+                fmt = 'xlsx'
+            if fmt not in {'csv', 'xlsx'}:
+                raise ValueError("output_format must be 'csv' or 'xlsx'.")
+            out_dir = cfg.output_dir("hotspot_anomaly_summary_table", region_slug)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_path = out_dir / f"hotspot_anomaly_summary_{year_tag}_{run_tag}.{fmt}"
+        else:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fmt = str(output_format or output_path.suffix.lstrip('.') or 'csv').lower()
+            if fmt == 'excel':
+                fmt = 'xlsx'
+
+        saved_path = Path(output_path)
+        if fmt == 'csv':
+            table.to_csv(saved_path, index=False)
+        elif fmt == 'xlsx':
+            try:
+                from openpyxl.utils import get_column_letter
+
+                with pd.ExcelWriter(saved_path, engine='openpyxl') as writer:
+                    sheet_name = 'summary'
+                    table.to_excel(writer, index=False, sheet_name=sheet_name)
+                    worksheet = writer.sheets[sheet_name]
+                    worksheet.freeze_panes = 'A2'
+
+                    int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number'}
+                    coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
+                    sci_cols = {'glorys_n2_local', 'glorys_n2_p95', 'n2_threshold'}
+                    fraction_cols = {'n2_valid_fraction'}
+
+                    def _excel_number_format(col_name: str) -> str | None:
+                        col_lower = str(col_name).lower()
+                        if col_name in int_cols:
+                            return '0'
+                        if col_name == 'date':
+                            return 'yyyy-mm-dd'
+                        if col_name in coord_cols:
+                            return '0.000'
+                        if col_name in sci_cols:
+                            return '0.00E+00'
+                        if col_name in fraction_cols:
+                            return '0.00'
+                        if 'depth' in col_lower:
+                            return '0.0'
+                        if any(token in col_lower for token in ['delta', 'value', 'score', 'threshold']):
+                            return '0.000'
+                        if col_name == 'glorys_k':
+                            return '0.000'
+                        return None
+
+                    def _preview_excel_value(value, number_format: str | None) -> str:
+                        if pd.isna(value):
+                            return ''
+                        if number_format == '0':
+                            return f"{float(value):.0f}"
+                        if number_format == 'yyyy-mm-dd':
+                            try:
+                                return pd.Timestamp(value).strftime('%Y-%m-%d')
+                            except Exception:
+                                return str(value)
+                        if number_format == '0.000':
+                            return f"{float(value):.3f}"
+                        if number_format == '0.00E+00':
+                            return f"{float(value):.2E}"
+                        if number_format == '0.00':
+                            return f"{float(value):.2f}"
+                        if number_format == '0.0':
+                            return f"{float(value):.1f}"
+                        return str(value)
+
+                    for col_idx, col_name in enumerate(table.columns, start=1):
+                        values = table[col_name].dropna()
+                        sample_values = values.head(1000)
+                        number_format = _excel_number_format(str(col_name))
+                        if number_format is not None:
+                            for row_idx in range(2, len(table) + 2):
+                                worksheet.cell(row=row_idx, column=col_idx).number_format = number_format
+                        max_value_len = max(
+                            [len(str(col_name))]
+                            + [len(_preview_excel_value(value, number_format)) for value in sample_values]
+                        )
+                        width = min(max(max_value_len + 1, 6), 42)
+                        worksheet.column_dimensions[get_column_letter(col_idx)].width = width
+            except Exception as exc:
+                warnings_list.append(f"设置 xlsx 列宽失败，已使用默认宽度保存: {exc}")
+                table.to_excel(saved_path, index=False)
+        else:
+            raise ValueError("output_format must be 'csv' or 'xlsx'.")
+
+        if verbose:
+            print(f"Summary table saved to: {saved_path}")
+
+    if verbose:
+        for msg in warnings_list:
+            print(f"[WARN] {msg}")
+
+    return {
+        'summary_table': table,
+        'output_path': str(saved_path) if saved_path is not None else None,
+        'anomalies_path': str(resolved_anomalies_path),
+        'argo_glorys_summary_data_path': str(glorys_summary_path_used) if glorys_summary_path_used is not None else None,
+        'n_rows': int(len(table)),
+        'dropped_columns': dropped_summary_columns,
+        'warnings': warnings_list,
+    }
+
+
 def plot_single_hotspot_profile(
     profile_number: int,
     profile_time: int | str | pd.Timestamp,
@@ -12073,6 +12648,41 @@ def plot_single_hotspot_profile(
         'save_path': str(saved_path) if saved_path is not None else None,
     }
 
+def _hotspot_anomaly_output_columns() -> list[str]:
+    """返回 ``plot_argo_hotspots`` anomaly parquet 的首选列顺序。"""
+    return [
+        'Profile_number',
+        'Platform_number',
+        'Longitude',
+        'Latitude',
+        'Year',
+        'Month',
+        'Day',
+        'depth',
+        'delta_do',
+        'do_value',
+        'delta_aou',
+        'aou_value',
+        'delta_pi',
+        'pi_value',
+        'trim_score',
+        'trim_scale_res_rob_aou',
+        'trim_scale_res_rob_abs_sal',
+        'delta_salinity',
+        'salinity_value',
+        'delta_temperature',
+        'temperature_value',
+        'pi_peak_type',
+        'pi_peak_depth',
+        'aou_peak_depth',
+        'peak_depth_offset',
+        'anomaly_score',
+        'primary_metric',
+        'primary_value',
+        'detection_method',
+    ]
+
+
 def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     """模块级 worker，支持 multiprocessing pickling。
 
@@ -12129,12 +12739,7 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
         return baseline, pd.DataFrame()
     anomalies_year = _keep_best_anomaly_per_profile(anomalies_year, cfg)
     needed_cols = [
-        c for c in [
-            'Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day',
-            'depth', 'delta_do', 'delta_aou', 'delta_pi', 'trim_score',
-            'anomaly_score', 'primary_metric', 'primary_value', 'do_value',
-            'aou_value', 'detection_method'
-        ]
+        c for c in _hotspot_anomaly_output_columns()
         if c in anomalies_year.columns
     ]
     anomalies_year = anomalies_year[needed_cols]

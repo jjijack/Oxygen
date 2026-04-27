@@ -3,6 +3,7 @@
 *.png
 *.parquet
 *.csv
+*.xlsx
 *.npy
 *.txt
 *.mat

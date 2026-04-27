@@ -28,7 +28,7 @@ processing:
   depth_merge_tolerance: 10.0
   duplicate_depth_strategy: best_qc
   anomaly_min_depth: 300.0          # ΔDO 异常最小深度（m）；设为 0 表示不限制
-  anomaly_max_depth: 1500.0         # ΔDO 峰值最大深度（m）；设为 0 表示不限制
+  anomaly_max_depth: 1000.0         # ΔDO 峰值最大深度（m）；设为 0 表示不限制
   do_near_zero_threshold: 1.0       # 近零 DO 判定阈值（DO <= 该值）
   do_near_zero_max_count: 7         # 单剖面近零 DO 超过该数量时，整剖面跳过
   subduction_detection_method: do   # 默认异常识别方法：do | aou | trim
