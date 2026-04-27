@@ -10650,7 +10650,11 @@ def plot_argo_hotspots(
     dask_workers: int | None = None,
     dask_memory_limit: str | None = None,
     use_interacting_argo: bool = False,
-    split_plots: bool = False,
+    use_glorys_n2: bool = False,
+    argo_glorys_summary_data_path: str | Path | None = None,
+    split_plots: bool | str = False,
+    split_plot_mode: str | None = None,
+    hotspot_type_n2_threshold: float | None = 2e-5,
 ):
     """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
 
@@ -10674,8 +10678,18 @@ def plot_argo_hotspots(
         use_interacting_argo (bool): 是否读取 run_batch_plotting_multiprocessing 生成的交互 Argo 文件，
                                           并在图中区分交互/非交互 Argo，同时统计交互比例。
                                           默认 False。
-        split_plots (bool): 若为 True 且 use_interacting_argo=True，则将交互（菱形）与非交互（圆形）异常点分别绘制在两张图中。
-                            默认 False。
+        use_glorys_n2 (bool): 是否读取 ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的 summary parquet，
+            用 GLORYS N2 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 N2 时会退回
+            “近岸第 3 类 / 非第 3 类”绘图。
+        argo_glorys_summary_data_path: 可选 GLORYS overview summary parquet 路径；None 时按默认命名自动定位。
+        split_plots (bool | str): False 时只绘制合并图；True 时按 split_plot_mode 拆图。
+            也可直接传 ``'eddy_interaction'`` 或 ``'hotspot_type'``。
+        split_plot_mode (str | None): 拆图模式。
+            - ``'eddy_interaction'``：原有 META 交互/非交互拆图；
+            - ``'hotspot_type'``：按 hotspot_type=1/2/3 拆图。
+            None 时，若 use_glorys_n2=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
+            仅 use_interacting_argo=True 时默认 ``'eddy_interaction'``。
+        hotspot_type_n2_threshold: 当 anomalies 中已含 ``glorys_n2_p95`` 时，用于生成 hotspot_type 的 N2 阈值。
 
     输出:
         - 图像（可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/Argo_Anomaly_Hotspots_*.png`
@@ -10689,6 +10703,34 @@ def plot_argo_hotspots(
     )
     method_name = cfg.method
     run_tag = cfg.file_stem()
+    split_plot_mode_explicit = split_plot_mode is not None or isinstance(split_plots, str)
+    if isinstance(split_plots, str):
+        if split_plot_mode is None:
+            split_plot_mode = split_plots
+        split_plots = True
+
+    if use_interacting_argo and use_glorys_n2 and not split_plot_mode_explicit:
+        print("[Plot Info] Both use_interacting_argo and use_glorys_n2 are enabled; plotting uses hotspot_type by default.")
+
+    split_mode = None
+    if split_plots:
+        split_mode_raw = split_plot_mode or (
+            'hotspot_type' if (use_glorys_n2 or not use_interacting_argo) else 'eddy_interaction'
+        )
+        split_mode_key = str(split_mode_raw).strip().lower().replace('-', '_')
+        split_aliases = {
+            'interaction': 'eddy_interaction',
+            'interacting': 'eddy_interaction',
+            'eddy': 'eddy_interaction',
+            'eddy_interaction': 'eddy_interaction',
+            'meta': 'eddy_interaction',
+            'type': 'hotspot_type',
+            'types': 'hotspot_type',
+            'hotspot_type': 'hotspot_type',
+        }
+        split_mode = split_aliases.get(split_mode_key, split_mode_key)
+        if split_mode not in {'eddy_interaction', 'hotspot_type'}:
+            raise ValueError("split_plot_mode must be 'eddy_interaction' or 'hotspot_type'.")
 
     # --- 尝试加载交互 Argo 文件（若启用） ---
     interacting_argo_ids: set[int] = set()
@@ -10810,6 +10852,56 @@ def plot_argo_hotspots(
     if anomalies.empty:
         print("No anomalies detected.")
 
+    glorys_n2_available = False
+    glorys_summary_path_used = None
+    if use_glorys_n2 and not anomalies.empty:
+        region_slug_for_path = _current_region_key()
+        glorys_summary_candidates: list[Path] = []
+        if argo_glorys_summary_data_path is not None:
+            glorys_summary_candidates.append(Path(argo_glorys_summary_data_path))
+        glorys_summary_candidates.append(
+            cfg.output_dir("plot_hotspot_anomaly_argo_glorys_overviews", region_slug_for_path)
+            / f"hotspot_anomaly_argo_glorys_overviews_summary_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+        for path_obj in glorys_summary_candidates:
+            if path_obj.exists():
+                glorys_summary_path_used = path_obj
+                break
+
+        if glorys_summary_path_used is None:
+            print(
+                "[WARN] GLORYS N2 summary parquet not found; "
+                "falling back to nearshore/non-nearshore hotspot types."
+            )
+        else:
+            try:
+                glorys_summary_df = pd.read_parquet(glorys_summary_path_used)
+                anomalies = _merge_hotspot_glorys_summary_fields(anomalies, glorys_summary_df)
+                n2_vals = pd.to_numeric(anomalies.get('glorys_n2_p95'), errors='coerce')
+                matched_n2 = int(n2_vals.notna().sum())
+                if matched_n2 > 0:
+                    glorys_n2_available = True
+                    print(
+                        f"[*] Loaded GLORYS N2 hotspot type fields from {glorys_summary_path_used} "
+                        f"(matched {matched_n2}/{len(anomalies)} anomalies)."
+                    )
+                else:
+                    print(
+                        f"[WARN] GLORYS summary parquet has no matched N2 values: {glorys_summary_path_used}; "
+                        "falling back to nearshore/non-nearshore hotspot types."
+                    )
+            except Exception as exc:
+                print(
+                    f"[WARN] Failed to read GLORYS N2 summary parquet {glorys_summary_path_used}: {exc}; "
+                    "falling back to nearshore/non-nearshore hotspot types."
+                )
+
+    if not anomalies.empty and 'nearshore_do_dip' in anomalies.columns:
+        anomalies['hotspot_type'] = _assign_hotspot_type(
+            anomalies,
+            n2_threshold=hotspot_type_n2_threshold if glorys_n2_available else None,
+        )
+
     # 绘图
     crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
     central_lon = 180 if crosses_dateline else 0
@@ -10842,7 +10934,134 @@ def plot_argo_hotspots(
     base_anomaly_label = cfg.threshold_label()
     title_threshold_label = cfg.threshold_label()
     plots_to_generate = []
-    if split_plots and use_interacting_argo:
+    if split_plots and split_mode == 'hotspot_type':
+        if glorys_n2_available:
+            type_vals = (
+                pd.to_numeric(anomalies['hotspot_type'], errors='coerce')
+                if (not anomalies.empty and 'hotspot_type' in anomalies.columns)
+                else pd.Series(dtype=float)
+            )
+            if not anomalies.empty:
+                counts = {
+                    type_id: int((type_vals == type_id).sum())
+                    for type_id in (1, 2, 3)
+                }
+                untyped = int(type_vals.isna().sum())
+                print(
+                    "[Plot Info] Hotspot types: "
+                    f"type1={counts[1]}, type2={counts[2]}, type3={counts[3]}, "
+                    f"untyped={untyped}"
+                )
+
+            type_specs = [
+                {
+                    'type_id': 1,
+                    'name': 'hotspot_type_1',
+                    'title_extra': ' (Type 1: Strong N2)',
+                    'file_suffix': '_type1',
+                    'marker': 'o',
+                    'edgecolor': 'black',
+                    'label': f'Type 1 - strong N2 ({base_anomaly_label})',
+                    's': 60,
+                    'zorder': 3,
+                },
+                {
+                    'type_id': 2,
+                    'name': 'hotspot_type_2',
+                    'title_extra': ' (Type 2: Weak N2)',
+                    'file_suffix': '_type2',
+                    'marker': 'o',
+                    'edgecolor': 'dimgray',
+                    'label': f'Type 2 - weak N2 ({base_anomaly_label})',
+                    's': 60,
+                    'zorder': 3,
+                },
+                {
+                    'type_id': 3,
+                    'name': 'hotspot_type_3',
+                    'title_extra': ' (Type 3: Nearshore DO Dip)',
+                    'file_suffix': '_type3',
+                    'marker': '^',
+                    'edgecolor': 'red',
+                    'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
+                    's': 80,
+                    'zorder': 4,
+                },
+            ]
+            for spec in type_specs:
+                type_data = (
+                    anomalies.loc[type_vals == spec['type_id']].copy()
+                    if not anomalies.empty else pd.DataFrame()
+                )
+                plots_to_generate.append({
+                    'name': spec['name'],
+                    'title_extra': spec['title_extra'],
+                    'file_suffix': spec['file_suffix'],
+                    'data_list': [
+                        {
+                            'data': type_data,
+                            'marker': spec['marker'],
+                            'edgecolor': spec['edgecolor'],
+                            'label': spec['label'],
+                            's': spec['s'],
+                            'zorder': spec['zorder'],
+                        }
+                    ],
+                })
+        else:
+            nearshore_vals = (
+                anomalies['nearshore_do_dip'].astype('boolean').fillna(False)
+                if (not anomalies.empty and 'nearshore_do_dip' in anomalies.columns)
+                else pd.Series(False, index=anomalies.index, dtype=bool)
+            )
+            nearshore_count = int(nearshore_vals.sum()) if not anomalies.empty else 0
+            non_nearshore_count = int((~nearshore_vals).sum()) if not anomalies.empty else 0
+            if not anomalies.empty:
+                print(
+                    "[Plot Info] Hotspot type groups: "
+                    f"non_nearshore={non_nearshore_count}, type3_nearshore={nearshore_count}"
+                )
+            hotspot_type_split_specs = [
+                {
+                    'data': anomalies.loc[~nearshore_vals].copy() if not anomalies.empty else pd.DataFrame(),
+                    'name': 'non_nearshore',
+                    'title_extra': ' (Non-nearshore)',
+                    'file_suffix': '_non_nearshore',
+                    'marker': 'o',
+                    'edgecolor': 'black',
+                    'label': f'Non-nearshore ({base_anomaly_label})',
+                    's': 60,
+                    'zorder': 3,
+                },
+                {
+                    'data': anomalies.loc[nearshore_vals].copy() if not anomalies.empty else pd.DataFrame(),
+                    'name': 'hotspot_type_3',
+                    'title_extra': ' (Type 3: Nearshore DO Dip)',
+                    'file_suffix': '_type3',
+                    'marker': '^',
+                    'edgecolor': 'red',
+                    'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
+                    's': 80,
+                    'zorder': 4,
+                },
+            ]
+            for spec in hotspot_type_split_specs:
+                plots_to_generate.append({
+                    'name': spec['name'],
+                    'title_extra': spec['title_extra'],
+                    'file_suffix': spec['file_suffix'],
+                    'data_list': [
+                        {
+                            'data': spec['data'],
+                            'marker': spec['marker'],
+                            'edgecolor': spec['edgecolor'],
+                            'label': spec['label'],
+                            's': spec['s'],
+                            'zorder': spec['zorder'],
+                        }
+                    ],
+                })
+    elif split_plots and split_mode == 'eddy_interaction' and use_interacting_argo:
         plots_to_generate.append({
             'name': 'interacting',
             'title_extra': ' (Interacting)',
@@ -10860,16 +11079,64 @@ def plot_argo_hotspots(
             ]
         })
     else:
+        if split_plots and split_mode == 'eddy_interaction' and not use_interacting_argo:
+            print("[WARN] split_plot_mode='eddy_interaction' requires use_interacting_argo=True; drawing combined plot.")
         # 合并模式
         combined_data = []
-        if not anom_others.empty:
-            label_str = base_anomaly_label
-            if use_interacting_argo and interacting_argo_ids:
-                label_str = f'Non-interacting ({base_anomaly_label})'
-            combined_data.append({'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': label_str, 's': 60, 'zorder': 3})
-        
-        if not anom_interacting.empty:
-            combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({base_anomaly_label})', 's': 100, 'zorder': 4})
+        use_hotspot_type_combined = (
+            not anomalies.empty
+            and 'nearshore_do_dip' in anomalies.columns
+            and (use_glorys_n2 or not use_interacting_argo)
+        )
+        if use_hotspot_type_combined and glorys_n2_available:
+            type_vals = pd.to_numeric(anomalies.get('hotspot_type'), errors='coerce')
+            hotspot_type_combined_specs = [
+                (1, 'o', 'black', f'Type 1 - strong N2 ({base_anomaly_label})', 60, 3),
+                (2, 'o', 'dimgray', f'Type 2 - weak N2 ({base_anomaly_label})', 60, 3),
+                (3, '^', 'red', f'Type 3 - nearshore DO dip ({base_anomaly_label})', 80, 4),
+            ]
+            for type_id, marker, edgecolor, label, size, zorder in hotspot_type_combined_specs:
+                type_data = anomalies.loc[type_vals == type_id].copy()
+                if not type_data.empty:
+                    combined_data.append({
+                        'data': type_data,
+                        'marker': marker,
+                        'edgecolor': edgecolor,
+                        'label': label,
+                        's': size,
+                        'zorder': zorder,
+                    })
+        elif use_hotspot_type_combined:
+            nearshore_vals = anomalies['nearshore_do_dip'].astype('boolean').fillna(False)
+            non_nearshore = anomalies.loc[~nearshore_vals].copy()
+            nearshore = anomalies.loc[nearshore_vals].copy()
+            if not non_nearshore.empty:
+                combined_data.append({
+                    'data': non_nearshore,
+                    'marker': 'o',
+                    'edgecolor': 'black',
+                    'label': f'Non-nearshore ({base_anomaly_label})',
+                    's': 60,
+                    'zorder': 3,
+                })
+            if not nearshore.empty:
+                combined_data.append({
+                    'data': nearshore,
+                    'marker': '^',
+                    'edgecolor': 'red',
+                    'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
+                    's': 80,
+                    'zorder': 4,
+                })
+        else:
+            if not anom_others.empty:
+                label_str = base_anomaly_label
+                if use_interacting_argo and interacting_argo_ids:
+                    label_str = f'Non-interacting ({base_anomaly_label})'
+                combined_data.append({'data': anom_others, 'marker': 'o', 'edgecolor': 'black', 'label': label_str, 's': 60, 'zorder': 3})
+            
+            if not anom_interacting.empty:
+                combined_data.append({'data': anom_interacting, 'marker': 'D', 'edgecolor': 'blue', 'label': f'Interacting ({base_anomaly_label})', 's': 100, 'zorder': 4})
             
         plots_to_generate.append({
             'name': 'combined',
@@ -10939,8 +11206,18 @@ def plot_argo_hotspots(
             )
             sc = sc_curr
 
-        if not has_anom_plot and anomalies.empty:
-               ax.text(0.5, 0.5, 'No anomalies', transform=ax.transAxes, ha='center', va='center', fontsize=24, color='red')
+        if not has_anom_plot:
+            empty_msg = 'No anomalies' if anomalies.empty else 'No anomalies for this split'
+            ax.text(
+                0.5,
+                0.5,
+                empty_msg,
+                transform=ax.transAxes,
+                ha='center',
+                va='center',
+                fontsize=24,
+                color='red',
+            )
 
         if sc is not None:
             cbar = plt.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.05)
@@ -11019,6 +11296,9 @@ def plot_argo_hotspots(
         'selected_depth_mean': selected_depth_mean,
         'all_argo_depth_mean': np.nan,
         'all_argo_do_mean': np.nan,
+        'use_glorys_n2': bool(use_glorys_n2),
+        'glorys_n2_available': bool(glorys_n2_available),
+        'argo_glorys_summary_data_path': str(glorys_summary_path_used) if glorys_summary_path_used is not None else None,
     }
 
     return {
@@ -11865,6 +12145,11 @@ def export_hotspot_anomaly_summary_table(
     output_format: str | None = None,
     save_table: bool = True,
     n2_threshold: float | None = 2e-5,
+    diagnose_nearshore_do: bool = True,
+    nearshore_do_min_threshold: float = 50.0,
+    nearshore_do_drop_threshold: float = 100.0,
+    nearshore_do_recovery_threshold: float = 100.0,
+    nearshore_do_depth_gap_threshold_m: float = 100.0,
     compact_columns: bool = True,
     require_glorys_details: bool = False,
     verbose: bool = True,
@@ -11874,7 +12159,11 @@ def export_hotspot_anomaly_summary_table(
     该函数不重新做异常检测或 GLORYS 绘图。基础剖面信息与异常指标来自
     ``plot_argo_hotspots`` 保存的 anomalies parquet；N2 与 GLORYS 绘图状态优先来自
     ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值，若未传返回值则读取该函数默认保存的
-    summary parquet。若 N2 详情缺失，会在表中保留空值并给出提示。
+    summary parquet。若 N2 详情缺失，会在表中保留空值并给出提示。近岸 DO 形态指标优先读取
+    ``plot_argo_hotspots`` 新版 anomalies parquet 中已保存的列；旧版 parquet 缺列时才回查 Argo 年数据。
+
+    ``hotspot_type`` 用于快速人工复核：Type 3 表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；
+    非近岸剖面中，N2 强于阈值者为 1，否则为 2。
 
     参数:
         vertical_profiles_result: ``plot_hotspot_anomaly_vertical_profiles`` 的返回值。
@@ -11888,6 +12177,11 @@ def export_hotspot_anomaly_summary_table(
         output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
         save_table: 是否保存表格文件，默认 True。
         n2_threshold: N2 分类阈值，默认 2e-5；设为 None 时不新增 ``n2_strong`` 列。
+        diagnose_nearshore_do: 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
+        nearshore_do_min_threshold: 近岸型判据中，异常深度以上 DO 最小值阈值。
+        nearshore_do_drop_threshold: 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
+        nearshore_do_recovery_threshold: 近岸型判据中，最小 DO 到异常深度 DO 的最小回升幅度。
+        nearshore_do_depth_gap_threshold_m: 近岸型判据中，最小 DO 与异常深度的最小垂向间隔。
         compact_columns: 是否删除人工检查中冗余的固定/重复列，默认 True。
         require_glorys_details: True 时若缺少 GLORYS details/N2 信息则报错。
         verbose: 是否打印保存路径和缺失提示。
@@ -12041,6 +12335,120 @@ def export_hotspot_anomaly_summary_table(
             table_out = table_out.drop(columns=drop_cols)
         return table_out, drop_cols
 
+    def _do_profile_shape_metrics(profile_rows: pd.DataFrame, target_depth, target_do) -> dict:
+        return _nearshore_do_profile_shape_metrics(
+            profile_rows,
+            target_depth,
+            target_do,
+            nearshore_do_min_threshold=nearshore_do_min_threshold,
+            nearshore_do_drop_threshold=nearshore_do_drop_threshold,
+            nearshore_do_recovery_threshold=nearshore_do_recovery_threshold,
+            nearshore_do_depth_gap_threshold_m=nearshore_do_depth_gap_threshold_m,
+        )
+
+    def _append_nearshore_do_diagnostics(table_in: pd.DataFrame) -> pd.DataFrame:
+        table_out = table_in.copy()
+        metric_cols = [
+            'surface_do_ref',
+            'pre_anomaly_do_min',
+            'pre_anomaly_do_min_depth_m',
+            'surface_to_min_do_drop',
+            'min_to_anomaly_do_recovery',
+            'min_to_anomaly_depth_gap_m',
+            'do_v_shape_score',
+            'nearshore_do_dip',
+        ]
+        for col_name in metric_cols:
+            table_out[col_name] = np.nan
+        table_out['nearshore_do_dip'] = pd.Series(pd.NA, index=table_out.index, dtype='boolean')
+
+        required = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'anomaly_depth_m'}
+        if not required.issubset(table_out.columns):
+            warnings_list.append("缺少 Argo DO 近岸诊断所需列，已跳过 nearshore_do_dip。")
+            return table_out
+
+        for year_val in sorted(pd.to_numeric(table_out['Year'], errors='coerce').dropna().astype(int).unique()):
+            year_mask = pd.to_numeric(table_out['Year'], errors='coerce') == year_val
+            year_rows = table_out.loc[year_mask].copy()
+            if year_rows.empty:
+                continue
+            argo_file = Path(argo_path) / f'Argo{year_val}.parquet'
+            if not argo_file.exists():
+                warnings_list.append(f"Argo file not found for nearshore DO diagnostics: {argo_file}")
+                continue
+
+            try:
+                parquet_cols = set(pq.read_schema(argo_file).names)
+                read_cols = [
+                    c for c in [
+                        'Year', 'Month', 'Day', 'Depth', 'depth',
+                        'DO', 'DOXY_Adjusted', 'DOXY', 'DO_Adjusted', 'DO_Raw',
+                        'Profile_number', 'Platform_number',
+                    ]
+                    if c in parquet_cols
+                ]
+                argo_year = pd.read_parquet(argo_file, columns=read_cols)
+            except Exception:
+                try:
+                    argo_year = load_argo_data(year_val, data_dir=argo_path, verbose=False)
+                except Exception as exc:
+                    warnings_list.append(f"读取 Argo{year_val} 失败，已跳过 nearshore DO diagnostics: {exc}")
+                    continue
+
+            if argo_year.empty:
+                continue
+            for col_name in ['Year', 'Month', 'Day', 'Profile_number', 'Platform_number']:
+                if col_name in argo_year.columns:
+                    argo_year[col_name] = pd.to_numeric(argo_year[col_name], errors='coerce').astype('Int64')
+
+            needed_keys = set()
+            for _, row in year_rows.iterrows():
+                needed_keys.add((
+                    _to_int_or_none(row.get('Profile_number')),
+                    _to_int_or_none(row.get('Platform_number')),
+                    _to_int_or_none(row.get('Month')),
+                    _to_int_or_none(row.get('Day')),
+                ))
+
+            if {'Profile_number', 'Platform_number', 'Month', 'Day'}.issubset(argo_year.columns):
+                key_series = list(zip(
+                    argo_year['Profile_number'],
+                    argo_year['Platform_number'],
+                    argo_year['Month'],
+                    argo_year['Day'],
+                ))
+                argo_year = argo_year.loc[[key in needed_keys for key in key_series]].copy()
+            if argo_year.empty:
+                continue
+
+            grouped = {
+                key: grp
+                for key, grp in argo_year.groupby(
+                    ['Profile_number', 'Platform_number', 'Month', 'Day'],
+                    dropna=False,
+                    sort=False,
+                )
+            }
+            for idx, row in year_rows.iterrows():
+                key = (
+                    _to_int_or_none(row.get('Profile_number')),
+                    _to_int_or_none(row.get('Platform_number')),
+                    _to_int_or_none(row.get('Month')),
+                    _to_int_or_none(row.get('Day')),
+                )
+                profile_rows = grouped.get(key)
+                if profile_rows is None:
+                    continue
+                metrics = _do_profile_shape_metrics(
+                    profile_rows,
+                    row.get('anomaly_depth_m'),
+                    row.get('do_value'),
+                )
+                for col_name, value in metrics.items():
+                    table_out.at[idx, col_name] = value
+
+        return table_out
+
     cfg = _resolve_detection_config(detection_config)
     method_name = cfg.method
     run_tag = cfg.file_stem()
@@ -12139,6 +12547,10 @@ def export_hotspot_anomaly_summary_table(
         'delta_temperature',
         'delta_salinity',
     ]:
+        if col_name in work.columns:
+            table[col_name] = work[col_name]
+
+    for col_name in _NEARSHORE_DO_DIAGNOSTIC_COLUMNS:
         if col_name in work.columns:
             table[col_name] = work[col_name]
 
@@ -12273,6 +12685,17 @@ def export_hotspot_anomaly_summary_table(
             dtype='boolean',
         )
 
+    has_nearshore_diagnostics = (
+        'nearshore_do_dip' in table.columns
+        and table['nearshore_do_dip'].notna().any()
+    )
+    if diagnose_nearshore_do and not has_nearshore_diagnostics:
+        table = _append_nearshore_do_diagnostics(table)
+    elif not diagnose_nearshore_do:
+        table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
+
+    table['hotspot_type'] = _assign_hotspot_type(table, n2_threshold=n2_threshold)
+
     for col_name in [
         'Year', 'Month', 'Day', 'Profile_number', 'Platform_number',
         'Longitude', 'Latitude', 'anomaly_depth_m',
@@ -12283,6 +12706,9 @@ def export_hotspot_anomaly_summary_table(
         'glorys_k', 'glorys_b', 'glorys_center_lon', 'glorys_center_lat',
         'n2_projection_depth_m', 'n2_x_window_km', 'n2_z_window_m',
         'n2_valid_fraction', 'glorys_n2_local', 'glorys_n2_p95',
+        'surface_do_ref', 'pre_anomaly_do_min', 'pre_anomaly_do_min_depth_m',
+        'surface_to_min_do_drop', 'min_to_anomaly_do_recovery',
+        'min_to_anomaly_depth_gap_m', 'do_v_shape_score', 'hotspot_type',
     ]:
         if col_name in table.columns:
             table[col_name] = pd.to_numeric(table[col_name], errors='coerce')
@@ -12328,10 +12754,19 @@ def export_hotspot_anomaly_summary_table(
                     worksheet = writer.sheets[sheet_name]
                     worksheet.freeze_panes = 'A2'
 
-                    int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number'}
+                    int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
                     sci_cols = {'glorys_n2_local', 'glorys_n2_p95', 'n2_threshold'}
                     fraction_cols = {'n2_valid_fraction'}
+                    one_decimal_cols = {
+                        'surface_do_ref',
+                        'pre_anomaly_do_min',
+                        'pre_anomaly_do_min_depth_m',
+                        'surface_to_min_do_drop',
+                        'min_to_anomaly_do_recovery',
+                        'min_to_anomaly_depth_gap_m',
+                        'do_v_shape_score',
+                    }
 
                     def _excel_number_format(col_name: str) -> str | None:
                         col_lower = str(col_name).lower()
@@ -12345,6 +12780,8 @@ def export_hotspot_anomaly_summary_table(
                             return '0.00E+00'
                         if col_name in fraction_cols:
                             return '0.00'
+                        if col_name in one_decimal_cols:
+                            return '0.0'
                         if 'depth' in col_lower:
                             return '0.0'
                         if any(token in col_lower for token in ['delta', 'value', 'score', 'threshold']):
@@ -12406,6 +12843,12 @@ def export_hotspot_anomaly_summary_table(
         'argo_glorys_summary_data_path': str(glorys_summary_path_used) if glorys_summary_path_used is not None else None,
         'n_rows': int(len(table)),
         'dropped_columns': dropped_summary_columns,
+        'nearshore_do_thresholds': {
+            'pre_anomaly_do_min': float(nearshore_do_min_threshold),
+            'surface_to_min_do_drop': float(nearshore_do_drop_threshold),
+            'min_to_anomaly_do_recovery': float(nearshore_do_recovery_threshold),
+            'min_to_anomaly_depth_gap_m': float(nearshore_do_depth_gap_threshold_m),
+        },
         'warnings': warnings_list,
     }
 
@@ -12648,6 +13091,338 @@ def plot_single_hotspot_profile(
         'save_path': str(saved_path) if saved_path is not None else None,
     }
 
+_NEARSHORE_DO_DIAGNOSTIC_COLUMNS = [
+    'surface_do_ref',
+    'pre_anomaly_do_min',
+    'pre_anomaly_do_min_depth_m',
+    'surface_to_min_do_drop',
+    'min_to_anomaly_do_recovery',
+    'min_to_anomaly_depth_gap_m',
+    'do_v_shape_score',
+    'nearshore_do_dip',
+]
+
+
+def _first_existing_profile_column(columns: pd.Index, names: list[str]) -> str | None:
+    for name in names:
+        if name in columns:
+            return name
+    return None
+
+
+def _nearshore_do_profile_shape_metrics(
+    profile_rows: pd.DataFrame,
+    target_depth,
+    target_do=np.nan,
+    *,
+    nearshore_do_min_threshold: float = 50.0,
+    nearshore_do_drop_threshold: float = 100.0,
+    nearshore_do_recovery_threshold: float = 100.0,
+    nearshore_do_depth_gap_threshold_m: float = 100.0,
+) -> dict:
+    """计算单个 Argo 剖面的近岸型 DO 先降后升诊断。"""
+    out = {
+        'surface_do_ref': np.nan,
+        'pre_anomaly_do_min': np.nan,
+        'pre_anomaly_do_min_depth_m': np.nan,
+        'surface_to_min_do_drop': np.nan,
+        'min_to_anomaly_do_recovery': np.nan,
+        'min_to_anomaly_depth_gap_m': np.nan,
+        'do_v_shape_score': np.nan,
+        'nearshore_do_dip': pd.NA,
+    }
+    try:
+        target_depth_f = float(target_depth)
+    except Exception:
+        return out
+    if not np.isfinite(target_depth_f):
+        return out
+
+    depth_col = _first_existing_profile_column(profile_rows.columns, ['Depth', 'depth', 'DEPTH'])
+    if depth_col is None:
+        return out
+    do_adj_col = _first_existing_profile_column(profile_rows.columns, ['DO', 'DOXY_Adjusted', 'DO_Adjusted'])
+    do_raw_col = _first_existing_profile_column(profile_rows.columns, ['DOXY', 'DO_Raw'])
+    if do_adj_col is None and do_raw_col is None:
+        return out
+
+    depth_vals = pd.to_numeric(profile_rows[depth_col], errors='coerce')
+    do_vals = (
+        pd.to_numeric(profile_rows[do_adj_col], errors='coerce')
+        if do_adj_col is not None else pd.Series(np.nan, index=profile_rows.index)
+    )
+    if do_raw_col is not None:
+        do_raw_vals = pd.to_numeric(profile_rows[do_raw_col], errors='coerce')
+        do_vals = do_vals.where(do_vals.notna(), do_raw_vals)
+
+    prof = pd.DataFrame({'Depth': depth_vals, 'DO': do_vals}).dropna().sort_values('Depth')
+    prof = prof[np.isfinite(prof['Depth']) & np.isfinite(prof['DO'])].copy()
+    if len(prof) < 5:
+        return out
+
+    pre = prof[(prof['Depth'] >= 0.0) & (prof['Depth'] <= target_depth_f)].copy()
+    if len(pre) < 5:
+        return out
+
+    surface = pre[pre['Depth'] <= 100.0]
+    if len(surface) >= 3:
+        surface_ref = float(surface['DO'].median())
+    else:
+        surface_ref = float(pre.head(min(10, len(pre)))['DO'].median())
+
+    min_idx = pre['DO'].idxmin()
+    min_do = float(pre.loc[min_idx, 'DO'])
+    min_depth = float(pre.loc[min_idx, 'Depth'])
+
+    try:
+        anomaly_do = float(target_do)
+    except Exception:
+        anomaly_do = np.nan
+    if not np.isfinite(anomaly_do):
+        nearest_idx = (prof['Depth'] - target_depth_f).abs().idxmin()
+        anomaly_do = float(prof.loc[nearest_idx, 'DO'])
+
+    drop_val = float(surface_ref - min_do)
+    recovery_val = float(anomaly_do - min_do)
+    depth_gap = float(target_depth_f - min_depth)
+    score_val = float(min(drop_val, recovery_val)) if np.isfinite(drop_val) and np.isfinite(recovery_val) else np.nan
+    nearshore_flag = (
+        np.isfinite(min_do)
+        and np.isfinite(drop_val)
+        and np.isfinite(recovery_val)
+        and np.isfinite(depth_gap)
+        and min_do <= float(nearshore_do_min_threshold)
+        and drop_val >= float(nearshore_do_drop_threshold)
+        and recovery_val >= float(nearshore_do_recovery_threshold)
+        and depth_gap >= float(nearshore_do_depth_gap_threshold_m)
+    )
+
+    out.update({
+        'surface_do_ref': surface_ref,
+        'pre_anomaly_do_min': min_do,
+        'pre_anomaly_do_min_depth_m': min_depth,
+        'surface_to_min_do_drop': drop_val,
+        'min_to_anomaly_do_recovery': recovery_val,
+        'min_to_anomaly_depth_gap_m': depth_gap,
+        'do_v_shape_score': score_val,
+        'nearshore_do_dip': bool(nearshore_flag),
+    })
+    return out
+
+
+def _append_nearshore_do_diagnostics_from_profiles(
+    anomalies: pd.DataFrame,
+    profile_rows: pd.DataFrame,
+    *,
+    target_depth_col: str = 'depth',
+    target_do_col: str = 'do_value',
+    nearshore_do_min_threshold: float = 50.0,
+    nearshore_do_drop_threshold: float = 100.0,
+    nearshore_do_recovery_threshold: float = 100.0,
+    nearshore_do_depth_gap_threshold_m: float = 100.0,
+) -> pd.DataFrame:
+    """把近岸型 DO 诊断附加到 anomaly 摘要表。"""
+    out = anomalies.copy()
+    for col_name in _NEARSHORE_DO_DIAGNOSTIC_COLUMNS:
+        out[col_name] = np.nan
+    out['nearshore_do_dip'] = pd.Series(pd.NA, index=out.index, dtype='boolean')
+
+    if out.empty or profile_rows is None or profile_rows.empty:
+        return out
+    if 'Profile_number' not in out.columns or 'Profile_number' not in profile_rows.columns:
+        return out
+    if target_depth_col not in out.columns:
+        return out
+
+    key_cols = [
+        c for c in ['Profile_number', 'Platform_number', 'Month', 'Day']
+        if c in out.columns and c in profile_rows.columns
+    ]
+    if 'Profile_number' not in key_cols:
+        key_cols.insert(0, 'Profile_number')
+    key_cols = list(dict.fromkeys(key_cols))
+
+    def _key_from_row(row) -> tuple:
+        vals = []
+        for col_name in key_cols:
+            vals.append(_to_int_like(row.get(col_name)))
+        return tuple(vals)
+
+    prof = profile_rows.copy()
+    for col_name in key_cols:
+        prof[col_name] = pd.to_numeric(prof[col_name], errors='coerce').astype('Int64')
+
+    def _normalize_group_key(key) -> tuple:
+        if not isinstance(key, tuple):
+            key = (key,)
+        return tuple(_to_int_like(v) for v in key)
+
+    grouped = {
+        _normalize_group_key(key): grp
+        for key, grp in prof.groupby(key_cols, dropna=False, sort=False)
+    }
+
+    for idx, row in out.iterrows():
+        key = _key_from_row(row)
+        profile_group = grouped.get(key)
+        if profile_group is None:
+            continue
+        metrics = _nearshore_do_profile_shape_metrics(
+            profile_group,
+            row.get(target_depth_col),
+            row.get(target_do_col, np.nan),
+            nearshore_do_min_threshold=nearshore_do_min_threshold,
+            nearshore_do_drop_threshold=nearshore_do_drop_threshold,
+            nearshore_do_recovery_threshold=nearshore_do_recovery_threshold,
+            nearshore_do_depth_gap_threshold_m=nearshore_do_depth_gap_threshold_m,
+        )
+        for col_name, value in metrics.items():
+            out.at[idx, col_name] = value
+
+    return out
+
+
+def _assign_hotspot_type(
+    table: pd.DataFrame,
+    *,
+    n2_threshold: float | None = 2e-5,
+    n2_col: str = 'glorys_n2_p95',
+    nearshore_col: str = 'nearshore_do_dip',
+) -> pd.Series:
+    """按近岸 DO 诊断和可选 N2 阈值生成 hotspot_type。"""
+    nearshore_vals = (
+        table[nearshore_col].astype('boolean')
+        if nearshore_col in table.columns
+        else pd.Series(False, index=table.index, dtype='boolean')
+    )
+    hotspot_type = pd.Series(pd.NA, index=table.index, dtype='Int64')
+    nearshore_mask = nearshore_vals.fillna(False)
+    hotspot_type[nearshore_mask] = 3
+
+    if n2_threshold is None or n2_col not in table.columns:
+        return hotspot_type
+
+    n2_vals = pd.to_numeric(table[n2_col], errors='coerce')
+    n2_available = n2_vals.notna()
+    non_nearshore_mask = ~nearshore_mask
+    hotspot_type[non_nearshore_mask & n2_available & (n2_vals >= float(n2_threshold))] = 1
+    hotspot_type[non_nearshore_mask & n2_available & (n2_vals < float(n2_threshold))] = 2
+    return hotspot_type
+
+
+def _hotspot_date_key_from_parts(year_val, month_val=None, day_val=None) -> str | None:
+    try:
+        if month_val is None or day_val is None or pd.isna(month_val) or pd.isna(day_val):
+            return None
+        return pd.Timestamp(
+            year=int(year_val),
+            month=int(month_val),
+            day=int(day_val),
+        ).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _hotspot_date_key_from_value(val) -> str | None:
+    try:
+        if val is None or pd.isna(val):
+            return None
+    except Exception:
+        pass
+    try:
+        return pd.Timestamp(val).normalize().strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _hotspot_record_keys(year_val, profile_val, date_key=None, platform_val=None) -> list[tuple]:
+    year_key = _to_int_like(year_val)
+    profile_key = _to_int_like(profile_val)
+    if year_key is None or profile_key is None:
+        return []
+    platform_key = _to_int_like(platform_val)
+    keys = []
+    if date_key and platform_key is not None:
+        keys.append((year_key, profile_key, date_key, platform_key))
+    if date_key:
+        keys.append((year_key, profile_key, date_key, None))
+    if platform_key is not None:
+        keys.append((year_key, profile_key, None, platform_key))
+    keys.append((year_key, profile_key, None, None))
+    return keys
+
+
+def _merge_hotspot_glorys_summary_fields(
+    anomalies: pd.DataFrame,
+    glorys_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """将 GLORYS overview summary parquet 中的 N2/状态字段合并到 hotspot anomalies。"""
+    out = anomalies.copy()
+    if out.empty or glorys_summary is None or glorys_summary.empty:
+        return out
+
+    glorys_cols = [
+        ('glorys_status', 'status'),
+        ('glorys_error', 'error'),
+        ('glorys_horizontal_status', 'horizontal_status'),
+        ('glorys_vertical_status', 'vertical_status'),
+        ('glorys_line_strategy', 'line_strategy'),
+        ('glorys_k', 'k'),
+        ('glorys_b', 'b'),
+        ('glorys_center_lon', 'center_lon'),
+        ('glorys_center_lat', 'center_lat'),
+        ('n2_projection_depth_m', 'projection_depth_m'),
+        ('n2_x_window_km', 'n2_x_window_km'),
+        ('n2_z_window_m', 'n2_z_window_m'),
+        ('n2_valid_fraction', 'n2_valid_fraction'),
+        ('glorys_n2_local', 'glorys_n2_local'),
+        ('glorys_n2_p95', 'glorys_n2_p95'),
+        ('n2_error', 'n2_error'),
+    ]
+    for out_col, _ in glorys_cols:
+        if out_col not in out.columns:
+            out[out_col] = np.nan
+
+    glorys_by_key: dict[tuple, dict] = {}
+    for rec in glorys_summary.to_dict('records'):
+        if not isinstance(rec, dict):
+            continue
+        date_key = (
+            _hotspot_date_key_from_value(rec.get('target_date'))
+            or _hotspot_date_key_from_value(rec.get('profile_time'))
+        )
+        for key in _hotspot_record_keys(
+            rec.get('year'),
+            rec.get('profile_number'),
+            date_key,
+            rec.get('platform_number'),
+        ):
+            glorys_by_key.setdefault(key, rec)
+
+    matched_records = []
+    for _, row in out.iterrows():
+        date_key = _hotspot_date_key_from_parts(row.get('Year'), row.get('Month'), row.get('Day'))
+        matched = None
+        for key in _hotspot_record_keys(row.get('Year'), row.get('Profile_number'), date_key, row.get('Platform_number')):
+            matched = glorys_by_key.get(key)
+            if matched is not None:
+                break
+        matched_records.append(matched or {})
+
+    for out_col, rec_col in glorys_cols:
+        out[out_col] = [rec.get(rec_col, np.nan) for rec in matched_records]
+    return out
+
+
+def _to_int_like(val) -> int | None:
+    try:
+        if pd.isna(val):
+            return None
+        return int(val)
+    except Exception:
+        return None
+
+
 def _hotspot_anomaly_output_columns() -> list[str]:
     """返回 ``plot_argo_hotspots`` anomaly parquet 的首选列顺序。"""
     return [
@@ -12679,6 +13454,19 @@ def _hotspot_anomaly_output_columns() -> list[str]:
         'anomaly_score',
         'primary_metric',
         'primary_value',
+        'surface_do_ref',
+        'pre_anomaly_do_min',
+        'pre_anomaly_do_min_depth_m',
+        'surface_to_min_do_drop',
+        'min_to_anomaly_do_recovery',
+        'min_to_anomaly_depth_gap_m',
+        'do_v_shape_score',
+        'nearshore_do_dip',
+        'n2_valid_fraction',
+        'glorys_n2_local',
+        'glorys_n2_p95',
+        'n2_error',
+        'hotspot_type',
         'detection_method',
     ]
 
@@ -12738,6 +13526,16 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     if anomalies_year.empty:
         return baseline, pd.DataFrame()
     anomalies_year = _keep_best_anomaly_per_profile(anomalies_year, cfg)
+    anomalies_year = _append_nearshore_do_diagnostics_from_profiles(
+        anomalies_year,
+        df_geo,
+        target_depth_col='depth',
+        target_do_col='do_value',
+    )
+    anomalies_year['hotspot_type'] = _assign_hotspot_type(
+        anomalies_year,
+        n2_threshold=None,
+    )
     needed_cols = [
         c for c in _hotspot_anomaly_output_columns()
         if c in anomalies_year.columns
