@@ -10,7 +10,7 @@
 version: 1.1
 wrap_convention: "-180_180"  # 全局默认经度体系
 
-default_region: kuroshio_extension
+default_region: global
 
 regions:
   global:

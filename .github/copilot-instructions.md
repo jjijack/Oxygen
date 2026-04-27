@@ -12,7 +12,7 @@
 
 ## Config & Regions
 - Always read paths via `_PATHS_CFG` accessors at the top of `track.py`; new features should expose knobs through the YAML instead of constants.
-- Region bounds (`lonmin`, `lonmax`, `latmin`, `latmax`) are globals populated by `_load_region_config`; if you do not call `switch_region(...)`, code uses `default_region` from `config/regions.yml` (currently `kuroshio_extension`). Call `switch_region('global')` (or another key) before workflows that depend on spatial filtering.
+- Region bounds (`lonmin`, `lonmax`, `latmin`, `latmax`) are globals populated by `_load_region_config`; if you do not call `switch_region(...)`, code uses `default_region` from `config/regions.yml` (currently `global`). Call `switch_region('global')` (or another key) before workflows that depend on spatial filtering.
 - In parallel code paths (e.g., Dask or `multiprocessing`), do not assume that region-related globals are preserved in worker processes—they may fall back to defaults. Make sure to reinitialize or propagate the required global state within each worker (e.g., by calling `switch_region(...)` or equivalent setup).
 - Regions may cross the dateline; rely on `_region_lon_mask`, `_minimal_lon_diff_deg`, or `adaptive_distance_m` instead of naive `lon` comparisons.
 - Basemap styling derives from `processing.yml:plot.basemap_colors`; reuse `_BASEMAP_COLORS` when adding new plots.
