@@ -11308,6 +11308,278 @@ def plot_argo_hotspots(
     }
 
 
+def _hotspot_profile_to_int_or_none(val):
+    try:
+        if pd.isna(val):
+            return None
+        return int(val)
+    except Exception:
+        return None
+
+
+def _plot_hotspot_vertical_profile_from_record(
+    row: dict,
+    df_year: pd.DataFrame,
+    *,
+    cfg: DetectionConfig,
+    run_tag: str,
+    plot_variables: list,
+    overlay_aou_on_do: bool,
+    remove_outliers: bool,
+    plot_normal_scatter: bool,
+    annotate_delta_ts: bool,
+    save_fig: bool,
+    show_fig: bool,
+    output_dir: str | Path,
+) -> dict:
+    """绘制单个 hotspot anomaly 的 Argo 垂向剖面。"""
+    fig = None
+    year_val = int(row['_year'])
+    profile_num = int(row['_profile'])
+    result = {
+        'year': year_val,
+        'profile_number': profile_num,
+        'plotted': False,
+        'skipped': True,
+        'save_path': None,
+        'warning': None,
+    }
+
+    try:
+        if df_year.empty:
+            result['warning'] = f"Empty Argo yearly data for {year_val}, skip profile {profile_num}."
+            return result
+
+        profile_rows = df_year[df_year['Profile_number'] == profile_num].copy()
+        if profile_rows.empty:
+            result['warning'] = f"No raw profile found for Year={year_val}, Profile_number={profile_num}."
+            return result
+
+        month_val = _hotspot_profile_to_int_or_none(row.get('Month'))
+        day_val = _hotspot_profile_to_int_or_none(row.get('Day'))
+        if month_val is not None and day_val is not None:
+            day_rows = profile_rows[
+                (pd.to_numeric(profile_rows['Month'], errors='coerce') == month_val)
+                & (pd.to_numeric(profile_rows['Day'], errors='coerce') == day_val)
+            ].copy()
+            if not day_rows.empty:
+                profile_rows = day_rows
+
+        platform_val = None
+        row_platform_val = _hotspot_profile_to_int_or_none(row.get('Platform_number'))
+        if row_platform_val is not None and 'Platform_number' in profile_rows.columns:
+            platform_rows = profile_rows[
+                pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == row_platform_val
+            ].copy()
+            if not platform_rows.empty:
+                profile_rows = platform_rows
+                platform_val = row_platform_val
+
+        if 'Platform_number' in profile_rows.columns:
+            platforms = pd.to_numeric(profile_rows['Platform_number'], errors='coerce').dropna().astype(int).unique()
+            if platforms.size > 0:
+                platform_val = platform_val if platform_val is not None else int(platforms[0])
+                if platforms.size > 1:
+                    result['warning'] = (
+                        f"Multiple platforms found for Year={year_val}, Profile={profile_num}; "
+                        f"using Platform_number={platform_val}."
+                    )
+                    profile_rows = profile_rows[
+                        pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == platform_val
+                    ].copy()
+
+        if profile_rows.empty:
+            return result
+
+        profile_rows = profile_rows.sort_values('Depth').copy()
+
+        annotation_text = ""
+        depth_text = ""
+        if annotate_delta_ts:
+            annotation_text, depth_text = _annotation_text_from_anomaly_record(row, cfg)
+
+        num_variables = len(plot_variables)
+        fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
+        if num_variables == 1:
+            axes = [axes]
+
+        line_color = plt.cm.coolwarm(0.15)
+        any_plotted = False
+
+        for var_name, ax in zip(plot_variables, axes):
+            plot_variable_name = var_name
+            is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
+            do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
+
+            db_variable_name = _map_plot_variable_name(plot_variable_name)
+            plot_line_color = '#ff8c00' if db_variable_name == 'AOU' else line_color
+
+            if not _has_plottable_profile_variable(profile_rows, db_variable_name):
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"Variable '{db_variable_name}'\nnot found in data.",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                    fontsize=16,
+                )
+                _apply_vertical_profile_axis_style(ax, var_name)
+                continue
+
+            did_plot = _plot_single_argo_profile_line(
+                ax,
+                profile_rows,
+                plot_variable_name,
+                plot_line_color,
+                remove_outliers=remove_outliers,
+                show_normal_scatter=plot_normal_scatter,
+                do_aux_layers=do_aux_layers,
+                aou_aux_color='#ff8c00',
+                alpha=0.9,
+            )
+            if not did_plot:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No valid data after QC.",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                    fontsize=14,
+                )
+            else:
+                any_plotted = True
+
+            _apply_vertical_profile_axis_style(ax, plot_variable_name)
+
+        axes[0].set_ylabel("Depth/m", fontsize=20)
+        axes[0].tick_params(axis='y', labelsize=16)
+        axes[0].invert_yaxis()
+
+        row_month = _hotspot_profile_to_int_or_none(row.get('Month'))
+        row_day = _hotspot_profile_to_int_or_none(row.get('Day'))
+        if row_month is not None and row_day is not None:
+            date_text = f"{year_val:04d}-{row_month:02d}-{row_day:02d}"
+        else:
+            first_row = profile_rows.iloc[0]
+            first_year = _hotspot_profile_to_int_or_none(first_row.get('Year'))
+            first_month = _hotspot_profile_to_int_or_none(first_row.get('Month'))
+            first_day = _hotspot_profile_to_int_or_none(first_row.get('Day'))
+            if first_year is not None and first_month is not None and first_day is not None:
+                date_text = f"{first_year:04d}-{first_month:02d}-{first_day:02d}"
+            else:
+                date_text = str(year_val)
+
+        platform_text = f", Platform={platform_val}" if platform_val is not None else ""
+        lon_text = ""
+        lat_text = ""
+        lon_val = pd.to_numeric(pd.Series([row.get('Longitude')]), errors='coerce').iloc[0]
+        lat_val = pd.to_numeric(pd.Series([row.get('Latitude')]), errors='coerce').iloc[0]
+        if not np.isfinite(lon_val) or not np.isfinite(lat_val):
+            first_row = profile_rows.iloc[0]
+            lon_val = pd.to_numeric(pd.Series([first_row.get('Longitude')]), errors='coerce').iloc[0]
+            lat_val = pd.to_numeric(pd.Series([first_row.get('Latitude')]), errors='coerce').iloc[0]
+        if np.isfinite(lon_val):
+            lon_text = f"Lon={float(_normalize_lon_array(lon_val)):.3f}"
+        if np.isfinite(lat_val):
+            lat_text = f"Lat={float(lat_val):.3f}"
+        location_text = ", ".join([t for t in [lon_text, lat_text] if t])
+
+        title_line1 = (
+            f"Hotspots Profile {profile_num}{platform_text}, "
+            f"{date_text}{annotation_text}{depth_text}"
+        )
+        title_line2 = location_text if location_text else "Lon/Lat unavailable"
+        fig.suptitle(
+            f"{title_line1}\n{title_line2}",
+            fontsize=24,
+            y=0.97,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.90])
+
+        if save_fig and any_plotted:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            file_date = date_text.replace('-', '')
+            platform_suffix = f"_platform{platform_val}" if platform_val is not None else ""
+            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}_{run_tag}.png"
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            result['save_path'] = str(save_path)
+
+        if show_fig:
+            plt.show()
+
+        result['plotted'] = bool(any_plotted)
+        result['skipped'] = not bool(any_plotted)
+        return result
+    except Exception as exc:
+        result['warning'] = f"Failed plotting Year={year_val}, Profile={profile_num}: {exc}"
+        return result
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+def _plot_hotspot_vertical_profiles_year_worker(args: dict) -> dict:
+    """按年份绘制 hotspot Argo 垂向剖面的 multiprocessing worker。"""
+    year_val = int(args['year'])
+    records = list(args.get('records') or [])
+    result = {
+        'year': year_val,
+        'total': len(records),
+        'plotted': 0,
+        'skipped': 0,
+        'save_paths': [],
+        'warnings': [],
+    }
+    if bool(args.get('force_agg_backend', False)):
+        try:
+            plt.switch_backend('Agg')
+        except Exception:
+            pass
+    if not bool(args.get('show_fig', False)):
+        plt.ioff()
+
+    try:
+        df_year = load_argo_data(year_val, data_dir=args.get('argo_data_dir'))
+    except FileNotFoundError:
+        result['skipped'] = len(records)
+        result['warnings'].append(f"Missing Argo yearly file for {year_val}, skip {len(records)} profiles.")
+        return result
+    except Exception as exc:
+        result['skipped'] = len(records)
+        result['warnings'].append(f"Failed loading Argo {year_val}: {exc}")
+        return result
+
+    for row in records:
+        item = _plot_hotspot_vertical_profile_from_record(
+            row,
+            df_year,
+            cfg=args['detection_config'],
+            run_tag=args['run_tag'],
+            plot_variables=args['plot_variables'],
+            overlay_aou_on_do=bool(args.get('overlay_aou_on_do', False)),
+            remove_outliers=bool(args.get('remove_outliers', True)),
+            plot_normal_scatter=bool(args.get('plot_normal_scatter', True)),
+            annotate_delta_ts=bool(args.get('annotate_delta_ts', False)),
+            save_fig=bool(args.get('save_fig', True)),
+            show_fig=bool(args.get('show_fig', False)),
+            output_dir=args['output_dir'],
+        )
+        if item.get('plotted'):
+            result['plotted'] += 1
+        else:
+            result['skipped'] += 1
+        if item.get('save_path'):
+            result['save_paths'].append(item['save_path'])
+        if item.get('warning'):
+            result['warnings'].append(item['warning'])
+
+    plt.close('all')
+    return result
+
+
 def plot_hotspot_anomaly_vertical_profiles(
     start_year: int | None = None,
     end_year: int | None = None,
@@ -11322,6 +11594,8 @@ def plot_hotspot_anomaly_vertical_profiles(
     clear_output_dir: bool = True,
     max_profiles: int | None = None,
     argo_data_dir: str | Path | None = None,
+    use_multiprocessing: bool = True,
+    num_workers: int | None = None,
 ) -> dict:
     """基于 hotspots 异常文件批量绘制 Argo 垂向剖面。
 
@@ -11341,18 +11615,12 @@ def plot_hotspot_anomaly_vertical_profiles(
         clear_output_dir: 保存图片时是否在本次运行开始前清空输出目录，默认 True。
         max_profiles: 最多绘制多少个异常剖面；None 表示全部。
         argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        use_multiprocessing: 是否按年份并行绘图，默认 True；show_fig=True 时自动退回串行。
+        num_workers: 并行 worker 数；None 时自动取 min(年份数, CPU数, 8)。
 
     返回:
         dict: 包含 total_candidates/plotted_profiles/skipped_profiles/output_dir/anomalies_path。
     """
-
-    def _to_int_or_none(val):
-        try:
-            if pd.isna(val):
-                return None
-            return int(val)
-        except Exception:
-            return None
 
     cfg = _resolve_detection_config(detection_config)
     method_name = cfg.method
@@ -11424,196 +11692,77 @@ def plot_hotspot_anomaly_vertical_profiles(
                 print(f"[WARN] Failed to clear output directory {output_dir}: {exc}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    year_cache: dict[int, pd.DataFrame] = {}
     total_candidates = int(len(work))
     plotted_profiles = 0
     skipped_profiles = 0
+    saved_figure_paths: list[str] = []
+    warnings_list: list[str] = []
+    active_num_workers = 1
 
-    row_iter = tqdm(work.iterrows(), total=total_candidates, desc="hotspot vertical profiles", unit="profile")
+    records_by_year = [
+        (int(year_val), group.to_dict('records'))
+        for year_val, group in work.groupby('_year', sort=True)
+    ]
 
-    for _, row in row_iter:
-        year_val = int(row['_year'])
-        profile_num = int(row['_profile'])
+    if show_fig and use_multiprocessing:
+        print("[WARN] show_fig=True is not compatible with multiprocessing; falling back to serial plotting.")
+        use_multiprocessing = False
 
-        if year_val not in year_cache:
+    worker_args = [
+        {
+            'year': year_val,
+            'records': records,
+            'detection_config': cfg,
+            'run_tag': run_tag,
+            'plot_variables': plot_variables,
+            'overlay_aou_on_do': overlay_aou_on_do,
+            'remove_outliers': remove_outliers,
+            'plot_normal_scatter': plot_normal_scatter,
+            'annotate_delta_ts': annotate_delta_ts,
+            'save_fig': save_fig,
+            'show_fig': show_fig,
+            'output_dir': str(output_dir),
+            'argo_data_dir': str(argo_data_dir),
+            'force_agg_backend': bool(not show_fig),
+        }
+        for year_val, records in records_by_year
+    ]
+
+    def _consume_year_result(res: dict) -> None:
+        nonlocal plotted_profiles, skipped_profiles, saved_figure_paths, warnings_list
+        plotted_profiles += int(res.get('plotted', 0))
+        skipped_profiles += int(res.get('skipped', 0))
+        saved_figure_paths.extend([str(p) for p in res.get('save_paths', []) if p])
+        warnings_list.extend([str(w) for w in res.get('warnings', []) if w])
+
+    if use_multiprocessing and len(worker_args) > 1:
+        worker_count = int(num_workers) if num_workers is not None else min(len(worker_args), os.cpu_count() or 1, 8)
+        worker_count = max(1, min(worker_count, len(worker_args)))
+        active_num_workers = worker_count
+        print(
+            f"[*] Hotspots vertical profile multiprocessing: "
+            f"workers={worker_count}, years={len(worker_args)}, profiles={total_candidates}."
+        )
+        with multiprocessing.Pool(processes=worker_count, maxtasksperchild=1) as pool:
+            progress = tqdm(total=total_candidates, desc="hotspot vertical profiles", unit="profile")
             try:
-                year_cache[year_val] = load_argo_data(year_val, data_dir=argo_data_dir)
-            except FileNotFoundError:
-                print(f"[WARN] Missing Argo yearly file for {year_val}, skip profile {profile_num}.")
-                year_cache[year_val] = pd.DataFrame()
-            except Exception as exc:
-                print(f"[WARN] Failed loading Argo {year_val}: {exc}")
-                year_cache[year_val] = pd.DataFrame()
+                for res in pool.imap_unordered(_plot_hotspot_vertical_profiles_year_worker, worker_args):
+                    _consume_year_result(res)
+                    progress.update(int(res.get('total', 0)))
+            finally:
+                progress.close()
+    else:
+        progress = tqdm(total=total_candidates, desc="hotspot vertical profiles", unit="profile")
+        try:
+            for args in worker_args:
+                res = _plot_hotspot_vertical_profiles_year_worker(args)
+                _consume_year_result(res)
+                progress.update(int(res.get('total', 0)))
+        finally:
+            progress.close()
 
-        df_year = year_cache[year_val]
-        if df_year.empty:
-            skipped_profiles += 1
-            continue
-
-        profile_rows = df_year[df_year['Profile_number'] == profile_num].copy()
-        if profile_rows.empty:
-            print(f"[WARN] No raw profile found for Year={year_val}, Profile_number={profile_num}.")
-            skipped_profiles += 1
-            continue
-
-        month_val = _to_int_or_none(row.get('Month'))
-        day_val = _to_int_or_none(row.get('Day'))
-        if month_val is not None and day_val is not None:
-            day_rows = profile_rows[
-                (pd.to_numeric(profile_rows['Month'], errors='coerce') == month_val)
-                & (pd.to_numeric(profile_rows['Day'], errors='coerce') == day_val)
-            ].copy()
-            if not day_rows.empty:
-                profile_rows = day_rows
-
-        platform_val = None
-        row_platform_val = _to_int_or_none(row.get('Platform_number'))
-        if row_platform_val is not None and 'Platform_number' in profile_rows.columns:
-            platform_rows = profile_rows[
-                pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == row_platform_val
-            ].copy()
-            if not platform_rows.empty:
-                profile_rows = platform_rows
-                platform_val = row_platform_val
-
-        if 'Platform_number' in profile_rows.columns:
-            platforms = pd.to_numeric(profile_rows['Platform_number'], errors='coerce').dropna().astype(int).unique()
-            if platforms.size > 0:
-                platform_val = platform_val if platform_val is not None else int(platforms[0])
-                if platforms.size > 1:
-                    print(
-                        f"[WARN] Multiple platforms found for Year={year_val}, Profile={profile_num}; "
-                        f"using Platform_number={platform_val}."
-                    )
-                    profile_rows = profile_rows[
-                        pd.to_numeric(profile_rows['Platform_number'], errors='coerce') == platform_val
-                    ].copy()
-
-        if profile_rows.empty:
-            skipped_profiles += 1
-            continue
-
-        profile_rows = profile_rows.sort_values('Depth').copy()
-
-        annotation_text = ""
-        depth_text = ""
-        if annotate_delta_ts:
-            annotation_text, depth_text = _annotation_text_from_anomaly_record(row, cfg)
-
-        num_variables = len(plot_variables)
-        fig, axes = plt.subplots(1, num_variables, figsize=(10 * num_variables, 20), sharey=True)
-        if num_variables == 1:
-            axes = [axes]
-
-        line_color = plt.cm.coolwarm(0.15)
-        any_plotted = False
-
-        for var_name, ax in zip(plot_variables, axes):
-            plot_variable_name = var_name
-            is_do_panel = (_map_plot_variable_name(plot_variable_name) == 'DO')
-            do_aux_layers = ('aou',) if (is_do_panel and overlay_aou_on_do) else tuple()
-
-            db_variable_name = _map_plot_variable_name(plot_variable_name)
-            plot_line_color = '#ff8c00' if db_variable_name == 'AOU' else line_color
-
-            if not _has_plottable_profile_variable(profile_rows, db_variable_name):
-                ax.text(
-                    0.5,
-                    0.5,
-                    f"Variable '{db_variable_name}'\\nnot found in data.",
-                    ha='center',
-                    va='center',
-                    transform=ax.transAxes,
-                    fontsize=16,
-                )
-                _apply_vertical_profile_axis_style(ax, var_name)
-                continue
-
-            did_plot = _plot_single_argo_profile_line(
-                ax,
-                profile_rows,
-                plot_variable_name,
-                plot_line_color,
-                remove_outliers=remove_outliers,
-                show_normal_scatter=plot_normal_scatter,
-                do_aux_layers=do_aux_layers,
-                aou_aux_color='#ff8c00',
-                alpha=0.9,
-            )
-            if not did_plot:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No valid data after QC.",
-                    ha='center',
-                    va='center',
-                    transform=ax.transAxes,
-                    fontsize=14,
-                )
-            else:
-                any_plotted = True
-
-            _apply_vertical_profile_axis_style(ax, plot_variable_name)
-
-        axes[0].set_ylabel("Depth/m", fontsize=20)
-        axes[0].tick_params(axis='y', labelsize=16)
-        axes[0].invert_yaxis()
-
-        row_month = _to_int_or_none(row.get('Month'))
-        row_day = _to_int_or_none(row.get('Day'))
-        if row_month is not None and row_day is not None:
-            date_text = f"{year_val:04d}-{row_month:02d}-{row_day:02d}"
-        else:
-            first_row = profile_rows.iloc[0]
-            first_year = _to_int_or_none(first_row.get('Year'))
-            first_month = _to_int_or_none(first_row.get('Month'))
-            first_day = _to_int_or_none(first_row.get('Day'))
-            if first_year is not None and first_month is not None and first_day is not None:
-                date_text = f"{first_year:04d}-{first_month:02d}-{first_day:02d}"
-            else:
-                date_text = str(year_val)
-
-        platform_text = f", Platform={platform_val}" if platform_val is not None else ""
-        lon_text = ""
-        lat_text = ""
-        lon_val = pd.to_numeric(pd.Series([row.get('Longitude')]), errors='coerce').iloc[0]
-        lat_val = pd.to_numeric(pd.Series([row.get('Latitude')]), errors='coerce').iloc[0]
-        if not np.isfinite(lon_val) or not np.isfinite(lat_val):
-            first_row = profile_rows.iloc[0]
-            lon_val = pd.to_numeric(pd.Series([first_row.get('Longitude')]), errors='coerce').iloc[0]
-            lat_val = pd.to_numeric(pd.Series([first_row.get('Latitude')]), errors='coerce').iloc[0]
-        if np.isfinite(lon_val):
-            lon_text = f"Lon={float(_normalize_lon_array(lon_val)):.3f}"
-        if np.isfinite(lat_val):
-            lat_text = f"Lat={float(lat_val):.3f}"
-        location_text = ", ".join([t for t in [lon_text, lat_text] if t])
-
-        title_line1 = (
-            f"Hotspots Profile {profile_num}{platform_text}, "
-            f"{date_text}{annotation_text}{depth_text}"
-        )
-        title_line2 = location_text if location_text else "Lon/Lat unavailable"
-        fig.suptitle(
-            f"{title_line1}\n{title_line2}",
-            fontsize=24,
-            y=0.97,
-        )
-        plt.tight_layout(rect=[0, 0, 1, 0.90])
-
-        if save_fig and any_plotted:
-            file_date = date_text.replace('-', '')
-            platform_suffix = f"_platform{platform_val}" if platform_val is not None else ""
-            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}_{run_tag}.png"
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-
-        if show_fig:
-            plt.show()
-        plt.close(fig)
-
-        if any_plotted:
-            plotted_profiles += 1
-        else:
-            skipped_profiles += 1
+    for msg in warnings_list:
+        print(f"[WARN] {msg}")
 
     print(
         f"[*] Hotspots profile plotting complete: "
@@ -11626,6 +11775,9 @@ def plot_hotspot_anomaly_vertical_profiles(
         'skipped_profiles': int(skipped_profiles),
         'output_dir': str(output_dir) if save_fig else None,
         'anomalies_path': str(anomalies_path),
+        'figure_paths': saved_figure_paths,
+        'use_multiprocessing': bool(use_multiprocessing and len(worker_args) > 1),
+        'num_workers': int(active_num_workers),
     }
 
 
