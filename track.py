@@ -4932,6 +4932,13 @@ def _compute_horizontal_glorys_field(
         )
     return glorys_lon, glorys_lat, glorys_depth, glorys_vars[var_key]
 
+def _show_figure_for_current_backend(fig, *, block: bool = False) -> None:
+    """在当前 Matplotlib backend 下显示 figure。"""
+    try:
+        plt.show(block=block)
+    except TypeError:
+        plt.show()
+
 def _style_horizontal_colorbar(
     pc,
     cbar,
@@ -5934,6 +5941,7 @@ def plot_argo_horizontal_glorys(
     argo_data_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
     verbose: bool = True,
+    enable_line_drawer: bool = True,
 ):
     """以单个 Argo 剖面为中心绘制 GLORYS 水平快照图。
 
@@ -5962,6 +5970,7 @@ def plot_argo_horizontal_glorys(
         argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
         output_dir (str | Path | None): 保存目录覆盖；None 使用默认输出目录。
         verbose (bool): 是否打印保存路径与提示信息。
+        enable_line_drawer (bool): inline_mode=False 时是否启用点击两点画线工具。
 
     返回:
         tuple: ``(fig, ax)``，便于调用侧进一步自定义或复用。
@@ -5975,7 +5984,7 @@ def plot_argo_horizontal_glorys(
         anomaly_min_depth=argo_min_depth,
     )
 
-    if not inline_mode:
+    if not inline_mode and enable_line_drawer:
         backend_name = str(plt.get_backend()).lower()
         if 'inline' in backend_name:
             if verbose:
@@ -6142,17 +6151,15 @@ def plot_argo_horizontal_glorys(
 
     if show_fig:
         if not inline_mode:
-            line_drawer = LineDrawer(ax, legend_loc='best')
-            cid_click = fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
-            # 绑定到 figure，避免局部变量被回收导致交互回调偶发失效
-            fig._interactive_line_drawer = line_drawer
-            fig._interactive_line_drawer_click_cid = cid_click
-            try:
-                plt.show(block=False)
-            except TypeError:
-                plt.show()
+            if enable_line_drawer:
+                line_drawer = LineDrawer(ax, legend_loc='best')
+                cid_click = fig.canvas.mpl_connect('button_press_event', line_drawer.onclick)
+                # 绑定到 figure，避免局部变量被回收导致交互回调偶发失效
+                fig._interactive_line_drawer = line_drawer
+                fig._interactive_line_drawer_click_cid = cid_click
+            _show_figure_for_current_backend(fig, block=False)
         else:
-            plt.show()
+            _show_figure_for_current_backend(fig, block=False)
 
     if inline_mode:
         plt.close(fig)
@@ -8351,6 +8358,7 @@ def _run_vertical_overview_batch(
     n2_x_window_km: float = 25.0,
     n2_z_window_m: float | None = 100.0,
     annotate_n2: bool = False,
+    close_fig: bool = True,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
     results: list[dict] = []
@@ -8428,13 +8436,17 @@ def _run_vertical_overview_batch(
                 print(f"Figure saved to: {save_path}")
 
         if show_fig:
-            plt.show()
-        plt.close(fig)
+            _show_figure_for_current_backend(fig, block=False)
 
         result_item = {'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None}
         if n2_diag:
             result_item.update(n2_diag)
+        if not close_fig:
+            result_item['figure'] = fig
         results.append(result_item)
+
+        if close_fig:
+            plt.close(fig)
 
     return results
 
@@ -8473,10 +8485,12 @@ def plot_track_vertical_glorys_overview(
     n2_x_window_km: float = 25.0,
     n2_z_window_m: float | None = 100.0,
     annotate_n2: bool = False,
+    close_fig: bool = True,
 ) -> list[dict]:
     """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
     verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
+    close_fig=False 时会保留并在返回项中附加 figure，适合 Notebook 交互回调。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -8570,6 +8584,7 @@ def plot_track_vertical_glorys_overview(
         n2_x_window_km=n2_x_window_km,
         n2_z_window_m=n2_z_window_m,
         annotate_n2=annotate_n2,
+        close_fig=close_fig,
     )
 
 
@@ -8608,11 +8623,13 @@ def plot_argo_vertical_glorys_overview(
     n2_x_window_km: float = 25.0,
     n2_z_window_m: float | None = 100.0,
     annotate_n2: bool = False,
+    close_fig: bool = True,
 ) -> list[dict]:
     """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
     verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
     annotate_n2=True 时会在标题显示 Argo 投影位置附近的 GLORYS N2。
+    close_fig=False 时会保留并在返回项中附加 figure，适合 Notebook 交互回调。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -8717,6 +8734,7 @@ def plot_argo_vertical_glorys_overview(
         n2_x_window_km=n2_x_window_km,
         n2_z_window_m=n2_z_window_m,
         annotate_n2=annotate_n2,
+        close_fig=close_fig,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -12284,6 +12302,791 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     return summary
 
 
+def _is_year_like_time(value) -> bool:
+    """判断时间参数是否是单独年份。"""
+    if isinstance(value, (int, np.integer)):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        return bool(re.fullmatch(r'\d{4}', text))
+    return False
+
+
+def _resolve_argo_review_time_range(
+    start_time: int | str | pd.Timestamp,
+    end_time: int | str | pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """把交互式 Argo review 的时间输入规范化为闭区间日期。"""
+    start_is_year = _is_year_like_time(start_time)
+    if start_is_year:
+        start_ts = pd.Timestamp(year=int(str(start_time).strip()), month=1, day=1)
+    else:
+        start_ts = pd.Timestamp(start_time).normalize()
+
+    if end_time is None:
+        if start_is_year:
+            end_ts = pd.Timestamp(year=int(str(start_time).strip()), month=12, day=31)
+        else:
+            end_ts = start_ts
+    elif _is_year_like_time(end_time):
+        end_ts = pd.Timestamp(year=int(str(end_time).strip()), month=12, day=31)
+    else:
+        end_ts = pd.Timestamp(end_time).normalize()
+
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        raise ValueError("start_time/end_time 无法解析为有效时间。")
+    if end_ts < start_ts:
+        raise ValueError(
+            f"end_time ({end_ts.strftime('%Y-%m-%d')}) 早于 start_time ({start_ts.strftime('%Y-%m-%d')})。"
+        )
+    return start_ts.normalize(), end_ts.normalize()
+
+
+def _resolve_argo_review_bounds(
+    lon_bounds: tuple[float, float] | list[float] | None,
+    lat_bounds: tuple[float, float] | list[float] | None,
+) -> tuple[float, float, float, float]:
+    """解析交互式 Argo review 的空间范围；默认使用当前 switch_region 区域。"""
+    if lon_bounds is None:
+        lon_min_bound, lon_max_bound = float(lonmin), float(lonmax)
+    else:
+        if len(lon_bounds) != 2:
+            raise ValueError("lon_bounds 必须是 (lon_min, lon_max)。")
+        lon_min_bound, lon_max_bound = float(lon_bounds[0]), float(lon_bounds[1])
+
+    if lat_bounds is None:
+        lat_min_bound, lat_max_bound = float(latmin), float(latmax)
+    else:
+        if len(lat_bounds) != 2:
+            raise ValueError("lat_bounds 必须是 (lat_min, lat_max)。")
+        lat_min_bound, lat_max_bound = float(lat_bounds[0]), float(lat_bounds[1])
+
+    if lat_max_bound < lat_min_bound:
+        lat_min_bound, lat_max_bound = lat_max_bound, lat_min_bound
+    return lon_min_bound, lon_max_bound, lat_min_bound, lat_max_bound
+
+
+def _review_lon_bounds_are_global(lon_min_bound: float, lon_max_bound: float) -> bool:
+    lon_min_norm = float(_normalize_lon_array(lon_min_bound))
+    lon_max_norm = float(_normalize_lon_array(lon_max_bound))
+    raw_span = abs(float(lon_max_bound) - float(lon_min_bound))
+    eff_span = (lon_max_norm - lon_min_norm) % 360.0
+    return bool(
+        raw_span >= 359.5
+        or eff_span >= 359.5
+        or np.isclose(eff_span, 0.0, atol=1e-6)
+    )
+
+
+def _review_lon_bounds_cross_dateline(lon_min_bound: float, lon_max_bound: float) -> bool:
+    if _review_lon_bounds_are_global(lon_min_bound, lon_max_bound):
+        return False
+    lon_min_norm = float(_normalize_lon_array(lon_min_bound))
+    lon_max_norm = float(_normalize_lon_array(lon_max_bound))
+    return bool(lon_min_norm > lon_max_norm)
+
+
+def _review_int_or_none(value) -> int | None:
+    try:
+        if pd.isna(value):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _load_argo_profiles_for_interactive_review(
+    *,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    lon_min_bound: float,
+    lon_max_bound: float,
+    lat_min_bound: float,
+    lat_max_bound: float,
+    detection_config: DetectionConfig,
+    classify_anomalies: bool,
+    argo_data_dir: str | Path | None,
+    max_profiles: int | None,
+    verbose: bool,
+) -> dict:
+    """加载交互 review 所需的 Argo profile 摘要、原始行和异常摘要。"""
+    frames: list[pd.DataFrame] = []
+    missing_years: list[int] = []
+    years = range(int(start_ts.year), int(end_ts.year) + 1)
+
+    for year_val in years:
+        try:
+            df_year = load_argo_data(year_val, data_dir=argo_data_dir)
+        except FileNotFoundError:
+            missing_years.append(int(year_val))
+            continue
+        except Exception as exc:
+            if verbose:
+                print(f"[ArgoReview] 读取 Argo{year_val} 失败，已跳过: {exc}")
+            continue
+
+        if df_year.empty:
+            continue
+        work = df_year.copy()
+        for col_name in ['Longitude', 'Latitude', 'Depth', 'Profile_number', 'Platform_number', 'Year', 'Month', 'Day']:
+            if col_name in work.columns:
+                work[col_name] = pd.to_numeric(work[col_name], errors='coerce')
+        required_cols = ['Year', 'Month', 'Day', 'Longitude', 'Latitude', 'Profile_number']
+        missing_cols = [c for c in required_cols if c not in work.columns]
+        if missing_cols:
+            if verbose:
+                print(f"[ArgoReview] Argo{year_val} 缺少列 {missing_cols}，已跳过。")
+            continue
+
+        work['_date'] = pd.to_datetime(work[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+        work = work.dropna(subset=['_date', 'Longitude', 'Latitude', 'Profile_number']).copy()
+        if work.empty:
+            continue
+
+        time_mask = (work['_date'] >= start_ts) & (work['_date'] <= end_ts)
+        lon_mask = _region_lon_mask(work['Longitude'].to_numpy(dtype=float), lon_min_bound, lon_max_bound)
+        lat_vals = work['Latitude'].to_numpy(dtype=float)
+        lat_mask = (lat_vals >= lat_min_bound) & (lat_vals <= lat_max_bound)
+        selected = work.loc[time_mask.to_numpy() & lon_mask & lat_mask].copy()
+        if not selected.empty:
+            frames.append(selected)
+
+    if not frames:
+        empty = pd.DataFrame()
+        return {
+            'profiles': empty,
+            'raw_rows': empty,
+            'anomalies': empty,
+            'missing_years': missing_years,
+            'limited': False,
+        }
+
+    raw_rows = pd.concat(frames, ignore_index=True)
+    group_cols = ['Year', 'Month', 'Day', 'Profile_number']
+    if 'Platform_number' in raw_rows.columns:
+        group_cols.append('Platform_number')
+    sort_cols = [c for c in ['Profile_number', 'Year', 'Month', 'Day', 'Platform_number', 'Depth'] if c in raw_rows.columns]
+    profiles = (
+        raw_rows.sort_values(sort_cols, kind='mergesort')
+        .groupby(group_cols, as_index=False, dropna=False)
+        .first()
+    )
+    profiles['date'] = pd.to_datetime(profiles[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
+    profiles['is_anomaly'] = False
+
+    anomalies = pd.DataFrame()
+    if classify_anomalies:
+        anomalies = _reduce_argo_profiles_by_anomaly(raw_rows, detection_config=detection_config)
+        if anomalies is not None and not anomalies.empty and 'Profile_number' in anomalies.columns:
+            selected_ids = set(
+                pd.to_numeric(anomalies['Profile_number'], errors='coerce')
+                .dropna()
+                .astype(int)
+                .tolist()
+            )
+            profile_ids = pd.to_numeric(profiles['Profile_number'], errors='coerce')
+            profiles['is_anomaly'] = profile_ids.astype('Int64').isin(selected_ids).fillna(False).to_numpy(dtype=bool)
+
+            skip_merge_cols = {
+                'Year',
+                'Month',
+                'Day',
+                'Longitude',
+                'Latitude',
+                'Platform_number',
+            }
+            anomaly_cols = ['Profile_number'] + [
+                c for c in anomalies.columns
+                if c not in skip_merge_cols and c != 'Profile_number'
+            ]
+            anomaly_summary = anomalies[anomaly_cols].drop_duplicates(subset='Profile_number', keep='first').copy()
+            rename_map = {
+                c: f"anomaly_{c}"
+                for c in anomaly_summary.columns
+                if c != 'Profile_number' and c in profiles.columns
+            }
+            anomaly_summary = anomaly_summary.rename(columns=rename_map)
+            profiles = profiles.merge(anomaly_summary, on='Profile_number', how='left')
+
+    profiles['review_status'] = np.where(profiles['is_anomaly'], 'selected', 'filtered')
+    profiles = profiles.sort_values(['date', 'Profile_number'], kind='mergesort').reset_index(drop=True)
+
+    limited = False
+    if max_profiles is not None and int(max_profiles) > 0 and len(profiles) > int(max_profiles):
+        profiles = profiles.head(int(max_profiles)).copy().reset_index(drop=True)
+        keep_ids = set(pd.to_numeric(profiles['Profile_number'], errors='coerce').dropna().astype(int).tolist())
+        raw_rows = raw_rows[
+            pd.to_numeric(raw_rows['Profile_number'], errors='coerce').astype('Int64').isin(keep_ids).fillna(False)
+        ].copy()
+        if not anomalies.empty:
+            anomalies = anomalies[
+                pd.to_numeric(anomalies['Profile_number'], errors='coerce').astype('Int64').isin(keep_ids).fillna(False)
+            ].copy()
+        limited = True
+
+    return {
+        'profiles': profiles,
+        'raw_rows': raw_rows,
+        'anomalies': anomalies if anomalies is not None else pd.DataFrame(),
+        'missing_years': missing_years,
+        'limited': limited,
+    }
+
+
+class InteractiveArgoGlorysReviewer:
+    """交互式 Argo profile review 控制器。
+
+    Notebook 中点击主图上的 profile 点后，会按该 profile 的日期和位置生成
+    Argo-centered GLORYS 水平图与 vertical overview。可用 ``close_current()``
+    关闭当前已打开的 detail 图，也可用 ``open_profile(...)`` 手动打开指定剖面。
+    """
+
+    def __init__(
+        self,
+        *,
+        profiles: pd.DataFrame,
+        raw_rows: pd.DataFrame,
+        anomalies: pd.DataFrame,
+        fig,
+        ax,
+        scatter_artists: list,
+        callback_cid: int | None,
+        detection_config: DetectionConfig,
+        detail_options: dict,
+        save_clicked_figures: bool,
+        output_dir: str | Path | None,
+        close_previous: bool,
+        verbose: bool,
+    ):
+        self.profiles = profiles
+        self.raw_rows = raw_rows
+        self.anomalies = anomalies
+        self.fig = fig
+        self.ax = ax
+        self._scatter_artists: list[tuple] = scatter_artists
+        self._callback_cid = callback_cid
+        self.detection_config = detection_config
+        self.detail_options = dict(detail_options)
+        self.save_clicked_figures = bool(save_clicked_figures)
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.close_previous = bool(close_previous)
+        self.verbose = bool(verbose)
+        self.current_figures: list = []
+        self.last_selection: dict | None = None
+        self.last_error: Exception | None = None
+        # 预计算 profile 经纬度数组，用于快速最近邻搜索
+        self._profile_lons = profiles['Longitude'].to_numpy(dtype=float)
+        self._profile_lats = profiles['Latitude'].to_numpy(dtype=float)
+
+    def _on_click(self, event) -> None:
+        """button_press_event 回调；用最近邻匹配点击的 profile。"""
+        if event.inaxes is not self.ax:
+            return
+        click_lon, click_lat = float(event.xdata), float(event.ydata)
+        if not (np.isfinite(click_lon) and np.isfinite(click_lat)):
+            return
+
+        # 用 local_xy_distance_m 找最近的 profile
+        dists = local_xy_distance_m(
+            self._profile_lons, self._profile_lats,
+            click_lon, click_lat,
+        )
+        nearest_idx = int(np.argmin(dists))
+        nearest_dist_m = float(dists[nearest_idx])
+        # 100 km 容差（足够覆盖散点点击）
+        max_click_dist_m = 100_000.0
+        if nearest_dist_m > max_click_dist_m:
+            if self.verbose:
+                print(f"[ArgoReview] 点击 ({click_lon:.3f}, {click_lat:.3f}) 最近 profile 距离 {nearest_dist_m/1000:.1f}km，超出容差", flush=True)
+            return
+
+        row_idx = int(self.profiles.index[nearest_idx])
+        profile_number = int(self.profiles.loc[row_idx, 'Profile_number'])
+        if self.verbose:
+            print(
+                f"[ArgoReview] 点击 ({click_lon:.3f}, {click_lat:.3f}) → "
+                f"Profile {profile_number}, 距离 {nearest_dist_m/1000:.1f}km",
+                flush=True,
+            )
+        try:
+            self.open_profile_by_row_index(row_idx)
+        except Exception as exc:
+            self.last_error = exc
+            if self.verbose:
+                import traceback
+                print(f"[ArgoReview] 点击处理失败: {exc}")
+                traceback.print_exc()
+
+    def close_current(self) -> None:
+        """关闭当前由点击打开的所有 detail 图。"""
+        for fig_obj in list(self.current_figures):
+            try:
+                plt.close(fig_obj)
+            except Exception:
+                pass
+        self.current_figures.clear()
+
+    def disconnect(self) -> None:
+        """断开主图 pick 事件。"""
+        if self._callback_cid is not None:
+            try:
+                self.fig.canvas.mpl_disconnect(self._callback_cid)
+            except Exception:
+                pass
+            self._callback_cid = None
+
+    def open_profile(
+        self,
+        profile_number: int,
+        profile_time: int | str | pd.Timestamp | None = None,
+        platform_number: int | None = None,
+    ) -> dict:
+        """按 Profile_number 手动打开 detail 图；可选指定日期和平台号。"""
+        profile_ids = pd.to_numeric(self.profiles['Profile_number'], errors='coerce')
+        mask = profile_ids == int(profile_number)
+        if profile_time is not None:
+            target_date = pd.Timestamp(profile_time).normalize()
+            mask &= pd.to_datetime(self.profiles['date'], errors='coerce').dt.normalize() == target_date
+        if platform_number is not None and 'Platform_number' in self.profiles.columns:
+            mask &= pd.to_numeric(self.profiles['Platform_number'], errors='coerce') == int(platform_number)
+        matches = self.profiles.loc[mask]
+        if matches.empty:
+            raise ValueError(f"Profile_number={profile_number} 不在当前 review 表中。")
+        return self.open_profile_by_row_index(int(matches.index[0]))
+
+    def open_profile_by_row_index(self, row_index: int) -> dict:
+        """按 profiles DataFrame 的行号打开 detail 图。"""
+        if row_index not in self.profiles.index:
+            raise IndexError(f"row_index={row_index} 不在 profiles.index 中。")
+        row = self.profiles.loc[row_index]
+
+        if self.close_previous:
+            self.close_current()
+
+        profile_number = int(row['Profile_number'])
+        target_date = pd.Timestamp(row['date']).normalize()
+        platform_number = _review_int_or_none(row.get('Platform_number'))
+        center_lat = float(row['Latitude'])
+        k_val = 0.0
+        b_val = center_lat
+
+        if self.verbose:
+            platform_text = f", Platform={platform_number}" if platform_number is not None else ""
+            print(
+                f"[ArgoReview] Profile {profile_number}{platform_text}, "
+                f"{target_date.strftime('%Y-%m-%d')}, "
+                f"lon={float(row['Longitude']):.3f}, lat={float(row['Latitude']):.3f}"
+            )
+
+        horizontal_output_dir = None
+        vertical_output_dir = None
+        if self.save_clicked_figures:
+            if self.output_dir is None:
+                region_slug = _current_region_key()
+                self.output_dir = self.detection_config.output_dir("plot_interactive_argo_glorys_review", region_slug)
+            horizontal_output_dir = self.output_dir / "horizontal"
+            vertical_output_dir = self.output_dir / "vertical_overview"
+
+        try:
+            # 1) hotspot profile 垂向剖面图（最先绘制）
+            hotspot_fig = None
+            hotspot_figs_before = set(plt.get_fignums())
+            try:
+                plot_single_hotspot_profile(
+                    profile_number=profile_number,
+                    profile_time=target_date,
+                    platform_number=platform_number,
+                    detection_config=self.detection_config,
+                    show_fig=False,
+                    close_fig=False,
+                    save_fig=self.save_clicked_figures,
+                    argo_data_dir=self.detail_options.get('argo_data_dir'),
+                    output_dir=vertical_output_dir,
+                )
+                hotspot_figs_after = set(plt.get_fignums())
+                new_figs = hotspot_figs_after - hotspot_figs_before
+                if new_figs:
+                    hotspot_fig = plt.figure(list(new_figs)[0])
+            except Exception as exc:
+                if self.verbose:
+                    import traceback
+                    print(f"[ArgoReview] plot_single_hotspot_profile 失败: {exc}")
+                    traceback.print_exc()
+
+            # 2) GLORYS 水平图
+            fig_h, ax_h = plot_argo_horizontal_glorys(
+                profile_number=profile_number,
+                profile_time=target_date,
+                platform_number=platform_number,
+                variable=self.detail_options.get('horizontal_variable', 'vorticity'),
+                show_fig=False,
+                save_fig=self.save_clicked_figures,
+                k=k_val,
+                b=b_val,
+                needed_depth=self.detail_options.get('needed_depth', 0),
+                inline_mode=False,
+                xmin=self.detail_options.get('xmin', -400.0),
+                xmax=self.detail_options.get('xmax', 400.0),
+                argo_detection_config=self.detection_config,
+                argo_min_depth=self.detail_options.get('argo_min_depth'),
+                argo_data_dir=self.detail_options.get('argo_data_dir'),
+                output_dir=horizontal_output_dir,
+                verbose=self.verbose,
+                enable_line_drawer=False,
+            )
+
+            # 3) GLORYS 垂向总览
+            vertical_results = plot_argo_vertical_glorys_overview(
+                profile_number=profile_number,
+                profile_time=target_date,
+                k=k_val,
+                b=b_val,
+                platform_number=platform_number,
+                variables=self.detail_options.get('vertical_variables'),
+                needed_depth=self.detail_options.get('needed_depth', 0),
+                xmin=self.detail_options.get('xmin', -400.0),
+                xmax=self.detail_options.get('xmax', 400.0),
+                ymin=self.detail_options.get('ymin', 0.0),
+                ymax=self.detail_options.get('ymax', 1000.0),
+                profile_spacing_km=self.detail_options.get('profile_spacing_km'),
+                interpolate_z=bool(self.detail_options.get('interpolate_z', True)),
+                profile_depth_spacing_m=self.detail_options.get('profile_depth_spacing_m'),
+                plot_mlt=bool(self.detail_options.get('plot_mlt', False)),
+                plot_argo_projection=bool(self.detail_options.get('plot_argo_projection', True)),
+                argo_projection_config=self.detection_config,
+                argo_projection_min_depth=self.detail_options.get('argo_projection_min_depth'),
+                plot_isolines=bool(self.detail_options.get('plot_isolines', True)),
+                isoline_levels=self.detail_options.get('isoline_levels'),
+                isoline_color=self.detail_options.get('isoline_color', 'black'),
+                isoline_linewidth=float(self.detail_options.get('isoline_linewidth', 0.8)),
+                isoline_alpha=float(self.detail_options.get('isoline_alpha', 0.45)),
+                label_isolines=bool(self.detail_options.get('label_isolines', False)),
+                argo_data_dir=self.detail_options.get('argo_data_dir'),
+                show_fig=False,
+                save_fig=self.save_clicked_figures,
+                output_dir=vertical_output_dir,
+                verbose=self.verbose,
+                n2_projection_depth_m=self.detail_options.get('n2_projection_depth_m'),
+                n2_x_window_km=float(self.detail_options.get('n2_x_window_km', 25.0)),
+                n2_z_window_m=float(self.detail_options.get('n2_z_window_m', 100.0)),
+                annotate_n2=bool(self.detail_options.get('annotate_n2', False)),
+                close_fig=False,
+            )
+
+            # 收集所有 detail figure
+            self.current_figures = []
+            if hotspot_fig is not None:
+                self.current_figures.append(hotspot_fig)
+            self.current_figures.append(fig_h)
+            for item in vertical_results:
+                fig_obj = item.get('figure') if isinstance(item, dict) else None
+                if fig_obj is not None:
+                    self.current_figures.append(fig_obj)
+
+            for fig_obj in self.current_figures:
+                fig_obj.canvas.draw_idle()
+                plt.show(block=False)
+
+            self.last_selection = {
+                'row_index': int(row_index),
+                'profile_number': profile_number,
+                'platform_number': platform_number,
+                'date': target_date.strftime('%Y-%m-%d'),
+                'horizontal_figure': fig_h,
+                'horizontal_axis': ax_h,
+                'vertical_results': vertical_results,
+            }
+            self.last_error = None
+            return self.last_selection
+        except Exception as exc:
+            self.last_error = exc
+            if self.verbose:
+                print(f"[ArgoReview] 绘制 Profile {profile_number} 失败: {exc}")
+            raise
+
+
+def plot_interactive_argo_glorys_review(
+    start_time: int | str | pd.Timestamp,
+    end_time: int | str | pd.Timestamp | None = None,
+    *,
+    region: str | None = None,
+    lon_bounds: tuple[float, float] | list[float] | None = None,
+    lat_bounds: tuple[float, float] | list[float] | None = None,
+    detection_config: DetectionConfig | None = None,
+    review_mode: str = 'all',
+    classify_anomalies: bool = True,
+    horizontal_variable: str = 'vorticity',
+    vertical_variables: list[str] | None = None,
+    needed_depth: float | int = 0,
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    plot_mlt: bool = False,
+    plot_argo_projection: bool = True,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = False,
+    argo_min_depth: float | None = None,
+    argo_projection_min_depth: float | None = None,
+    argo_data_dir: str | Path | None = None,
+    max_profiles: int | None = None,
+    picker_tolerance: float = 7.0,
+    close_previous: bool = True,
+    save_clicked_figures: bool = False,
+    output_dir: str | Path | None = None,
+    figsize: tuple[float, float] = (14.0, 8.0),
+    show_fig: bool = True,
+    verbose: bool = True,
+    n2_projection_depth_m: float | None = None,
+    n2_x_window_km: float = 25.0,
+    n2_z_window_m: float | None = 100.0,
+    annotate_n2: bool = False,
+) -> InteractiveArgoGlorysReviewer:
+    """绘制可点击的 Argo profile 地图，用于人工复核被异常筛选排除的剖面。
+
+    该函数按给定时间和空间范围加载 Argo profile，默认用 ``detection_config``
+    区分已筛出的 anomaly 与被筛掉的 profile。主图使用纯 matplotlib Axes
+    + geopandas 底图（与 ``plot_argo_hotspots`` 风格一致），确保 widget backend
+    下鼠标点击事件能正常触发。点击任意地图位置后，会通过最近邻匹配找到
+    最近的 Argo profile，并以该剖面为中心调用
+    ``plot_argo_horizontal_glorys`` 和 ``plot_argo_vertical_glorys_overview``。
+
+    Notebook 中建议在调用前执行 ``%matplotlib widget``，否则 inline backend
+    只能显示静态图，点击事件通常不会触发。
+
+    参数:
+        start_time/end_time: 时间闭区间。传单独年份时表示全年；end_time=None 且
+            start_time 为日期时仅查看当天。
+        region: 可选 regions.yml key；提供后先调用 ``switch_region(region)``。
+        lon_bounds/lat_bounds: 自定义经纬度范围；None 时使用当前 region 全局范围。
+        review_mode: ``'filtered'`` 默认只让被筛掉的点可点击；
+            ``'selected'`` 只让 anomaly 点可点击；``'all'`` 两类都可点击。
+        classify_anomalies: True 时运行当前 DetectionConfig 异常筛选并给点分类。
+        close_previous: 点击下一个 profile 前是否自动关闭上一组 detail 图。
+        save_clicked_figures: True 时把点击打开的水平图和垂向图保存到 output_dir。
+
+    返回:
+        InteractiveArgoGlorysReviewer。常用属性/方法：
+        ``reviewer.profiles`` 查看可复核剖面表；
+        ``reviewer.close_current()`` 关闭当前 detail 图；
+        ``reviewer.open_profile(profile_number, profile_time=...)`` 手动打开剖面。
+    """
+    if region is not None:
+        switch_region(str(region), verbose=verbose)
+
+    cfg = _resolve_detection_config(detection_config)
+    start_ts, end_ts = _resolve_argo_review_time_range(start_time, end_time)
+    lon_min_bound, lon_max_bound, lat_min_bound, lat_max_bound = _resolve_argo_review_bounds(lon_bounds, lat_bounds)
+
+    review_mode_norm = str(review_mode).strip().lower().replace('-', '_')
+    aliases = {
+        'filtered_out': 'filtered',
+        'filtered': 'filtered',
+        'rejected': 'filtered',
+        'screened_out': 'filtered',
+        'selected': 'selected',
+        'anomaly': 'selected',
+        'anomalies': 'selected',
+        'all': 'all',
+    }
+    review_mode_norm = aliases.get(review_mode_norm, review_mode_norm)
+    if review_mode_norm not in {'filtered', 'selected', 'all'}:
+        raise ValueError("review_mode must be 'filtered', 'selected', or 'all'.")
+
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+
+    loaded = _load_argo_profiles_for_interactive_review(
+        start_ts=start_ts,
+        end_ts=end_ts,
+        lon_min_bound=lon_min_bound,
+        lon_max_bound=lon_max_bound,
+        lat_min_bound=lat_min_bound,
+        lat_max_bound=lat_max_bound,
+        detection_config=cfg,
+        classify_anomalies=bool(classify_anomalies),
+        argo_data_dir=argo_data_dir,
+        max_profiles=max_profiles,
+        verbose=verbose,
+    )
+    profiles = loaded['profiles']
+    if profiles.empty:
+        raise ValueError(
+            "指定时间和区域内没有 Argo profile："
+            f"{start_ts.strftime('%Y-%m-%d')} 到 {end_ts.strftime('%Y-%m-%d')}, "
+            f"lon[{lon_min_bound}, {lon_max_bound}], lat[{lat_min_bound}, {lat_max_bound}]。"
+        )
+
+    if bool(loaded.get('limited')) and verbose:
+        print(f"[ArgoReview] profiles 超过 max_profiles={max_profiles}，当前仅显示前 {len(profiles)} 个。")
+    if loaded.get('missing_years') and verbose:
+        years_text = ", ".join(str(y) for y in loaded['missing_years'])
+        print(f"[ArgoReview] 缺少这些年份的 Argo 文件，已跳过: {years_text}")
+
+    backend_name = str(plt.get_backend()).lower()
+    if show_fig and 'inline' in backend_name and verbose:
+        print("[ArgoReview] 当前 matplotlib backend 是 inline；若要点击 profile，请先运行 `%matplotlib widget` 后重新调用。")
+
+    crosses_dateline = _review_lon_bounds_cross_dateline(lon_min_bound, lon_max_bound)
+    is_global_lon = _review_lon_bounds_are_global(lon_min_bound, lon_max_bound)
+
+    # 使用纯 matplotlib Axes 替代 cartopy GeoAxes，确保 widget backend 下
+    # 鼠标事件（button_press_event / pick_event）能正常触发。
+    world = _load_world_geodataframe()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_facecolor(_BASEMAP_COLORS['ocean'])
+    world.plot(ax=ax, color=_BASEMAP_COLORS['land'], edgecolor=_BASEMAP_COLORS['coastline'], linewidth=0.5)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+
+    lon_extent_min = float(lon_min_bound)
+    lon_extent_max = float(lon_max_bound)
+    if is_global_lon:
+        lon_extent_min, lon_extent_max = -180.0, 180.0
+    elif crosses_dateline and lon_extent_max < lon_extent_min:
+        lon_extent_max += 360.0
+    ax.set_xlim(lon_extent_min, lon_extent_max)
+    ax.set_ylim(lat_min_bound, lat_max_bound)
+
+    scatter_artists: list[tuple] = []
+
+    filtered = profiles.loc[~profiles['is_anomaly']].copy()
+    selected = profiles.loc[profiles['is_anomaly']].copy()
+
+    if not filtered.empty:
+        sc_filtered = ax.scatter(
+            filtered['Longitude'],
+            filtered['Latitude'],
+            facecolors='none',
+            edgecolors='gray',
+            linewidths=0.75,
+            s=38,
+            alpha=0.85,
+            label='Filtered-out Argo profiles',
+            zorder=2,
+            picker=True,
+        )
+        scatter_artists.append((sc_filtered, filtered.index.to_numpy(dtype=int)))
+
+    sc_selected = None
+    color_label = cfg.color_label()
+    if not selected.empty:
+        color_values, _, color_label, cmap_name = _color_values_for_anomalies(selected, cfg)
+        scatter_kwargs = {}
+        if color_values is not None and color_values.notna().any():
+            cbar_lo, cbar_hi = cfg.resolved_cbar()
+            scatter_kwargs.update(dict(c=color_values, cmap=cmap_name, vmin=cbar_lo, vmax=cbar_hi))
+        else:
+            scatter_kwargs.update(dict(color='tab:red'))
+
+        sc_selected = ax.scatter(
+            selected['Longitude'],
+            selected['Latitude'],
+            s=64,
+            edgecolors='black',
+            linewidths=0.5,
+            label=f'Selected anomalies ({cfg.threshold_label()})',
+            zorder=3,
+            picker=True,
+            **scatter_kwargs,
+        )
+        scatter_artists.append((sc_selected, selected.index.to_numpy(dtype=int)))
+        if color_values is not None and color_values.notna().any():
+            cbar = plt.colorbar(sc_selected, ax=ax, orientation='horizontal', fraction=0.046, pad=0.06)
+            cbar.set_label(color_label, fontsize=11)
+            cbar.ax.tick_params(labelsize=10)
+            _apply_detection_colorbar_ticks(cbar, cfg, cbar_lo, cbar_hi)
+
+    clickable_count = 0
+    if review_mode_norm == 'filtered':
+        clickable_count = int(len(filtered))
+    elif review_mode_norm == 'selected':
+        clickable_count = int(len(selected))
+    else:
+        clickable_count = int(len(profiles))
+
+    title_parts = [
+        f"Argo GLORYS Review {start_ts.strftime('%Y-%m-%d')} to {end_ts.strftime('%Y-%m-%d')}",
+        f"profiles={len(profiles)}",
+    ]
+    if classify_anomalies:
+        title_parts.append(f"selected={len(selected)}")
+        title_parts.append(f"filtered={len(filtered)}")
+    title_parts.append(f"clickable={clickable_count} ({review_mode_norm})")
+    ax.set_title(", ".join(title_parts), fontsize=14)
+    ax.legend(fontsize=10, loc='upper left')
+    plt.tight_layout()
+
+    detail_options = {
+        'horizontal_variable': horizontal_variable,
+        'vertical_variables': vertical_variables,
+        'needed_depth': needed_depth,
+        'xmin': xmin,
+        'xmax': xmax,
+        'ymin': ymin,
+        'ymax': ymax,
+        'profile_spacing_km': profile_spacing_km,
+        'interpolate_z': interpolate_z,
+        'profile_depth_spacing_m': profile_depth_spacing_m,
+        'plot_mlt': plot_mlt,
+        'plot_argo_projection': plot_argo_projection,
+        'plot_isolines': plot_isolines,
+        'isoline_levels': isoline_levels,
+        'isoline_color': isoline_color,
+        'isoline_linewidth': isoline_linewidth,
+        'isoline_alpha': isoline_alpha,
+        'label_isolines': label_isolines,
+        'argo_min_depth': argo_min_depth,
+        'argo_projection_min_depth': argo_projection_min_depth,
+        'argo_data_dir': argo_data_dir,
+        'n2_projection_depth_m': n2_projection_depth_m,
+        'n2_x_window_km': n2_x_window_km,
+        'n2_z_window_m': n2_z_window_m,
+        'annotate_n2': annotate_n2,
+    }
+
+    reviewer = InteractiveArgoGlorysReviewer(
+        profiles=profiles,
+        raw_rows=loaded['raw_rows'],
+        anomalies=loaded['anomalies'],
+        fig=fig,
+        ax=ax,
+        scatter_artists=scatter_artists,
+        callback_cid=None,
+        detection_config=cfg,
+        detail_options=detail_options,
+        save_clicked_figures=save_clicked_figures,
+        output_dir=output_dir,
+        close_previous=close_previous,
+        verbose=verbose,
+    )
+    callback_cid = fig.canvas.mpl_connect('button_press_event', reviewer._on_click)
+    reviewer._callback_cid = callback_cid
+    fig._interactive_argo_glorys_reviewer = reviewer
+
+    if show_fig:
+        _show_figure_for_current_backend(fig, block=False)
+
+    if verbose:
+        print(
+            "[ArgoReview] ready. 点击地图任意位置即可选中最近的 Argo profile；"
+            "用 reviewer.close_current() 关闭当前 detail 图。",
+            flush=True,
+        )
+        if clickable_count == 0:
+            print("[ArgoReview] 当前 review_mode 下没有可点击 profile。")
+
+    return reviewer
+
+
 def export_hotspot_anomaly_summary_table(
     vertical_profiles_result: dict | None = None,
     argo_glorys_result: dict | None = None,
@@ -13017,6 +13820,7 @@ def plot_single_hotspot_profile(
     annotate_delta_ts: bool = True,
     save_fig: bool = False,
     show_fig: bool = True,
+    close_fig: bool = True,
     argo_data_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
@@ -13224,7 +14028,8 @@ def plot_single_hotspot_profile(
 
     if show_fig:
         plt.show()
-    plt.close(fig)
+    if close_fig:
+        plt.close(fig)
 
     return {
         'profile_number': int(profile_number),
