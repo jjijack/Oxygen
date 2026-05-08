@@ -7821,15 +7821,22 @@ def _normalize_overview_vertical_variables(variables: list[str] | None) -> list[
 
 
 def _overview_var_style(var_key: str) -> tuple[str, str, str, tuple[float, float] | None]:
-    """返回变量的标题、色标标签、配色和默认色标范围。"""
+    """返回变量的标题、色标标签、配色和固定色标范围。
+
+    所有变量均使用固定色标范围，以确保跨图颜色可比：
+    - vorticity: (-0.7, 0.7) ζ/f
+    - thetao:    (1, 27) °C
+    - sigma:     (23, 28) kg/m³
+    - salinity:  (33, 36) psu
+    """
     if var_key == 'vorticity':
         return ('Vorticity', r'$\zeta/f$', 'seismic', (-0.7, 0.7))
     if var_key == 'thetao':
-        return ('Temperature', 'Temperature (°C)', 'rainbow', None)
+        return ('Temperature', 'Temperature (°C)', 'rainbow', (1.0, 27.0))
     if var_key == 'sigma':
-        return ('Density', 'Potential Density Anomaly (kg/m³)', 'RdBu_r', None)
+        return ('Density', 'Potential Density Anomaly (kg/m³)', 'RdBu_r', (23.0, 28.0))
     if var_key == 'salinity':
-        return ('Salinity', 'Salinity (psu)', 'viridis', None)
+        return ('Salinity', 'Salinity (psu)', 'viridis', (33.0, 36.0))
     return (var_key, var_key, 'viridis', None)
 
 
@@ -8164,7 +8171,7 @@ def _plot_glorys_overview_vertical_2x2(
     isoline_color: str = 'black',
     isoline_linewidth: float = 0.8,
     isoline_alpha: float = 0.45,
-    label_isolines: bool = False,
+    label_isolines: bool = True,
     title_extra: str = '',
 ):
     """绘制 overview 的 2x2 vertical 图。"""
@@ -8237,7 +8244,7 @@ def _plot_glorys_overview_vertical_2x2(
                         zorder=5,
                     )
                     if label_isolines:
-                        ax.clabel(contour_set, inline=True, fontsize=9, fmt='%.2g')
+                        ax.clabel(contour_set, inline=True, fontsize=9, fmt='%.3g')
 
         if draw_reference_lines:
             ax.axvline(0.0, color='black', linestyle='--', linewidth=1.6, label='Center Projection' if i == 0 else None)
@@ -8464,7 +8471,7 @@ def plot_track_vertical_glorys_overview(
     isoline_color: str = 'black',
     isoline_linewidth: float = 0.8,
     isoline_alpha: float = 0.45,
-    label_isolines: bool = False,
+    label_isolines: bool = True,
     show_fig: bool = True,
     save_fig: bool = False,
     output_dir: str | Path | None = None,
@@ -8598,7 +8605,7 @@ def plot_argo_vertical_glorys_overview(
     isoline_color: str = 'black',
     isoline_linewidth: float = 0.8,
     isoline_alpha: float = 0.45,
-    label_isolines: bool = False,
+    label_isolines: bool = True,
     argo_data_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = False,
@@ -11962,7 +11969,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     isoline_color: str = 'black',
     isoline_linewidth: float = 0.8,
     isoline_alpha: float = 0.45,
-    label_isolines: bool = False,
+    label_isolines: bool = True,
     argo_min_depth: float | None = None,
     argo_projection_min_depth: float | None = None,
     argo_data_dir: str | Path | None = None,
