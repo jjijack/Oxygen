@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.8 变更：
+#   - 新增 heave 配置小节，统一管理等密面出露诊断的物理阈值参数。
 # version 1.7 变更：
 #   - 新增 subduction_detection_method，统一选择 do/aou/trim 三种异常识别模式。
 #   - 新增 aou_* 与 trim_* 参数，供 DetectionConfig / calculate_delta_do 读取。
@@ -18,7 +20,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.7
+version: 1.8
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -55,6 +57,14 @@ processing:
   adaptive_distance_threshold_km: 300.0 # 平面最大距离超出触发大圆
   vertical_profile_spacing_km: 2.0      # 垂向剖面横向采样步长（km）
   vertical_profile_depth_spacing_m: 5.0 # 垂向剖面 z 轴采样步长（m）
+
+  # Heave + Ventilation 等密面出露诊断参数
+  heave:
+    search_range: 0.5               # σ 搜索范围 (kg/m³)，从 σ_argo 向上搜索
+    depth_threshold: 150.0          # 通风深度阈值 (m)，z_min 浅于此值视为出露
+    magnitude_threshold: 100.0      # Heave 幅度阈值 (m)，等密面起伏 ≥ 此值视为显著位移
+    x_window_km: 200.0              # 出露搜索水平窗口半宽 (km)
+    local_x_window_km: 50.0         # Heave 局地搜索水平窗口半宽 (km)
 
 plot:
   basemap_colors:

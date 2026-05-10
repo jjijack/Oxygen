@@ -177,6 +177,24 @@ _default_vertical_profile_depth_spacing_m = float(
     _PROC_CFG.get('processing', {}).get('vertical_profile_depth_spacing_m', 5.0)
 )
 
+# Heave + Ventilation 等密面出露诊断参数（从 processing.yml:processing.heave 读取）
+_HEAVE_CFG = _PROC_CFG.get('processing', {}).get('heave', {})
+_heave_search_range = float(
+    _HEAVE_CFG.get('search_range', 0.5)
+)
+_heave_depth_threshold = float(
+    _HEAVE_CFG.get('depth_threshold', 150.0)
+)
+_heave_magnitude_threshold = float(
+    _HEAVE_CFG.get('magnitude_threshold', 100.0)
+)
+_heave_x_window_km = float(
+    _HEAVE_CFG.get('x_window_km', 200.0)
+)
+_heave_local_x_window_km = float(
+    _HEAVE_CFG.get('local_x_window_km', 50.0)
+)
+
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
 _CBAR_FALLBACK = {
@@ -519,6 +537,12 @@ def print_current_processing_defaults():
         print(f"  trim_depth_max            : {_default_trim_depth_max}")
         print(f"  vertical_profile_spacing_km: {_default_vertical_profile_spacing_km}")
         print(f"  vertical_profile_depth_spacing_m: {_default_vertical_profile_depth_spacing_m}")
+        print(f"  --- Heave / OI diagnostics ---")
+        print(f"  heave.search_range          : {_heave_search_range}")
+        print(f"  heave.depth_threshold       : {_heave_depth_threshold}")
+        print(f"  heave.magnitude_threshold   : {_heave_magnitude_threshold}")
+        print(f"  heave.x_window_km           : {_heave_x_window_km}")
+        print(f"  heave.local_x_window_km     : {_heave_local_x_window_km}")
 
 def approximate_degree_length(lat: float | np.ndarray, lon: float | np.ndarray | None = None) -> dict:
     """计算指定纬度（可选经度）处经纬度与距离的近似换算关系。
@@ -8024,20 +8048,51 @@ def calculate_glorys_vertical_profile_diagnostics(
     x_window_km: float = 25.0,
     z_window_m: float | None = 100.0,
     depth_range_m: tuple[float, float] | None = (0.0, 1000.0),
-    rho0: float = 1025.0,
-    gravity: float = 9.81,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    heave_threshold: float = _heave_magnitude_threshold,
+    heave_x_window_km: float = _heave_x_window_km,
+    heave_local_x_window_km: float = _heave_local_x_window_km,
 ) -> dict:
-    """计算 GLORYS 垂向剖面在 Argo 投影位置附近的 N2 层化指标。
+    """计算等密面出露指数 OI (Outcrop Index) 与垂向位移 Heave。
 
-    指标定义:
-        - 直接读取 ``data_package['profile_data']['sigma']``，不在此处重新计算密度。
-        - 使用近似 ``N2 = g/rho0 * d(sigma0)/dDepth``。
-          深度坐标采用向下为正，稳定层化通常对应正 N2。
-        - 若给定 ``projection_depth_m``，局地窗口为 ``projection_depth_m ± z_window_m``；
-          否则使用 ``depth_range_m``。
+    OI 是一个二值诊断量，判定 Argo 异常深度处的等密面（σ_argo）在水平窗口内
+    是否「出露」（outcrop）到近表层。它由 Heave + Ventilation 双准则联合判定:
+
+    1. **Heave（等密面垂向位移）**: 在 Argo 附近 ±local_x_window_km 范围内，
+       找到 σ ≈ σ_argo 的等密线的最深点（凹底），与全窗口（±x_window_km）
+       内该等密线的最浅点之间的垂直距离。Heave ≥ heave_threshold 说明
+       等密面发生了显著的中尺度起伏。
+
+    2. **Ventilation（通风深度）**: 在 ±x_window_km 范围内搜索从 σ_argo 向上
+       到 σ_argo − heave_search_range 的所有等密线，取其中最小深度 z_min。
+       z_min < heave_depth_threshold 说明至少有一根等密线在窗口内接近海表，
+       存在通风/潜沉的物理通道。
+
+    联合判定:
+        - OI=True  → Heave ≥ threshold AND z_min < depth_threshold
+                     深层高 DO 可通过等密面通风追溯至表层 → Type 1
+        - OI=False → 任一条件不满足，等密线全程停留在深层
+                     高 DO 来源不能用局地通风解释 → Type 2
+
+    参数:
+        projection_x_km: Argo 在剖面线上的投影 x 坐标 (km)，默认 0。
+        projection_depth_m: Argo 异常深度 (m)；为 None 时用深度范围中点。
+        x_window_km / z_window_m: 局地窗口半宽（用于 valid_fraction）。
+        depth_range_m: 限制搜索的深度范围 (m)，默认 0–1000 m。
+        heave_search_range: 从 σ_argo 向上搜索的 σ 跨度 (kg/m³)，默认来自 processing.yml。
+        heave_depth_threshold: 通风判定深度 (m)，z_min 浅于此值视为「接近海表」，默认来自 processing.yml。
+        heave_threshold: Heave 判定阈值 (m)，等密面起伏 ≥ 此值视为显著位移，默认来自 processing.yml。
+        heave_x_window_km: 搜索通风/出露的水平窗口半宽 (km)，默认来自 processing.yml。
+        heave_local_x_window_km: 计算 Heave 时局部最深的搜索半宽 (km)，默认来自 processing.yml。
 
     返回:
-        dict: 少量 N2 诊断指标，用于绘图标题标注或批处理运行日志。
+        dict: 诊断指标字典，包含以下键:
+            - ``glorys_heave_oi`` (bool): 出露指数 OI，True 为通风型
+            - ``glorys_heave_m`` (float): Heave 幅度 (m)，等密线在局地凹底到窗口最浅点的垂直距离
+            - ``glorys_heave_zmin`` (float): 窗口内等密线最小深度 z_min (m)
+            - ``glorys_heave_sigma_argo`` (float): Argo 异常点的 σ (kg/m³)
+            - ``heave_valid_fraction`` (float): 局地窗口内 σ 有效数据占比
     """
     try:
         x0 = float(projection_x_km)
@@ -8048,31 +8103,40 @@ def calculate_glorys_vertical_profile_diagnostics(
     except Exception:
         depth0 = np.nan
 
-    out = {
+    heave_x_half = abs(float(heave_x_window_km))
+    heave_sr = abs(float(heave_search_range))
+    heave_dt = abs(float(heave_depth_threshold))
+    heave_ht = abs(float(heave_threshold))
+
+    out: dict[str, object] = {
         'projection_x_km': x0 if np.isfinite(x0) else np.nan,
         'projection_depth_m': depth0 if np.isfinite(depth0) else np.nan,
-        'n2_x_window_km': float(x_window_km),
-        'n2_z_window_m': float(z_window_m) if z_window_m is not None else np.nan,
-        'n2_valid_fraction': np.nan,
-        'glorys_n2_local': np.nan,
-        'glorys_n2_p95': np.nan,
-        'n2_error': None,
+        'heave_x_window_km': float(heave_x_half),
+        'heave_search_range': float(heave_sr),
+        'heave_depth_threshold': float(heave_dt),
+        'heave_threshold': float(heave_ht),
+        'heave_valid_fraction': np.nan,
+        'glorys_heave_oi': False,
+        'glorys_heave_zmin': np.nan,
+        'glorys_heave_m': np.nan,
+        'glorys_heave_sigma_argo': np.nan,
+        'heave_error': None,
     }
 
     if not data_package:
-        out['n2_error'] = 'empty_data_package'
+        out['heave_error'] = 'empty_data_package'
         return out
 
     y_coords = np.asarray(data_package.get('y_coords', []), dtype=float)
     z_coords = np.asarray(data_package.get('z_coords', []), dtype=float)
     if y_coords.size < 2 or z_coords.size < 2:
-        out['n2_error'] = 'insufficient_coordinates'
+        out['heave_error'] = 'insufficient_coordinates'
         return out
 
     finite_y = np.isfinite(y_coords)
     finite_z = np.isfinite(z_coords)
     if np.count_nonzero(finite_y) < 2 or np.count_nonzero(finite_z) < 2:
-        out['n2_error'] = 'nonfinite_coordinates'
+        out['heave_error'] = 'nonfinite_coordinates'
         return out
 
     y_idx = np.nonzero(finite_y)[0]
@@ -8089,16 +8153,40 @@ def calculate_glorys_vertical_profile_diagnostics(
     expected_shape = (len(z_coords), len(y_coords))
     sigma_full = _as_profile_2d_array(data_package.get('profile_data', {}).get('sigma'), expected_shape=expected_shape)
     if sigma_full is None:
-        out['n2_error'] = 'sigma_unavailable'
+        out['heave_error'] = 'sigma_unavailable'
         return out
 
     sigma = sigma_full[np.ix_(z_idx, y_idx)]
     if sigma.shape != (z_use.size, y_use.size):
-        out['n2_error'] = 'sigma_shape_mismatch'
+        out['heave_error'] = 'sigma_shape_mismatch'
         return out
 
     if not np.isfinite(x0):
         x0 = 0.0
+
+    # 确定 Argo 投影点的 σ 值
+    nearest_y_idx = int(np.nanargmin(np.abs(y_use - x0)))
+    if np.isfinite(depth0):
+        nearest_z_idx = int(np.nanargmin(np.abs(z_use - depth0)))
+    else:
+        if depth_range_m is not None and len(depth_range_m) == 2:
+            z_min_d = float(min(depth_range_m))
+            z_max_d = float(max(depth_range_m))
+            z_in_range = np.nonzero((z_use >= z_min_d) & (z_use <= z_max_d))[0]
+        else:
+            z_in_range = np.arange(len(z_use))
+        if z_in_range.size == 0:
+            z_in_range = np.arange(len(z_use))
+        nearest_z_idx = int(z_in_range[len(z_in_range) // 2])
+
+    sigma_argo = float(sigma[nearest_z_idx, nearest_y_idx])
+    out['glorys_heave_sigma_argo'] = sigma_argo if np.isfinite(sigma_argo) else np.nan
+
+    if not np.isfinite(sigma_argo):
+        out['heave_error'] = 'sigma_argo_nan'
+        return out
+
+    # 局地窗口 valid_fraction
     try:
         x_half = abs(float(x_window_km))
     except Exception:
@@ -8123,31 +8211,70 @@ def calculate_glorys_vertical_profile_diagnostics(
 
     local_mask = z_mask[:, None] & x_mask[None, :]
     local_sigma = sigma[local_mask]
-    out['n2_valid_fraction'] = (
+    out['heave_valid_fraction'] = (
         float(np.count_nonzero(np.isfinite(local_sigma)) / local_sigma.size)
         if local_sigma.size > 0 else np.nan
     )
 
-    try:
-        d_sigma_dz = np.gradient(sigma, z_use, axis=0)
-    except Exception:
-        d_sigma_dz = np.full_like(sigma, np.nan, dtype=float)
+    # --- Heave + OI 联合算法 ---
+    # 水平搜索窗口
+    heave_x_mask = np.abs(y_use - x0) <= heave_x_half
+    if not np.any(heave_x_mask):
+        heave_x_mask[np.nanargmin(np.abs(y_use - x0))] = True
 
-    n2 = (float(gravity) / float(rho0)) * d_sigma_dz
-    n2_positive = np.where(n2 > 0, n2, np.nan)
+    sigma_lower = sigma_argo - heave_sr
+    sigma_search_range = max(0.05, heave_sr)
+    n_search = max(8, int(sigma_search_range / 0.01))
+    sigma_levels = np.linspace(sigma_lower, sigma_argo, n_search)
 
-    nearest_y_idx = int(np.nanargmin(np.abs(y_use - x0)))
-    if np.isfinite(depth0):
-        nearest_z_idx = int(np.nanargmin(np.abs(z_use - depth0)))
-    elif np.any(z_mask):
-        z_candidates = np.nonzero(z_mask)[0]
-        nearest_z_idx = int(z_candidates[len(z_candidates) // 2])
-    else:
-        nearest_z_idx = 0
+    # Heave: 等密线在 Argo 附近的最大深度 − 窗口内最浅深度
+    # 用 local_z_max (±50km) 而非 x=0 点值，避免 Argo 恰好落在凸顶上时 heave 被低估
+    local_x_half = abs(float(heave_local_x_window_km))
+    local_x_mask = np.abs(y_use - x0) <= local_x_half
+    if not np.any(local_x_mask):
+        local_x_mask[np.nanargmin(np.abs(y_use - x0))] = True
 
-    n2_local = n2[nearest_z_idx, nearest_y_idx]
-    out['glorys_n2_local'] = float(n2_local) if np.isfinite(n2_local) else np.nan
-    out['glorys_n2_p95'] = _nan_stat(n2_positive[local_mask], 'p95')
+    max_heave = 0.0
+    min_depth_overall = np.nan
+
+    for sigma_i in sigma_levels:
+        sigma_diff = np.abs(sigma - sigma_i)
+        tol = max(0.02, 1.5 * (sigma_levels[1] - sigma_levels[0]))
+        close_mask = (sigma_diff < tol) & heave_x_mask[None, :]
+        close_local = (sigma_diff < tol) & local_x_mask[None, :]
+
+        # z_min in full outcrop window
+        if not np.any(close_mask):
+            continue
+        matched_z = z_use[np.nonzero(close_mask)[0]]
+        if matched_z.size < 2:
+            continue
+        min_z_i = float(np.nanmin(matched_z))
+
+        if np.isfinite(min_z_i):
+            if not np.isfinite(min_depth_overall) or min_z_i < min_depth_overall:
+                min_depth_overall = min_z_i
+
+        # local_z_max: 等密线在 Argo 附近 ±50km 的最深点（凹底）
+        if not np.any(close_local):
+            continue
+        local_z = z_use[np.nonzero(close_local)[0]]
+        if local_z.size == 0:
+            continue
+        local_z_max_i = float(np.nanmax(local_z))
+
+        if np.isfinite(local_z_max_i) and np.isfinite(min_z_i):
+            heave_i = float(local_z_max_i - min_z_i)
+            if heave_i > max_heave:
+                max_heave = heave_i
+
+    out['glorys_heave_m'] = float(max_heave) if max_heave > 0 else np.nan
+    out['glorys_heave_zmin'] = min_depth_overall if np.isfinite(min_depth_overall) else np.nan
+
+    # 联合判定：Heave > 阈值 AND z_min < 深度阈值 → Type 1
+    if (np.isfinite(max_heave) and max_heave >= heave_ht
+            and np.isfinite(min_depth_overall) and min_depth_overall < heave_dt):
+        out['glorys_heave_oi'] = True
 
     return out
 
@@ -8354,10 +8481,12 @@ def _run_vertical_overview_batch(
     save_fig: bool,
     output_dir: str | Path | None,
     verbose: bool,
-    n2_projection_depth_m: float | None = None,
-    n2_x_window_km: float = 25.0,
-    n2_z_window_m: float | None = 100.0,
-    annotate_n2: bool = False,
+    heave_projection_depth_m: float | None = None,
+    heave_x_window_km: float = 25.0,
+    heave_z_window_m: float | None = 100.0,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    annotate_heave: bool = False,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
     results: list[dict] = []
@@ -8383,18 +8512,26 @@ def _run_vertical_overview_batch(
             distance_scale_km=projection_distance_scale_km,
         ) if plot_argo_projection else pd.DataFrame()
 
-        n2_diag = calculate_glorys_vertical_profile_diagnostics(
+        heave_diag = calculate_glorys_vertical_profile_diagnostics(
             pkg,
             projection_x_km=0.0,
-            projection_depth_m=n2_projection_depth_m,
-            x_window_km=n2_x_window_km,
-            z_window_m=n2_z_window_m,
-        ) if annotate_n2 else {}
-        n2_title_extra = ''
-        if annotate_n2 and n2_diag:
-            n2_val = n2_diag.get('glorys_n2_p95')
-            if n2_val is not None and np.isfinite(float(n2_val)):
-                n2_title_extra = rf"$N^2_{{95}}={_format_scientific_mathtext(n2_val)}\,\mathrm{{s}}^{{-2}}$"
+            projection_depth_m=heave_projection_depth_m,
+            x_window_km=heave_x_window_km,
+            z_window_m=heave_z_window_m,
+            heave_search_range=heave_search_range,
+            heave_depth_threshold=heave_depth_threshold,
+        ) if annotate_heave else {}
+        heave_title_extra = ''
+        if annotate_heave and heave_diag:
+            heave_val = heave_diag.get('glorys_heave_m')
+            zmin_val = heave_diag.get('glorys_heave_zmin')
+            parts = []
+            if heave_val is not None and np.isfinite(float(heave_val)):
+                parts.append(rf"H={heave_val:.0f}\,\mathrm{{m}}")
+            if zmin_val is not None and np.isfinite(float(zmin_val)):
+                parts.append(rf"z_{{\mathrm{{min}}}}={zmin_val:.0f}\,\mathrm{{m}}")
+            if parts:
+                heave_title_extra = rf"${', '.join(parts)}$"
 
         fig = _plot_glorys_overview_vertical_2x2(
             vertical_package=pkg,
@@ -8415,7 +8552,7 @@ def _run_vertical_overview_batch(
             isoline_linewidth=isoline_linewidth,
             isoline_alpha=isoline_alpha,
             label_isolines=label_isolines,
-            title_extra=n2_title_extra,
+            title_extra=heave_title_extra,
         )
 
         save_path = None
@@ -8439,8 +8576,8 @@ def _run_vertical_overview_batch(
         plt.close(fig)
 
         result_item = {'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None}
-        if n2_diag:
-            result_item.update(n2_diag)
+        if heave_diag:
+            result_item.update(heave_diag)
         results.append(result_item)
 
     return results
@@ -8476,19 +8613,22 @@ def plot_track_vertical_glorys_overview(
     save_fig: bool = False,
     output_dir: str | Path | None = None,
     verbose: bool = True,
-    n2_projection_depth_m: float | None = None,
-    n2_x_window_km: float = 25.0,
-    n2_z_window_m: float | None = 100.0,
-    annotate_n2: bool = False,
+    heave_projection_depth_m: float | None = None,
+    heave_x_window_km: float = 25.0,
+    heave_z_window_m: float | None = 100.0,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    annotate_heave: bool = False,
 ) -> list[dict]:
     """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
     verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
+    annotate_heave=True 时会在标题显示出露最小深度。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
-    if annotate_n2:
+    if annotate_heave:
         vars_to_fetch.add('sigma')
     if plot_mlt:
         vars_to_fetch.add('mlt')
@@ -8573,10 +8713,12 @@ def plot_track_vertical_glorys_overview(
         save_fig=save_fig,
         output_dir=output_dir,
         verbose=verbose,
-        n2_projection_depth_m=n2_projection_depth_m,
-        n2_x_window_km=n2_x_window_km,
-        n2_z_window_m=n2_z_window_m,
-        annotate_n2=annotate_n2,
+        heave_projection_depth_m=heave_projection_depth_m,
+        heave_x_window_km=heave_x_window_km,
+        heave_z_window_m=heave_z_window_m,
+        heave_search_range=heave_search_range,
+        heave_depth_threshold=heave_depth_threshold,
+        annotate_heave=annotate_heave,
     )
 
 
@@ -8611,20 +8753,22 @@ def plot_argo_vertical_glorys_overview(
     save_fig: bool = False,
     output_dir: str | Path | None = None,
     verbose: bool = True,
-    n2_projection_depth_m: float | None = None,
-    n2_x_window_km: float = 25.0,
-    n2_z_window_m: float | None = 100.0,
-    annotate_n2: bool = False,
+    heave_projection_depth_m: float | None = None,
+    heave_x_window_km: float = 25.0,
+    heave_z_window_m: float | None = 100.0,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    annotate_heave: bool = False,
 ) -> list[dict]:
     """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
     verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
-    annotate_n2=True 时会在标题显示 Argo 投影位置附近的 GLORYS N2。
+    annotate_heave=True 时会在标题显示出露最小深度。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
-    if annotate_n2:
+    if annotate_heave:
         vars_to_fetch.add('sigma')
     if plot_mlt:
         vars_to_fetch.add('mlt')
@@ -8720,10 +8864,12 @@ def plot_argo_vertical_glorys_overview(
         save_fig=save_fig,
         output_dir=output_dir,
         verbose=verbose,
-        n2_projection_depth_m=n2_projection_depth_m,
-        n2_x_window_km=n2_x_window_km,
-        n2_z_window_m=n2_z_window_m,
-        annotate_n2=annotate_n2,
+        heave_projection_depth_m=heave_projection_depth_m,
+        heave_x_window_km=heave_x_window_km,
+        heave_z_window_m=heave_z_window_m,
+        heave_search_range=heave_search_range,
+        heave_depth_threshold=heave_depth_threshold,
+        annotate_heave=annotate_heave,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -10657,11 +10803,11 @@ def plot_argo_hotspots(
     dask_workers: int | None = None,
     dask_memory_limit: str | None = None,
     use_interacting_argo: bool = False,
-    use_glorys_n2: bool = False,
+    use_glorys_heave: bool = False,
     argo_glorys_summary_data_path: str | Path | None = None,
     split_plots: bool | str = False,
     split_plot_mode: str | None = None,
-    hotspot_type_n2_threshold: float | None = 2e-5,
+    hotspot_type_heave_threshold: float | None = _heave_depth_threshold,
 ):
     """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
 
@@ -10685,8 +10831,8 @@ def plot_argo_hotspots(
         use_interacting_argo (bool): 是否读取 run_batch_plotting_multiprocessing 生成的交互 Argo 文件，
                                           并在图中区分交互/非交互 Argo，同时统计交互比例。
                                           默认 False。
-        use_glorys_n2 (bool): 是否读取 ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的 summary parquet，
-            用 GLORYS N2 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 N2 时会退回
+        use_glorys_heave (bool): 是否读取 ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的 summary parquet，
+            用 GLORYS OI 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 OI 时会退回
             “近岸第 3 类 / 非第 3 类”绘图。
         argo_glorys_summary_data_path: 可选 GLORYS overview summary parquet 路径；None 时按默认命名自动定位。
         split_plots (bool | str): False 时只绘制合并图；True 时按 split_plot_mode 拆图。
@@ -10694,9 +10840,9 @@ def plot_argo_hotspots(
         split_plot_mode (str | None): 拆图模式。
             - ``'eddy_interaction'``：原有 META 交互/非交互拆图；
             - ``'hotspot_type'``：按 hotspot_type=1/2/3 拆图。
-            None 时，若 use_glorys_n2=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
+            None 时，若 use_glorys_heave=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
             仅 use_interacting_argo=True 时默认 ``'eddy_interaction'``。
-        hotspot_type_n2_threshold: 当 anomalies 中已含 ``glorys_n2_p95`` 时，用于生成 hotspot_type 的 N2 阈值。
+        hotspot_type_heave_threshold: 当 anomalies 中已含 ``glorys_heave_zmin`` 时，用于生成 hotspot_type 的 出露深度阈值。
 
     输出:
         - 图像（可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/Argo_Anomaly_Hotspots_*.png`
@@ -10716,13 +10862,13 @@ def plot_argo_hotspots(
             split_plot_mode = split_plots
         split_plots = True
 
-    if use_interacting_argo and use_glorys_n2 and not split_plot_mode_explicit:
-        print("[Plot Info] Both use_interacting_argo and use_glorys_n2 are enabled; plotting uses hotspot_type by default.")
+    if use_interacting_argo and use_glorys_heave and not split_plot_mode_explicit:
+        print("[Plot Info] Both use_interacting_argo and use_glorys_heave are enabled; plotting uses hotspot_type by default.")
 
     split_mode = None
     if split_plots:
         split_mode_raw = split_plot_mode or (
-            'hotspot_type' if (use_glorys_n2 or not use_interacting_argo) else 'eddy_interaction'
+            'hotspot_type' if (use_glorys_heave or not use_interacting_argo) else 'eddy_interaction'
         )
         split_mode_key = str(split_mode_raw).strip().lower().replace('-', '_')
         split_aliases = {
@@ -10859,9 +11005,9 @@ def plot_argo_hotspots(
     if anomalies.empty:
         print("No anomalies detected.")
 
-    glorys_n2_available = False
+    glorys_heave_available = False
     glorys_summary_path_used = None
-    if use_glorys_n2 and not anomalies.empty:
+    if use_glorys_heave and not anomalies.empty:
         region_slug_for_path = _current_region_key()
         glorys_summary_candidates: list[Path] = []
         if argo_glorys_summary_data_path is not None:
@@ -10877,36 +11023,37 @@ def plot_argo_hotspots(
 
         if glorys_summary_path_used is None:
             print(
-                "[WARN] GLORYS N2 summary parquet not found; "
+                "[WARN] GLORYS heave summary parquet not found; "
                 "falling back to nearshore/non-nearshore hotspot types."
             )
         else:
             try:
                 glorys_summary_df = pd.read_parquet(glorys_summary_path_used)
                 anomalies = _merge_hotspot_glorys_summary_fields(anomalies, glorys_summary_df)
-                n2_vals = pd.to_numeric(anomalies.get('glorys_n2_p95'), errors='coerce')
-                matched_n2 = int(n2_vals.notna().sum())
-                if matched_n2 > 0:
-                    glorys_n2_available = True
+                heave_vals = pd.to_numeric(anomalies.get('glorys_heave_zmin'), errors='coerce')
+                matched_outcrop = int(heave_vals.notna().sum())
+                if matched_outcrop > 0:
+                    glorys_heave_available = True
                     print(
-                        f"[*] Loaded GLORYS N2 hotspot type fields from {glorys_summary_path_used} "
-                        f"(matched {matched_n2}/{len(anomalies)} anomalies)."
+                        f"[*] Loaded GLORYS OI hotspot type fields from {glorys_summary_path_used} "
+                        f"(matched {matched_outcrop}/{len(anomalies)} anomalies)."
                     )
                 else:
                     print(
-                        f"[WARN] GLORYS summary parquet has no matched N2 values: {glorys_summary_path_used}; "
+                        f"[WARN] GLORYS summary parquet has no matched heave/OI fields: {glorys_summary_path_used}; "
                         "falling back to nearshore/non-nearshore hotspot types."
                     )
             except Exception as exc:
                 print(
-                    f"[WARN] Failed to read GLORYS N2 summary parquet {glorys_summary_path_used}: {exc}; "
+                    f"[WARN] Failed to read GLORYS heave summary parquet {glorys_summary_path_used}: {exc}; "
                     "falling back to nearshore/non-nearshore hotspot types."
                 )
 
     if not anomalies.empty and 'nearshore_do_dip' in anomalies.columns:
         anomalies['hotspot_type'] = _assign_hotspot_type(
             anomalies,
-            n2_threshold=hotspot_type_n2_threshold if glorys_n2_available else None,
+            heave_z_threshold=hotspot_type_heave_threshold if glorys_heave_available else None,
+            heave_m_threshold=_heave_magnitude_threshold if glorys_heave_available else None,
         )
 
     # 绘图
@@ -10942,7 +11089,7 @@ def plot_argo_hotspots(
     title_threshold_label = cfg.threshold_label()
     plots_to_generate = []
     if split_plots and split_mode == 'hotspot_type':
-        if glorys_n2_available:
+        if glorys_heave_available:
             type_vals = (
                 pd.to_numeric(anomalies['hotspot_type'], errors='coerce')
                 if (not anomalies.empty and 'hotspot_type' in anomalies.columns)
@@ -10964,22 +11111,22 @@ def plot_argo_hotspots(
                 {
                     'type_id': 1,
                     'name': 'hotspot_type_1',
-                    'title_extra': ' (Type 1: Strong N2)',
+                    'title_extra': ' (Type 1: Ventilated)',
                     'file_suffix': '_type1',
                     'marker': 'o',
                     'edgecolor': 'black',
-                    'label': f'Type 1 - strong N2 ({base_anomaly_label})',
+                    'label': f'Type 1 - ventilated ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
                 },
                 {
                     'type_id': 2,
                     'name': 'hotspot_type_2',
-                    'title_extra': ' (Type 2: Weak N2)',
+                    'title_extra': ' (Type 2: Deep only)',
                     'file_suffix': '_type2',
                     'marker': 'o',
                     'edgecolor': 'dimgray',
-                    'label': f'Type 2 - weak N2 ({base_anomaly_label})',
+                    'label': f'Type 2 - deep only ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
                 },
@@ -11093,13 +11240,13 @@ def plot_argo_hotspots(
         use_hotspot_type_combined = (
             not anomalies.empty
             and 'nearshore_do_dip' in anomalies.columns
-            and (use_glorys_n2 or not use_interacting_argo)
+            and (use_glorys_heave or not use_interacting_argo)
         )
-        if use_hotspot_type_combined and glorys_n2_available:
+        if use_hotspot_type_combined and glorys_heave_available:
             type_vals = pd.to_numeric(anomalies.get('hotspot_type'), errors='coerce')
             hotspot_type_combined_specs = [
-                (1, 'o', 'black', f'Type 1 - strong N2 ({base_anomaly_label})', 60, 3),
-                (2, 'o', 'dimgray', f'Type 2 - weak N2 ({base_anomaly_label})', 60, 3),
+                (1, 'o', 'black', f'Type 1 - ventilated ({base_anomaly_label})', 60, 3),
+                (2, 'o', 'dimgray', f'Type 2 - deep only ({base_anomaly_label})', 60, 3),
                 (3, '^', 'red', f'Type 3 - nearshore DO dip ({base_anomaly_label})', 80, 4),
             ]
             for type_id, marker, edgecolor, label, size, zorder in hotspot_type_combined_specs:
@@ -11303,8 +11450,8 @@ def plot_argo_hotspots(
         'selected_depth_mean': selected_depth_mean,
         'all_argo_depth_mean': np.nan,
         'all_argo_do_mean': np.nan,
-        'use_glorys_n2': bool(use_glorys_n2),
-        'glorys_n2_available': bool(glorys_n2_available),
+        'use_glorys_heave': bool(use_glorys_heave),
+        'glorys_heave_available': bool(glorys_heave_available),
         'argo_glorys_summary_data_path': str(glorys_summary_path_used) if glorys_summary_path_used is not None else None,
     }
 
@@ -11796,7 +11943,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
     month_val = args.get('month')
     day_val = args.get('day')
     platform_val = args.get('platform_number')
-    n2_projection_depth_m = args.get('n2_projection_depth_m')
+    heave_projection_depth_m = args.get('heave_projection_depth_m')
 
     if month_val is not None and day_val is not None:
         profile_time = pd.Timestamp(year=year_val, month=int(month_val), day=int(day_val))
@@ -11815,7 +11962,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
         'center_lon': np.nan,
         'center_lat': np.nan,
         'target_date': None,
-        'anomaly_depth_m': n2_projection_depth_m,
+        'anomaly_depth_m': heave_projection_depth_m,
         'horizontal_status': 'not_started',
         'vertical_status': 'not_started',
         'vertical_save_paths': None,
@@ -11913,10 +12060,12 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             save_fig=bool(args.get('save_fig', True)),
             output_dir=args.get('vertical_output_dir'),
             verbose=bool(args.get('verbose', False)),
-            n2_projection_depth_m=n2_projection_depth_m,
-            n2_x_window_km=float(args.get('n2_x_window_km', 25.0)),
-            n2_z_window_m=args.get('n2_z_window_m', 100.0),
-            annotate_n2=bool(args.get('annotate_n2', False)),
+            heave_projection_depth_m=heave_projection_depth_m,
+            heave_x_window_km=float(args.get('heave_x_window_km', 25.0)),
+            heave_z_window_m=args.get('heave_z_window_m', 100.0),
+            heave_search_range=float(args.get('heave_search_range', 0.5)),
+            heave_depth_threshold=float(args.get('heave_depth_threshold', 150.0)),
+            annotate_heave=bool(args.get('annotate_heave', False)),
         )
         record['vertical_status'] = 'ok' if vertical_results else 'empty'
         record['vertical_save_paths'] = ";".join(
@@ -11926,12 +12075,13 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             first_vertical = vertical_results[0]
             for key in [
                 'projection_depth_m',
-                'n2_x_window_km',
-                'n2_z_window_m',
-                'n2_valid_fraction',
-                'glorys_n2_local',
-                'glorys_n2_p95',
-                'n2_error',
+                'heave_x_window_km',
+                'heave_z_window_m',
+                'heave_valid_fraction',
+                'glorys_heave_sigma_argo',
+                'glorys_heave_zmin',
+                'glorys_heave_oi',
+                'heave_error',
             ]:
                 if key in first_vertical:
                     value = first_vertical[key]
@@ -11982,9 +12132,11 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     use_multiprocessing: bool = True,
     num_workers: int | None = None,
     maxtasksperchild: int | None = 4,
-    n2_x_window_km: float = 25.0,
-    n2_z_window_m: float | None = 100.0,
-    annotate_n2: bool = False,
+    heave_x_window_km: float = 25.0,
+    heave_z_window_m: float | None = 100.0,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    annotate_heave: bool = False,
     return_details: bool = False,
     save_summary_data: bool = True,
     summary_data_path: str | Path | None = None,
@@ -12016,10 +12168,10 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         use_multiprocessing: 是否用多进程并行处理 profile；默认 True。
         num_workers: worker 数；None 时自动取 min(profile数, CPU数, 4)。
         maxtasksperchild: 每个 worker 处理多少个任务后重启；None 表示不自动重启。
-        n2_x_window_km / n2_z_window_m: N2 局地窗口半宽。
-        annotate_n2: 是否在 vertical overview 标题中显示 N2。
+        heave_x_window_km / heave_z_window_m: OI 局地窗口半宽。
+        annotate_heave: 是否在 vertical overview 标题中显示出露深度。
         return_details: 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
-        save_summary_data: 是否保存逐 profile GLORYS/N2 明细 parquet，默认 True。
+        save_summary_data: 是否保存逐 profile GLORYS/Heave 诊断明细 parquet，默认 True。
         summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
 
     返回:
@@ -12127,12 +12279,13 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
                     'status',
                     'error',
                     'projection_depth_m',
-                    'n2_x_window_km',
-                    'n2_z_window_m',
-                    'n2_valid_fraction',
-                    'glorys_n2_local',
-                    'glorys_n2_p95',
-                    'n2_error',
+                    'heave_x_window_km',
+                    'heave_z_window_m',
+                    'heave_valid_fraction',
+                    'glorys_heave_sigma_argo',
+                    'glorys_heave_zmin',
+                    'glorys_heave_oi',
+                    'heave_error',
                 ]
                 pd.DataFrame(columns=empty_cols).to_parquet(resolved_summary_data_path, index=False)
                 saved_summary_data_path = str(resolved_summary_data_path)
@@ -12145,8 +12298,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'output_dir': str(batch_output_dir) if save_fig else None,
             'anomalies_path': str(anomalies_path),
             'summary_data_path': saved_summary_data_path,
-            'n2_diagnostics': bool(annotate_n2),
-            'annotate_n2': bool(annotate_n2),
+            'heave_diagnostics': bool(annotate_heave),
+            'annotate_heave': bool(annotate_heave),
         }
         if return_details:
             empty_summary['results'] = []
@@ -12194,7 +12347,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'month': _to_int_or_none(row.get('Month')),
             'day': _to_int_or_none(row.get('Day')),
             'platform_number': _to_int_or_none(row.get('Platform_number')),
-            'n2_projection_depth_m': _first_float_from_row(row, ['depth', 'Depth', 'Anomaly_depth']),
+            'heave_projection_depth_m': _first_float_from_row(row, ['depth', 'Depth', 'Anomaly_depth']),
             'detection_config': cfg,
             'region_config_key': region_config_key,
             'horizontal_variable': horizontal_variable,
@@ -12225,9 +12378,11 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'vertical_output_dir': vertical_output_dir if save_fig else None,
             'verbose': verbose,
             'force_agg_backend': bool(worker_count > 1 and not show_fig),
-            'n2_x_window_km': n2_x_window_km,
-            'n2_z_window_m': n2_z_window_m,
-            'annotate_n2': annotate_n2,
+            'heave_x_window_km': heave_x_window_km,
+            'heave_z_window_m': heave_z_window_m,
+            'heave_search_range': float(heave_search_range),
+            'heave_depth_threshold': heave_depth_threshold,
+            'annotate_heave': annotate_heave,
         })
 
     if worker_count > 1:
@@ -12283,8 +12438,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         'vertical_output_dir': str(vertical_output_dir) if save_fig else None,
         'anomalies_path': str(anomalies_path),
         'summary_data_path': saved_summary_data_path,
-        'n2_diagnostics': bool(annotate_n2),
-        'annotate_n2': bool(annotate_n2),
+        'heave_diagnostics': bool(annotate_heave),
+        'annotate_heave': bool(annotate_heave),
     }
     if return_details:
         summary['results'] = results
@@ -12303,7 +12458,7 @@ def export_hotspot_anomaly_summary_table(
     output_path: str | Path | None = None,
     output_format: str | None = None,
     save_table: bool = True,
-    n2_threshold: float | None = 2e-5,
+    heave_threshold: float | None = _heave_depth_threshold,
     diagnose_nearshore_do: bool = True,
     nearshore_do_min_threshold: float = 50.0,
     nearshore_do_drop_threshold: float = 100.0,
@@ -12316,33 +12471,33 @@ def export_hotspot_anomaly_summary_table(
     """导出 hotspot anomaly 检查用 summary 表。
 
     该函数不重新做异常检测或 GLORYS 绘图。基础剖面信息与异常指标来自
-    ``plot_argo_hotspots`` 保存的 anomalies parquet；N2 与 GLORYS 绘图状态优先来自
+    ``plot_argo_hotspots`` 保存的 anomalies parquet；OI 与 GLORYS 绘图状态优先来自
     ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值，若未传返回值则读取该函数默认保存的
-    summary parquet。若 N2 详情缺失，会在表中保留空值并给出提示。近岸 DO 形态指标优先读取
+    summary parquet。若 heave 详情缺失，会在表中保留空值并给出提示。近岸 DO 形态指标优先读取
     ``plot_argo_hotspots`` 新版 anomalies parquet 中已保存的列；旧版 parquet 缺列时才回查 Argo 年数据。
 
     ``hotspot_type`` 用于快速人工复核：Type 3 表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；
-    非近岸剖面中，N2 强于阈值者为 1，否则为 2。
+    非近岸剖面中，OI=True 者为 1，否则为 2。
 
     参数:
         vertical_profiles_result: ``plot_hotspot_anomaly_vertical_profiles`` 的返回值。
             仅用于兼容旧调用：若其中包含 ``anomalies_path``，可用来定位输入 parquet。
         argo_glorys_result: ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值。
-            若包含 ``results``，会合并 GLORYS 状态和 N2 字段。
+            若包含 ``results``，会合并 GLORYS 状态和 OI 字段。
         start_year / end_year / anomalies_path: 当返回值中没有 anomalies_path 时用于定位输入 parquet。
         detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
         argo_glorys_summary_data_path: ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的明细 parquet。
         output_path: 保存路径；None 时写到当前 method/region 的默认 summary 目录。
         output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
         save_table: 是否保存表格文件，默认 True。
-        n2_threshold: N2 分类阈值，默认 2e-5；设为 None 时不新增 ``n2_strong`` 列。
+        heave_threshold: 出露深度阈值 (m)，默认 150；设为 None 时不新增 ``heave_oi`` 列。
         diagnose_nearshore_do: 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
         nearshore_do_min_threshold: 近岸型判据中，异常深度以上 DO 最小值阈值。
         nearshore_do_drop_threshold: 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
         nearshore_do_recovery_threshold: 近岸型判据中，最小 DO 到异常深度 DO 的最小回升幅度。
         nearshore_do_depth_gap_threshold_m: 近岸型判据中，最小 DO 与异常深度的最小垂向间隔。
         compact_columns: 是否删除人工检查中冗余的固定/重复列，默认 True。
-        require_glorys_details: True 时若缺少 GLORYS details/N2 信息则报错。
+        require_glorys_details: True 时若缺少 GLORYS heave/OI 信息则报错。
         verbose: 是否打印保存路径和缺失提示。
 
     返回:
@@ -12467,16 +12622,16 @@ def export_hotspot_anomaly_summary_table(
             'glorys_vertical_status',
             'glorys_line_strategy',
             'glorys_k',
-            'n2_x_window_km',
-            'n2_z_window_m',
-            'n2_error',
+            'heave_x_window_km',
+            'heave_z_window_m',
+            'heave_error',
         ]
         for col_name in constant_drop_candidates:
             if col_name in table_out.columns and _series_constant(table_out[col_name]):
                 drop_cols.append(col_name)
 
         duplicate_pairs = [
-            ('n2_projection_depth_m', 'anomaly_depth_m'),
+            ('heave_projection_depth_m', 'anomaly_depth_m'),
             ('glorys_center_lon', 'Longitude'),
             ('glorys_center_lat', 'Latitude'),
             ('glorys_b', 'Latitude'),
@@ -12765,7 +12920,7 @@ def export_hotspot_anomaly_summary_table(
             if glorys_summary_path_used is None and argo_glorys_result is None:
                 warnings_list.append(
                     "未收到 plot_hotspot_anomaly_argo_glorys_overviews 的返回值，也未找到默认 GLORYS summary parquet；"
-                    "N2 与 GLORYS 绘图状态将为空。"
+                    "OI 与 GLORYS 绘图状态将为空。"
                 )
             elif glorys_summary_path_used is None:
                 warnings_list.append(
@@ -12779,7 +12934,7 @@ def export_hotspot_anomaly_summary_table(
     if require_glorys_details and len(table) > 0 and not glorys_records:
         raise ValueError(
             "缺少 GLORYS details。请先运行 "
-            "plot_hotspot_anomaly_argo_glorys_overviews(..., annotate_n2=True)。"
+            "plot_hotspot_anomaly_argo_glorys_overviews(..., annotate_heave=True)。"
         )
     glorys_by_key: dict[tuple, dict] = {}
     for rec in glorys_records:
@@ -12804,13 +12959,14 @@ def export_hotspot_anomaly_summary_table(
         ('glorys_b', 'b'),
         ('glorys_center_lon', 'center_lon'),
         ('glorys_center_lat', 'center_lat'),
-        ('n2_projection_depth_m', 'projection_depth_m'),
-        ('n2_x_window_km', 'n2_x_window_km'),
-        ('n2_z_window_m', 'n2_z_window_m'),
-        ('n2_valid_fraction', 'n2_valid_fraction'),
-        ('glorys_n2_local', 'glorys_n2_local'),
-        ('glorys_n2_p95', 'glorys_n2_p95'),
-        ('n2_error', 'n2_error'),
+        ('heave_projection_depth_m', 'projection_depth_m'),
+        ('heave_x_window_km', 'heave_x_window_km'),
+        ('heave_z_window_m', 'heave_z_window_m'),
+        ('heave_valid_fraction', 'heave_valid_fraction'),
+        ('glorys_heave_sigma_argo', 'glorys_heave_sigma_argo'),
+        ('glorys_heave_zmin', 'glorys_heave_zmin'),
+        ('glorys_heave_oi', 'glorys_heave_oi'),
+        ('heave_error', 'heave_error'),
     ]
 
     matched_records = []
@@ -12826,20 +12982,20 @@ def export_hotspot_anomaly_summary_table(
     for out_col, rec_col in glorys_cols:
         table[out_col] = [rec.get(rec_col, np.nan) for rec in matched_records]
 
-    if glorys_records and table['glorys_n2_p95'].isna().all():
+    if glorys_records and table['glorys_heave_zmin'].isna().all():
         warnings_list.append(
-            "GLORYS details 中没有可用 N2。若需要 N2，请使用 annotate_n2=True 重新运行 "
+            "GLORYS details 中没有可用 OI。若需要 OI，请使用 annotate_heave=True 重新运行 "
             "plot_hotspot_anomaly_argo_glorys_overviews。"
         )
         if require_glorys_details:
             raise ValueError(warnings_list[-1])
 
-    if n2_threshold is not None:
-        threshold_val = float(n2_threshold)
-        n2_vals = pd.to_numeric(table['glorys_n2_p95'], errors='coerce')
-        table['n2_threshold'] = threshold_val
-        table['n2_strong'] = pd.Series(
-            np.where(n2_vals.notna(), n2_vals >= threshold_val, pd.NA),
+    if heave_threshold is not None:
+        threshold_val = float(heave_threshold)
+        min_depth_vals = pd.to_numeric(table['glorys_heave_zmin'], errors='coerce')
+        table['heave_threshold'] = threshold_val
+        table['heave_oi'] = pd.Series(
+            np.where(min_depth_vals.notna(), min_depth_vals < threshold_val, pd.NA),
             index=table.index,
             dtype='boolean',
         )
@@ -12853,7 +13009,46 @@ def export_hotspot_anomaly_summary_table(
     elif not diagnose_nearshore_do:
         table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
 
-    table['hotspot_type'] = _assign_hotspot_type(table, n2_threshold=n2_threshold)
+    table['hotspot_type'] = _assign_hotspot_type(
+        table,
+        heave_z_threshold=heave_threshold,
+        heave_m_threshold=_heave_magnitude_threshold,
+    )
+
+    # --- 基于 META 的涡旋位置辅助判定 ---
+    table['meta_inside_eddy'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
+    table['meta_eddy_list'] = pd.Series('', index=table.index, dtype='object')
+    try:
+        meta_dir = _shared_output_dir("statistics", region_slug)
+        meta_files = sorted(meta_dir.glob("all_interacting_argo_*.parquet"))
+        if meta_files:
+            meta_df = pd.read_parquet(meta_files[-1])
+            required = {'Year', 'Profile_number'}
+            if required.issubset(meta_df.columns):
+                meta_df['_profile'] = pd.to_numeric(meta_df['Profile_number'], errors='coerce')
+                meta_df['_year'] = pd.to_numeric(meta_df['Year'], errors='coerce')
+                # 构建涡旋编号字符串：如 "ACL24906494, CL595940"
+                ds_col = 'ds_name' if 'ds_name' in meta_df.columns else None
+                tid_col = 'track_id' if 'track_id' in meta_df.columns else None
+                if ds_col and tid_col:
+                    meta_df['_eddy_tag'] = meta_df[ds_col].astype(str).str.upper() + meta_df[tid_col].astype(str)
+                elif tid_col:
+                    meta_df['_eddy_tag'] = meta_df[tid_col].astype(str)
+                else:
+                    meta_df['_eddy_tag'] = ''
+                eddy_list = meta_df.groupby(['_year', '_profile'])['_eddy_tag'].apply(lambda x: ', '.join(sorted(set(x)))).reset_index(name='eddy_ids')
+                table['_year_tmp'] = pd.to_numeric(table['Year'], errors='coerce')
+                table['_profile_tmp'] = pd.to_numeric(table['Profile_number'], errors='coerce')
+                merged = table[['_year_tmp', '_profile_tmp']].merge(
+                    eddy_list, left_on=['_year_tmp', '_profile_tmp'],
+                    right_on=['_year', '_profile'], how='left'
+                )
+                table['meta_eddy_list'] = merged['eddy_ids'].fillna('').astype(str)
+                table['meta_inside_eddy'] = table['meta_eddy_list'] != ''
+                table.drop(columns=['_year_tmp', '_profile_tmp'], inplace=True, errors='ignore')
+    except Exception as exc:
+        if verbose:
+            print(f"[INFO] META eddy lookup skipped: {exc}")
 
     for col_name in [
         'Year', 'Month', 'Day', 'Profile_number', 'Platform_number',
@@ -12863,8 +13058,8 @@ def export_hotspot_anomaly_summary_table(
         'trim_score', 'trim_scale_res_rob_aou', 'trim_scale_res_rob_abs_sal',
         'delta_temperature', 'delta_salinity',
         'glorys_k', 'glorys_b', 'glorys_center_lon', 'glorys_center_lat',
-        'n2_projection_depth_m', 'n2_x_window_km', 'n2_z_window_m',
-        'n2_valid_fraction', 'glorys_n2_local', 'glorys_n2_p95',
+        'heave_projection_depth_m', 'heave_x_window_km', 'heave_z_window_m',
+        'heave_valid_fraction', 'glorys_heave_sigma_argo', 'glorys_heave_zmin', 'glorys_heave_oi',
         'surface_do_ref', 'pre_anomaly_do_min', 'pre_anomaly_do_min_depth_m',
         'surface_to_min_do_drop', 'min_to_anomaly_do_recovery',
         'min_to_anomaly_depth_gap_m', 'do_v_shape_score', 'hotspot_type',
@@ -12915,8 +13110,8 @@ def export_hotspot_anomaly_summary_table(
 
                     int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
-                    sci_cols = {'glorys_n2_local', 'glorys_n2_p95', 'n2_threshold'}
-                    fraction_cols = {'n2_valid_fraction'}
+                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_zmin', 'heave_threshold', 'glorys_heave_oi'}
+                    fraction_cols = {'heave_valid_fraction'}
                     one_decimal_cols = {
                         'surface_do_ref',
                         'pre_anomaly_do_min',
@@ -13444,11 +13639,21 @@ def _append_nearshore_do_diagnostics_from_profiles(
 def _assign_hotspot_type(
     table: pd.DataFrame,
     *,
-    n2_threshold: float | None = 2e-5,
-    n2_col: str = 'glorys_n2_p95',
+    heave_z_threshold: float | None = _heave_depth_threshold,
+    heave_z_col: str = 'glorys_heave_zmin',
+    heave_m_threshold: float | None = _heave_magnitude_threshold,
+    heave_m_col: str = 'glorys_heave_m',
     nearshore_col: str = 'nearshore_do_dip',
 ) -> pd.Series:
-    """按近岸 DO 诊断和可选 N2 阈值生成 hotspot_type。"""
+    """按近岸 DO 诊断和 heave 联合判定生成 hotspot_type。
+
+    - Type 1: 非近岸，heave H ≥ heave_m_threshold 且 z_min < heave_z_threshold（等密面显著位移且通风型）
+    - Type 2: 非近岸，不满足 heave 联合判定（深层隔离型）
+    - Type 3: 近岸 DO dip
+
+    阈值默认值来自 processing.yml:processing.heave（运行时可覆盖），
+    若阈值参数为 None 或表中无对应列，则只分 Type 3 / 未分类。
+    """
     nearshore_vals = (
         table[nearshore_col].astype('boolean')
         if nearshore_col in table.columns
@@ -13458,14 +13663,21 @@ def _assign_hotspot_type(
     nearshore_mask = nearshore_vals.fillna(False)
     hotspot_type[nearshore_mask] = 3
 
-    if n2_threshold is None or n2_col not in table.columns:
+    has_z = heave_z_threshold is not None and heave_z_col in table.columns
+    has_m = heave_m_threshold is not None and heave_m_col in table.columns
+    if not has_z or not has_m:
         return hotspot_type
 
-    n2_vals = pd.to_numeric(table[n2_col], errors='coerce')
-    n2_available = n2_vals.notna()
+    z_vals = pd.to_numeric(table[heave_z_col], errors='coerce')
+    m_vals = pd.to_numeric(table[heave_m_col], errors='coerce')
+    z_ok = z_vals.notna()
+    m_ok = m_vals.notna()
     non_nearshore_mask = ~nearshore_mask
-    hotspot_type[non_nearshore_mask & n2_available & (n2_vals >= float(n2_threshold))] = 1
-    hotspot_type[non_nearshore_mask & n2_available & (n2_vals < float(n2_threshold))] = 2
+
+    pass_z = z_vals < float(heave_z_threshold)
+    pass_m = m_vals >= float(heave_m_threshold)
+    hotspot_type[non_nearshore_mask & z_ok & m_ok & pass_z & pass_m] = 1
+    hotspot_type[non_nearshore_mask & z_ok & m_ok & ~(pass_z & pass_m)] = 2
     return hotspot_type
 
 
@@ -13515,7 +13727,7 @@ def _merge_hotspot_glorys_summary_fields(
     anomalies: pd.DataFrame,
     glorys_summary: pd.DataFrame,
 ) -> pd.DataFrame:
-    """将 GLORYS overview summary parquet 中的 N2/状态字段合并到 hotspot anomalies。"""
+    """将 GLORYS overview summary parquet 中的 OI/状态字段合并到 hotspot anomalies。"""
     out = anomalies.copy()
     if out.empty or glorys_summary is None or glorys_summary.empty:
         return out
@@ -13530,13 +13742,14 @@ def _merge_hotspot_glorys_summary_fields(
         ('glorys_b', 'b'),
         ('glorys_center_lon', 'center_lon'),
         ('glorys_center_lat', 'center_lat'),
-        ('n2_projection_depth_m', 'projection_depth_m'),
-        ('n2_x_window_km', 'n2_x_window_km'),
-        ('n2_z_window_m', 'n2_z_window_m'),
-        ('n2_valid_fraction', 'n2_valid_fraction'),
-        ('glorys_n2_local', 'glorys_n2_local'),
-        ('glorys_n2_p95', 'glorys_n2_p95'),
-        ('n2_error', 'n2_error'),
+        ('heave_projection_depth_m', 'projection_depth_m'),
+        ('heave_x_window_km', 'heave_x_window_km'),
+        ('heave_z_window_m', 'heave_z_window_m'),
+        ('heave_valid_fraction', 'heave_valid_fraction'),
+        ('glorys_heave_sigma_argo', 'glorys_heave_sigma_argo'),
+        ('glorys_heave_zmin', 'glorys_heave_zmin'),
+        ('glorys_heave_oi', 'glorys_heave_oi'),
+        ('heave_error', 'heave_error'),
     ]
     for out_col, _ in glorys_cols:
         if out_col not in out.columns:
@@ -13621,10 +13834,10 @@ def _hotspot_anomaly_output_columns() -> list[str]:
         'min_to_anomaly_depth_gap_m',
         'do_v_shape_score',
         'nearshore_do_dip',
-        'n2_valid_fraction',
-        'glorys_n2_local',
-        'glorys_n2_p95',
-        'n2_error',
+        'heave_valid_fraction',
+        'glorys_heave_sigma_argo',
+        'glorys_heave_zmin',
+        'heave_error',
         'hotspot_type',
         'detection_method',
     ]
@@ -13693,7 +13906,8 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     anomalies_year['hotspot_type'] = _assign_hotspot_type(
         anomalies_year,
-        n2_threshold=None,
+        heave_z_threshold=None,
+        heave_m_threshold=None,
     )
     needed_cols = [
         c for c in _hotspot_anomaly_output_columns()
