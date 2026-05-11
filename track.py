@@ -6176,7 +6176,7 @@ def plot_argo_horizontal_glorys(
         )
         save_dir.mkdir(parents=True, exist_ok=True)
         fname = (
-            f"Argo_{needed_date.strftime('%Y%m%d')}_profile{int(profile_number)}_"
+            f"Argo_{needed_date.strftime('%Y%m%d')}_P{int(profile_number)}_"
             f"{float(glorys_depth_filtered[0]):.2f}m_{variable}_{run_tag}.png"
         )
         save_path = save_dir / fname
@@ -9262,7 +9262,7 @@ def plot_argo_vertical_glorys_overview(
         b_list=b_list,
         vertical_vars=vertical_vars,
         target_date=target_date,
-        subject_label=f"P{int(profile_number)}",
+        subject_label=f"Profile {int(profile_number)}",
         save_name_prefix=f"Argo_{{date}}_P{int(profile_number)}",
         save_subdir='plot_argo_vertical_glorys_overview',
         xmin=xmin,
@@ -12079,7 +12079,7 @@ def _plot_hotspot_vertical_profile_from_record(
             output_dir.mkdir(parents=True, exist_ok=True)
             file_date = date_text.replace('-', '')
             platform_suffix = f"_platform{platform_val}" if platform_val is not None else ""
-            save_path = output_dir / f"hotspot_profile_{file_date}_profile{profile_num}{platform_suffix}_{run_tag}.png"
+            save_path = output_dir / f"hotspot_{file_date}_P{profile_num}{platform_suffix}_{run_tag}.png"
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             result['save_path'] = str(save_path)
 
@@ -12431,25 +12431,32 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             'target_date': target_date.strftime('%Y-%m-%d'),
         })
 
-        plot_argo_horizontal_glorys(
-            profile_number=profile_num,
-            profile_time=target_date,
-            platform_number=platform_val,
-            variable=args.get('horizontal_variable', 'vorticity'),
-            show_fig=bool(args.get('show_fig', False)),
-            save_fig=bool(args.get('save_fig', True)),
-            k=k_val,
-            b=b_val,
-            needed_depth=args.get('needed_depth', 0),
-            inline_mode=bool(args.get('inline_mode', True)),
-            xmin=args.get('xmin', -400.0),
-            xmax=args.get('xmax', 400.0),
-            argo_detection_config=cfg,
-            argo_min_depth=args.get('argo_min_depth'),
-            argo_data_dir=args.get('argo_data_dir'),
-            output_dir=args.get('horizontal_output_dir'),
-            verbose=bool(args.get('verbose', False)),
-        )
+        horiz_var = args.get('horizontal_variable', 'vorticity')
+        horiz_depths = [0.0]  # always sea surface
+        if bool(args.get('horizontal_argo_depth', False)):
+            argo_d = args.get('heave_projection_depth_m')
+            if argo_d is not None and np.isfinite(float(argo_d)) and float(argo_d) > 0:
+                horiz_depths.append(float(argo_d))
+        for hd in horiz_depths:
+            plot_argo_horizontal_glorys(
+                profile_number=profile_num,
+                profile_time=target_date,
+                platform_number=platform_val,
+                variable=horiz_var,
+                show_fig=bool(args.get('show_fig', False)),
+                save_fig=bool(args.get('save_fig', True)),
+                k=k_val,
+                b=b_val,
+                needed_depth=float(hd),
+                inline_mode=bool(args.get('inline_mode', True)),
+                xmin=args.get('xmin', -400.0),
+                xmax=args.get('xmax', 400.0),
+                argo_detection_config=cfg,
+                argo_min_depth=args.get('argo_min_depth'),
+                argo_data_dir=args.get('argo_data_dir'),
+                output_dir=args.get('horizontal_output_dir'),
+                verbose=bool(args.get('verbose', False)),
+            )
         record['horizontal_status'] = 'ok'
 
         vertical_results = plot_argo_vertical_glorys_overview(
@@ -12532,6 +12539,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     detection_config: DetectionConfig | None = None,
     *,
     horizontal_variable: str = 'vorticity',
+    horizontal_argo_depth: bool = False,
     vertical_variables: list[str] | None = None,
     needed_depth: float | int = 0,
     xmin: float = -400.0,
@@ -12588,6 +12596,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
         detection_config: 异常识别配置；同时用于水平图异常点与垂向图投影点筛选。
         horizontal_variable: 水平 GLORYS 背景变量，默认 'vorticity'。
+        horizontal_argo_depth: 是否额外绘制 Argo 异常深度的水平图，默认 False（仅海表）。
         vertical_variables: 垂向总览变量；None 时使用 overview 默认 ['vorticity','sigma','thetao','salinity']。
         needed_depth: 水平图读取深度，默认 0 m。
         xmin/xmax/ymin/ymax: 垂向图（z 坐标）显示范围；xmin/xmax 也决定 Argo-centered GLORYS 读取窗口。
@@ -12792,6 +12801,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'detection_config': cfg,
             'region_config_key': region_config_key,
             'horizontal_variable': horizontal_variable,
+            'horizontal_argo_depth': horizontal_argo_depth,
             'vertical_variables': vertical_variables,
             'needed_depth': needed_depth,
             'xmin': xmin,
@@ -13864,7 +13874,7 @@ def plot_single_hotspot_profile(
         run_tag = cfg.file_stem()
         platform_suffix = f"_platform{platform_label}" if platform_label is not None else ""
         filename = (
-            f"hotspot_profile_{date_text.replace('-', '')}_profile{int(profile_number)}"
+            f"hotspot_{date_text.replace('-', '')}_P{int(profile_number)}"
             f"{platform_suffix}_{run_tag}_single.png"
         )
         saved_path = output_dir / filename
