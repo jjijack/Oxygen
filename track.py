@@ -32,6 +32,7 @@ from dask import delayed, compute
 from dask.diagnostics import ProgressBar
 from tqdm.auto import tqdm
 import yaml
+import traceback
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
 import zarr
@@ -5568,10 +5569,12 @@ def get_vertical_glorys_from_center(
         'v': 'v', 'vo': 'v',
         'ssh': 'ssh', 'zos': 'ssh',
         'mlt': 'mlt', 'mlotst': 'mlt',
-        'vorticity': 'vorticity'
+        'vorticity': 'vorticity',
+        'pv': 'pv',
     }
     var_dims = {
         'thetao': 3, 'salinity': 3, 'sigma': 3, 'u': 3, 'v': 3, 'vorticity': 3,
+        'pv': 3,
         'ssh': 2, 'mlt': 2
     }
 
@@ -5580,6 +5583,8 @@ def get_vertical_glorys_from_center(
         standard_name = alias_map.get(var, var)
         if standard_name == 'vorticity':
             raw_vars_to_fetch.update(['u', 'v'])
+        elif standard_name == 'pv':
+            raw_vars_to_fetch.update(['u', 'v', 'salinity', 'thetao'])
         elif standard_name == 'sigma':
             raw_vars_to_fetch.update(['salinity', 'thetao'])
         else:
@@ -5614,7 +5619,7 @@ def get_vertical_glorys_from_center(
     contour_lat = np.asarray(float(center_lat) + lat_radius_deg * np.sin(theta), dtype=float)
 
     sigma_3d_cache = None
-    if any(alias_map.get(v, v) == 'sigma' for v in variables):
+    if any(alias_map.get(v, v) in ('sigma', 'pv') for v in variables):
         sal_3d = glorys_data_raw.get('salinity')
         theta_3d = glorys_data_raw.get('thetao')
         if sal_3d is not None and theta_3d is not None:
@@ -5814,6 +5819,21 @@ def get_vertical_glorys_from_center(
                     glorys_variable_3d = zeta_3d / f_3d
             elif standard_name == 'sigma':
                 glorys_variable_3d = sigma_3d_cache
+            elif standard_name == 'pv':
+                u = glorys_data_raw.get('u')
+                v = glorys_data_raw.get('v')
+                if (u is not None and v is not None and u.size > 0 and v.size > 0
+                        and sigma_3d_cache is not None):
+                    if u.ndim == 2:
+                        u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
+                    zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
+                    z3 = glorys_depth_raw[:, np.newaxis, np.newaxis]
+                    dz = np.gradient(z3, axis=0)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        dsigma_dz = np.gradient(sigma_3d_cache, axis=0) / np.where(dz != 0, dz, np.nan)
+                    N2 = (9.81 / 1025.0) * dsigma_dz
+                    N2 = np.maximum(N2, 0.0)  # clip convective instability (N² < 0)
+                    glorys_variable_3d = (f_3d + zeta_3d) * N2 / 9.81
             else:
                 glorys_variable_3d = glorys_data_raw.get(standard_name)
 
@@ -6594,10 +6614,12 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         'v': 'v', 'vo': 'v',
         'ssh': 'ssh', 'zos': 'ssh',
         'mlt': 'mlt', 'mlotst': 'mlt',
-        'vorticity': 'vorticity'
+        'vorticity': 'vorticity',
+        'pv': 'pv',
     }
     var_dims = {
         'thetao': 3, 'salinity': 3, 'sigma': 3, 'u': 3, 'v': 3, 'vorticity': 3,
+        'pv': 3,
         'ssh': 2, 'mlt': 2
     }
 
@@ -6606,6 +6628,8 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         standard_name = alias_map.get(var, var)
         if standard_name == 'vorticity':
             raw_vars_to_fetch.update(['u', 'v'])
+        elif standard_name == 'pv':
+            raw_vars_to_fetch.update(['u', 'v', 'salinity', 'thetao'])
         elif standard_name == 'sigma':
             raw_vars_to_fetch.update(['salinity', 'thetao'])
         else:
@@ -6745,7 +6769,7 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
         return [{} for _ in k_list]
 
     sigma_3d_cache = None
-    if any(alias_map.get(v, v) == 'sigma' for v in variables):
+    if any(alias_map.get(v, v) in ('sigma', 'pv') for v in variables):
         sal_3d = glorys_data_raw.get('salinity')
         theta_3d = glorys_data_raw.get('thetao')
         if sal_3d is not None and theta_3d is not None:
@@ -6942,6 +6966,21 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
                     glorys_variable_3d = zeta_3d / f_3d
             elif standard_name == 'sigma':
                 glorys_variable_3d = sigma_3d_cache
+            elif standard_name == 'pv':
+                u = glorys_data_raw.get('u')
+                v = glorys_data_raw.get('v')
+                if (u is not None and v is not None and u.size > 0 and v.size > 0
+                        and sigma_3d_cache is not None):
+                    if u.ndim == 2:
+                        u, v = u[np.newaxis, :, :], v[np.newaxis, :, :]
+                    zeta_3d, f_3d = calculate_vorticity(glorys_lon_raw, glorys_lat_raw, u, v)
+                    z3 = glorys_depth_raw[:, np.newaxis, np.newaxis]
+                    dz = np.gradient(z3, axis=0)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        dsigma_dz = np.gradient(sigma_3d_cache, axis=0) / np.where(dz != 0, dz, np.nan)
+                    N2 = (9.81 / 1025.0) * dsigma_dz
+                    N2 = np.maximum(N2, 0.0)  # clip convective instability (N² < 0)
+                    glorys_variable_3d = (f_3d + zeta_3d) * N2 / 9.81
             else:
                 glorys_variable_3d = glorys_data_raw.get(standard_name)
 
@@ -7061,6 +7100,63 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
 
     # --- 5. 返回所有剖面的结果列表 ---
     return all_profiles_data
+
+
+def _draw_isolines(
+    ax,
+    Y_mesh: np.ndarray,
+    Z_mesh: np.ndarray,
+    data_filled: np.ndarray,
+    clim: tuple[float, float] | None,
+    *,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    clabel_fontsize: int = 9,
+    clabel_fmt: str = '%.3g',
+) -> None:
+    """在色斑图上叠加等值线，等值线级别自动适应数据范围。"""
+    finite_vals = data_filled[np.isfinite(data_filled)]
+    if finite_vals.size == 0:
+        return
+
+    levels_to_use = None
+    if isoline_levels is None:
+        lo = float(np.nanmin(finite_vals))
+        hi = float(np.nanmax(finite_vals))
+        if clim is not None:
+            lo = max(lo, clim[0])
+            hi = min(hi, clim[1])
+        if hi > lo:
+            levels_to_use = np.linspace(lo, hi, 9)
+    elif isinstance(isoline_levels, (int, np.integer)):
+        n_levels = int(isoline_levels)
+        if clim is not None and n_levels >= 2:
+            levels_to_use = np.linspace(clim[0], clim[1], n_levels)
+    else:
+        levels_to_use = np.asarray(isoline_levels, dtype=float)
+
+    if levels_to_use is None:
+        return
+    levels_to_use = np.asarray(levels_to_use, dtype=float)
+    levels_to_use = levels_to_use[np.isfinite(levels_to_use)]
+    levels_to_use = np.unique(levels_to_use)
+    if levels_to_use.size < 2:
+        return
+
+    cs = ax.contour(
+        Y_mesh, Z_mesh, data_filled,
+        levels=levels_to_use,
+        colors=isoline_color,
+        linewidths=float(isoline_linewidth),
+        alpha=float(isoline_alpha),
+        zorder=5,
+    )
+    if label_isolines:
+        ax.clabel(cs, inline=True, fontsize=clabel_fontsize, fmt=clabel_fmt)
+
 
 def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, needed_date: str | pd.Timestamp,
                      k: float | list[float], b: float | list[float],
@@ -7351,40 +7447,18 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
         ax.set_ylabel('Depth (m)', fontsize=18)
         ax.tick_params(labelsize=14)
         
-        pc = ax.pcolormesh(Y_mesh, Z_mesh, profile_variable_2d, cmap=cmap, shading='auto', vmin=clim[0], vmax=clim[1])
+        v_field_filled = np.ma.filled(np.ma.array(profile_variable_2d, copy=False), np.nan)
+        pc = ax.pcolormesh(Y_mesh, Z_mesh, v_field_filled, cmap=cmap, shading='auto', vmin=clim[0], vmax=clim[1])
 
         if plot_isolines:
-            prof_filled = np.ma.filled(np.ma.array(profile_variable_2d, copy=False), np.nan)
-            finite_vals = prof_filled[np.isfinite(prof_filled)]
-            if finite_vals.size > 0:
-                levels_to_use = None
-                if isoline_levels is None:
-                    levels_to_use = np.linspace(clim[0], clim[1], 9)
-                elif isinstance(isoline_levels, (int, np.integer)):
-                    n_levels = int(isoline_levels)
-                    if n_levels >= 2:
-                        levels_to_use = np.linspace(clim[0], clim[1], n_levels)
-                else:
-                    levels_to_use = np.asarray(isoline_levels, dtype=float)
-
-                if levels_to_use is not None:
-                    levels_to_use = np.asarray(levels_to_use, dtype=float)
-                    levels_to_use = levels_to_use[np.isfinite(levels_to_use)]
-                    levels_to_use = np.unique(levels_to_use)
-
-                if levels_to_use is not None and levels_to_use.size >= 2:
-                    contour_set = ax.contour(
-                        Y_mesh,
-                        Z_mesh,
-                        prof_filled,
-                        levels=levels_to_use,
-                        colors=isoline_color,
-                        linewidths=float(isoline_linewidth),
-                        alpha=float(isoline_alpha),
-                        zorder=5,
-                    )
-                    if label_isolines:
-                        ax.clabel(contour_set, inline=True, fontsize=10, fmt='%.2g')
+            _draw_isolines(ax, Y_mesh, Z_mesh, v_field_filled, clim,
+                           isoline_levels=isoline_levels,
+                           isoline_color=isoline_color,
+                           isoline_linewidth=isoline_linewidth,
+                           isoline_alpha=isoline_alpha,
+                           label_isolines=label_isolines,
+                           clabel_fontsize=10,
+                           clabel_fmt='%.2g')
 
         cbar = fig.colorbar(pc, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
         cbar.set_label(cbar_label, fontsize=18)
@@ -7848,11 +7922,14 @@ def _overview_var_style(var_key: str) -> tuple[str, str, str, tuple[float, float
     """返回变量的标题、色标标签、配色和固定色标范围。
 
     所有变量均使用固定色标范围，以确保跨图颜色可比：
+    - pv:        (-5e-9, 5e-9) QG PV (m⁻¹s⁻¹)
     - vorticity: (-0.7, 0.7) ζ/f
     - thetao:    (1, 27) °C
     - sigma:     (23, 28) kg/m³
     - salinity:  (33, 36) psu
     """
+    if var_key == 'pv':
+        return ('QG PV', 'QG PV (m⁻¹s⁻¹)', 'RdBu_r', (-5e-9, 5e-9))
     if var_key == 'vorticity':
         return ('Vorticity', r'$\zeta/f$', 'seismic', (-0.7, 0.7))
     if var_key == 'thetao':
@@ -7861,6 +7938,8 @@ def _overview_var_style(var_key: str) -> tuple[str, str, str, tuple[float, float
         return ('Density', 'Potential Density Anomaly (kg/m³)', 'RdBu_r', (23.0, 28.0))
     if var_key == 'salinity':
         return ('Salinity', 'Salinity (psu)', 'viridis', (33.0, 36.0))
+    if var_key == 'z_of_sigma':
+        return ('Isopycnal Depth', 'Depth (m)', 'terrain', None)
     return (var_key, var_key, 'viridis', None)
 
 
@@ -7961,6 +8040,55 @@ def _project_argo_rows_to_profile_for_overview(
     })
     out = out[np.isfinite(out['proj_y']) & np.isfinite(out['Depth'])].copy()
     return out
+
+
+def _project_argo_rows_to_sigma_for_overview(
+    z_package: dict,
+    projected_argo_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """将 z 坐标 Argo 投影点转换到 σ 坐标，用于在 σ 坐标 overview 上叠加。
+
+    在每个 Argo 点的投影位置，从 GLORYS sigma 场中插值出对应深度的 σ₀，
+    返回 ``(proj_y, sigma, DO, marker_size)`` 格式的 DataFrame。
+    """
+    if projected_argo_rows is None or projected_argo_rows.empty:
+        return pd.DataFrame()
+
+    profile_data = z_package.get('profile_data', {})
+    sigma_2d = profile_data.get('sigma')
+    z_coords = np.asarray(z_package.get('z_coords', []), dtype=float)
+    y_coords = np.asarray(z_package.get('y_coords', []), dtype=float)
+
+    if sigma_2d is None or z_coords.size < 2 or y_coords.size < 2:
+        return pd.DataFrame()
+
+    sigma_ma = np.ma.array(sigma_2d, copy=False)
+
+    rows = projected_argo_rows.copy()
+    proj_y = rows['proj_y'].to_numpy(dtype=float)
+    depths = rows['Depth'].to_numpy(dtype=float)
+    do_vals = rows['DO'].to_numpy(dtype=float)
+    marker_sizes = rows['marker_size'].to_numpy(dtype=float)
+
+    sigma_at_argo = np.full(len(rows), np.nan)
+
+    for i, (y_i, depth_i) in enumerate(zip(proj_y, depths)):
+        # 找到最近的 y 索引
+        j = int(np.argmin(np.abs(y_coords - y_i)))
+        sigma_col = np.asarray(np.ma.filled(sigma_ma[:, j], np.nan), dtype=float)
+        valid = np.isfinite(sigma_col)
+        if valid.sum() < 2:
+            continue
+        sigma_at_argo[i] = np.interp(depth_i, z_coords[valid], sigma_col[valid],
+                                     left=np.nan, right=np.nan)
+
+    out = pd.DataFrame({
+        'proj_y': proj_y,
+        'sigma': sigma_at_argo,
+        'DO': do_vals,
+        'marker_size': marker_sizes,
+    })
+    return out[np.isfinite(out['proj_y']) & np.isfinite(out['sigma'])].copy()
 
 
 def _prepare_overview_projection_rows(
@@ -8092,6 +8220,7 @@ def calculate_glorys_vertical_profile_diagnostics(
             - ``glorys_heave_m`` (float): Heave 幅度 (m)，等密线在局地凹底到窗口最浅点的垂直距离
             - ``glorys_heave_zmin`` (float): 窗口内等密线最小深度 z_min (m)
             - ``glorys_heave_sigma_argo`` (float): Argo 异常点的 σ (kg/m³)
+            - ``glorys_heave_sigma_peak`` (float): Heave 峰值所在 σ 面 (kg/m³)
             - ``heave_valid_fraction`` (float): 局地窗口内 σ 有效数据占比
     """
     try:
@@ -8120,6 +8249,7 @@ def calculate_glorys_vertical_profile_diagnostics(
         'glorys_heave_zmin': np.nan,
         'glorys_heave_m': np.nan,
         'glorys_heave_sigma_argo': np.nan,
+        'glorys_heave_sigma_peak': np.nan,
         'heave_error': None,
     }
 
@@ -8235,6 +8365,7 @@ def calculate_glorys_vertical_profile_diagnostics(
         local_x_mask[np.nanargmin(np.abs(y_use - x0))] = True
 
     max_heave = 0.0
+    max_heave_sigma = np.nan
     min_depth_overall = np.nan
 
     for sigma_i in sigma_levels:
@@ -8267,8 +8398,10 @@ def calculate_glorys_vertical_profile_diagnostics(
             heave_i = float(local_z_max_i - min_z_i)
             if heave_i > max_heave:
                 max_heave = heave_i
+                max_heave_sigma = sigma_i
 
     out['glorys_heave_m'] = float(max_heave) if max_heave > 0 else np.nan
+    out['glorys_heave_sigma_peak'] = float(max_heave_sigma) if np.isfinite(max_heave_sigma) else np.nan
     out['glorys_heave_zmin'] = min_depth_overall if np.isfinite(min_depth_overall) else np.nan
 
     # 联合判定：Heave > 阈值 AND z_min < 深度阈值 → Type 1
@@ -8277,6 +8410,106 @@ def calculate_glorys_vertical_profile_diagnostics(
         out['glorys_heave_oi'] = True
 
     return out
+
+
+def _remap_vertical_package_to_sigma(
+    vertical_package: dict,
+    sigma_min: float = 23.0,
+    sigma_max: float = 28.0,
+    sigma_step: float = 0.05,
+) -> dict:
+    """将 z 坐标 vertical_package 的 3D 变量重映射到 σ 坐标。
+
+    对每个水平列，从混合层底以下的稳定层化区提取 σ 单调段，
+    再插值到目标 σ 级别上。返回与 z 坐标包结构相同的字典，
+    其中 ``z_coords`` 变为 σ 级别，``profile_data`` 新增 ``z_of_sigma``。
+    """
+    profile_data = vertical_package.get('profile_data', {})
+    z_coords = np.asarray(vertical_package.get('z_coords', []), dtype=float)
+    y_coords = np.asarray(vertical_package.get('y_coords', []), dtype=float)
+
+    sigma_2d = profile_data.get('sigma')
+    if sigma_2d is None:
+        raise ValueError("vertical_package 中缺少 'sigma' 变量，无法重映射到 σ 坐标")
+
+    sigma_ma = np.ma.array(sigma_2d, copy=False)
+    nz, ny = sigma_ma.shape
+    if nz != len(z_coords) or ny != len(y_coords):
+        raise ValueError("sigma 维度与 z_coords / y_coords 不匹配")
+
+    sigma_targets = np.arange(sigma_min, sigma_max + sigma_step * 0.5, sigma_step)
+
+    # 收集需要重映射的 3D 变量（排除 sigma 和 2D 变量如 mlt）
+    vars_3d = {}
+    for key, val in profile_data.items():
+        if key == 'sigma':
+            continue
+        val_arr = np.ma.array(val, copy=False)
+        if val_arr.ndim == 2 and val_arr.shape[0] == nz and val_arr.shape[1] == ny:
+            vars_3d[key] = val_arr
+
+    out_profile_data: dict[str, np.ma.MaskedArray] = {}
+    for key in vars_3d:
+        out_profile_data[key] = np.ma.masked_all((len(sigma_targets), ny), dtype=float)
+    z_of_sigma = np.ma.masked_all((len(sigma_targets), ny), dtype=float)
+
+    for j in range(ny):
+        sigma_col = sigma_ma[:, j]
+        valid = ~sigma_col.mask if np.ma.is_masked(sigma_col) else np.ones(nz, dtype=bool)
+        if valid.sum() < 2:
+            continue
+
+        z_valid = z_coords[valid]
+        sigma_valid = np.asarray(sigma_col[valid], dtype=float)
+
+        # 找到稳定层化起点: dσ/dz > threshold
+        dsigma_dz = np.gradient(sigma_valid, z_valid)
+        strat_start = 0
+        for idx in range(len(dsigma_dz)):
+            if dsigma_dz[idx] > 0.001:
+                strat_start = idx
+                break
+
+        z_strat = z_valid[strat_start:]
+        sigma_strat = sigma_valid[strat_start:]
+        if len(sigma_strat) < 2:
+            continue
+
+        # 确保严格单调递增: 去除 dσ <= 0 的扰动点
+        mono_mask = np.ones(len(sigma_strat), dtype=bool)
+        for idx in range(1, len(sigma_strat)):
+            if sigma_strat[idx] <= sigma_strat[idx - 1]:
+                mono_mask[idx] = False
+        z_mono = z_strat[mono_mask]
+        sigma_mono = sigma_strat[mono_mask]
+        if len(sigma_mono) < 2:
+            continue
+
+        # 裁剪到目标 σ 范围内
+        z_mono_interp = np.interp(sigma_targets, sigma_mono, z_mono,
+                                  left=np.nan, right=np.nan)
+        z_of_sigma[:, j] = np.ma.masked_invalid(z_mono_interp)
+
+        for key, var_arr in vars_3d.items():
+            var_col = var_arr[:, j]
+            var_valid = np.asarray(var_col[valid][strat_start:][mono_mask], dtype=float)
+            var_interp = np.interp(sigma_targets, sigma_mono, var_valid,
+                                   left=np.nan, right=np.nan)
+            out_profile_data[key][:, j] = np.ma.masked_invalid(var_interp)
+
+    # 将 z_of_sigma 加入导出变量
+    out_profile_data['z_of_sigma'] = z_of_sigma
+
+    return {
+        'profile_data': out_profile_data,
+        'y_coords': y_coords.copy(),
+        'z_coords': sigma_targets.copy(),
+        'lon_coords': np.asarray(vertical_package.get('lon_coords', []), dtype=float).copy(),
+        'lat_coords': np.asarray(vertical_package.get('lat_coords', []), dtype=float).copy(),
+        'projections': copy.deepcopy(vertical_package.get('projections', {})),
+        'metadata': copy.deepcopy(vertical_package.get('metadata', {})),
+        'is_sigma_coords': True,
+    }
 
 
 def _plot_glorys_overview_vertical_2x2(
@@ -8338,40 +8571,16 @@ def _plot_glorys_overview_vertical_2x2(
 
         Y_mesh, Z_mesh = np.meshgrid(y_plot, z_plot)
         v_clim = fixed_clim if fixed_clim is not None else _auto_clim(v_field)
-        pc = ax.pcolormesh(Y_mesh, Z_mesh, v_field, cmap=cmap_name, shading='auto', vmin=v_clim[0], vmax=v_clim[1])
+        v_field_filled = np.ma.filled(np.ma.array(v_field, copy=False), np.nan)
+        pc = ax.pcolormesh(Y_mesh, Z_mesh, v_field_filled, cmap=cmap_name, shading='auto', vmin=v_clim[0], vmax=v_clim[1])
 
         if plot_isolines:
-            prof_filled = np.ma.filled(np.ma.array(v_field, copy=False), np.nan)
-            finite_vals = prof_filled[np.isfinite(prof_filled)]
-            if finite_vals.size > 0:
-                levels_to_use = None
-                if isoline_levels is None:
-                    levels_to_use = np.linspace(v_clim[0], v_clim[1], 9)
-                elif isinstance(isoline_levels, (int, np.integer)):
-                    n_levels = int(isoline_levels)
-                    if n_levels >= 2:
-                        levels_to_use = np.linspace(v_clim[0], v_clim[1], n_levels)
-                else:
-                    levels_to_use = np.asarray(isoline_levels, dtype=float)
-
-                if levels_to_use is not None:
-                    levels_to_use = np.asarray(levels_to_use, dtype=float)
-                    levels_to_use = levels_to_use[np.isfinite(levels_to_use)]
-                    levels_to_use = np.unique(levels_to_use)
-
-                if levels_to_use is not None and levels_to_use.size >= 2:
-                    contour_set = ax.contour(
-                        Y_mesh,
-                        Z_mesh,
-                        prof_filled,
-                        levels=levels_to_use,
-                        colors=isoline_color,
-                        linewidths=float(isoline_linewidth),
-                        alpha=float(isoline_alpha),
-                        zorder=5,
-                    )
-                    if label_isolines:
-                        ax.clabel(contour_set, inline=True, fontsize=9, fmt='%.3g')
+            _draw_isolines(ax, Y_mesh, Z_mesh, v_field_filled, v_clim,
+                           isoline_levels=isoline_levels,
+                           isoline_color=isoline_color,
+                           isoline_linewidth=isoline_linewidth,
+                           isoline_alpha=isoline_alpha,
+                           label_isolines=label_isolines)
 
         if draw_reference_lines:
             ax.axvline(0.0, color='black', linestyle='--', linewidth=1.6, label='Center Projection' if i == 0 else None)
@@ -8452,6 +8661,145 @@ def _plot_glorys_overview_vertical_2x2(
     return fig
 
 
+def _plot_glorys_overview_vertical_2x2_sigma(
+    *,
+    vertical_package: dict,
+    k_val: float,
+    b_val: float,
+    subject_label: str,
+    date_label: str,
+    xmin: float | None = None,
+    xmax: float | None = None,
+    ymin: float = 23.0,
+    ymax: float = 28.0,
+    projected_argo_profile: pd.DataFrame | None = None,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    title_extra: str = '',
+):
+    """绘制 σ 坐标的 2x2 垂向总览图：PV / Z(σ) / θ / S。
+
+    y 轴为 σ₀ (kg/m³)，向下增大以对应海洋密度结构。
+    ``plot_isolines`` 控制各面板自身变量的等值线叠加，
+    其中 Z(σ) 面板天然为等深度线。
+    """
+    sigma_vars = ['pv', 'z_of_sigma', 'thetao', 'salinity']
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    axes_flat = axes.ravel()
+
+    y_coords = np.asarray(vertical_package.get('y_coords', []), dtype=float)
+    sigma_coords = np.asarray(vertical_package.get('z_coords', []), dtype=float)
+    projections = vertical_package.get('projections', {})
+    metadata = vertical_package.get('metadata', {})
+    draw_reference_lines = bool(metadata.get('draw_reference_lines', True))
+
+    for i, var_key in enumerate(sigma_vars):
+        ax = axes_flat[i]
+        title_txt, cbar_label, cmap_name, fixed_clim = _overview_var_style(var_key)
+
+        v_field = np.ma.array(
+            vertical_package.get('profile_data', {}).get(var_key), copy=False,
+        )
+        if v_field.ndim != 2 or y_coords.size < 2 or sigma_coords.size < 2:
+            ax.text(0.5, 0.5, f"No valid {title_txt}", ha='center', va='center',
+                    transform=ax.transAxes)
+            ax.set_title(f"{title_txt} ($\\sigma$ coord)")
+            continue
+
+        ns = min(v_field.shape[0], len(sigma_coords))
+        ny = min(v_field.shape[1], len(y_coords))
+        v_field = v_field[:ns, :ny]
+        s_plot = sigma_coords[:ns]
+        y_plot = y_coords[:ny]
+
+        Y_mesh, S_mesh = np.meshgrid(y_plot, s_plot)
+        v_clim = fixed_clim if fixed_clim is not None else _auto_clim(v_field)
+        v_field_filled = np.ma.filled(np.ma.array(v_field, copy=False), np.nan)
+        pc = ax.pcolormesh(Y_mesh, S_mesh, v_field_filled, cmap=cmap_name, shading='auto',
+                           vmin=v_clim[0], vmax=v_clim[1])
+
+        if plot_isolines:
+            _draw_isolines(ax, Y_mesh, S_mesh, v_field_filled, v_clim,
+                           isoline_levels=isoline_levels,
+                           isoline_color=isoline_color,
+                           isoline_linewidth=isoline_linewidth,
+                           isoline_alpha=isoline_alpha,
+                           label_isolines=label_isolines)
+
+        if draw_reference_lines:
+            ax.axvline(0.0, color='black', linestyle='--', linewidth=1.6,
+                       label='Center Projection' if i == 0 else None)
+            for j, dist in enumerate(projections.get('radius', [])):
+                ax.axvline(dist, color='r', linestyle='--', linewidth=1.2,
+                           label='Radius Projection' if (i == 0 and j == 0) else None)
+            for j, dist in enumerate(projections.get('contour', [])):
+                ax.axvline(dist, color='tab:blue', linestyle=':', linewidth=1.2,
+                           label='Contour Projection' if (i == 0 and j == 0) else None)
+
+        if (projected_argo_profile is not None and not projected_argo_profile.empty
+                and 'sigma' in projected_argo_profile.columns):
+            valid_pts = (
+                np.isfinite(projected_argo_profile['proj_y'].to_numpy(dtype=float))
+                & np.isfinite(projected_argo_profile['sigma'].to_numpy(dtype=float))
+            )
+            if np.any(valid_pts):
+                do_vals = projected_argo_profile['DO'].to_numpy(dtype=float)
+                if np.isfinite(do_vals[valid_pts]).any():
+                    ax.scatter(
+                        projected_argo_profile['proj_y'].to_numpy(dtype=float)[valid_pts],
+                        projected_argo_profile['sigma'].to_numpy(dtype=float)[valid_pts],
+                        c=do_vals[valid_pts],
+                        cmap='bwr',
+                        vmin=150,
+                        vmax=240,
+                        s=projected_argo_profile['marker_size'].to_numpy(dtype=float)[valid_pts],
+                        edgecolors='black',
+                        linewidths=0.35,
+                        alpha=0.9,
+                        zorder=6,
+                        label='Projected Argo' if i == 0 else None,
+                    )
+                else:
+                    ax.scatter(
+                        projected_argo_profile['proj_y'].to_numpy(dtype=float)[valid_pts],
+                        projected_argo_profile['sigma'].to_numpy(dtype=float)[valid_pts],
+                        color='blue',
+                        s=projected_argo_profile['marker_size'].to_numpy(dtype=float)[valid_pts],
+                        edgecolors='black',
+                        linewidths=0.35,
+                        alpha=0.9,
+                        zorder=6,
+                        label='Projected Argo' if i == 0 else None,
+                    )
+
+        ax.set_ylim(float(ymax), float(ymin))
+        if xmin is not None and xmax is not None:
+            ax.set_xlim(float(xmin), float(xmax))
+
+        ax.set_title(f"{title_txt} ($\\sigma$ coord)", fontsize=12)
+        ax.set_xlabel('Distance (km)')
+        ax.set_ylabel(r'$\sigma_0$ (kg/m$^3$)')
+        cbar = fig.colorbar(pc, ax=ax, orientation='vertical', fraction=0.045, pad=0.02)
+        cbar.set_label(cbar_label, fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+        if i == 0 and draw_reference_lines:
+            ax.legend(fontsize=9, loc='best')
+
+    extra_text = f", {title_extra}" if title_extra else ""
+    fig.suptitle(
+        f"{subject_label} GLORYS $\\sigma$ PV Overview on {date_label}, "
+        f"y={k_val:.2f}x{b_val:+.2f}{extra_text}",
+        fontsize=16,
+        y=1.02,
+    )
+    return fig
+
+
 def _run_vertical_overview_batch(
     *,
     vertical_packages: list[dict],
@@ -8487,8 +8835,17 @@ def _run_vertical_overview_batch(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     annotate_heave: bool = False,
+    z_overview: bool = True,
+    sigma_overview: bool = False,
+    sigma_ymin: float = 23.0,
+    sigma_ymax: float = 28.0,
 ) -> list[dict]:
-    """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。"""
+    """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。
+
+    ``z_overview=True`` 绘制 z 坐标 2x2 总览图，
+    ``sigma_overview=True`` 绘制 σ 坐标 2x2 总览图（PV / Z(σ) / θ / S）。
+    两者可独立开关，同时为 True 则一起出。
+    """
     results: list[dict] = []
     region_slug = _current_region_key()
     cfg = _resolve_detection_config(detection_config)
@@ -8522,6 +8879,7 @@ def _run_vertical_overview_batch(
             heave_depth_threshold=heave_depth_threshold,
         ) if annotate_heave else {}
         heave_title_extra = ''
+        sigma_title_extra = ''
         if annotate_heave and heave_diag:
             heave_val = heave_diag.get('glorys_heave_m')
             zmin_val = heave_diag.get('glorys_heave_zmin')
@@ -8532,50 +8890,104 @@ def _run_vertical_overview_batch(
                 parts.append(rf"z_{{\mathrm{{min}}}}={zmin_val:.0f}\,\mathrm{{m}}")
             if parts:
                 heave_title_extra = rf"${', '.join(parts)}$"
-
-        fig = _plot_glorys_overview_vertical_2x2(
-            vertical_package=pkg,
-            variables=vertical_vars,
-            k_val=k_val,
-            b_val=b_val,
-            subject_label=subject_label,
-            date_label=date_str,
-            xmin=xmin,
-            xmax=xmax,
-            ymin=ymin,
-            ymax=ymax,
-            projected_argo_profile=proj_profile,
-            plot_mlt=plot_mlt,
-            plot_isolines=plot_isolines,
-            isoline_levels=isoline_levels,
-            isoline_color=isoline_color,
-            isoline_linewidth=isoline_linewidth,
-            isoline_alpha=isoline_alpha,
-            label_isolines=label_isolines,
-            title_extra=heave_title_extra,
-        )
+            # σ 坐标标题：显示 heave 峰值密度面
+            sigma_peak = heave_diag.get('glorys_heave_sigma_peak')
+            if sigma_peak is not None and np.isfinite(float(sigma_peak)):
+                sigma_title_extra = (
+                    rf"$\sigma_{{\mathrm{{peak}}}}={float(sigma_peak):.2f}\,\mathrm{{kg/m^3}}$"
+                )
 
         save_path = None
-        if save_fig:
-            if '{date}' in save_name_prefix:
-                filename_core = save_name_prefix.format(date=date_tag)
-                filename = f"{filename_core}_overview_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
-            else:
-                filename = (
-                    f"{save_name_prefix}_overview_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
-                )
-            save_path = out_dir / (
-                filename
+        if z_overview:
+            fig = _plot_glorys_overview_vertical_2x2(
+                vertical_package=pkg,
+                variables=vertical_vars,
+                k_val=k_val,
+                b_val=b_val,
+                subject_label=subject_label,
+                date_label=date_str,
+                xmin=xmin,
+                xmax=xmax,
+                ymin=ymin,
+                ymax=ymax,
+                projected_argo_profile=proj_profile,
+                plot_mlt=plot_mlt,
+                plot_isolines=plot_isolines,
+                isoline_levels=isoline_levels,
+                isoline_color=isoline_color,
+                isoline_linewidth=isoline_linewidth,
+                isoline_alpha=isoline_alpha,
+                label_isolines=label_isolines,
+                title_extra=heave_title_extra,
             )
-            fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            if verbose:
-                print(f"Figure saved to: {save_path}")
 
-        if show_fig:
-            plt.show()
-        plt.close(fig)
+            if save_fig:
+                if '{date}' in save_name_prefix:
+                    filename_core = save_name_prefix.format(date=date_tag)
+                    filename = f"{filename_core}_z_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                else:
+                    filename = f"{save_name_prefix}_z_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                save_path = out_dir / filename
+                fig.savefig(save_path, dpi=300, bbox_inches='tight')
+                if verbose:
+                    print(f"Figure saved to: {save_path}")
+
+            if show_fig:
+                plt.show()
+            plt.close(fig)
+
+        sigma_save_path = None
+        if sigma_overview and 'sigma' in pkg.get('profile_data', {}):
+            try:
+                sigma_pkg = _remap_vertical_package_to_sigma(pkg)
+                sigma_proj = _project_argo_rows_to_sigma_for_overview(
+                    pkg, proj_profile,
+                ) if plot_argo_projection else pd.DataFrame()
+
+                sigma_fig = _plot_glorys_overview_vertical_2x2_sigma(
+                    vertical_package=sigma_pkg,
+                    k_val=k_val,
+                    b_val=b_val,
+                    subject_label=subject_label,
+                    date_label=date_str,
+                    xmin=xmin,
+                    xmax=xmax,
+                    ymin=sigma_ymin,
+                    ymax=sigma_ymax,
+                    projected_argo_profile=sigma_proj if not sigma_proj.empty else None,
+                    plot_isolines=plot_isolines,
+                    isoline_levels=isoline_levels,
+                    isoline_color=isoline_color,
+                    isoline_linewidth=isoline_linewidth,
+                    isoline_alpha=isoline_alpha,
+                    label_isolines=label_isolines,
+                    title_extra=sigma_title_extra,
+                )
+
+                if save_fig:
+                    if '{date}' in save_name_prefix:
+                        filename_core = save_name_prefix.format(date=date_tag)
+                        sigma_filename = f"{filename_core}_sigma_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                    else:
+                        sigma_filename = (
+                            f"{save_name_prefix}_sigma_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                        )
+                    sigma_save_path = out_dir / sigma_filename
+                    sigma_fig.savefig(sigma_save_path, dpi=300, bbox_inches='tight')
+                    if verbose:
+                        print(f"Sigma overview saved to: {sigma_save_path}")
+
+                if show_fig:
+                    plt.show()
+                plt.close(sigma_fig)
+            except (ValueError, RuntimeError, TypeError, KeyError):
+                if verbose:
+                    print(f"Warning: sigma overview failed for k={k_val}, b={b_val}:")
+                    traceback.print_exc()
 
         result_item = {'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None}
+        if sigma_save_path is not None:
+            result_item['sigma_save_path'] = str(sigma_save_path)
         if heave_diag:
             result_item.update(heave_diag)
         results.append(result_item)
@@ -8619,17 +9031,20 @@ def plot_track_vertical_glorys_overview(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     annotate_heave: bool = False,
+    z_overview: bool = True,
+    sigma_overview: bool = False,
 ) -> list[dict]:
     """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
-    verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
-    annotate_heave=True 时会在标题显示出露最小深度。
+    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
     if annotate_heave:
         vars_to_fetch.add('sigma')
+    if sigma_overview:
+        vars_to_fetch.update(['pv', 'sigma'])
     if plot_mlt:
         vars_to_fetch.add('mlt')
 
@@ -8719,6 +9134,8 @@ def plot_track_vertical_glorys_overview(
         heave_search_range=heave_search_range,
         heave_depth_threshold=heave_depth_threshold,
         annotate_heave=annotate_heave,
+        z_overview=z_overview,
+        sigma_overview=sigma_overview,
     )
 
 
@@ -8759,17 +9176,20 @@ def plot_argo_vertical_glorys_overview(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     annotate_heave: bool = False,
+    z_overview: bool = True,
+    sigma_overview: bool = False,
 ) -> list[dict]:
     """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
-    verbose=True 时保存图片后打印输出路径；批处理调用可设为 False 以减少日志。
-    annotate_heave=True 时会在标题显示出露最小深度。
+    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
     vars_to_fetch = set(vertical_vars)
     if annotate_heave:
         vars_to_fetch.add('sigma')
+    if sigma_overview:
+        vars_to_fetch.update(['pv', 'sigma'])
     if plot_mlt:
         vars_to_fetch.add('mlt')
 
@@ -8842,8 +9262,8 @@ def plot_argo_vertical_glorys_overview(
         b_list=b_list,
         vertical_vars=vertical_vars,
         target_date=target_date,
-        subject_label=f"Profile {int(profile_number)}",
-        save_name_prefix=f"Argo_{{date}}_profile{int(profile_number)}",
+        subject_label=f"P{int(profile_number)}",
+        save_name_prefix=f"Argo_{{date}}_P{int(profile_number)}",
         save_subdir='plot_argo_vertical_glorys_overview',
         xmin=xmin,
         xmax=xmax,
@@ -8870,6 +9290,8 @@ def plot_argo_vertical_glorys_overview(
         heave_search_range=heave_search_range,
         heave_depth_threshold=heave_depth_threshold,
         annotate_heave=annotate_heave,
+        z_overview=z_overview,
+        sigma_overview=sigma_overview,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -12066,10 +12488,15 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             heave_search_range=float(args.get('heave_search_range', 0.5)),
             heave_depth_threshold=float(args.get('heave_depth_threshold', 150.0)),
             annotate_heave=bool(args.get('annotate_heave', False)),
+            z_overview=bool(args.get('z_overview', True)),
+            sigma_overview=bool(args.get('sigma_overview', False)),
         )
         record['vertical_status'] = 'ok' if vertical_results else 'empty'
         record['vertical_save_paths'] = ";".join(
             [str(item.get('save_path')) for item in vertical_results if item.get('save_path')]
+        ) or None
+        record['sigma_save_paths'] = ";".join(
+            [str(item.get('sigma_save_path')) for item in vertical_results if item.get('sigma_save_path')]
         ) or None
         if vertical_results:
             first_vertical = vertical_results[0]
@@ -12079,7 +12506,9 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
                 'heave_z_window_m',
                 'heave_valid_fraction',
                 'glorys_heave_sigma_argo',
+                'glorys_heave_sigma_peak',
                 'glorys_heave_zmin',
+                'glorys_heave_m',
                 'glorys_heave_oi',
                 'heave_error',
             ]:
@@ -12137,11 +12566,16 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     annotate_heave: bool = False,
+    z_overview: bool = True,
+    sigma_overview: bool = False,
     return_details: bool = False,
     save_summary_data: bool = True,
     summary_data_path: str | Path | None = None,
 ) -> dict:
     """为 hotspots 异常剖面批量绘制 Argo-centered GLORYS 水平图与垂向总览图。
+
+    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标 2x2 总览图，
+    默认 ``z_overview=True, sigma_overview=False``，两者可同时开启。
 
     第一版使用固定的纬向剖面线：每个剖面都取经过 Argo 点的 ``y = lat``，
     即 ``k=0, b=center_lat``。输入 anomalies parquet 的定位规则与
@@ -12156,9 +12590,13 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         horizontal_variable: 水平 GLORYS 背景变量，默认 'vorticity'。
         vertical_variables: 垂向总览变量；None 时使用 overview 默认 ['vorticity','sigma','thetao','salinity']。
         needed_depth: 水平图读取深度，默认 0 m。
-        xmin/xmax/ymin/ymax: 垂向图显示范围；xmin/xmax 也决定 Argo-centered GLORYS 读取窗口。
+        xmin/xmax/ymin/ymax: 垂向图（z 坐标）显示范围；xmin/xmax 也决定 Argo-centered GLORYS 读取窗口。
         profile_spacing_km / interpolate_z / profile_depth_spacing_m: 传递给垂向 GLORYS 插值。
-        plot_mlt / plot_argo_projection / plot_isolines: 垂向总览图附加层控制。
+        z_overview: 是否绘制 z 坐标 2x2 垂向总览图，默认 True。
+        sigma_overview: 是否绘制 σ 坐标 2x2 垂向总览图（PV / Z(σ) / θ / S），默认 False。
+        plot_mlt / plot_argo_projection: z 坐标总览图附加层控制。
+        plot_isolines / isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines:
+            z 坐标与 σ 坐标总览图共用；各面板叠加自身变量的等值线。
         argo_min_depth / argo_projection_min_depth: 分别覆盖水平图异常点与垂向投影点的最小深度阈值。
         argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
         output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
@@ -12283,9 +12721,12 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
                     'heave_z_window_m',
                     'heave_valid_fraction',
                     'glorys_heave_sigma_argo',
+                    'glorys_heave_sigma_peak',
                     'glorys_heave_zmin',
+                    'glorys_heave_m',
                     'glorys_heave_oi',
                     'heave_error',
+                    'sigma_save_paths',
                 ]
                 pd.DataFrame(columns=empty_cols).to_parquet(resolved_summary_data_path, index=False)
                 saved_summary_data_path = str(resolved_summary_data_path)
@@ -12383,6 +12824,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'heave_search_range': float(heave_search_range),
             'heave_depth_threshold': heave_depth_threshold,
             'annotate_heave': annotate_heave,
+            'z_overview': z_overview,
+            'sigma_overview': sigma_overview,
         })
 
     if worker_count > 1:
@@ -12422,7 +12865,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     if save_summary_data:
         try:
             resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(results).to_parquet(resolved_summary_data_path, index=False)
+            summary_df = pd.DataFrame(results)
+            summary_df.to_parquet(resolved_summary_data_path, index=False)
             saved_summary_data_path = str(resolved_summary_data_path)
             if verbose:
                 print(f"Summary data saved to: {resolved_summary_data_path}")
@@ -13059,7 +13503,8 @@ def export_hotspot_anomaly_summary_table(
         'delta_temperature', 'delta_salinity',
         'glorys_k', 'glorys_b', 'glorys_center_lon', 'glorys_center_lat',
         'heave_projection_depth_m', 'heave_x_window_km', 'heave_z_window_m',
-        'heave_valid_fraction', 'glorys_heave_sigma_argo', 'glorys_heave_zmin', 'glorys_heave_oi',
+        'heave_valid_fraction', 'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak',
+        'glorys_heave_zmin', 'glorys_heave_m', 'glorys_heave_oi',
         'surface_do_ref', 'pre_anomaly_do_min', 'pre_anomaly_do_min_depth_m',
         'surface_to_min_do_drop', 'min_to_anomaly_do_recovery',
         'min_to_anomaly_depth_gap_m', 'do_v_shape_score', 'hotspot_type',
@@ -13110,7 +13555,7 @@ def export_hotspot_anomaly_summary_table(
 
                     int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
-                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_zmin', 'heave_threshold', 'glorys_heave_oi'}
+                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_threshold', 'glorys_heave_oi'}
                     fraction_cols = {'heave_valid_fraction'}
                     one_decimal_cols = {
                         'surface_do_ref',
@@ -13120,6 +13565,7 @@ def export_hotspot_anomaly_summary_table(
                         'min_to_anomaly_do_recovery',
                         'min_to_anomaly_depth_gap_m',
                         'do_v_shape_score',
+                        'glorys_heave_m',
                     }
 
                     def _excel_number_format(col_name: str) -> str | None:
@@ -17247,14 +17693,12 @@ def _export_interacting_argo_worker(args):
                                 })
             except Exception as e:
                 print(f"[Warn] Batch processing failed for {ds_name} in Year {y}: {e}")
-                import traceback
                 traceback.print_exc()
                 continue
 
         return interacting_records, baseline
     except Exception as e:
         print(f"[Error] Year {y}: {e}")
-        import traceback
         traceback.print_exc()
         return [], pd.DataFrame()
 
