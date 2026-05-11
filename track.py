@@ -8216,7 +8216,6 @@ def calculate_glorys_vertical_profile_diagnostics(
 
     返回:
         dict: 诊断指标字典，包含以下键:
-            - ``glorys_heave_oi`` (bool): 出露指数 OI，True 为通风型
             - ``glorys_heave_m`` (float): Heave 幅度 (m)，等密线在局地凹底到窗口最浅点的垂直距离
             - ``glorys_heave_zmin`` (float): 窗口内等密线最小深度 z_min (m)
             - ``glorys_heave_sigma_argo`` (float): Argo 异常点的 σ (kg/m³)
@@ -8245,7 +8244,6 @@ def calculate_glorys_vertical_profile_diagnostics(
         'heave_depth_threshold': float(heave_dt),
         'heave_threshold': float(heave_ht),
         'heave_valid_fraction': np.nan,
-        'glorys_heave_oi': False,
         'glorys_heave_zmin': np.nan,
         'glorys_heave_m': np.nan,
         'glorys_heave_sigma_argo': np.nan,
@@ -8403,11 +8401,6 @@ def calculate_glorys_vertical_profile_diagnostics(
     out['glorys_heave_m'] = float(max_heave) if max_heave > 0 else np.nan
     out['glorys_heave_sigma_peak'] = float(max_heave_sigma) if np.isfinite(max_heave_sigma) else np.nan
     out['glorys_heave_zmin'] = min_depth_overall if np.isfinite(min_depth_overall) else np.nan
-
-    # 联合判定：Heave > 阈值 AND z_min < 深度阈值 → Type 1
-    if (np.isfinite(max_heave) and max_heave >= heave_ht
-            and np.isfinite(min_depth_overall) and min_depth_overall < heave_dt):
-        out['glorys_heave_oi'] = True
 
     return out
 
@@ -12516,7 +12509,6 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
                 'glorys_heave_sigma_peak',
                 'glorys_heave_zmin',
                 'glorys_heave_m',
-                'glorys_heave_oi',
                 'heave_error',
             ]:
                 if key in first_vertical:
@@ -12944,7 +12936,7 @@ def export_hotspot_anomaly_summary_table(
         output_path: 保存路径；None 时写到当前 method/region 的默认 summary 目录。
         output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
         save_table: 是否保存表格文件，默认 True。
-        heave_threshold: 出露深度阈值 (m)，默认 150；设为 None 时不新增 ``heave_oi`` 列。
+        heave_threshold: 出露深度阈值 (m)，默认 150；设为 None 时不新增 ``heave_threshold`` 列。
         diagnose_nearshore_do: 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
         nearshore_do_min_threshold: 近岸型判据中，异常深度以上 DO 最小值阈值。
         nearshore_do_drop_threshold: 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
@@ -13079,10 +13071,16 @@ def export_hotspot_anomaly_summary_table(
             'heave_x_window_km',
             'heave_z_window_m',
             'heave_error',
+            'heave_threshold',
         ]
         for col_name in constant_drop_candidates:
             if col_name in table_out.columns and _series_constant(table_out[col_name]):
                 drop_cols.append(col_name)
+
+        # nearshore_do_dip ≡ (hotspot_type == 3) — 保留后者
+        if ('nearshore_do_dip' in table_out.columns
+                and 'hotspot_type' in table_out.columns):
+            drop_cols.append('nearshore_do_dip')
 
         duplicate_pairs = [
             ('heave_projection_depth_m', 'anomaly_depth_m'),
@@ -13418,8 +13416,9 @@ def export_hotspot_anomaly_summary_table(
         ('heave_z_window_m', 'heave_z_window_m'),
         ('heave_valid_fraction', 'heave_valid_fraction'),
         ('glorys_heave_sigma_argo', 'glorys_heave_sigma_argo'),
+        ('glorys_heave_sigma_peak', 'glorys_heave_sigma_peak'),
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
-        ('glorys_heave_oi', 'glorys_heave_oi'),
+        ('glorys_heave_m', 'glorys_heave_m'),
         ('heave_error', 'heave_error'),
     ]
 
@@ -13445,14 +13444,7 @@ def export_hotspot_anomaly_summary_table(
             raise ValueError(warnings_list[-1])
 
     if heave_threshold is not None:
-        threshold_val = float(heave_threshold)
-        min_depth_vals = pd.to_numeric(table['glorys_heave_zmin'], errors='coerce')
-        table['heave_threshold'] = threshold_val
-        table['heave_oi'] = pd.Series(
-            np.where(min_depth_vals.notna(), min_depth_vals < threshold_val, pd.NA),
-            index=table.index,
-            dtype='boolean',
-        )
+        table['heave_threshold'] = float(heave_threshold)
 
     has_nearshore_diagnostics = (
         'nearshore_do_dip' in table.columns
@@ -13514,7 +13506,7 @@ def export_hotspot_anomaly_summary_table(
         'glorys_k', 'glorys_b', 'glorys_center_lon', 'glorys_center_lat',
         'heave_projection_depth_m', 'heave_x_window_km', 'heave_z_window_m',
         'heave_valid_fraction', 'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak',
-        'glorys_heave_zmin', 'glorys_heave_m', 'glorys_heave_oi',
+        'glorys_heave_zmin', 'glorys_heave_m',
         'surface_do_ref', 'pre_anomaly_do_min', 'pre_anomaly_do_min_depth_m',
         'surface_to_min_do_drop', 'min_to_anomaly_do_recovery',
         'min_to_anomaly_depth_gap_m', 'do_v_shape_score', 'hotspot_type',
@@ -13565,7 +13557,7 @@ def export_hotspot_anomaly_summary_table(
 
                     int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
-                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_threshold', 'glorys_heave_oi'}
+                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_threshold'}
                     fraction_cols = {'heave_valid_fraction'}
                     one_decimal_cols = {
                         'surface_do_ref',
@@ -14203,8 +14195,9 @@ def _merge_hotspot_glorys_summary_fields(
         ('heave_z_window_m', 'heave_z_window_m'),
         ('heave_valid_fraction', 'heave_valid_fraction'),
         ('glorys_heave_sigma_argo', 'glorys_heave_sigma_argo'),
+        ('glorys_heave_sigma_peak', 'glorys_heave_sigma_peak'),
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
-        ('glorys_heave_oi', 'glorys_heave_oi'),
+        ('glorys_heave_m', 'glorys_heave_m'),
         ('heave_error', 'heave_error'),
     ]
     for out_col, _ in glorys_cols:
