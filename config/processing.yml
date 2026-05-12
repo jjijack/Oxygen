@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.9 变更：
+#   - 新增 heave.z_search_m，等密线连通性检查：仅搜索在 Argo 点附近存在的 σ 面。
+#   - z_min 改为与 σ_peak 同一条等密线的最浅深度，H/z_min 物理自洽。
 # version 1.8 变更：
 #   - 新增 heave 配置小节，统一管理等密面出露诊断的物理阈值参数。
 # version 1.7 变更：
@@ -61,10 +64,11 @@ processing:
   # Heave + Ventilation 等密面出露诊断参数
   heave:
     search_range: 0.5               # σ 搜索范围 (kg/m³)，从 σ_argo 向上搜索
-    depth_threshold: 150.0          # 通风深度阈值 (m)，z_min 浅于此值视为出露
+    depth_threshold: 300.0          # 通风深度阈值 (m)，z_min 浅于此值视为出露
     magnitude_threshold: 100.0      # Heave 幅度阈值 (m)，等密面起伏 ≥ 此值视为显著位移
     x_window_km: 200.0              # 出露搜索水平窗口半宽 (km)
     local_x_window_km: 50.0         # Heave 局地搜索水平窗口半宽 (km)
+    z_search_m: 200.0               # 等密线连通性垂向范围 (m)，仅搜索在 Argo 点 ±200m 内存在过的 σ 面
 
 plot:
   basemap_colors:

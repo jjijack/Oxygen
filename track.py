@@ -195,6 +195,9 @@ _heave_x_window_km = float(
 _heave_local_x_window_km = float(
     _HEAVE_CFG.get('local_x_window_km', 50.0)
 )
+_heave_z_search_m = float(
+    _HEAVE_CFG.get('z_search_m', 200.0)
+)
 
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
@@ -544,6 +547,7 @@ def print_current_processing_defaults():
         print(f"  heave.magnitude_threshold   : {_heave_magnitude_threshold}")
         print(f"  heave.x_window_km           : {_heave_x_window_km}")
         print(f"  heave.local_x_window_km     : {_heave_local_x_window_km}")
+        print(f"  heave.z_search_m            : {_heave_z_search_m}")
 
 def approximate_degree_length(lat: float | np.ndarray, lon: float | np.ndarray | None = None) -> dict:
     """计算指定纬度（可选经度）处经纬度与距离的近似换算关系。
@@ -8181,6 +8185,7 @@ def calculate_glorys_vertical_profile_diagnostics(
     heave_threshold: float = _heave_magnitude_threshold,
     heave_x_window_km: float = _heave_x_window_km,
     heave_local_x_window_km: float = _heave_local_x_window_km,
+    heave_z_search_m: float | None = _heave_z_search_m,
 ) -> dict:
     """计算等密面出露指数 OI (Outcrop Index) 与垂向位移 Heave。
 
@@ -8217,7 +8222,7 @@ def calculate_glorys_vertical_profile_diagnostics(
     返回:
         dict: 诊断指标字典，包含以下键:
             - ``glorys_heave_m`` (float): Heave 幅度 (m)，等密线在局地凹底到窗口最浅点的垂直距离
-            - ``glorys_heave_zmin`` (float): 窗口内等密线最小深度 z_min (m)
+            - ``glorys_heave_zmin`` (float): heave 峰值 σ 面在窗口内的最浅深度 (m)，与 σ_peak 同源
             - ``glorys_heave_sigma_argo`` (float): Argo 异常点的 σ (kg/m³)
             - ``glorys_heave_sigma_peak`` (float): Heave 峰值所在 σ 面 (kg/m³)
             - ``heave_valid_fraction`` (float): 局地窗口内 σ 有效数据占比
@@ -8351,7 +8356,19 @@ def calculate_glorys_vertical_profile_diagnostics(
         heave_x_mask[np.nanargmin(np.abs(y_use - x0))] = True
 
     sigma_lower = sigma_argo - heave_sr
-    sigma_search_range = max(0.05, heave_sr)
+
+    # 等密线连通性约束：取 Argo 投影列 ±z_connect_m 内的 σ 范围，与原 σ 窗取交集
+    sigma_argo_col = sigma[:, nearest_y_idx]
+    if heave_z_search_m is not None and np.isfinite(depth0):
+        z_connect_mask = np.abs(z_use - depth0) <= float(heave_z_search_m)
+        sigma_connect = sigma_argo_col[z_connect_mask]
+        sigma_connect = sigma_connect[np.isfinite(sigma_connect)]
+        if sigma_connect.size < 2:
+            out['heave_error'] = 'no_valid_sigma_near_argo'
+            return out
+        sigma_lower = max(sigma_lower, float(np.nanmin(sigma_connect)))
+
+    sigma_search_range = max(0.05, sigma_argo - sigma_lower)
     n_search = max(8, int(sigma_search_range / 0.01))
     sigma_levels = np.linspace(sigma_lower, sigma_argo, n_search)
 
@@ -8364,15 +8381,16 @@ def calculate_glorys_vertical_profile_diagnostics(
 
     max_heave = 0.0
     max_heave_sigma = np.nan
-    min_depth_overall = np.nan
+    max_heave_zmin = np.nan
+
+    tol = max(0.02, 1.5 * (sigma_levels[1] - sigma_levels[0]))
 
     for sigma_i in sigma_levels:
         sigma_diff = np.abs(sigma - sigma_i)
-        tol = max(0.02, 1.5 * (sigma_levels[1] - sigma_levels[0]))
         close_mask = (sigma_diff < tol) & heave_x_mask[None, :]
         close_local = (sigma_diff < tol) & local_x_mask[None, :]
 
-        # z_min in full outcrop window
+        # z_min：当前 σ 面在 ±200km 窗口内的最浅深度
         if not np.any(close_mask):
             continue
         matched_z = z_use[np.nonzero(close_mask)[0]]
@@ -8380,11 +8398,7 @@ def calculate_glorys_vertical_profile_diagnostics(
             continue
         min_z_i = float(np.nanmin(matched_z))
 
-        if np.isfinite(min_z_i):
-            if not np.isfinite(min_depth_overall) or min_z_i < min_depth_overall:
-                min_depth_overall = min_z_i
-
-        # local_z_max: 等密线在 Argo 附近 ±50km 的最深点（凹底）
+        # local_z_max：当前 σ 面在 Argo 附近 ±50km 的最深点（凹底）
         if not np.any(close_local):
             continue
         local_z = z_use[np.nonzero(close_local)[0]]
@@ -8397,10 +8411,11 @@ def calculate_glorys_vertical_profile_diagnostics(
             if heave_i > max_heave:
                 max_heave = heave_i
                 max_heave_sigma = sigma_i
+                max_heave_zmin = min_z_i
 
     out['glorys_heave_m'] = float(max_heave) if max_heave > 0 else np.nan
     out['glorys_heave_sigma_peak'] = float(max_heave_sigma) if np.isfinite(max_heave_sigma) else np.nan
-    out['glorys_heave_zmin'] = min_depth_overall if np.isfinite(min_depth_overall) else np.nan
+    out['glorys_heave_zmin'] = float(max_heave_zmin) if np.isfinite(max_heave_zmin) else np.nan
 
     return out
 
@@ -8827,6 +8842,7 @@ def _run_vertical_overview_batch(
     heave_z_window_m: float | None = 100.0,
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
+    heave_z_search_m: float | None = _heave_z_search_m,
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
@@ -8870,6 +8886,7 @@ def _run_vertical_overview_batch(
             z_window_m=heave_z_window_m,
             heave_search_range=heave_search_range,
             heave_depth_threshold=heave_depth_threshold,
+            heave_z_search_m=heave_z_search_m,
         ) if annotate_heave else {}
         heave_title_extra = ''
         sigma_title_extra = ''
@@ -9023,6 +9040,7 @@ def plot_track_vertical_glorys_overview(
     heave_z_window_m: float | None = 100.0,
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
+    heave_z_search_m: float | None = _heave_z_search_m,
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
@@ -9126,6 +9144,7 @@ def plot_track_vertical_glorys_overview(
         heave_z_window_m=heave_z_window_m,
         heave_search_range=heave_search_range,
         heave_depth_threshold=heave_depth_threshold,
+        heave_z_search_m=heave_z_search_m,
         annotate_heave=annotate_heave,
         z_overview=z_overview,
         sigma_overview=sigma_overview,
@@ -9168,6 +9187,7 @@ def plot_argo_vertical_glorys_overview(
     heave_z_window_m: float | None = 100.0,
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
+    heave_z_search_m: float | None = _heave_z_search_m,
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
@@ -9282,6 +9302,7 @@ def plot_argo_vertical_glorys_overview(
         heave_z_window_m=heave_z_window_m,
         heave_search_range=heave_search_range,
         heave_depth_threshold=heave_depth_threshold,
+        heave_z_search_m=heave_z_search_m,
         annotate_heave=annotate_heave,
         z_overview=z_overview,
         sigma_overview=sigma_overview,
@@ -12487,6 +12508,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             heave_z_window_m=args.get('heave_z_window_m', 100.0),
             heave_search_range=float(args.get('heave_search_range', 0.5)),
             heave_depth_threshold=float(args.get('heave_depth_threshold', 150.0)),
+            heave_z_search_m=args.get('heave_z_search_m', 200.0),
             annotate_heave=bool(args.get('annotate_heave', False)),
             z_overview=bool(args.get('z_overview', True)),
             sigma_overview=bool(args.get('sigma_overview', False)),
@@ -12565,6 +12587,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     heave_z_window_m: float | None = 100.0,
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
+    heave_z_search_m: float | None = _heave_z_search_m,
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
@@ -12825,6 +12848,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'heave_z_window_m': heave_z_window_m,
             'heave_search_range': float(heave_search_range),
             'heave_depth_threshold': heave_depth_threshold,
+            'heave_z_search_m': heave_z_search_m,
             'annotate_heave': annotate_heave,
             'z_overview': z_overview,
             'sigma_overview': sigma_overview,

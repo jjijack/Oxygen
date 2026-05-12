@@ -84,9 +84,11 @@ nearshore_do_dip = (
 
 1. 确定 Argo 异常深度处的密度 σ_argo
 2. 在 σ_argo − 0.5 到 σ_argo 之间搜索等密线
-3. 每条等密线在 ±200 km 窗口内找最浅深度 (z_min)，
+3. 等密线连通性约束：仅保留在 Argo 点 ±200m 垂向范围内存在过的 σ 面
+4. 每条等密线在 ±200 km 窗口内找最浅深度 (z_min)，
    在 Argo 附近 ±50 km 找最深深度 (local_z_max)
-4. Heave H = max(local_z_max − z_min)，Heave 峰值 σ = argmax 对应的 σ
+5. Heave H = max(local_z_max − z_min)，Heave 峰值 σ = argmax 对应的 σ，
+   z_min 取自 σ_peak 同一条等密线
 
 ### 变量
 
@@ -95,14 +97,14 @@ nearshore_do_dip = (
 | `heave_valid_fraction` | float (0–1) | 局地窗口内 σ 有效数据占比。衡量诊断可靠性 |
 | `glorys_heave_sigma_argo` | float | Argo 异常深度处的 σ₀ (kg/m³) |
 | `glorys_heave_sigma_peak` | float | Heave 峰值所在 σ₀ (kg/m³)。低值=浅层变形，高值=深层变形 |
-| `glorys_heave_zmin` | float | ±200 km 窗口内等密线最浅深度 (m)。越小越接近海表 |
+| `glorys_heave_zmin` | float | heave 峰值 σ 面在窗口内的最浅深度 (m)。越小越接近海表 |
 | `glorys_heave_m` | float | Heave 幅度 (m)：等密线局地最深与窗口最浅的垂直距离 |
 
 ## 分类
 
 | 列 | 类型 | 说明 |
 |---|---|---|
-| `hotspot_type` | int (1/2/3) | 1=通风型（H≥100m 且 z_min<150m），2=深层隔离型，3=近岸 DO 骤降型 |
+| `hotspot_type` | int (1/2/3) | 1=通风型（H≥100m 且 z_min<300m），2=深层隔离型，3=近岸 DO 骤降型 |
 
 ## 涡旋匹配（可选）
 
