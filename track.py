@@ -8197,10 +8197,9 @@ def calculate_glorys_vertical_profile_diagnostics(
        内该等密线的最浅点之间的垂直距离。Heave ≥ heave_threshold 说明
        等密面发生了显著的中尺度起伏。
 
-    2. **Ventilation（通风深度）**: 在 ±x_window_km 范围内搜索从 σ_argo 向上
-       到 σ_argo − heave_search_range 的所有等密线，取其中最小深度 z_min。
-       z_min < heave_depth_threshold 说明至少有一根等密线在窗口内接近海表，
-       存在通风/潜沉的物理通道。
+    2. **Ventilation（通风深度）**: Heave 峰值 σ 面（σ_peak）在 ±x_window_km
+       范围内的最浅深度 z_min。z_min < heave_depth_threshold 说明该等密面
+       在窗口内接近海表，存在通风/潜沉的物理通道。
 
     联合判定:
         - OI=True  → Heave ≥ threshold AND z_min < depth_threshold
@@ -8218,6 +8217,7 @@ def calculate_glorys_vertical_profile_diagnostics(
         heave_threshold: Heave 判定阈值 (m)，等密面起伏 ≥ 此值视为显著位移，默认来自 processing.yml。
         heave_x_window_km: 搜索通风/出露的水平窗口半宽 (km)，默认来自 processing.yml。
         heave_local_x_window_km: 计算 Heave 时局部最深的搜索半宽 (km)，默认来自 processing.yml。
+        heave_z_search_m: 等密线连通性垂向范围 (m)，仅搜索在 Argo 点 ± 该距离内存在过的 σ 面，默认来自 processing.yml。
 
     返回:
         dict: 诊断指标字典，包含以下键:
@@ -8808,6 +8808,132 @@ def _plot_glorys_overview_vertical_2x2_sigma(
     return fig
 
 
+def plot_argo_ts_diagram(
+    vertical_package: dict,
+    argo_profile_rows: pd.DataFrame,
+    anomaly_depth: float | None = None,
+    *,
+    subject_label: str = '',
+    date_label: str = '',
+    show_fig: bool = True,
+    save_fig: bool = False,
+    save_path: str | Path | None = None,
+    sigma_contour_levels: list[float] | None = None,
+    contour_color: str = 'black',
+    contour_linewidth: float = 0.6,
+    contour_alpha: float = 0.45,
+    label_contours: bool = True,
+) -> plt.Figure | None:
+    """绘制 T-S 图：GLORYS 背景散点 + σ₀ 等值线 + Argo 剖面叠加。
+
+    GLORYS θ/S 来自 ``vertical_package`` 的 2D 剖面数据，
+    Argo T/S 来自 ``argo_profile_rows``（需含 Temperature / Salinity / Depth 列）。
+    σ₀ 等值线在 T-S 网格上走 gsw SA→CT→sigma0 链，参考深度 0 m。
+    ``anomaly_depth`` 非 None 时在对应 θ/S 位置标 ★。
+    """
+    profile_data = vertical_package.get('profile_data', {})
+    theta_gl = profile_data.get('thetao')
+    sal_gl = profile_data.get('salinity')
+    if theta_gl is None or sal_gl is None:
+        print("[TS] vertical_package 缺少 thetao 或 salinity，跳过 T-S 图。")
+        return None
+
+    theta_ma = np.ma.array(theta_gl, copy=False)
+    sal_ma = np.ma.array(sal_gl, copy=False)
+    valid_gl = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+    if valid_gl.sum() < 5:
+        print("[TS] GLORYS 有效 θ/S 点不足，跳过 T-S 图。")
+        return None
+    theta_vals = theta_ma[valid_gl]
+    sal_vals = sal_ma[valid_gl]
+
+    center_lat = float(np.nanmean(np.asarray(vertical_package.get('lat_coords', [30.0]), dtype=float)))
+    center_lon = float(np.nanmean(np.asarray(vertical_package.get('lon_coords', [0.0]), dtype=float)))
+    z_ref = 0.0  # surface-referenced σ₀
+
+    argo_valid = argo_profile_rows.dropna(subset=['Temperature', 'Salinity', 'Depth'])
+    argo_theta = argo_valid['Temperature'].to_numpy(dtype=float)
+    argo_sal = argo_valid['Salinity'].to_numpy(dtype=float)
+    argo_depth = argo_valid['Depth'].to_numpy(dtype=float)
+    has_argo = len(argo_valid) > 0
+
+    s_min = float(np.nanmin(np.concatenate([sal_vals, argo_sal] if has_argo else [sal_vals])))
+    s_max = float(np.nanmax(np.concatenate([sal_vals, argo_sal] if has_argo else [sal_vals])))
+    t_min = float(np.nanmin(np.concatenate([theta_vals, argo_theta] if has_argo else [theta_vals])))
+    t_max = float(np.nanmax(np.concatenate([theta_vals, argo_theta] if has_argo else [theta_vals])))
+    s_pad = max(0.1, (s_max - s_min) * 0.05)
+    t_pad = max(0.1, (t_max - t_min) * 0.05)
+    s_min, s_max = s_min - s_pad, s_max + s_pad
+    t_min, t_max = t_min - t_pad, t_max + t_pad
+
+    n_grid = 100
+    S_grid, T_grid = np.meshgrid(
+        np.linspace(s_min, s_max, n_grid),
+        np.linspace(t_min, t_max, n_grid),
+    )
+    p_ref = gsw.p_from_z(-z_ref, center_lat)
+    SA_grid = gsw.SA_from_SP(S_grid, p_ref, center_lon, center_lat)
+    CT_grid = gsw.CT_from_pt(SA_grid, T_grid)
+    sigma_grid = gsw.sigma0(SA_grid, CT_grid)
+
+    if sigma_contour_levels is None:
+        sigma_valid = sigma_grid[np.isfinite(sigma_grid)]
+        if sigma_valid.size < 2:
+            sigma_contour_levels = np.linspace(20, 28, 9)
+        else:
+            lo = np.floor(np.nanmin(sigma_valid))
+            hi = np.ceil(np.nanmax(sigma_valid))
+            sigma_contour_levels = np.arange(lo, hi + 0.5, 0.5)
+
+    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
+
+    ax.scatter(sal_vals, theta_vals, c='lightgray', s=2, alpha=0.5,
+               rasterized=True, zorder=1, label='GLORYS')
+
+    cs = ax.contour(S_grid, T_grid, sigma_grid, levels=sigma_contour_levels,
+                    colors=contour_color, linewidths=contour_linewidth,
+                    alpha=contour_alpha, zorder=2)
+    if label_contours:
+        ax.clabel(cs, inline=True, fontsize=8, fmt='%.1f')
+
+    if has_argo:
+        sc = ax.scatter(argo_sal, argo_theta, c=argo_depth, cmap='viridis',
+                        s=30, edgecolors='black', linewidths=0.3,
+                        zorder=3, label='Argo')
+        cbar = fig.colorbar(sc, ax=ax, orientation='vertical', fraction=0.045, pad=0.02)
+        cbar.set_label('Depth (m)', fontsize=10)
+
+    if anomaly_depth is not None and np.isfinite(anomaly_depth) and has_argo:
+        argo_depths_sorted = np.argsort(argo_depth)
+        ad_theta = float(np.interp(anomaly_depth, argo_depth[argo_depths_sorted],
+                                    argo_theta[argo_depths_sorted], left=np.nan, right=np.nan))
+        ad_sal = float(np.interp(anomaly_depth, argo_depth[argo_depths_sorted],
+                                  argo_sal[argo_depths_sorted], left=np.nan, right=np.nan))
+        if np.isfinite(ad_theta) and np.isfinite(ad_sal):
+            ax.scatter([ad_sal], [ad_theta], marker='*', c='red', s=200,
+                       edgecolors='black', linewidths=0.5, zorder=5,
+                       label=f'Anomaly ({anomaly_depth:.0f} m)')
+
+    ax.set_xlabel('Salinity (psu)', fontsize=12)
+    ax.set_ylabel('Temperature (°C)', fontsize=12)
+    title_parts = []
+    if subject_label:
+        title_parts.append(subject_label)
+    title_parts.append('T-S Diagram')
+    if date_label:
+        title_parts.append(date_label)
+    ax.set_title(' | '.join(title_parts), fontsize=14)
+    ax.legend(fontsize=9, loc='best', markerscale=0.8)
+    ax.grid(True, alpha=0.2)
+
+    if save_fig and save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    return fig
+
+
 def _run_vertical_overview_batch(
     *,
     vertical_packages: list[dict],
@@ -8848,12 +8974,14 @@ def _run_vertical_overview_batch(
     sigma_overview: bool = False,
     sigma_ymin: float = 23.0,
     sigma_ymax: float = 28.0,
+    ts_diagram: bool = False,
+    argo_profile_rows: pd.DataFrame | None = None,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。
 
     ``z_overview=True`` 绘制 z 坐标 2x2 总览图，
-    ``sigma_overview=True`` 绘制 σ 坐标 2x2 总览图（PV / Z(σ) / θ / S）。
-    两者可独立开关，同时为 True 则一起出。
+    ``sigma_overview=True`` 绘制 σ 坐标 2x2 总览图（PV / Z(σ) / θ / S），
+    ``ts_diagram=True`` 绘制 T-S 图（需传入 ``argo_profile_rows``）。
     """
     results: list[dict] = []
     region_slug = _current_region_key()
@@ -8995,9 +9123,40 @@ def _run_vertical_overview_batch(
                     print(f"Warning: sigma overview failed for k={k_val}, b={b_val}:")
                     traceback.print_exc()
 
+        ts_save_path = None
+        if ts_diagram and argo_profile_rows is not None and not argo_profile_rows.empty:
+            try:
+                ts_fig = plot_argo_ts_diagram(
+                    vertical_package=pkg,
+                    argo_profile_rows=argo_profile_rows,
+                    anomaly_depth=heave_projection_depth_m,
+                    subject_label=subject_label,
+                    date_label=date_str,
+                    show_fig=show_fig,
+                    save_fig=False,
+                )
+                if ts_fig is not None and save_fig:
+                    if '{date}' in save_name_prefix:
+                        filename_core = save_name_prefix.format(date=date_tag)
+                        ts_filename = f"{filename_core}_ts_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                    else:
+                        ts_filename = f"{save_name_prefix}_ts_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                    ts_save_path = out_dir / ts_filename
+                    ts_fig.savefig(ts_save_path, dpi=300, bbox_inches='tight')
+                    if verbose:
+                        print(f"T-S diagram saved to: {ts_save_path}")
+                if ts_fig is not None and not save_fig:
+                    plt.close(ts_fig)
+            except (ValueError, RuntimeError, TypeError, KeyError):
+                if verbose:
+                    print(f"Warning: T-S diagram failed for k={k_val}, b={b_val}:")
+                    traceback.print_exc()
+
         result_item = {'k': k_val, 'b': b_val, 'save_path': str(save_path) if save_path else None}
         if sigma_save_path is not None:
             result_item['sigma_save_path'] = str(sigma_save_path)
+        if ts_save_path is not None:
+            result_item['ts_save_path'] = str(ts_save_path)
         if heave_diag:
             result_item.update(heave_diag)
         results.append(result_item)
@@ -9044,10 +9203,12 @@ def plot_track_vertical_glorys_overview(
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
+    ts_diagram: bool = False,
 ) -> list[dict]:
     """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
 
-    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
+    ``z_overview`` / ``sigma_overview`` / ``ts_diagram`` 独立控制
+    z 坐标、σ 坐标总览图与 T-S 图的输出。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -9092,20 +9253,22 @@ def plot_track_vertical_glorys_overview(
     )
 
     projected_argo_rows = pd.DataFrame()
-    if plot_argo_projection:
-        argo_projection_config = _resolve_detection_config(
-            argo_projection_config,
-            anomaly_min_depth=argo_projection_min_depth,
-        )
-
+    ts_argo_rows = pd.DataFrame()
+    if plot_argo_projection or ts_diagram:
         argo_all = filtered_float_data(ds_source_for_filter, no, track=track_df)
         if not argo_all.empty:
             argo_all = argo_all.copy()
             argo_all['date'] = pd.to_datetime(argo_all[['Year', 'Month', 'Day']], errors='coerce').dt.normalize()
-            projected_argo_rows = argo_all[argo_all['date'] == target_date.normalize()].copy()
-            if not projected_argo_rows.empty:
+            same_day_rows = argo_all[argo_all['date'] == target_date.normalize()].copy()
+            if ts_diagram:
+                ts_argo_rows = same_day_rows.copy()
+            if plot_argo_projection and not same_day_rows.empty:
+                argo_projection_config = _resolve_detection_config(
+                    argo_projection_config,
+                    anomaly_min_depth=argo_projection_min_depth,
+                )
                 projected_argo_rows = _prepare_overview_projection_rows(
-                    projected_argo_rows,
+                    same_day_rows,
                     detection_config=argo_projection_config,
                 )
 
@@ -9148,6 +9311,8 @@ def plot_track_vertical_glorys_overview(
         annotate_heave=annotate_heave,
         z_overview=z_overview,
         sigma_overview=sigma_overview,
+        ts_diagram=ts_diagram,
+        argo_profile_rows=ts_argo_rows if ts_diagram else None,
     )
 
 
@@ -9191,8 +9356,11 @@ def plot_argo_vertical_glorys_overview(
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
+    ts_diagram: bool = False,
 ) -> list[dict]:
     """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
+
+    ``ts_diagram=True`` 时额外绘制 T-S 图。
 
     ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
     """
@@ -9306,6 +9474,8 @@ def plot_argo_vertical_glorys_overview(
         annotate_heave=annotate_heave,
         z_overview=z_overview,
         sigma_overview=sigma_overview,
+        ts_diagram=ts_diagram,
+        argo_profile_rows=info.get('profile_rows') if ts_diagram else None,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -12512,6 +12682,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             annotate_heave=bool(args.get('annotate_heave', False)),
             z_overview=bool(args.get('z_overview', True)),
             sigma_overview=bool(args.get('sigma_overview', False)),
+            ts_diagram=bool(args.get('ts_diagram', False)),
         )
         record['vertical_status'] = 'ok' if vertical_results else 'empty'
         record['vertical_save_paths'] = ";".join(
@@ -12519,6 +12690,9 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
         ) or None
         record['sigma_save_paths'] = ";".join(
             [str(item.get('sigma_save_path')) for item in vertical_results if item.get('sigma_save_path')]
+        ) or None
+        record['ts_save_paths'] = ";".join(
+            [str(item.get('ts_save_path')) for item in vertical_results if item.get('ts_save_path')]
         ) or None
         if vertical_results:
             first_vertical = vertical_results[0]
@@ -12591,6 +12765,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
+    ts_diagram: bool = False,
     return_details: bool = False,
     save_summary_data: bool = True,
     summary_data_path: str | Path | None = None,
@@ -12618,6 +12793,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         profile_spacing_km / interpolate_z / profile_depth_spacing_m: 传递给垂向 GLORYS 插值。
         z_overview: 是否绘制 z 坐标 2x2 垂向总览图，默认 True。
         sigma_overview: 是否绘制 σ 坐标 2x2 垂向总览图（PV / Z(σ) / θ / S），默认 False。
+        ts_diagram: 是否额外绘制 T-S 图（仅 Argo 场景生效），默认 False。
         plot_mlt / plot_argo_projection: z 坐标总览图附加层控制。
         plot_isolines / isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines:
             z 坐标与 σ 坐标总览图共用；各面板叠加自身变量的等值线。
@@ -12852,6 +13028,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'annotate_heave': annotate_heave,
             'z_overview': z_overview,
             'sigma_overview': sigma_overview,
+            'ts_diagram': ts_diagram,
         })
 
     if worker_count > 1:
@@ -12928,7 +13105,7 @@ def export_hotspot_anomaly_summary_table(
     output_path: str | Path | None = None,
     output_format: str | None = None,
     save_table: bool = True,
-    heave_threshold: float | None = _heave_depth_threshold,
+    heave_z_threshold: float | None = _heave_depth_threshold,
     diagnose_nearshore_do: bool = True,
     nearshore_do_min_threshold: float = 50.0,
     nearshore_do_drop_threshold: float = 100.0,
@@ -12960,7 +13137,7 @@ def export_hotspot_anomaly_summary_table(
         output_path: 保存路径；None 时写到当前 method/region 的默认 summary 目录。
         output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
         save_table: 是否保存表格文件，默认 True。
-        heave_threshold: 出露深度阈值 (m)，默认 150；设为 None 时不新增 ``heave_threshold`` 列。
+        heave_z_threshold: 通风深度阈值 (m)，用于 hotspot_type 分类；设为 None 时不新增对应列。
         diagnose_nearshore_do: 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
         nearshore_do_min_threshold: 近岸型判据中，异常深度以上 DO 最小值阈值。
         nearshore_do_drop_threshold: 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
@@ -13095,7 +13272,7 @@ def export_hotspot_anomaly_summary_table(
             'heave_x_window_km',
             'heave_z_window_m',
             'heave_error',
-            'heave_threshold',
+            'heave_z_threshold',
         ]
         for col_name in constant_drop_candidates:
             if col_name in table_out.columns and _series_constant(table_out[col_name]):
@@ -13467,8 +13644,8 @@ def export_hotspot_anomaly_summary_table(
         if require_glorys_details:
             raise ValueError(warnings_list[-1])
 
-    if heave_threshold is not None:
-        table['heave_threshold'] = float(heave_threshold)
+    if heave_z_threshold is not None:
+        table['heave_z_threshold'] = float(heave_z_threshold)
 
     has_nearshore_diagnostics = (
         'nearshore_do_dip' in table.columns
@@ -13481,7 +13658,7 @@ def export_hotspot_anomaly_summary_table(
 
     table['hotspot_type'] = _assign_hotspot_type(
         table,
-        heave_z_threshold=heave_threshold,
+        heave_z_threshold=heave_z_threshold,
         heave_m_threshold=_heave_magnitude_threshold,
     )
 
@@ -13581,7 +13758,7 @@ def export_hotspot_anomaly_summary_table(
 
                     int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
-                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_threshold'}
+                    sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_z_threshold'}
                     fraction_cols = {'heave_valid_fraction'}
                     one_decimal_cols = {
                         'surface_do_ref',
