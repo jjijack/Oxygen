@@ -4931,7 +4931,12 @@ def _reduce_argo_profiles_by_anomaly(
         return pd.DataFrame()
 
     deltas = _keep_best_anomaly_per_profile(deltas, cfg)
-    return deltas.rename(columns={'depth': 'Depth', 'do_value': 'DO'})
+    return deltas.rename(columns={
+        'depth': 'Depth',
+        'do_value': 'DO',
+        'temperature_value': 'Temperature',
+        'salinity_value': 'Salinity',
+    })
 
 def _compute_horizontal_glorys_field(
     variable: str,
@@ -5316,7 +5321,15 @@ def _resolve_argo_profile_center(
 
     target_date: pd.Timestamp | None = None
     if isinstance(profile_time, (int, np.integer)):
-        year = int(profile_time)
+        val = int(profile_time)
+        if 1000 <= val <= 9999:
+            year = val
+        else:
+            parsed_time = convert_date(val)
+            if pd.isna(parsed_time):
+                raise ValueError(f"profile_time={val!r} 无法解析为日期。")
+            year = int(parsed_time.year)
+            target_date = parsed_time.normalize()
     elif isinstance(profile_time, str) and profile_time.strip().isdigit() and len(profile_time.strip()) == 4:
         year = int(profile_time.strip())
     else:
@@ -8808,13 +8821,19 @@ def _plot_glorys_overview_vertical_2x2_sigma(
     return fig
 
 
-def plot_argo_ts_diagram(
-    vertical_package: dict,
-    argo_profile_rows: pd.DataFrame,
-    anomaly_depth: float | None = None,
+def _plot_ts_diagram_core(
+    bg_theta: np.ndarray,
+    bg_sal: np.ndarray,
+    argo_rows: pd.DataFrame,
     *,
+    center_lat: float = 30.0,
+    center_lon: float = 0.0,
+    anomaly_depth: float | None = None,
+    anomaly_peaks: pd.DataFrame | None = None,
     subject_label: str = '',
     date_label: str = '',
+    bg_label: str = 'Background',
+    color_by: str = 'depth',
     show_fig: bool = True,
     save_fig: bool = False,
     save_path: str | Path | None = None,
@@ -8823,44 +8842,38 @@ def plot_argo_ts_diagram(
     contour_linewidth: float = 0.6,
     contour_alpha: float = 0.45,
     label_contours: bool = True,
-) -> plt.Figure | None:
-    """绘制 T-S 图：GLORYS 背景散点 + σ₀ 等值线 + Argo 剖面叠加。
+) -> None:
+    """T-S 图内核：背景散点 + σ₀ 等值线 + Argo 剖面叠加。
 
-    GLORYS θ/S 来自 ``vertical_package`` 的 2D 剖面数据，
-    Argo T/S 来自 ``argo_profile_rows``（需含 Temperature / Salinity / Depth 列）。
-    σ₀ 等值线在 T-S 网格上走 gsw SA→CT→sigma0 链，参考深度 0 m。
-    ``anomaly_depth`` 非 None 时在对应 θ/S 位置标 ★。
+    ``bg_theta`` 与 ``bg_sal`` 为**等长一维**配对数组（调用方负责展平与掩膜过滤）。
+    ``argo_rows`` 需含 Temperature / Salinity / Depth 列；
+    当 ``color_by='do'`` 时需含 DO 列；当 ``color_by='month'`` 时需含 Month 列（int 1-12）。
     """
-    profile_data = vertical_package.get('profile_data', {})
-    theta_gl = profile_data.get('thetao')
-    sal_gl = profile_data.get('salinity')
-    if theta_gl is None or sal_gl is None:
-        print("[TS] vertical_package 缺少 thetao 或 salinity，跳过 T-S 图。")
+    if bg_theta is None or bg_sal is None or len(bg_theta) == 0:
+        print("[TS] 背景 θ/S 数据为空，跳过 T-S 图。")
         return None
-
-    theta_ma = np.ma.array(theta_gl, copy=False)
-    sal_ma = np.ma.array(sal_gl, copy=False)
-    valid_gl = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
-    if valid_gl.sum() < 5:
-        print("[TS] GLORYS 有效 θ/S 点不足，跳过 T-S 图。")
+    if len(bg_theta) != len(bg_sal):
+        raise ValueError(f"bg_theta ({len(bg_theta)}) 与 bg_sal ({len(bg_sal)}) 长度不一致。")
+    theta_vals = np.asarray(bg_theta, dtype=float)
+    sal_vals = np.asarray(bg_sal, dtype=float)
+    finite_bg = np.isfinite(theta_vals) & np.isfinite(sal_vals)
+    theta_vals = theta_vals[finite_bg]
+    sal_vals = sal_vals[finite_bg]
+    if theta_vals.size < 5:
+        print("[TS] 有效背景 θ/S 点不足 5，跳过 T-S 图。")
         return None
-    theta_vals = theta_ma[valid_gl]
-    sal_vals = sal_ma[valid_gl]
-
-    center_lat = float(np.nanmean(np.asarray(vertical_package.get('lat_coords', [30.0]), dtype=float)))
-    center_lon = float(np.nanmean(np.asarray(vertical_package.get('lon_coords', [0.0]), dtype=float)))
     z_ref = 0.0  # surface-referenced σ₀
 
-    argo_valid = argo_profile_rows.dropna(subset=['Temperature', 'Salinity', 'Depth'])
-    argo_theta = argo_valid['Temperature'].to_numpy(dtype=float)
-    argo_sal = argo_valid['Salinity'].to_numpy(dtype=float)
-    argo_depth = argo_valid['Depth'].to_numpy(dtype=float)
+    argo_valid = argo_rows.dropna(subset=['Temperature', 'Salinity', 'Depth']) if not argo_rows.empty else argo_rows
+    argo_theta = argo_valid['Temperature'].to_numpy(dtype=float) if not argo_valid.empty else np.array([])
+    argo_sal = argo_valid['Salinity'].to_numpy(dtype=float) if not argo_valid.empty else np.array([])
+    argo_depth = argo_valid['Depth'].to_numpy(dtype=float) if not argo_valid.empty else np.array([])
     has_argo = len(argo_valid) > 0
 
-    s_min = float(np.nanmin(np.concatenate([sal_vals, argo_sal] if has_argo else [sal_vals])))
-    s_max = float(np.nanmax(np.concatenate([sal_vals, argo_sal] if has_argo else [sal_vals])))
-    t_min = float(np.nanmin(np.concatenate([theta_vals, argo_theta] if has_argo else [theta_vals])))
-    t_max = float(np.nanmax(np.concatenate([theta_vals, argo_theta] if has_argo else [theta_vals])))
+    all_sal = np.concatenate([sal_vals, argo_sal]) if has_argo else sal_vals
+    all_theta = np.concatenate([theta_vals, argo_theta]) if has_argo else theta_vals
+    s_min, s_max = float(np.nanmin(all_sal)), float(np.nanmax(all_sal))
+    t_min, t_max = float(np.nanmin(all_theta)), float(np.nanmax(all_theta))
     s_pad = max(0.1, (s_max - s_min) * 0.05)
     t_pad = max(0.1, (t_max - t_min) * 0.05)
     s_min, s_max = s_min - s_pad, s_max + s_pad
@@ -8888,7 +8901,7 @@ def plot_argo_ts_diagram(
     fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
 
     ax.scatter(sal_vals, theta_vals, c='lightgray', s=2, alpha=0.5,
-               rasterized=True, zorder=1, label='GLORYS')
+               rasterized=True, zorder=1, label=bg_label)
 
     cs = ax.contour(S_grid, T_grid, sigma_grid, levels=sigma_contour_levels,
                     colors=contour_color, linewidths=contour_linewidth,
@@ -8897,13 +8910,31 @@ def plot_argo_ts_diagram(
         ax.clabel(cs, inline=True, fontsize=8, fmt='%.1f')
 
     if has_argo:
-        sc = ax.scatter(argo_sal, argo_theta, c=argo_depth, cmap='viridis',
+        if color_by == 'do' and 'DO' in argo_valid.columns:
+            c_arr = argo_valid['DO'].to_numpy(dtype=float)
+            cmap, cbar_label = 'RdBu_r', 'DO (μmol/kg)'
+        elif color_by == 'month' and 'Month' in argo_valid.columns:
+            c_arr = argo_valid['Month'].to_numpy(dtype=float)
+            cmap, cbar_label = 'hsv', 'Month'
+        elif color_by == 'none':
+            c_arr, cmap, cbar_label = 'steelblue', None, None
+        else:  # 'depth' or fallback
+            c_arr, cmap, cbar_label = argo_depth, 'viridis', 'Depth (m)'
+
+        sc = ax.scatter(argo_sal, argo_theta, c=c_arr, cmap=cmap,
                         s=30, edgecolors='black', linewidths=0.3,
                         zorder=3, label='Argo')
-        cbar = fig.colorbar(sc, ax=ax, orientation='vertical', fraction=0.045, pad=0.02)
-        cbar.set_label('Depth (m)', fontsize=10)
+        if cbar_label:
+            cbar = fig.colorbar(sc, ax=ax, orientation='vertical', fraction=0.045, pad=0.02)
+            cbar.set_label(cbar_label, fontsize=10)
 
-    if anomaly_depth is not None and np.isfinite(anomaly_depth) and has_argo:
+    if anomaly_peaks is not None and not anomaly_peaks.empty:
+        peaks = anomaly_peaks.dropna(subset=['Salinity', 'Temperature'])
+        if not peaks.empty:
+            ax.scatter(peaks['Salinity'], peaks['Temperature'], marker='*',
+                       c='red', s=100, edgecolors='black', linewidths=0.5,
+                       zorder=5, label='Anomaly peak')
+    elif anomaly_depth is not None and np.isfinite(anomaly_depth) and has_argo:
         argo_depths_sorted = np.argsort(argo_depth)
         ad_theta = float(np.interp(anomaly_depth, argo_depth[argo_depths_sorted],
                                     argo_theta[argo_depths_sorted], left=np.nan, right=np.nan))
@@ -8931,7 +8962,402 @@ def plot_argo_ts_diagram(
         fig.savefig(save_path, dpi=300, bbox_inches='tight')
     if show_fig:
         plt.show()
-    return fig
+    plt.close(fig)
+
+
+def plot_argo_ts_diagram(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    k: float | list[float],
+    b: float | list[float],
+    *,
+    platform_number: int | None = None,
+    detection_config: DetectionConfig | None = None,
+    color_by: str = 'depth',
+    xmin: float = -400.0,
+    xmax: float = 400.0,
+    profile_spacing_km: float | None = None,
+    interpolate_z: bool = True,
+    profile_depth_spacing_m: float | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    sigma_contour_levels: list[float] | None = None,
+    contour_color: str = 'black',
+    contour_linewidth: float = 0.6,
+    contour_alpha: float = 0.45,
+    label_contours: bool = True,
+) -> None:
+    """绘制单个 Argo 剖面的温盐图（GLORYS 垂向切片 + Argo 叠加）。
+
+    给定剖面编号和观测日期，自动加载 Argo 剖面数据与沿 GLORYS
+    垂向切片的 θ/S 背景场，叠加 σ₀ 等密度线。适合快速查看
+    某个特定剖面的水团属性与异常深度位置。
+
+    参数:
+        profile_number (int): Argo 剖面编号。
+        profile_time: 剖面日期（int YYYYMMDD / 'YYYY-MM-DD' / Timestamp）。
+        k / b: GLORYS 垂向剖面线参数 y = kx + b（支持 list，每条线出一张图）。
+        platform_number: 浮标平台编号，辅助定位（可选）。
+        detection_config: 异常检测配置，传入后在异常峰值深度叠加 ★ 标记。
+        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
+        xmin / xmax: 垂向剖面窗口半宽 (km)，默认 ±400 km。
+        profile_spacing_km: 剖面内采样间距 (km)，None 回退默认值。
+        interpolate_z: 是否对 GLORYS 垂向插值。
+        profile_depth_spacing_m: 垂向插值间距 (m)。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+        sigma_contour_levels: σ₀ 等密度线层级，None 时按数据范围自动推断。
+        contour_color / contour_linewidth / contour_alpha: 等密度线样式。
+        label_contours: 是否在等密度线上标注 σ₀ 值。
+    """
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+    )
+    center_lon = float(info['center_lon'])
+    center_lat = float(info['center_lat'])
+    target_date = pd.Timestamp(info['target_date'])
+    argo_rows = info['profile_rows'].copy()
+
+    window_half_size_km = max(abs(float(xmin)), abs(float(xmax)))
+    k_list = [k] if isinstance(k, (int, float)) else k
+    b_list = [b] if isinstance(b, (int, float)) else b
+    pkgs = get_vertical_glorys_from_center(
+        center_lon, center_lat, target_date, k_list, b_list,
+        variables=['thetao', 'salinity'],
+        x_min_km=xmin, x_max_km=xmax,
+        profile_spacing_km=profile_spacing_km,
+        interpolate_z=interpolate_z,
+        profile_depth_spacing_m=profile_depth_spacing_m,
+        window_half_size_km=window_half_size_km,
+        profile_id=int(profile_number),
+        ds_name='ARGO',
+    )
+    pkg = pkgs[0] if pkgs else {}
+    pd_data = pkg.get('profile_data', {})
+    theta_gl = pd_data.get('thetao')
+    sal_gl = pd_data.get('salinity')
+    if theta_gl is None or sal_gl is None:
+        print("[TS] GLORYS 缺少 thetao 或 salinity，跳过 T-S 图。")
+        return
+
+    theta_ma = np.ma.array(theta_gl, copy=False)
+    sal_ma = np.ma.array(sal_gl, copy=False)
+    valid_gl = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+    if valid_gl.sum() < 5:
+        print("[TS] GLORYS 有效 θ/S 点不足，跳过 T-S 图。")
+        return
+    bg_theta = np.asarray(theta_ma[valid_gl], dtype=float)
+    bg_sal = np.asarray(sal_ma[valid_gl], dtype=float)
+
+    anomaly_peaks = None
+    if detection_config is not None:
+        anomaly_rows = _reduce_argo_profiles_by_anomaly(argo_rows, detection_config=detection_config)
+        if not anomaly_rows.empty:
+            anomaly_peaks = anomaly_rows
+
+    k_val = k_list[0] if k_list else 0.0
+    b_val = b_list[0] if b_list else 0.0
+    date_str = target_date.strftime('%Y-%m-%d')
+    save_path = None
+    if save_fig:
+        region_slug = _current_region_key()
+        out_dir = Path(output_dir) if output_dir is not None else Path('plot_outputs') / 'shared' / region_slug / 'plot_ts_diagram'
+        filename = f"Argo_P{int(profile_number)}_{date_str}_k{k_val:.2f}b{b_val:+.2f}.png"
+        save_path = out_dir / filename
+
+    _plot_ts_diagram_core(
+        bg_theta, bg_sal, argo_rows,
+        center_lat=center_lat, center_lon=center_lon,
+        anomaly_peaks=anomaly_peaks,
+        subject_label=f"Profile {int(profile_number)}",
+        date_label=date_str,
+        bg_label='GLORYS',
+        color_by=color_by,
+        show_fig=show_fig, save_fig=save_fig, save_path=save_path,
+        sigma_contour_levels=sigma_contour_levels,
+        contour_color=contour_color, contour_linewidth=contour_linewidth,
+        contour_alpha=contour_alpha, label_contours=label_contours,
+    )
+
+
+def plot_track_ts_diagram(
+    DS: str,
+    no: int,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    *,
+    background: str = 'argo',
+    k: float | None = None,
+    b: float | None = None,
+    detection_config: DetectionConfig | None = None,
+    color_by: str = 'depth',
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+) -> None:
+    """沿涡旋轨迹的聚合温盐图（拉格朗日视角）。
+
+    追踪指定涡旋在时间窗口内的移动路径，收集路径附近所有匹配
+    Argo 剖面，叠加在背景 T-S 散点之上。背景可选 Argo（区域内
+    全量剖面）或 GLORYS（沿 kx+b 线的垂向切片）。适合分析
+    特定涡旋演化过程中水团属性的系统性变化。
+
+    参数:
+        DS (str): kind 字符串（'acs'|'acl'|'cs'|'cl'）。
+        no (int): 涡旋编号。
+        start_date / end_date: 时间窗口。
+        background: 'argo' 用全量 Argo 作背景，'glorys' 用 GLORYS 垂向剖面。
+        k / b: 剖面线参数，``background='glorys'`` 时必传。
+        detection_config: 异常检测配置，传入后仅异常剖面在前台叠加，峰值标 ★。
+        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+    """
+    # --- 1. 加载轨迹并按时间过滤 ---
+    track_df = find_track(DS, no)
+    if track_df is None or (isinstance(track_df, pd.DataFrame) and track_df.empty):
+        print(f"[TS] Track for eddy {no} not found, returning None.")
+        return None
+    track_df = track_df.copy()
+    if 'date' not in track_df.columns:
+        track_df['date'] = convert_date(track_df['time'])
+    start_ts, end_ts = pd.Timestamp(start_date), pd.Timestamp(end_date)
+    track_df = track_df[(track_df['date'] >= start_ts) & (track_df['date'] <= end_ts)]
+    if track_df.empty:
+        print(f"[TS] Track {no} has no data in [{start_date}, {end_date}].")
+        return None
+
+    # --- 2. 匹配 Argo 浮标 ---
+    print(f"[TS] Loading Argo floats for eddy {no} in [{start_date}, {end_date}]...")
+    argo_data = filtered_float_data(DS, no, track=track_df)
+    if argo_data.empty:
+        print("[TS] No matching Argo floats found.")
+        return None
+    if 'date' not in argo_data.columns:
+        argo_data['date'] = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
+    argo_data = argo_data[(argo_data['date'] >= start_ts) & (argo_data['date'] <= end_ts)]
+    if argo_data.empty:
+        print("[TS] No Argo data in the specified date range.")
+        return None
+
+    # --- 3. 准备背景数据（全量 Argo 或 GLORYS）---
+    bg_theta: np.ndarray
+    bg_sal: np.ndarray
+    if background == 'argo':
+        argo_full = argo_data.dropna(subset=['Temperature', 'Salinity'])
+        if len(argo_full) < 50:
+            print("[TS] Fewer than 50 valid θ/S points; background scatter will be skipped.")
+        bg_theta = argo_full['Temperature'].to_numpy(dtype=float)
+        bg_sal = argo_full['Salinity'].to_numpy(dtype=float)
+    elif background == 'glorys':
+        if k is None or b is None:
+            raise ValueError("background='glorys' 时必须提供 k 和 b 参数。")
+        mid_date = start_ts + (end_ts - start_ts) / 2
+        center_lon = float(track_df['center_lon'].mean())
+        center_lat = float(track_df['center_lat'].mean())
+        pkgs = get_vertical_glorys_from_center(
+            center_lon, center_lat, mid_date, k, b,
+            variables=['thetao', 'salinity'],
+        )
+        pkg = pkgs[0] if pkgs else {}
+        pd_data = pkg.get('profile_data', {})
+        theta_gl = pd_data.get('thetao')
+        sal_gl = pd_data.get('salinity')
+        if theta_gl is None or sal_gl is None:
+            print("[TS] GLORYS 缺少 thetao 或 salinity，无法生成背景。")
+            return None
+        theta_ma = np.ma.array(theta_gl, copy=False)
+        sal_ma = np.ma.array(sal_gl, copy=False)
+        valid_mask = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+        bg_theta = np.asarray(theta_ma[valid_mask], dtype=float)
+        bg_sal = np.asarray(sal_ma[valid_mask], dtype=float)
+        if bg_theta.size < 5:
+            print("[TS] GLORYS 有效 θ/S 点不足，无法生成背景。")
+            return None
+    else:
+        raise ValueError(f"background 须为 'argo' 或 'glorys'，收到 '{background}'。")
+
+    # --- 4. 前台：异常剖面全深度 + 峰值 ★ ---
+    argo_all = argo_full if background == 'argo' else argo_data
+    anomaly_rows = _reduce_argo_profiles_by_anomaly(argo_all, detection_config=detection_config)
+    if anomaly_rows.empty:
+        print("[TS] No anomalous profiles detected.")
+        return None
+    anomaly_pns = anomaly_rows['Profile_number'].unique()
+    argo_fg = argo_all[argo_all['Profile_number'].isin(anomaly_pns)]
+
+    # --- 5. 绘图 ---
+    region_slug = _current_region_key()
+    out_dir = Path(output_dir) if output_dir is not None else Path('plot_outputs') / 'shared' / region_slug / 'plot_ts_diagram'
+
+    kind = DS.lower() if isinstance(DS, str) else 'unknown'
+    sd_tag = start_ts.strftime('%Y%m%d')
+    ed_tag = end_ts.strftime('%Y%m%d')
+    filename = f"{kind}{no}_ts_{sd_tag}_{ed_tag}.png"
+    save_path = out_dir / filename if save_fig else None
+
+    date_label = f"{start_ts.strftime('%Y-%m-%d')} – {end_ts.strftime('%Y-%m-%d')}"
+    _plot_ts_diagram_core(
+        bg_theta, bg_sal, argo_fg,
+        center_lat=float(track_df['center_lat'].mean()),
+        center_lon=float(track_df['center_lon'].mean()),
+        anomaly_peaks=anomaly_rows,
+        subject_label=f"{kind.upper()} {no}",
+        date_label=date_label,
+        bg_label='Argo (bkg)' if background == 'argo' else 'GLORYS',
+        color_by=color_by,
+        show_fig=show_fig, save_fig=save_fig, save_path=save_path,
+    )
+
+
+def plot_regional_ts_diagram(
+    lon_range: tuple[float, float],
+    lat_range: tuple[float, float],
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    *,
+    background: str = 'argo',
+    detection_config: DetectionConfig | None = None,
+    color_by: str = 'depth',
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+) -> None:
+    """固定区域的聚合温盐图（欧拉视角）。
+
+    在指定经纬度范围内，收集时间窗口内所有 Argo 剖面，叠加在
+    背景 T-S 散点之上。背景可选 Argo（区域内全量剖面）或 GLORYS
+    （时间窗口中点的区域场）。适合分析特定海域的水团结构及其
+    异常剖面的 T-S 分布特征。
+
+    参数:
+        lon_range (tuple): (lon_min, lon_max)，允许跨日界线（如 170, -170）。
+        lat_range (tuple): (lat_min, lat_max)。
+        start_date / end_date: 时间窗口。
+        background: 'argo' 用全量 Argo 作背景，'glorys' 用 GLORYS 区域场。
+        detection_config: 异常检测配置，传入后仅异常剖面在前台叠加，峰值标 ★。
+        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+    """
+    lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
+    lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
+    start_ts, end_ts = pd.Timestamp(start_date), pd.Timestamp(end_date)
+
+    # --- 1. 按年加载 Argo 并空间过滤 ---
+    print(f"[TS] Loading Argo data for region ({lon_min}, {lon_max}), ({lat_min}, {lat_max})...")
+    all_years = []
+    for year in range(start_ts.year, end_ts.year + 1):
+        try:
+            yearly = load_argo_data(year)
+        except FileNotFoundError:
+            continue
+        if yearly.empty:
+            continue
+        lon_mask = _region_lon_mask(yearly['Longitude'].to_numpy(dtype=float), lon_min, lon_max)
+        lat_vals = yearly['Latitude'].to_numpy(dtype=float)
+        lat_mask = (lat_vals >= lat_min) & (lat_vals <= lat_max)
+        yearly = yearly[lon_mask & lat_mask]
+        if not yearly.empty:
+            all_years.append(yearly)
+
+    if not all_years:
+        print("[TS] No Argo data found in the specified region.")
+        return None
+    argo_data = pd.concat(all_years, ignore_index=True)
+
+    # --- 2. 时间过滤 ---
+    if 'date' not in argo_data.columns:
+        argo_data['date'] = pd.to_datetime(argo_data[['Year', 'Month', 'Day']])
+    argo_data = argo_data[(argo_data['date'] >= start_ts) & (argo_data['date'] <= end_ts)]
+    n_profiles = argo_data['Profile_number'].nunique() if 'Profile_number' in argo_data.columns else len(argo_data)
+    print(f"[TS] Found {n_profiles} unique profiles in the region and time window.")
+    if argo_data.empty:
+        print("[TS] No Argo data in the specified date range.")
+        return None
+
+    # --- 3. 准备背景数据（全量 Argo 或 GLORYS）---
+    bg_theta: np.ndarray
+    bg_sal: np.ndarray
+    if background == 'argo':
+        argo_full = argo_data.dropna(subset=['Temperature', 'Salinity'])
+        bg_theta = argo_full['Temperature'].to_numpy(dtype=float)
+        bg_sal = argo_full['Salinity'].to_numpy(dtype=float)
+    elif background == 'glorys':
+        mid_date = start_ts + (end_ts - start_ts) / 2
+        # 跨日线安全：用 _minimal_lon_diff_deg 计算区间中点
+        center_lon_ref = float(_normalize_lon_array(
+            lon_min + float(_minimal_lon_diff_deg(lon_max, lon_min)) / 2.0
+        ))
+        half_span = abs(float(_minimal_lon_diff_deg(lon_max, lon_min))) / 2.0
+        # _load_glorys_window_by_center 的 lon_min/max 是绝对经度，非偏移量
+        lon_min_local = center_lon_ref - half_span
+        lon_max_local = center_lon_ref + half_span
+        try:
+            _g_lon, _g_lat, _g_depth, g_vars = _load_glorys_window_by_center(
+                mid_date, center_lon_ref, lon_min_local, lon_max_local,
+                lat_min, lat_max, ['thetao', 'salinity'],
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"[TS] GLORYS 加载失败: {exc}")
+            return None
+        theta_gl = g_vars.get('thetao')
+        sal_gl = g_vars.get('salinity')
+        if theta_gl is None or sal_gl is None:
+            print("[TS] GLORYS 缺少 thetao 或 salinity。")
+            return None
+        theta_ma = np.ma.array(theta_gl, copy=False)
+        sal_ma = np.ma.array(sal_gl, copy=False)
+        valid_mask = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+        bg_theta = np.asarray(theta_ma[valid_mask], dtype=float)
+        bg_sal = np.asarray(sal_ma[valid_mask], dtype=float)
+        if bg_theta.size < 50:
+            print(f"[TS] GLORYS 有效 θ/S 配对点仅 {bg_theta.size}，过少。")
+            return None
+    else:
+        raise ValueError(f"background 须为 'argo' 或 'glorys'，收到 '{background}'。")
+
+    # --- 4. 前台：异常剖面全深度 + 峰值 ★ ---
+    argo_all = argo_full if background == 'argo' else argo_data
+    anomaly_rows = _reduce_argo_profiles_by_anomaly(argo_all, detection_config=detection_config)
+    if anomaly_rows.empty:
+        print("[TS] No anomalous profiles detected.")
+        return None
+    anomaly_pns = anomaly_rows['Profile_number'].unique()
+    argo_fg = argo_all[argo_all['Profile_number'].isin(anomaly_pns)]
+
+    # --- 5. 绘图 ---
+    # 跨日线安全：用区域几何中心（而非 Argo 坐标均值）作为 σ₀ 参考点
+    center_lat = (lat_min + lat_max) / 2.0
+    center_lon = float(_normalize_lon_array(
+        lon_min + float(_minimal_lon_diff_deg(lon_max, lon_min)) / 2.0
+    ))
+
+    region_slug = _current_region_key()
+    out_dir = Path(output_dir) if output_dir is not None else Path('plot_outputs') / 'shared' / region_slug / 'plot_ts_diagram'
+    sd_tag = start_ts.strftime('%Y%m%d')
+    ed_tag = end_ts.strftime('%Y%m%d')
+    lon0_s = f"{abs(lon_min):.0f}{'E' if lon_min >= 0 else 'W'}"
+    lon1_s = f"{abs(lon_max):.0f}{'E' if lon_max >= 0 else 'W'}"
+    lat0_s = f"{abs(lat_min):.0f}{'N' if lat_min >= 0 else 'S'}"
+    lat1_s = f"{abs(lat_max):.0f}{'N' if lat_max >= 0 else 'S'}"
+    filename = f"regional_ts_{lon0_s}-{lon1_s}_{lat0_s}-{lat1_s}_{sd_tag}_{ed_tag}.png"
+    save_path = out_dir / filename if save_fig else None
+
+    date_label = f"{start_ts.strftime('%Y-%m-%d')} – {end_ts.strftime('%Y-%m-%d')}"
+    _plot_ts_diagram_core(
+        bg_theta, bg_sal, argo_fg,
+        center_lat=center_lat, center_lon=center_lon,
+        anomaly_peaks=anomaly_rows,
+        subject_label=f"Regional ({lon_min:.0f}°–{lon_max:.0f}°, {lat_min:.0f}°–{lat_max:.0f}°)",
+        date_label=date_label,
+        bg_label='Argo (bkg)' if background == 'argo' else 'GLORYS',
+        color_by=color_by,
+        show_fig=show_fig, save_fig=save_fig, save_path=save_path,
+    )
 
 
 def _run_vertical_overview_batch(
@@ -9125,28 +9551,33 @@ def _run_vertical_overview_batch(
 
         ts_save_path = None
         if ts_diagram and argo_profile_rows is not None and not argo_profile_rows.empty:
+            if save_fig:
+                if '{date}' in save_name_prefix:
+                    filename_core = save_name_prefix.format(date=date_tag)
+                    ts_filename = f"{filename_core}_ts_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                else:
+                    ts_filename = f"{save_name_prefix}_ts_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
+                ts_save_path = out_dir / ts_filename
             try:
-                ts_fig = plot_argo_ts_diagram(
-                    vertical_package=pkg,
-                    argo_profile_rows=argo_profile_rows,
-                    anomaly_depth=heave_projection_depth_m,
-                    subject_label=subject_label,
-                    date_label=date_str,
-                    show_fig=show_fig,
-                    save_fig=False,
-                )
-                if ts_fig is not None and save_fig:
-                    if '{date}' in save_name_prefix:
-                        filename_core = save_name_prefix.format(date=date_tag)
-                        ts_filename = f"{filename_core}_ts_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
-                    else:
-                        ts_filename = f"{save_name_prefix}_ts_{date_tag}_k{k_val:.2f}b{b_val:+.2f}_{run_tag}.png"
-                    ts_save_path = out_dir / ts_filename
-                    ts_fig.savefig(ts_save_path, dpi=300, bbox_inches='tight')
-                    if verbose:
-                        print(f"T-S diagram saved to: {ts_save_path}")
-                if ts_fig is not None and not save_fig:
-                    plt.close(ts_fig)
+                pd_data = pkg.get('profile_data', {})
+                theta_gl = pd_data.get('thetao')
+                sal_gl = pd_data.get('salinity')
+                if theta_gl is not None and sal_gl is not None:
+                    theta_ma = np.ma.array(theta_gl, copy=False)
+                    sal_ma = np.ma.array(sal_gl, copy=False)
+                    valid_gl = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+                    bg_theta = np.asarray(theta_ma[valid_gl], dtype=float)
+                    bg_sal = np.asarray(sal_ma[valid_gl], dtype=float)
+                    center_lat = float(np.nanmean(np.asarray(pkg.get('lat_coords', [30.0]), dtype=float)))
+                    center_lon = float(np.nanmean(np.asarray(pkg.get('lon_coords', [0.0]), dtype=float)))
+                    _plot_ts_diagram_core(
+                        bg_theta, bg_sal, argo_profile_rows,
+                        center_lat=center_lat, center_lon=center_lon,
+                        anomaly_depth=heave_projection_depth_m,
+                        subject_label=subject_label, date_label=date_str,
+                        bg_label='GLORYS',
+                        show_fig=show_fig, save_fig=save_fig, save_path=ts_save_path,
+                    )
             except (ValueError, RuntimeError, TypeError, KeyError):
                 if verbose:
                     print(f"Warning: T-S diagram failed for k={k_val}, b={b_val}:")
