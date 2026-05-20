@@ -5522,8 +5522,8 @@ def get_vertical_glorys_from_center(
     center_lon: float,
     center_lat: float,
     needed_date: str | pd.Timestamp,
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
     *,
     variables: list = ['vorticity'],
     x_min_km: float | None = None,
@@ -5535,12 +5535,15 @@ def get_vertical_glorys_from_center(
     profile_id: int | None = None,
     ds_name: str = 'ARGO',
 ) -> list[dict]:
-    """按给定中心点与剖面线参数计算 GLORYS 垂向剖面数据包。"""
-    if k is None or b is None:
-        raise ValueError("k 和 b 必须提供以计算垂直剖面。")
+    """按给定中心点与剖面线参数计算 GLORYS 垂向剖面数据包。
 
-    k_list = [k] if isinstance(k, (int, float)) else k
-    b_list = [b] if isinstance(b, (int, float)) else b
+    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
+    """
+    if k is None or b is None:
+        k_list, b_list = [0.0], [float(center_lat)]
+    else:
+        k_list = [k] if isinstance(k, (int, float)) else k
+        b_list = [b] if isinstance(b, (int, float)) else b
     if len(k_list) != len(b_list):
         raise ValueError("k 和 b 的列表长度必须一致。")
 
@@ -6525,7 +6528,8 @@ def get_idx(DS: list, no: int, start_date: str, end_date: str = None) -> int | l
         return idx_list
 
 def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
-                        k: float | list[float], b: float | list[float],
+                        k: float | list[float] | None = None,
+                        b: float | list[float] | None = None,
                         variables: list = ['vorticity'],
                         x_min_km: float | None = None,
                         x_max_km: float | None = None,
@@ -6597,11 +6601,13 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
                 - 'b'` (float): 该剖面所用直线方程的截距。
     '''
     # --- 0. 准备工作：统一输入格式并获取公共数据 ---
-    if k is None or b is None:
-        raise ValueError("k 和 b 必须提供以计算垂直剖面。")
-
-    k_list = [k] if isinstance(k, (int, float)) else k
-    b_list = [b] if isinstance(b, (int, float)) else b
+    if k is None and b is None:
+        k_list, b_list = [], []
+    elif k is None or b is None:
+        raise ValueError("k 和 b 必须同时提供，或同时省略。")
+    else:
+        k_list = [k] if isinstance(k, (int, float)) else k
+        b_list = [b] if isinstance(b, (int, float)) else b
 
     if len(k_list) != len(b_list):
         raise ValueError("k 和 b 的列表长度必须一致。")
@@ -6679,6 +6685,9 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
     center_lon_arr = track_df['center_lon'].to_numpy()
     center_lat_arr = track_df['center_lat'].to_numpy()
     radius_arr = track_df['radius'].to_numpy()
+
+    if not k_list and not b_list:
+        k_list, b_list = [0.0], [float(center_lat_arr[int(needed_idx)])]
 
     lon_flat: list[np.ndarray] = []
     lat_flat: list[np.ndarray] = []
@@ -7632,7 +7641,8 @@ def _plot_vertical_glorys_core(DS: list | str | tuple | dict | None, no: int, ne
         plt.close(fig)
 
 def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
-                               k: float | list[float], b: float | list[float],
+                               k: float | list[float] | None = None,
+                               b: float | list[float] | None = None,
                                variable: str = 'vorticity',
                                show_fig: bool = True, save_fig: bool = False,
                                xmin: float = -400.0, xmax: float = 400.0,
@@ -7717,8 +7727,8 @@ def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestam
 def plot_argo_vertical_glorys(
     profile_number: int,
     profile_time: int | str | pd.Timestamp,
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
     platform_number: int | None = None,
     variable: str = 'vorticity',
     show_fig: bool = True,
@@ -7889,12 +7899,14 @@ def plot_argo_vertical_glorys(
 
 
 def _normalize_profile_lines(
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
 ) -> tuple[list[float], list[float]]:
-    """标准化剖面线参数，返回等长的 k/b 列表。"""
+    """标准化剖面线参数，返回等长的 k/b 列表。k/b 均为 None 时返回空列表。"""
+    if k is None and b is None:
+        return [], []
     if k is None or b is None:
-        raise ValueError("k 和 b 必须同时提供。")
+        raise ValueError("k 和 b 必须同时提供，或同时省略。")
 
     k_list = [float(k)] if isinstance(k, (int, float, np.integer, np.floating)) else [float(v) for v in k]
     b_list = [float(b)] if isinstance(b, (int, float, np.integer, np.floating)) else [float(v) for v in b]
@@ -8968,8 +8980,8 @@ def _plot_ts_diagram_core(
 def plot_argo_ts_diagram(
     profile_number: int,
     profile_time: int | str | pd.Timestamp,
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
     *,
     platform_number: int | None = None,
     detection_config: DetectionConfig | None = None,
@@ -8997,7 +9009,8 @@ def plot_argo_ts_diagram(
     参数:
         profile_number (int): Argo 剖面编号。
         profile_time: 剖面日期（int YYYYMMDD / 'YYYY-MM-DD' / Timestamp）。
-        k / b: GLORYS 垂向剖面线参数 y = kx + b（支持 list，每条线出一张图）。
+        k / b: GLORYS 垂向剖面线参数 y = kx + b（支持 list，每条线出一张图；
+            None 时默认纬向线 k=0, b=center_lat）。
         platform_number: 浮标平台编号，辅助定位（可选）。
         detection_config: 异常检测配置，传入后在异常峰值深度叠加 ★ 标记。
         color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
@@ -9022,10 +9035,8 @@ def plot_argo_ts_diagram(
     argo_rows = info['profile_rows'].copy()
 
     window_half_size_km = max(abs(float(xmin)), abs(float(xmax)))
-    k_list = [k] if isinstance(k, (int, float)) else k
-    b_list = [b] if isinstance(b, (int, float)) else b
     pkgs = get_vertical_glorys_from_center(
-        center_lon, center_lat, target_date, k_list, b_list,
+        center_lon, center_lat, target_date, k, b,
         variables=['thetao', 'salinity'],
         x_min_km=xmin, x_max_km=xmax,
         profile_spacing_km=profile_spacing_km,
@@ -9058,8 +9069,8 @@ def plot_argo_ts_diagram(
         if not anomaly_rows.empty:
             anomaly_peaks = anomaly_rows
 
-    k_val = k_list[0] if k_list else 0.0
-    b_val = b_list[0] if b_list else 0.0
+    k_val = k if isinstance(k, (int, float)) else (k[0] if k else 0.0)
+    b_val = b if isinstance(b, (int, float)) else (b[0] if b else float(center_lat))
     date_str = target_date.strftime('%Y-%m-%d')
     save_path = None
     if save_fig:
@@ -9090,8 +9101,6 @@ def plot_track_ts_diagram(
     end_date: str | pd.Timestamp,
     *,
     background: str = 'argo',
-    k: float | None = None,
-    b: float | None = None,
     detection_config: DetectionConfig | None = None,
     color_by: str = 'depth',
     show_fig: bool = True,
@@ -9102,15 +9111,14 @@ def plot_track_ts_diagram(
 
     追踪指定涡旋在时间窗口内的移动路径，收集路径附近所有匹配
     Argo 剖面，叠加在背景 T-S 散点之上。背景可选 Argo（区域内
-    全量剖面）或 GLORYS（沿 kx+b 线的垂向切片）。适合分析
+    全量剖面）或 GLORYS（逐月收集涡旋有效半径内 θ/S 散点）。适合分析
     特定涡旋演化过程中水团属性的系统性变化。
 
     参数:
         DS (str): kind 字符串（'acs'|'acl'|'cs'|'cl'）。
         no (int): 涡旋编号。
         start_date / end_date: 时间窗口。
-        background: 'argo' 用全量 Argo 作背景，'glorys' 用 GLORYS 垂向剖面。
-        k / b: 剖面线参数，``background='glorys'`` 时必传。
+        background: 'argo' 用全量 Argo 作背景，'glorys' 用涡旋半径内 GLORYS 逐月聚合。
         detection_config: 异常检测配置，传入后仅异常剖面在前台叠加，峰值标 ★。
         color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
         show_fig / save_fig: 是否显示 / 保存图片。
@@ -9153,29 +9161,93 @@ def plot_track_ts_diagram(
         bg_theta = argo_full['Temperature'].to_numpy(dtype=float)
         bg_sal = argo_full['Salinity'].to_numpy(dtype=float)
     elif background == 'glorys':
-        if k is None or b is None:
-            raise ValueError("background='glorys' 时必须提供 k 和 b 参数。")
-        mid_date = start_ts + (end_ts - start_ts) / 2
-        center_lon = float(track_df['center_lon'].mean())
-        center_lat = float(track_df['center_lat'].mean())
-        pkgs = get_vertical_glorys_from_center(
-            center_lon, center_lat, mid_date, k, b,
-            variables=['thetao', 'salinity'],
-        )
-        pkg = pkgs[0] if pkgs else {}
-        pd_data = pkg.get('profile_data', {})
-        theta_gl = pd_data.get('thetao')
-        sal_gl = pd_data.get('salinity')
-        if theta_gl is None or sal_gl is None:
-            print("[TS] GLORYS 缺少 thetao 或 salinity，无法生成背景。")
+        # 逐月收集涡旋半径 + 轮廓多边形内的 GLORYS θ/S
+        circle_factor = globals().get('circle_enlargement_factor', 1.2)
+        radii_m = pd.to_numeric(track_df['radius'], errors='coerce')
+        clats = pd.to_numeric(track_df['center_lat'], errors='coerce')
+        radius_deg = radii_m / (111320.0 * np.cos(np.radians(clats.clip(-80, 80))))
+        track_df['_r_deg'] = radius_deg * float(circle_factor)
+        track_df['_ym'] = track_df['date'].dt.to_period('M')
+
+        bg_parts_theta, bg_parts_sal = [], []
+        for _ym, group in track_df.groupby('_ym', sort=True):
+            mid_idx = len(group) // 2
+            ref_date = group['date'].iloc[mid_idx]
+            ref_lon = float(_normalize_lon_array(group['center_lon'].mean()))
+            ref_lat = float(group['center_lat'].mean())
+            # 窗口半宽 = max(圆形半径, 轮廓边界框)
+            half_deg = float(group['_r_deg'].max()) + 0.25
+            for _, row in group.iterrows():
+                clon_arr = np.asarray(row['contour_lon'], dtype=float)
+                clat_arr = np.asarray(row['contour_lat'], dtype=float)
+                if clon_arr.size < 3 or np.all(np.abs(clon_arr) >= 179.9):
+                    continue
+                clon_norm = ref_lon + _minimal_lon_diff_deg(clon_arr, ref_lon)
+                half_deg = max(half_deg,
+                               float(np.abs(clon_norm - ref_lon).max()) + 0.25,
+                               float(np.abs(clat_arr - ref_lat).max()) + 0.25)
+            lon_lo = ref_lon - half_deg
+            lon_hi = ref_lon + half_deg
+            lat_lo = ref_lat - half_deg
+            lat_hi = ref_lat + half_deg
+            try:
+                _gl, _ga, _gd, gv = _load_glorys_window_by_center(
+                    ref_date, ref_lon, lon_lo, lon_hi, lat_lo, lat_hi,
+                    ['thetao', 'salinity'],
+                )
+            except (ValueError, FileNotFoundError):
+                continue
+            th = gv.get('thetao')
+            sa = gv.get('salinity')
+            if th is None or sa is None:
+                continue
+            th_ma = np.ma.array(th, copy=False)
+            sa_ma = np.ma.array(sa, copy=False)
+            valid_data = ~np.ma.getmaskarray(th_ma) & ~np.ma.getmaskarray(sa_ma)
+            if valid_data.sum() == 0:
+                continue
+            # 构建网格坐标
+            glon_1d = np.asarray(_gl, dtype=float)
+            glat_1d = np.asarray(_ga, dtype=float)
+            glon_2d, glat_2d = np.meshgrid(glon_1d, glat_1d)
+            spatial_mask = np.zeros(glon_2d.shape, dtype=bool)
+            # 逐日累积：圆形 + 轮廓多边形
+            for _, row in group.iterrows():
+                day_lon = float(row['center_lon'])
+                day_lat = float(row['center_lat'])
+                day_radius_m = float(row['radius'])
+                dist_m = adaptive_distance_m(
+                    glon_2d.ravel(), glat_2d.ravel(),
+                    day_lon, day_lat, wrap_dateline=True,
+                ).reshape(glon_2d.shape)
+                day_mask = dist_m <= day_radius_m * float(circle_factor)
+                # 轮廓多边形
+                clon = np.asarray(row['contour_lon'], dtype=float)
+                clat = np.asarray(row['contour_lat'], dtype=float)
+                if clon.size >= 3 and not np.all(np.abs(clon) >= 179.9):
+                    clon_n = day_lon + _minimal_lon_diff_deg(clon, day_lon)
+                    verts = np.column_stack([clon_n, clat])
+                    try:
+                        poly = MplPath(verts)
+                        day_mask |= poly.contains_points(
+                            np.column_stack([glon_2d.ravel(), glat_2d.ravel()])
+                        ).reshape(glon_2d.shape)
+                    except Exception:
+                        pass
+                spatial_mask |= day_mask
+            # 应用到所有深度层
+            full_mask = valid_data & spatial_mask[np.newaxis, :, :]
+            if full_mask.sum() > 0:
+                bg_parts_theta.append(np.asarray(th_ma[full_mask], dtype=float))
+                bg_parts_sal.append(np.asarray(sa_ma[full_mask], dtype=float))
+
+        if not bg_parts_theta:
+            print("[TS] GLORYS 未收集到有效 θ/S 点，无法生成背景。")
             return None
-        theta_ma = np.ma.array(theta_gl, copy=False)
-        sal_ma = np.ma.array(sal_gl, copy=False)
-        valid_mask = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
-        bg_theta = np.asarray(theta_ma[valid_mask], dtype=float)
-        bg_sal = np.asarray(sal_ma[valid_mask], dtype=float)
-        if bg_theta.size < 5:
-            print("[TS] GLORYS 有效 θ/S 点不足，无法生成背景。")
+        bg_theta = np.concatenate(bg_parts_theta)
+        bg_sal = np.concatenate(bg_parts_sal)
+        if bg_theta.size < 50:
+            print(f"[TS] GLORYS 有效 θ/S 配对点仅 {bg_theta.size}，过少。")
             return None
     else:
         raise ValueError(f"background 须为 'argo' 或 'glorys'，收到 '{background}'。")
@@ -9599,8 +9671,8 @@ def plot_track_vertical_glorys_overview(
     DS: list | str | tuple | dict,
     no: int,
     needed_date: str | pd.Timestamp,
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
     *,
     variables: list[str] | None = None,
     needed_depth: float | int = 0,
@@ -9636,8 +9708,9 @@ def plot_track_vertical_glorys_overview(
     sigma_overview: bool = False,
     ts_diagram: bool = False,
 ) -> list[dict]:
-    """绘制 track 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
+    """绘制 track 场景 GLORYS vertical 2x2 总览图。
 
+    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
     ``z_overview`` / ``sigma_overview`` / ``ts_diagram`` 独立控制
     z 坐标、σ 坐标总览图与 T-S 图的输出。
     """
@@ -9663,6 +9736,10 @@ def plot_track_vertical_glorys_overview(
         raise ValueError(f"Date {target_ts.strftime('%Y-%m-%d')} not found in track {no}.")
     needed_idx = int(same_day_idx[0])
     target_date = pd.Timestamp(dates.iloc[needed_idx])
+
+    if not k_list and not b_list:
+        center_lats = pd.to_numeric(track_df['center_lat'], errors='coerce')
+        k_list, b_list = [0.0], [float(center_lats.iloc[needed_idx])]
 
     radius_arr = pd.to_numeric(track_df['radius'], errors='coerce').to_numpy(dtype=float)
     projection_distance_scale_km = None
@@ -9750,8 +9827,8 @@ def plot_track_vertical_glorys_overview(
 def plot_argo_vertical_glorys_overview(
     profile_number: int,
     profile_time: int | str | pd.Timestamp,
-    k: float | list[float],
-    b: float | list[float],
+    k: float | list[float] | None = None,
+    b: float | list[float] | None = None,
     *,
     platform_number: int | None = None,
     variables: list[str] | None = None,
@@ -9789,8 +9866,9 @@ def plot_argo_vertical_glorys_overview(
     sigma_overview: bool = False,
     ts_diagram: bool = False,
 ) -> list[dict]:
-    """绘制 Argo 场景 GLORYS vertical 2x2 总览图（每条 k/b 一张图）。
+    """绘制 Argo 场景 GLORYS vertical 2x2 总览图。
 
+    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
     ``ts_diagram=True`` 时额外绘制 T-S 图。
 
     ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
@@ -9814,6 +9892,9 @@ def plot_argo_vertical_glorys_overview(
     center_lon = float(info['center_lon'])
     center_lat = float(info['center_lat'])
     target_date = pd.Timestamp(info['target_date'])
+
+    if not k_list and not b_list:
+        k_list, b_list = [0.0], [center_lat]
 
     window_half_size_km = max(abs(float(xmin)), abs(float(xmax)))
 
@@ -13206,8 +13287,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标 2x2 总览图，
     默认 ``z_overview=True, sigma_overview=False``，两者可同时开启。
 
-    第一版使用固定的纬向剖面线：每个剖面都取经过 Argo 点的 ``y = lat``，
-    即 ``k=0, b=center_lat``。输入 anomalies parquet 的定位规则与
+    垂向剖面线默认为纬向（``k=0, b=center_lat``），与所有垂向函数的
+    缺省行为一致。输入 anomalies parquet 的定位规则与
     ``plot_hotspot_anomaly_vertical_profiles`` 保持一致；每个剖面的 GLORYS 图
     分别交给 ``plot_argo_horizontal_glorys`` 与
     ``plot_argo_vertical_glorys_overview`` 生成。
