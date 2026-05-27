@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.10 变更：
+#   - 新增 spice 配置小节，百分位阈值判定 T-S spiciness 偏离（核加权，中纬高纬通用）。
 # version 1.9 变更：
 #   - 新增 heave.z_search_m，等密线连通性检查：仅搜索在 Argo 点附近存在的 σ 面。
 #   - z_min 改为与 σ_peak 同一条等密线的最浅深度，H/z_min 物理自洽。
@@ -69,6 +71,10 @@ processing:
     x_window_km: 200.0              # 出露搜索水平窗口半宽 (km)
     local_x_window_km: 50.0         # Heave 局地搜索水平窗口半宽 (km)
     z_search_m: 200.0               # 等密线连通性垂向范围 (m)，仅搜索在 Argo 点 ±200m 内存在过的 σ 面
+
+  # Spiciness 异常阈值（百分位 P < threshold 或 P > 100−threshold 视为显著 T-S 偏离）
+  spice:
+    percentile_threshold: 10          # P < 10 = 显著冷鲜，P > 90 = 显著暖咸
 
 plot:
   basemap_colors:

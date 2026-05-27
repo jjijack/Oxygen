@@ -171,6 +171,9 @@ _default_adaptive_lat_threshold = float(
 _default_adaptive_distance_threshold_km = float(
     _PROC_CFG.get('processing', {}).get('adaptive_distance_threshold_km', 300.0)
 )
+_default_spice_percentile_threshold = float(
+    _PROC_CFG.get('processing', {}).get('spice', {}).get('percentile_threshold', 10.0)
+)
 _default_vertical_profile_spacing_km = float(
     _PROC_CFG.get('processing', {}).get('vertical_profile_spacing_km', 2.0)
 )
@@ -261,6 +264,9 @@ class DetectionConfig:
     trim_bin_width_check: float = field(default_factory=lambda: _default_trim_bin_width_check)
     trim_depth_min: float = field(default_factory=lambda: _default_trim_depth_min)
     trim_depth_max: float = field(default_factory=lambda: _default_trim_depth_max)
+
+    # Spiciness T-S 偏离阈值（百分位）
+    spice_percentile_threshold: float = field(default_factory=lambda: _default_spice_percentile_threshold)
 
     # 通用预处理与过滤
     depth_interval: float = field(default_factory=lambda: _default_depth_interval)
@@ -8833,6 +8839,103 @@ def _plot_glorys_overview_vertical_2x2_sigma(
     return fig
 
 
+def compute_spiciness_anomaly(
+    bg_theta: np.ndarray,
+    bg_sal: np.ndarray,
+    fg_theta: np.ndarray,
+    fg_sal: np.ndarray,
+    *,
+    center_lat: float = 30.0,
+    center_lon: float = 0.0,
+    sigma_bandwidth: float = 0.25,
+    min_effective_weight: float = 50.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """计算前景 T-S 点相对背景分布的带符号 spiciness 异常。
+
+    用高斯核在 σ₀ 空间加权所有背景点，返回 π 的加权中位数偏差 δπ
+    和加权百分位。P < 5 为显著冷鲜（T-S 图偏左下），P > 95 为显著暖咸
+    （T-S 图偏右）。百分位不受 σ₀ 范围宽窄影响，中纬高纬通用。
+
+    参数：
+        bg_theta / bg_sal: 背景温盐一维数组。
+        fg_theta / fg_sal: 前景温盐一维数组。
+        center_lat / center_lon: 参考位置（仅影响 SA 计算，对本函数影响极小）。
+        sigma_bandwidth: σ₀ 高斯核带宽 (kg/m³)，越大越平滑。
+        min_effective_weight: 有效权重下限，不足则返回 NaN。
+
+    返回：
+        (delta_pi, percentile): 等长一维数组；无法计算的位置为 NaN。
+        delta_pi 为带符号 spiciness 偏差，percentile 为 σ₀ 加权背景
+        π 分布中的百分位 (0–100)。
+    """
+    bg_theta = np.asarray(bg_theta, dtype=float)
+    bg_sal = np.asarray(bg_sal, dtype=float)
+    fg_theta = np.asarray(fg_theta, dtype=float)
+    fg_sal = np.asarray(fg_sal, dtype=float)
+
+    finite_bg = np.isfinite(bg_theta) & np.isfinite(bg_sal)
+    bg_theta = bg_theta[finite_bg]
+    bg_sal = bg_sal[finite_bg]
+    if len(bg_theta) < 30:
+        return np.full_like(fg_theta, np.nan), np.full_like(fg_theta, np.nan)
+
+    p_ref = 0.0  # surface-referenced; bg 无深度信息，fg 同理以保持一致
+    SA_bg = gsw.SA_from_SP(bg_sal, p_ref, center_lon, center_lat)
+    CT_bg = gsw.CT_from_pt(SA_bg, bg_theta)
+    sigma0_bg = gsw.sigma0(SA_bg, CT_bg)
+    pi_bg = gsw.spiciness0(SA_bg, CT_bg)
+
+    valid_bg = np.isfinite(sigma0_bg) & np.isfinite(pi_bg)
+    sigma0_bg = sigma0_bg[valid_bg]
+    pi_bg = pi_bg[valid_bg]
+    if len(sigma0_bg) < 30:
+        return np.full_like(fg_theta, np.nan), np.full_like(fg_theta, np.nan)
+
+    # Sort bg by π ascending once — all fg points share this sorted order
+    sort_idx = np.argsort(pi_bg)
+    pi_bg_sorted = pi_bg[sort_idx]
+    sigma0_bg_sorted = sigma0_bg[sort_idx]
+
+    SA_fg = gsw.SA_from_SP(fg_sal, p_ref, center_lon, center_lat)
+    CT_fg = gsw.CT_from_pt(SA_fg, fg_theta)
+    sigma0_fg = gsw.sigma0(SA_fg, CT_fg)
+    pi_fg = gsw.spiciness0(SA_fg, CT_fg)
+
+    delta_pi = np.full_like(fg_theta, np.nan)
+    percentile = np.full_like(fg_theta, np.nan)
+    inv_two_s2 = -0.5 / (float(sigma_bandwidth) ** 2)
+
+    for j in range(len(fg_theta)):
+        sf = sigma0_fg[j]
+        pf = pi_fg[j]
+        if not (np.isfinite(sf) and np.isfinite(pf)):
+            continue
+
+        # Gaussian weights in σ₀ space
+        dsigma = sigma0_bg_sorted - sf
+        weights = np.exp(dsigma * dsigma * inv_two_s2)
+        total_weight = np.sum(weights)
+        if total_weight < float(min_effective_weight):
+            continue
+
+        # Weighted median → δπ
+        cum_weights = np.cumsum(weights)
+        med_pos = np.searchsorted(cum_weights, total_weight / 2.0)
+        pi_median_w = float(pi_bg_sorted[min(med_pos, len(pi_bg_sorted) - 1)])
+        delta_pi[j] = float(pf - pi_median_w)
+
+        # Weighted percentile of π_fg in bg π distribution
+        rank = np.searchsorted(pi_bg_sorted, pf, side='right')
+        if rank <= 0:
+            percentile[j] = 0.0
+        elif rank >= len(pi_bg_sorted):
+            percentile[j] = 100.0
+        else:
+            percentile[j] = float(cum_weights[rank - 1]) / float(total_weight) * 100.0
+
+    return delta_pi, percentile
+
+
 def _plot_ts_diagram_core(
     bg_theta: np.ndarray,
     bg_sal: np.ndarray,
@@ -8854,6 +8957,7 @@ def _plot_ts_diagram_core(
     contour_linewidth: float = 0.6,
     contour_alpha: float = 0.45,
     label_contours: bool = True,
+    annotate_spice: bool = True,
 ) -> None:
     """T-S 图内核：背景散点 + σ₀ 等值线 + Argo 剖面叠加。
 
@@ -8957,6 +9061,38 @@ def _plot_ts_diagram_core(
                        edgecolors='black', linewidths=0.5, zorder=5,
                        label=f'Anomaly ({anomaly_depth:.0f} m)')
 
+    spice_label = ''
+    if annotate_spice and anomaly_peaks is not None and not anomaly_peaks.empty:
+        peaks = anomaly_peaks.dropna(subset=['Salinity', 'Temperature'])
+        if not peaks.empty:
+            dp_arr, pct_arr = compute_spiciness_anomaly(
+                theta_vals, sal_vals,
+                peaks['Temperature'].to_numpy(dtype=float),
+                peaks['Salinity'].to_numpy(dtype=float),
+                center_lat=center_lat, center_lon=center_lon,
+            )
+            valid = np.isfinite(dp_arr) & np.isfinite(pct_arr)
+            if valid.any():
+                dp_v = dp_arr[valid]
+                pct_v = pct_arr[valid]
+                if len(pct_v) == 1:
+                    spice_label = f'δπ={dp_v[0]:+.3f}, {pct_v[0]:.0f}%'
+                else:
+                    spice_label = (
+                        f'δπ={np.mean(dp_v):+.3f}, '
+                        f'{np.min(pct_v):.0f}%–{np.max(pct_v):.0f}%'
+                    )
+    elif annotate_spice and anomaly_depth is not None and np.isfinite(anomaly_depth) and has_argo:
+        ad_sal_arr = np.array([ad_sal], dtype=float)
+        ad_theta_arr = np.array([ad_theta], dtype=float)
+        dp_single, pct_single = compute_spiciness_anomaly(
+            theta_vals, sal_vals,
+            ad_theta_arr, ad_sal_arr,
+            center_lat=center_lat, center_lon=center_lon,
+        )
+        if np.isfinite(pct_single[0]) and np.isfinite(dp_single[0]):
+            spice_label = f'δπ={dp_single[0]:+.3f}, {pct_single[0]:.0f}%'
+
     ax.set_xlabel('Salinity (psu)', fontsize=12)
     ax.set_ylabel('Temperature (°C)', fontsize=12)
     title_parts = []
@@ -8965,6 +9101,8 @@ def _plot_ts_diagram_core(
     title_parts.append('T-S Diagram')
     if date_label:
         title_parts.append(date_label)
+    if spice_label:
+        title_parts.append(spice_label)
     ax.set_title(' | '.join(title_parts), fontsize=14)
     ax.legend(fontsize=9, loc='best', markerscale=0.8)
     ax.grid(True, alpha=0.2)
@@ -8999,6 +9137,7 @@ def plot_argo_ts_diagram(
     contour_linewidth: float = 0.6,
     contour_alpha: float = 0.45,
     label_contours: bool = True,
+    annotate_spice: bool = True,
 ) -> None:
     """绘制单个 Argo 剖面的温盐图（GLORYS 垂向切片 + Argo 叠加）。
 
@@ -9023,6 +9162,7 @@ def plot_argo_ts_diagram(
         sigma_contour_levels: σ₀ 等密度线层级，None 时按数据范围自动推断。
         contour_color / contour_linewidth / contour_alpha: 等密度线样式。
         label_contours: 是否在等密度线上标注 σ₀ 值。
+        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
     """
     info = _resolve_argo_profile_center(
         profile_number=int(profile_number),
@@ -9091,6 +9231,7 @@ def plot_argo_ts_diagram(
         sigma_contour_levels=sigma_contour_levels,
         contour_color=contour_color, contour_linewidth=contour_linewidth,
         contour_alpha=contour_alpha, label_contours=label_contours,
+        annotate_spice=annotate_spice,
     )
 
 
@@ -9106,6 +9247,7 @@ def plot_track_ts_diagram(
     show_fig: bool = True,
     save_fig: bool = False,
     output_dir: str | Path | None = None,
+    annotate_spice: bool = True,
 ) -> None:
     """沿涡旋轨迹的聚合温盐图（拉格朗日视角）。
 
@@ -9123,6 +9265,7 @@ def plot_track_ts_diagram(
         color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
         show_fig / save_fig: 是否显示 / 保存图片。
         output_dir: 图片输出目录，None 时使用默认路径。
+        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
     """
     # --- 1. 加载轨迹并按时间过滤 ---
     track_df = find_track(DS, no)
@@ -9282,6 +9425,7 @@ def plot_track_ts_diagram(
         bg_label='Argo (bkg)' if background == 'argo' else 'GLORYS',
         color_by=color_by,
         show_fig=show_fig, save_fig=save_fig, save_path=save_path,
+        annotate_spice=annotate_spice,
     )
 
 
@@ -9297,6 +9441,7 @@ def plot_regional_ts_diagram(
     show_fig: bool = True,
     save_fig: bool = False,
     output_dir: str | Path | None = None,
+    annotate_spice: bool = True,
 ) -> None:
     """固定区域的聚合温盐图（欧拉视角）。
 
@@ -9314,6 +9459,7 @@ def plot_regional_ts_diagram(
         color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
         show_fig / save_fig: 是否显示 / 保存图片。
         output_dir: 图片输出目录，None 时使用默认路径。
+        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
     """
     lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
     lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
@@ -9429,6 +9575,7 @@ def plot_regional_ts_diagram(
         bg_label='Argo (bkg)' if background == 'argo' else 'GLORYS',
         color_by=color_by,
         show_fig=show_fig, save_fig=save_fig, save_path=save_path,
+        annotate_spice=annotate_spice,
     )
 
 
@@ -9457,29 +9604,33 @@ def _run_vertical_overview_batch(
     isoline_alpha: float,
     label_isolines: bool,
     detection_config: DetectionConfig | None,
-    show_fig: bool,
-    save_fig: bool,
-    output_dir: str | Path | None,
-    verbose: bool,
-    heave_projection_depth_m: float | None = None,
-    heave_x_window_km: float = 25.0,
-    heave_z_window_m: float | None = 100.0,
-    heave_search_range: float = _heave_search_range,
-    heave_depth_threshold: float = _heave_depth_threshold,
-    heave_z_search_m: float | None = _heave_z_search_m,
-    annotate_heave: bool = False,
     z_overview: bool = True,
     sigma_overview: bool = False,
     sigma_ymin: float = 23.0,
     sigma_ymax: float = 28.0,
     ts_diagram: bool = False,
     argo_profile_rows: pd.DataFrame | None = None,
+    annotate_heave: bool = True,
+    heave_projection_depth_m: float | None = None,
+    heave_x_window_km: float = 25.0,
+    heave_z_window_m: float | None = 100.0,
+    heave_search_range: float = _heave_search_range,
+    heave_depth_threshold: float = _heave_depth_threshold,
+    heave_z_search_m: float | None = _heave_z_search_m,
+    annotate_spice: bool = True,
+    anomaly_sal: float | None = None,
+    anomaly_theta: float | None = None,
+    show_fig: bool,
+    save_fig: bool,
+    output_dir: str | Path | None,
+    verbose: bool,
 ) -> list[dict]:
     """按多条 k/b 批量绘制 vertical overview，并统一处理保存与显示。
 
     ``z_overview=True`` 绘制 z 坐标 2x2 总览图，
     ``sigma_overview=True`` 绘制 σ 坐标 2x2 总览图（PV / Z(σ) / θ / S），
     ``ts_diagram=True`` 绘制 T-S 图（需传入 ``argo_profile_rows``）。
+    ``annotate_heave`` / ``annotate_spice`` 控制对应诊断量的计算与结果输出。
     """
     results: list[dict] = []
     region_slug = _current_region_key()
@@ -9533,6 +9684,30 @@ def _run_vertical_overview_batch(
                     rf"$\sigma_{{\mathrm{{peak}}}}={float(sigma_peak):.2f}\,\mathrm{{kg/m^3}}$"
                 )
 
+        spice_anomaly_val = np.nan
+        spice_percentile_val = np.nan
+        if annotate_spice and anomaly_sal is not None and anomaly_theta is not None:
+            pd_data = pkg.get('profile_data', {})
+            theta_gl = pd_data.get('thetao')
+            sal_gl = pd_data.get('salinity')
+            if theta_gl is not None and sal_gl is not None:
+                theta_ma = np.ma.array(theta_gl, copy=False)
+                sal_ma = np.ma.array(sal_gl, copy=False)
+                valid_gl = ~np.ma.getmaskarray(theta_ma) & ~np.ma.getmaskarray(sal_ma)
+                bg_theta = np.asarray(theta_ma[valid_gl], dtype=float)
+                bg_sal = np.asarray(sal_ma[valid_gl], dtype=float)
+                center_lat_sp = float(np.nanmean(np.asarray(pkg.get('lat_coords', [30.0]), dtype=float)))
+                center_lon_sp = float(np.nanmean(np.asarray(pkg.get('lon_coords', [0.0]), dtype=float)))
+                dp_arr, pct_arr = compute_spiciness_anomaly(
+                    bg_theta, bg_sal,
+                    np.array([anomaly_theta]), np.array([anomaly_sal]),
+                    center_lat=center_lat_sp, center_lon=center_lon_sp,
+                )
+                if np.isfinite(dp_arr[0]) and np.isfinite(pct_arr[0]):
+                    spice_anomaly_val = float(dp_arr[0])
+                    spice_percentile_val = float(pct_arr[0])
+
+        title_extra = heave_title_extra
         save_path = None
         if z_overview:
             fig = _plot_glorys_overview_vertical_2x2(
@@ -9554,7 +9729,7 @@ def _run_vertical_overview_batch(
                 isoline_linewidth=isoline_linewidth,
                 isoline_alpha=isoline_alpha,
                 label_isolines=label_isolines,
-                title_extra=heave_title_extra,
+                title_extra=title_extra,
             )
 
             if save_fig:
@@ -9649,6 +9824,7 @@ def _run_vertical_overview_batch(
                         subject_label=subject_label, date_label=date_str,
                         bg_label='GLORYS',
                         show_fig=show_fig, save_fig=save_fig, save_path=ts_save_path,
+                        annotate_spice=annotate_spice,
                     )
             except (ValueError, RuntimeError, TypeError, KeyError):
                 if verbose:
@@ -9662,6 +9838,9 @@ def _run_vertical_overview_batch(
             result_item['ts_save_path'] = str(ts_save_path)
         if heave_diag:
             result_item.update(heave_diag)
+        if annotate_spice:
+            result_item['spice_anomaly'] = spice_anomaly_val
+            result_item['spice_percentile'] = spice_percentile_val
         results.append(result_item)
 
     return results
@@ -9703,7 +9882,7 @@ def plot_track_vertical_glorys_overview(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     heave_z_search_m: float | None = _heave_z_search_m,
-    annotate_heave: bool = False,
+    annotate_heave: bool = True,
     z_overview: bool = True,
     sigma_overview: bool = False,
     ts_diagram: bool = False,
@@ -9861,7 +10040,10 @@ def plot_argo_vertical_glorys_overview(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     heave_z_search_m: float | None = _heave_z_search_m,
-    annotate_heave: bool = False,
+    annotate_heave: bool = True,
+    annotate_spice: bool = True,
+    anomaly_sal: float | None = None,
+    anomaly_theta: float | None = None,
     z_overview: bool = True,
     sigma_overview: bool = False,
     ts_diagram: bool = False,
@@ -9872,6 +10054,7 @@ def plot_argo_vertical_glorys_overview(
     ``ts_diagram=True`` 时额外绘制 T-S 图。
 
     ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
+    ``annotate_spice=True`` 时在标题标注 spiciness 异常 δπ。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -9988,6 +10171,9 @@ def plot_argo_vertical_glorys_overview(
         sigma_overview=sigma_overview,
         ts_diagram=ts_diagram,
         argo_profile_rows=info.get('profile_rows') if ts_diagram else None,
+        annotate_spice=annotate_spice,
+        anomaly_sal=anomaly_sal,
+        anomaly_theta=anomaly_theta,
     )
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
@@ -12860,7 +13046,7 @@ def plot_hotspot_anomaly_vertical_profiles(
     variables: list = ['DO', 'AOU', 'Temp', 'Salinity'],
     remove_outliers: bool = True,
     plot_normal_scatter: bool = True,
-    annotate_delta_ts: bool = False,
+    annotate_delta_ts: bool = True,
     save_fig: bool = True,
     show_fig: bool = False,
     clear_output_dir: bool = True,
@@ -13195,6 +13381,9 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
             z_overview=bool(args.get('z_overview', True)),
             sigma_overview=bool(args.get('sigma_overview', False)),
             ts_diagram=bool(args.get('ts_diagram', False)),
+            annotate_spice=bool(args.get('annotate_spice', True)),
+            anomaly_sal=args.get('salinity_value'),
+            anomaly_theta=args.get('temperature_value'),
         )
         record['vertical_status'] = 'ok' if vertical_results else 'empty'
         record['vertical_save_paths'] = ";".join(
@@ -13218,6 +13407,8 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
                 'glorys_heave_zmin',
                 'glorys_heave_m',
                 'heave_error',
+                'spice_anomaly',
+                'spice_percentile',
             ]:
                 if key in first_vertical:
                     value = first_vertical[key]
@@ -13274,7 +13465,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     heave_search_range: float = _heave_search_range,
     heave_depth_threshold: float = _heave_depth_threshold,
     heave_z_search_m: float | None = _heave_z_search_m,
-    annotate_heave: bool = False,
+    annotate_heave: bool = True,
+    annotate_spice: bool = True,
     z_overview: bool = True,
     sigma_overview: bool = False,
     ts_diagram: bool = False,
@@ -13320,6 +13512,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         maxtasksperchild: 每个 worker 处理多少个任务后重启；None 表示不自动重启。
         heave_x_window_km / heave_z_window_m: OI 局地窗口半宽。
         annotate_heave: 是否在 vertical overview 标题中显示出露深度。
+        annotate_spice: 是否在标题标注 spiciness 异常 δπ 并在 summary parquet 中输出对应列，默认 True。
         return_details: 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
         save_summary_data: 是否保存逐 profile GLORYS/Heave 诊断明细 parquet，默认 True。
         summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
@@ -13438,6 +13631,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
                     'glorys_heave_m',
                     'glorys_heave_oi',
                     'heave_error',
+                    'spice_anomaly',
+                    'spice_percentile',
                     'sigma_save_paths',
                 ]
                 pd.DataFrame(columns=empty_cols).to_parquet(resolved_summary_data_path, index=False)
@@ -13453,6 +13648,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'summary_data_path': saved_summary_data_path,
             'heave_diagnostics': bool(annotate_heave),
             'annotate_heave': bool(annotate_heave),
+            'annotate_spice': bool(annotate_spice),
         }
         if return_details:
             empty_summary['results'] = []
@@ -13541,6 +13737,9 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'z_overview': z_overview,
             'sigma_overview': sigma_overview,
             'ts_diagram': ts_diagram,
+            'annotate_spice': annotate_spice,
+            'salinity_value': _to_float_or_none(row.get('salinity_value')),
+            'temperature_value': _to_float_or_none(row.get('temperature_value')),
         })
 
     if worker_count > 1:
@@ -13599,6 +13798,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         'summary_data_path': saved_summary_data_path,
         'heave_diagnostics': bool(annotate_heave),
         'annotate_heave': bool(annotate_heave),
+        'annotate_spice': bool(annotate_spice),
     }
     if return_details:
         summary['results'] = results
@@ -14133,6 +14333,8 @@ def export_hotspot_anomaly_summary_table(
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
         ('glorys_heave_m', 'glorys_heave_m'),
         ('heave_error', 'heave_error'),
+        ('spice_anomaly', 'spice_anomaly'),
+        ('spice_percentile', 'spice_percentile'),
     ]
 
     matched_records = []
@@ -14912,6 +15114,8 @@ def _merge_hotspot_glorys_summary_fields(
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
         ('glorys_heave_m', 'glorys_heave_m'),
         ('heave_error', 'heave_error'),
+        ('spice_anomaly', 'spice_anomaly'),
+        ('spice_percentile', 'spice_percentile'),
     ]
     for out_col, _ in glorys_cols:
         if out_col not in out.columns:
