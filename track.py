@@ -202,6 +202,36 @@ _heave_z_search_m = float(
     _HEAVE_CFG.get('z_search_m', 200.0)
 )
 
+# Argo 3D 高斯核断面重建参数（从 processing.yml:processing.argo_reconstruction 读取）
+_ARGO_RECON_CFG = _PROC_CFG.get('processing', {}).get('argo_reconstruction', {})
+_argo_recon_h_bw_km = float(
+    _ARGO_RECON_CFG.get('h_bw_km', 60.0)
+)
+_argo_recon_min_weight = float(
+    _ARGO_RECON_CFG.get('min_weight', 3.0)
+)
+_argo_recon_depth_bw_m = float(
+    _ARGO_RECON_CFG.get('depth_bw_m', 25.0)
+)
+_argo_recon_h_spacing_deg = float(
+    _ARGO_RECON_CFG.get('h_spacing_deg', 0.1)
+)
+_argo_recon_z_max_m = float(
+    _ARGO_RECON_CFG.get('z_max_m', 1500.0)
+)
+_argo_recon_z_spacing_m = float(
+    _ARGO_RECON_CFG.get('z_spacing_m', 10.0)
+)
+_argo_recon_x_spacing_km = float(
+    _ARGO_RECON_CFG.get('x_spacing_km', 5.0)
+)
+_argo_recon_radius_km = float(
+    _ARGO_RECON_CFG.get('radius_km', 400.0)
+)
+_argo_recon_day_window = int(
+    _ARGO_RECON_CFG.get('day_window_days', 15)
+)
+
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
 _CBAR_FALLBACK = {
@@ -7975,6 +8005,8 @@ def _overview_var_style(var_key: str) -> tuple[str, str, str, tuple[float, float
         return ('Salinity', 'Salinity (psu)', 'viridis', (33.0, 36.0))
     if var_key == 'z_of_sigma':
         return ('Isopycnal Depth', 'Depth (m)', 'terrain', None)
+    if var_key == 'argo_weight':
+        return ('Argo Coverage', 'Effective Weight', 'YlOrRd', None)
     return (var_key, var_key, 'viridis', None)
 
 
@@ -8572,6 +8604,7 @@ def _plot_glorys_overview_vertical_2x2(
     isoline_alpha: float = 0.45,
     label_isolines: bool = True,
     title_extra: str = '',
+    source_label: str = 'GLORYS',
 ):
     """绘制 overview 的 2x2 vertical 图。"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
@@ -8693,7 +8726,7 @@ def _plot_glorys_overview_vertical_2x2(
 
     extra_text = f", {title_extra}" if title_extra else ""
     fig.suptitle(
-        f"{subject_label} GLORYS Vertical Overview on {date_label}, y={k_val:.2f}x{b_val:+.2f}{extra_text}",
+        f"{subject_label} {source_label} Vertical Overview on {date_label}, y={k_val:.2f}x{b_val:+.2f}{extra_text}",
         fontsize=16,
         y=1.02,
     )
@@ -10175,6 +10208,532 @@ def plot_argo_vertical_glorys_overview(
         anomaly_sal=anomaly_sal,
         anomaly_theta=anomaly_theta,
     )
+
+
+def collect_argo_pool(
+    lon_range: tuple[float, float],
+    lat_range: tuple[float, float],
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    *,
+    max_depth: float = 2000.0,
+) -> pd.DataFrame:
+    """收集指定经纬度范围与时间窗口内的 Argo 剖面池。
+
+    仅保留 T/S 均有效的深度行，不处理日界线穿越。
+
+    参数:
+        lon_range (tuple): (lon_min, lon_max) 经度范围，不支持跨日界线。
+        lat_range (tuple): (lat_min, lat_max) 纬度范围。
+        start_date / end_date: 时间窗口（含端点），支持字符串或 Timestamp。
+        max_depth (float): 最大采样深度（m），默认 2000 m。
+
+    返回:
+        DataFrame，含剖面 T/S/Depth/位置/时间列；无匹配数据时返回空 DataFrame。
+    """
+    lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
+    lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
+    t_min, t_max = pd.Timestamp(start_date), pd.Timestamp(end_date)
+
+    needed_cols = [
+        'Year', 'Month', 'Day', 'Longitude', 'Latitude', 'Depth',
+        'Temp_Adjusted', 'PSAL_Adjusted', 'Profile_number', 'Platform_number',
+    ]
+    dfs = []
+    for yr in range(t_min.year, t_max.year + 1):
+        fpath = Path(argo_path) / f'Argo{yr}.parquet'
+        if not fpath.exists():
+            continue
+        df = pd.read_parquet(fpath, columns=needed_cols)
+        mask = (
+            df['Latitude'].between(lat_min, lat_max)
+            & df['Longitude'].between(lon_min, lon_max)
+            & (df['Depth'] <= max_depth)
+        )
+        dfs.append(df[mask])
+
+    if not dfs:
+        return pd.DataFrame()
+
+    pool = pd.concat(dfs, ignore_index=True)
+    pool['date'] = pd.to_datetime(
+        {'year': pool['Year'], 'month': pool['Month'], 'day': pool['Day']}
+    )
+    pool = pool[(pool['date'] >= t_min) & (pool['date'] <= t_max)]
+    pool = pool.dropna(subset=['Temp_Adjusted', 'PSAL_Adjusted'])
+    return pool.reset_index(drop=True)
+
+
+def _build_argo_3d_depth_chunk(args: tuple) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    """Worker for _build_argo_3d_field: processes a contiguous slice of depth levels.
+
+    Vectorizes the lat dimension in chunks to eliminate the inner Python loop while
+    keeping per-chunk memory bounded to ~50 MB.
+    """
+    (iz_start, z_chunk,
+     p_lons, p_lats, p_depths, p_temps, p_sals,
+     lon_grid, lat_grid,
+     inv2_h, inv2_z, h_cut, z_cut, min_weight, lat_chunk_size) = args
+
+    nz_c = len(z_chunk)
+    nlat = len(lat_grid)
+    nlon = len(lon_grid)
+    T_c = np.full((nz_c, nlat, nlon), np.nan)
+    S_c = np.full((nz_c, nlat, nlon), np.nan)
+    W_c = np.zeros((nz_c, nlat, nlon))
+
+    for ic, zc in enumerate(z_chunk):
+        depth_mask = np.abs(p_depths - zc) < z_cut
+        if not depth_mask.any():
+            continue
+        d_lons = p_lons[depth_mask]
+        d_lats = p_lats[depth_mask]
+        d_temps = p_temps[depth_mask]
+        d_sals = p_sals[depth_mask]
+        w_depth = np.exp(inv2_z * (p_depths[depth_mask] - zc) ** 2)
+
+        for lat_start in range(0, nlat, lat_chunk_size):
+            lat_end = min(lat_start + lat_chunk_size, nlat)
+            lat_c = lat_grid[lat_start:lat_end]  # (nc,)
+            cos_lats = np.cos(np.radians(lat_c))
+
+            lat_lo = lat_c[0] - h_cut / 111.32
+            lat_hi = lat_c[-1] + h_cut / 111.32
+            f_mask = (d_lats >= lat_lo) & (d_lats <= lat_hi)
+            if not f_mask.any():
+                continue
+
+            d_lons_f = d_lons[f_mask]
+            d_lats_f = d_lats[f_mask]
+            d_temps_f = d_temps[f_mask]
+            d_sals_f = d_sals[f_mask]
+            w_depth_f = w_depth[f_mask]
+
+            dy_km = (lat_c[:, None] - d_lats_f[None, :]) * 111.32          # (nc, n_f)
+            dx_km = (lon_grid[None, :, None] - d_lons_f[None, None, :]) * 111.32 * cos_lats[:, None, None]
+            r2 = dx_km ** 2 + dy_km[:, None, :] ** 2                        # (nc, nlon, n_f)
+            w = np.exp(inv2_h * r2) * w_depth_f[None, None, :]              # (nc, nlon, n_f)
+            w_sum = w.sum(axis=2)                                            # (nc, nlon)
+            valid = w_sum >= min_weight
+            if not valid.any():
+                continue
+
+            T_num = (w * d_temps_f[None, None, :]).sum(axis=2)
+            S_num = (w * d_sals_f[None, None, :]).sum(axis=2)
+            T_c[ic, lat_start:lat_end] = np.where(valid, T_num / w_sum, np.nan)
+            S_c[ic, lat_start:lat_end] = np.where(valid, S_num / w_sum, np.nan)
+            W_c[ic, lat_start:lat_end] = np.where(valid, w_sum, 0.0)
+
+    return iz_start, T_c, S_c, W_c
+
+
+def _build_argo_3d_field(
+    pool: pd.DataFrame,
+    lon_range: tuple[float, float],
+    lat_range: tuple[float, float],
+    *,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    n_jobs: int | None = None,
+    verbose: bool = True,
+) -> dict:
+    """用 Argo 剖面池三维高斯核重建 (lon × lat × depth) 网格场。
+
+    核函数：w = exp(−0.5·(r²/h_bw² + dz²/depth_bw²))，截断半径 3σ。
+    权重低于 min_weight 的格点保持 NaN，不做外推填充。
+    深度维度按 n_jobs 分块，各块通过 multiprocessing.Pool 并行。
+
+    参数:
+        pool (DataFrame): collect_argo_pool 返回的剖面数据。
+        lon_range / lat_range (tuple): 重建区域经纬度范围（°）。
+        h_bw (float): 水平高斯核带宽（km），默认 60 km。
+        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
+        h_spacing_deg (float): 水平网格间距（°），默认 0.1°。
+        z_max_m (float): 最大重建深度（m），默认 1500 m。
+        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
+        min_weight (float): 最小累积权重阈值，低于此值格点标为 NaN，默认 3.0。
+        n_jobs (int | None): 并行进程数，None 时取 min(cpu_count, 8)。
+        verbose (bool): 是否打印进度信息。
+
+    返回:
+        dict，键包括 thetao / salinity / sigma0 / weight（均为 (nz, nlat, nlon) ndarray）
+        及 lon / lat / depth 坐标数组和 attrs 元数据字典。
+    """
+    lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
+    lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
+
+    lon_grid = np.arange(lon_min, lon_max + h_spacing_deg / 2.0, h_spacing_deg)
+    lat_grid = np.arange(lat_min, lat_max + h_spacing_deg / 2.0, h_spacing_deg)
+    z_grid = np.arange(0.0, z_max_m + z_spacing_m / 2.0, z_spacing_m)
+    nlon, nlat, nz = len(lon_grid), len(lat_grid), len(z_grid)
+
+    _attrs = {
+        'h_bw_km': h_bw, 'depth_bw_m': depth_bw,
+        'h_spacing_deg': h_spacing_deg, 'z_spacing_m': z_spacing_m,
+        'min_weight': min_weight,
+    }
+    if pool.empty:
+        return {
+            'thetao': np.full((nz, nlat, nlon), np.nan),
+            'salinity': np.full((nz, nlat, nlon), np.nan),
+            'sigma0': np.full((nz, nlat, nlon), np.nan),
+            'weight': np.zeros((nz, nlat, nlon)),
+            'lon': lon_grid, 'lat': lat_grid, 'depth': z_grid, 'attrs': _attrs,
+        }
+
+    p_lons = pool['Longitude'].values
+    p_lats = pool['Latitude'].values
+    p_depths = pool['Depth'].values
+    p_temps = pool['Temp_Adjusted'].values
+    p_sals = pool['PSAL_Adjusted'].values
+
+    inv2_h = -0.5 / h_bw ** 2
+    inv2_z = -0.5 / depth_bw ** 2
+    h_cut = 3.0 * h_bw
+    z_cut = 3.0 * depth_bw
+
+    lat_chunk_size = max(1, nlat // 8)  # ~8 chunks per depth level
+
+    _default_jobs = min(os.cpu_count() or 1, 8)
+    n_workers = min(max(1, n_jobs if n_jobs is not None else _default_jobs), nz)
+    z_chunks = np.array_split(z_grid, n_workers)
+    iz_starts = [int(sum(len(c) for c in z_chunks[:i])) for i in range(n_workers)]
+
+    shared = (p_lons, p_lats, p_depths, p_temps, p_sals,
+              lon_grid, lat_grid, inv2_h, inv2_z, h_cut, z_cut, min_weight, lat_chunk_size)
+    task_args = [(iz_s, zc) + shared for iz_s, zc in zip(iz_starts, z_chunks)]
+
+    if n_workers == 1:
+        results = [_build_argo_3d_depth_chunk(task_args[0])]
+    else:
+        with multiprocessing.Pool(processes=n_workers) as mp_pool:
+            results = mp_pool.map(_build_argo_3d_depth_chunk, task_args)
+
+    T_out = np.full((nz, nlat, nlon), np.nan)
+    S_out = np.full((nz, nlat, nlon), np.nan)
+    W_out = np.zeros((nz, nlat, nlon))
+    for iz_s, T_c, S_c, W_c in results:
+        iz_e = iz_s + len(T_c)
+        T_out[iz_s:iz_e] = T_c
+        S_out[iz_s:iz_e] = S_c
+        W_out[iz_s:iz_e] = W_c
+
+    center_lat = float(lat_grid.mean())
+    center_lon = float(lon_grid.mean())
+    p_from_z = gsw.p_from_z(-z_grid, center_lat)
+    p_3d = p_from_z[:, None, None]
+    valid3d = ~np.isnan(T_out)
+    sigma_out = np.full_like(T_out, np.nan)
+    if valid3d.any():
+        SA = np.where(valid3d, gsw.SA_from_SP(S_out, np.broadcast_to(p_3d, T_out.shape), center_lon, center_lat), np.nan)
+        CT = np.where(valid3d, gsw.CT_from_t(SA, T_out, np.broadcast_to(p_3d, T_out.shape)), np.nan)
+        sigma_out = np.where(valid3d, gsw.sigma0(SA, CT), np.nan)
+
+    if verbose:
+        n_valid = int(valid3d.sum())
+        n_total = nz * nlat * nlon
+        # 顶层 1000m 覆盖率：避开深层（多数 Argo 浮标到不了）拉低的部分，更贴近常见绘图深度
+        z_shallow = z_grid <= 1000.0
+        n_valid_top = int(valid3d[z_shallow].sum())
+        n_total_top = int(z_shallow.sum()) * nlat * nlon
+        print(
+            f'  3D field: ({nz}, {nlat}, {nlon}), valid={n_valid}/{n_total} '
+            f'({100 * n_valid / n_total:.1f}% full, {100 * n_valid_top / n_total_top:.1f}% ≤1000m)'
+        )
+
+    return {
+        'thetao': T_out, 'salinity': S_out, 'sigma0': sigma_out, 'weight': W_out,
+        'lon': lon_grid, 'lat': lat_grid, 'depth': z_grid, 'attrs': _attrs,
+    }
+
+
+def _save_argo_3d_field(field: dict, zarr_path: str | Path) -> None:
+    """将 _build_argo_3d_field 返回的 3D 场保存为 zarr 格式。"""
+    root = zarr.open_group(str(zarr_path), mode='w')
+    for key in ('thetao', 'salinity', 'sigma0', 'weight', 'lon', 'lat', 'depth'):
+        root[key] = field[key]
+    root.attrs.update(field.get('attrs', {}))
+
+
+def load_argo_3d_field(zarr_path: str | Path) -> dict:
+    """加载 zarr 格式的 3D Argo 重建场。"""
+    root = zarr.open_group(str(zarr_path), mode='r')
+    return {
+        **{key: root[key][:] for key in ('thetao', 'salinity', 'sigma0', 'weight', 'lon', 'lat', 'depth')},
+        'attrs': dict(root.attrs),
+    }
+
+
+def slice_section_from_argo_field(
+    field: dict,
+    k: float,
+    center_lon: float,
+    center_lat: float,
+    *,
+    x_min_km: float | None = None,
+    x_max_km: float | None = None,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+) -> list[dict]:
+    """从 3D Argo 场沿测线切取 2D 垂向断面。
+
+    用 RegularGridInterpolator 双线性插值，返回与 get_vertical_glorys 格式兼容的 list[dict]。
+
+    参数:
+        field (dict): _build_argo_3d_field / load_argo_3d_field 返回的 3D 场字典。
+        k (float): 测线斜率 Δlat/Δlon；0.0 为纯纬向断面。
+        center_lon / center_lat (float): 测线 x=0 的地理参考点。
+        x_min_km / x_max_km (float | None): 断面 x 轴范围（km），None 时从 field
+            经度范围自动推导，使区域断面覆盖完整宽度。
+        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
+
+    返回:
+        list[dict]，格式与 get_vertical_glorys 兼容，供 _plot_glorys_overview_vertical_2x2 使用。
+    """
+    cos_lat = np.cos(np.radians(center_lat))
+    if x_min_km is None or x_max_km is None:
+        _half_km = (float(field['lon'][-1]) - float(field['lon'][0])) / 2.0 * 111.32 * cos_lat
+        x_min_km = x_min_km if x_min_km is not None else -_half_km
+        x_max_km = x_max_km if x_max_km is not None else _half_km
+    slope_km = k / cos_lat if cos_lat > 1e-6 else k
+    dir_norm = np.sqrt(1.0 + slope_km ** 2)
+    ux, uy = 1.0 / dir_norm, slope_km / dir_norm
+
+    x_grid = np.arange(x_min_km, x_max_km + x_spacing_km / 2.0, x_spacing_km)
+    lon_sec = center_lon + x_grid * ux / (111.32 * cos_lat if cos_lat > 1e-6 else 111.32)
+    lat_sec = center_lat + x_grid * uy / 111.32
+    nx = len(x_grid)
+
+    z_grid = field['depth']
+    lat_grid = field['lat']
+    lon_grid = field['lon']
+    nz = len(z_grid)
+
+    z_pts = np.repeat(z_grid, nx)
+    lat_pts = np.tile(lat_sec, nz)
+    lon_pts = np.tile(lon_sec, nz)
+    query = np.column_stack([z_pts, lat_pts, lon_pts])
+
+    def _interp(data3d):
+        rgi = RegularGridInterpolator(
+            (z_grid, lat_grid, lon_grid), data3d,
+            method='linear', bounds_error=False, fill_value=np.nan,
+        )
+        return rgi(query).reshape(nz, nx)
+
+    T_2d = _interp(field['thetao'])
+    S_2d = _interp(field['salinity'])
+    sigma_2d = _interp(field['sigma0'])
+    W_2d = _interp(field['weight'])
+
+    return [{
+        'profile_data': {
+            'thetao': np.ma.masked_invalid(T_2d),
+            'salinity': np.ma.masked_invalid(S_2d),
+            'sigma': np.ma.masked_invalid(sigma_2d),
+            'argo_weight': W_2d,
+        },
+        'y_coords': x_grid,
+        'z_coords': z_grid,
+        'lon_coords': lon_sec,
+        'lat_coords': lat_sec,
+        'projections': {},
+        'metadata': {'draw_reference_lines': False, 'source': 'argo_reconstruction'},
+    }]
+
+
+def plot_regional_vertical_argo_overview(
+    lon_range: tuple[float, float],
+    lat_range: tuple[float, float],
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    *,
+    k: float = 0.0,
+    center_lon: float | None = None,
+    center_lat: float | None = None,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    x_min_km: float | None = None,
+    x_max_km: float | None = None,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    field: dict | None = None,
+    save_field: bool = False,
+    field_path: str | Path | None = None,
+    n_jobs: int | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
+) -> None:
+    """用 Argo 数据重建并绘制区域垂向断面 2x2 总览图（σ / θ / S / 覆盖权重）。
+
+    先建立 3D 高斯核重建场（_build_argo_3d_field），再用
+    slice_section_from_argo_field 切取 2D 断面绘图。3D 场可选以 zarr 保存
+    供后续直接切片，避免每次重建。n_jobs>1 时重建阶段按深度并行。
+
+    参数:
+        lon_range / lat_range (tuple): 区域经纬度范围（°）。
+        start_date / end_date: 时间窗口（含端点），与 field= 互斥；field= 为 None 时必填。
+        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        center_lon / center_lat (float | None): 测线参考点，None 时取区域经纬度中心。
+        h_bw (float): 水平高斯核带宽（km），默认 60 km。
+        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
+        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
+        z_max_m (float): 最大重建深度（m），默认 1500 m。
+        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
+        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
+        x_min_km / x_max_km (float | None): 断面 x 轴范围（km），None 时自动取区域全宽。
+        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
+        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
+        plot_isolines: 是否叠加 σ₀ 等值线。
+        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
+        field (dict | None): 预建 3D 场，传入后跳过 collect_argo_pool + _build_argo_3d_field；
+            与 start_date/end_date 互斥，日期从 field['attrs'] 读取。
+        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        field_path (str | Path | None): zarr 保存路径，None 时按区域和时间窗口自动生成。
+        n_jobs (int | None): _build_argo_3d_field 并行进程数，None 时取 min(cpu_count, 8)。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+        verbose (bool): 是否打印进度信息。
+    """
+    if field is not None and (start_date is not None or end_date is not None):
+        raise ValueError(
+            "Provide either field= (pre-built 3D field) or start_date/end_date — not both."
+        )
+    if field is None and (start_date is None or end_date is None):
+        raise ValueError("start_date and end_date are required when field= is not provided.")
+
+    lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
+    lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
+
+    if field is None:
+        t_min, t_max = pd.Timestamp(start_date), pd.Timestamp(end_date)
+    else:
+        _s = field['attrs'].get('start_date')
+        _e = field['attrs'].get('end_date')
+        t_min = pd.Timestamp(_s) if _s else None
+        t_max = pd.Timestamp(_e) if _e else None
+
+    clon = center_lon if center_lon is not None else (lon_min + lon_max) / 2.0
+    clat = center_lat if center_lat is not None else (lat_min + lat_max) / 2.0
+    b = clat - k * clon
+
+    cos_lat_c = np.cos(np.radians(clat))
+    half_lon_km = (lon_max - lon_min) / 2.0 * 111.32 * cos_lat_c
+    xmin = x_min_km if x_min_km is not None else -half_lon_km
+    xmax = x_max_km if x_max_km is not None else half_lon_km
+    z_plot_max = ymax
+
+    if field is None:
+        if verbose:
+            print(
+                f'[Argo3D] ({lon_min:.1f},{lon_max:.1f}) / ({lat_min:.1f},{lat_max:.1f})  '
+                f'{t_min.date()} – {t_max.date()}'
+            )
+        pool = collect_argo_pool(
+            lon_range, lat_range, t_min, t_max,
+            max_depth=z_max_m + 200.0,
+        )
+        if pool.empty:
+            print('No Argo data found.')
+            return
+        n_prof = pool['Profile_number'].nunique()
+        if verbose:
+            print(f'  {n_prof} profiles, {len(pool)} depth rows')
+        field = _build_argo_3d_field(
+            pool, lon_range, lat_range,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+            n_jobs=n_jobs, verbose=verbose,
+        )
+        field['attrs']['start_date'] = t_min.strftime('%Y-%m-%d')
+        field['attrs']['end_date'] = t_max.strftime('%Y-%m-%d')
+    else:
+        n_prof = None
+
+    if save_field:
+        fp = Path(field_path) if field_path else (
+            _shared_output_dir('argo_3d_fields')
+            / (
+                f'argo3d_{lon_min:.1f}_{lon_max:.1f}_{lat_min:.1f}_{lat_max:.1f}'
+                f'_{t_min.strftime("%Y%m%d") if t_min else "unknown"}'
+                f'_{t_max.strftime("%Y%m%d") if t_max else "unknown"}'
+                f'_hbw{h_bw:.0f}_dbw{depth_bw:.0f}.zarr'
+            )
+        )
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        _save_argo_3d_field(field, fp)
+        if verbose:
+            print(f'  Saved 3D field: {fp}')
+
+    vertical_packages = slice_section_from_argo_field(
+        field, k, clon, clat,
+        x_min_km=xmin, x_max_km=xmax, x_spacing_km=x_spacing_km,
+    )
+    if not vertical_packages:
+        return
+
+    if t_min and t_max:
+        date_label = f'{t_min.strftime("%Y-%m-%d")} – {t_max.strftime("%Y-%m-%d")}'
+    else:
+        date_label = 'unknown'
+    subject_label = f'({lon_min:.1f}–{lon_max:.1f}°E, {lat_min:.1f}–{lat_max:.1f}°N)'
+    n_label = f'  N={n_prof}' if n_prof is not None else ''
+    title_extra = f'  h_bw={h_bw:.0f}km{n_label}'
+
+    for vp in vertical_packages:
+        _plot_glorys_overview_vertical_2x2(
+            vertical_package=vp,
+            variables=['argo_weight', 'sigma', 'thetao', 'salinity'],
+            k_val=k,
+            b_val=b,
+            subject_label=subject_label,
+            date_label=date_label,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=z_plot_max,
+            plot_isolines=plot_isolines,
+            isoline_levels=isoline_levels,
+            isoline_color=isoline_color,
+            isoline_linewidth=isoline_linewidth,
+            isoline_alpha=isoline_alpha,
+            label_isolines=label_isolines,
+            title_extra=title_extra,
+            source_label='Argo',
+        )
+        if save_fig:
+            out_dir = Path(output_dir) if output_dir else _shared_output_dir('plot_regional_vertical_argo_overview')
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fname = (
+                f'argo_regional_{lon_min:.1f}E_{lon_max:.1f}E_'
+                f'{lat_min:.1f}N_{lat_max:.1f}N_'
+                f'{t_min.strftime("%Y%m%d") if t_min else "unknown"}_'
+                f'{t_max.strftime("%Y%m%d") if t_max else "unknown"}'
+                f'_hbw{h_bw:.0f}km.png'
+            )
+            plt.savefig(out_dir / fname, dpi=150, bbox_inches='tight')
+            if verbose:
+                print(f'  Saved: {out_dir / fname}')
+        if show_fig:
+            plt.show()
+        plt.close()
+
 
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
 def _orientation(p, q, r):

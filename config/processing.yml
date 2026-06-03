@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.11 变更：
+#   - 新增 argo_reconstruction 配置小节，集中管理 Argo 3D 高斯核断面重建参数（核带宽/权重阈值/网格步长/半径/时间窗），三个重建函数统一默认 h_bw=60 / min_weight=3.0。
 # version 1.10 变更：
 #   - 新增 spice 配置小节，百分位阈值判定 T-S spiciness 偏离（核加权，中纬高纬通用）。
 # version 1.9 变更：
@@ -25,7 +27,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.8
+version: 1.11
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -75,6 +77,18 @@ processing:
   # Spiciness 异常阈值（百分位 P < threshold 或 P > 100−threshold 视为显著 T-S 偏离）
   spice:
     percentile_threshold: 10          # P < 10 = 显著冷鲜，P > 90 = 显著暖咸
+
+  # Argo 3D 高斯核断面重建参数（_build_argo_3d_field / plot_*_vertical_argo_overview）
+  argo_reconstruction:
+    h_bw_km: 60.0             # 水平高斯核带宽（km）：越紧越保中尺度（三个重建函数统一默认）
+    min_weight: 3.0           # 最小累积权重阈值：低于此值的格点判为缺测（NaN）
+    depth_bw_m: 25.0          # 垂向高斯核带宽（m）
+    h_spacing_deg: 0.1        # 重建网格水平间距（°）
+    z_max_m: 1500.0           # 最大重建深度（m）
+    z_spacing_m: 10.0         # 垂向网格间距（m）
+    x_spacing_km: 5.0         # 断面水平采样步长（km）
+    radius_km: 400.0          # track/argo 变体的中心半径（km）
+    day_window_days: 15       # track/argo 变体的时间窗半宽（天）
 
 plot:
   basemap_colors:
