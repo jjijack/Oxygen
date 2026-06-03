@@ -10735,6 +10735,462 @@ def plot_regional_vertical_argo_overview(
         plt.close()
 
 
+def _plot_center_vertical_argo_overview(
+    center_lon: float,
+    center_lat: float,
+    target_date: pd.Timestamp,
+    *,
+    subject_label: str,
+    save_name_prefix: str,
+    save_subdir: str,
+    n_prof: int | None = None,
+    k: float = 0.0,
+    radius_km: float = _argo_recon_radius_km,
+    day_window: int = _argo_recon_day_window,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    field: dict | None = None,
+    save_field: bool = False,
+    field_path: str | Path | None = None,
+    n_jobs: int | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
+) -> None:
+    """以中心点 + 半径重建并绘制 Argo 垂向断面 2x2 总览图（track / argo 变体共用）。
+
+    将 center_lon/center_lat 加 ±radius_km 转成经纬度盒子，喂给 collect_argo_pool
+    与 _build_argo_3d_field，再沿过中心的测线切取 ±radius_km 断面绘图，时间窗取
+    target_date ± day_window 天。与 plot_regional_vertical_argo_overview 共用同一套
+    重建 / 切片 / 绘图核心，区别仅在于以中心半径而非显式经纬度边界圈定范围。
+    """
+    clon = float(_normalize_lon_array(center_lon))
+    clat = float(center_lat)
+    target_date = pd.Timestamp(target_date).normalize()
+
+    lon_min, lon_max, lat_min, lat_max = _window_bounds_from_center_km(clon, clat, radius_km)
+    lon_range = (lon_min, lon_max)
+    lat_range = (lat_min, lat_max)
+    b = clat - k * clon
+    xmin, xmax = -float(radius_km), float(radius_km)
+    z_plot_max = ymax
+
+    if field is None:
+        t_min = target_date - pd.Timedelta(days=int(day_window))
+        t_max = target_date + pd.Timedelta(days=int(day_window))
+        if verbose:
+            print(
+                f'[Argo3D] {subject_label}  center ({clon:.2f}, {clat:.2f})  '
+                f'{target_date.date()} ±{int(day_window)}d  r={radius_km:.0f}km'
+            )
+        pool = collect_argo_pool(
+            lon_range, lat_range, t_min, t_max,
+            max_depth=z_max_m + 200.0,
+        )
+        if pool.empty:
+            print('No Argo data found.')
+            return
+        n_prof = pool['Profile_number'].nunique()
+        if verbose:
+            print(f'  {n_prof} profiles, {len(pool)} depth rows')
+        field = _build_argo_3d_field(
+            pool, lon_range, lat_range,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+            n_jobs=n_jobs, verbose=verbose,
+        )
+        field['attrs']['start_date'] = t_min.strftime('%Y-%m-%d')
+        field['attrs']['end_date'] = t_max.strftime('%Y-%m-%d')
+    # field 预建（如 track 拉格朗日场）时跳过采集，n_prof 由调用方经参数传入
+
+    if save_field:
+        fp = Path(field_path) if field_path else (
+            _shared_output_dir('argo_3d_fields')
+            / (
+                f'argo3d_{save_name_prefix}_{target_date.strftime("%Y%m%d")}'
+                f'_hbw{h_bw:.0f}_dbw{depth_bw:.0f}.zarr'
+            )
+        )
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        _save_argo_3d_field(field, fp)
+        if verbose:
+            print(f'  Saved 3D field: {fp}')
+
+    vertical_packages = slice_section_from_argo_field(
+        field, k, clon, clat,
+        x_min_km=xmin, x_max_km=xmax, x_spacing_km=x_spacing_km,
+    )
+    if not vertical_packages:
+        return
+
+    date_label = f'{target_date.strftime("%Y-%m-%d")} ±{int(day_window)}d'
+    n_label = f'  N={n_prof}' if n_prof is not None else ''
+    title_extra = f'  h_bw={h_bw:.0f}km  r={radius_km:.0f}km{n_label}'
+
+    for vp in vertical_packages:
+        _plot_glorys_overview_vertical_2x2(
+            vertical_package=vp,
+            variables=['argo_weight', 'sigma', 'thetao', 'salinity'],
+            k_val=k,
+            b_val=b,
+            subject_label=subject_label,
+            date_label=date_label,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=z_plot_max,
+            plot_isolines=plot_isolines,
+            isoline_levels=isoline_levels,
+            isoline_color=isoline_color,
+            isoline_linewidth=isoline_linewidth,
+            isoline_alpha=isoline_alpha,
+            label_isolines=label_isolines,
+            title_extra=title_extra,
+            source_label='Argo',
+        )
+        if save_fig:
+            out_dir = Path(output_dir) if output_dir else _shared_output_dir(save_subdir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fname = (
+                f'{save_name_prefix}_argo_{target_date.strftime("%Y%m%d")}'
+                f'_hbw{h_bw:.0f}km.png'
+            )
+            plt.savefig(out_dir / fname, dpi=150, bbox_inches='tight')
+            if verbose:
+                print(f'  Saved: {out_dir / fname}')
+        if show_fig:
+            plt.show()
+        plt.close()
+
+
+def _build_lagrangian_argo_field(
+    track_df: pd.DataFrame,
+    ref_lon: float,
+    ref_lat: float,
+    ref_date: pd.Timestamp,
+    *,
+    radius_km: float = _argo_recon_radius_km,
+    day_window: int = _argo_recon_day_window,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    n_jobs: int | None = None,
+    verbose: bool = True,
+) -> tuple[dict | None, int]:
+    """构建随涡（拉格朗日）Argo 重建场，返回 (field, n_prof)。
+
+    将 ref_date ± day_window 窗口内每条 Argo 剖面按其观测当天的涡心（来自
+    track_df）重投影到涡旋相对坐标，再以参考涡心（ref_date 当天）为锚点建场，
+    从而抵消涡旋在时间窗内的平移、沿轨迹累积更多剖面。窗口内无可用数据时
+    返回 (None, 0)。
+    """
+    ref_lon = float(_normalize_lon_array(ref_lon))
+    ref_lat = float(ref_lat)
+    ref_date = pd.Timestamp(ref_date).normalize()
+    t_min = ref_date - pd.Timedelta(days=int(day_window))
+    t_max = ref_date + pd.Timedelta(days=int(day_window))
+
+    tdates = pd.to_datetime(
+        track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time']),
+        errors='coerce',
+    ).dt.normalize().to_numpy()
+    elon = pd.to_numeric(track_df['center_lon'], errors='coerce').to_numpy(dtype=float)
+    elat = pd.to_numeric(track_df['center_lat'], errors='coerce').to_numpy(dtype=float)
+    win = (
+        (tdates >= t_min.to_datetime64()) & (tdates <= t_max.to_datetime64())
+        & np.isfinite(elon) & np.isfinite(elat)
+    )
+    if not win.any():
+        return None, 0
+    centre_by_day = {
+        pd.Timestamp(d).normalize(): (float(lo), float(la))
+        for d, lo, la in zip(tdates[win], elon[win], elat[win])
+    }
+
+    win_lon = np.array([v[0] for v in centre_by_day.values()], dtype=float)
+    win_lat = np.array([v[1] for v in centre_by_day.values()], dtype=float)
+    pad_lon_deg = float(np.max(np.abs((win_lon - ref_lon + 180.0) % 360.0 - 180.0)))
+    pad_lat_deg = float(np.max(np.abs(win_lat - ref_lat)))
+
+    # 采集盒子在场盒子上外扩涡心最大漂移量，保证去平移后落入 ±radius 的剖面不漏采
+    fb_lon_lo, fb_lon_hi, fb_lat_lo, fb_lat_hi = _window_bounds_from_center_km(ref_lon, ref_lat, radius_km)
+    coll_lon = (fb_lon_lo - pad_lon_deg, fb_lon_hi + pad_lon_deg)
+    coll_lat = (fb_lat_lo - pad_lat_deg, fb_lat_hi + pad_lat_deg)
+
+    pool = collect_argo_pool(coll_lon, coll_lat, t_min, t_max, max_depth=z_max_m + 200.0)
+    if pool.empty:
+        return None, 0
+
+    pool['_d'] = pool['date'].dt.normalize()
+    cb = pd.DataFrame({
+        '_d': list(centre_by_day.keys()),
+        '_elon': [v[0] for v in centre_by_day.values()],
+        '_elat': [v[1] for v in centre_by_day.values()],
+    })
+    pool = pool.merge(cb, on='_d', how='left')
+    eddy_lon_d = pool['_elon'].to_numpy(dtype=float)
+    eddy_lat_d = pool['_elat'].to_numpy(dtype=float)
+    keep = np.isfinite(eddy_lon_d) & np.isfinite(eddy_lat_d)
+    pool = pool.loc[keep].copy()
+    if pool.empty:
+        return None, 0
+    eddy_lon_d = eddy_lon_d[keep]
+    eddy_lat_d = eddy_lat_d[keep]
+
+    # 去平移：每条剖面相对其当天涡心的偏移，移到参考涡心系（涡旋相对坐标）
+    rel_lon = (pool['Longitude'].to_numpy(dtype=float) - eddy_lon_d + 180.0) % 360.0 - 180.0
+    rel_lat = pool['Latitude'].to_numpy(dtype=float) - eddy_lat_d
+    pool['Longitude'] = ref_lon + rel_lon
+    pool['Latitude'] = ref_lat + rel_lat
+
+    n_prof = int(pool['Profile_number'].nunique())
+    if verbose:
+        scale = approximate_degree_length(ref_lat)
+        drift_km = max(
+            pad_lon_deg * float(scale['meters_per_degree_lon']),
+            pad_lat_deg * float(scale['meters_per_degree_lat']),
+        ) / 1000.0
+        print(
+            f'  Lagrangian composite: {n_prof} profiles, {ref_date.date()} ±{int(day_window)}d, '
+            f'eddy drift ≤ {drift_km:.0f} km'
+        )
+
+    field = _build_argo_3d_field(
+        pool, (fb_lon_lo, fb_lon_hi), (fb_lat_lo, fb_lat_hi),
+        h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+        z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+        n_jobs=n_jobs, verbose=verbose,
+    )
+    field['attrs']['start_date'] = t_min.strftime('%Y-%m-%d')
+    field['attrs']['end_date'] = t_max.strftime('%Y-%m-%d')
+    field['attrs']['lagrangian'] = True
+    return field, n_prof
+
+
+def plot_track_vertical_argo_overview(
+    DS: list | str | tuple | dict,
+    no: int,
+    needed_date: str | pd.Timestamp,
+    *,
+    k: float = 0.0,
+    radius_km: float = _argo_recon_radius_km,
+    day_window: int = _argo_recon_day_window,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    field: dict | None = None,
+    save_field: bool = False,
+    field_path: str | Path | None = None,
+    n_jobs: int | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
+) -> None:
+    """随涡（拉格朗日）重建并绘制 track 垂向断面 2x2 总览图。
+
+    取 needed_date 当天的涡旋中心（来自 find_track）为参考涡心，对 ±day_window
+    窗口内每条 Argo 剖面按其观测当天的涡心重投影到涡旋相对坐标后合成，从而抵消
+    涡旋平移、沿轨迹累积更多剖面（窗口越宽收益越大）；再沿过涡心的测线切取
+    ±radius_km 断面。与 plot_track_vertical_glorys_overview 对应，但垂向场来自
+    随涡 Argo 重建而非 GLORYS；与单日欧拉式的 plot_argo_vertical_argo_overview 互补。
+
+    参数:
+        DS: 涡旋数据源（kind 串 'acl'|'cl'|'cs'|'acs'，或 list/tuple/dict）。
+        no (int): 涡旋 track_id。
+        needed_date: 参考日期，须是该 track 中存在的某天，决定参考涡心位置。
+        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
+        day_window (int): 时间窗半宽（天），围绕 needed_date 取 ±day_window，默认 15。
+        h_bw (float): 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
+        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
+        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
+        z_max_m (float): 最大重建深度（m），默认 1500 m。
+        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
+        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
+        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
+        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
+        plot_isolines: 是否叠加 σ₀ 等值线。
+        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
+        field (dict | None): 预建（拉格朗日）3D 场，传入后跳过重建直接切片绘图。
+        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        field_path (str | Path | None): zarr 保存路径，None 时按涡旋与日期自动生成。
+        n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+        verbose (bool): 是否打印进度信息。
+    """
+    track_df, ds_name, _ = _resolve_track_context(DS, no, include_contours=True)
+
+    dates = pd.to_datetime(
+        track_df['date'] if 'date' in track_df.columns else convert_date(track_df['time']),
+        errors='coerce',
+    )
+    target_ts = pd.Timestamp(needed_date).normalize()
+    same_day_idx = np.nonzero(dates.dt.normalize().to_numpy() == target_ts.to_datetime64())[0]
+    if same_day_idx.size == 0:
+        raise ValueError(f"Date {target_ts.strftime('%Y-%m-%d')} not found in track {no}.")
+    needed_idx = int(same_day_idx[0])
+
+    center_lon = float(pd.to_numeric(track_df['center_lon'], errors='coerce').iloc[needed_idx])
+    center_lat = float(pd.to_numeric(track_df['center_lat'], errors='coerce').iloc[needed_idx])
+    ds_name_upper = ds_name.upper() if isinstance(ds_name, str) else 'UNKNOWN'
+
+    n_prof = None
+    if field is None:
+        if verbose:
+            print(
+                f'[Argo3D-L] Track {ds_name_upper}{int(no)}  ref涡心 ({center_lon:.2f}, {center_lat:.2f})  '
+                f'{target_ts.date()} ±{int(day_window)}d  r={radius_km:.0f}km'
+            )
+        field, n_prof = _build_lagrangian_argo_field(
+            track_df, center_lon, center_lat, target_ts,
+            radius_km=radius_km, day_window=day_window,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+            n_jobs=n_jobs, verbose=verbose,
+        )
+        if field is None:
+            print('No Argo data found.')
+            return
+
+    _plot_center_vertical_argo_overview(
+        center_lon, center_lat, target_ts,
+        subject_label=f'Track {ds_name_upper}{int(no)} (Lagrangian)',
+        save_name_prefix=f'{ds_name_upper}{int(no)}_L{int(day_window)}d',
+        save_subdir='plot_track_vertical_argo_overview',
+        n_prof=n_prof,
+        k=k, radius_km=radius_km, day_window=day_window,
+        h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+        z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+        x_spacing_km=x_spacing_km, ymin=ymin, ymax=ymax,
+        plot_isolines=plot_isolines, isoline_levels=isoline_levels,
+        isoline_color=isoline_color, isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha, label_isolines=label_isolines,
+        field=field, save_field=save_field, field_path=field_path, n_jobs=n_jobs,
+        show_fig=show_fig, save_fig=save_fig, output_dir=output_dir, verbose=verbose,
+    )
+
+
+def plot_argo_vertical_argo_overview(
+    profile_number: int,
+    profile_time: int | str | pd.Timestamp,
+    *,
+    platform_number: int | None = None,
+    k: float = 0.0,
+    radius_km: float = _argo_recon_radius_km,
+    day_window: int = _argo_recon_day_window,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    argo_data_dir: str | Path | None = None,
+    field: dict | None = None,
+    save_field: bool = False,
+    field_path: str | Path | None = None,
+    n_jobs: int | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    output_dir: str | Path | None = None,
+    verbose: bool = True,
+) -> None:
+    """以 Argo 剖面位置为中心，用 Argo 数据重建并绘制垂向断面 2x2 总览图。
+
+    取目标剖面（profile_number + profile_time）的位置与日期，以 ±radius_km 圈定
+    范围、±day_window 天为时间窗，重建 3D Argo 高斯核场并沿过该剖面的测线切取断面
+    （单日中心固定的欧拉快照，不随涡平移）。与 plot_argo_vertical_glorys_overview
+    对应，但垂向场来自 Argo 重建而非 GLORYS；与随涡的 plot_track_vertical_argo_overview 互补。
+
+    参数:
+        profile_number (int): 目标 Argo 剖面编号。
+        profile_time: 年份（如 2014）或具体日期（如 '2014-05-09'），用于定位剖面。
+        platform_number (int | None): 浮标编号，剖面编号同年重复时用于消歧，默认 None。
+        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
+        day_window (int): 时间窗半宽（天），围绕剖面日期取 ±day_window，默认 15。
+        h_bw (float): 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
+        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
+        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
+        z_max_m (float): 最大重建深度（m），默认 1500 m。
+        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
+        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
+        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
+        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
+        plot_isolines: 是否叠加 σ₀ 等值线。
+        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
+        argo_data_dir (str | Path | None): Argo 数据目录，None 时用默认 argo_path。
+        field (dict | None): 预建 3D 场，传入后跳过重建直接切片绘图。
+        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        field_path (str | Path | None): zarr 保存路径，None 时按剖面与日期自动生成。
+        n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
+        show_fig / save_fig: 是否显示 / 保存图片。
+        output_dir: 图片输出目录，None 时使用默认路径。
+        verbose (bool): 是否打印进度信息。
+    """
+    info = _resolve_argo_profile_center(
+        profile_number=int(profile_number),
+        profile_time=profile_time,
+        platform_number=platform_number,
+        argo_data_dir=argo_data_dir,
+    )
+    target_date = pd.Timestamp(info['target_date'])
+    _plot_center_vertical_argo_overview(
+        float(info['center_lon']), float(info['center_lat']), target_date,
+        subject_label=f'Profile {int(profile_number)}',
+        save_name_prefix=f'P{int(profile_number)}',
+        save_subdir='plot_argo_vertical_argo_overview',
+        k=k, radius_km=radius_km, day_window=day_window,
+        h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+        z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+        x_spacing_km=x_spacing_km, ymin=ymin, ymax=ymax,
+        plot_isolines=plot_isolines, isoline_levels=isoline_levels,
+        isoline_color=isoline_color, isoline_linewidth=isoline_linewidth,
+        isoline_alpha=isoline_alpha, label_isolines=label_isolines,
+        field=field, save_field=save_field, field_path=field_path, n_jobs=n_jobs,
+        show_fig=show_fig, save_fig=save_fig, output_dir=output_dir, verbose=verbose,
+    )
+
+
 # 帮助函数：判断三个点 (p, q, r) 的方向（共线，顺时针，逆时针）
 def _orientation(p, q, r):
     val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
