@@ -5,6 +5,7 @@
 *.csv
 *.xlsx
 *.npy
+*.npz
 *.txt
 *.mat
 *.zarr
@@ -18,3 +19,4 @@ GLORYS_processed/
 *tmp*/
 __pycache__/
 external/
+test/

@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.13 变更：
+#   - 新增 glorys_residual 配置小节，集中管理 GLORYS 逐点残差 / 垂向细结构丢失统计参数（残差深度/插值步长/高通窗口/同位与匹配半径/经纬度·时间搜索窗/最佳匹配深度覆盖门槛/南大洋分界纬度），供 plot_glorys_detail_loss_residual_atlas 使用。
 # version 1.12 变更：
 #   - argo_reconstruction 新增 min_profiles / min_coverage_top1000 / coverage_probe_spacing_m，供批处理重建预筛（剖面数 + ≤1000m 粗探针覆盖率）跳过低覆盖区域，避免无谓 build。
 # version 1.11 变更：
@@ -29,7 +31,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.12
+version: 1.13
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -94,6 +96,18 @@ processing:
     min_profiles: 20          # 批处理预筛：盒子+时间窗内剖面数下限，不足直接跳过不 build
     min_coverage_top1000: 0.5 # 批处理预筛：≤1000m 预估覆盖率下限，不足直接跳过不 build
     coverage_probe_spacing_m: 100.0  # 预估覆盖率的粗深度探针步长（m），越大越快越粗
+
+  # GLORYS 逐点残差 / 垂向细结构丢失统计（plot_glorys_detail_loss_residual_atlas）
+  glorys_residual:
+    z_max_m: 1000.0           # 残差比较的最大深度（m）
+    z_spacing_m: 5.0          # 潜温廓线统一插值的垂向间距（m）
+    fine_struct_window: 15    # 高通细结构的滚动窗口点数（×z_spacing_m = 物理尺度）
+    sameloc_radius_km: 40.0   # 同位 GLORYS 读取窗口半宽（km）
+    match_radius_km: 140.0    # 最佳匹配搜索的 GLORYS 读取窗口半宽（km）
+    match_window_deg: 1.0     # 最佳匹配的经纬度搜索半宽（°）
+    match_window_days: 1      # 最佳匹配的时间搜索半宽（天）
+    match_min_depth_coverage: 0.8  # 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，防浅海床列以截断深度刷低 RMS 胜出
+    so_lat_threshold: -40.0   # 南大洋专项分界纬度（°）
 
 plot:
   basemap_colors:

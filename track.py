@@ -241,6 +241,39 @@ _argo_recon_coverage_probe_spacing_m = float(
     _ARGO_RECON_CFG.get('coverage_probe_spacing_m', 100.0)
 )
 
+# GLORYS 逐点残差 / 垂向细结构丢失统计参数（从 processing.yml:processing.glorys_residual 读取）
+_GLORYS_RESID_CFG = _PROC_CFG.get('processing', {}).get('glorys_residual', {})
+_glorys_resid_z_max_m = float(
+    _GLORYS_RESID_CFG.get('z_max_m', 1000.0)
+)
+_glorys_resid_z_spacing_m = float(
+    _GLORYS_RESID_CFG.get('z_spacing_m', 5.0)
+)
+_glorys_resid_fine_window = int(
+    _GLORYS_RESID_CFG.get('fine_struct_window', 15)
+)
+_glorys_resid_sameloc_radius_km = float(
+    _GLORYS_RESID_CFG.get('sameloc_radius_km', 40.0)
+)
+_glorys_resid_match_radius_km = float(
+    _GLORYS_RESID_CFG.get('match_radius_km', 140.0)
+)
+_glorys_resid_match_window_deg = float(
+    _GLORYS_RESID_CFG.get('match_window_deg', 1.0)
+)
+_glorys_resid_match_window_days = int(
+    _GLORYS_RESID_CFG.get('match_window_days', 1)
+)
+_glorys_resid_match_min_cov = float(
+    _GLORYS_RESID_CFG.get('match_min_depth_coverage', 0.8)
+)
+_glorys_resid_so_lat = float(
+    _GLORYS_RESID_CFG.get('so_lat_threshold', -40.0)
+)
+# 残差 worker 进程内的 Argo 年缓存及其上限（防跨十几年累积把内存吃爆；任务按年份排序后命中率仍高）
+_RESID_ARGO_CACHE: dict = {}
+_RESID_ARGO_CACHE_MAX = 3
+
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
 _CBAR_FALLBACK = {
@@ -15338,6 +15371,623 @@ def plot_hotspot_anomaly_argo_reconstruction_overviews(
     }
     if return_details:
         summary['results'] = results
+    return summary
+
+
+def _glorys_residual_core(args: dict) -> tuple[dict, dict | None]:
+    """单条 Argo 剖面的 GLORYS 逐点残差核心（多进程入口）：同位残差 + ±窗最佳匹配，拆错位 vs 丢细节。
+
+    把 GLORYS 插值到 Argo 剖面位置（同位），并在 ±经纬度/±天窗口内搜最小 RMS 的原生
+    GLORYS 列（最佳匹配）；二者之差给出错位贡献，最佳匹配后的高通细结构比 <1 即真丢细节。
+    返回 (record, curves)：record 为扁平标量明细，成功时 curves 含统一 z 网格上的三条潜温
+    廓线（供单剖面对比图），跳过/失败时 curves 为 None。
+    """
+    task_index = int(args.get('task_index', -1))
+    record = {
+        'task_index': task_index,
+        'year': int(args['year']),
+        'profile_number': int(args['profile_number']),
+        'lat': np.nan, 'lon': np.nan,
+        'anomaly_depth_m': args.get('anomaly_depth_m'),
+        'rms_same': np.nan, 'rms_best': np.nan, 'disp_rms': np.nan,
+        'disp_km': np.nan, 'day_off': 0,
+        'fine_argo': np.nan, 'fine_glorys_same': np.nan, 'fine_glorys_best': np.nan,
+        'fine_ratio_same': np.nan, 'fine_ratio_best': np.nan,
+        'status': 'failed', 'skip_reason': None, 'error': None,
+    }
+    curves = None
+    try:
+        region_config_key = args.get('region_config_key')
+        if region_config_key:
+            switch_region(str(region_config_key), verbose=False)
+
+        clon = float(args['center_lon'])
+        clat = float(args['center_lat'])
+        record['lon'] = round(clon, 3)
+        record['lat'] = round(clat, 3)
+        year = int(args['year'])
+        date = pd.Timestamp(year=year, month=int(args['month']), day=int(args['day']))
+
+        z_max = float(args['z_max_m'])
+        z_sp = float(args['z_spacing_m'])
+        fine_win = int(args['fine_window'])
+        zc = np.arange(0.0, z_max + 0.1, z_sp)
+
+        def onto(z, v):
+            m = np.isfinite(z) & np.isfinite(v)
+            return np.interp(zc, z[m], v[m], left=np.nan, right=np.nan) if m.sum() > 3 else np.full(zc.size, np.nan)
+
+        def fine_std(v):
+            # 高通：减去滚动均值后取标准差，得到比窗口尺度更细的垂向结构强度
+            s = pd.Series(v)
+            resid = (s - s.rolling(fine_win, center=True, min_periods=5).mean()).to_numpy()
+            resid = resid[np.isfinite(resid)]
+            return float(np.std(resid)) if resid.size else np.nan
+
+        def load_thetao(needed_date, rad_km):
+            lo, hi, la, lb = _window_bounds_from_center_km(clon, clat, rad_km)
+            glon, glat, gdep, gdat = _load_glorys_window_by_center(
+                needed_date, clon, lo, hi, la, lb, variables=['thetao'], depth=None)
+            return glon, glat, gdep, np.ma.filled(np.ma.array(gdat['thetao']), np.nan)
+
+        if year not in _RESID_ARGO_CACHE:
+            if len(_RESID_ARGO_CACHE) >= _RESID_ARGO_CACHE_MAX:
+                _RESID_ARGO_CACHE.pop(next(iter(_RESID_ARGO_CACHE)))  # 淘汰最早进入的年份
+            _RESID_ARGO_CACHE[year] = load_argo_data(year, data_dir=args.get('argo_data_dir'))
+        prof = _RESID_ARGO_CACHE[year]
+        prof = prof[prof['Profile_number'] == int(args['profile_number'])].sort_values('Depth')
+        za = prof['Depth'].to_numpy(float)
+        ti = prof['Temperature'].to_numpy(float)
+        sa = prof['Salinity'].to_numpy(float)
+        if za.size < 5:
+            record['skip_reason'] = 'argo_profile<5pts'
+            record['status'] = 'skipped'
+            return record, None
+        # Argo 现场温 → 潜温，与 GLORYS thetao 对齐
+        pres = gsw.p_from_z(-za, clat)
+        SA = gsw.SA_from_SP(sa, pres, clon, clat)
+        pta = gsw.pt0_from_t(SA, ti, pres)
+        PTa = onto(za, pta)
+        fa = fine_std(PTa)
+        if not np.isfinite(fa) or fa <= 0:
+            record['skip_reason'] = 'argo_fine_std<=0'
+            record['status'] = 'skipped'
+            return record, None
+        record['fine_argo'] = round(fa, 4)
+
+        glon, glat, gdep, cube0 = load_thetao(date, float(args['sameloc_radius_km']))
+        qlat = float(np.clip(clat, glat.min(), glat.max()))
+        qlon = float(np.clip(clon, glon.min(), glon.max()))
+        rgi = RegularGridInterpolator((gdep, glat, glon), cube0, bounds_error=False, fill_value=np.nan)
+        ptg_same = rgi(np.column_stack([gdep, np.full(gdep.size, qlat), np.full(gdep.size, qlon)]))
+        PTg_same = onto(gdep, ptg_same)
+        in_z = zc <= z_max
+        resid_same = (PTg_same - PTa)[in_z]
+        resid_same = resid_same[np.isfinite(resid_same)]
+        rms_same = float(np.std(resid_same)) if resid_same.size else np.nan
+        f_same = fine_std(PTg_same)
+
+        win_deg = float(args['match_window_deg'])
+        win_days = int(args['match_window_days'])
+        match_rad = float(args['match_radius_km'])
+        match_min_cov = float(args['match_min_depth_coverage'])
+        best = dict(rms=np.inf, dk=np.nan, dd=0, col=None, gdep=None)
+        for dd in range(-win_days, win_days + 1):
+            try:
+                glon2, glat2, gdep2, cube = load_thetao(date + pd.Timedelta(days=dd), match_rad)
+            except Exception:
+                continue
+            pta_on_g = np.interp(gdep2, zc, PTa, left=np.nan, right=np.nan)
+            zmask = gdep2 <= z_max
+            d = (cube - pta_on_g[:, None, None])[zmask]
+            valid = np.isfinite(d)
+            cnt = valid.sum(axis=0)
+            denom = np.maximum(cnt, 1)
+            # 逐列差值的「去均值标准差」，与同位 rms_same 同口径（只看结构、不计整体冷暖偏差，
+            # 使 disp²=total²−resid² 的分解自洽）；计数保护避开全 NaN 海床列的空切片告警
+            col_mean = np.where(valid, d, 0.0).sum(axis=0) / denom
+            col_var = np.where(valid, d * d, 0.0).sum(axis=0) / denom - col_mean ** 2
+            rmsmap = np.sqrt(np.where(cnt > 0, np.clip(col_var, 0.0, None), np.nan))
+            # 候选列须覆盖 Argo 廓线深度范围的 match_min_cov 比例，否则浅海床列会以截断深度刷低误胜
+            nz_argo = int(np.isfinite(pta_on_g[zmask]).sum())
+            enough = cnt >= max(1, int(np.ceil(match_min_cov * nz_argo)))
+            dlon = np.array([_minimal_lon_diff_deg(lon_val, clon) for lon_val in glon2])
+            within = (np.abs(glat2[:, None] - clat) <= win_deg) & (np.abs(dlon[None, :]) <= win_deg)
+            rmsmap = np.where(within & enough & np.isfinite(rmsmap), rmsmap, np.inf)
+            if not np.isfinite(rmsmap).any():
+                continue
+            j, i = np.unravel_index(np.argmin(rmsmap), rmsmap.shape)
+            if rmsmap[j, i] < best['rms']:
+                sc = approximate_degree_length(clat)
+                dk = np.hypot(dlon[i] * sc['meters_per_degree_lon'],
+                              (glat2[j] - clat) * sc['meters_per_degree_lat']) / 1000.0
+                best = dict(rms=float(rmsmap[j, i]), col=cube[:, j, i], gdep=gdep2, dk=float(dk), dd=int(dd))
+        if best['col'] is None:
+            record['skip_reason'] = 'no_glorys_match'
+            record['status'] = 'skipped'
+            return record, None
+        PTg_best = onto(best['gdep'], best['col'])
+        fb = fine_std(PTg_best)
+        # 错位贡献按二次方差分离：总偏差² = 错位² + 残差²
+        disp_rms = float(np.sqrt(max(rms_same ** 2 - best['rms'] ** 2, 0.0)))
+
+        record.update({
+            'rms_same': round(rms_same, 3), 'rms_best': round(best['rms'], 3),
+            'disp_rms': round(disp_rms, 3), 'disp_km': round(best['dk'], 1), 'day_off': best['dd'],
+            'fine_glorys_same': round(f_same, 4), 'fine_glorys_best': round(fb, 4),
+            'fine_ratio_same': round(f_same / fa, 3), 'fine_ratio_best': round(fb / fa, 3),
+            'status': 'ok',
+        })
+        curves = {
+            'profile_number': int(args['profile_number']),
+            'lat': clat, 'lon': clon,
+            'date': date.strftime('%Y-%m-%d'),
+            'zc': zc, 'PTa': PTa, 'PTg_same': PTg_same, 'PTg_best': PTg_best,
+            'anomaly_depth_m': args.get('anomaly_depth_m'),
+            'disp_km': float(best['dk']), 'day_off': int(best['dd']),
+            'fine_ratio_best': record['fine_ratio_best'], 'rms_best': record['rms_best'],
+        }
+    except Exception as exc:
+        record['error'] = str(exc)
+    return record, curves
+
+
+def _glorys_residual_curve_worker(args: dict) -> dict | None:
+    """单剖面对比图的廓线 worker：只取廓线（reuse 时按需补算缓存缺失的剖面用）。"""
+    return _glorys_residual_core(args)[1]
+
+
+def _save_residual_curves(path: str | Path, curves: list[dict | None]) -> None:
+    """把所有剖面的三条潜温廓线压成单个 npz（共享 z 网格），供绘图零 GLORYS 读地复用。"""
+    cur = [c for c in curves if c is not None]
+    if not cur:
+        return
+    np.savez_compressed(
+        path,
+        zc=cur[0]['zc'],
+        profile_number=np.array([c['profile_number'] for c in cur], int),
+        lat=np.array([c['lat'] for c in cur], float),
+        anomaly_depth_m=np.array([np.nan if c['anomaly_depth_m'] is None else c['anomaly_depth_m']
+                                  for c in cur], float),
+        disp_km=np.array([c['disp_km'] for c in cur], float),
+        day_off=np.array([c['day_off'] for c in cur], int),
+        fine_ratio_best=np.array([c['fine_ratio_best'] for c in cur], float),
+        PTa=np.vstack([c['PTa'] for c in cur]),
+        PTg_same=np.vstack([c['PTg_same'] for c in cur]),
+        PTg_best=np.vstack([c['PTg_best'] for c in cur]),
+    )
+
+
+def _load_residual_curves(path: str | Path) -> dict[int, dict]:
+    """读回 npz 廓线缓存，返回 {profile_number: curve_dict}；文件缺失返回空字典。"""
+    if not Path(path).exists():
+        return {}
+    z = np.load(path)
+    zc = z['zc']
+    store = {}
+    for k, pn in enumerate(z['profile_number']):
+        store[int(pn)] = {
+            'profile_number': int(pn), 'lat': float(z['lat'][k]),
+            'anomaly_depth_m': float(z['anomaly_depth_m'][k]),
+            'disp_km': float(z['disp_km'][k]), 'day_off': int(z['day_off'][k]),
+            'fine_ratio_best': float(z['fine_ratio_best'][k]),
+            'zc': zc, 'PTa': z['PTa'][k], 'PTg_same': z['PTg_same'][k], 'PTg_best': z['PTg_best'][k],
+        }
+    return store
+
+
+def _residual_basin_of(lat: float, lon: float, so_lat: float = -40.0) -> str:
+    """按经纬度粗分海盆；纬度低于 so_lat 一律归为南大洋（SO）。"""
+    if lat < so_lat:
+        return 'SO'
+    if lat > 66:
+        return 'Arctic'
+    lon360 = lon % 360
+    if 20 <= lon360 < 120 and lat <= 30:
+        return 'Indian'
+    if 100 <= lon360 < 290:
+        return 'Pacific'
+    return 'Atlantic'
+
+
+def _render_glorys_residual_figures(df: pd.DataFrame, output_dir: Path, so_lat: float) -> list[str]:
+    """由逐点残差明细 df 渲染 4 张聚合图，返回保存路径列表。"""
+    from scipy.stats import mannwhitneyu
+
+    df = df[df['status'] == 'ok'].copy()
+    df['is_SO'] = df['lat'] < so_lat
+    # hotspot_type 分类整数码 → 英文名：1=通风 2=隔离 3=OMZ（氧最小带，早期 Argo 曲线分类）
+    df['htype'] = df['hotspot_type'].map({1: 'ventilated', 2: 'isolated', 3: 'OMZ'})
+    df['basin'] = [_residual_basin_of(la, lo, so_lat) for la, lo in zip(df['lat'], df['lon'])]
+    # 异常筛选已排除 ≤300m，故深度分箱从 300 起（无 <300 一列）
+    df['dbin'] = pd.cut(df['anomaly_depth_m'].astype(float), [300, 500, 800, 5000],
+                        labels=['300-500', '500-800', '>800'])
+    n_total = len(df)
+    saved: list[str] = []
+
+    # Fig 1：细结构比分布（深度 / 海盆 / hotspot 分类）
+    htype_order = [t for t in ['ventilated', 'isolated', 'OMZ'] if t in set(df['htype'].dropna())]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, key, order, ttl in [
+        (axes[0], 'dbin', ['300-500', '500-800', '>800'], 'by anomaly depth (m)'),
+        (axes[1], 'basin', ['Pacific', 'Atlantic', 'Indian', 'SO'], 'by basin'),
+        (axes[2], 'htype', htype_order, 'by hotspot type')]:
+        data = [df[df[key] == o]['fine_ratio_best'].clip(0, 2).dropna() for o in order]
+        bp = ax.boxplot(data, labels=[str(o) for o in order], showmeans=True, patch_artist=True)
+        for patch in bp['boxes']:
+            patch.set_facecolor('#9ecae1')
+            patch.set_alpha(0.7)
+        ax.axhline(1.0, color='grey', ls='--', lw=1)
+        ax.set_title(ttl)
+        ax.set_ylabel('fine-structure ratio (GLORYS/Argo, best-match)')
+        ax.set_ylim(0, 1.6)
+        ax.grid(alpha=0.3, axis='y')
+    fig.suptitle('GLORYS retained vertical fine-structure  (<1 = detail lost; n=%d)' % n_total, fontsize=13)
+    fig.tight_layout()
+    fp = output_dir / 'fig1_fine_ratio_distributions.png'
+    fig.savefig(fp, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    saved.append(str(fp))
+
+    # Fig 2：错位 vs 丢细节占比
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5.2))
+    order = [b for b in ['Pacific', 'Atlantic', 'Indian', 'SO'] if b in set(df['basin'])]
+    gb = df.groupby('basin')
+    disp = [gb.get_group(b)['disp_rms'].mean() for b in order]
+    resid = [gb.get_group(b)['rms_best'].mean() for b in order]
+    x = np.arange(len(order))
+    ax[0].bar(x, disp, label='displacement (quad)', color='#fdae6b')
+    ax[0].bar(x, resid, bottom=disp, label='residual detail-loss', color='#3182bd')
+    ax[0].set_xticks(x)
+    ax[0].set_xticklabels(order)
+    ax[0].set_ylabel('pot-temp deviation std (°C)')
+    ax[0].set_title('deviation decomposition: displacement vs detail-loss')
+    ax[0].legend()
+    sc = ax[1].scatter(df['rms_same'], df['rms_best'], c=df['disp_km'], cmap='viridis', s=18, alpha=0.7)
+    hi = float(np.nanpercentile(df['rms_same'], 99))
+    ax[1].plot([0, hi], [0, hi], 'k--', lw=1, label='no displacement gain')
+    ax[1].set_xlim(0, hi)
+    ax[1].set_ylim(0, hi)
+    ax[1].set_xlabel('same-loc std (total, °C)')
+    ax[1].set_ylabel('best-match std (residual, °C)')
+    ax[1].set_title('best-match below diagonal => displacement removed')
+    plt.colorbar(sc, ax=ax[1], label='best-match displacement (km)')
+    ax[1].legend()
+    fig.tight_layout()
+    fp = output_dir / 'fig2_displacement_vs_detailloss.png'
+    fig.savefig(fp, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    saved.append(str(fp))
+
+    # Fig 3：大残差世界地图
+    fig = plt.figure(figsize=(15, 7))
+    ax = plt.axes(projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
+    ax.set_global()
+    loss = 1 - df['fine_ratio_best'].clip(0, 1)
+    sc = ax.scatter(df['lon'], df['lat'], c=loss, s=20 + df['rms_best'] * 40, cmap='inferno_r',
+                    vmin=0, vmax=1, transform=ccrs.PlateCarree(), edgecolor='k', linewidth=0.2)
+    ax.plot([-180, 180], [so_lat, so_lat], color='cyan', ls='--', lw=1.2, transform=ccrs.PlateCarree())
+    plt.colorbar(sc, ax=ax, orientation='horizontal', pad=0.04, shrink=0.6,
+                 label='detail loss = 1 - fine_ratio_best  (size ~ residual std)')
+    ax.set_title('Where GLORYS loses vertical fine-structure (cyan = %.0fS, SO boundary)' % abs(so_lat))
+    fp = output_dir / 'fig3_residual_map.png'
+    fig.savefig(fp, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    saved.append(str(fp))
+
+    # Fig 4：南大洋专项
+    so = df[df['is_SO']]
+    rest = df[~df['is_SO']]
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    for a, col, ttl in [(ax[0], 'fine_ratio_best', 'fine-structure ratio'),
+                        (ax[1], 'rms_best', 'residual std (°C)'),
+                        (ax[2], 'disp_km', 'best-match displacement (km)')]:
+        rest_v = rest[col].clip(0, 2) if 'ratio' in col else rest[col]
+        so_v = so[col].clip(0, 2) if 'ratio' in col else so[col]
+        a.hist(rest_v.dropna(), bins=25, density=True, alpha=0.5,
+               label='rest (n=%d)' % len(rest), color='grey')
+        a.hist(so_v.dropna(), bins=15, density=True, alpha=0.6,
+               label='SO (n=%d)' % len(so), color='red')
+        a.axvline(rest[col].median(), color='grey', ls='--')
+        a.axvline(so[col].median(), color='red', ls='--')
+        try:
+            _, pval = mannwhitneyu(so[col].dropna(), rest[col].dropna(), alternative='two-sided')
+        except Exception:
+            pval = np.nan
+        a.set_title('%s\nSO med=%.2f  rest med=%.2f  p=%.2g' %
+                    (ttl, so[col].median(), rest[col].median(), pval))
+        a.legend()
+    fig.suptitle('Southern Ocean (<%.0fS) vs rest' % abs(so_lat), fontsize=13)
+    fig.tight_layout()
+    fp = output_dir / 'fig4_southern_ocean.png'
+    fig.savefig(fp, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    saved.append(str(fp))
+    return saved
+
+
+def _render_glorys_residual_profile_examples(curves_list: list[dict], output_dir: Path) -> str | None:
+    """单剖面对比图：每个面板叠 Argo（黑）/ GLORYS 同位（红虚）/ GLORYS 最佳匹配（绿虚）潜温廓线。"""
+    curves_list = [c for c in curves_list if c is not None]
+    if not curves_list:
+        return None
+    n = len(curves_list)
+    ncol = min(4, n)
+    nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 4.6 * nrow), sharey=True, squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis('off')
+    for ax, c in zip(axes.ravel(), curves_list):
+        zc = c['zc']
+        ax.plot(c['PTa'], zc, 'k-', lw=1.5, label='Argo (obs)')
+        ax.plot(c['PTg_same'], zc, 'r--', lw=1.2, label='GLORYS same-loc')
+        ax.plot(c['PTg_best'], zc, 'g--', lw=1.2, label='GLORYS best-match')
+        adep = c.get('anomaly_depth_m')
+        if adep is not None and np.isfinite(adep):
+            ax.axhline(float(adep), color='blue', ls=':', lw=1, label='anomaly depth')
+        ax.set_ylim(zc.max(), 0)
+        ax.set_xlabel('potential temp (°C)')
+        ax.grid(alpha=0.3)
+        # 每格各自的位移/天偏移进标题（单一 legend 无法逐格显示）
+        ax.set_title("P%d (%.1f°N)  kept=%.2f  disp=%.0fkm/%+dd" %
+                     (c['profile_number'], c['lat'], c['fine_ratio_best'], c['disp_km'], c['day_off']),
+                     fontsize=10)
+    for r in range(nrow):
+        axes[r, 0].set_ylabel('depth (m)')
+    axes.ravel()[0].legend(fontsize=8, loc='upper left')
+    fig.suptitle('Argo vs GLORYS profiles  (same-loc=red, best-match within search window=green)', fontsize=13)
+    fig.tight_layout()
+    fp = output_dir / 'fig5_profile_examples.png'
+    fig.savefig(fp, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    return str(fp)
+
+
+def plot_glorys_detail_loss_residual_atlas(
+    start_year: int | None = None,
+    end_year: int | None = None,
+    anomalies_path: str | Path | None = None,
+    detection_config: DetectionConfig | None = None,
+    *,
+    z_max_m: float = _glorys_resid_z_max_m,
+    z_spacing_m: float = _glorys_resid_z_spacing_m,
+    fine_struct_window: int = _glorys_resid_fine_window,
+    sameloc_radius_km: float = _glorys_resid_sameloc_radius_km,
+    match_radius_km: float = _glorys_resid_match_radius_km,
+    match_window_deg: float = _glorys_resid_match_window_deg,
+    match_window_days: int = _glorys_resid_match_window_days,
+    match_min_depth_coverage: float = _glorys_resid_match_min_cov,
+    so_lat_threshold: float = _glorys_resid_so_lat,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    rows_path: str | Path | None = None,
+    reuse_rows: bool = False,
+    make_figures: bool = True,
+    save_fig: bool = True,
+    profile_examples: list[int] | None = None,
+    n_example_profiles: int = 8,
+    use_multiprocessing: bool = True,
+    num_workers: int | None = None,
+    maxtasksperchild: int | None = None,
+    verbose: bool = False,
+    return_details: bool = False,
+) -> dict:
+    """逐点统计 GLORYS 相对原始 Argo 剖面丢失的垂向细结构，并出全量聚合图。
+
+    对每条 hotspot 异常剖面，把 GLORYS 插值到其 (lon,lat,date,depth) 与原始 Argo 潜温
+    廓线逐点比较：``rms_same`` 为同位总偏差；在 ±``match_window_deg``/±``match_window_days``
+    窗口内搜最小 RMS 的原生 GLORYS 列得 ``rms_best``，二者按二次方差分离出错位贡献
+    （``disp_rms`` / ``disp_km``）；剔除错位后的高通细结构比 ``fine_ratio_best`` <1 即
+    GLORYS 真丢细节。即便单条剖面也成立，故在 Argo 稀疏、重建不可行处（尤其南大洋）仍适用。
+    聚合图按深度/海盆/Type 给出细结构比分布、错位 vs 丢细节占比、大残差世界地图，并单独
+    对比南大洋；另出一张单剖面对比图，逐条叠 Argo / GLORYS 同位 / GLORYS 最佳匹配三条潜温廓线。
+
+    参数:
+        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
+        anomalies_path: anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        detection_config: 异常识别配置；决定 method/region 与默认输入输出路径。
+        z_max_m: 残差比较的最大深度（m），默认取 processing.yml。
+        z_spacing_m: 潜温廓线统一插值的垂向间距（m）。
+        fine_struct_window: 高通细结构的滚动窗口点数（×z_spacing_m 为物理尺度）。
+        sameloc_radius_km: 同位 GLORYS 读取窗口半宽（km）。
+        match_radius_km: 最佳匹配搜索的 GLORYS 读取窗口半宽（km）。
+        match_window_deg / match_window_days: 最佳匹配的经纬度（°）与时间（天）搜索半宽。
+        match_min_depth_coverage: 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，剔除浅海床
+            截断列以截断深度刷低 RMS 误胜的伪匹配。
+        so_lat_threshold: 南大洋专项分界纬度（°），低于此值归为 SO。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
+        rows_path: 逐剖面明细 parquet 路径；None 时落在 output_dir 下默认文件名。同目录会另存一份
+            同名 `_curves.npz`（全部廓线），供重绘单剖面对比图时零 GLORYS 读地复用。
+        reuse_rows: 若明细 parquet 已存在则直接复用、跳过计算（仅重绘图时用）；此时单剖面图从
+            `_curves.npz` 取，缺失的剖面才按需补算，默认 False。
+        make_figures: 是否渲染聚合图，默认 True。
+        save_fig: 是否把图保存到 output_dir，默认 True；批处理仅离线渲染。
+        profile_examples: 单剖面对比图（Argo / 同位 / 最佳匹配 三条廓线）要画的 Profile_number 列表；
+            None 时按 fine_ratio_best 等距自动选样。
+        n_example_profiles: 自动选样时的剖面数（按细结构比从最差到最好等距取），<=0 关闭该图，默认 8。
+        use_multiprocessing: 是否多进程并行计算 profile，默认 True。
+        num_workers: worker 数；None 时自动取 min(profile数, CPU数, 12)。
+        maxtasksperchild: 每个 worker 处理多少任务后重启；None 表示不重启（保留 Argo 年缓存）。
+        verbose: 是否打印每条 profile 的失败明细。
+        return_details: 是否在返回中附带逐 profile 结果 DataFrame，默认 False。
+
+    返回:
+        dict: 含 total_candidates/processed_profiles/skipped_profiles/rows_path/output_dir/
+              figures/southern_ocean 等摘要；return_details=True 时附 'rows'（DataFrame）。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    region_slug = _current_region_key()
+    region_config_key = _current_region_config_key()
+    batch_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else cfg.output_dir("plot_glorys_detail_loss_residual_atlas", region_slug)
+    )
+
+    if anomalies_path is None:
+        if start_year is None or end_year is None:
+            raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
+        anomalies_path = cfg.output_dir("plot_argo_hotspots", region_slug) / (
+            f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+    else:
+        anomalies_path = Path(anomalies_path)
+    if not Path(anomalies_path).exists():
+        raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
+
+    anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+        anomalies = anomalies[method_mask].copy()
+    required_cols = ['Year', 'Profile_number', 'Longitude', 'Latitude', 'Month', 'Day']
+    missing_cols = [c for c in required_cols if c not in anomalies.columns]
+    if missing_cols:
+        raise ValueError(f"Anomalies file missing required columns: {missing_cols}")
+
+    batch_output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_rows_path = (
+        Path(rows_path) if rows_path is not None
+        else batch_output_dir / f"glorys_residual_rows_{run_tag}.parquet"
+    )
+    resolved_curves_path = Path(resolved_rows_path).with_name(
+        Path(resolved_rows_path).stem.replace('_rows', '_curves') + '.npz')
+
+    depth_cols = ['heave_projection_depth_m', 'depth', 'Depth', 'Anomaly_depth']
+
+    def _arg_for_row(task_index: int, row: pd.Series) -> dict:
+        adep = next((float(row[c]) for c in depth_cols
+                     if c in anomalies.columns and pd.notna(row.get(c))), np.nan)
+        return {
+            'task_index': int(task_index),
+            'year': int(row['Year']),
+            'profile_number': int(row['Profile_number']),
+            'month': int(row['Month']),
+            'day': int(row['Day']),
+            'center_lon': float(row['Longitude']),
+            'center_lat': float(row['Latitude']),
+            'anomaly_depth_m': adep,
+            'argo_data_dir': argo_data_dir,
+            'region_config_key': region_config_key,
+            'z_max_m': z_max_m, 'z_spacing_m': z_spacing_m,
+            'fine_window': fine_struct_window,
+            'sameloc_radius_km': sameloc_radius_km,
+            'match_radius_km': match_radius_km,
+            'match_window_deg': match_window_deg,
+            'match_window_days': match_window_days,
+            'match_min_depth_coverage': match_min_depth_coverage,
+        }
+
+    if reuse_rows and resolved_rows_path.exists():
+        rows_df = pd.read_parquet(resolved_rows_path)
+        curves_store = _load_residual_curves(resolved_curves_path)
+        print(f"[*] GLORYS residual: reusing existing rows ({len(rows_df)}) from {resolved_rows_path}"
+              f"{' + curves cache' if curves_store else ''}")
+    else:
+        # 按年份排序后分块派发，使每个 worker 处理相邻年份、Argo 缓存（上限 _RESID_ARGO_CACHE_MAX 年）命中率高
+        worker_args = [_arg_for_row(i, row) for i, (_, row)
+                       in enumerate(anomalies.sort_values('Year', kind='stable').iterrows())]
+
+        total_candidates = len(worker_args)
+        worker_count = 1
+        if use_multiprocessing and total_candidates > 1:
+            worker_count = int(num_workers) if num_workers is not None else min(total_candidates, os.cpu_count() or 1, 12)
+            worker_count = max(1, worker_count)
+
+        if worker_count > 1:
+            print(f"[*] GLORYS residual multiprocessing: workers={worker_count}, profiles={total_candidates}.")
+            pool_kwargs = {'processes': worker_count}
+            if maxtasksperchild is not None:
+                pool_kwargs['maxtasksperchild'] = max(1, int(maxtasksperchild))
+            with multiprocessing.Pool(**pool_kwargs) as pool:
+                pairs = list(tqdm(
+                    pool.imap_unordered(_glorys_residual_core, worker_args, chunksize=8),
+                    total=total_candidates, desc="glorys residual", unit="profile"))
+            pairs = sorted(pairs, key=lambda rc: int(rc[0].get('task_index', 0)))
+        else:
+            pairs = [
+                _glorys_residual_core(a)
+                for a in tqdm(worker_args, total=total_candidates, desc="glorys residual", unit="profile")
+            ]
+        results = [rc[0] for rc in pairs]
+        curves_store = {c['profile_number']: c for _, c in pairs if c is not None}
+
+        if verbose:
+            for item in results:
+                if item.get('status') == 'failed':
+                    print(f"[WARN] residual failed Year={item.get('year')} "
+                          f"Profile={item.get('profile_number')}: {item.get('error')}")
+        rows_df = pd.DataFrame(results)
+        # 合并 hotspot 分类后再存盘，让 parquet 自洽（供聚合图分组与后续单独分析）
+        rows_df = rows_df.merge(
+            anomalies[['Profile_number', 'hotspot_type']].rename(columns={'Profile_number': 'profile_number'}),
+            on='profile_number', how='left')
+        rows_df.to_parquet(resolved_rows_path, index=False)
+        _save_residual_curves(resolved_curves_path, list(curves_store.values()))
+        print(f"[*] GLORYS residual rows saved: {resolved_rows_path}")
+
+    # reuse 旧 rows 缺 hotspot_type 列时补上（新算的已在上面带好）
+    if 'hotspot_type' not in rows_df.columns:
+        rows_df = rows_df.merge(
+            anomalies[['Profile_number', 'hotspot_type']].rename(columns={'Profile_number': 'profile_number'}),
+            on='profile_number', how='left')
+
+    ok = rows_df[rows_df['status'] == 'ok']
+    processed_profiles = int(len(ok))
+    skipped_profiles = int((rows_df['status'] != 'ok').sum())
+
+    figures: list[str] = []
+    if make_figures and save_fig and processed_profiles > 0:
+        figures = _render_glorys_residual_figures(rows_df, batch_output_dir, so_lat_threshold)
+
+        # 单剖面对比图：显式 profile_examples 优先，否则按 fine_ratio_best 等距取 n 条（最差→最好）
+        example_pns: list[int] = []
+        if profile_examples:
+            example_pns = [int(p) for p in profile_examples]
+        elif n_example_profiles and n_example_profiles > 0:
+            okx = ok.dropna(subset=['fine_ratio_best']).sort_values('fine_ratio_best')
+            if len(okx):
+                idx = np.linspace(0, len(okx) - 1, min(int(n_example_profiles), len(okx))).round().astype(int)
+                example_pns = okx.iloc[np.unique(idx)]['profile_number'].astype(int).tolist()
+        if example_pns:
+            # 优先用 npz 廓线缓存（零 GLORYS 读）；仅对缓存缺失的剖面按需补算
+            example_curves = [curves_store[pn] for pn in example_pns if pn in curves_store]
+            missing = [pn for pn in example_pns if pn not in curves_store]
+            if missing:
+                pn_to_row = {int(r['Profile_number']): r
+                             for _, r in anomalies.drop_duplicates('Profile_number').iterrows()}
+                miss_args = [_arg_for_row(-1, pn_to_row[pn]) for pn in missing if pn in pn_to_row]
+                recomputed = [_glorys_residual_curve_worker(a) for a in miss_args]
+                example_curves += [c for c in recomputed if c is not None]
+            ex_fig = _render_glorys_residual_profile_examples(example_curves, batch_output_dir)
+            if ex_fig:
+                figures.append(ex_fig)
+        print(f"[*] GLORYS residual figures saved to {batch_output_dir}")
+
+    so_mask = ok['lat'] < so_lat_threshold
+    summary = {
+        'total_candidates': int(len(rows_df)),
+        'processed_profiles': processed_profiles,
+        'skipped_profiles': skipped_profiles,
+        'rows_path': str(resolved_rows_path),
+        'output_dir': str(batch_output_dir),
+        'anomalies_path': str(anomalies_path),
+        'figures': figures,
+        'fine_ratio_best_median': float(ok['fine_ratio_best'].median()) if processed_profiles else None,
+        'southern_ocean': {
+            'n': int(so_mask.sum()),
+            'fine_ratio_best_median': float(ok.loc[so_mask, 'fine_ratio_best'].median()) if so_mask.any() else None,
+            'rest_fine_ratio_best_median': float(ok.loc[~so_mask, 'fine_ratio_best'].median()) if (~so_mask).any() else None,
+        },
+    }
+    if return_details:
+        summary['rows'] = rows_df
     return summary
 
 
