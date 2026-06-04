@@ -1,5 +1,7 @@
 # Oxygen Copilot Instructions
 
+> **Canonical source: `CLAUDE.md`** — This file is kept for Copilot compatibility. In case of conflict, `CLAUDE.md` takes precedence.
+
 ## Repo Snapshot
 - Majority of the logic lives in `track.py` covering geometry helpers, data ingestion, analytics, and plotting for eddy–Argo interactions.
 - Configuration is entirely YAML-driven under `config/` (`paths.yml`, `processing.yml`, `regions.yml`); do not hardcode paths or thresholds.
