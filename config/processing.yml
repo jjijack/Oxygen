@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.12 变更：
+#   - argo_reconstruction 新增 min_profiles / min_coverage_top1000 / coverage_probe_spacing_m，供批处理重建预筛（剖面数 + ≤1000m 粗探针覆盖率）跳过低覆盖区域，避免无谓 build。
 # version 1.11 变更：
 #   - 新增 argo_reconstruction 配置小节，集中管理 Argo 3D 高斯核断面重建参数（核带宽/权重阈值/网格步长/半径/时间窗），三个重建函数统一默认 h_bw=60 / min_weight=3.0。
 # version 1.10 变更：
@@ -27,7 +29,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.11
+version: 1.12
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -89,6 +91,9 @@ processing:
     x_spacing_km: 5.0         # 断面水平采样步长（km）
     radius_km: 400.0          # track/argo 变体的中心半径（km）
     day_window_days: 15       # track/argo 变体的时间窗半宽（天）
+    min_profiles: 20          # 批处理预筛：盒子+时间窗内剖面数下限，不足直接跳过不 build
+    min_coverage_top1000: 0.5 # 批处理预筛：≤1000m 预估覆盖率下限，不足直接跳过不 build
+    coverage_probe_spacing_m: 100.0  # 预估覆盖率的粗深度探针步长（m），越大越快越粗
 
 plot:
   basemap_colors:

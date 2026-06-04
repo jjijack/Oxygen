@@ -231,6 +231,15 @@ _argo_recon_radius_km = float(
 _argo_recon_day_window = int(
     _ARGO_RECON_CFG.get('day_window_days', 15)
 )
+_argo_recon_min_profiles = int(
+    _ARGO_RECON_CFG.get('min_profiles', 20)
+)
+_argo_recon_min_coverage_top = float(
+    _ARGO_RECON_CFG.get('min_coverage_top1000', 0.5)
+)
+_argo_recon_coverage_probe_spacing_m = float(
+    _ARGO_RECON_CFG.get('coverage_probe_spacing_m', 100.0)
+)
 
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
@@ -10451,6 +10460,39 @@ def _build_argo_3d_field(
     }
 
 
+def _estimate_argo_top_coverage(
+    pool: pd.DataFrame,
+    lon_range: tuple[float, float],
+    lat_range: tuple[float, float],
+    *,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    min_weight: float = _argo_recon_min_weight,
+    z_top_m: float = 1000.0,
+    probe_spacing_m: float = _argo_recon_coverage_probe_spacing_m,
+    n_jobs: int | None = 1,
+) -> float:
+    """粗深度探针预估 ≤z_top_m 的重建覆盖率（批处理预筛用，避免全量 build）。
+
+    复用 _build_argo_3d_field，但只在 0..z_top_m 间按 probe_spacing_m 取稀疏深度层
+    （默认 100 m，约为正式 10 m 网格的 1/10 成本），返回有效格点占比。Argo 在
+    ≤1000 m 垂向连续密集，稀疏深度采样即可忠实反映真实 ≤1000m 覆盖率。
+    """
+    if pool.empty:
+        return 0.0
+    field = _build_argo_3d_field(
+        pool, lon_range, lat_range,
+        h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+        z_max_m=z_top_m, z_spacing_m=probe_spacing_m, min_weight=min_weight,
+        n_jobs=n_jobs, verbose=False,
+    )
+    valid = ~np.isnan(field['thetao'])
+    if valid.size == 0:
+        return 0.0
+    return float(valid.mean())
+
+
 def _save_argo_3d_field(field: dict, zarr_path: str | Path) -> None:
     """将 _build_argo_3d_field 返回的 3D 场保存为 zarr 格式。"""
     root = zarr.open_group(str(zarr_path), mode='w')
@@ -10769,6 +10811,7 @@ def _plot_center_vertical_argo_overview(
     show_fig: bool = True,
     save_fig: bool = False,
     output_dir: str | Path | None = None,
+    save_name: str | None = None,
     verbose: bool = True,
 ) -> None:
     """以中心点 + 半径重建并绘制 Argo 垂向断面 2x2 总览图（track / argo 变体共用）。
@@ -10865,7 +10908,7 @@ def _plot_center_vertical_argo_overview(
         if save_fig:
             out_dir = Path(output_dir) if output_dir else _shared_output_dir(save_subdir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            fname = (
+            fname = save_name or (
                 f'{save_name_prefix}_argo_{target_date.strftime("%Y%m%d")}'
                 f'_hbw{h_bw:.0f}km.png'
             )
@@ -14814,6 +14857,484 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         'heave_diagnostics': bool(annotate_heave),
         'annotate_heave': bool(annotate_heave),
         'annotate_spice': bool(annotate_spice),
+    }
+    if return_details:
+        summary['results'] = results
+    return summary
+
+
+def _plot_hotspot_argo_reconstruction_profile_worker(args: dict) -> dict:
+    """单个 hotspot Argo profile 的点 Eulerian 重建 vertical overview worker（含覆盖率预筛）。"""
+    task_index = int(args.get('task_index', -1))
+    year_val = int(args['year'])
+    profile_num = int(args['profile_number'])
+    month_val = args.get('month')
+    day_val = args.get('day')
+    platform_val = args.get('platform_number')
+    anomaly_depth_m = args.get('anomaly_depth_m')
+
+    if month_val is not None and day_val is not None:
+        profile_time = pd.Timestamp(year=year_val, month=int(month_val), day=int(day_val))
+    else:
+        profile_time = year_val
+
+    record = {
+        'task_index': task_index,
+        'year': year_val,
+        'profile_number': profile_num,
+        'platform_number': platform_val,
+        'profile_time': str(profile_time),
+        'center_lon': np.nan,
+        'center_lat': np.nan,
+        'target_date': None,
+        'anomaly_depth_m': anomaly_depth_m,
+        'n_profiles': 0,
+        'est_coverage_top': np.nan,
+        'coverage_top': np.nan,
+        'save_path': None,
+        'skip_reason': None,
+        'status': 'failed',
+        'error': None,
+    }
+
+    try:
+        region_config_key = args.get('region_config_key')
+        if region_config_key:
+            switch_region(str(region_config_key), verbose=False)
+        if bool(args.get('force_agg_backend', False)):
+            try:
+                plt.switch_backend('Agg')
+            except Exception:
+                pass
+        if not bool(args.get('show_fig', False)):
+            plt.ioff()
+        plt.close('all')
+
+        info = _resolve_argo_profile_center(
+            profile_number=profile_num,
+            profile_time=profile_time,
+            platform_number=platform_val,
+            argo_data_dir=args.get('argo_data_dir'),
+        )
+        center_lon = float(info['center_lon'])
+        center_lat = float(info['center_lat'])
+        target_date = pd.Timestamp(info['target_date']).normalize()
+        platform_resolved = info.get('platform_number')
+        if platform_val is None and platform_resolved is not None:
+            platform_val = int(platform_resolved)
+        record.update({
+            'platform_number': platform_val,
+            'profile_time': target_date.strftime('%Y-%m-%d'),
+            'center_lon': center_lon,
+            'center_lat': center_lat,
+            'target_date': target_date.strftime('%Y-%m-%d'),
+        })
+
+        radius_km = float(args['radius_km'])
+        day_window = int(args['day_window'])
+        h_bw = float(args['h_bw'])
+        depth_bw = float(args['depth_bw'])
+        h_spacing_deg = float(args['h_spacing_deg'])
+        z_max_m = float(args['z_max_m'])
+        z_spacing_m = float(args['z_spacing_m'])
+        min_weight = float(args['min_weight'])
+        inner_n_jobs = args.get('inner_n_jobs')
+
+        lon_min, lon_max, lat_min, lat_max = _window_bounds_from_center_km(center_lon, center_lat, radius_km)
+        lon_range = (lon_min, lon_max)
+        lat_range = (lat_min, lat_max)
+        t_min = target_date - pd.Timedelta(days=day_window)
+        t_max = target_date + pd.Timedelta(days=day_window)
+
+        pool = collect_argo_pool(lon_range, lat_range, t_min, t_max, max_depth=z_max_m + 200.0)
+        n_prof = int(pool['Profile_number'].nunique()) if not pool.empty else 0
+        record['n_profiles'] = n_prof
+
+        # Stage 1：剖面数预筛（~毫秒）；不足直接跳过，不进入任何 build
+        min_profiles = int(args['min_profiles'])
+        if n_prof < min_profiles:
+            record['skip_reason'] = f'n_profiles<{min_profiles}'
+            record['status'] = 'skipped'
+            return record
+
+        # Stage 2：粗深度探针预估 ≤1000m 覆盖率（~亚秒）；不足直接跳过，不做全量 build
+        est_cov = _estimate_argo_top_coverage(
+            pool, lon_range, lat_range,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            min_weight=min_weight,
+            probe_spacing_m=float(args['coverage_probe_spacing_m']),
+            n_jobs=inner_n_jobs,
+        )
+        record['est_coverage_top'] = est_cov
+        min_coverage = float(args['min_coverage_top1000'])
+        if est_cov < min_coverage:
+            record['skip_reason'] = f'est_coverage<{min_coverage:.2f}'
+            record['status'] = 'skipped'
+            return record
+
+        field = _build_argo_3d_field(
+            pool, lon_range, lat_range,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+            n_jobs=inner_n_jobs, verbose=False,
+        )
+        field['attrs']['start_date'] = t_min.strftime('%Y-%m-%d')
+        field['attrs']['end_date'] = t_max.strftime('%Y-%m-%d')
+        z_top = field['depth'] <= 1000.0
+        valid_top = ~np.isnan(field['thetao'][z_top])
+        record['coverage_top'] = float(valid_top.mean()) if valid_top.size else np.nan
+
+        out_dir = args.get('vertical_output_dir')
+        # 与 GLORYS 总览同前缀 Argo_{日期}_P{剖面}，便于两批输出在目录里成对相邻对比
+        save_name = f'Argo_{target_date.strftime("%Y%m%d")}_P{profile_num}_recon_hbw{h_bw:.0f}km.png'
+        _plot_center_vertical_argo_overview(
+            center_lon, center_lat, target_date,
+            subject_label=f'Profile {profile_num}',
+            save_name_prefix=f'P{profile_num}',
+            save_name=save_name,
+            save_subdir='plot_hotspot_anomaly_argo_reconstruction_overviews',
+            n_prof=n_prof,
+            k=float(args.get('k', 0.0)),
+            radius_km=radius_km, day_window=day_window,
+            h_bw=h_bw, depth_bw=depth_bw, h_spacing_deg=h_spacing_deg,
+            z_max_m=z_max_m, z_spacing_m=z_spacing_m, min_weight=min_weight,
+            x_spacing_km=float(args['x_spacing_km']),
+            ymin=float(args.get('ymin', 0.0)), ymax=float(args.get('ymax', 1000.0)),
+            plot_isolines=bool(args.get('plot_isolines', True)),
+            isoline_levels=args.get('isoline_levels'),
+            isoline_color=args.get('isoline_color', 'black'),
+            isoline_linewidth=float(args.get('isoline_linewidth', 0.8)),
+            isoline_alpha=float(args.get('isoline_alpha', 0.45)),
+            label_isolines=bool(args.get('label_isolines', True)),
+            field=field,
+            show_fig=bool(args.get('show_fig', False)),
+            save_fig=bool(args.get('save_fig', True)),
+            output_dir=out_dir,
+            verbose=bool(args.get('verbose', False)),
+        )
+        if bool(args.get('save_fig', True)) and out_dir is not None:
+            record['save_path'] = str(Path(out_dir) / save_name)
+        record['status'] = 'ok'
+
+    except Exception as exc:
+        record['error'] = str(exc)
+    finally:
+        plt.close('all')
+
+    return record
+
+
+def plot_hotspot_anomaly_argo_reconstruction_overviews(
+    start_year: int | None = None,
+    end_year: int | None = None,
+    anomalies_path: str | Path | None = None,
+    detection_config: DetectionConfig | None = None,
+    *,
+    k: float = 0.0,
+    radius_km: float = _argo_recon_radius_km,
+    day_window: int = _argo_recon_day_window,
+    h_bw: float = _argo_recon_h_bw_km,
+    depth_bw: float = _argo_recon_depth_bw_m,
+    h_spacing_deg: float = _argo_recon_h_spacing_deg,
+    z_max_m: float = _argo_recon_z_max_m,
+    z_spacing_m: float = _argo_recon_z_spacing_m,
+    min_weight: float = _argo_recon_min_weight,
+    x_spacing_km: float = _argo_recon_x_spacing_km,
+    ymin: float = 0.0,
+    ymax: float = 1000.0,
+    min_profiles: int = _argo_recon_min_profiles,
+    min_coverage_top1000: float = _argo_recon_min_coverage_top,
+    coverage_probe_spacing_m: float = _argo_recon_coverage_probe_spacing_m,
+    plot_isolines: bool = True,
+    isoline_levels: int | list[float] | np.ndarray | None = None,
+    isoline_color: str = 'black',
+    isoline_linewidth: float = 0.8,
+    isoline_alpha: float = 0.45,
+    label_isolines: bool = True,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    clear_output_dir: bool = True,
+    save_fig: bool = True,
+    show_fig: bool = False,
+    verbose: bool = False,
+    use_multiprocessing: bool = True,
+    num_workers: int | None = None,
+    maxtasksperchild: int | None = 4,
+    return_details: bool = False,
+    save_summary_data: bool = True,
+    summary_data_path: str | Path | None = None,
+) -> dict:
+    """为 hotspots 异常剖面批量重建并绘制点 Eulerian Argo 垂向断面 2x2 总览图。
+
+    与 plot_hotspot_anomaly_argo_glorys_overviews 对标：读取同一份 anomalies parquet、
+    按完全一致的逐行规则（_resolve_argo_profile_center）定位每条剖面的中心与日期，因此
+    第 i 张重建图与该函数第 i 张 GLORYS 图一一对应，可并排比较。每条剖面以
+    center ± radius_km 圈定盒子、target_date ± day_window 为时间窗，调用与
+    plot_argo_vertical_argo_overview 相同的点 Eulerian 重建核心（argo 变体），输出
+    [Argo Coverage / σ₀ / θ / S] 四联图。
+
+    重建较重（单图约一分钟），故在 build 前做两段廉价预筛：先数盒子+时间窗内的 Argo
+    剖面数（min_profiles），再用粗深度探针预估 ≤1000m 覆盖率（min_coverage_top1000，
+    复用 _build_argo_3d_field 的稀疏深度层，约亚秒）；任一不达标即跳过、不做全量 build。
+    被跳过的剖面在 summary parquet 中记录 n_profiles / est_coverage_top / skip_reason，
+    便于事后审计与回调阈值。
+
+    参数:
+        start_year / end_year: 当 anomalies_path=None 时，用于按命名规则定位默认 anomalies 文件。
+        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        detection_config: 异常识别配置；用于筛选 detection_method 与定位输出目录。
+        k: 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        radius_km: 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
+        day_window: 时间窗半宽（天），围绕剖面日期取 ±day_window，默认 15。
+        h_bw: 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
+        depth_bw: 垂向高斯核带宽（m），默认 25 m。
+        h_spacing_deg: 重建网格水平间距（°），默认 0.1°。
+        z_max_m: 最大重建深度（m），默认 1500 m。
+        z_spacing_m: 垂向网格间距（m），默认 10 m。
+        min_weight: 最小累积权重阈值，低于此值格点标为 NaN，默认 3.0。
+        x_spacing_km: 断面水平采样间距（km），默认 5 km。
+        ymin / ymax: 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
+        min_profiles: 预筛一段，盒子+时间窗内剖面数下限，不足直接跳过，默认 20。
+        min_coverage_top1000: 预筛二段，≤1000m 预估覆盖率下限，不足直接跳过，默认 0.5。
+        coverage_probe_spacing_m: 预估覆盖率的粗深度探针步长（m），默认 100 m。
+        plot_isolines / isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines:
+            σ₀ 等值线开关与样式。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
+        clear_output_dir: 保存图片时是否在本次运行开始前清空批处理专属输出目录，默认 True。
+        save_fig / show_fig: 输出控制；默认保存图片且不显示图窗。
+        verbose: 是否打印底层单图进度等详细信息；批处理默认关闭。
+        use_multiprocessing: 是否按剖面并行；并行时每个 worker 内部 build 强制单进程以避免嵌套，默认 True。
+        num_workers: worker 数；None 时自动取 min(剖面数, CPU数, 24)（物理核量级，纯本地 IO 可放心拉满）。
+        maxtasksperchild: 每个 worker 处理多少任务后重启；None 表示不自动重启。
+        return_details: 是否在返回值中附每条剖面的运行记录；默认 False。
+        save_summary_data: 是否保存逐剖面预筛/覆盖率明细 parquet，默认 True。
+        summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
+
+    返回:
+        dict: 含 total_candidates / processed_profiles / skipped_profiles / failed_profiles /
+            output_dir / vertical_output_dir / anomalies_path / summary_data_path 等摘要；
+            return_details=True 时附带每条剖面的 results 列表。
+    """
+
+    def _to_int_or_none(val):
+        try:
+            if pd.isna(val):
+                return None
+            return int(val)
+        except Exception:
+            return None
+
+    def _first_float_from_row(row: pd.Series, names: list[str]) -> float | None:
+        for name in names:
+            if name not in row.index:
+                continue
+            try:
+                if pd.isna(row.get(name)):
+                    continue
+                value = float(row.get(name))
+                if np.isfinite(value):
+                    return value
+            except Exception:
+                continue
+        return None
+
+    def _infer_year_tag(path_obj: Path | None = None) -> str:
+        if start_year is not None and end_year is not None:
+            return f"{int(start_year)}_{int(end_year)}"
+        if path_obj is not None:
+            match = re.search(r'anomalies_(\d{4})_(\d{4})_', path_obj.name)
+            if match:
+                return f"{match.group(1)}_{match.group(2)}"
+        return "custom"
+
+    cfg = _resolve_detection_config(detection_config)
+    method_name = cfg.method
+    run_tag = cfg.file_stem()
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    region_slug = _current_region_key()
+    batch_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else cfg.output_dir("plot_hotspot_anomaly_argo_reconstruction_overviews", region_slug)
+    )
+
+    if anomalies_path is None:
+        if start_year is None or end_year is None:
+            raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
+        anomalies_path = cfg.output_dir("plot_argo_hotspots", region_slug) / (
+            f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+    else:
+        anomalies_path = Path(anomalies_path)
+
+    if not Path(anomalies_path).exists():
+        raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
+
+    year_tag = _infer_year_tag(Path(anomalies_path))
+    resolved_summary_data_path = (
+        Path(summary_data_path)
+        if summary_data_path is not None
+        else batch_output_dir / f"hotspot_anomaly_argo_reconstruction_overviews_summary_{year_tag}_{run_tag}.parquet"
+    )
+
+    anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
+        mismatch_count = int((~method_mask).sum())
+        if mismatch_count > 0:
+            print(f"[WARN] Mixed detection_method found: expected={method_name}, mismatched={mismatch_count}/{len(anomalies)}.")
+        anomalies = anomalies[method_mask].copy()
+
+    required_cols = ['Year', 'Profile_number']
+    missing_cols = [c for c in required_cols if c not in anomalies.columns]
+    if missing_cols:
+        raise ValueError(f"Anomalies file missing required columns: {missing_cols}")
+
+    work = anomalies.copy()
+    work['_year'] = pd.to_numeric(work['Year'], errors='coerce')
+    work['_profile'] = pd.to_numeric(work['Profile_number'], errors='coerce')
+    work = work.dropna(subset=['_year', '_profile']).copy()
+    work['_year'] = work['_year'].astype(int)
+    work['_profile'] = work['_profile'].astype(int)
+
+    vertical_output_dir = batch_output_dir / "vertical_overview"
+    if save_fig:
+        if clear_output_dir and batch_output_dir.exists():
+            try:
+                shutil.rmtree(batch_output_dir)
+            except Exception as exc:
+                print(f"[WARN] Failed to clear output directory {batch_output_dir}: {exc}")
+    if save_fig or save_summary_data:
+        batch_output_dir.mkdir(parents=True, exist_ok=True)
+    if save_fig:
+        vertical_output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_candidates = int(len(work))
+    if total_candidates == 0:
+        print(f"[*] No anomalies in file: {anomalies_path}")
+        empty_summary = {
+            'total_candidates': 0,
+            'processed_profiles': 0,
+            'skipped_profiles': 0,
+            'failed_profiles': 0,
+            'output_dir': str(batch_output_dir) if save_fig else None,
+            'vertical_output_dir': str(vertical_output_dir) if save_fig else None,
+            'anomalies_path': str(anomalies_path),
+            'summary_data_path': None,
+        }
+        if return_details:
+            empty_summary['results'] = []
+        return empty_summary
+
+    worker_count = 1
+    if use_multiprocessing and total_candidates > 1:
+        # 纯本地 Argo parquet + CPU-bound build，无远程 GLORYS IO 争用，故默认放到物理核量级
+        # （24 对应 i9-14900KF 的 24 物理核，避免 HT 超订；不沿用 GLORYS 那个为远程盘设的 4）
+        worker_count = int(num_workers) if num_workers is not None else min(
+            total_candidates, os.cpu_count() or 1, 24
+        )
+        worker_count = max(1, worker_count)
+    # 跨剖面并行时，每个 worker 内部 build 强制单进程，避免 daemon 进程嵌套 multiprocessing
+    inner_n_jobs = 1 if worker_count > 1 else None
+
+    region_config_key = _current_region_config_key()
+    worker_args: list[dict] = []
+    for task_index, (_, row) in enumerate(work.iterrows()):
+        worker_args.append({
+            'task_index': int(task_index),
+            'year': int(row['_year']),
+            'profile_number': int(row['_profile']),
+            'month': _to_int_or_none(row.get('Month')),
+            'day': _to_int_or_none(row.get('Day')),
+            'platform_number': _to_int_or_none(row.get('Platform_number')),
+            'anomaly_depth_m': _first_float_from_row(row, ['depth', 'Depth', 'Anomaly_depth']),
+            'region_config_key': region_config_key,
+            'argo_data_dir': argo_data_dir,
+            'k': k,
+            'radius_km': radius_km,
+            'day_window': day_window,
+            'h_bw': h_bw,
+            'depth_bw': depth_bw,
+            'h_spacing_deg': h_spacing_deg,
+            'z_max_m': z_max_m,
+            'z_spacing_m': z_spacing_m,
+            'min_weight': min_weight,
+            'x_spacing_km': x_spacing_km,
+            'ymin': ymin,
+            'ymax': ymax,
+            'min_profiles': min_profiles,
+            'min_coverage_top1000': min_coverage_top1000,
+            'coverage_probe_spacing_m': coverage_probe_spacing_m,
+            'inner_n_jobs': inner_n_jobs,
+            'plot_isolines': plot_isolines,
+            'isoline_levels': isoline_levels,
+            'isoline_color': isoline_color,
+            'isoline_linewidth': isoline_linewidth,
+            'isoline_alpha': isoline_alpha,
+            'label_isolines': label_isolines,
+            'save_fig': save_fig,
+            'show_fig': show_fig,
+            'vertical_output_dir': vertical_output_dir if save_fig else None,
+            'verbose': verbose,
+            'force_agg_backend': bool(worker_count > 1 and not show_fig),
+        })
+
+    if worker_count > 1:
+        print(f"[*] Hotspots Argo reconstruction multiprocessing: workers={worker_count}, profiles={total_candidates}.")
+        pool_kwargs = {'processes': worker_count}
+        if maxtasksperchild is not None:
+            pool_kwargs['maxtasksperchild'] = max(1, int(maxtasksperchild))
+        with multiprocessing.Pool(**pool_kwargs) as mp_pool:
+            results = list(tqdm(
+                mp_pool.imap_unordered(_plot_hotspot_argo_reconstruction_profile_worker, worker_args),
+                total=total_candidates,
+                desc="hotspot argo recon",
+                unit="profile",
+            ))
+        results = sorted(results, key=lambda item: int(item.get('task_index', 0)))
+    else:
+        results = [
+            _plot_hotspot_argo_reconstruction_profile_worker(a)
+            for a in tqdm(worker_args, total=total_candidates, desc="hotspot argo recon", unit="profile")
+        ]
+
+    processed_profiles = int(sum(1 for item in results if item.get('status') == 'ok'))
+    skipped_profiles = int(sum(1 for item in results if item.get('status') == 'skipped'))
+    failed_profiles = int(sum(1 for item in results if item.get('status') == 'failed'))
+    for item in results:
+        if item.get('status') == 'failed':
+            print(
+                f"[WARN] Failed hotspot Argo reconstruction for "
+                f"Year={item.get('year')}, Profile={item.get('profile_number')}: {item.get('error')}"
+            )
+
+    print(
+        f"[*] Hotspots Argo reconstruction complete: total={total_candidates}, "
+        f"plotted={processed_profiles}, skipped(low-coverage)={skipped_profiles}, failed={failed_profiles}."
+    )
+
+    saved_summary_data_path = None
+    if save_summary_data:
+        try:
+            resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(results).to_parquet(resolved_summary_data_path, index=False)
+            saved_summary_data_path = str(resolved_summary_data_path)
+            if verbose:
+                print(f"Summary data saved to: {resolved_summary_data_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to save reconstruction summary data: {exc}")
+
+    summary = {
+        'total_candidates': total_candidates,
+        'processed_profiles': processed_profiles,
+        'skipped_profiles': skipped_profiles,
+        'failed_profiles': failed_profiles,
+        'output_dir': str(batch_output_dir) if save_fig else None,
+        'vertical_output_dir': str(vertical_output_dir) if save_fig else None,
+        'anomalies_path': str(anomalies_path),
+        'summary_data_path': saved_summary_data_path,
     }
     if return_details:
         summary['results'] = results
