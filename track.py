@@ -8928,7 +8928,7 @@ def compute_spiciness_anomaly(
     """计算前景 T-S 点相对背景分布的带符号 spiciness 异常。
 
     用高斯核在 σ₀ 空间加权所有背景点，返回 π 的加权中位数偏差 δπ
-    和加权百分位。P < 5 为显著冷鲜（T-S 图偏左下），P > 95 为显著暖咸
+    和加权百分位。P < 10 为显著冷鲜（T-S 图偏左下），P > 90 为显著暖咸
     （T-S 图偏右）。百分位不受 σ₀ 范围宽窄影响，中纬高纬通用。
 
     参数：
@@ -14724,6 +14724,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
                     'heave_error',
                     'spice_anomaly',
                     'spice_percentile',
+                    'spice_type',
                     'sigma_save_paths',
                 ]
                 pd.DataFrame(columns=empty_cols).to_parquet(resolved_summary_data_path, index=False)
@@ -14871,6 +14872,9 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         try:
             resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
             summary_df = pd.DataFrame(results)
+            # spice_type 整数码随 spice_percentile 一同落盘，使其成为一等列（导出仅映射成名称）
+            summary_df['spice_type'] = _assign_spice_type(
+                summary_df, percentile_threshold=cfg.spice_percentile_threshold)
             summary_df.to_parquet(resolved_summary_data_path, index=False)
             saved_summary_data_path = str(resolved_summary_data_path)
             if verbose:
@@ -16021,8 +16025,15 @@ def export_hotspot_anomaly_summary_table(
     summary parquet。若 heave 详情缺失，会在表中保留空值并给出提示。近岸 DO 形态指标优先读取
     ``plot_argo_hotspots`` 新版 anomalies parquet 中已保存的列；旧版 parquet 缺列时才回查 Argo 年数据。
 
-    ``hotspot_type`` 用于快速人工复核：Type 3 表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；
-    非近岸剖面中，OI=True 者为 1，否则为 2。
+    ``hotspot_type`` 用于快速人工复核，输出为类别名（与整数码一一对应，整数码本身仍保留在 anomalies parquet）：
+    ``OMZ``（原 3）表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；非近岸剖面中，heave 通风型为
+    ``ventilated``（原 1），否则为深层隔离型 ``isolated``（原 2）。
+
+    ``spice_type`` 是与 ``hotspot_type`` 正交的 T-S 水团轴，与之同构：整数码（``1`` cold-fresh /
+    ``2`` background-consistent / ``3`` warm-salty，阈值 ``detection_config.spice_percentile_threshold``）
+    由 plot_hotspot_anomaly_argo_glorys_overviews 写进 GLORYS overview summary parquet，导出时仅读码映射成名称。
+    二者叉乘即 T-S × 通风四宫格。
+    导出表把 ``hotspot_type``、``spice_type`` 连同身份-定位列前置到表头，其余为支撑证据列。
 
     参数:
         vertical_profiles_result: ``plot_hotspot_anomaly_vertical_profiles`` 的返回值。
@@ -16171,6 +16182,10 @@ def export_hotspot_anomaly_summary_table(
             'heave_z_window_m',
             'heave_error',
             'heave_z_threshold',
+            'primary_metric',
+            'do_threshold',
+            'anomaly_min_depth_m',
+            'anomaly_max_depth_m',
         ]
         for col_name in constant_drop_candidates:
             if col_name in table_out.columns and _series_constant(table_out[col_name]):
@@ -16186,6 +16201,11 @@ def export_hotspot_anomaly_summary_table(
             ('glorys_center_lon', 'Longitude'),
             ('glorys_center_lat', 'Latitude'),
             ('glorys_b', 'Latitude'),
+            # primary_value/anomaly_score 是首选指标的通用镜像，与具体 delta_<metric> 数值重复
+            ('primary_value', 'delta_do'),
+            ('primary_value', 'delta_aou'),
+            ('anomaly_score', 'delta_do'),
+            ('anomaly_score', 'delta_aou'),
         ]
         for duplicate_col, source_col in duplicate_pairs:
             if (
@@ -16194,6 +16214,10 @@ def export_hotspot_anomaly_summary_table(
                 and _numeric_columns_equal(table_out[duplicate_col], table_out[source_col])
             ):
                 drop_cols.append(duplicate_col)
+
+        # Profile_number 全局唯一、date 已含年月日 → 精简模式 Year/Month/Day 冗余，只留可读的 date
+        if 'date' in table_out.columns:
+            drop_cols.extend(c for c in ('Year', 'Month', 'Day') if c in table_out.columns)
 
         if drop_cols:
             drop_cols = [c for c in dict.fromkeys(drop_cols) if c in table_out.columns]
@@ -16521,6 +16545,7 @@ def export_hotspot_anomaly_summary_table(
         ('heave_error', 'heave_error'),
         ('spice_anomaly', 'spice_anomaly'),
         ('spice_percentile', 'spice_percentile'),
+        ('spice_type', 'spice_type'),
     ]
 
     matched_records = []
@@ -16556,11 +16581,15 @@ def export_hotspot_anomaly_summary_table(
     elif not diagnose_nearshore_do:
         table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
 
-    table['hotspot_type'] = _assign_hotspot_type(
+    hotspot_type_codes = _assign_hotspot_type(
         table,
         heave_z_threshold=heave_z_threshold,
         heave_m_threshold=_heave_magnitude_threshold,
     )
+    table['hotspot_type'] = hotspot_type_codes.map(_HOTSPOT_TYPE_NAMES, na_action='ignore').astype('object')
+    # spice_type：读已落盘的整数码（join 自 GLORYS overview summary）→ 映射成名称
+    spice_type_codes = pd.to_numeric(table['spice_type'], errors='coerce').astype('Int64')
+    table['spice_type'] = spice_type_codes.map(_SPICE_TYPE_NAMES, na_action='ignore').astype('object')
 
     # --- 基于 META 的涡旋位置辅助判定 ---
     table['meta_inside_eddy'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
@@ -16610,7 +16639,7 @@ def export_hotspot_anomaly_summary_table(
         'glorys_heave_zmin', 'glorys_heave_m',
         'surface_do_ref', 'pre_anomaly_do_min', 'pre_anomaly_do_min_depth_m',
         'surface_to_min_do_drop', 'min_to_anomaly_do_recovery',
-        'min_to_anomaly_depth_gap_m', 'do_v_shape_score', 'hotspot_type',
+        'min_to_anomaly_depth_gap_m', 'do_v_shape_score',
     ]:
         if col_name in table.columns:
             table[col_name] = pd.to_numeric(table[col_name], errors='coerce')
@@ -16624,6 +16653,14 @@ def export_hotspot_anomaly_summary_table(
     dropped_summary_columns: list[str] = []
     if compact_columns:
         table, dropped_summary_columns = _compact_summary_columns(table)
+
+    # 四宫格两列 hotspot_type/spice_type 连同身份-定位列前置，便于人工复核
+    front_priority = [
+        'date', 'Year', 'Month', 'Day', 'Profile_number', 'Platform_number',
+        'Longitude', 'Latitude', 'anomaly_depth_m', 'hotspot_type', 'spice_type',
+    ]
+    front_cols = [c for c in front_priority if c in table.columns]
+    table = table[front_cols + [c for c in table.columns if c not in front_cols]]
 
     saved_path = None
     if save_table:
@@ -16656,7 +16693,7 @@ def export_hotspot_anomaly_summary_table(
                     worksheet = writer.sheets[sheet_name]
                     worksheet.freeze_panes = 'A2'
 
-                    int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number', 'hotspot_type'}
+                    int_cols = {'Year', 'Month', 'Day', 'Profile_number', 'Platform_number'}
                     coord_cols = {'Longitude', 'Latitude', 'glorys_center_lon', 'glorys_center_lat', 'glorys_b'}
                     sci_cols = {'glorys_heave_sigma_argo', 'glorys_heave_sigma_peak', 'glorys_heave_zmin', 'heave_z_threshold'}
                     fraction_cols = {'heave_valid_fraction'}
@@ -17185,6 +17222,12 @@ def _append_nearshore_do_diagnostics_from_profiles(
     return out
 
 
+# 导出表渲染用：hotspot_type 整数码→类别名（整数码仍在 anomalies parquet，拆图逻辑依赖它）
+_HOTSPOT_TYPE_NAMES = {1: 'ventilated', 2: 'isolated', 3: 'OMZ'}
+# spice_type 整数码→类别名（码落盘在 GLORYS overview summary parquet，导出时映射）
+_SPICE_TYPE_NAMES = {1: 'cold-fresh', 2: 'background-consistent', 3: 'warm-salty'}
+
+
 def _assign_hotspot_type(
     table: pd.DataFrame,
     *,
@@ -17228,6 +17271,33 @@ def _assign_hotspot_type(
     hotspot_type[non_nearshore_mask & z_ok & m_ok & pass_z & pass_m] = 1
     hotspot_type[non_nearshore_mask & z_ok & m_ok & ~(pass_z & pass_m)] = 2
     return hotspot_type
+
+
+def _assign_spice_type(
+    table: pd.DataFrame,
+    *,
+    percentile_threshold: float = _default_spice_percentile_threshold,
+    percentile_col: str = 'spice_percentile',
+) -> pd.Series:
+    """按背景相对 spiciness 百分位生成 spice_type 整数码（与 hotspot_type 同构的一等列）。
+
+    判据基于 compute_spiciness_anomaly 的 σ₀ 加权背景百分位 P（0–100），返回 Int64 码：
+    - ``1`` 冷淡水团 cold-fresh：P < percentile_threshold（T-S 图偏左下）
+    - ``3`` 暖咸水团 warm-salty：P > 100 − percentile_threshold（T-S 图偏右）
+    - ``2`` 背景一致 background-consistent：两者之间
+    ``spice_percentile`` 为 NaN（背景不足无法计算）时留 <NA>，与码 2 区分。
+    名称映射见 ``_SPICE_TYPE_NAMES``；阈值默认来自 processing.yml:processing.spice.percentile_threshold。
+    """
+    codes = pd.Series(pd.NA, index=table.index, dtype='Int64')
+    if percentile_col not in table.columns:
+        return codes
+    pct = pd.to_numeric(table[percentile_col], errors='coerce')
+    valid = pct.notna()
+    thr = float(percentile_threshold)
+    codes[valid] = 2
+    codes[valid & (pct < thr)] = 1
+    codes[valid & (pct > 100.0 - thr)] = 3
+    return codes
 
 
 def _hotspot_date_key_from_parts(year_val, month_val=None, day_val=None) -> str | None:
