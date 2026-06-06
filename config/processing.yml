@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.14 变更：
+#   - plot 下新增 hotspot_type_colors / hotspot_spice_colors / hotspot_cross_colors 三组配色，
+#     分别供 plot_argo_hotspots 的 hotspot_type / spice_type / cross 拆图模式使用。
 # version 1.13 变更：
 #   - 新增 glorys_residual 配置小节，集中管理 GLORYS 逐点残差 / 垂向细结构丢失统计参数（残差深度/插值步长/高通窗口/同位与匹配半径/经纬度·时间搜索窗/最佳匹配深度覆盖门槛/南大洋分界纬度），供 plot_glorys_detail_loss_residual_atlas 使用。
 # version 1.12 变更：
@@ -31,7 +34,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.13
+version: 1.14
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -116,3 +119,17 @@ plot:
     coastline: "#787d85" # 海岸线颜色
     border: "#9aa0a8"    # 国界线颜色
     grid: "#b6bdc6"      # 格网线颜色
+  hotspot_type_colors:
+    type_1: "black"              # Type 1 通风
+    type_2: "dimgray"            # Type 2 隔离
+    type_3: "red"                # Type 3 OMZ（近岸 DO 下降）
+  hotspot_spice_colors:
+    cold_fresh: "#1f77b4"        # 冷鲜
+    background: "#7f7f7f"        # 背景一致
+    warm_salty: "#2ca02c"        # 暖咸
+  hotspot_cross_colors:
+    T1_cold_fresh: "#1f77b4"     # T1 通风 × 冷鲜
+    T1_background: "#aec7e8"     # T1 通风 × 背景
+    T2_cold_fresh: "#d62728"     # T2 隔离 × 冷鲜
+    T2_background: "#ff9896"     # T2 隔离 × 背景
+    T3_OMZ: "#ff7f0e"            # T3 OMZ

@@ -574,6 +574,25 @@ def _load_basemap_colors() -> dict:
 
 _BASEMAP_COLORS = _load_basemap_colors()
 
+def _load_hotspot_plot_colors() -> tuple[dict, dict, dict]:
+    """加载 hotspot_type / spice_type / cross 三组拆图配色。"""
+    plot_cfg = _PROC_CFG.get('plot', {}) if isinstance(_PROC_CFG, dict) else {}
+    type_defaults = {'type_1': 'black', 'type_2': 'dimgray', 'type_3': 'red'}
+    spice_defaults = {'cold_fresh': '#1f77b4', 'background': '#7f7f7f', 'warm_salty': '#2ca02c'}
+    cross_defaults = {
+        'T1_cold_fresh': '#1f77b4', 'T1_background': '#aec7e8',
+        'T2_cold_fresh': '#d62728', 'T2_background': '#ff9896', 'T3_OMZ': '#ff7f0e',
+    }
+    def _merge(defaults, key):
+        raw = plot_cfg.get(key, {})
+        merged = defaults.copy()
+        if isinstance(raw, dict):
+            merged.update({k: str(v) for k, v in raw.items() if k in defaults})
+        return merged
+    return _merge(type_defaults, 'hotspot_type_colors'), _merge(spice_defaults, 'hotspot_spice_colors'), _merge(cross_defaults, 'hotspot_cross_colors')
+
+_HOTSPOT_TYPE_COLORS, _HOTSPOT_SPICE_COLORS, _HOTSPOT_CROSS_COLORS = _load_hotspot_plot_colors()
+
 # -------------------- 自带底图加载（使用本地 Natural Earth, 简洁版） --------------------
 def _load_world_geodataframe():
     """从配置读取底图路径，默认 external/natural_earth/ne_110m_admin_0_countries.shp。"""
@@ -13201,7 +13220,6 @@ def plot_argo_hotspots(
     use_glorys_heave: bool = False,
     argo_glorys_summary_data_path: str | Path | None = None,
     split_plots: bool | str = False,
-    split_plot_mode: str | None = None,
     hotspot_type_heave_threshold: float | None = _heave_depth_threshold,
 ):
     """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
@@ -13230,12 +13248,13 @@ def plot_argo_hotspots(
             用 GLORYS OI 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 OI 时会退回
             “近岸第 3 类 / 非第 3 类”绘图。
         argo_glorys_summary_data_path: 可选 GLORYS overview summary parquet 路径；None 时按默认命名自动定位。
-        split_plots (bool | str): False 时只绘制合并图；True 时按 split_plot_mode 拆图。
-            也可直接传 ``'eddy_interaction'`` 或 ``'hotspot_type'``。
-        split_plot_mode (str | None): 拆图模式。
+        split_plots (bool | str): False 时只绘制合并图；True 时按默认规则拆图。
+            也可直接传拆图模式字符串：
             - ``'eddy_interaction'``：原有 META 交互/非交互拆图；
-            - ``'hotspot_type'``：按 hotspot_type=1/2/3 拆图。
-            None 时，若 use_glorys_heave=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
+            - ``'hotspot_type'``：按 hotspot_type=1/2/3 拆图；
+            - ``'spice_type'``：按 spice_type=1/2/3 拆图，需 summary parquet 含 spice_type；
+            - ``'cross'``：按 hotspot_type{1,2} × spice_type{1,2} 叉乘 + type 3 OMZ 拆图。
+            True 时，若 use_glorys_heave=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
             仅 use_interacting_argo=True 时默认 ``'eddy_interaction'``。
         hotspot_type_heave_threshold: 当 anomalies 中已含 ``glorys_heave_zmin`` 时，用于生成 hotspot_type 的 出露深度阈值。
 
@@ -13251,20 +13270,20 @@ def plot_argo_hotspots(
     )
     method_name = cfg.method
     run_tag = cfg.file_stem()
-    split_plot_mode_explicit = split_plot_mode is not None or isinstance(split_plots, str)
+    split_mode_explicit = isinstance(split_plots, str)
     if isinstance(split_plots, str):
-        if split_plot_mode is None:
-            split_plot_mode = split_plots
+        split_mode_raw = split_plots
         split_plots = True
+    else:
+        split_mode_raw = None
 
-    if use_interacting_argo and use_glorys_heave and not split_plot_mode_explicit:
+    if use_interacting_argo and use_glorys_heave and not split_mode_explicit:
         print("[Plot Info] Both use_interacting_argo and use_glorys_heave are enabled; plotting uses hotspot_type by default.")
 
     split_mode = None
     if split_plots:
-        split_mode_raw = split_plot_mode or (
-            'hotspot_type' if (use_glorys_heave or not use_interacting_argo) else 'eddy_interaction'
-        )
+        if split_mode_raw is None:
+            split_mode_raw = 'hotspot_type' if (use_glorys_heave or not use_interacting_argo) else 'eddy_interaction'
         split_mode_key = str(split_mode_raw).strip().lower().replace('-', '_')
         split_aliases = {
             'interaction': 'eddy_interaction',
@@ -13275,10 +13294,13 @@ def plot_argo_hotspots(
             'type': 'hotspot_type',
             'types': 'hotspot_type',
             'hotspot_type': 'hotspot_type',
+            'cross': 'cross',
+            'spice_type': 'spice_type',
+            'spice': 'spice_type',
         }
         split_mode = split_aliases.get(split_mode_key, split_mode_key)
-        if split_mode not in {'eddy_interaction', 'hotspot_type'}:
-            raise ValueError("split_plot_mode must be 'eddy_interaction' or 'hotspot_type'.")
+        if split_mode not in {'eddy_interaction', 'hotspot_type', 'cross', 'spice_type'}:
+            raise ValueError("split_plots must be bool or one of 'eddy_interaction', 'hotspot_type', 'cross', 'spice_type'.")
 
     # --- 尝试加载交互 Argo 文件（若启用） ---
     interacting_argo_ids: set[int] = set()
@@ -13444,13 +13466,6 @@ def plot_argo_hotspots(
                     "falling back to nearshore/non-nearshore hotspot types."
                 )
 
-    if not anomalies.empty and 'nearshore_do_dip' in anomalies.columns:
-        anomalies['hotspot_type'] = _assign_hotspot_type(
-            anomalies,
-            heave_z_threshold=hotspot_type_heave_threshold if glorys_heave_available else None,
-            heave_m_threshold=_heave_magnitude_threshold if glorys_heave_available else None,
-        )
-
     # 绘图
     crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
     central_lon = 180 if crosses_dateline else 0
@@ -13509,7 +13524,7 @@ def plot_argo_hotspots(
                     'title_extra': ' (Type 1: Ventilated)',
                     'file_suffix': '_type1',
                     'marker': 'o',
-                    'edgecolor': 'black',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_1'],
                     'label': f'Type 1 - ventilated ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
@@ -13520,7 +13535,7 @@ def plot_argo_hotspots(
                     'title_extra': ' (Type 2: Deep only)',
                     'file_suffix': '_type2',
                     'marker': 'o',
-                    'edgecolor': 'dimgray',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_2'],
                     'label': f'Type 2 - deep only ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
@@ -13531,7 +13546,7 @@ def plot_argo_hotspots(
                     'title_extra': ' (Type 3: Nearshore DO Dip)',
                     'file_suffix': '_type3',
                     'marker': '^',
-                    'edgecolor': 'red',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_3'],
                     'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
                     's': 80,
                     'zorder': 4,
@@ -13577,7 +13592,7 @@ def plot_argo_hotspots(
                     'title_extra': ' (Non-nearshore)',
                     'file_suffix': '_non_nearshore',
                     'marker': 'o',
-                    'edgecolor': 'black',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_1'],
                     'label': f'Non-nearshore ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
@@ -13588,7 +13603,7 @@ def plot_argo_hotspots(
                     'title_extra': ' (Type 3: Nearshore DO Dip)',
                     'file_suffix': '_type3',
                     'marker': '^',
-                    'edgecolor': 'red',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_3'],
                     'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
                     's': 80,
                     'zorder': 4,
@@ -13610,6 +13625,180 @@ def plot_argo_hotspots(
                         }
                     ],
                 })
+    elif split_plots and split_mode == 'spice_type':
+        if (glorys_heave_available and not anomalies.empty
+                and 'spice_type' in anomalies.columns):
+            spice_vals = pd.to_numeric(anomalies['spice_type'], errors='coerce')
+            counts = {s: int((spice_vals == s).sum()) for s in (1, 2, 3)}
+            untyped = int(spice_vals.isna().sum())
+            print(
+                "[Plot Info] Spice type counts: "
+                f"cold-fresh={counts[1]}, background={counts[2]}, "
+                f"warm-salty={counts[3]}, untyped={untyped}"
+            )
+
+            spice_specs = [
+                {
+                    'type_id': 1,
+                    'name': 'spice_cold_fresh',
+                    'title_extra': ' (Cold-Fresh)',
+                    'file_suffix': '_spice_cold_fresh',
+                    'marker': 'o', 'edgecolor': _HOTSPOT_SPICE_COLORS['cold_fresh'],
+                    'label': f'Cold-Fresh ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 2,
+                    'name': 'spice_background',
+                    'title_extra': ' (Background-Consistent)',
+                    'file_suffix': '_spice_background',
+                    'marker': 's', 'edgecolor': _HOTSPOT_SPICE_COLORS['background'],
+                    'label': f'Background-Consistent ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 3,
+                    'name': 'spice_warm_salty',
+                    'title_extra': ' (Warm-Salty)',
+                    'file_suffix': '_spice_warm_salty',
+                    'marker': '^', 'edgecolor': _HOTSPOT_SPICE_COLORS['warm_salty'],
+                    'label': f'Warm-Salty ({base_anomaly_label})',
+                    's': 80, 'zorder': 4,
+                },
+            ]
+            for spec in spice_specs:
+                spice_data = anomalies.loc[spice_vals == spec['type_id']].copy()
+                plots_to_generate.append({
+                    'name': spec['name'],
+                    'title_extra': spec['title_extra'],
+                    'file_suffix': spec['file_suffix'],
+                    'data_list': [
+                        {
+                            'data': spice_data,
+                            'marker': spec['marker'],
+                            'edgecolor': spec['edgecolor'],
+                            'label': spec['label'],
+                            's': spec['s'],
+                            'zorder': spec['zorder'],
+                        }
+                    ],
+                })
+        else:
+            print(
+                "[WARN] spice_type mode requires GLORYS overview parquet with matched profiles "
+                "and spice_type column; falling back to combined plot."
+            )
+            combined_data = []
+            if not anomalies.empty:
+                combined_data.append({
+                    'data': anom_others if not anom_others.empty else anomalies.copy(),
+                    'marker': 'o', 'edgecolor': 'black',
+                    'label': f'{base_anomaly_label}',
+                    's': 60, 'zorder': 3,
+                })
+            plots_to_generate.append({
+                'name': 'combined',
+                'title_extra': '',
+                'file_suffix': '',
+                'data_list': combined_data,
+            })
+
+    elif split_plots and split_mode == 'cross':
+        if (glorys_heave_available and not anomalies.empty
+                and 'hotspot_type' in anomalies.columns
+                and 'spice_type' in anomalies.columns):
+            type_vals = pd.to_numeric(anomalies['hotspot_type'], errors='coerce')
+            spice_vals = pd.to_numeric(anomalies['spice_type'], errors='coerce')
+
+            counts = {}
+            for t in (1, 2):
+                for s in (1, 2):
+                    counts[(t, s)] = int(((type_vals == t) & (spice_vals == s)).sum())
+            count_t3 = int((type_vals == 3).sum())
+            untyped = int((~type_vals.isin([1, 2, 3])).sum())
+            nospice = int(((type_vals.isin([1, 2])) & spice_vals.isna()).sum())
+            print(
+                "[Plot Info] Cross counts: "
+                f"T1×cold-fresh={counts[(1, 1)]}, T1×bg={counts[(1, 2)]}, "
+                f"T2×cold-fresh={counts[(2, 1)]}, T2×bg={counts[(2, 2)]}, "
+                f"T3={count_t3}, untyped={untyped}, no-spice={nospice}"
+            )
+
+            cross_specs = [
+                {
+                    'type_id': 1, 'spice_id': 1,
+                    'name': 'cross_T1_cold_fresh',
+                    'title_extra': ' (Ventilated × Cold-Fresh)',
+                    'file_suffix': '_T1_cold_fresh',
+                    'marker': 'o', 'edgecolor': _HOTSPOT_CROSS_COLORS['T1_cold_fresh'],
+                    'label': f'T1 Ventilated × Cold-Fresh ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 1, 'spice_id': 2,
+                    'name': 'cross_T1_background',
+                    'title_extra': ' (Ventilated × Background)',
+                    'file_suffix': '_T1_background',
+                    'marker': 'o', 'edgecolor': _HOTSPOT_CROSS_COLORS['T1_background'],
+                    'label': f'T1 Ventilated × Background ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 2, 'spice_id': 1,
+                    'name': 'cross_T2_cold_fresh',
+                    'title_extra': ' (Isolated × Cold-Fresh)',
+                    'file_suffix': '_T2_cold_fresh',
+                    'marker': 's', 'edgecolor': _HOTSPOT_CROSS_COLORS['T2_cold_fresh'],
+                    'label': f'T2 Isolated × Cold-Fresh ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 2, 'spice_id': 2,
+                    'name': 'cross_T2_background',
+                    'title_extra': ' (Isolated × Background)',
+                    'file_suffix': '_T2_background',
+                    'marker': 's', 'edgecolor': _HOTSPOT_CROSS_COLORS['T2_background'],
+                    'label': f'T2 Isolated × Background ({base_anomaly_label})',
+                    's': 60, 'zorder': 3,
+                },
+                {
+                    'type_id': 3, 'spice_id': None,
+                    'name': 'cross_T3_OMZ',
+                    'title_extra': ' (Type 3 OMZ)',
+                    'file_suffix': '_T3_OMZ',
+                    'marker': '^', 'edgecolor': _HOTSPOT_CROSS_COLORS['T3_OMZ'],
+                    'label': f'T3 OMZ - nearshore DO dip ({base_anomaly_label})',
+                    's': 80, 'zorder': 4,
+                },
+            ]
+            for spec in cross_specs:
+                if spec['spice_id'] is not None:
+                    cross_data = anomalies.loc[
+                        (type_vals == spec['type_id']) & (spice_vals == spec['spice_id'])
+                    ].copy()
+                else:
+                    cross_data = anomalies.loc[type_vals == spec['type_id']].copy()
+                plots_to_generate.append({
+                    'name': spec['name'],
+                    'title_extra': spec['title_extra'],
+                    'file_suffix': spec['file_suffix'],
+                    'data_list': [
+                        {
+                            'data': cross_data,
+                            'marker': spec['marker'],
+                            'edgecolor': spec['edgecolor'],
+                            'label': spec['label'],
+                            's': spec['s'],
+                            'zorder': spec['zorder'],
+                        }
+                    ],
+                })
+        else:
+            raise ValueError(
+                "split_plots='cross' 需要 GLORYS overview parquet 含 spice_type "
+                "且有匹配的 heave 记录，请先运行 plot_hotspot_anomaly_argo_glorys_overviews。"
+            )
+
     elif split_plots and split_mode == 'eddy_interaction' and use_interacting_argo:
         plots_to_generate.append({
             'name': 'interacting',
@@ -13629,7 +13818,7 @@ def plot_argo_hotspots(
         })
     else:
         if split_plots and split_mode == 'eddy_interaction' and not use_interacting_argo:
-            print("[WARN] split_plot_mode='eddy_interaction' requires use_interacting_argo=True; drawing combined plot.")
+            print("[WARN] split_plots='eddy_interaction' requires use_interacting_argo=True; drawing combined plot.")
         # 合并模式
         combined_data = []
         use_hotspot_type_combined = (
@@ -13640,9 +13829,9 @@ def plot_argo_hotspots(
         if use_hotspot_type_combined and glorys_heave_available:
             type_vals = pd.to_numeric(anomalies.get('hotspot_type'), errors='coerce')
             hotspot_type_combined_specs = [
-                (1, 'o', 'black', f'Type 1 - ventilated ({base_anomaly_label})', 60, 3),
-                (2, 'o', 'dimgray', f'Type 2 - deep only ({base_anomaly_label})', 60, 3),
-                (3, '^', 'red', f'Type 3 - nearshore DO dip ({base_anomaly_label})', 80, 4),
+                (1, 'o', _HOTSPOT_TYPE_COLORS['type_1'], f'Type 1 - ventilated ({base_anomaly_label})', 60, 3),
+                (2, 'o', _HOTSPOT_TYPE_COLORS['type_2'], f'Type 2 - deep only ({base_anomaly_label})', 60, 3),
+                (3, '^', _HOTSPOT_TYPE_COLORS['type_3'], f'Type 3 - nearshore DO dip ({base_anomaly_label})', 80, 4),
             ]
             for type_id, marker, edgecolor, label, size, zorder in hotspot_type_combined_specs:
                 type_data = anomalies.loc[type_vals == type_id].copy()
@@ -13663,7 +13852,7 @@ def plot_argo_hotspots(
                 combined_data.append({
                     'data': non_nearshore,
                     'marker': 'o',
-                    'edgecolor': 'black',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_1'],
                     'label': f'Non-nearshore ({base_anomaly_label})',
                     's': 60,
                     'zorder': 3,
@@ -13672,7 +13861,7 @@ def plot_argo_hotspots(
                 combined_data.append({
                     'data': nearshore,
                     'marker': '^',
-                    'edgecolor': 'red',
+                    'edgecolor': _HOTSPOT_TYPE_COLORS['type_3'],
                     'label': f'Type 3 - nearshore DO dip ({base_anomaly_label})',
                     's': 80,
                     'zorder': 4,
@@ -14358,6 +14547,7 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
         'center_lat': np.nan,
         'target_date': None,
         'anomaly_depth_m': heave_projection_depth_m,
+        'nearshore_do_dip': args.get('nearshore_do_dip', pd.NA),
         'horizontal_status': 'not_started',
         'vertical_status': 'not_started',
         'vertical_save_paths': None,
@@ -14788,6 +14978,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'month': _to_int_or_none(row.get('Month')),
             'day': _to_int_or_none(row.get('Day')),
             'platform_number': _to_int_or_none(row.get('Platform_number')),
+            'nearshore_do_dip': row.get('nearshore_do_dip', pd.NA),
             'heave_projection_depth_m': _first_float_from_row(row, ['depth', 'Depth', 'Anomaly_depth']),
             'detection_config': cfg,
             'region_config_key': region_config_key,
@@ -14872,9 +15063,14 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         try:
             resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
             summary_df = pd.DataFrame(results)
-            # spice_type 整数码随 spice_percentile 一同落盘，使其成为一等列（导出仅映射成名称）
+            # spice_type / hotspot_type 整数码一并落盘，使其成为一等列（导出仅映射成名称）
             summary_df['spice_type'] = _assign_spice_type(
                 summary_df, percentile_threshold=cfg.spice_percentile_threshold)
+            summary_df['hotspot_type'] = _assign_hotspot_type(
+                summary_df,
+                heave_z_threshold=float(heave_depth_threshold),
+                heave_m_threshold=float(_heave_magnitude_threshold),
+            )
             summary_df.to_parquet(resolved_summary_data_path, index=False)
             saved_summary_data_path = str(resolved_summary_data_path)
             if verbose:
@@ -16546,6 +16742,7 @@ def export_hotspot_anomaly_summary_table(
         ('spice_anomaly', 'spice_anomaly'),
         ('spice_percentile', 'spice_percentile'),
         ('spice_type', 'spice_type'),
+        ('hotspot_type', 'hotspot_type'),
     ]
 
     matched_records = []
@@ -16581,11 +16778,13 @@ def export_hotspot_anomaly_summary_table(
     elif not diagnose_nearshore_do:
         table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
 
-    hotspot_type_codes = _assign_hotspot_type(
-        table,
-        heave_z_threshold=heave_z_threshold,
-        heave_m_threshold=_heave_magnitude_threshold,
-    )
+    # 读取 overview_summary.parquet 已落盘的完整分类
+    hotspot_type_codes = pd.to_numeric(table.get('hotspot_type'), errors='coerce').astype('Int64')
+    if not hotspot_type_codes.isin([1, 2, 3]).any():
+        raise ValueError(
+            "overview_summary.parquet 中缺少有效 hotspot_type 分类码，"
+            "请重新运行 plot_hotspot_anomaly_argo_glorys_overviews。"
+        )
     table['hotspot_type'] = hotspot_type_codes.map(_HOTSPOT_TYPE_NAMES, na_action='ignore').astype('object')
     # spice_type：读已落盘的整数码（join 自 GLORYS overview summary）→ 映射成名称
     spice_type_codes = pd.to_numeric(table['spice_type'], errors='coerce').astype('Int64')
@@ -17372,6 +17571,8 @@ def _merge_hotspot_glorys_summary_fields(
         ('heave_error', 'heave_error'),
         ('spice_anomaly', 'spice_anomaly'),
         ('spice_percentile', 'spice_percentile'),
+        ('spice_type', 'spice_type'),
+        ('hotspot_type', 'hotspot_type'),
     ]
     for out_col, _ in glorys_cols:
         if out_col not in out.columns:
