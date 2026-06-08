@@ -1,4 +1,6 @@
 # 数据路径配置
+# version 1.4 变更：
+#   - 新增 classification_overrides：人工分类修正表路径（csv，纯文本便于频繁编辑），供下游覆盖自动 hotspot_type / spice_type。
 # version 1.3 变更：
 #   - 新增 glorys_processed：GLORYS 处理后产物目录（如 EKE zarr 缓存），默认 ./GLORYS_processed。
 # version 1.2 变更：
@@ -7,7 +9,7 @@
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.3
+version: 1.4
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
@@ -19,3 +21,4 @@ paths:
   META_tracks_root: ./META_tracks
   plots_output: ./plot_outputs
   gpd_world_shp: ./external/natural_earth/ne_110m_admin_0_countries.shp
+  classification_overrides: ./data/classification_overrides.csv

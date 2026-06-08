@@ -99,6 +99,9 @@ Glorys_path = _PATHS_CFG.get('paths', {}).get('glorys_root', '../copernicus/GLOR
 glorys_processed_root = Path(_PATHS_CFG.get('paths', {}).get('glorys_processed', './GLORYS_processed'))
 META_root_path = Path(_PATHS_CFG.get('paths', {}).get('meta_root', '../META3.2_DT_allsat'))
 plots_output_root = Path(_PATHS_CFG.get('paths', {}).get('plots_output', './plot_outputs'))
+_classification_overrides_path = Path(
+    _PATHS_CFG.get('paths', {}).get('classification_overrides', './data/classification_overrides.csv')
+)
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -13512,6 +13515,7 @@ def plot_argo_hotspots(
 
     glorys_heave_available = False
     glorys_summary_path_used = None
+    anomalies_pure_for_save = None
     if use_glorys_heave and not anomalies.empty:
         region_slug_for_path = _current_region_key()
         glorys_summary_candidates: list[Path] = []
@@ -13535,6 +13539,9 @@ def plot_argo_hotspots(
             try:
                 glorys_summary_df = pd.read_parquet(glorys_summary_path_used)
                 anomalies = _merge_hotspot_glorys_summary_fields(anomalies, glorys_summary_df)
+                # 存盘留纯自动版本；订正只施加到绘图用的 anomalies，使落盘 parquet 保持纯净
+                anomalies_pure_for_save = anomalies.copy()
+                anomalies = _apply_classification_overrides(anomalies)
                 heave_vals = pd.to_numeric(anomalies.get('glorys_heave_zmin'), errors='coerce')
                 matched_outcrop = int(heave_vals.notna().sum())
                 if matched_outcrop > 0:
@@ -14073,7 +14080,9 @@ def plot_argo_hotspots(
         out_dir.mkdir(exist_ok=True, parents=True)
         pq_path = out_dir / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
         try:
-            anomalies_out = anomalies.copy()
+            # 落盘纯自动版本（订正只用于绘图，不写进 parquet）
+            anomalies_out = (anomalies_pure_for_save
+                             if anomalies_pure_for_save is not None else anomalies).copy()
             preferred_cols = _hotspot_anomaly_output_columns()
             if anomalies_out.empty:
                 anomalies_out = pd.DataFrame(columns=preferred_cols)
@@ -16125,7 +16134,6 @@ def plot_glorys_detail_loss_residual_atlas(
         - dict: 含 total_candidates/processed_profiles/skipped_profiles/rows_path/output_dir/figures/southern_ocean 等摘要；return_details=True 时附 'rows'（DataFrame）。
     """
     cfg = _resolve_detection_config(detection_config)
-    method_name = cfg.method
     run_tag = cfg.file_stem()
     if argo_data_dir is None:
         argo_data_dir = argo_path
@@ -16148,10 +16156,7 @@ def plot_glorys_detail_loss_residual_atlas(
     if not Path(anomalies_path).exists():
         raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
 
-    anomalies = pd.read_parquet(anomalies_path)
-    if 'detection_method' in anomalies.columns:
-        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(method_name)
-        anomalies = anomalies[method_mask].copy()
+    anomalies = load_corrected_anomalies(anomalies_path=anomalies_path, detection_config=cfg)
     required_cols = ['Year', 'Profile_number', 'Longitude', 'Latitude', 'Month', 'Day']
     missing_cols = [c for c in required_cols if c not in anomalies.columns]
     if missing_cols:
@@ -16238,11 +16243,10 @@ def plot_glorys_detail_loss_residual_atlas(
         _save_residual_curves(resolved_curves_path, list(curves_store.values()))
         print(f"[*] GLORYS residual rows saved: {resolved_rows_path}")
 
-    # reuse 旧 rows 缺 hotspot_type 列时补上（新算的已在上面带好）
-    if 'hotspot_type' not in rows_df.columns:
-        rows_df = rows_df.merge(
-            anomalies[['Profile_number', 'hotspot_type']].rename(columns={'Profile_number': 'profile_number'}),
-            on='profile_number', how='left')
+    # hotspot_type 始终从（已叠加修正的）anomalies 现取，避免复用旧 rows 时沿用过期分类
+    rows_df = rows_df.drop(columns=['hotspot_type'], errors='ignore').merge(
+        anomalies[['Profile_number', 'hotspot_type']].rename(columns={'Profile_number': 'profile_number'}),
+        on='profile_number', how='left')
 
     ok = rows_df[rows_df['status'] == 'ok']
     processed_profiles = int(len(ok))
@@ -16879,7 +16883,8 @@ def export_hotspot_anomaly_summary_table(
     elif not diagnose_nearshore_do:
         table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
 
-    # 读取 overview_summary.parquet 已落盘的完整分类
+    # 读取 overview_summary.parquet 已落盘的完整分类，叠加人工修正
+    table = _apply_classification_overrides(table)
     hotspot_type_codes = pd.to_numeric(table.get('hotspot_type'), errors='coerce').astype('Int64')
     if not hotspot_type_codes.isin([1, 2, 3]).any():
         raise ValueError(
@@ -17526,6 +17531,270 @@ def _append_nearshore_do_diagnostics_from_profiles(
 _HOTSPOT_TYPE_NAMES = {1: 'ventilated', 2: 'isolated', 3: 'OMZ'}
 # spice_type 整数码→类别名（码落盘在 GLORYS overview summary parquet，导出时映射）
 _SPICE_TYPE_NAMES = {1: 'cold-fresh', 2: 'background-consistent', 3: 'warm-salty'}
+
+_HOTSPOT_TYPE_FROM_NAME: dict[str, int] = {
+    'ventilated': 1, 'isolated': 2, 'omz': 3,
+}
+_SPICE_TYPE_FROM_NAME: dict[str, int] = {
+    'cold-fresh': 1, 'cold_fresh': 1,
+    'background-consistent': 2, 'background_consistent': 2, 'background': 2,
+    'warm-salty': 3, 'warm_salty': 3,
+}
+
+
+def _load_classification_overrides(
+    path: str | Path | None = None,
+) -> pd.DataFrame | None:
+    """读取人工分类修正表，返回标准化的 DataFrame（profile_number / hotspot_type / spice_type / exclude）。
+
+    文件格式按后缀判定：`.csv` 走 `read_csv`（推荐，纯文本任意编辑器可改），其余按 xlsx 读取。"""
+    p = Path(path) if path is not None else _classification_overrides_path
+    if not p.exists():
+        return None
+    try:
+        if p.suffix.lower() == '.csv':
+            raw = pd.read_csv(p)
+        else:
+            raw = pd.read_excel(p, engine='openpyxl')
+    except Exception as exc:
+        print(f"[WARN] 无法读取分类修正文件 {p}: {exc}")
+        return None
+    if 'profile_number' not in raw.columns:
+        print(f"[WARN] 分类修正文件 {p} 缺少 profile_number 列，跳过。")
+        return None
+
+    def _parse_type_col(series: pd.Series, name_map: dict[str, int]) -> pd.Series:
+        valid_codes = set(name_map.values())
+        codes = pd.Series(pd.NA, index=series.index, dtype='Int64')
+        for i, v in series.items():
+            if pd.isna(v):
+                continue
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) in valid_codes:
+                codes[i] = int(v)
+            elif isinstance(v, str):
+                token = v.strip().lower()
+                if token in name_map:
+                    codes[i] = name_map[token]
+                elif token.isdigit() and int(token) in valid_codes:
+                    # csv 把混名称/数字的列整列读成字符串，数字码会以 '1' 形式到达。
+                    codes[i] = int(token)
+        return codes
+
+    out = pd.DataFrame({'profile_number': pd.to_numeric(raw['profile_number'], errors='coerce').astype('Int64')})
+    out['hotspot_type'] = (
+        _parse_type_col(raw['hotspot_type'], _HOTSPOT_TYPE_FROM_NAME)
+        if 'hotspot_type' in raw.columns else pd.Series(pd.NA, index=out.index, dtype='Int64')
+    )
+    out['spice_type'] = (
+        _parse_type_col(raw['spice_type'], _SPICE_TYPE_FROM_NAME)
+        if 'spice_type' in raw.columns else pd.Series(pd.NA, index=out.index, dtype='Int64')
+    )
+    out['exclude'] = False
+    if 'exclude' in raw.columns:
+        # csv 读出来全是字符串，bool('False') 为 True，故按真值集合显式解析。
+        def _parse_exclude(v) -> bool:
+            if pd.isna(v):
+                return False
+            if isinstance(v, str):
+                return v.strip().lower() in {'true', '1', 'yes', 'y', 'x', 'exclude'}
+            return bool(v)
+        out['exclude'] = raw['exclude'].map(_parse_exclude).astype(bool)
+    out = out.dropna(subset=['profile_number'])
+    return out if not out.empty else None
+
+
+def _apply_classification_overrides(
+    df: pd.DataFrame,
+    *,
+    overrides_path: str | Path | None = None,
+    profile_col: str | None = None,
+) -> pd.DataFrame:
+    """对 DataFrame 应用人工分类修正：覆盖 hotspot_type / spice_type，排除 exclude=True 的行。"""
+    ovr = _load_classification_overrides(overrides_path)
+    if ovr is None:
+        return df
+    if profile_col is None:
+        profile_col = 'Profile_number' if 'Profile_number' in df.columns else 'profile_number'
+    if profile_col not in df.columns:
+        return df
+
+    pn = pd.to_numeric(df[profile_col], errors='coerce')
+    ovr_map = {int(r.profile_number): r for _, r in ovr.iterrows() if pd.notna(r.profile_number)}
+
+    n_type, n_spice, n_exclude = 0, 0, 0
+    exclude_mask = pd.Series(False, index=df.index)
+    for idx, pn_val in pn.items():
+        if pd.isna(pn_val):
+            continue
+        rec = ovr_map.get(int(pn_val))
+        if rec is None:
+            continue
+        if rec.exclude:
+            exclude_mask[idx] = True
+            n_exclude += 1
+            continue
+        if pd.notna(rec.hotspot_type) and 'hotspot_type' in df.columns:
+            df.at[idx, 'hotspot_type'] = int(rec.hotspot_type)
+            n_type += 1
+        if pd.notna(rec.spice_type) and 'spice_type' in df.columns:
+            df.at[idx, 'spice_type'] = int(rec.spice_type)
+            n_spice += 1
+
+    if n_exclude > 0:
+        df = df[~exclude_mask].reset_index(drop=True)
+    applied = n_type + n_spice + n_exclude
+    if applied > 0:
+        parts = []
+        if n_type:
+            parts.append(f"{n_type} hotspot_type")
+        if n_spice:
+            parts.append(f"{n_spice} spice_type")
+        if n_exclude:
+            parts.append(f"{n_exclude} excluded")
+        src = overrides_path or _classification_overrides_path
+        print(f"[Override] Applied {' + '.join(parts)} overrides from {src}.")
+    return df
+
+
+def load_corrected_anomalies(
+    anomalies_path: str | Path | None = None,
+    *,
+    start_year: int | None = None,
+    end_year: int | None = None,
+    detection_config: DetectionConfig | None = None,
+    apply_method_filter: bool = True,
+) -> pd.DataFrame:
+    """读取 plot_argo_hotspots 落盘的纯自动 anomalies parquet，叠加人工分类修正后返回。
+
+    所有需要「带订正分类」的下游（残差图谱、notebook 自定义分析等）统一走此入口，避免各处
+    重复 read_parquet + 施加修正、也避免漏施。落盘 parquet 始终是纯自动结果，修正只在此读取
+    时叠加（覆盖 hotspot_type / spice_type、剔除 exclude 行）。
+
+    参数:
+        - anomalies_path (str | Path | None): anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则、依 start_year/end_year 与 detection_config 自动定位。
+        - start_year (int | None): anomalies_path=None 时拼路径用的起始年。
+        - end_year (int | None): anomalies_path=None 时拼路径用的结束年。
+        - detection_config (DetectionConfig | None): 决定 method/region 与默认路径，并作为方法过滤依据；None 时取当前默认配置。
+        - apply_method_filter (bool): 是否按 detection_config.method 过滤 detection_method 列，默认 True。
+    返回:
+        - pd.DataFrame: 已叠加人工分类修正、剔除 exclude 行后的 anomalies 表。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    if anomalies_path is None:
+        if start_year is None or end_year is None:
+            raise ValueError("anomalies_path 为空时，必须提供 start_year 与 end_year。")
+        anomalies_path = cfg.output_dir("plot_argo_hotspots", _current_region_key()) / (
+            f"anomalies_{start_year}_{end_year}_{cfg.file_stem()}.parquet"
+        )
+    anomalies_path = Path(anomalies_path)
+    if not anomalies_path.exists():
+        raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
+
+    anomalies = pd.read_parquet(anomalies_path)
+    if apply_method_filter and 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(cfg.method)
+        anomalies = anomalies[method_mask].copy()
+    return _apply_classification_overrides(anomalies)
+
+
+def show_classification_overrides(
+    summary_path: str | Path | None = None,
+    *,
+    overrides_path: str | Path | None = None,
+    detection_config: DetectionConfig | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame | None:
+    """列出人工分类修正表中每条修正涉及的 profile 及其原始/修正分类，供人工复核。
+
+    从 classification_overrides csv 读取待修正 profile，与 plot_hotspot_anomaly_argo_glorys_overviews
+    写出的 overview summary parquet（保存自动分类原值）按 profile_number 关联，逐条对照
+    hotspot_type / spice_type 的「原始 → 修正」以及是否整条排除。csv 中在 parquet 找不到的 profile
+    （拼写错误或过期）和与原值相同的空转修正会单独提示。该函数只读，不改任何文件。
+
+    参数:
+        - summary_path (str | Path | None): overview summary parquet 路径；None 时按 detection_config 推断的 method/region 默认目录里匹配 file_stem 取最新一个。
+        - overrides_path (str | Path | None): 分类修正 csv 路径；None 时用 config 中的 classification_overrides。
+        - detection_config (DetectionConfig | None): 用于定位默认 parquet 的 method/region；None 时取当前默认配置。
+        - verbose (bool): 是否打印对照表与提示，默认 True。
+    返回:
+        - pd.DataFrame | None: 每行一条修正，含 profile_number、date、lon、lat（涡心经纬度）、原始与修正后的 hotspot/spice 名称、exclude 标志；无任何有效修正时返回 None。
+    """
+    ovr = _load_classification_overrides(overrides_path)
+    if ovr is None:
+        if verbose:
+            print(f"[Override] 修正表为空或不存在: {overrides_path or _classification_overrides_path}")
+        return None
+
+    if summary_path is None:
+        cfg = _resolve_detection_config(detection_config)
+        overview_dir = cfg.output_dir("plot_hotspot_anomaly_argo_glorys_overviews")
+        stem = cfg.file_stem()
+        candidates = list(overview_dir.glob(f"hotspot_anomaly_argo_glorys_overviews_summary_*_{stem}.parquet"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"未找到 overview summary parquet: {overview_dir}/"
+                f"hotspot_anomaly_argo_glorys_overviews_summary_*_{stem}.parquet"
+            )
+        summary_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    summary = pd.read_parquet(summary_path)
+    summary = summary.dropna(subset=['profile_number']).copy()
+    summary['profile_number'] = summary['profile_number'].astype(int)
+    summary_map = {int(r['profile_number']): r for _, r in summary.iterrows()}
+
+    def _name(code, mapping: dict[int, str]) -> str:
+        if pd.isna(code):
+            return ''
+        return mapping.get(int(code), str(int(code)))
+
+    rows, orphans, noops = [], [], []
+    for _, rec in ovr.iterrows():
+        pn = int(rec.profile_number)
+        src = summary_map.get(pn)
+        if src is None:
+            orphans.append(pn)
+            continue
+        orig_h, orig_s = src.get('hotspot_type'), src.get('spice_type')
+        if pd.notna(rec.hotspot_type) and pd.notna(orig_h) and int(rec.hotspot_type) == int(orig_h):
+            noops.append((pn, 'hotspot', _name(orig_h, _HOTSPOT_TYPE_NAMES)))
+        if pd.notna(rec.spice_type) and pd.notna(orig_s) and int(rec.spice_type) == int(orig_s):
+            noops.append((pn, 'spice', _name(orig_s, _SPICE_TYPE_NAMES)))
+        rows.append({
+            'profile_number': pn,
+            'date': pd.Timestamp(src.get('profile_time')).strftime('%Y-%m-%d') if pd.notna(src.get('profile_time')) else '',
+            'lon': round(float(src.get('center_lon')), 2) if pd.notna(src.get('center_lon')) else None,
+            'lat': round(float(src.get('center_lat')), 2) if pd.notna(src.get('center_lat')) else None,
+            'hotspot_orig': _name(orig_h, _HOTSPOT_TYPE_NAMES),
+            'hotspot_new': _name(rec.hotspot_type, _HOTSPOT_TYPE_NAMES),
+            'spice_orig': _name(orig_s, _SPICE_TYPE_NAMES),
+            'spice_new': _name(rec.spice_type, _SPICE_TYPE_NAMES),
+            'exclude': bool(rec.exclude),
+        })
+
+    table = pd.DataFrame(rows)
+    if verbose:
+        print(f"[Override] 修正表 {overrides_path or _classification_overrides_path} 对照 {Path(summary_path).name}")
+        if not table.empty:
+            disp = pd.DataFrame({
+                'profile': table['profile_number'],
+                'date': table['date'],
+                'lon': table['lon'],
+                'lat': table['lat'],
+                'hotspot': [o + (f' → {n}' if n else '') for o, n in zip(table['hotspot_orig'], table['hotspot_new'])],
+                'spice': [o + (f' → {n}' if n else '') for o, n in zip(table['spice_orig'], table['spice_new'])],
+                'exclude': ['EXCLUDE' if e else '' for e in table['exclude']],
+            })
+            print(disp.to_string(index=False))
+            n_exc = int(table['exclude'].sum())
+            print(f"  共 {len(table)} 条修正（其中 {n_exc} 条整条排除）。")
+        else:
+            print("  无可对照的有效修正。")
+        if noops:
+            print(f"  [空转] {len(noops)} 处修正与自动分类原值相同：" +
+                  ", ".join(f"{pn}({axis}={name})" for pn, axis, name in noops))
+        if orphans:
+            print(f"  [孤儿] {len(orphans)} 个 profile 在 summary parquet 中找不到（拼写错误或过期）：" +
+                  ", ".join(str(pn) for pn in orphans))
+    return table if not table.empty else None
 
 
 def _assign_hotspot_type(
