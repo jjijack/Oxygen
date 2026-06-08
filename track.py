@@ -453,7 +453,18 @@ def make_detection_config(
     method: str | DetectionConfig | None = None,
     **overrides,
 ) -> DetectionConfig:
-    """从全局默认配置构建 DetectionConfig，并应用临时覆盖。"""
+    """从全局默认配置构建 DetectionConfig，并应用临时覆盖。
+
+    传入 DetectionConfig 实例时按其字段克隆再覆盖；传入方法名字符串（或 None）时先规范化方法名，
+    再用 processing.yml 默认值构建。覆盖项通过 ``**overrides`` 透传给 DetectionConfig。
+
+    参数:
+        - method (str | DetectionConfig | None): 检测方法名（'do'/'aou'/'trim'），或一个已有的 DetectionConfig（克隆后覆盖），或 None（取默认方法）。
+        - **overrides: 透传给 DetectionConfig 的字段覆盖（如 do_threshold、anomaly_min_depth 等）。
+
+    返回:
+        - DetectionConfig: 构建好的检测配置实例。
+    """
     if isinstance(method, DetectionConfig):
         values = method.__dict__.copy()
         values.update(overrides)
@@ -603,16 +614,11 @@ def _load_world_geodataframe():
 # -------------------------------------------------------------------------------
 
 def print_current_processing_defaults():
-        """打印当前生效的处理参数全局默认值（从 processing.yml 读取/回退）。
+        """打印当前生效的处理参数全局默认值（从 processing.yml 读取/回退），用于调试与运行时确认配置，无返回值。
 
-        包含：
-            circle_enlargement_factor,
-            distance_deg_per_meter,
-            subduction_detection_method 与 do/aou/trim 识别参数，
-            salinity_threshold / temperature_threshold,
-            depth_interval / depth_merge_tolerance / duplicate_depth_strategy。
-
-        目的：调试与运行时确认当前配置，无返回值。
+        涵盖 circle_enlargement_factor、distance_deg_per_meter、subduction_detection_method 与 do/aou/trim
+        识别参数、salinity_threshold/temperature_threshold、depth_interval/depth_merge_tolerance/
+        duplicate_depth_strategy 等。
         """
         print("[Processing Defaults]")
         print(f"  circle_enlargement_factor : {circle_enlargement_factor}")
@@ -649,28 +655,19 @@ def print_current_processing_defaults():
 def approximate_degree_length(lat: float | np.ndarray, lon: float | np.ndarray | None = None) -> dict:
     """计算指定纬度（可选经度）处经纬度与距离的近似换算关系。
 
-    采用 WGS84 椭球常用的近似级数公式 (单位: 米/度)，适用于绝大多数海洋学分析精度需求。
-
-    公式来源（展开项保留到 cos(5φ)/cos(6φ)）：
-        meters_per_degree_lat ≈ 111132.92 - 559.82*cos(2φ) + 1.175*cos(4φ) - 0.0023*cos(6φ)
-        meters_per_degree_lon ≈ 111412.84*cos(φ) - 93.5*cos(3φ) + 0.118*cos(5φ)
+    采用 WGS84 椭球常用的近似级数公式（单位：米/度），适用于绝大多数海洋学分析的精度需求；相比旧的
+    单一平均值，提供随纬度变化的更精细米/度估计。
 
     参数:
-        lat (float | np.ndarray): 纬度（度）。可为标量或 numpy 数组。
-        lon (float | np.ndarray | None): 经度（度）。对当前计算不影响，只是为了接口对称；
-            可传入与 lat 同形状数组（将被忽略）。保留此参数便于未来扩展（比如考虑地形加权等）。
+        - lat (float | np.ndarray): 纬度（度），可为标量或 numpy 数组。
+        - lon (float | np.ndarray | None): 经度（度），对当前计算无影响，仅为接口对称保留（可传与 lat 同形状数组，将被忽略），便于未来扩展（如地形加权）。
 
     返回:
-        dict: 包含以下键：
-            meters_per_degree_lat: 指定纬度上一度纬差对应的米数
-            meters_per_degree_lon: 指定纬度上一度经差对应的米数
-            degrees_per_meter_lat: 上述量的倒数（度/米）
-            degrees_per_meter_lon: 上述量的倒数（度/米）
+        - dict: 含四个键 —— meters_per_degree_lat / meters_per_degree_lon（该纬度上一度纬差/经差对应的米数）、degrees_per_meter_lat / degrees_per_meter_lon（前两者的倒数，度/米）；输入为数组时各字段为同形状 numpy 数组。
 
-    备注:
-        1. 若输入为数组，则返回值各字段为同形状 numpy 数组。
-        2. 该函数提供纬度依赖的更精细米/度估计，替代旧的单一平均值。
-        3. 用于将“米单位半径”换算到“角度半径”时，推荐： radius_deg_lat = radius_m / meters_per_degree_lat。
+    说明:
+        - 近似级数（展开到 cos(5φ)/cos(6φ)）：meters_per_degree_lat ≈ 111132.92 − 559.82·cos2φ + 1.175·cos4φ − 0.0023·cos6φ；meters_per_degree_lon ≈ 111412.84·cosφ − 93.5·cos3φ + 0.118·cos5φ。
+        - 将“米单位半径”换算到“角度半径”时推荐：radius_deg_lat = radius_m / meters_per_degree_lat。
     """
     # 转换为 numpy 数组以统一处理
     lat_arr = np.asarray(lat, dtype=float)
@@ -748,17 +745,20 @@ def _region_lon_mask(lon_vals: np.ndarray, lon_min_cfg: float, lon_max_cfg: floa
 
 def local_xy_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
                         lon0: float, lat0: float, wrap_dateline: bool = True) -> np.ndarray:
-    """计算点 (lon,lat) 到参考点 (lon0,lat0) 的局地平面近似距离（米）。
+    """计算点 (lon, lat) 到参考点 (lon0, lat0) 的局地平面近似距离（米）。
+
+    使用纬度依赖的经/纬一度长度（WGS84 近似）。在中低纬、距离 <~500 km 时平面近似已足够；距离很大
+    或靠近极区时误差增大，可改用 great_circle_distance_m。
 
     参数:
-        lon, lat: 点的经纬度，可为标量或数组（广播到与 lon 相同形状）。
-        lon0, lat0: 参考中心（标量）。
-        wrap_dateline: 是否对经度差进行跨日界线 (±180°) 最短差处理。
+        - lon (float | np.ndarray): 目标点经度，可为标量或数组（广播到与 lat 相同形状）。
+        - lat (float | np.ndarray): 目标点纬度，可为标量或数组。
+        - lon0 (float): 参考中心经度（标量）。
+        - lat0 (float): 参考中心纬度（标量）。
+        - wrap_dateline (bool): 是否对经度差做跨日界线（±180°）最短差处理，默认 True；为 True 时能正确处理如 179.9° 与 -179.9° 仅相差 0.2° 的情况。
 
-    说明:
-        1. 使用纬度依赖的经/纬一度长度（WGS84 近似）。在中低纬、距离 <~500 km 下平面近似足够。
-        2. 若距离很大或靠近极区，平面近似误差增大，可考虑改用大圆距离。
-        3. wrap_dateline=True 时能正确处理 179.9° 与 -179.9° 仅 0.2° 之差的情况。
+    返回:
+        - np.ndarray: 与广播后输入同形状的距离（米）。
     """
     scale = approximate_degree_length(lat0)
     m_per_deg_lat = scale['meters_per_degree_lat']
@@ -772,25 +772,22 @@ def local_xy_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
 def great_circle_distance_m(lon: float | np.ndarray, lat: float | np.ndarray,
                             lon0: float, lat0: float, wrap_dateline: bool = True,
                             radius_earth_m: float = 6371000.0) -> np.ndarray:
-    """计算球面大圆距离（Haversine 公式），单位: 米。
+    """计算球面大圆距离（Haversine 公式），单位：米。
 
-    设计目标: 简单、稳定、无自动切换逻辑；与 local_xy_distance_m 并存，供需要更精确/大尺度/高纬场景手动调用。
+    设计目标是简单稳定、无自动切换逻辑，与 local_xy_distance_m 并存，供需要更精确、大尺度或高纬场景
+    手动调用。采用 Haversine 公式（a = sin²(Δφ/2) + cosφ₁·cosφ₂·sin²(Δλ/2)，c = 2·asin√a，d = R·c），
+    中短距离下与球面真值非常接近，对极区与大尺度优于局地平面近似。
 
     参数:
-        lon, lat : 目标点经纬度（标量或一维数组）。
-        lon0, lat0 : 中心点经纬度（标量）。
-        wrap_dateline : True 时对经度差做跨日界线最短差归一（±180°）。
-        radius_earth_m : 地球半径（可根据需要调整为更精确椭球平均半径）。
+        - lon (float | np.ndarray): 目标点经度（标量或一维数组）。
+        - lat (float | np.ndarray): 目标点纬度（标量或一维数组）。
+        - lon0 (float): 中心点经度（标量）。
+        - lat0 (float): 中心点纬度（标量）。
+        - wrap_dateline (bool): 为 True 时对经度差做跨日界线（±180°）最短差归一，默认 True。
+        - radius_earth_m (float): 地球半径（米），默认 6371000.0，可按需改为更精确的椭球平均半径。
 
     返回:
-        与输入 (lon, lat) 形状一致的距离（米）。标量输入 → 标量输出。
-
-    说明:
-        Haversine 公式: 
-            a = sin²(Δφ/2) + cos φ1 * cos φ2 * sin²(Δλ/2)
-            c = 2 * asin( sqrt(a) )
-            d = R * c
-        在中短距离下与球面真值非常接近；对极区与大尺度优于局地平面近似。
+        - np.ndarray | float: 与输入 (lon, lat) 形状一致的距离（米）；标量输入返回标量。
     """
     lon_arr = np.asarray(lon, dtype=float)
     lat_arr = np.asarray(lat, dtype=float)
@@ -821,28 +818,34 @@ def adaptive_distance_m(
     force_great_circle: bool = False,
     radius_earth_m: float = 6371000.0
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """自适应距离 (米)。在保持平面估算速度的前提下，自动在高纬或大尺度条件改用大圆距离。
-
-    策略:
-        1. force_great_circle=True 时直接使用大圆（适合全球/大范围批处理）。
-        2. 若 |lat0| >= gc_lat_threshold → 直接大圆，跳过平面计算。
-        3. 否则先计算一次平面近似 (planar)；若最大平面距离 > gc_distance_threshold_km → 改用大圆；否则保留平面结果。
-
-    使用建议:
-        - 全球或大量远距点：直接 force_great_circle=True 减少双重计算。
-        - 中低纬涡旋附近（大多数点在半径数倍内）：保持默认，可获得接近平面距离的速度与足够精度。
-        - 极区或大半径场景对精度敏感：force_great_circle=True。
+    """自适应距离（米）。在保持平面估算速度的前提下，自动在高纬或大尺度条件下改用大圆距离。
 
     参数:
-        lon, lat : 目标点（标量或数组）。
-        lon0, lat0 : 中心经纬度（标量或数组，可与目标点一一对应广播）。
-        gc_lat_threshold : 高纬触发大圆的绝对纬度阈值；None 时使用配置文件 adaptive_lat_threshold。
-        gc_distance_threshold_km : 平面最大距离超过该值 (km) 触发大圆；None 时使用配置文件 adaptive_distance_threshold_km。
-        force_great_circle : 强制使用大圆。
-        radius_earth_m : 地球半径。
+        - lon (float | np.ndarray): 目标点经度（标量或数组）。
+        - lat (float | np.ndarray): 目标点纬度（标量或数组）。
+        - lon0 (float | np.ndarray): 中心点经度（标量或数组，可与目标点一一对应广播）。
+        - lat0 (float | np.ndarray): 中心点纬度（标量或数组）。
+        - wrap_dateline (bool): 为 True 时对经度差做跨日界线（±180°）最短差归一，默认 True。
+        - gc_lat_threshold (float | None): 高纬触发大圆的绝对纬度阈值；None 时取配置 adaptive_lat_threshold。
+        - gc_distance_threshold_km (float | None): 平面最大距离超过该值（km）触发大圆；None 时取配置 adaptive_distance_threshold_km。
+        - force_great_circle (bool): 强制全程使用大圆，默认 False。
+        - radius_earth_m (float): 地球半径（米），默认 6371000.0。
 
     返回:
-        与 (lon, lat) 形状一致的距离；标量输入返回 float。
+        - np.ndarray | float: 与 (lon, lat) 形状一致的距离（米）；标量输入返回 float。
+
+    说明:
+        策略:
+
+            - force_great_circle=True 时直接使用大圆（适合全球/大范围批处理）。
+            - 若 |lat0| >= gc_lat_threshold，直接大圆，跳过平面计算。
+            - 否则先算一次平面近似；若最大平面距离 > gc_distance_threshold_km 则改用大圆，否则保留平面结果。
+
+        使用建议:
+
+            - 全球或大量远距点：直接 force_great_circle=True，减少双重计算。
+            - 中低纬涡旋附近（多数点在半径数倍内）：保持默认，兼顾平面速度与精度。
+            - 极区或大半径且对精度敏感：force_great_circle=True。
     """
     if gc_lat_threshold is None:
         gc_lat_threshold = _default_adaptive_lat_threshold
@@ -903,7 +906,25 @@ def inside_radius_m_adaptive(
     gc_distance_threshold_km: float | None = None,
     force_great_circle: bool = False
 ) -> np.ndarray | bool:
-    """自适应包含判定：与 adaptive_distance_m 策略一致。"""
+    """自适应包含判定：点是否落在以 (lon0, lat0) 为心、radius_m 为半径（可放大 enlarge 倍）的范围内。
+
+    距离计算与 adaptive_distance_m 策略一致（高纬或大尺度自动切换大圆）。
+
+    参数:
+        - lon (float | np.ndarray): 目标点经度（标量或数组）。
+        - lat (float | np.ndarray): 目标点纬度（标量或数组）。
+        - lon0 (float): 中心点经度。
+        - lat0 (float): 中心点纬度。
+        - radius_m (float | np.ndarray): 判定半径（米），可为标量或与点广播一致的数组。
+        - enlarge (float): 半径放大系数，默认 1.0。
+        - wrap_dateline (bool): 为 True 时对经度差做跨日界线最短差归一，默认 True。
+        - gc_lat_threshold (float | None): 高纬触发大圆的绝对纬度阈值；None 时取配置默认。
+        - gc_distance_threshold_km (float | None): 平面最大距离超过该值（km）触发大圆；None 时取配置默认。
+        - force_great_circle (bool): 强制全程使用大圆，默认 False。
+
+    返回:
+        - np.ndarray | bool: 与点同形状的布尔包含掩码；标量输入返回 bool。
+    """
     dist = adaptive_distance_m(
         lon, lat, lon0, lat0,
         wrap_dateline=wrap_dateline,
@@ -923,8 +944,18 @@ def ellipse_patch_for_eddy(lon0: float, lat0: float, radius_m: float, enlarge: f
                            **kwargs):
     """构造在经纬度坐标下表示真实米尺度涡旋半径的椭圆补丁。
 
-    在 lon-lat 图上，同一米半径在经向与纬向角度跨度不同（lon 方向按 cos(lat) 收缩），
-    因此绘制为椭圆 (width=Δlon, height=Δlat)。
+    在 lon-lat 图上同一米半径在经向与纬向的角度跨度不同（经向按 cos(lat) 收缩），故绘制为椭圆
+    （width=Δlon、height=Δlat）。
+
+    参数:
+        - lon0 (float): 涡旋中心经度。
+        - lat0 (float): 涡旋中心纬度。
+        - radius_m (float): 涡旋半径（米）。
+        - enlarge (float): 半径放大系数，默认 1.0。
+        - **kwargs: 透传给 matplotlib.patches.Ellipse 的样式参数（默认 edgecolor='gray'、facecolor='none'、linestyle='--'、linewidth=1.0、zorder=3）。
+
+    返回:
+        - matplotlib.patches.Ellipse: 可直接 add_patch 到坐标轴的椭圆补丁。
     """
     scale = approximate_degree_length(lat0)
     m_per_deg_lat = scale['meters_per_degree_lat']
@@ -941,25 +972,18 @@ def switch_region(
     config_path: str | Path = 'config/regions.yml',
     verbose: bool = True,
 ):
-    """在运行时切换默认区域（无需改 YAML），并刷新全局经纬度。
+    """在运行时切换默认区域（无需改 YAML），并刷新全局 lonmin/lonmax/latmin/latmax 与 _REGION_CFG。
 
-    更新内容: `lonmin, lonmax, latmin, latmax, _REGION_CFG`。
-
-    推荐用法 (确保后续访问得到最新值):
-        import track
-        track.switch_region('global')
-        print(track.lonmin, track.lonmax)
-
-    不推荐:
-        from track import lonmin  # 后续 switch_region 不会自动更新这个已绑定的数值副本
+    推荐先 ``import track`` 再 ``track.switch_region(...)``，之后通过 ``track.lonmin`` 等访问最新值；
+    不要用 ``from track import lonmin`` 绑定数值副本，否则后续切换不会更新它。
 
     参数:
-        region_name: 在 regions.yml 中定义的区域 key。
-        config_path: 配置文件路径，默认 'config/regions.yml'。
-        verbose: 是否打印区域切换提示。默认 True；并行 worker 中可传 False 以避免刷屏。
+        - region_name (str): 在 regions.yml 中定义的区域 key。
+        - config_path (str | Path): 配置文件路径，默认 'config/regions.yml'。
+        - verbose (bool): 是否打印区域切换提示，默认 True；并行 worker 中可传 False 避免刷屏。
 
-    异常:
-        KeyError: 区域未找到或加载失败（进入 fallback）。
+    说明:
+        - 抛出 KeyError：区域未找到或配置加载失败（进入 fallback）。
     """
     global _REGION_CFG, lonmin, lonmax, latmin, latmax
     new_cfg = _load_region_config(config_path=config_path, region=region_name)
@@ -979,14 +1003,14 @@ def load_meta_data(path: str | os.PathLike | None = None, version: float = 3.2):
     加载 META 涡旋数据，返回 (ACS, ACL, CS, CL)。
 
     参数:
-        path : META 数据根目录；None 时使用配置文件 `paths.meta_root` (默认 '../META3.2_DT_allsat')。
-        version : 3.1 或 3.2。
+        - path (str | os.PathLike | None): META 数据根目录；None 时取配置 paths.meta_root（默认 '../META3.2_DT_allsat'）。
+        - version (float): META 版本，3.1 或 3.2，默认 3.2。
 
-    目录期望包含相应命名模式的 NetCDF 文件，例如 (version=3.2):
-        META3.2_DT_allsat_Anticyclonic_short_*.nc
-        META3.2_DT_allsat_Anticyclonic_long_*.nc
-        META3.2_DT_allsat_Cyclonic_short_*.nc
-        META3.2_DT_allsat_Cyclonic_long_*.nc
+    返回:
+        - tuple: (ACS, ACL, CS, CL) 四个已打开的 netCDF4.Dataset，依次为反气旋短/长生命期、气旋短/长生命期。
+
+    说明:
+        - 目录需包含对应命名的 NetCDF 文件，如 version=3.2 时 `META3.2_DT_allsat_{Anticyclonic,Cyclonic}_{short,long}_*.nc`。
     '''
     if path is None:
         path = META_root_path
@@ -1010,9 +1034,17 @@ def load_meta_data(path: str | os.PathLike | None = None, version: float = 3.2):
 
 def area_limit(DS, latmin, latmax, lonmin, lonmax):
     '''
-    限制区域范围
-    
-    输出：涡旋序号，时间，中心点经度，中心点纬度，最值点经度，最值点纬度，边界经度，边界纬度，半径，速度边界经度，速度边界纬度
+    将 META 涡旋数据集按经纬度范围裁剪到指定区域，并按轨迹分组返回逐字段记录。
+
+    参数:
+        - DS (netCDF4.Dataset): 已打开的 META 涡旋数据集。
+        - latmin (float): 纬度下界。
+        - latmax (float): 纬度上界。
+        - lonmin (float): 经度下界（经度掩码经 _region_lon_mask 做跨日界线安全处理）。
+        - lonmax (float): 经度上界。
+
+    返回:
+        - list: 按轨迹分组的嵌套列表；每条轨迹含若干日项，每个日项依次为 [涡旋序号, 时间, 中心点经度, 中心点纬度, 最值点经度, 最值点纬度, 边界经度, 边界纬度, 半径, 速度边界经度, 速度边界纬度]。
     '''
     time = DS.variables['time'][:].data
     if np.issubdtype(time.dtype, np.floating):
@@ -1090,28 +1122,28 @@ def export_meta_tracks(ds: Dataset,
                        compact_after: bool = True) -> dict:
     """流式导出 META 涡旋数据为标准化拆表格式（Parquet + Zarr）。
 
-    输出：
-        - <kind>_daily.parquet   : 每个涡旋每日一行（标量 & 计数）
-        - <kind>_contours.zarr   : 轮廓顶点按 1D 扁平数组存储，含 prefix index（N+1）
-        - <kind>_contours.parquet: (可选) 展开轮廓顶点逐行记录（用于 SQL/分析）
-        - <kind>_tracks.parquet  : (可选) 汇总轨迹层（聚合统计）
-        - <kind>_metadata.json   : 基本元信息（区域、生成时间、列说明、Zarr 路径）
-
     参数:
-        ds : netCDF4.Dataset (已打开的 META 文件)
-        kind : 标识（如 'acs','acl','cs','cl'）用于文件前缀
-        region_key : 区域 key / slug（默认基于当前 _REGION_CFG['name'] 生成）
-        output_root : 根输出目录（默认 ./META_tracks 或配置 paths.META_tracks_root/meta_tracks_root）
-        chunk_size : indices 分块大小（按满足区域筛选的记录索引数量）
-        write_contours : 是否同时写 contours 的 Parquet 拆表（顶点逐行），Zarr 始终会生成
-        build_track_summary : 是否生成轨迹汇总表
-        keep_legacy_pickle : 是否额外写出旧嵌套结构 pickle（用于临时兼容调试）
-        use_dask : 是否用 Dask 并行按块处理
-        dask_num_workers : Dask 并行进程数
-        compact_after : 是否在完成后直接将目录形式的 Parquet 压实为单文件，并删除目录
+        - ds (netCDF4.Dataset): 已打开的 META 文件。
+        - kind (str): 标识（如 'acs'/'acl'/'cs'/'cl'），用于文件前缀。
+        - region_key (str | None): 区域 key / slug；默认基于当前 _REGION_CFG['name'] 生成。
+        - output_root (str | Path | None): 根输出目录；默认 ./META_tracks 或配置 paths.META_tracks_root。
+        - chunk_size (int): indices 分块大小（按满足区域筛选的记录索引数量），默认 100000。
+        - write_contours (bool): 是否同时写 contours 的 Parquet 拆表（顶点逐行），Zarr 始终生成，默认 False。
+        - build_track_summary (bool): 是否生成轨迹汇总表，默认 True。
+        - keep_legacy_pickle (bool): 是否额外写出旧嵌套结构 pickle（临时兼容调试），默认 False。
+        - use_dask (bool): 是否用 Dask 并行按块处理，默认 False。
+        - dask_num_workers (int | None): Dask 并行进程数。
+        - compact_after (bool): 完成后是否将目录形式的 Parquet 压实为单文件并删除目录，默认 True。
 
     返回:
-        dict: 包含写出的关键文件路径（如 daily_file/daily_dir、tracks_path、contours_zarr、metadata 等）。
+        - dict: 写出的关键文件路径（如 daily_file/daily_dir、tracks_path、contours_zarr、metadata 等）。
+
+    输出:
+        - `<kind>_daily.parquet`：每个涡旋每日一行（标量 & 计数）。
+        - `<kind>_contours.zarr`：轮廓顶点按 1D 扁平数组存储，含 prefix index（N+1）。
+        - `<kind>_contours.parquet`：（可选）展开轮廓顶点逐行记录（用于 SQL/分析）。
+        - `<kind>_tracks.parquet`：（可选）汇总轨迹层（聚合统计）。
+        - `<kind>_metadata.json`：基本元信息（区域、生成时间、列说明、Zarr 路径）。
     """
     # 记录总长度用于分块；避免一次性加载变量
     try:
@@ -1551,13 +1583,12 @@ def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: 
     """将某年份的逐月 Argo .mat 原始文件合并为单一 Parquet。
 
     参数:
-        year (int): 年份 (如 2008)。
-        input_dir (str | Path | None): 每月 .mat 文件所在目录；None → 配置 paths.yml 的 argo_mat_input。
-        output_dir (str | Path | None): 输出目录；None → 配置 paths.yml 的 argo_parquet。
+        - year (int): 年份（如 2008）。
+        - input_dir (str | Path | None): 每月 .mat 文件所在目录；None 时取配置 paths.argo_mat_input。
+        - output_dir (str | Path | None): 输出目录；None 时取配置 paths.argo_parquet。
 
     说明:
-        该函数当前仅示例性地提取 'do' 数据集（如果存在），并按固定列顺序写出。
-        若未来需要更多变量，可在此扩展。
+        - 当前仅示例性地提取 'do' 数据集（若存在）并按固定列顺序写出；如需更多变量可在此扩展。
     """
     year_str = str(year)
     if input_dir is None:
@@ -1616,14 +1647,14 @@ def compact_parquet_dataset(kind: str,
     """将目录形式的 Parquet Dataset (many part_*.parquet) 压实为单一文件，并可选删除源目录。
 
     参数:
-        kind: 数据类型前缀，如 'acs'、'acl'、'cs'、'cl'。
-        which: 'daily' 或 'contours'。
-        region_key: 区域 slug；None 时基于当前区域生成。
-    output_root: 根输出目录；None 则读取配置或使用默认 './META_tracks'。
-        delete_source: 压实完成后是否删除源目录。
+        - kind (str): 数据类型前缀，如 'acs'/'acl'/'cs'/'cl'。
+        - which (str): 'daily' 或 'contours'。
+        - region_key (str | None): 区域 slug；None 时基于当前区域生成。
+        - output_root (str | Path | None): 根输出目录；None 时读取配置或用默认 './META_tracks'。
+        - delete_source (bool): 压实完成后是否删除源目录，默认 True。
 
     返回:
-        目标单一 Parquet 文件路径（字符串）。
+        - str: 目标单一 Parquet 文件路径。
     """
     region_slug = region_key or _current_region_key()
     root = _ensure_meta_tracks_root(output_root)
@@ -1677,18 +1708,16 @@ def compact_parquet_dataset(kind: str,
 
 def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
     """
-    解析单个扁平的、由制表符分隔的Argo表格文件。
+    解析单个扁平的、由制表符分隔的 Argo 表格文件。
 
-    功能:
-        此函数假设输入文件是一个标准的表格文件，其中第一行是列标题，
-        后续行是数据，所有字段均由制表符 ('\t') 分隔。
-        它会自动将指定的占位符（如 -999）转换成标准的 NaN。
+    假设输入文件第一行是列标题、后续行是数据、字段以制表符（Tab）分隔，并自动将占位符（如 -999）
+    转换为标准 NaN。
 
     参数:
-        file_path (Path): 单个Argo txt文件的路径。
+        - file_path (Path): 单个 Argo txt 文件的路径。
 
     返回:
-        pd.DataFrame | None: 如果文件成功解析且内容不为空，返回DataFrame；否则返回None。
+        - pd.DataFrame | None: 解析成功且内容非空时返回 DataFrame；否则返回 None。
     """
     try:
         # 定义需要被视作NaN的占位符列表
@@ -1711,16 +1740,12 @@ def parse_argo_txt_file(file_path: Path) -> pd.DataFrame | None:
 
 def worker_process_file(task_args: tuple[Path, Path]):
     """
-    (Worker函数) 这是Dask的工作单元，负责处理单个文件。
+    Dask 工作单元：处理单个文件。
 
-    功能:
-        接收一个包含输入和输出路径的元组，调用解析函数，
-        并将结果保存为中间Parquet文件。
+    接收含输入/输出路径的元组，调用 parse_argo_txt_file 解析，并将结果保存为中间 Parquet 文件。
 
     参数:
-        task_args (tuple[Path, Path]): 一个元组，包含:
-            - 原始txt文件路径 (input_path)
-            - 中间Parquet文件输出路径 (output_path)
+        - task_args (tuple[Path, Path]): (原始 txt 文件路径 input_path, 中间 Parquet 输出路径 output_path)。
     """
     input_path, output_path = task_args
     try:
@@ -1739,24 +1764,17 @@ def process_argo_txt_to_yearly_parquet_dask(
     cleanup_temp_dir: bool = True
 ):
     """
-    (主流程函数) 使用Dask统一并行处理Argo txt文件，高效处理大规模数据。
+    使用 Dask 统一并行处理 Argo txt 文件，高效完成大规模数据的 ETL。
 
-    功能:
-        这是一个完整的、适用于超大数据集的ETL流程，完全由Dask驱动：
-        1. (并行) [Dask] 将所有原始 .txt 文件转换为临时的 .parquet 文件。
-        2. (并行) [Dask] 对所有临时文件进行并行地合并、清洗、排序，并输出为按年份分区的临时目录。
-        3. (串行) 将分区目录合并为最终的单个年度文件。
-        此版本利用Dask的HPC环境自适应能力，避免内存瓶颈，全程并行执行。
-        最后，根据参数选择是否清理所有临时文件。
+    完整的 Dask 驱动 ETL：先并行将所有 .txt 转为临时 .parquet，再并行合并、清洗、排序并输出为按年份
+    分区的临时目录，最后串行合并为单个年度文件；利用 Dask 的 HPC 自适应能力避免内存瓶颈，并按参数选择
+    是否清理临时文件。
 
     参数:
-        origin_dir (Path | str | None): 存放原始 Argo .txt 文件的目录。
-            - None 时自动读取 paths.yml 中的 paths.argo_txt_input；若缺省，则回退到 './Argo_origin'。
-        temp_dir (Path | str | None): 存放中间产物（初始 Parquet、映射表、分区数据）的临时目录。
-            - None 时优先读取 paths.yml 中的 paths.tmp_parquet_path；若缺省，则回退到 final_dir / '_tmp_txt2parquet_dask'。
-        final_dir (Path | str | None): 保存最终年度 Parquet 文件（ArgoYYYY.parquet）的目录。
-            - None 时使用配置 paths.yml 中的 paths.argo_parquet（即全局 argo_path）。
-        cleanup_temp_dir (bool, optional): 是否在任务结束后删除临时目录。默认为 True。
+        - origin_dir (Path | str | None): 存放原始 Argo .txt 文件的目录；None 时取配置 paths.argo_txt_input，缺省则回退 './Argo_origin'。
+        - temp_dir (Path | str | None): 中间产物（初始 Parquet、映射表、分区数据）的临时目录；None 时取配置 paths.tmp_parquet_path，缺省则回退 final_dir/'_tmp_txt2parquet_dask'。
+        - final_dir (Path | str | None): 保存最终年度 Parquet（ArgoYYYY.parquet）的目录；None 时取配置 paths.argo_parquet。
+        - cleanup_temp_dir (bool): 是否在任务结束后删除临时目录，默认 True。
     """
     # --- 0. 解析/回退目录参数（与 META 一致的配置驱动） ---
     start_total_time = tm.time()
@@ -1896,21 +1914,17 @@ def load_argo_data(year: int, data_dir: str | Path = None,
     """
     加载指定年份的 Argo Parquet 数据文件，并进行列名规范化和变量选择。
 
-    功能:
-        1. 自动将旧版列名 (如 'Depth_m') 转换为新版标准名 ('Depth')。
-        2. 通过 `variable_selection` 参数，允许用户灵活选择最终输出的标准变量
-           (Temperature, DO, Salinity) 分别来源于文件中的哪一列数据。
+    自动将旧版列名（如 'Depth_m'）转换为新版标准名；并通过 variable_selection 灵活指定 Temperature/DO/
+    Salinity 三个标准变量分别来源于文件中的哪一列。
 
     参数:
-        year (int): 需要加载的数据年份 (例如 2014)。
-        data_dir (str | Path | None): Argo Parquet 所在目录；None → paths.yml: argo_parquet。
-        variable_selection (dict | None): 覆盖默认变量来源映射，例如 {'Salinity':'PSAL_WOA'}。
-            默认: {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}
-        verbose (bool): 是否输出详细日志，默认 False（安静模式）。
+        - year (int): 需要加载的数据年份（如 2014）。
+        - data_dir (str | Path | None): Argo Parquet 所在目录；None 时取配置 paths.argo_parquet。
+        - variable_selection (dict | None): 覆盖默认变量来源映射，如 {'Salinity': 'PSAL_WOA'}；默认 {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}。
+        - verbose (bool): 是否输出详细日志，默认 False。
 
     返回:
-        pd.DataFrame: 一个包含处理后 Argo 数据的 pandas DataFrame，其列名和数据源
-                      均已根据参数进行了标准化。
+        - pd.DataFrame: 处理后的 Argo 数据，列名与数据源均已按参数标准化。
     """
     if data_dir is None:
         data_dir = argo_path
@@ -1985,38 +1999,36 @@ def find_track(
 ) -> pd.DataFrame | list | dict:
     """查找一个或多个涡旋编号的整条轨迹（兼容老/新两种数据源），并统一输出约定。
 
-    支持的数据源:
-    - DS_or_kind 为旧的嵌套列表（例如从 pickle 读取的 legacy `acl/acs/...` 列表）。
-    - DS_or_kind 为字符串 kind（'acs'|'acl'|'cs'|'cl'）：从 META_tracks/<region>
-      读取 <kind>_daily.parquet 与（可选）<kind>_contours.zarr。
-
-    返回契约（默认 return_list=False):
-    - 单 ID: 返回 DataFrame（列依数据源而异）
-            • 新结构（DS_or_kind 为字符串 kind）：首列为 'track_id'，列为
-                ['track_id','time','center_lon','center_lat','max_lon','max_lat',
-                    'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date']
-                说明：'date' 由 'time' 规范化得到；不附加末尾重复的 'track_id' 列。
-            • 旧结构（DS_or_kind 为嵌套列表 legacy）：首列为 'index_org'，并在末尾追加 'track_id'：
-                ['index_org','time','center_lon','center_lat','max_lon','max_lat',
-                    'contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date','track_id']
-    - 多 ID: 返回合并后的 DataFrame（含 'track_id' 列），并按 ['track_id','date'] 排序。
-
-    当 return_list=True 时:
-    - 单 ID: 返回旧版 list[list] 结构，每个日项的首元素为真实 track_id：
-        [track_id, YYYYMMDD, center_lon, center_lat, max_lon, max_lat,
-         eff_contour_lon[], eff_contour_lat[], radius, speed_contour_lon[], speed_contour_lat[]]
-    - 多 ID: 返回 { track_id: list[list] } 的字典。
+    DS_or_kind 可为旧的嵌套列表（如从 pickle 读取的 legacy acl/acs/... 列表），或字符串 kind
+    （'acs'|'acl'|'cs'|'cl'，从 `META_tracks/<region>` 读取 `<kind>_daily.parquet` 与可选的
+    `<kind>_contours.zarr`）。
 
     参数:
-    - DS_or_kind: 旧结构列表或新结构 kind 字符串。
-    - num: 单个 track_id 或可迭代的多个 track_id。
-    - region: 区域 slug，None 使用当前默认区域。
-    - output_root: META_tracks 根目录，None 读取配置或使用默认 './META_tracks'。
-    - include_contours: True 时加载等值线（新结构路径）；False 时 'contour_*' 为空数组。
+        - DS_or_kind (list | str): 旧结构列表或新结构 kind 字符串。
+        - num (int | list | tuple | set | np.ndarray): 单个 track_id 或可迭代的多个 track_id。
+        - region (str | None): 区域 slug，None 时使用当前默认区域。
+        - output_root (str | Path | None): META_tracks 根目录，None 时读取配置或用默认 './META_tracks'。
+        - include_contours (bool): True 时加载等值线（新结构路径），False 时 'contour_*' 为空数组，默认 True。
+        - return_list (bool): True 时返回旧版 list/dict 结构而非 DataFrame，默认 False。
 
-    异常:
-    - TypeError: DS_or_kind 类型非法。
-    - ValueError: 指定 track_id 未找到。
+    返回:
+        - pd.DataFrame | list | dict: 形态随 return_list 与单/多 ID 而定，详见“说明”。
+
+    说明:
+        返回契约（return_list=False，默认）:
+
+            - 单 ID：返回 DataFrame。新结构首列为 'track_id'，列为 ['track_id','time','center_lon','center_lat','max_lon','max_lat','contour_lon','contour_lat','radius','speed_contour_lon','speed_contour_lat','date']（'date' 由 'time' 规范化得到，不附加末尾重复的 'track_id'）；旧结构首列为 'index_org'，末尾追加 'track_id'。
+            - 多 ID：返回合并后的 DataFrame（含 'track_id' 列），按 ['track_id','date'] 排序。
+
+        返回契约（return_list=True）:
+
+            - 单 ID：返回旧版 list[list]，每个日项首元素为真实 track_id：[track_id, YYYYMMDD, center_lon, center_lat, max_lon, max_lat, eff_contour_lon[], eff_contour_lat[], radius, speed_contour_lon[], speed_contour_lat[]]。
+            - 多 ID：返回 {track_id: list[list]} 字典。
+
+        异常:
+
+            - TypeError：DS_or_kind 类型非法。
+            - ValueError：指定 track_id 未找到。
     """
     # 规范化 num 输入，判断是否批量
     def _is_scalar_id(x) -> bool:
@@ -2358,17 +2370,14 @@ def is_point_in_contour(row: pd.Series) -> bool:
     """
     检查一个数据行中的点坐标是否在其涡旋轮廓坐标内部。
 
-    功能:
-        这是一个辅助函数，通常与DataFrame的.apply()方法配合使用。
-        它从一行数据中提取'Longitude', 'Latitude', 'contour_lon', 'contour_lat'，
-        并判断点是否在多边形内部。
+    辅助函数，通常与 DataFrame 的 .apply() 配合使用，从一行数据中提取 'Longitude'/'Latitude'/
+    'contour_lon'/'contour_lat' 并判断点是否在多边形内部。
 
     参数:
-        row (pd.Series): 
-            一个Pandas DataFrame的数据行，必须包含经纬度和轮廓坐标。
+        - row (pd.Series): 一个 Pandas DataFrame 的数据行，必须包含经纬度和轮廓坐标。
 
     返回:
-        bool: 如果点在轮廓内部，则返回True，否则返回False。
+        - bool: 点在轮廓内部返回 True，否则 False。
     """
     try:
         contour_lon = np.asarray(row['contour_lon'], dtype=float)
@@ -2409,30 +2418,24 @@ def filtered_float_data(
     track: list | pd.DataFrame | None = None
 ) -> pd.DataFrame:
     """
-    根据涡旋轨迹，动态加载并筛选匹配的Argo浮标剖面数据。
+    根据涡旋轨迹，动态加载并筛选匹配的 Argo 浮标剖面数据。
 
-    功能:
-        1. 分析涡旋轨迹覆盖的年份，并自动加载对应年份的Argo数据。
-        2. 使用向量化的方式高效匹配在同一天出现在涡旋区域内的Argo浮标。
-        3. 筛选标准为：浮标位置处于涡旋的有效轮廓内，或处于扩大一定倍数后的有效半径内。
+    分析涡旋轨迹覆盖的年份并自动加载对应年份的 Argo 数据，再以向量化方式高效匹配同一天出现在涡旋区域
+    内的浮标；筛选标准为浮标位置处于涡旋有效轮廓内，或处于扩大一定倍数后的有效半径内。
 
     参数:
-        DS (list | str):
-            • 旧结构：legacy 轨迹列表（如从 pickle 读取的 acl/acs/... 数据）。
-            • 新结构：字符串 kind（'acs'|'acl'|'cs'|'cl'），内部会调用 find_track 动态装载 META_tracks/<region> 数据。
-        no (int): 需要筛选的涡旋的唯一编号。
-        argo_data_dir (str | Path, optional): 存放Argo Parquet文件的目录。None 时使用配置文件 paths.yml 中的 argo_parquet。
-        circle_enlargement_factor (float | None, optional): None 时回退配置值。
-        use_adaptive_circle (bool): 若为 True，则半径匹配的距离用 `adaptive_distance_m`（高纬或大距离自动切换大圆），否则使用局地平面近似。
-        adaptive_lat_threshold (float): |lat| 高于该阈值触发自适应大圆距离计算。
-        adaptive_distance_threshold_km (float): 平面近似距离超过该阈值(km)触发大圆距离计算。
-        force_great_circle_circle (bool): 强制半径距离全部使用大圆（忽略阈值条件）。
+        - DS (list | str): 旧结构传 legacy 轨迹列表（如从 pickle 读取的 acl/acs/... 数据）；新结构传字符串 kind（'acs'|'acl'|'cs'|'cl'），内部调用 find_track 从 META_tracks 区域目录动态装载。
+        - no (int): 需要筛选的涡旋唯一编号。
+        - argo_data_dir (str | Path | None): 存放 Argo Parquet 文件的目录；None 时取配置 paths.argo_parquet。
+        - circle_enlargement_factor (float | None): 有效半径放大系数；None 时回退配置值。
+        - use_adaptive_circle (bool): 为 True 时半径匹配距离用 adaptive_distance_m（高纬或大距离自动切换大圆），否则用局地平面近似，默认 True。
+        - adaptive_lat_threshold (float): |lat| 高于该阈值触发自适应大圆距离计算，默认 70.0。
+        - adaptive_distance_threshold_km (float): 平面近似距离超过该阈值（km）触发大圆距离计算，默认 300.0。
+        - force_great_circle_circle (bool): 强制半径距离全部使用大圆（忽略阈值条件），默认 False。
+        - track (list | pd.DataFrame | None): 预先加载好的涡旋轨迹；传入可避免函数内部再次调用 find_track 触发重复磁盘 I/O，默认 None。
 
     返回:
-        pd.DataFrame: 匹配的Argo剖面完整数据（所有深度层级）。若无匹配返回空 DataFrame。
-
-    额外优化:
-        track 参数可传入事先加载好的涡旋轨迹（list 或 DataFrame），以避免函数内部再次调用 find_track 触发重复磁盘 I/O。
+        - pd.DataFrame: 匹配的 Argo 剖面完整数据（所有深度层级）；无匹配时返回空 DataFrame。
     """
     # 参数回退
     if argo_data_dir is None:
@@ -2573,18 +2576,17 @@ def get_argo_profile_numbers_on_day(
 ) -> list[int]:
     """返回指定涡旋在指定日期命中的全部 Argo Profile_number（唯一值）。
 
-    说明:
-        - 复用 `filtered_float_data` 的匹配口径（同日 + 轮廓内或扩圈半径内）。
-        - 本函数只返回唯一 Profile 编号列表，不返回完整剖面数据。
+    复用 filtered_float_data 的匹配口径（同日 + 轮廓内或扩圈半径内），但只返回唯一 Profile 编号列表，
+    不返回完整剖面数据。
 
     参数:
-        DS: legacy 列表、kind 字符串、kind 序列或数据集字典。
-        track_id: 涡旋编号。
-        date: 目标日期；支持 'YYYY-MM-DD'、YYYYMMDD、days-since-1950、Timestamp。
-        sort_result: 是否按升序返回，默认 True。
+        - DS (list | str | tuple | dict): legacy 列表、kind 字符串、kind 序列或数据集字典。
+        - track_id (int): 涡旋编号。
+        - date (str | int | float | pd.Timestamp): 目标日期；支持 'YYYY-MM-DD'、YYYYMMDD、days-since-1950、Timestamp。
+        - sort_result (bool): 是否按升序返回，默认 True。
 
     返回:
-        list[int]: 该日命中的唯一 Profile_number 列表；若无命中返回空列表。
+        - list[int]: 该日命中的唯一 Profile_number 列表；无命中返回空列表。
     """
     try:
         track_df, _ds_name, ds_source_for_filter = _resolve_track_context(DS, int(track_id), include_contours=True)
@@ -2765,38 +2767,27 @@ def plot_track(
     """
     绘制指定编号涡旋的详细轨迹，并高亮显示与 Argo 异常剖面的交互情况。
 
-    功能:
-        1. 自动加载并筛选与指定涡旋匹配的Argo数据。
-        2. 绘制涡旋的完整轨迹（虚线）。
-        3. 智能高亮Argo浮标存在的时期：当浮标存在日的间隔小于阈值时，
-           会将这段完整的涡旋轨迹绘制为连续实线（孤立的单日则标记为点）。
-        4. 使用 calculate_delta_do 按 detection_config 识别异常（每个剖面保留 anomaly_score 最强一条），并按当前方法的主变量着色。
-        5. 可选地绘制涡旋在交互日的有效半径和轮廓。
+    自动加载并筛选与该涡旋匹配的 Argo 数据，将涡旋完整轨迹绘为虚线；对存在 Argo 浮标的时期智能高亮
+    （相邻存在日间隔小于 connection_threshold_days 时连成实线，孤立单日标为点），用 calculate_delta_do
+    按 detection_config 识别异常（每个剖面保留 anomaly_score 最强一条）并以当前方法主变量着色，可选叠加
+    涡旋在交互日的有效半径与轮廓。
 
     参数:
-        DS (list | str | sequence[str] | dict): 
-            legacy 模式传入已加载的数据列表（如 ACL/ACS）；
-            新模式可直接传入字符串 kind（'acs' 等）或字符串列表/元组，
-            函数会自动从本地 META_tracks 中检索对应轨迹；
-            亦支持传入 {"ACS": acs, ...} 字典以兼容旧流程。
-        no (int): 
-            需要绘制的涡旋的唯一编号。
-        save_fig (bool, optional): 
-            是否将生成的图像保存到文件。默认为 False。
-        show_fig (bool, optional): 
-            是否在交互式环境中显示生成的图像。默认为 True。
-        plot_radius (bool, optional): 
-            是否以圆的形式绘制涡旋在交互日的有效半径。默认为 False。
-        connection_threshold_days (int, optional):
-            连接 Argo 交互点的最大天数阈值。默认为 5 天。
-        plot_unrelated_argo (bool): 
-            是否绘制未被当前方法判定为异常的匹配 Argo 剖面基准位置（空心灰圈）。
-        detection_config:
-            异常识别配置；None 时使用 processing.yml 默认值。
-        fix_colorbar / cbar_min / cbar_max / cbar_ticks:
-            是否固定异常主变量色标及其范围/刻度。
-        min_anomaly_count (int): 
-            若 >0：要求异常数量 ≥ 该值才绘图；=0 表示不做数量阈值过滤（默认 0）。
+        - DS (list | str | tuple | dict): legacy 模式传入已加载的数据列表（如 ACL/ACS）；新模式可传字符串 kind（'acs' 等）或字符串列表/元组，自动从本地 META_tracks 检索对应轨迹；亦支持 {"ACS": acs, ...} 字典以兼容旧流程。
+        - no (int): 需要绘制的涡旋唯一编号。
+        - save_fig (bool): 是否将图像保存到文件，默认 False。
+        - show_fig (bool): 是否在交互式环境中显示图像，默认 True。
+        - plot_radius (bool): 是否以圆形式绘制涡旋在交互日的有效半径，默认 False。
+        - connection_threshold_days (int): 连接 Argo 交互点的最大天数阈值，默认 5。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - plot_unrelated_argo (bool): 是否绘制未被判定为异常的匹配 Argo 剖面基准位置（空心灰圈），默认 True。
+        - fix_colorbar (bool): 是否固定异常主变量色标，默认 True。
+        - cbar_min (float | None): 色标下限；None 时自动。
+        - cbar_max (float | None): 色标上限；None 时自动。
+        - cbar_ticks (list | None): 色标刻度；None 时自动。
+        - min_anomaly_count (int): >0 时要求异常数量 ≥ 该值才绘图，=0 不做数量阈值过滤，默认 0。
+    输出:
+        - 图像（save_fig=True 时）：`plot_outputs/<method>/<region>/plot_track/Track_Analysis_{数据集}{编号}_{stem}.png`
     """
     # --- 1. 准备涡旋和Argo数据 ---
     print(f"[*] Preparing data for eddy ID {no}...")
@@ -3023,22 +3014,24 @@ def plot_track_variable_timeseries(
     
 
     参数:
-        DS: legacy轨迹列表、kind字符串、字符串序列或数据集字典。
-        no: 涡旋编号。
-        variable: 需要统计的变量列名；None 时按 detection_config 自动选择
-            do->'DO'，aou/trim->'AOU'。
-        only_anomaly_profiles: True 时先按 detection_config 筛出异常剖面，再绘制这些剖面的变量场；
-            False 时使用全部匹配剖面。
-        depth_col: 深度列名，默认 'Depth'。
-        max_depth: 最大深度（单位与 depth_col 一致），默认 1000 dbar；None 表示使用观测最大值。
-        depth_bin_size: 深度分箱大小（dbar），默认 25。
-        cmap: 色标名称，默认 'RdYlBu_r'。
-        show_profile_hist: 是否在底部显示每日剖面数柱状条，默认 True。
-        start_date / end_date: 限制横轴开始/结束日期，可传 pandas.Timestamp、YYYYMMDD 整数、days-since-1950、ISO 字符串。
-        platform_number: 可选，仅绘制指定 Argo 浮标（单个或列表/集合），先于异常筛选过滤。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        remove_outliers: 是否执行基础 QC（Flag 过滤 + DO<=1 过滤），默认 True。
-        save_fig / show_fig: 控制图像输出。
+        - DS (list | str | tuple | dict): legacy 轨迹列表、kind 字符串、字符串序列或数据集字典。
+        - no (int): 涡旋编号。
+        - variable (str | None): 需要统计的变量列名；None 时按 detection_config 自动选择（do→'DO'，aou/trim→'AOU'）。
+        - only_anomaly_profiles (bool): True 时先按 detection_config 筛出异常剖面再绘制其变量场，False 时使用全部匹配剖面，默认 True。
+        - depth_col (str): 深度列名，默认 'Depth'。
+        - max_depth (float | None): 最大深度（单位与 depth_col 一致），默认 1000.0；None 表示使用观测最大值。
+        - depth_bin_size (float): 深度分箱大小（dbar），默认 25.0。
+        - cmap (str): 色标名称，默认 'RdYlBu_r'。
+        - show_profile_hist (bool): 是否在底部显示每日剖面数柱状条，默认 True。
+        - start_date (str | int | float | pd.Timestamp | None): 横轴开始日期，可传 pandas.Timestamp、YYYYMMDD 整数、days-since-1950 或 ISO 字符串。
+        - end_date (str | int | float | pd.Timestamp | None): 横轴结束日期，编码同 start_date。
+        - platform_number (int | str | list | tuple | set | None): 仅绘制指定 Argo 浮标（单个或列表/集合），先于异常筛选过滤。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - remove_outliers (bool): 是否执行基础 QC（Flag 过滤 + DO<=1 过滤），默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+    输出:
+        - 图像（save_fig=True 时）：`plot_outputs/<method>/<region>/plot_track_timeseries/{数据集}{编号}_{变量}_timeseries*_{stem}.png`
     """
     cfg = _resolve_detection_config(detection_config)
     if variable is None:
@@ -3307,13 +3300,13 @@ def plot_track_variable_timeseries(
 def convert_date(values: pd.Series | np.ndarray | list | str | int | float) -> pd.Series | pd.Timestamp:
     """统一将整数/字符串编码日期转为 pandas datetime（日精度）。
 
-    支持两种编码：
-      1) 自 1950-01-01 起的天数 (CF 常见 time 轴)
-      2) YYYYMMDD 8 位整数 (如 20220131)
+    支持两种编码：自 1950-01-01 起的天数（CF 常见 time 轴），或 YYYYMMDD 8 位整数（如 20220131）。
 
-    返回：
-      - 标量输入（如单个字符串/数字）→ 返回单个 `pd.Timestamp`
-      - 序列输入（Series/ndarray/list）→ 返回 `pd.Series` (dtype=datetime64[ns])，未能解析的元素为 NaT。
+    参数:
+        - values (pd.Series | np.ndarray | list | str | int | float): 待转换的日期，标量或序列。
+
+    返回:
+        - pd.Series | pd.Timestamp: 标量输入返回单个 pd.Timestamp；序列输入返回 pd.Series（datetime64[ns]），未能解析的元素为 NaT。
     """
     is_scalar_input = isinstance(values, (str, bytes, int, float, np.integer, np.floating, np.str_))
     if isinstance(values, pd.Series):
@@ -3380,18 +3373,17 @@ def convert_eddy_number(
     在 legacy orig_index 与标准 track_id 之间转换涡旋编号。
 
     参数:
-        kind: 涡旋类型，'acs'|'acl'|'cs'|'cl'。必须指定，以保证索引映射到正确数据集。
-        value: 单个编号或编号可迭代。可为旧编号（orig_index）或新编号（track_id）。
-        order: 转换方向，支持别名：
-            • legacy->new: 'old_to_new', 'orig_to_track', 'legacy_to_track', 'to_track'.
-            • new->legacy: 'new_to_old', 'track_to_orig', 'track_to_legacy', 'to_orig'.
-        meta_root: META 原始 NetCDF 目录，默认读取配置 paths.meta_root。
-        version: META 版本（3.1 或 3.2）。
+        - kind (str): 涡旋类型 'acs'|'acl'|'cs'|'cl'，必须指定以保证索引映射到正确数据集。
+        - value (str | int | float | list | tuple | np.ndarray): 单个编号或编号可迭代；可为旧编号（orig_index）或新编号（track_id）。
+        - order (str): 转换方向，支持别名：
+
+            - legacy→new：'old_to_new'、'orig_to_track'、'legacy_to_track'、'to_track'。
+            - new→legacy：'new_to_old'、'track_to_orig'、'track_to_legacy'、'to_orig'。
+        - meta_root (str | os.PathLike | None): META 原始 NetCDF 目录；None 时取配置 paths.meta_root。
+        - version (float): META 版本（3.1 或 3.2），默认 3.2。
 
     返回:
-        按输入形状返回转换后的编号：
-            • 标量输入 -> int
-            • 可迭代输入 -> list[int]
+        - int | list[int]: 按输入形状返回 —— 标量输入返回 int，可迭代输入返回 list[int]。
 
     说明:
         - 旧编号对应 NetCDF 中的全局行索引（orig_index）。
@@ -3962,38 +3954,40 @@ def plot_vertical(
     '''
     根据涡旋轨迹与匹配到的 Argo 剖面，绘制变量-深度的垂直剖面。
 
+    为 variables 中每个变量创建一个子图，按剖面绘制变量随深度变化的曲线，曲线颜色可按与涡旋中心的相对
+    距离（distance）或采样时间（time）变化，可选显示颜色条并保存/显示图片；variables 同含 DO 与 AOU 时
+    绘制两张独立子图（不做 DO 顶部 AOU 叠加）。
+
     参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
-        show_fig (bool): 是否显示图片，默认 False。
-        save_fig (bool): 是否保存图片，默认 False。
-        color_mode (str): 颜色模式，'distance' 或 'time'，默认 'distance'。
-        variables (list): 需要绘制的变量名称，默认 ['DO', 'Temp', 'Salinity']。
-        show_colorbar (bool): 是否显示颜色条，默认 False。
-        remove_outliers (bool): True 时执行 QC 过滤与规则法去极值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
-        plot_normal_scatter (bool): 是否绘制正常值的孤立散点标记。默认 False。
-        aggregated (bool): 是否进行跨平台聚合绘制，默认 False。
-        argo_required (list | None): 平台过滤；None 表示不过滤；传入平台编号列表时仅保留指定平台。
-        year_required (list | None): 年份过滤；None 表示不过滤；传入年份列表时仅保留指定年份。
-        month_required (list | None): 月份过滤；聚合模式 None 表示使用所有可用月份；逐平台模式 None 表示不过滤。
-        day_required (list | None): 日期过滤（按日1-31）；None 表示不过滤；传入日期列表时仅保留指定日期。
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
+        - show_fig (bool): 是否显示图片，默认 False。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - color_mode (str): 颜色模式，'distance' 或 'time'，默认 'distance'。
+        - variables (list): 需要绘制的变量名称，默认 ['DO', 'Temp', 'Salinity']。
+        - show_colorbar (bool): 是否显示颜色条，默认 False。
+        - remove_outliers (bool): True 时执行 QC 过滤与规则法去极值；False 时保留 QC 通过段为原色、断点用红线桥接并用红色圆点标记 QC 异常值，默认 True。
+        - plot_normal_scatter (bool): 是否绘制正常值的孤立散点标记，默认 False。
+        - aggregated (bool): 是否进行跨平台聚合绘制，默认 False。
+        - argo_required (list | None): 平台过滤；None 表示不过滤，传入平台编号列表时仅保留指定平台。
+        - year_required (list | None): 年份过滤；None 表示不过滤，传入年份列表时仅保留指定年份。
+        - month_required (list | None): 月份过滤；聚合模式 None 表示使用所有可用月份，逐平台模式 None 表示不过滤。
+        - day_required (list | None): 日期过滤（按日 1-31）；None 表示不过滤，传入日期列表时仅保留指定日期。
+    输出:
+        - 逐平台图（save_fig=True, aggregated=False）：`plot_outputs/shared/<region>/plot_vertical_profiles/{数据集}{编号}_Platform_{平台号}.png`
+        - 聚合图（save_fig=True, aggregated=True）：`plot_outputs/shared/<region>/plot_vertical_monthly_aggregated/{数据集}{编号}_months_{月份}_aggregated.png`
 
-    功能:
-        - 为 variables 中的每个变量创建一个子图，按剖面绘制变量随深度变化的曲线。
-        - 当 variables 同时包含 DO 和 AOU 时：plot_vertical 会绘制两张独立子图（不做 DO 顶部 AOU 叠加）。
-        - 曲线颜色可根据与涡旋中心的相对距离（distance）或采样时间（time）变化。
-        - 可选显示颜色条；支持图片保存与显示。
-        - remove_outliers=True 时执行基础质量控制（QC 仅保留 {1,2,5,8}；DO<=1 置为 NaN）。
-        - remove_outliers=False 时不剔除点：QC 通过段保持原色，本应断开的跨段连接用红线显示，并用红色圆点标记不通过基础 QC 的观测。
-        - 当 DO 子图绘制 AOU 时，AOU 会复用 DO/Temp/Sal 的同等 QC 逻辑：
-            remove_outliers=True 时同样剔除；False 时同样以红色桥接线+红点标注 QC 异常段。
-        - 可用 month_required 和 argo_required 对数据进行月份与平台筛选。
+    说明:
+        模式差异:
 
-    模式差异:
-        - aggregated=False（逐平台）：
-            • 为每个浮标平台单独出图；每图包含 variables 中各变量的一个子图。
-        - aggregated=True（聚合）：
-            • 所有平台剖面在同一张图上聚合绘制（每个变量一个子图）。
+            - aggregated=False（逐平台）：为每个浮标平台单独出图，每图含 variables 中各变量的一个子图。
+            - aggregated=True（聚合）：所有平台剖面在同一张图上聚合绘制（每个变量一个子图）。
+
+        质量控制:
+
+            - remove_outliers=True 时执行基础 QC（仅保留 Flag {1,2,5,8}，DO<=1 置 NaN）。
+            - remove_outliers=False 时不剔除点：QC 通过段保持原色，应断开的跨段连接用红线显示，QC 不通过的观测用红色圆点标记。
+            - DO 子图绘制 AOU 时，AOU 复用 DO/Temp/Sal 的同等 QC 逻辑（True 同样剔除，False 同样以红色桥接线+红点标注）。
     '''
     try:
         track_df, ds_names, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=False)
@@ -4352,30 +4346,31 @@ def plot_relative_position(
     '''
     根据涡旋轨迹和浮标数据，绘制浮标在单位圆涡旋中的相对位置分布图。
 
+    计算剖面代表点在单位圆涡旋中的相对位置并以散点标注（中心×、单位圆圈），横纵轴刻度兼含
+    真实经纬度与相对坐标，可选显示颜色条并保存/显示图片，支持按月份与平台编号筛选。颜色模式
+    'distance' 按距离中心归一化（0=中心，1=边缘），'time' 按时间顺序归一化。
+
     参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
-        show_fig (bool): 是否显示图片，默认 False。
-        save_fig (bool): 是否保存图片，默认 False。
-        color_mode (str): 'distance' 或 'time'，默认 'distance'。
-        show_colorbar (bool): 是否显示颜色条，默认 False。
-        aggregated (bool): 是否聚合所有平台于一图，默认 False。
-        argo_required (list | None): 平台筛选；None 表示不过滤；传入平台编号列表时仅保留指定平台。
-        year_required (list | None): 年份筛选；None 表示不过滤。
-        month_required (list | None): 月份筛选；聚合模式 None 表示使用所有可用月份；逐平台模式 None 表示不过滤。
-        day_required (list | None): 日期筛选（按日1-31）；None 表示不过滤。
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
+        - show_fig (bool): 是否显示图片，默认 False。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - color_mode (str): 'distance' 或 'time'，默认 'distance'。
+        - show_colorbar (bool): 是否显示颜色条，默认 False。
+        - aggregated (bool): 是否聚合所有平台于一图，默认 False。
+        - argo_required (list | None): 平台筛选；None 表示不过滤；传入平台编号列表时仅保留指定平台。
+        - year_required (list | None): 年份筛选；None 表示不过滤。
+        - month_required (list | None): 月份筛选；聚合模式 None 表示使用所有可用月份；逐平台模式 None 表示不过滤。
+        - day_required (list | None): 日期筛选（按日 1-31）；None 表示不过滤。
+    输出:
+        - 逐平台图（save_fig=True, aggregated=False）：`plot_outputs/shared/<region>/plot_relative_position/{数据集}{编号}RP{平台号}.png`
+        - 聚合图（save_fig=True, aggregated=True）：`plot_outputs/shared/<region>/plot_relative_position_monthly_aggregated/{数据集}{编号}_RP_months_{月份}_aggregated.png`
 
-        功能:
-        - 计算剖面代表点在单位圆涡旋中的相对位置，并以散点标注（中心×，单位圆圈）。
-        - 颜色模式: 'distance'（距离中心归一化，0=中心，1=边缘）或 'time'（按时间顺序归一化）。
-        - 横纵轴刻度包含真实经纬度与相对坐标。可选显示颜色条；支持图片保存与显示。
-        - 支持按照月份（month_required）与平台编号（argo_required）进行筛选。
+    说明:
+        模式差异:
 
-    模式差异:
-        - aggregated=False（逐平台）：
-            • 对每个浮标平台分别出图，点内数字代表该平台内部的剖面时序，从1开始递增。
-        - aggregated=True（聚合）：
-            • 所有平台的代表点聚合到同一张图，点内数字代表相对于所选月份范围起始日的累积天数。例如，若数据从7月29日开始，则该日所有剖面的数字为29，7月30日为30，8月1日则为32。
+            - aggregated=False（逐平台）：对每个平台分别出图，点内数字为该平台内部剖面时序（从 1 递增）。
+            - aggregated=True（聚合）：所有平台代表点聚合到一图，点内数字为相对所选月份范围起始日的累积天数（如数据自 7 月 29 日起，则该日为 29、7 月 30 日为 30、8 月 1 日为 32）。
     '''
     try:
         track_df, ds_names, ds_source_for_filter = _resolve_track_context(DS, no, include_contours=False)
@@ -4793,7 +4788,19 @@ def plot_vertical_monthly(
     argo_required: list | None = None
 ):
     '''
-    兼容封装：保持旧接口，内部调用统一的 plot_vertical。
+    兼容封装：保持旧接口，内部以 aggregated=True 调用统一的 plot_vertical。
+
+    参数:
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
+        - month_required (list | None): 月份筛选；None 时使用所有可用月份。
+        - show_fig (bool): 是否显示图片，默认 False。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - color_mode (str): 着色方式，默认 'distance'。
+        - variables (list): 绘制变量，默认 ['DO', 'Temp', 'Salinity']。
+        - show_colorbar (bool): 是否显示颜色条，默认 False。
+        - remove_outliers (bool): 是否执行基础 QC，默认 True。
+        - argo_required (list | None): 平台筛选；None 时不过滤。
     '''
     return plot_vertical(
         DS=DS,
@@ -4820,7 +4827,17 @@ def plot_relative_position_monthly(
     argo_required: list | None = None
 ):
     '''
-    兼容封装：保持旧接口，内部调用统一的 plot_relative_position（aggregated=True）。
+    兼容封装：保持旧接口，内部以 aggregated=True 调用统一的 plot_relative_position。
+
+    参数:
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
+        - show_fig (bool): 是否显示图片，默认 False。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - color_mode (str): 着色方式，默认 'distance'。
+        - show_colorbar (bool): 是否显示颜色条，默认 False。
+        - month_required (list | None): 月份筛选；None 时使用所有可用月份。
+        - argo_required (list | None): 平台筛选；None 时不过滤。
     '''
     return plot_relative_position(
         DS=DS,
@@ -4836,20 +4853,19 @@ def plot_relative_position_monthly(
 
 def get_glorys_filepath(date)-> str:
     '''
-    根据给定日期返回对应的GLORYS NetCDF文件路径。
+    根据给定日期返回对应的 GLORYS NetCDF 文件路径。
 
-    构造目标日期的文件夹路径和文件名模式，查找匹配的文件。如果找到且仅有一个匹配文件，则返回其完整路径；
-    如果没有找到或找到多个匹配文件，则抛出异常。
+    构造目标日期的文件夹路径与文件名模式并查找匹配文件：恰有一个匹配时返回其完整路径，否则抛异常。
 
     参数:
-        date: 由convert_date得出的需要查找的日期。
+        - date (pd.Timestamp): 由 convert_date 得出的需要查找的日期。
 
     返回:
-        str: 匹配的GLORYS NetCDF文件的完整路径。
+        - str: 匹配的 GLORYS NetCDF 文件完整路径。
 
-    异常:
-        RuntimeError: 如果找到多个匹配文件。
-        FileNotFoundError: 如果没有找到匹配文件。
+    说明:
+        - 抛出 RuntimeError：找到多个匹配文件。
+        - 抛出 FileNotFoundError：没有找到匹配文件。
     '''
     nc_path = os.path.join(Glorys_path, date.strftime("%Y"), date.strftime("%m"), 'mercatorglorys12v1_gl12_mean_')
     nc_path += date.strftime("%Y%m%d")
@@ -4865,7 +4881,10 @@ def get_glorys_filepath(date)-> str:
         
 def print_glorys_variable(nc_path: str):
     '''
-    打印指定路径对应NetCDF文件中的所有变量名称、标准名称、维度和形状信息。
+    打印指定路径 NetCDF 文件中的所有变量名称、标准名称、维度和形状信息。
+
+    参数:
+        - nc_path (str): NetCDF 文件路径。
     '''
     nc_file = Dataset(nc_path, 'r')
     
@@ -4876,15 +4895,14 @@ def print_glorys_variable(nc_path: str):
 
 def find_track_glorys_filepath(DS: list, no: int) -> dict:
     '''
-    根据涡旋编号在GLORYS数据集中查找对应的轨迹文件路径。
+    根据涡旋编号在 GLORYS 数据集中查找对应的轨迹文件路径。
 
     参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
 
     返回:
-        dict: 涡旋轨迹数据文件路径的字典，格式为 {date: glorys_filepath}。
-              如果未找到对应的轨迹数据或文件路径，则返回空字典。
+        - dict: {date: glorys_filepath} 字典；未找到对应轨迹或文件路径时返回空字典。
     '''
     try:
         track_df, _, _ = _resolve_track_context(DS, no, include_contours=False)
@@ -5125,40 +5143,36 @@ def plot_track_horizontal_glorys(DS: list, no: int, needed_date: str | pd.Timest
     '''
     绘制指定涡旋在指定日期的 GLORYS 水平快照，并叠加同日 Argo 异常点。
 
-    该函数是 track 场景下的水平可视化入口：
-    - 背景场来自目标日期与目标深度的 GLORYS 子区域；
-    - 叠加涡旋轨迹、当日有效半径和轮廓；
-    - 对同日匹配 Argo 按 argo_detection_config 识别异常后，仅保留每个 Profile 的最强异常代表点。
+    track 场景下的水平可视化入口：背景场取目标日期、目标深度的 GLORYS 子区域，叠加涡旋轨迹、当日有效
+    半径与轮廓，并对同日匹配 Argo 按 argo_detection_config 识别异常后仅保留每个 Profile 的最强异常代表点。
 
     参数:
-        DS (list | str | tuple | dict): 轨迹数据输入。
-            常见可用值：'acs'/'acl'/'cs'/'cl'，或 legacy 轨迹列表结构。
-        no (int): 轨迹编号（track id）。
-        needed_date (str | pd.Timestamp): 目标日期。
-            支持 'YYYY-MM-DD' 字符串或 pandas 时间戳；会按日精度匹配轨迹时间。
-        variable (str): 背景变量名。
-            常用值：'vorticity'、'thetao'、'so'、'u'、'v'、'ssh'。
-        show_fig (bool): 是否显示图像。
-        save_fig (bool): 是否保存图像到输出目录。
-        k, b (float | list[float] | None): 可选剖面线参数，满足 y = kx + b。
-            传入等长列表时会叠加多条线；若仅传其一或长度不一致会报错。
-        needed_depth (float | int): GLORYS 读取深度（m），默认 0（表层）。
-        inline_mode (bool): 是否使用内联静态模式。
-            - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
-            - False: 交互模式，保留图窗句柄，可配合 LineDrawer 手动点选剖面线。
-        argo_detection_config: Argo 异常点筛选配置。
-        argo_min_depth (float | None): Argo 筛选最小深度阈值（m），None 回退全局配置。
-        verbose (bool): 是否打印保存路径与提示信息。
+        - DS (list | str | tuple | dict): 轨迹数据输入，常见可用值 'acs'/'acl'/'cs'/'cl'，或 legacy 轨迹列表结构。
+        - no (int): 轨迹编号（track id）。
+        - needed_date (str | pd.Timestamp): 目标日期，支持 'YYYY-MM-DD' 字符串或 pandas 时间戳，按日精度匹配轨迹时间。
+        - variable (str): 背景变量名，常用 'vorticity'/'thetao'/'so'/'u'/'v'/'ssh'，默认 'vorticity'。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像到输出目录，默认 False。
+        - k (float | list[float] | None): 剖面线斜率，满足 y = kx + b；传入等长列表可叠加多条线，仅传其一或长度不一致会报错。
+        - b (float | list[float] | None): 剖面线截距，与 k 配套使用。
+        - needed_depth (float | int): GLORYS 读取深度（m），默认 0（表层）。
+        - inline_mode (bool): 是否使用内联静态模式，默认 True；详见“说明”。
+        - argo_detection_config (DetectionConfig | None): Argo 异常点筛选配置；None 时使用默认。
+        - argo_min_depth (float | None): Argo 筛选最小深度阈值（m），None 时回退全局配置。
+        - verbose (bool): 是否打印保存路径与提示信息，默认 True。
 
     返回:
-        tuple: (fig, ax)，便于调用侧继续叠加绘图或交互操作。
+        - tuple: (fig, ax)，便于调用侧继续叠加绘图或交互操作。
 
-    可能抛出:
-        ValueError: 当 needed_date 无法解析，或该日期不在目标轨迹时间范围内。
+    说明:
+        显示模式:
 
-    显示模式:
-        - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
-        - inline_mode=False: 交互模式，可在图窗中继续点选与分析。
+            - inline_mode=True（默认）：静态出图模式，资源占用更可控，函数结束会关闭 figure 释放内存，适合脚本批量出图。
+            - inline_mode=False：交互模式，保留图窗句柄，可配合 LineDrawer 手动点选剖面线。
+
+        异常:
+
+            - 抛出 ValueError：needed_date 无法解析，或该日期不在目标轨迹时间范围内。
     '''
     argo_detection_config = _resolve_detection_config(
         argo_detection_config,
@@ -5634,7 +5648,27 @@ def get_vertical_glorys_from_center(
 ) -> list[dict]:
     """按给定中心点与剖面线参数计算 GLORYS 垂向剖面数据包。
 
-    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
+    与 get_vertical_glorys 同构，但以显式中心点 (center_lon, center_lat) 而非涡旋编号定位剖面；k/b 为
+    None 时默认取纬向剖面线（k=0、b=center_lat）。返回结构与 get_vertical_glorys 一致。
+
+    参数:
+        - center_lon (float): 剖面中心经度。
+        - center_lat (float): 剖面中心纬度。
+        - needed_date (str | pd.Timestamp): 目标日期（'YYYY-MM-DD' 或时间戳）。
+        - k (float | list[float] | None): 直线方程 y=kx+b 的斜率或斜率列表；None 时取 0。
+        - b (float | list[float] | None): 截距或截距列表；None 时取 center_lat。
+        - variables (list): 需要提取的 GLORYS 物理变量列表，默认 ['vorticity']。
+        - x_min_km (float | None): 横坐标采样下界（km，中心为 0）；与 x_max_km 都为 None 时用全范围。
+        - x_max_km (float | None): 横坐标采样上界（km），与 x_min_km 配套。
+        - profile_spacing_km (float | None): 剖面采样步长（km）；None 时用配置默认值。
+        - interpolate_z (bool): 是否将 z 轴重采样为等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): z 轴重采样步长（m）；None 时用配置默认值。
+        - window_half_size_km (float | None): GLORYS 子区域读取窗口半宽（km）；None 时按采样范围自动确定。
+        - profile_id (int | None): 可选剖面标识，写入结果 metadata。
+        - ds_name (str): 数据源名称标签，默认 'ARGO'。
+
+    返回:
+        - list[dict]: 剖面结果字典列表，结构同 get_vertical_glorys（含 profile_data/y_coords/z_coords/lon_coords/lat_coords/projections/metadata）。
     """
     if k is None or b is None:
         k_list, b_list = [0.0], [float(center_lat)]
@@ -6098,38 +6132,36 @@ def plot_argo_horizontal_glorys(
 ):
     """以单个 Argo 剖面为中心绘制 GLORYS 水平快照图。
 
-    该函数会先根据 ``profile_number`` 与 ``profile_time`` 定位目标剖面中心，
-    再在给定窗口内读取同日 GLORYS 场并叠加同口径筛选后的 Argo 异常点。
+    先根据 profile_number 与 profile_time 定位目标剖面中心，再在给定窗口内读取同日 GLORYS 场并叠加同
+    口径筛选后的 Argo 异常点。
 
     参数:
-        profile_number (int): 目标 Argo 剖面编号。
-        profile_time (int | str | pd.Timestamp): 时间输入，支持：
-            - 年份（如 ``2014`` 或 ``"2014"``）；
-            - 具体日期/时间戳（如 ``"2014-05-09"``）。
-            若仅给年份且该剖面在该年对应多个日期，会提示需要传具体日期。
-        platform_number (int | None): 可选平台号过滤；None 表示自动选择该剖面对应平台。
-        variable (str): 背景变量名；常用 ``'vorticity'``、``'thetao'``、``'so'``、``'u'``、``'v'``、``'ssh'``。
-        show_fig (bool): 是否显示图像。
-        save_fig (bool): 是否保存图像到输出目录。
-        k, b (float | list[float] | None): 可选剖面线参数，按 ``y = kx + b`` 叠加到水平图。
-            传列表时需等长，会逐条绘制。
-        needed_depth (float | int): GLORYS 读取深度（m）；默认 0 表层。
-        inline_mode (bool): 是否使用内联静态模式。
-            - True: 适合脚本批量出图；函数结束会关闭 figure 释放内存。
-            - False: 保留图窗句柄，便于后续交互或外部继续操作。
-        xmin, xmax (float): 局地窗口横向范围（km，中心为 0），用于确定经纬子区域读取范围。
-        argo_detection_config: 叠加点异常筛选配置。
-        argo_min_depth (float | None): 叠加点最小深度阈值（m）；None 回退配置项。
-        argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
-        output_dir (str | Path | None): 保存目录覆盖；None 使用默认输出目录。
-        verbose (bool): 是否打印保存路径与提示信息。
+        - profile_number (int): 目标 Argo 剖面编号。
+        - profile_time (int | str | pd.Timestamp): 时间输入，支持年份（如 2014 或 "2014"）或具体日期/时间戳（如 "2014-05-09"）；仅给年份且该剖面在该年对应多个日期时会提示需传具体日期。
+        - platform_number (int | None): 可选平台号过滤；None 时自动选择该剖面对应平台。
+        - variable (str): 背景变量名，常用 'vorticity'/'thetao'/'so'/'u'/'v'/'ssh'，默认 'vorticity'。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像到输出目录，默认 False。
+        - k (float | list[float] | None): 剖面线斜率，按 y = kx + b 叠加；传列表需等长，逐条绘制。
+        - b (float | list[float] | None): 剖面线截距，与 k 配套。
+        - needed_depth (float | int): GLORYS 读取深度（m），默认 0（表层）。
+        - inline_mode (bool): 是否使用内联静态模式，默认 True；详见“说明”。
+        - xmin (float): 局地窗口横向下界（km，中心为 0），用于确定经纬子区域读取范围，默认 -400.0。
+        - xmax (float): 局地窗口横向上界（km），默认 400.0。
+        - argo_detection_config (DetectionConfig | None): 叠加点异常筛选配置；None 时使用默认。
+        - argo_min_depth (float | None): 叠加点最小深度阈值（m）；None 时回退配置项。
+        - argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 时使用配置默认目录。
+        - output_dir (str | Path | None): 保存目录覆盖；None 时使用默认输出目录。
+        - verbose (bool): 是否打印保存路径与提示信息，默认 True。
 
     返回:
-        tuple: ``(fig, ax)``，便于调用侧进一步自定义或复用。
+        - tuple: (fig, ax)，便于调用侧进一步自定义或复用。
 
-    显示模式:
-        - inline_mode=True（默认）: 静态出图模式，资源占用更可控。
-        - inline_mode=False: 交互模式，适合 Notebook 实时查看与二次操作。
+    说明:
+        显示模式:
+
+            - inline_mode=True（默认）：静态出图模式，资源占用更可控，函数结束会关闭 figure 释放内存，适合脚本批量出图。
+            - inline_mode=False：交互模式，保留图窗句柄，适合 Notebook 实时查看与二次操作。
     """
     argo_detection_config = _resolve_detection_config(
         argo_detection_config,
@@ -6329,20 +6361,21 @@ def get_track_area_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, va
     '''
     获取指定涡旋在特定时间点周围的 GLORYS 数据。
 
-    该函数会根据涡旋轮廓确定一个矩形区域，并从相应的 GLORYS 文件中
-    提取此区域内的一个或多个物理变量。
+    根据涡旋轮廓确定一个矩形区域，并从相应 GLORYS 文件中提取该区域内的一个或多个物理变量。
 
     参数:
-        DS (list): 包含涡旋轨迹信息的数据集。
-        no (int): 涡旋的唯一编号。
-        needed_date (str | pd.Timestamp): 需要提取数据的日期（'YYYY-MM-DD' 或时间戳）。
-        variables (list): 需要提取的变量列表，默认为 ['thetao']，可选'salinity', 'u', 'v', 'ssh', 'mlt'。
-        depth (float | int | None): 如果指定，提取该深度的 GLORYS 数据；如果为 None，则提取2000米以内的所有深度数据。
-        lon_min_local, lon_max_local (float | None): 可选的局地经度窗口（以轨迹中心经度为参考的连续经度坐标）。
-        lat_min, lat_max (float | None): 可选的纬度窗口；与轮廓窗口取并集。
+        - DS (list): 包含涡旋轨迹信息的数据集。
+        - no (int): 涡旋唯一编号。
+        - needed_date (str | pd.Timestamp): 需要提取数据的日期（'YYYY-MM-DD' 或时间戳）。
+        - variables (list): 需要提取的变量列表，默认 ['thetao']，可选 'salinity'/'u'/'v'/'ssh'/'mlt'。
+        - depth (float | int | None): 指定时提取该深度的 GLORYS 数据；None 时提取 2000 米以内的所有深度。
+        - lon_min_local (float | None): 可选局地经度下界（以轨迹中心经度为参考的连续经度坐标）。
+        - lon_max_local (float | None): 可选局地经度上界。
+        - lat_min (float | None): 可选纬度下界（与轮廓窗口取并集）。
+        - lat_max (float | None): 可选纬度上界。
 
     返回:
-        一个元组，包含筛选后的经度、纬度、深度数组，以及一个存储了所有请求变量数据的字典。
+        - tuple: (经度数组, 纬度数组, 深度数组, 变量数据字典)，字典存储所有请求变量的数据。
     '''
     wanted_track = find_track(DS, no)
     # 展平轮廓数组并过滤无效值，兼容 DataFrame/ndarray/object 列
@@ -6468,23 +6501,20 @@ def get_track_area_glorys(DS: list, no: int, needed_date: str | pd.Timestamp, va
 
 def calculate_vorticity(lon, lat, u, v):
     '''
-    计算给定速度场的相对涡度 (zeta) 和科里奥利参数 (f)。
-    该函数可智能处理2D/3D以及Masked Array输入。
+    计算给定速度场的相对涡度（zeta）和科里奥利参数（f）。
 
-    输入的速度场 u, v 的维度应为 (latitude, longitude) 或
-    (depth, latitude, longitude)。如果输入为Masked Array，则输出也会是
-    Masked Array，其中在mask边缘计算不准确的点会被自动mask掉。
+    可智能处理 2D/3D 以及 Masked Array 输入：u、v 维度应为 (latitude, longitude) 或
+    (depth, latitude, longitude)；输入为 Masked Array 时输出也是 Masked Array，mask 边缘计算不准确的点
+    会被自动 mask 掉。
 
     参数:
-        lon (np.ndarray): 一维经度数组 (单位: 度)。
-        lat (np.ndarray): 一维纬度数组 (单位: 度)。
-        u (np.ndarray | np.ma.MaskedArray): Zonal 速度数组。
-        v (np.ndarray | np.ma.MaskedArray): Meridional 速度数组。
+        - lon (np.ndarray): 一维经度数组（度）。
+        - lat (np.ndarray): 一维纬度数组（度）。
+        - u (np.ndarray | np.ma.MaskedArray): Zonal（纬向）速度数组。
+        - v (np.ndarray | np.ma.MaskedArray): Meridional（经向）速度数组。
 
     返回:
-        tuple: 包含两个元素的元组 (zeta, f)。
-               zeta (np.ndarray | np.ma.MaskedArray): 计算得到的相对涡度数组。
-               f (np.ndarray | np.ma.MaskedArray): 计算得到的科里奥利参数数组。
+        - tuple: (zeta, f) —— zeta 为相对涡度数组，f 为科里奥利参数数组（类型随输入，可为 MaskedArray）。
     '''
     # --- 1. 输入校验和维度处理 ---
     if u.shape[-2:] != (len(lat), len(lon)) or u.shape != v.shape:
@@ -6579,19 +6609,17 @@ def get_idx(DS: list, no: int, start_date: str, end_date: str = None) -> int | l
     '''
     获取指定涡旋编号在给定时间或时间范围内的索引。
 
-    - 如果只提供 start_date，则返回该日期对应的单个索引。
-    - 如果同时提供 start_date 和 end_date，则返回该时间范围内的索引列表。
+    只提供 start_date 时返回该日期对应的单个索引；同时提供 start_date 与 end_date 时返回该时间范围内的
+    索引列表。
 
     参数:
-        DS (list): 涡旋轨迹数据集。
-        no (int): 涡旋编号。
-        start_date (str): 起始日期，格式为 'YYYY-MM-DD'。
-        end_date (str, optional): 结束日期，格式为 'YYYY-MM-DD'。默认为 None。
+        - DS (list): 涡旋轨迹数据集。
+        - no (int): 涡旋编号。
+        - start_date (str): 起始日期，格式 'YYYY-MM-DD'。
+        - end_date (str | None): 结束日期，格式 'YYYY-MM-DD'，默认 None。
 
     返回:
-        int | list | None: 
-        - 如果 end_date 为 None，返回单个整数索引或 None (如果未找到)。
-        - 如果提供了 end_date，返回一个整数索引的列表。
+        - int | list | None: end_date 为 None 时返回单个整数索引或 None（未找到）；提供 end_date 时返回整数索引列表。
     '''
     wanted_track = find_track(DS, no)
     if wanted_track is None or len(wanted_track) == 0:
@@ -6636,66 +6664,32 @@ def get_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestamp,
     '''
     计算并返回指定涡旋在特定时刻沿一条或多条 y=kx+b 剖面的物理量数据。
 
-        该函数封装了从GLORYS数据场中提取剖面数据的核心插值计算，并以字典列表的形式返回结果。
-        它能正确处理三维变量（如温度，返回二维垂直剖面）和二维变量（如混合层深度，返回一维水平剖面）。
-        其中派生变量 `density` / `sigma` / `sigma0` 统一表示势密度异常 σ0 (kg/m³)。
-    无论输入变量使用何种别名，输出字典中的键都将是标准化的变量名。
+    封装从 GLORYS 数据场提取剖面数据的核心插值计算，以字典列表返回；能正确处理三维变量（如温度，返回
+    二维垂直剖面）和二维变量（如混合层深度，返回一维水平剖面）。派生变量 density/sigma/sigma0 统一表示
+    势密度异常 σ0（kg/m³）；无论输入变量用何种别名，输出字典的键都是标准化变量名。
 
     参数:
-        DS (list): 包含涡旋轨迹信息的数据集。
-        no (int): 涡旋的唯一编号。
-        needed_date (str | pd.Timestamp): 涡旋轨迹日期（'YYYY-MM-DD' 或时间戳）。
-        k (float | list[float]): 直线方程 y=kx+b 的斜率或斜率列表。
-        b (float | list[float]): 直线方程 y=kx+b 的截距或截距列表。
-        variables (list): 需要提取的GLORYS物理变量列表。默认为 ['vorticity']。
-        x_min_km, x_max_km (float | None): 可选横坐标采样范围（km，中心投影为 0）。
-            - 两者都为 None：使用剖面线在局地窗口内的全范围；
-            - 两者都给定：先按该范围裁剪剖面采样点，再执行插值。
-        profile_spacing_km (float | None): 剖面采样步长（km）。
-            - None：使用 processing.yml 中 processing.vertical_profile_spacing_km；
-            - 给定正数：覆盖默认值。
-        interpolate_z (bool): 是否将 z 轴重采样为等间距网格。默认 True。
-        profile_depth_spacing_m (float | None): z 轴重采样步长（m）。
-                - 当 interpolate_z=True 且为 None：使用 processing.yml 中
-                    processing.vertical_profile_depth_spacing_m；
-                - 给定正数：覆盖默认值。
+        - DS (list): 包含涡旋轨迹信息的数据集。
+        - no (int): 涡旋唯一编号。
+        - needed_date (str | pd.Timestamp): 涡旋轨迹日期（'YYYY-MM-DD' 或时间戳）。
+        - k (float | list[float]): 直线方程 y=kx+b 的斜率或斜率列表。
+        - b (float | list[float]): 直线方程 y=kx+b 的截距或截距列表。
+        - variables (list): 需要提取的 GLORYS 物理变量列表，默认 ['vorticity']。
+        - x_min_km (float | None): 横坐标采样下界（km，中心投影为 0）；与 x_max_km 都为 None 时用剖面线在局地窗口内的全范围，都给定时先裁剪采样点再插值。
+        - x_max_km (float | None): 横坐标采样上界（km），与 x_min_km 配套。
+        - profile_spacing_km (float | None): 剖面采样步长（km）；None 时用 processing.yml 的 vertical_profile_spacing_km，给定正数则覆盖。
+        - interpolate_z (bool): 是否将 z 轴重采样为等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): z 轴重采样步长（m）；interpolate_z=True 且为 None 时用 processing.yml 的 vertical_profile_depth_spacing_m，给定正数则覆盖。
 
     返回:
-        list[dict]: 一个包含一个或多个剖面结果字典的列表。列表中每个字典的结构如下：
-        
-          - **'profile_data' (dict)**:
-            - *键*: 标准化的物理量名称 (字符串, 如 'salinity', 'mlt')。
-            - *值*:
-                - 对于三维变量 (如'vorticity', 'thetao'), 值为一个二维 `numpy.ma.MaskedArray` 数组，代表其垂直剖面，维度为 `(深度层数, 剖面水平点数)`。
-                - 对于二维变量 (如'mlt', 'ssh'), 值为一个一维 `numpy.ndarray` 数组，代表其沿剖面线的水平分布，长度为 `剖面水平点数`。
+        - list[dict]: 一个或多个剖面结果字典的列表，每个字典含以下键：
 
-          - **'y_coords' (np.ndarray)**:
-            - 一个一维NumPy数组，表示剖面的横坐标轴（物理距离）。
-            - 数值单位为公里 (km)，`0` 点对应涡旋中心在剖面线上的投影位置。
-
-          - **'z_coords' (np.ndarray)**:
-            - 一个一维NumPy数组，表示剖面的纵坐标轴（物理深度）。
-            - 数值单位为米 (m)。
-            - 当 interpolate_z=True 时为等间距深度坐标；否则为 GLORYS 原始深度层。
-          
-          - **'lon_coords' (np.ndarray)**:
-            - 一个一维NumPy数组，包含了剖面线上每个点（对应`y_coords`）的经度。
-          
-          - **'lat_coords' (np.ndarray)**:
-            - 一个一维NumPy数组，包含了剖面线上每个点（对应`y_coords`）的纬度。
-
-          - **'projections' (dict)**:
-            - 一个字典，包含了涡旋边界在横坐标 (`y_coords`) 上的投影位置。
-            - *键*: 边界类型 (字符串)， `'radius'` 代表有效半径，`'contour'` 代表有效轮廓。
-            - *值*: 一个包含交点位置(km)的列表。
-
-          - **'metadata' (dict)**:
-            - 一个包含涡旋元数据的字典。
-            - *键*:
-                - 'eddy_no'` (int): 涡旋的唯一编号。
-                - 'date_str'` (str): 该剖面对应日期的字符串，格式为 'YYYY-MM-DD'。
-                - 'k'` (float): 该剖面所用直线方程的斜率。
-                - 'b'` (float): 该剖面所用直线方程的截距。
+            - 'profile_data' (dict)：键为标准化物理量名（如 'salinity'、'mlt'）；三维变量（如 'vorticity'、'thetao'）的值为二维 MaskedArray（深度层数 × 剖面水平点数）的垂直剖面，二维变量（如 'mlt'、'ssh'）的值为一维 ndarray（长度=剖面水平点数）的水平分布。
+            - 'y_coords' (np.ndarray)：剖面横坐标轴（物理距离，km），0 点对应涡旋中心在剖面线上的投影。
+            - 'z_coords' (np.ndarray)：剖面纵坐标轴（深度，m）；interpolate_z=True 时为等间距，否则为 GLORYS 原始深度层。
+            - 'lon_coords' / 'lat_coords' (np.ndarray)：剖面线上每个点（对应 y_coords）的经度/纬度。
+            - 'projections' (dict)：涡旋边界在 y_coords 上的投影；键 'radius'（有效半径）/'contour'（有效轮廓），值为交点位置（km）列表。
+            - 'metadata' (dict)：涡旋元数据，含 'eddy_no'(int)、'date_str'(str, 'YYYY-MM-DD')、'k'(float)、'b'(float)。
     '''
     # --- 0. 准备工作：统一输入格式并获取公共数据 ---
     if k is None and b is None:
@@ -7761,33 +7755,37 @@ def plot_track_vertical_glorys(DS: list, no: int, needed_date: str | pd.Timestam
                                profile_depth_spacing_m: float | None = None):
     """绘制指定涡旋在指定日期的 GLORYS 垂向剖面图（实际业务入口）。
 
-    该函数是基于轨迹数据（META/legacy）的垂向可视化入口，内部复用共享绘图核心。
-    与 Argo 入口相比，本函数会保留 eddy 语义的参考信息（中心/半径/轮廓投影线）。
+    基于轨迹数据（META/legacy）的垂向可视化入口，内部复用共享绘图核心；与 Argo 入口相比会保留 eddy
+    语义的参考信息（中心/半径/轮廓投影线）。
 
     参数:
-        DS (list | str | tuple | dict): 轨迹数据输入。
-            常见可用值：``'acs'``/``'acl'``/``'cs'``/``'cl'``，或 legacy 列表结构。
-        no (int): 轨迹编号（track id）。
-        needed_date (str | pd.Timestamp): 目标日期。
-        k, b (float | list[float]): 剖面线参数 ``y = kx + b``；可传多条线。
-        variable (str): 主绘变量。
-        show_fig, save_fig (bool): 显示/保存控制。
-        xmin, xmax (float): 横向显示与采样范围（km）。
-        ymin, ymax (float): 纵向深度显示范围（m）。
-        color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
-        plot_mlt (bool): 是否叠加混合层深度线。
-        plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层。
-        argo_projection_config: 投影点异常筛选配置。
-        argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
-        plot_isolines (bool): 是否叠加变量等值线。
-        isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
-            等值线级别与样式参数。
-        profile_spacing_km (float | None): 水平采样步长（km）。
-        interpolate_z (bool): 是否将深度轴重采样到等间距网格。
-        profile_depth_spacing_m (float | None): 深度重采样步长（m）。
-
-    返回:
-        None。函数内部完成绘图与可选保存。
+        - DS (list | str | tuple | dict): 轨迹数据输入，常见 'acs'/'acl'/'cs'/'cl' 或 legacy 列表结构。
+        - no (int): 轨迹编号（track id）。
+        - needed_date (str | pd.Timestamp): 目标日期。
+        - k (float | list[float] | None): 剖面线斜率，y = kx + b；可传多条线。
+        - b (float | list[float] | None): 剖面线截距，与 k 配套。
+        - variable (str): 主绘变量，默认 'vorticity'。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - xmin (float): 横向显示与采样下界（km），默认 -400.0。
+        - xmax (float): 横向显示与采样上界（km），默认 400.0。
+        - ymin (float): 纵向深度显示上界（m），默认 0.0。
+        - ymax (float): 纵向深度显示下界（m），默认 1000.0。
+        - color_vmin (float | None): 主色斑图色标下限覆盖；None 时自动。
+        - color_vmax (float | None): 主色斑图色标上限覆盖；None 时自动。
+        - plot_mlt (bool): 是否叠加混合层深度线，默认 False。
+        - plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层，默认 True。
+        - argo_projection_config (DetectionConfig | None): 投影点异常筛选配置；None 时使用默认。
+        - argo_projection_min_depth (float | None): 投影点最小深度阈值（m）；None 时回退配置。
+        - plot_isolines (bool): 是否叠加变量等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 False。
+        - profile_spacing_km (float | None): 水平采样步长（km）；None 时用配置默认。
+        - interpolate_z (bool): 是否将深度轴重采样到等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): 深度重采样步长（m）；None 时用配置默认。
     """
     return _plot_vertical_glorys_core(
         DS,
@@ -7853,36 +7851,37 @@ def plot_argo_vertical_glorys(
 ):
     """以单个 Argo 剖面为中心绘制 GLORYS 垂向剖面图。
 
-    基于 Argo 剖面中心和剖面线 ``y = kx + b`` 计算垂向切片。
-    图中默认不绘制 eddy 语义参考竖线（中心/半径/轮廓）。
+    基于 Argo 剖面中心和剖面线 y = kx + b 计算垂向切片；图中默认不绘制 eddy 语义参考竖线（中心/半径/轮廓）。
 
     参数:
-        profile_number (int): 目标 Argo 剖面编号。
-        profile_time (int | str | pd.Timestamp): 时间输入，支持年份或具体日期时间。
-            - 给年份时：在该年内定位该剖面；若对应多个日期会要求给具体日期；
-            - 给日期时：直接定位到该日对应的剖面数据。
-        k, b (float | list[float]): 剖面线参数，满足 ``y = kx + b``。
-            可传标量或等长列表（多条剖面线分别出图）。
-        platform_number (int | None): 可选平台号过滤。
-        variable (str): 主绘变量，常用 ``'vorticity'``、``'thetao'``、``'so'``、``'u'``、``'v'``、``'density'``。
-        show_fig, save_fig (bool): 显示/保存控制。
-        xmin, xmax (float): 横向显示与采样范围（km）。
-        ymin, ymax (float): 纵向深度显示范围（m）。
-        color_vmin, color_vmax (float | None): 主色斑图色标范围覆盖。
-        plot_mlt (bool): 是否叠加混合层深度线。
-        plot_argo_projection (bool): 是否叠加同日 Argo 点投影层。
-        argo_projection_config: 投影点异常筛选配置。
-        argo_projection_min_depth (float | None): 投影点最小深度阈值（m）。
-        plot_isolines (bool): 是否叠加变量等值线。
-        isoline_levels, isoline_color, isoline_linewidth, isoline_alpha, label_isolines:
-            等值线级别与样式参数。
-        profile_spacing_km (float | None): 水平采样步长（km）。
-        interpolate_z (bool): 是否将深度轴重采样到等间距网格。
-        profile_depth_spacing_m (float | None): 深度重采样步长（m）。
-        argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 使用配置默认目录。
-
-    返回:
-        None。函数内部完成绘图与可选保存。
+        - profile_number (int): 目标 Argo 剖面编号。
+        - profile_time (int | str | pd.Timestamp): 时间输入，支持年份（在该年内定位该剖面，对应多个日期时要求给具体日期）或具体日期/时间戳（直接定位当日剖面）。
+        - k (float | list[float] | None): 剖面线斜率，满足 y = kx + b；可传标量或等长列表（多条剖面线分别出图）。
+        - b (float | list[float] | None): 剖面线截距，与 k 配套。
+        - platform_number (int | None): 可选平台号过滤。
+        - variable (str): 主绘变量，常用 'vorticity'/'thetao'/'so'/'u'/'v'/'density'，默认 'vorticity'。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - xmin (float): 横向显示与采样下界（km），默认 -400.0。
+        - xmax (float): 横向显示与采样上界（km），默认 400.0。
+        - ymin (float): 纵向深度显示上界（m），默认 0.0。
+        - ymax (float): 纵向深度显示下界（m），默认 1000.0。
+        - color_vmin (float | None): 主色斑图色标下限覆盖；None 时自动。
+        - color_vmax (float | None): 主色斑图色标上限覆盖；None 时自动。
+        - plot_mlt (bool): 是否叠加混合层深度线，默认 False。
+        - plot_argo_projection (bool): 是否叠加同日 Argo 点投影层，默认 True。
+        - argo_projection_config (DetectionConfig | None): 投影点异常筛选配置；None 时使用默认。
+        - argo_projection_min_depth (float | None): 投影点最小深度阈值（m）；None 时回退配置。
+        - plot_isolines (bool): 是否叠加变量等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 False。
+        - profile_spacing_km (float | None): 水平采样步长（km）；None 时用配置默认。
+        - interpolate_z (bool): 是否将深度轴重采样到等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): 深度重采样步长（m）；None 时用配置默认。
+        - argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 时使用配置默认目录。
     """
     info = _resolve_argo_profile_center(
         profile_number=int(profile_number),
@@ -8311,45 +8310,48 @@ def calculate_glorys_vertical_profile_diagnostics(
     heave_local_x_window_km: float = _heave_local_x_window_km,
     heave_z_search_m: float | None = _heave_z_search_m,
 ) -> dict:
-    """计算等密面出露指数 OI (Outcrop Index) 与垂向位移 Heave。
+    """计算等密面出露指数 OI（Outcrop Index）与垂向位移 Heave。
 
-    OI 是一个二值诊断量，判定 Argo 异常深度处的等密面（σ_argo）在水平窗口内
-    是否「出露」（outcrop）到近表层。它由 Heave + Ventilation 双准则联合判定:
-
-    1. **Heave（等密面垂向位移）**: 在 Argo 附近 ±local_x_window_km 范围内，
-       找到 σ ≈ σ_argo 的等密线的最深点（凹底），与全窗口（±x_window_km）
-       内该等密线的最浅点之间的垂直距离。Heave ≥ heave_threshold 说明
-       等密面发生了显著的中尺度起伏。
-
-    2. **Ventilation（通风深度）**: Heave 峰值 σ 面（σ_peak）在 ±x_window_km
-       范围内的最浅深度 z_min。z_min < heave_depth_threshold 说明该等密面
-       在窗口内接近海表，存在通风/潜沉的物理通道。
-
-    联合判定:
-        - OI=True  → Heave ≥ threshold AND z_min < depth_threshold
-                     深层高 DO 可通过等密面通风追溯至表层 → Type 1
-        - OI=False → 任一条件不满足，等密线全程停留在深层
-                     高 DO 来源不能用局地通风解释 → Type 2
+    OI 是一个二值诊断量，判定 Argo 异常深度处的等密面（σ_argo）在水平窗口内是否「出露」（outcrop）到
+    近表层，由 Heave（等密面垂向位移）与 Ventilation（通风深度）双准则联合判定，用于区分深层高 DO 能否
+    经局地通风追溯至表层（Type 1）还是只能停留深层（Type 2）。
 
     参数:
-        projection_x_km: Argo 在剖面线上的投影 x 坐标 (km)，默认 0。
-        projection_depth_m: Argo 异常深度 (m)；为 None 时用深度范围中点。
-        x_window_km / z_window_m: 局地窗口半宽（用于 valid_fraction）。
-        depth_range_m: 限制搜索的深度范围 (m)，默认 0–1000 m。
-        heave_search_range: 从 σ_argo 向上搜索的 σ 跨度 (kg/m³)，默认来自 processing.yml。
-        heave_depth_threshold: 通风判定深度 (m)，z_min 浅于此值视为「接近海表」，默认来自 processing.yml。
-        heave_threshold: Heave 判定阈值 (m)，等密面起伏 ≥ 此值视为显著位移，默认来自 processing.yml。
-        heave_x_window_km: 搜索通风/出露的水平窗口半宽 (km)，默认来自 processing.yml。
-        heave_local_x_window_km: 计算 Heave 时局部最深的搜索半宽 (km)，默认来自 processing.yml。
-        heave_z_search_m: 等密线连通性垂向范围 (m)，仅搜索在 Argo 点 ± 该距离内存在过的 σ 面，默认来自 processing.yml。
+        - data_package (dict): 含 GLORYS 垂向切片的数据包（get_vertical_glorys 输出）。
+        - projection_x_km (float): Argo 在剖面线上的投影 x 坐标（km），默认 0.0。
+        - projection_depth_m (float | None): Argo 异常深度（m）；None 时用深度范围中点。
+        - x_window_km (float): 局地水平窗口半宽（km，用于 valid_fraction），默认 25.0。
+        - z_window_m (float | None): 局地垂向窗口半宽（m，用于 valid_fraction），默认 100.0。
+        - depth_range_m (tuple[float, float] | None): 限制搜索的深度范围（m），默认 (0.0, 1000.0)。
+        - heave_search_range (float): 从 σ_argo 向上搜索的 σ 跨度（kg/m³），默认来自 processing.yml。
+        - heave_depth_threshold (float): 通风判定深度（m），z_min 浅于此值视为「接近海表」，默认来自 processing.yml。
+        - heave_threshold (float): Heave 判定阈值（m），等密面起伏 ≥ 此值视为显著位移，默认来自 processing.yml。
+        - heave_x_window_km (float): 搜索通风/出露的水平窗口半宽（km），默认来自 processing.yml。
+        - heave_local_x_window_km (float): 计算 Heave 时局部最深的搜索半宽（km），默认来自 processing.yml。
+        - heave_z_search_m (float | None): 等密线连通性垂向范围（m），仅搜索 Argo 点 ± 该距离内存在过的 σ 面，默认来自 processing.yml。
 
     返回:
-        dict: 诊断指标字典，包含以下键:
-            - ``glorys_heave_m`` (float): Heave 幅度 (m)，等密线在局地凹底到窗口最浅点的垂直距离
-            - ``glorys_heave_zmin`` (float): heave 峰值 σ 面在窗口内的最浅深度 (m)，与 σ_peak 同源
-            - ``glorys_heave_sigma_argo`` (float): Argo 异常点的 σ (kg/m³)
-            - ``glorys_heave_sigma_peak`` (float): Heave 峰值所在 σ 面 (kg/m³)
-            - ``heave_valid_fraction`` (float): 局地窗口内 σ 有效数据占比
+        - dict: 诊断指标字典，含以下键：
+
+            - glorys_heave_m (float)：Heave 幅度（m），等密线在局地凹底到窗口最浅点的垂直距离。
+            - glorys_heave_zmin (float)：heave 峰值 σ 面在窗口内的最浅深度（m），与 σ_peak 同源。
+            - glorys_heave_sigma_argo (float)：Argo 异常点的 σ（kg/m³）。
+            - glorys_heave_sigma_peak (float)：Heave 峰值所在 σ 面（kg/m³）。
+            - heave_valid_fraction (float)：局地窗口内 σ 有效数据占比。
+
+    说明:
+        Heave（等密面垂向位移）:
+
+            - 在 Argo 附近 ±local_x_window_km 内找到 σ ≈ σ_argo 等密线的最深点（凹底），与全窗口（±x_window_km）内该等密线最浅点之间的垂直距离；Heave ≥ heave_threshold 说明等密面发生显著中尺度起伏。
+
+        Ventilation（通风深度）:
+
+            - Heave 峰值 σ 面（σ_peak）在 ±x_window_km 内的最浅深度 z_min；z_min < heave_depth_threshold 说明该等密面在窗口内接近海表，存在通风/潜沉的物理通道。
+
+        联合判定:
+
+            - OI=True（Type 1）：Heave ≥ threshold 且 z_min < depth_threshold，深层高 DO 可经等密面通风追溯至表层。
+            - OI=False（Type 2）：任一条件不满足，等密线全程停留深层，高 DO 来源不能用局地通风解释。
     """
     try:
         x0 = float(projection_x_km)
@@ -8946,21 +8948,21 @@ def compute_spiciness_anomaly(
 ) -> tuple[np.ndarray, np.ndarray]:
     """计算前景 T-S 点相对背景分布的带符号 spiciness 异常。
 
-    用高斯核在 σ₀ 空间加权所有背景点，返回 π 的加权中位数偏差 δπ
-    和加权百分位。P < 10 为显著冷鲜（T-S 图偏左下），P > 90 为显著暖咸
-    （T-S 图偏右）。百分位不受 σ₀ 范围宽窄影响，中纬高纬通用。
+    用高斯核在 σ₀ 空间加权所有背景点，返回 π 的加权中位数偏差 δπ 和加权百分位；P < 10 为显著冷鲜（T-S
+    图偏左下），P > 90 为显著暖咸（T-S 图偏右）。百分位不受 σ₀ 范围宽窄影响，中纬高纬通用。
 
-    参数：
-        bg_theta / bg_sal: 背景温盐一维数组。
-        fg_theta / fg_sal: 前景温盐一维数组。
-        center_lat / center_lon: 参考位置（仅影响 SA 计算，对本函数影响极小）。
-        sigma_bandwidth: σ₀ 高斯核带宽 (kg/m³)，越大越平滑。
-        min_effective_weight: 有效权重下限，不足则返回 NaN。
+    参数:
+        - bg_theta (np.ndarray): 背景位温一维数组。
+        - bg_sal (np.ndarray): 背景盐度一维数组。
+        - fg_theta (np.ndarray): 前景位温一维数组。
+        - fg_sal (np.ndarray): 前景盐度一维数组。
+        - center_lat (float): 参考纬度（仅影响 SA 计算，对本函数影响极小），默认 30.0。
+        - center_lon (float): 参考经度（同上），默认 0.0。
+        - sigma_bandwidth (float): σ₀ 高斯核带宽（kg/m³），越大越平滑，默认 0.25。
+        - min_effective_weight (float): 有效权重下限，不足则返回 NaN，默认 50.0。
 
-    返回：
-        (delta_pi, percentile): 等长一维数组；无法计算的位置为 NaN。
-        delta_pi 为带符号 spiciness 偏差，percentile 为 σ₀ 加权背景
-        π 分布中的百分位 (0–100)。
+    返回:
+        - tuple: (delta_pi, percentile)，等长一维数组（无法计算处为 NaN）；delta_pi 为带符号 spiciness 偏差，percentile 为 σ₀ 加权背景 π 分布中的百分位（0–100）。
     """
     bg_theta = np.asarray(bg_theta, dtype=float)
     bg_sal = np.asarray(bg_sal, dtype=float)
@@ -9235,28 +9237,31 @@ def plot_argo_ts_diagram(
 ) -> None:
     """绘制单个 Argo 剖面的温盐图（GLORYS 垂向切片 + Argo 叠加）。
 
-    给定剖面编号和观测日期，自动加载 Argo 剖面数据与沿 GLORYS
-    垂向切片的 θ/S 背景场，叠加 σ₀ 等密度线。适合快速查看
-    某个特定剖面的水团属性与异常深度位置。
+    给定剖面编号和观测日期，自动加载 Argo 剖面数据与沿 GLORYS 垂向切片的 θ/S 背景场，叠加 σ₀ 等密度线，
+    适合快速查看某个特定剖面的水团属性与异常深度位置。
 
     参数:
-        profile_number (int): Argo 剖面编号。
-        profile_time: 剖面日期（int YYYYMMDD / 'YYYY-MM-DD' / Timestamp）。
-        k / b: GLORYS 垂向剖面线参数 y = kx + b（支持 list，每条线出一张图；
-            None 时默认纬向线 k=0, b=center_lat）。
-        platform_number: 浮标平台编号，辅助定位（可选）。
-        detection_config: 异常检测配置，传入后在异常峰值深度叠加 ★ 标记。
-        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
-        xmin / xmax: 垂向剖面窗口半宽 (km)，默认 ±400 km。
-        profile_spacing_km: 剖面内采样间距 (km)，None 回退默认值。
-        interpolate_z: 是否对 GLORYS 垂向插值。
-        profile_depth_spacing_m: 垂向插值间距 (m)。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        sigma_contour_levels: σ₀ 等密度线层级，None 时按数据范围自动推断。
-        contour_color / contour_linewidth / contour_alpha: 等密度线样式。
-        label_contours: 是否在等密度线上标注 σ₀ 值。
-        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
+        - profile_number (int): Argo 剖面编号。
+        - profile_time (int | str | pd.Timestamp): 剖面日期（int YYYYMMDD / 'YYYY-MM-DD' / Timestamp）。
+        - k (float | list[float] | None): GLORYS 垂向剖面线斜率，y = kx + b（支持 list，每条线出一张图；None 时默认纬向线 k=0、b=center_lat）。
+        - b (float | list[float] | None): 剖面线截距，与 k 配套。
+        - platform_number (int | None): 浮标平台编号，辅助定位（可选）。
+        - detection_config (DetectionConfig | None): 异常检测配置，传入后在异常峰值深度叠加 ★ 标记。
+        - color_by (str): Argo 点着色方式 'depth'/'do'/'month'/'none'，默认 'depth'。
+        - xmin (float): 垂向剖面窗口下界（km），默认 -400.0。
+        - xmax (float): 垂向剖面窗口上界（km），默认 400.0。
+        - profile_spacing_km (float | None): 剖面内采样间距（km），None 时回退默认。
+        - interpolate_z (bool): 是否对 GLORYS 垂向插值，默认 True。
+        - profile_depth_spacing_m (float | None): 垂向插值间距（m）。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - sigma_contour_levels (list[float] | None): σ₀ 等密度线层级，None 时按数据范围自动推断。
+        - contour_color (str): 等密度线颜色，默认 'black'。
+        - contour_linewidth (float): 等密度线线宽，默认 0.6。
+        - contour_alpha (float): 等密度线透明度，默认 0.45。
+        - label_contours (bool): 是否在等密度线上标注 σ₀ 值，默认 True。
+        - annotate_spice (bool): 是否在标题标注异常峰值的 spiciness 异常 δπ，默认 True。
     """
     info = _resolve_argo_profile_center(
         profile_number=int(profile_number),
@@ -9345,21 +9350,22 @@ def plot_track_ts_diagram(
 ) -> None:
     """沿涡旋轨迹的聚合温盐图（拉格朗日视角）。
 
-    追踪指定涡旋在时间窗口内的移动路径，收集路径附近所有匹配
-    Argo 剖面，叠加在背景 T-S 散点之上。背景可选 Argo（区域内
-    全量剖面）或 GLORYS（逐月收集涡旋有效半径内 θ/S 散点）。适合分析
-    特定涡旋演化过程中水团属性的系统性变化。
+    追踪指定涡旋在时间窗口内的移动路径，收集路径附近所有匹配 Argo 剖面叠加在背景 T-S 散点之上；背景可选
+    Argo（区域内全量剖面）或 GLORYS（逐月收集涡旋有效半径内 θ/S 散点），适合分析特定涡旋演化过程中水团
+    属性的系统性变化。
 
     参数:
-        DS (str): kind 字符串（'acs'|'acl'|'cs'|'cl'）。
-        no (int): 涡旋编号。
-        start_date / end_date: 时间窗口。
-        background: 'argo' 用全量 Argo 作背景，'glorys' 用涡旋半径内 GLORYS 逐月聚合。
-        detection_config: 异常检测配置，传入后仅异常剖面在前台叠加，峰值标 ★。
-        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
+        - DS (str): kind 字符串（'acs'|'acl'|'cs'|'cl'）。
+        - no (int): 涡旋编号。
+        - start_date (str | pd.Timestamp): 时间窗口起始。
+        - end_date (str | pd.Timestamp): 时间窗口结束。
+        - background (str): 背景源，'argo' 用全量 Argo，'glorys' 用涡旋半径内 GLORYS 逐月聚合，默认 'argo'。
+        - detection_config (DetectionConfig | None): 异常检测配置，传入后仅异常剖面在前台叠加、峰值标 ★。
+        - color_by (str): Argo 点着色方式 'depth'/'do'/'month'/'none'，默认 'depth'。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - annotate_spice (bool): 是否在标题标注异常峰值的 spiciness 异常 δπ，默认 True。
     """
     # --- 1. 加载轨迹并按时间过滤 ---
     track_df = find_track(DS, no)
@@ -9539,21 +9545,21 @@ def plot_regional_ts_diagram(
 ) -> None:
     """固定区域的聚合温盐图（欧拉视角）。
 
-    在指定经纬度范围内，收集时间窗口内所有 Argo 剖面，叠加在
-    背景 T-S 散点之上。背景可选 Argo（区域内全量剖面）或 GLORYS
-    （时间窗口中点的区域场）。适合分析特定海域的水团结构及其
-    异常剖面的 T-S 分布特征。
+    在指定经纬度范围内收集时间窗口内所有 Argo 剖面叠加在背景 T-S 散点之上；背景可选 Argo（区域内全量
+    剖面）或 GLORYS（时间窗口中点的区域场），适合分析特定海域的水团结构及其异常剖面的 T-S 分布特征。
 
     参数:
-        lon_range (tuple): (lon_min, lon_max)，允许跨日界线（如 170, -170）。
-        lat_range (tuple): (lat_min, lat_max)。
-        start_date / end_date: 时间窗口。
-        background: 'argo' 用全量 Argo 作背景，'glorys' 用 GLORYS 区域场。
-        detection_config: 异常检测配置，传入后仅异常剖面在前台叠加，峰值标 ★。
-        color_by: Argo 点着色方式 'depth' | 'do' | 'month' | 'none'。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        annotate_spice: 是否在标题上标注异常峰值的 spiciness 异常 δπ。
+        - lon_range (tuple[float, float]): (lon_min, lon_max)，允许跨日界线（如 170, -170）。
+        - lat_range (tuple[float, float]): (lat_min, lat_max)。
+        - start_date (str | pd.Timestamp): 时间窗口起始。
+        - end_date (str | pd.Timestamp): 时间窗口结束。
+        - background (str): 背景源，'argo' 用全量 Argo，'glorys' 用 GLORYS 区域场，默认 'argo'。
+        - detection_config (DetectionConfig | None): 异常检测配置，传入后仅异常剖面在前台叠加、峰值标 ★。
+        - color_by (str): Argo 点着色方式 'depth'/'do'/'month'/'none'，默认 'depth'。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - annotate_spice (bool): 是否在标题标注异常峰值的 spiciness 异常 δπ，默认 True。
     """
     lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
     lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
@@ -9981,11 +9987,53 @@ def plot_track_vertical_glorys_overview(
     sigma_overview: bool = False,
     ts_diagram: bool = False,
 ) -> list[dict]:
-    """绘制 track 场景 GLORYS vertical 2x2 总览图。
+    """绘制 track 场景 GLORYS vertical 2×2 总览图。
 
-    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
-    ``z_overview`` / ``sigma_overview`` / ``ts_diagram`` 独立控制
-    z 坐标、σ 坐标总览图与 T-S 图的输出。
+    沿涡旋剖面线生成 z 坐标、σ 坐标垂向总览与 T-S 图，并可叠加 Argo 投影与 heave/OI 诊断；k/b 为 None 时
+    默认取纬向剖面线（k=0、b=center_lat），z_overview/sigma_overview/ts_diagram 独立控制三类输出。
+
+    参数:
+        - DS (list | str | tuple | dict): 轨迹数据输入，常见 'acs'/'acl'/'cs'/'cl' 或 legacy 列表结构。
+        - no (int): 轨迹编号（track id）。
+        - needed_date (str | pd.Timestamp): 目标日期。
+        - k (float | list[float] | None): 剖面线斜率，y = kx + b；None 时取纬向线 k=0。
+        - b (float | list[float] | None): 剖面线截距；None 时取 center_lat。
+        - variables (list[str] | None): 需要绘制的变量列表；None 时用默认集。
+        - needed_depth (float | int): 水平参考深度（m），默认 0（表层）。
+        - xmin (float): 横向显示与采样下界（km），默认 -400.0。
+        - xmax (float): 横向显示与采样上界（km），默认 400.0。
+        - ymin (float): 纵向深度显示上界（m），默认 0.0。
+        - ymax (float): 纵向深度显示下界（m），默认 1000.0。
+        - profile_spacing_km (float | None): 水平采样步长（km）；None 时用配置默认。
+        - interpolate_z (bool): 是否将深度轴重采样到等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): 深度重采样步长（m）；None 时用配置默认。
+        - plot_mlt (bool): 是否叠加混合层深度线，默认 False。
+        - plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层，默认 True。
+        - argo_projection_config (DetectionConfig | None): 投影点异常筛选配置；None 时使用默认。
+        - argo_projection_min_depth (float | None): 投影点最小深度阈值（m）；None 时回退配置。
+        - plot_isolines (bool): 是否叠加变量等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - verbose (bool): 是否打印进度与保存提示，默认 True。
+        - heave_projection_depth_m (float | None): heave 诊断的投影深度（m）；None 时自动。
+        - heave_x_window_km (float): heave 诊断水平窗口半宽（km），默认 25.0。
+        - heave_z_window_m (float | None): heave 诊断垂向窗口半宽（m），默认 100.0。
+        - heave_search_range (float): 从 σ_argo 向上搜索的 σ 跨度（kg/m³），默认来自 processing.yml。
+        - heave_depth_threshold (float): 通风判定深度（m），默认来自 processing.yml。
+        - heave_z_search_m (float | None): 等密线连通性垂向范围（m），默认来自 processing.yml。
+        - annotate_heave (bool): 是否在图上标注 heave/OI 诊断，默认 True。
+        - z_overview (bool): 是否输出 z 坐标总览图，默认 True。
+        - sigma_overview (bool): 是否输出 σ 坐标总览图，默认 False。
+        - ts_diagram (bool): 是否输出 T-S 图，默认 False。
+
+    返回:
+        - list[dict]: 每条剖面线一个结果字典，含保存路径、heave/OI 诊断与 spice 异常等字段。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -10142,13 +10190,58 @@ def plot_argo_vertical_glorys_overview(
     sigma_overview: bool = False,
     ts_diagram: bool = False,
 ) -> list[dict]:
-    """绘制 Argo 场景 GLORYS vertical 2x2 总览图。
+    """绘制 Argo 场景 GLORYS vertical 2×2 总览图。
 
-    k / b 为 None 时默认取纬向剖面线 ``k=0, b=center_lat``。
-    ``ts_diagram=True`` 时额外绘制 T-S 图。
+    以单个 Argo 剖面为中心沿剖面线生成 z 坐标、σ 坐标垂向总览与 T-S 图，并可叠加 Argo 投影、heave/OI 与
+    spiciness 诊断；k/b 为 None 时默认取纬向剖面线（k=0、b=center_lat），z_overview/sigma_overview/
+    ts_diagram 独立控制三类输出。
 
-    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标总览图的输出。
-    ``annotate_spice=True`` 时在标题标注 spiciness 异常 δπ。
+    参数:
+        - profile_number (int): 目标 Argo 剖面编号。
+        - profile_time (int | str | pd.Timestamp): 剖面日期（int YYYYMMDD / 'YYYY-MM-DD' / Timestamp）。
+        - k (float | list[float] | None): 剖面线斜率，y = kx + b；None 时取纬向线 k=0。
+        - b (float | list[float] | None): 剖面线截距；None 时取 center_lat。
+        - platform_number (int | None): 浮标平台编号，辅助定位（可选）。
+        - variables (list[str] | None): 需要绘制的变量列表；None 时用默认集。
+        - needed_depth (float | int): 水平参考深度（m），默认 0（表层）。
+        - xmin (float): 横向显示与采样下界（km），默认 -400.0。
+        - xmax (float): 横向显示与采样上界（km），默认 400.0。
+        - ymin (float): 纵向深度显示上界（m），默认 0.0。
+        - ymax (float): 纵向深度显示下界（m），默认 1000.0。
+        - profile_spacing_km (float | None): 水平采样步长（km）；None 时用配置默认。
+        - interpolate_z (bool): 是否将深度轴重采样到等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): 深度重采样步长（m）；None 时用配置默认。
+        - plot_mlt (bool): 是否叠加混合层深度线，默认 False。
+        - plot_argo_projection (bool): 是否叠加同日匹配 Argo 点投影层，默认 True。
+        - argo_projection_config (DetectionConfig | None): 投影点异常筛选配置；None 时使用默认。
+        - argo_projection_min_depth (float | None): 投影点最小深度阈值（m）；None 时回退配置。
+        - plot_isolines (bool): 是否叠加变量等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - argo_data_dir (str | Path | None): Argo 年度 parquet 目录；None 时使用配置默认目录。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - verbose (bool): 是否打印进度与保存提示，默认 True。
+        - heave_projection_depth_m (float | None): heave 诊断的投影深度（m）；None 时自动。
+        - heave_x_window_km (float): heave 诊断水平窗口半宽（km），默认 25.0。
+        - heave_z_window_m (float | None): heave 诊断垂向窗口半宽（m），默认 100.0。
+        - heave_search_range (float): 从 σ_argo 向上搜索的 σ 跨度（kg/m³），默认来自 processing.yml。
+        - heave_depth_threshold (float): 通风判定深度（m），默认来自 processing.yml。
+        - heave_z_search_m (float | None): 等密线连通性垂向范围（m），默认来自 processing.yml。
+        - annotate_heave (bool): 是否在图上标注 heave/OI 诊断，默认 True。
+        - annotate_spice (bool): 是否在标题标注 spiciness 异常 δπ，默认 True。
+        - anomaly_sal (float | None): 异常点盐度，用于 spiciness 诊断；None 时自动取。
+        - anomaly_theta (float | None): 异常点位温，用于 spiciness 诊断；None 时自动取。
+        - z_overview (bool): 是否输出 z 坐标总览图，默认 True。
+        - sigma_overview (bool): 是否输出 σ 坐标总览图，默认 False。
+        - ts_diagram (bool): 是否输出 T-S 图，默认 False。
+
+    返回:
+        - list[dict]: 每条剖面线一个结果字典，含保存路径、heave/OI 诊断与 spice 异常等字段。
     """
     vertical_vars = _normalize_overview_vertical_variables(variables)
     k_list, b_list = _normalize_profile_lines(k, b)
@@ -10284,13 +10377,14 @@ def collect_argo_pool(
     仅保留 T/S 均有效的深度行，不处理日界线穿越。
 
     参数:
-        lon_range (tuple): (lon_min, lon_max) 经度范围，不支持跨日界线。
-        lat_range (tuple): (lat_min, lat_max) 纬度范围。
-        start_date / end_date: 时间窗口（含端点），支持字符串或 Timestamp。
-        max_depth (float): 最大采样深度（m），默认 2000 m。
+        - lon_range (tuple[float, float]): (lon_min, lon_max) 经度范围，不支持跨日界线。
+        - lat_range (tuple[float, float]): (lat_min, lat_max) 纬度范围。
+        - start_date (str | pd.Timestamp): 时间窗口起始（含端点）。
+        - end_date (str | pd.Timestamp): 时间窗口结束（含端点）。
+        - max_depth (float): 最大采样深度（m），默认 2000.0。
 
     返回:
-        DataFrame，含剖面 T/S/Depth/位置/时间列；无匹配数据时返回空 DataFrame。
+        - pd.DataFrame: 含剖面 T/S/Depth/位置/时间列；无匹配数据时返回空 DataFrame。
     """
     lon_min, lon_max = float(lon_range[0]), float(lon_range[1])
     lat_min, lat_max = float(lat_range[0]), float(lat_range[1])
@@ -10554,7 +10648,14 @@ def _save_argo_3d_field(field: dict, zarr_path: str | Path) -> None:
 
 
 def load_argo_3d_field(zarr_path: str | Path) -> dict:
-    """加载 zarr 格式的 3D Argo 重建场。"""
+    """加载 zarr 格式的 3D Argo 重建场。
+
+    参数:
+        - zarr_path (str | Path): 3D 场的 zarr 路径。
+
+    返回:
+        - dict: 含 thetao/salinity/sigma0/weight/lon/lat/depth 数组及 attrs 元信息的字典。
+    """
     root = zarr.open_group(str(zarr_path), mode='r')
     return {
         **{key: root[key][:] for key in ('thetao', 'salinity', 'sigma0', 'weight', 'lon', 'lat', 'depth')},
@@ -10577,15 +10678,16 @@ def slice_section_from_argo_field(
     用 RegularGridInterpolator 双线性插值，返回与 get_vertical_glorys 格式兼容的 list[dict]。
 
     参数:
-        field (dict): _build_argo_3d_field / load_argo_3d_field 返回的 3D 场字典。
-        k (float): 测线斜率 Δlat/Δlon；0.0 为纯纬向断面。
-        center_lon / center_lat (float): 测线 x=0 的地理参考点。
-        x_min_km / x_max_km (float | None): 断面 x 轴范围（km），None 时从 field
-            经度范围自动推导，使区域断面覆盖完整宽度。
-        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
+        - field (dict): _build_argo_3d_field / load_argo_3d_field 返回的 3D 场字典。
+        - k (float): 测线斜率 Δlat/Δlon；0.0 为纯纬向断面。
+        - center_lon (float): 测线 x=0 的参考经度。
+        - center_lat (float): 测线 x=0 的参考纬度。
+        - x_min_km (float | None): 断面 x 轴下界（km）；None 时从 field 经度范围自动推导以覆盖完整宽度。
+        - x_max_km (float | None): 断面 x 轴上界（km）；None 时自动推导。
+        - x_spacing_km (float): 断面水平采样间距（km），默认 5。
 
     返回:
-        list[dict]，格式与 get_vertical_glorys 兼容，供 _plot_glorys_overview_vertical_2x2 使用。
+        - list[dict]: 与 get_vertical_glorys 兼容的断面结果，供 _plot_glorys_overview_vertical_2x2 使用。
     """
     cos_lat = np.cos(np.radians(center_lat))
     if x_min_km is None or x_max_km is None:
@@ -10681,29 +10783,41 @@ def plot_regional_vertical_argo_overview(
     供后续直接切片，避免每次重建。n_jobs>1 时重建阶段按深度并行。
 
     参数:
-        lon_range / lat_range (tuple): 区域经纬度范围（°）。
-        start_date / end_date: 时间窗口（含端点），与 field= 互斥；field= 为 None 时必填。
-        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
-        center_lon / center_lat (float | None): 测线参考点，None 时取区域经纬度中心。
-        h_bw (float): 水平高斯核带宽（km），默认 60 km。
-        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
-        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
-        z_max_m (float): 最大重建深度（m），默认 1500 m。
-        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
-        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
-        x_min_km / x_max_km (float | None): 断面 x 轴范围（km），None 时自动取区域全宽。
-        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
-        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
-        plot_isolines: 是否叠加 σ₀ 等值线。
-        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
-        field (dict | None): 预建 3D 场，传入后跳过 collect_argo_pool + _build_argo_3d_field；
-            与 start_date/end_date 互斥，日期从 field['attrs'] 读取。
-        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
-        field_path (str | Path | None): zarr 保存路径，None 时按区域和时间窗口自动生成。
-        n_jobs (int | None): _build_argo_3d_field 并行进程数，None 时取 min(cpu_count, 8)。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        verbose (bool): 是否打印进度信息。
+        - lon_range (tuple[float, float]): 区域经度范围（°）。
+        - lat_range (tuple[float, float]): 区域纬度范围（°）。
+        - start_date (str | pd.Timestamp | None): 时间窗口起始（含端点），与 field 互斥；field 为 None 时必填。
+        - end_date (str | pd.Timestamp | None): 时间窗口结束（含端点），与 field 互斥；field 为 None 时必填。
+        - k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        - center_lon (float | None): 测线参考经度，None 时取区域经度中心。
+        - center_lat (float | None): 测线参考纬度，None 时取区域纬度中心。
+        - h_bw (float): 水平高斯核带宽（km），默认来自 processing.yml:argo_reconstruction。
+        - depth_bw (float): 垂向高斯核带宽（m），默认来自配置。
+        - h_spacing_deg (float): 重建网格水平间距（°），默认来自配置。
+        - z_max_m (float): 最大重建深度（m），默认来自配置。
+        - z_spacing_m (float): 垂向网格间距（m），默认来自配置。
+        - min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认来自配置。
+        - x_min_km (float | None): 断面 x 轴下界（km），None 时自动取区域全宽。
+        - x_max_km (float | None): 断面 x 轴上界（km），None 时自动取区域全宽。
+        - x_spacing_km (float): 断面水平采样间距（km），默认来自配置。
+        - ymin (float): 图纵轴深度上界（m），默认 0.0。
+        - ymax (float): 图纵轴深度下界（m），默认 1000.0；3D 场仍建到 z_max_m。
+        - plot_isolines (bool): 是否叠加 σ₀ 等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - field (dict | None): 预建 3D 场，传入后跳过 collect_argo_pool + _build_argo_3d_field，与 start_date/end_date 互斥，日期从 field['attrs'] 读取。
+        - save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        - field_path (str | Path | None): zarr 保存路径，None 时按区域和时间窗口自动生成。
+        - n_jobs (int | None): _build_argo_3d_field 并行进程数，None 时取 min(cpu_count, 8)。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - verbose (bool): 是否打印进度信息，默认 True。
+    输出:
+        - 断面图（save_fig=True，或指定 output_dir 时）：`plot_outputs/shared/<region>/plot_regional_vertical_argo_overview/argo_regional_{经度范围}E_{纬度范围}N_{起止日期}_hbw{带宽}km.png`
+        - 3D 重建场（save_field=True 时）：zarr，路径为 `field_path` 或按区域与时间窗口自动命名。
     """
     if field is not None and (start_date is not None or end_date is not None):
         raise ValueError(
@@ -11120,29 +11234,35 @@ def plot_track_vertical_argo_overview(
     随涡 Argo 重建而非 GLORYS；与单日欧拉式的 plot_argo_vertical_argo_overview 互补。
 
     参数:
-        DS: 涡旋数据源（kind 串 'acl'|'cl'|'cs'|'acs'，或 list/tuple/dict）。
-        no (int): 涡旋 track_id。
-        needed_date: 参考日期，须是该 track 中存在的某天，决定参考涡心位置。
-        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
-        radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
-        day_window (int): 时间窗半宽（天），围绕 needed_date 取 ±day_window，默认 15。
-        h_bw (float): 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
-        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
-        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
-        z_max_m (float): 最大重建深度（m），默认 1500 m。
-        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
-        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
-        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
-        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
-        plot_isolines: 是否叠加 σ₀ 等值线。
-        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
-        field (dict | None): 预建（拉格朗日）3D 场，传入后跳过重建直接切片绘图。
-        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
-        field_path (str | Path | None): zarr 保存路径，None 时按涡旋与日期自动生成。
-        n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        verbose (bool): 是否打印进度信息。
+        - DS (list | str | tuple | dict): 涡旋数据源（kind 串 'acl'|'cl'|'cs'|'acs'，或 list/tuple/dict）。
+        - no (int): 涡旋 track_id。
+        - needed_date (str | pd.Timestamp): 参考日期，须是该 track 中存在的某天，决定参考涡心位置。
+        - k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        - radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认来自配置。
+        - day_window (int): 时间窗半宽（天），围绕 needed_date 取 ±day_window，默认来自配置。
+        - h_bw (float): 水平高斯核带宽（km，保留中尺度结构），默认来自配置。
+        - depth_bw (float): 垂向高斯核带宽（m），默认来自配置。
+        - h_spacing_deg (float): 重建网格水平间距（°），默认来自配置。
+        - z_max_m (float): 最大重建深度（m），默认来自配置。
+        - z_spacing_m (float): 垂向网格间距（m），默认来自配置。
+        - min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认来自配置。
+        - x_spacing_km (float): 断面水平采样间距（km），默认来自配置。
+        - ymin (float): 图纵轴深度上界（m），默认 0.0。
+        - ymax (float): 图纵轴深度下界（m），默认 1000.0；3D 场仍建到 z_max_m。
+        - plot_isolines (bool): 是否叠加 σ₀ 等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - field (dict | None): 预建（拉格朗日）3D 场，传入后跳过重建直接切片绘图。
+        - save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        - field_path (str | Path | None): zarr 保存路径，None 时按涡旋与日期自动生成。
+        - n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - verbose (bool): 是否打印进度信息，默认 True。
     """
     track_df, ds_name, _ = _resolve_track_context(DS, no, include_contours=True)
 
@@ -11237,30 +11357,36 @@ def plot_argo_vertical_argo_overview(
     对应，但垂向场来自 Argo 重建而非 GLORYS；与随涡的 plot_track_vertical_argo_overview 互补。
 
     参数:
-        profile_number (int): 目标 Argo 剖面编号。
-        profile_time: 年份（如 2014）或具体日期（如 '2014-05-09'），用于定位剖面。
-        platform_number (int | None): 浮标编号，剖面编号同年重复时用于消歧，默认 None。
-        k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
-        radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
-        day_window (int): 时间窗半宽（天），围绕剖面日期取 ±day_window，默认 15。
-        h_bw (float): 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
-        depth_bw (float): 垂向高斯核带宽（m），默认 25 m。
-        h_spacing_deg (float): 重建网格水平间距（°），默认 0.1°。
-        z_max_m (float): 最大重建深度（m），默认 1500 m。
-        z_spacing_m (float): 垂向网格间距（m），默认 10 m。
-        min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认 3.0。
-        x_spacing_km (float): 断面水平采样间距（km），默认 5 km。
-        ymin / ymax (float): 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
-        plot_isolines: 是否叠加 σ₀ 等值线。
-        isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines: 等值线样式。
-        argo_data_dir (str | Path | None): Argo 数据目录，None 时用默认 argo_path。
-        field (dict | None): 预建 3D 场，传入后跳过重建直接切片绘图。
-        save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
-        field_path (str | Path | None): zarr 保存路径，None 时按剖面与日期自动生成。
-        n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
-        show_fig / save_fig: 是否显示 / 保存图片。
-        output_dir: 图片输出目录，None 时使用默认路径。
-        verbose (bool): 是否打印进度信息。
+        - profile_number (int): 目标 Argo 剖面编号。
+        - profile_time (int | str | pd.Timestamp): 年份（如 2014）或具体日期（如 '2014-05-09'），用于定位剖面。
+        - platform_number (int | None): 浮标编号，剖面编号同年重复时用于消歧，默认 None。
+        - k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        - radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认来自配置。
+        - day_window (int): 时间窗半宽（天），围绕剖面日期取 ±day_window，默认来自配置。
+        - h_bw (float): 水平高斯核带宽（km，保留中尺度结构），默认来自配置。
+        - depth_bw (float): 垂向高斯核带宽（m），默认来自配置。
+        - h_spacing_deg (float): 重建网格水平间距（°），默认来自配置。
+        - z_max_m (float): 最大重建深度（m），默认来自配置。
+        - z_spacing_m (float): 垂向网格间距（m），默认来自配置。
+        - min_weight (float): 最小累积权重阈值，低于此值格点显示为 NaN，默认来自配置。
+        - x_spacing_km (float): 断面水平采样间距（km），默认来自配置。
+        - ymin (float): 图纵轴深度上界（m），默认 0.0。
+        - ymax (float): 图纵轴深度下界（m），默认 1000.0；3D 场仍建到 z_max_m。
+        - plot_isolines (bool): 是否叠加 σ₀ 等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - argo_data_dir (str | Path | None): Argo 数据目录，None 时用默认 argo_path。
+        - field (dict | None): 预建 3D 场，传入后跳过重建直接切片绘图。
+        - save_field (bool): 是否将 3D 场保存为 zarr，默认 False。
+        - field_path (str | Path | None): zarr 保存路径，None 时按剖面与日期自动生成。
+        - n_jobs (int | None): 重建并行进程数，None 时取 min(cpu_count, 8)。
+        - show_fig (bool): 是否显示图片，默认 True。
+        - save_fig (bool): 是否保存图片，默认 False。
+        - output_dir (str | Path | None): 图片输出目录，None 时使用默认路径。
+        - verbose (bool): 是否打印进度信息，默认 True。
     """
     info = _resolve_argo_profile_center(
         profile_number=int(profile_number),
@@ -11338,14 +11464,14 @@ def find_polygon_line_intersections(polygon_lon, polygon_lat, line_lons, line_la
     计算一条折线与闭合多边形边界的交点。
 
     参数:
-        polygon_lon (array): 多边形顶点经度。
-        polygon_lat (array): 多边形顶点纬度。
-        line_lons (array): 折线点经度。
-        line_lats (array): 折线点纬度。
-        tolerance (float): 判定重复交点的容差。
+        - polygon_lon (array): 多边形顶点经度。
+        - polygon_lat (array): 多边形顶点纬度。
+        - line_lons (array): 折线点经度。
+        - line_lats (array): 折线点纬度。
+        - tolerance (float): 判定重复交点的容差，默认 1e-6。
 
     返回:
-        list: 交点的 (lon, lat) 元组列表。
+        - list: 交点的 (lon, lat) 元组列表。
     """
     intersections = []
     
@@ -11390,44 +11516,22 @@ def regrid_vertical_slice(data_package: dict, dy: float = None, dz: float = None
     '''
     将垂直剖面数据包插值到新的等间距网格上。
 
-    该函数接收 get_vertical_glorys 的输出，并根据用户指定的水平(dy)或
-    垂直(dz)间距，生成一个新的、网格化更规整的数据包。
+    接收 get_vertical_glorys 的输出，根据用户指定的水平（dy）或垂直（dz）间距生成网格化更规整的新数据包。
 
     参数:
-        data_package (dict): 从 get_vertical_glorys 函数获取的原始数据包。
-        dy (float, optional): 新的水平(y轴)网格间距，单位为公里(km)。
-                              默认为 None，表示不改变水平网格。
-        dz (float, optional): 新的垂直(z轴)网格间距，单位为米(m)。
-                              默认为 None，表示不改变垂直网格。
+        - data_package (dict): 从 get_vertical_glorys 获取的原始数据包。
+        - dy (float | None): 新的水平（y 轴）网格间距（km）；None 时不改变水平网格。
+        - dz (float | None): 新的垂直（z 轴）网格间距（m）；None 时不改变垂直网格。
 
     返回:
-        dict: 一个结构与输入相同但数据已被插值到新网格上的新数据包。
-              字典包含以下键值对：
+        - dict: 结构与输入相同但数据已插值到新网格的新数据包，含以下键：
 
-            - **'profile_data' (dict)**:
-                - 其内部结构与输入相同，但每个二维数组的值都是插值后的结果。
-
-            - **'y_coords' (np.ndarray)**:
-                - 如果提供了 `dy`，这将是一个新生成的一维等间距数组。
-                - 否则，与输入的 'y_coords' 相同。
-
-            - **'z_coords' (np.ndarray)**:
-                - 如果提供了 `dz`，这将是一个新生成的一维等间距数组。
-                - 否则，与输入的 'z_coords' 相同。
-            
-            - **'lon_coords' (np.ndarray)**:
-                - 如果水平坐标被重采样，这将是新的一维插值经度数组。
-                - 否则，与输入的 'lon_coords' 相同。
-
-            - **'lat_coords' (np.ndarray)**:
-                - 如果水平坐标被重采样，这将是新的一维插值纬度数组。
-                - 否则，与输入的 'lat_coords' 相同。
-
-            - **'projections' (dict)**:
-                - 从原始数据包中原样复制而来，其数值仍对应原始的坐标系。
-                
-            - **'metadata' (dict)**:
-                - 从原始数据包中原样复制而来。
+            - 'profile_data' (dict)：内部结构同输入，但每个二维数组为插值后的结果。
+            - 'y_coords' (np.ndarray)：提供 dy 时为新生成的等间距数组，否则同输入。
+            - 'z_coords' (np.ndarray)：提供 dz 时为新生成的等间距数组，否则同输入。
+            - 'lon_coords' / 'lat_coords' (np.ndarray)：水平坐标被重采样时为新插值数组，否则同输入。
+            - 'projections' (dict)：从原始数据包原样复制，数值仍对应原始坐标系。
+            - 'metadata' (dict)：从原始数据包原样复制。
     '''
     # 如果用户未指定任何新的网格间距，则直接返回原始数据包的深拷贝
     if dy is None and dz is None:
@@ -11510,23 +11614,21 @@ def plot_data_package(data_package: dict, DS: list, variable: str,
     '''
     根据一个数据包和原始涡旋数据集，绘制单一物理量的垂直剖面图。
 
-    该函数是一个灵活的可视化接口，它接收一个数据包，并根据传入的涡旋数据集
-    (DS)来确定绘图风格（如颜色和标题），适用于 get_vertical_glorys 或
-    regrid_vertical_slice 的输出。
+    灵活的可视化接口：接收数据包并根据传入的涡旋数据集（DS）确定绘图风格（颜色、标题），适用于
+    get_vertical_glorys 或 regrid_vertical_slice 的输出。
 
     参数:
-        data_package (dict): 从 get_vertical_glorys 或 regrid_vertical_slice 获取的数据包。
-        DS (list): 原始涡旋数据集（用于解析涡旋类型显示样式）。
-        variable (str): 需要绘制的变量名。
-        show_fig (bool): 是否显示图像。
-        save_fig (bool): 是否保存图像。
-        xmin, xmax (float | None): 横坐标范围（km）。当两者同时给定时，会按
-            当前数据步长在该范围内重建目标 y 网格，并自动裁剪到有效覆盖区间，
-            以减少仅 set_xlim 导致的空白区域。
-        ymin, ymax (float | None): 纵坐标范围（m）。
-
-    返回:
-        None。
+        - data_package (dict): 从 get_vertical_glorys 或 regrid_vertical_slice 获取的数据包。
+        - DS (list): 原始涡旋数据集（用于解析涡旋类型显示样式）。
+        - variable (str): 需要绘制的变量名。
+        - show_fig (bool): 是否显示图像，默认 False。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - xmin (float | None): 横坐标下界（km）；与 xmax 同时给定时按当前步长在该范围内重建目标 y 网格并裁剪到有效覆盖区间，减少仅 set_xlim 导致的空白。
+        - xmax (float | None): 横坐标上界（km），与 xmin 配套。
+        - ymin (float | None): 纵坐标下界（m）。
+        - ymax (float | None): 纵坐标上界（m）。
+    输出:
+        - 图像（save_fig=True 时）：`plot_outputs/shared/<region>/plot_track_vertical_glorys/{数据集}{编号}_vertical_{变量}_YYYYMMDD_k*b*.png`
     '''
     # --- 1. 验证输入并解包数据 ---
     required_keys = ['profile_data', 'y_coords', 'z_coords', 'lon_coords', 'lat_coords', 'projections', 'metadata']
@@ -11728,33 +11830,29 @@ def get_raytraceR_inputs(data_package: dict,
     """
     将来自 track.regrid_vertical_slice 的数据包转换为 MATLAB raytraceR 函数所需的输入格式。
 
-    假设输入 data_package 的结构如下（来自 track.get_vertical_glorys 和 regrid_vertical_slice 处理后）：
-    - z_coords (np.ndarray): 等间距的深度 (Z) 坐标，单位为米(m)。
-    - y_coords (np.ndarray): 等间距的横流 (Y) 坐标，单位为公里(km)。
-    - lon_coords (np.ndarray): 剖面线上每个点对应的经度。
-    - lat_coords (np.ndarray): 剖面线上每个点对应的纬度。
-    - profile_data (dict): 包含以下二维 np.ndarray (或 np.ma.MaskedArray) 数组的字典:
-        - 'u': 纬向速度 (uo)
-        - 'v': 经向速度 (vo)
-        - 'salinity': 盐度 (Practical Salinity, SP)
-        - 'thetao': 位势温度 (potential temperature, pt)
-    
     参数:
-        data_package (dict): 包含 GLORYS 垂直切片数据的字典，通常是
-                             track.regrid_vertical_slice 的输出。
-        f_coriolis (float): 科里奥利频率 f (例如 1.454e-4 rad/s)。**必须提供**。
-        rho0 (float): 参考密度 (kg/m^3)。
-        g (float): 重力加速度 (m/s^2)。
-        m0 (float): 初始垂直波数。
-        omega_factor (float): 固有频率的倍数，omega = omega_factor * f。
-        v0_amplitude (float): 初始波速振幅。
-        thresh_val (float): 内部反射阈值。
-        chstart_val (int): 初始特征线 (1或2)。
-        filter_sigma_z (float): 沿深度方向高斯平滑的标准差（用于导数计算）。
-        filter_sigma_y (float): 沿横流方向高斯平滑的标准差。
+        - data_package (dict): GLORYS 垂直切片数据（通常是 regrid_vertical_slice 输出），结构见“说明”。
+        - f_coriolis (float): 科里奥利频率 f（如 1.454e-4 rad/s），必须提供。
+        - rho0 (float): 参考密度（kg/m³）。
+        - g (float): 重力加速度（m/s²）。
+        - m0 (float): 初始垂直波数。
+        - omega_factor (float): 固有频率倍数，omega = omega_factor · f。
+        - v0_amplitude (float): 初始波速振幅。
+        - thresh_val (float): 内部反射阈值。
+        - chstart_val (int): 初始特征线（1 或 2）。
+        - filter_sigma_z (float): 沿深度方向高斯平滑标准差（用于导数计算）。
+        - filter_sigma_y (float): 沿横流方向高斯平滑标准差。
 
     返回:
-        dict: 包含 raytraceR 所需所有输入参数的字典。
+        - dict: 含 raytraceR 所需所有输入参数的字典。
+
+    说明:
+        输入 data_package 结构（来自 get_vertical_glorys + regrid_vertical_slice）:
+
+            - z_coords (np.ndarray)：等间距深度 Z 坐标（m）。
+            - y_coords (np.ndarray)：等间距横流 Y 坐标（km）。
+            - lon_coords / lat_coords (np.ndarray)：剖面线上每个点的经度/纬度。
+            - profile_data (dict)：含 'u'（纬向速度 uo）、'v'（经向速度 vo）、'salinity'（实用盐度 SP）、'thetao'（位温 pt）四个二维数组。
     """
 
     # 1. 提取和映射输入数据
@@ -11961,12 +12059,14 @@ def get_raytraceR_inputs(data_package: dict,
 
 def init_worker(eddy_data_shared: dict):
     """
-    (Initializer函数) 为multiprocessing的子进程初始化共享的、只读的数据。
+    multiprocessing 子进程的初始化器：为每个工作进程设置共享的只读数据。
 
-    功能:
-        这个函数在每个工作进程启动时仅被调用一次。它接收大的数据集
-        (如涡旋数据字典)并将其设置为该进程的全局变量。这可以极大地避免
-        在每个任务间重复传输大数据的开销，是性能优化的关键。
+    在每个工作进程启动时仅调用一次，接收大数据集（如涡旋数据字典）并设为该进程的全局变量，避免在任务
+    间重复传输大数据，是性能优化的关键；同时将 OpenMP/MKL/OpenBLAS 线程数限制为 1，避免多进程×多线程
+    争抢 CPU。
+
+    参数:
+        - eddy_data_shared (dict): 供子进程只读共享的涡旋数据字典。
     """
     # 限制 OpenMP/MKL 线程数，避免多进程 x 多线程导致 CPU 争抢
     # 注意：这只影响子进程环境，不影响主进程
@@ -11998,42 +12098,35 @@ def check_single_track(
     save_interacting_argo: bool = False,
 ):
     """
-    (内部辅助函数) 检查单个涡旋轨迹是否与Argo数据有交集。
+    检查单个涡旋轨迹是否与 Argo 数据有交集（内部辅助函数）。
 
-    功能:
-        这是一个纯计算函数，会为所有在时间范围内的涡旋返回结果，
-        并附带一个布尔标志来说明其是否与Argo浮标有交集。
+    纯计算函数，为所有在时间范围内的涡旋返回结果，并附带布尔标志说明其是否与 Argo 浮标有交集。
 
     参数:
-        track_data (list): 单条涡旋的轨迹数据 (list of lists)。
-        argo_by_date (dict): 按日期组织的 Argo 明细，形如 {date: list[dict]}，
-            每个 dict 至少包含 'Longitude','Latitude'，可附带 Profile_number、Year/Month/Day、
-            delta_do、do_value/DO、Anomaly_depth 等元数据。
-        start_date (pd.Timestamp): 检查的开始日期。
-        end_date (pd.Timestamp): 检查的结束日期。
-        ds_name (str): 数据集名称 (如 'ACS')。
-        circle_enlargement_factor (float | None): 半径放大因子，None 回退全局配置。
-        use_adaptive_circle (bool): True 时半径距离用 `adaptive_distance_m` 自适应大圆。
-        adaptive_lat_threshold (float): |lat| 超过此值触发大圆距离。
-        adaptive_distance_threshold_km (float): 平面距离超过此值(km)触发大圆距离。
-        force_great_circle_circle (bool): 强制使用大圆距离（忽略阈值）。
-        save_interacting_argo (bool): True 时收集并返回每个命中的 Argo 点明细（含 method/track 等），
-            False 时为性能考虑在首个命中即停止当日迭代且不返回点明细。
+        - track_data (list): 单条涡旋的轨迹数据（list of lists）。
+        - argo_by_date (dict): 按日期组织的 Argo 明细，形如 {date: list[dict]}，每个 dict 至少含 'Longitude'/'Latitude'，可附带 Profile_number、Year/Month/Day、delta_do、do_value/DO、Anomaly_depth 等元数据。
+        - start_date (pd.Timestamp): 检查的开始日期。
+        - end_date (pd.Timestamp): 检查的结束日期。
+        - ds_name (str): 数据集名称（如 'ACS'）。
+        - circle_enlargement_factor (float | None): 半径放大因子，None 时回退全局配置。
+        - use_adaptive_circle (bool): True 时半径距离用 adaptive_distance_m 自适应大圆，默认 False。
+        - adaptive_lat_threshold (float): |lat| 超过此值触发大圆距离，默认 70.0。
+        - adaptive_distance_threshold_km (float): 平面距离超过此值（km）触发大圆距离，默认 300.0。
+        - force_great_circle_circle (bool): 强制使用大圆距离（忽略阈值），默认 False。
+        - save_interacting_argo (bool): True 时收集并返回每个命中的 Argo 点明细（含 method/track 等），False 时为性能在首个命中即停止当日迭代且不返回点明细，默认 False。
 
     返回:
-        dict | None: 如果涡旋在时间范围内，返回包含绘图/判定信息的字典，否则返回 None。
-        主要键：
-          - 'track_id': 轨迹编号
-          - 'has_interaction': 是否与 Argo 交互
-          - 'in_range_segments': 连续片段用于绘图
-          - 'contours_to_plot': 命中多边形时用于绘图的等值线
-          - 'candidate_dates_for_contour': 圆命中待进一步二次判定的日期
-          - 'dates_in_range': 轨迹在时间窗内的日期
-          - 'text_info': 绘图标签信息
-          - 'is_ace': 是否反气旋
-          - 'interacting_argo': 当 save_interacting_argo=True 时返回 list[dict]，
-             每个 dict 至少含 {'date','lon','lat','method'(poly/circle),'ds_name'}，
-                 并按 argo_by_date 附带 Profile_number/指标等元数据；否则为空列表。
+        - dict | None: 涡旋在时间范围内时返回含绘图/判定信息的字典，否则返回 None；主要键：
+
+            - 'track_id'：轨迹编号。
+            - 'has_interaction'：是否与 Argo 交互。
+            - 'in_range_segments'：连续片段用于绘图。
+            - 'contours_to_plot'：命中多边形时用于绘图的等值线。
+            - 'candidate_dates_for_contour'：圆命中待进一步二次判定的日期。
+            - 'dates_in_range'：轨迹在时间窗内的日期。
+            - 'text_info'：绘图标签信息。
+            - 'is_ace'：是否反气旋。
+            - 'interacting_argo'：save_interacting_argo=True 时返回 list[dict]（每个至少含 date/lon/lat/method(poly|circle)/ds_name，并附带 Profile_number/指标等），否则为空列表。
     """
     num, time, center_lon, center_lat, _, _, contour_lon, contour_lat, radius, _, _ = zip(*track_data)
     dates = convert_date(time)
@@ -12187,38 +12280,43 @@ def plot_all_tracks_in_range(
     save_interacted_eddies: bool = False,
     save_interacting_argo: bool = False,
 ):
-    """(核心绘图) 指定时间段内涡旋轨迹 + Argo 异常代表点（支持 do/aou/trim）。
+    """指定时间段内涡旋轨迹 + Argo 异常代表点的核心绘图（支持 do/aou/trim）。
 
-    依赖 Cartopy 进行制图，自动处理跨国际日期变更线的轨迹连线。
-
-    工作流程：
-      1. 装载时间范围内 Argo 数据 → 过滤地理范围 → 按 detection_config 计算异常。
-      2. 深度限制由 DetectionConfig 统一管理。
-      3. 每个剖面保留 anomaly_score 最强的一条。
-      4. anomaly_color_by='auto' 时按当前方法的主变量着色。
+    依赖 Cartopy 制图，自动处理跨国际日期变更线的轨迹连线：装载时间范围内 Argo 数据、过滤地理范围、按
+    detection_config 计算异常（深度限制由 DetectionConfig 统一管理，每个剖面保留 anomaly_score 最强一条），
+    anomaly_color_by='auto' 时按当前方法主变量着色。
 
     参数:
-        start_date_str, end_date_str: 日期范围。
-        eddy_datasets:
-          - 兼容旧版: dict，如 {'ACS': acs, 'ACL': acl, 'CS': cs, 'CL': cl}，每个值是“轨迹列表(list of tracks)”；
-          - 新版便捷: 字符串列表/元组，如 ['acs','acl','cs','cl']，函数将按配置从 META_tracks 读取对应时间段与区域内的轨迹；
-          - None: 并行 worker 模式下默认使用全局 worker_eddy_datasets。
-        plot_unrelated_eddies: 是否绘制未与 Argo 交互的涡旋。
-        plot_unrelated_argo: 是否额外绘制所有 Argo 剖面位置（空心圆），用于提供基准分布背景。
-        save_fig, show_fig: 输出控制。
-        skip_save_if_empty: 若为 True 且本图中未绘制任何涡旋（不含底图/Argo点），则跳过保存；默认 False（单次绘图默认不跳过）。
-        show_labels: 是否绘制轨迹文本标签（如 ACLXXXX）。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        anomaly_color_by: 'auto'、'primary_value'、'anomaly_score'，或异常表中的任意数值列名。
-        fix_colorbar / cbar_min / cbar_max / cbar_ticks: 异常主变量色标控制。
-        meta_output_root: 指定 META_tracks 根目录（可覆盖配置默认）。
-        save_interacted_eddies (bool): True 时保存本期交互涡旋标签（NPY）；默认 False。
-        save_interacting_argo (bool): True 时保存本期交互 Argo 明细（Parquet）；默认 False，输出目录按 detection_config.file_stem() 划分。
+        - start_date_str (str): 起始日期。
+        - end_date_str (str): 结束日期。
+        - eddy_datasets (dict | list[str] | tuple[str, ...] | None): 涡旋数据集，支持三种形式：
 
-    输出（保存到 plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/）：
-        - All_Tracks_{start}_to_{end}.png
-        - Interacted_Eddies_{start}_{end}_{detection_config.file_stem()}.npy（当 save_interacted_eddies=True 时）
-        - Interacting_Argo_{start}_{end}_{detection_config.file_stem()}.parquet（当 save_interacting_argo=True 时）
+            - 兼容旧版 dict，如 {'ACS': acs, ...}，每个值是轨迹列表。
+            - 新版便捷字符串列表/元组，如 ['acs','acl','cs','cl']，按配置从 META_tracks 读取对应时间段与区域内的轨迹。
+            - None：并行 worker 模式下默认使用全局 worker_eddy_datasets。
+        - plot_unrelated_eddies (bool): 是否绘制未与 Argo 交互的涡旋，默认 False。
+        - plot_unrelated_argo (bool): 是否额外绘制所有 Argo 剖面位置（空心圆）作基准分布背景，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - skip_save_if_empty (bool): True 且本图未绘制任何涡旋时跳过保存，默认 False。
+        - show_labels (bool): 是否绘制轨迹文本标签（如 ACLXXXX），默认 True。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - circle_enlargement_factor (float | None): 涡旋边界放大系数；None 时从配置读取。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - anomaly_color_by (str): 'auto'、'primary_value'、'anomaly_score' 或异常表中任意数值列名，默认 'auto'。
+        - fix_colorbar (bool): 是否固定异常主变量色标，默认 True。
+        - cbar_min (float | None): 色标下限；None 时自动。
+        - cbar_max (float | None): 色标上限；None 时自动。
+        - cbar_ticks (list | None): 色标刻度；None 时自动。
+        - meta_output_root (str | Path | None): META_tracks 根目录（可覆盖配置默认）。
+        - save_interacted_eddies (bool): True 时保存本期交互涡旋标签（NPY），默认 False。
+        - save_interacting_argo (bool): True 时保存本期交互 Argo 明细（Parquet），默认 False，输出目录按 detection_config.file_stem() 划分。
+
+    输出:
+        保存到 `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/`：
+
+            - `All_Tracks_{start}_to_{end}.png`
+            - `Interacted_Eddies_{start}_{end}_{file_stem}.npy`（save_interacted_eddies=True 时）
+            - `Interacting_Argo_{start}_{end}_{file_stem}.parquet`（save_interacting_argo=True 时）
     """
     # --- 0. 确定数据源 ---
     local_eddy_datasets = eddy_datasets
@@ -12938,10 +13036,10 @@ def _load_eddy_datasets_for_range(
     return out
 
 def worker_wrapper(args: tuple):
-    """multiprocessing worker 包装函数。
+    """multiprocessing worker 包装函数；结果由 plot_all_tracks_in_range 写盘保存。
+
     参数:
-        args: (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels, save_interacting_argo, save_interacted_eddies, cfg)
-    返回: None（结果由子函数写盘保存）。
+        - args (tuple): (start_date_str, end_date_str, plot_unrelated_eddies, skip_save_if_empty, show_labels, save_interacting_argo, save_interacted_eddies, cfg)。
     """
     start_d, end_d, unrelated_flag, skip_empty, show_labels, save_interacting_argo_flag, save_eddies_flag, cfg = args
     try:
@@ -12975,33 +13073,30 @@ def run_batch_plotting_multiprocessing(
     save_interacting_argo: bool = False,
 ):
     """
-    (批处理控制器) 使用multiprocessing启动一个扁平化的并行绘图作业，并带有进度条。
-    
-    功能:
-        1. 创建一个横跨指定数量核心的进程池。
-        2. 使用initializer高效地将涡旋数据共享给所有工作进程。
-        3. 按月份切分任务，并使用tqdm实时显示处理进度。
+    使用 multiprocessing 启动一个扁平化的并行绘图作业，并带进度条（批处理控制器）。
+
+    创建横跨指定核心数的进程池，用 initializer 高效将涡旋数据共享给所有工作进程，按月份切分任务并用
+    tqdm 实时显示进度。
 
     参数:
-        start_date_str (str): 批处理的开始日期 'YYYY-MM-DD'。
-        end_date_str (str): 批处理的结束日期 'YYYY-MM-DD'。
-        eddy_datasets (dict): 【已加载】的、将被共享给所有进程的涡旋数据集。
-        num_workers (int): 需要启动的并行工作进程数（核心数）。
-        plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋。
-        skip_save_if_empty (bool): 批处理默认 True（空图不保存）；当传入 False 时，将把 False 透传至 worker，空图也会保存。
-        show_labels (bool | None): 是否绘制轨迹标签；None 表示使用智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        save_interacted_eddies (bool): True 时各月份写出 `Interacted_Eddies_*.npy` 并在末尾汇总；默认 False。
-        save_interacting_argo (bool): True 时各月份写出 `Interacting_Argo_*.parquet` 并在末尾聚合；默认 False。
+        - start_date_str (str): 批处理的开始日期 'YYYY-MM-DD'。
+        - end_date_str (str): 批处理的结束日期 'YYYY-MM-DD'。
+        - eddy_datasets (dict): 【已加载】的、将被共享给所有进程的涡旋数据集。
+        - num_workers (int): 需要启动的并行工作进程数（核心数）。
+        - plot_unrelated_eddies (bool): 是否在批处理中绘制无关涡旋，默认 False。
+        - skip_save_if_empty (bool): 批处理默认 True（空图不保存）；传 False 时透传至 worker，空图也会保存。
+        - show_labels (bool | None): 是否绘制轨迹标签；None 时智能判定（全球且 plot_unrelated_eddies=True 时默认 False）。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - save_interacted_eddies (bool): True 时各月份写出 `Interacted_Eddies_*.npy` 并在末尾汇总，默认 False。
+        - save_interacting_argo (bool): True 时各月份写出 `Interacting_Argo_*.parquet` 并在末尾聚合，默认 False。
 
-        输出:
-                - 每月图像写入 `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/`。
-                - 当 save_interacted_eddies=True：整期交互涡旋标签汇总保存为带阈值后缀的 NPY：
-                    `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/eddy_list_<detection_config.file_stem()>.npy`。
-                - 当 save_interacting_argo=True 时，额外保存整期交互 Argo 汇总（Parquet）：
-                    `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<detection_config.file_stem()>/interacting_argo_all_<detection_config.file_stem()>.parquet`。
-        清理:
-                - 批处理开始前仅清空当前 detection_config.file_stem() 子目录，不会清空其它方法或参数目录。
+    输出:
+        - 每月图像写入 `plot_outputs/<method>/<region>/plot_all_tracks_in_range/<file_stem>/`。
+        - save_interacted_eddies=True 时整期交互涡旋标签汇总为 `.../eddy_list_<file_stem>.npy`。
+        - save_interacting_argo=True 时整期交互 Argo 汇总为 `.../interacting_argo_all_<file_stem>.parquet`。
+
+    说明:
+        - 批处理开始前仅清空当前 detection_config.file_stem() 子目录，不会清空其它方法或参数目录。
     """
     print("="*60)
     print("      Multiprocessing Batch Plotting with Progress Bar      ")
@@ -13131,16 +13226,16 @@ def load_combined_eddy_list(
     """读取并合并单个阈值目录下的 `eddy_list*.npy`（及可选月度文件）。
 
     参数:
-        region: 区域 slug；None 时复用当前 `switch_region` 的配置。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        thr_dir: 参数子目录名称或路径；None 时自动扫描 do/aou/trim 参数目录并要求只存在一个候选目录。
-        plots_root: 可选自定义 `plot_outputs` 根路径；None 使用配置 `plots_output_root`。
-        include_monthly: True 时若目录缺少汇总 `eddy_list*.npy`，会退回加载 `Interacted_Eddies_*.npy`（逐月文件）。
-        deduplicate: True 返回去重并排序后的唯一列表；False 按读取顺序返回。
-        save_path: 可选输出路径；相对路径时会解析到目标阈值目录中。
+        - region (str | None): 区域 slug；None 时复用当前 switch_region 的配置。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - thr_dir (str | Path | None): 参数子目录名称或路径；None 时自动扫描 do/aou/trim 参数目录并要求只存在一个候选目录。
+        - plots_root (str | Path | None): 自定义 plot_outputs 根路径；None 时使用配置 plots_output_root。
+        - include_monthly (bool): True 时若目录缺少汇总 `eddy_list*.npy`，退回加载 `Interacted_Eddies_*.npy`（逐月文件），默认 True。
+        - deduplicate (bool): True 返回去重并排序后的唯一列表，False 按读取顺序返回，默认 True。
+        - save_path (str | Path | None): 可选输出路径；相对路径时会解析到目标阈值目录中。
 
     返回:
-        list[str]: 聚合后的涡旋标签列表；当没有匹配文件时返回空列表。
+        - list[str]: 聚合后的涡旋标签列表；无匹配文件时返回空列表。
     """
     region_slug = region or _current_region_key()
     cfg = _resolve_detection_config(detection_config)
@@ -13221,43 +13316,36 @@ def plot_argo_hotspots(
     argo_glorys_summary_data_path: str | Path | None = None,
     split_plots: bool | str = False,
     hotspot_type_heave_threshold: float | None = _heave_depth_threshold,
-):
+) -> dict | None:
     """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
 
-    流程：
-      1. 逐年加载 Argo 年度数据并合并；可利用全局 lonmin/latmin/lonmax/latmax 做空间裁剪；
-      2. 用 calculate_delta_do 按 detection_config 检测每个剖面的潜在异常；
-      3. 深度限制由 DetectionConfig 统一管理；
-      4. 每个剖面保留 anomaly_score 最强的一条记录；
-      5. 绘制异常散点（可选固定色标范围），并可选绘制所有匹配剖面基线位置（空心灰圈）。
+    逐年加载 Argo 年度数据并合并（可利用全局 lonmin/latmin/lonmax/latmax 做空间裁剪），用
+    `calculate_delta_do` 按 detection_config 检测每个剖面的潜在异常（深度限制由 DetectionConfig
+    统一管理），每个剖面只保留 anomaly_score 最强的一条记录，再绘制异常散点（可选固定色标范围），
+    并可选叠加所有匹配剖面的基线位置（空心灰圈）。
 
     参数:
-        start_year / end_year: 年度范围（闭区间）。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        plot_unrelated_argo: 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
-        fix_colorbar / cbar_min / cbar_max / cbar_ticks: 异常主变量色标控制。
-        save_fig / show_fig: 输出控制。
-        save_data (bool): True 时保存 anomalies 为 Parquet；False 不保存数据，输出路径固定为 `plot_outputs/<method>/<region>/plot_argo_hotspots/`。
-        dask_scheduler (str | None): Dask 调度器，'threads'|'processes'|'single'，None 默认 'processes'。
-        dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
-        dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 '4GB'；None 不限制。
-        use_interacting_argo (bool): 是否读取 run_batch_plotting_multiprocessing 生成的交互 Argo 文件，
-                                          并在图中区分交互/非交互 Argo，同时统计交互比例。
-                                          默认 False。
-        use_glorys_heave (bool): 是否读取 ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的 summary parquet，
-            用 GLORYS OI 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 OI 时会退回
-            “近岸第 3 类 / 非第 3 类”绘图。
-        argo_glorys_summary_data_path: 可选 GLORYS overview summary parquet 路径；None 时按默认命名自动定位。
-        split_plots (bool | str): False 时只绘制合并图；True 时按默认规则拆图。
-            也可直接传拆图模式字符串：
-            - ``'eddy_interaction'``：原有 META 交互/非交互拆图；
-            - ``'hotspot_type'``：按 hotspot_type=1/2/3 拆图；
-            - ``'spice_type'``：按 spice_type=1/2/3 拆图，需 summary parquet 含 spice_type；
-            - ``'cross'``：按 hotspot_type{1,2} × spice_type{1,2} 叉乘 + type 3 OMZ 拆图。
-            True 时，若 use_glorys_heave=True 或 use_interacting_argo=False 默认 ``'hotspot_type'``；
-            仅 use_interacting_argo=True 时默认 ``'eddy_interaction'``。
-        hotspot_type_heave_threshold: 当 anomalies 中已含 ``glorys_heave_zmin`` 时，用于生成 hotspot_type 的 出露深度阈值。
+        - start_year / end_year (int): 年度范围（闭区间）。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - plot_unrelated_argo (bool): 是否绘制所有匹配剖面基线（被筛掉或无异常的）。
+        - fix_colorbar / cbar_min / cbar_max / cbar_ticks: 异常主变量色标控制。
+        - save_fig / show_fig (bool): 输出控制。
+        - save_data (bool): True 时保存 anomalies 为 Parquet，False 不保存数据。默认 True。
+        - dask_scheduler (str | None): Dask 调度器，`'threads'`|`'processes'`|`'single'`，None 默认 `'processes'`。
+        - dask_workers (int | None): Dask worker 数量；None 自动取 min(年度数, CPU)。
+        - dask_memory_limit (str | None): LocalCluster 模式下的单 worker 内存限制，如 `'4GB'`；None 不限制。
+        - use_interacting_argo (bool): 是否读取 `run_batch_plotting_multiprocessing` 生成的交互 Argo 文件，并在图中区分交互/非交互 Argo，同时统计交互比例。默认 False。
+        - use_glorys_heave (bool): 是否读取 `plot_hotspot_anomaly_argo_glorys_overviews` 保存的 summary parquet，用 GLORYS OI 将非近岸异常进一步分为 hotspot_type 1/2。找不到文件或 OI 时退回「近岸第 3 类 / 非第 3 类」绘图。
+        - argo_glorys_summary_data_path (str | Path | None): 可选 GLORYS overview summary parquet 路径；None 时按默认命名自动定位。
+        - split_plots (bool | str): False 时只绘制合并图；True 时按默认规则拆图（use_glorys_heave=True 或 use_interacting_argo=False 时默认 `'hotspot_type'`，仅 use_interacting_argo=True 时默认 `'eddy_interaction'`）。也可直接传拆图模式字符串：
 
+            - `'eddy_interaction'`：原有 META 交互/非交互拆图；
+            - `'hotspot_type'`：按 hotspot_type=1/2/3 拆图；
+            - `'spice_type'`：按 spice_type=1/2/3 拆图，需 summary parquet 含 spice_type；
+            - `'cross'`：按 hotspot_type{1,2} × spice_type{1,2} 叉乘 + type 3 OMZ 拆图。
+        - hotspot_type_heave_threshold (float | None): 当 anomalies 已含 `glorys_heave_zmin` 时，用于生成 hotspot_type 的出露深度阈值。
+    返回:
+        - dict | None: 含 `summary`（剖面计数/比例与异常、深度统计等汇总 dict）、`figure_paths`（写出的图像路径列表）、`anomalies_path`（异常 Parquet 路径，未保存时为 None）；筛选后无数据时整体返回 None。
     输出:
         - 图像（可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/Argo_Anomaly_Hotspots_*.png`
         - 异常数据（Parquet，可选）：`plot_outputs/<method>/<region>/plot_argo_hotspots/anomalies_{start}_{end}_{detection_config.file_stem()}.parquet`
@@ -14337,27 +14425,29 @@ def plot_hotspot_anomaly_vertical_profiles(
 ) -> dict:
     """基于 hotspots 异常文件批量绘制 Argo 垂向剖面。
 
-    说明:
-        1. 输入 anomalies parquet 仅包含异常摘要，不含完整剖面；本函数会按 Year+Profile_number 回查原始 Argo 年数据。
-        2. 绘图阶段复用 plot_vertical 的单剖面画线内核，并可通过 remove_outliers 控制基础 QC。
-
     参数:
-        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
-        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
-        detection_config: 异常识别配置；用于自动定位模式子目录与 detection_config.file_stem() 文件名。
-        variables: 每幅图绘制的变量列表，默认 ['DO','AOU','Temp','Salinity']。
-        remove_outliers: True 时按基础 QC 剔除异常值；False 时保留 QC 通过段为原色、断点用红线桥接，并用红色圆点标记 QC 异常值。
-        plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
-        annotate_delta_ts: 是否在标题标注当前异常方法的判别变量、辅助 ΔT/ΔS 及深度（默认 False）。
-        save_fig / show_fig: 输出控制。
-        clear_output_dir: 保存图片时是否在本次运行开始前清空输出目录，默认 True。
-        max_profiles: 最多绘制多少个异常剖面；None 表示全部。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        use_multiprocessing: 是否按年份并行绘图，默认 True；show_fig=True 时自动退回串行。
-        num_workers: 并行 worker 数；None 时自动取 min(年份数, CPU数, 8)。
+        - start_year (int | None): anomalies_path=None 时用于定位默认 anomalies 文件。
+        - end_year (int | None): 同上，结束年份。
+        - anomalies_path (str | Path | None): 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；用于自动定位模式子目录与 file_stem 文件名。
+        - variables (list): 每幅图绘制的变量列表，默认 ['DO','AOU','Temp','Salinity']。
+        - remove_outliers (bool): True 时按基础 QC 剔除异常值；False 时保留 QC 通过段为原色、断点用红线桥接并用红色圆点标记 QC 异常，默认 True。
+        - plot_normal_scatter (bool): 是否绘制正常值的孤立散点标记，默认 True。
+        - annotate_delta_ts (bool): 是否在标题标注当前异常方法的判别变量、辅助 ΔT/ΔS 及深度，默认 True。
+        - save_fig (bool): 是否保存图像，默认 True。
+        - show_fig (bool): 是否显示图像，默认 False。
+        - clear_output_dir (bool): 保存图片时是否在本次运行开始前清空输出目录，默认 True。
+        - max_profiles (int | None): 最多绘制多少个异常剖面；None 表示全部。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；None 时使用配置默认路径。
+        - use_multiprocessing (bool): 是否按年份并行绘图，默认 True；show_fig=True 时自动退回串行。
+        - num_workers (int | None): 并行 worker 数；None 时自动取 min(年份数, CPU数, 8)。
 
     返回:
-        dict: 包含 total_candidates/plotted_profiles/skipped_profiles/output_dir/anomalies_path。
+        - dict: 含 total_candidates/plotted_profiles/skipped_profiles/output_dir/anomalies_path。
+
+    说明:
+        - 输入 anomalies parquet 仅含异常摘要，不含完整剖面；本函数按 Year+Profile_number 回查原始 Argo 年数据。
+        - 绘图阶段复用 plot_vertical 的单剖面画线内核，可通过 remove_outliers 控制基础 QC。
     """
 
     cfg = _resolve_detection_config(detection_config)
@@ -14757,49 +14847,63 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
 ) -> dict:
     """为 hotspots 异常剖面批量绘制 Argo-centered GLORYS 水平图与垂向总览图。
 
-    ``z_overview`` / ``sigma_overview`` 独立控制 z 坐标与 σ 坐标 2x2 总览图，
-    默认 ``z_overview=True, sigma_overview=False``，两者可同时开启。
-
-    垂向剖面线默认为纬向（``k=0, b=center_lat``），与所有垂向函数的
-    缺省行为一致。输入 anomalies parquet 的定位规则与
-    ``plot_hotspot_anomaly_vertical_profiles`` 保持一致；每个剖面的 GLORYS 图
-    分别交给 ``plot_argo_horizontal_glorys`` 与
-    ``plot_argo_vertical_glorys_overview`` 生成。
+    z_overview/sigma_overview 独立控制 z 坐标与 σ 坐标 2×2 总览图（默认 z_overview=True、sigma_overview=False，
+    可同时开启）。垂向剖面线默认纬向（k=0、b=center_lat）；输入 anomalies parquet 的定位规则与
+    plot_hotspot_anomaly_vertical_profiles 一致，每个剖面的 GLORYS 图分别交给 plot_argo_horizontal_glorys 与
+    plot_argo_vertical_glorys_overview 生成。
 
     参数:
-        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
-        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
-        detection_config: 异常识别配置；同时用于水平图异常点与垂向图投影点筛选。
-        horizontal_variable: 水平 GLORYS 背景变量，默认 'vorticity'。
-        horizontal_argo_depth: 是否额外绘制 Argo 异常深度的水平图，默认 False（仅海表）。
-        vertical_variables: 垂向总览变量；None 时使用 overview 默认 ['vorticity','sigma','thetao','salinity']。
-        needed_depth: 水平图读取深度，默认 0 m。
-        xmin/xmax/ymin/ymax: 垂向图（z 坐标）显示范围；xmin/xmax 也决定 Argo-centered GLORYS 读取窗口。
-        profile_spacing_km / interpolate_z / profile_depth_spacing_m: 传递给垂向 GLORYS 插值。
-        z_overview: 是否绘制 z 坐标 2x2 垂向总览图，默认 True。
-        sigma_overview: 是否绘制 σ 坐标 2x2 垂向总览图（PV / Z(σ) / θ / S），默认 False。
-        ts_diagram: 是否额外绘制 T-S 图（仅 Argo 场景生效），默认 False。
-        plot_mlt / plot_argo_projection: z 坐标总览图附加层控制。
-        plot_isolines / isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines:
-            z 坐标与 σ 坐标总览图共用；各面板叠加自身变量的等值线。
-        argo_min_depth / argo_projection_min_depth: 分别覆盖水平图异常点与垂向投影点的最小深度阈值。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
-        clear_output_dir: 保存图片时是否在本次运行开始前清空批处理专属输出目录。
-        save_fig / show_fig / inline_mode: 输出控制；默认保存图片且不显示图窗。
-        verbose: 是否打印底层单图保存路径等详细信息；批处理默认关闭。
-        use_multiprocessing: 是否用多进程并行处理 profile；默认 True。
-        num_workers: worker 数；None 时自动取 min(profile数, CPU数, 4)。
-        maxtasksperchild: 每个 worker 处理多少个任务后重启；None 表示不自动重启。
-        heave_x_window_km / heave_z_window_m: OI 局地窗口半宽。
-        annotate_heave: 是否在 vertical overview 标题中显示出露深度。
-        annotate_spice: 是否在标题标注 spiciness 异常 δπ 并在 summary parquet 中输出对应列，默认 True。
-        return_details: 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
-        save_summary_data: 是否保存逐 profile GLORYS/Heave 诊断明细 parquet，默认 True。
-        summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
+        - start_year (int | None): anomalies_path=None 时用于定位默认 anomalies 文件。
+        - end_year (int | None): 同上，结束年份。
+        - anomalies_path (str | Path | None): 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；同时用于水平图异常点与垂向图投影点筛选。
+        - horizontal_variable (str): 水平 GLORYS 背景变量，默认 'vorticity'。
+        - horizontal_argo_depth (bool): 是否额外绘制 Argo 异常深度的水平图，默认 False（仅海表）。
+        - vertical_variables (list[str] | None): 垂向总览变量；None 时用默认 ['vorticity','sigma','thetao','salinity']。
+        - needed_depth (float | int): 水平图读取深度（m），默认 0。
+        - xmin (float): 垂向图横向下界（km），同时决定 Argo-centered GLORYS 读取窗口，默认 -400.0。
+        - xmax (float): 垂向图横向上界（km），默认 400.0。
+        - ymin (float): 垂向图深度上界（m），默认 0.0。
+        - ymax (float): 垂向图深度下界（m），默认 1000.0。
+        - profile_spacing_km (float | None): 垂向 GLORYS 插值的水平采样步长（km）；None 时用配置默认。
+        - interpolate_z (bool): 是否将深度轴重采样到等间距网格，默认 True。
+        - profile_depth_spacing_m (float | None): 深度重采样步长（m）；None 时用配置默认。
+        - plot_mlt (bool): z 坐标总览图是否叠加混合层深度线，默认 False。
+        - plot_argo_projection (bool): z 坐标总览图是否叠加 Argo 投影层，默认 True。
+        - plot_isolines (bool): 是否叠加变量等值线（z 与 σ 总览图共用），默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - argo_min_depth (float | None): 覆盖水平图异常点最小深度阈值（m）；None 时用配置。
+        - argo_projection_min_depth (float | None): 覆盖垂向投影点最小深度阈值（m）；None 时用配置。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；None 时使用配置默认路径。
+        - output_dir (str | Path | None): 批处理专属输出根目录；None 时使用当前 method/region 默认目录。
+        - clear_output_dir (bool): 保存图片时是否在本次运行开始前清空批处理专属输出目录，默认 True。
+        - save_fig (bool): 是否保存图像，默认 True。
+        - show_fig (bool): 是否显示图像，默认 False。
+        - inline_mode (bool): 是否使用内联静态模式，默认 True。
+        - verbose (bool): 是否打印底层单图保存路径等详细信息，默认 False。
+        - use_multiprocessing (bool): 是否用多进程并行处理 profile，默认 True。
+        - num_workers (int | None): worker 数；None 时自动取 min(profile数, CPU数, 4)。
+        - maxtasksperchild (int | None): 每个 worker 处理多少任务后重启；None 表示不自动重启，默认 4。
+        - heave_x_window_km (float): OI 局地水平窗口半宽（km），默认 25.0。
+        - heave_z_window_m (float | None): OI 局地垂向窗口半宽（m），默认 100.0。
+        - heave_search_range (float): 从 σ_argo 向上搜索的 σ 跨度（kg/m³），默认来自 processing.yml。
+        - heave_depth_threshold (float): 通风判定深度（m），默认来自 processing.yml。
+        - heave_z_search_m (float | None): 等密线连通性垂向范围（m），默认来自 processing.yml。
+        - annotate_heave (bool): 是否在 vertical overview 标题显示出露深度，默认 True。
+        - annotate_spice (bool): 是否在标题标注 spiciness 异常 δπ 并在 summary parquet 输出对应列，默认 True。
+        - z_overview (bool): 是否绘制 z 坐标 2×2 垂向总览图，默认 True。
+        - sigma_overview (bool): 是否绘制 σ 坐标 2×2 垂向总览图（PV/Z(σ)/θ/S），默认 False。
+        - ts_diagram (bool): 是否额外绘制 T-S 图（仅 Argo 场景生效），默认 False。
+        - return_details (bool): 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
+        - save_summary_data (bool): 是否保存逐 profile GLORYS/Heave 诊断明细 parquet，默认 True。
+        - summary_data_path (str | Path | None): 明细 parquet 保存路径；None 时使用批处理专属输出目录。
 
     返回:
-        dict: 默认包含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/summary_data_path 等摘要。
+        - dict: 默认含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/summary_data_path 等摘要。
     """
 
     def _to_int_or_none(val):
@@ -15313,41 +15417,46 @@ def plot_hotspot_anomaly_argo_reconstruction_overviews(
     便于事后审计与回调阈值。
 
     参数:
-        start_year / end_year: 当 anomalies_path=None 时，用于按命名规则定位默认 anomalies 文件。
-        anomalies_path: 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
-        detection_config: 异常识别配置；用于筛选 detection_method 与定位输出目录。
-        k: 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
-        radius_km: 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认 400 km。
-        day_window: 时间窗半宽（天），围绕剖面日期取 ±day_window，默认 15。
-        h_bw: 水平高斯核带宽（km），默认 60 km（保留中尺度结构）。
-        depth_bw: 垂向高斯核带宽（m），默认 25 m。
-        h_spacing_deg: 重建网格水平间距（°），默认 0.1°。
-        z_max_m: 最大重建深度（m），默认 1500 m。
-        z_spacing_m: 垂向网格间距（m），默认 10 m。
-        min_weight: 最小累积权重阈值，低于此值格点标为 NaN，默认 3.0。
-        x_spacing_km: 断面水平采样间距（km），默认 5 km。
-        ymin / ymax: 图纵轴（深度）范围（m），默认 0–1000 m；3D 场仍建到 z_max_m。
-        min_profiles: 预筛一段，盒子+时间窗内剖面数下限，不足直接跳过，默认 20。
-        min_coverage_top1000: 预筛二段，≤1000m 预估覆盖率下限，不足直接跳过，默认 0.5。
-        coverage_probe_spacing_m: 预估覆盖率的粗深度探针步长（m），默认 100 m。
-        plot_isolines / isoline_levels / isoline_color / isoline_linewidth / isoline_alpha / label_isolines:
-            σ₀ 等值线开关与样式。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
-        clear_output_dir: 保存图片时是否在本次运行开始前清空批处理专属输出目录，默认 True。
-        save_fig / show_fig: 输出控制；默认保存图片且不显示图窗。
-        verbose: 是否打印底层单图进度等详细信息；批处理默认关闭。
-        use_multiprocessing: 是否按剖面并行；并行时每个 worker 内部 build 强制单进程以避免嵌套，默认 True。
-        num_workers: worker 数；None 时自动取 min(剖面数, CPU数, 24)（物理核量级，纯本地 IO 可放心拉满）。
-        maxtasksperchild: 每个 worker 处理多少任务后重启；None 表示不自动重启。
-        return_details: 是否在返回值中附每条剖面的运行记录；默认 False。
-        save_summary_data: 是否保存逐剖面预筛/覆盖率明细 parquet，默认 True。
-        summary_data_path: 明细 parquet 保存路径；None 时使用批处理专属输出目录。
+        - start_year (int | None): anomalies_path=None 时按命名规则定位默认 anomalies 文件。
+        - end_year (int | None): 同上，结束年份。
+        - anomalies_path (str | Path | None): 指定 anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；用于筛选 detection_method 与定位输出目录。
+        - k (float): 断面测线斜率 Δlat/Δlon，0.0 为纬向，默认 0.0。
+        - radius_km (float): 中心半径（km），同时作为采集盒子半宽与断面 x 轴半宽，默认来自配置。
+        - day_window (int): 时间窗半宽（天），围绕剖面日期取 ±day_window，默认来自配置。
+        - h_bw (float): 水平高斯核带宽（km，保留中尺度结构），默认来自配置。
+        - depth_bw (float): 垂向高斯核带宽（m），默认来自配置。
+        - h_spacing_deg (float): 重建网格水平间距（°），默认来自配置。
+        - z_max_m (float): 最大重建深度（m），默认来自配置。
+        - z_spacing_m (float): 垂向网格间距（m），默认来自配置。
+        - min_weight (float): 最小累积权重阈值，低于此值格点标为 NaN，默认来自配置。
+        - x_spacing_km (float): 断面水平采样间距（km），默认来自配置。
+        - ymin (float): 图纵轴深度上界（m），默认 0.0。
+        - ymax (float): 图纵轴深度下界（m），默认 1000.0；3D 场仍建到 z_max_m。
+        - min_profiles (int): 预筛一段，盒子+时间窗内剖面数下限，不足直接跳过，默认来自配置。
+        - min_coverage_top1000 (float): 预筛二段，≤1000m 预估覆盖率下限，不足直接跳过，默认来自配置。
+        - coverage_probe_spacing_m (float): 预估覆盖率的粗深度探针步长（m），默认来自配置。
+        - plot_isolines (bool): 是否叠加 σ₀ 等值线，默认 True。
+        - isoline_levels (int | list[float] | np.ndarray | None): 等值线级别数或显式级别；None 时自动。
+        - isoline_color (str): 等值线颜色，默认 'black'。
+        - isoline_linewidth (float): 等值线线宽，默认 0.8。
+        - isoline_alpha (float): 等值线透明度，默认 0.45。
+        - label_isolines (bool): 是否标注等值线数值，默认 True。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；None 时使用配置默认路径。
+        - output_dir (str | Path | None): 批处理专属输出根目录；None 时使用当前 method/region 默认目录。
+        - clear_output_dir (bool): 保存图片时是否在本次运行开始前清空批处理专属输出目录，默认 True。
+        - save_fig (bool): 是否保存图像，默认 True。
+        - show_fig (bool): 是否显示图像，默认 False。
+        - verbose (bool): 是否打印底层单图进度等详细信息，默认 False。
+        - use_multiprocessing (bool): 是否按剖面并行；并行时每个 worker 内部 build 强制单进程以避免嵌套，默认 True。
+        - num_workers (int | None): worker 数；None 时自动取 min(剖面数, CPU数, 24)。
+        - maxtasksperchild (int | None): 每个 worker 处理多少任务后重启；None 表示不自动重启，默认 4。
+        - return_details (bool): 是否在返回值中附每条剖面的运行记录，默认 False。
+        - save_summary_data (bool): 是否保存逐剖面预筛/覆盖率明细 parquet，默认 True。
+        - summary_data_path (str | Path | None): 明细 parquet 保存路径；None 时使用批处理专属输出目录。
 
     返回:
-        dict: 含 total_candidates / processed_profiles / skipped_profiles / failed_profiles /
-            output_dir / vertical_output_dir / anomalies_path / summary_data_path 等摘要；
-            return_details=True 时附带每条剖面的 results 列表。
+        - dict: 含 total_candidates/processed_profiles/skipped_profiles/failed_profiles/output_dir/vertical_output_dir/anomalies_path/summary_data_path 等摘要；return_details=True 时附带每条剖面的 results 列表。
     """
 
     def _to_int_or_none(val):
@@ -15985,38 +16094,35 @@ def plot_glorys_detail_loss_residual_atlas(
     对比南大洋；另出一张单剖面对比图，逐条叠 Argo / GLORYS 同位 / GLORYS 最佳匹配三条潜温廓线。
 
     参数:
-        start_year / end_year: 当 anomalies_path=None 时，用于定位默认 anomalies 文件。
-        anomalies_path: anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
-        detection_config: 异常识别配置；决定 method/region 与默认输入输出路径。
-        z_max_m: 残差比较的最大深度（m），默认取 processing.yml。
-        z_spacing_m: 潜温廓线统一插值的垂向间距（m）。
-        fine_struct_window: 高通细结构的滚动窗口点数（×z_spacing_m 为物理尺度）。
-        sameloc_radius_km: 同位 GLORYS 读取窗口半宽（km）。
-        match_radius_km: 最佳匹配搜索的 GLORYS 读取窗口半宽（km）。
-        match_window_deg / match_window_days: 最佳匹配的经纬度（°）与时间（天）搜索半宽。
-        match_min_depth_coverage: 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，剔除浅海床
-            截断列以截断深度刷低 RMS 误胜的伪匹配。
-        so_lat_threshold: 南大洋专项分界纬度（°），低于此值归为 SO。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        output_dir: 批处理专属输出根目录；None 使用当前 method/region 下的默认目录。
-        rows_path: 逐剖面明细 parquet 路径；None 时落在 output_dir 下默认文件名。同目录会另存一份
-            同名 `_curves.npz`（全部廓线），供重绘单剖面对比图时零 GLORYS 读地复用。
-        reuse_rows: 若明细 parquet 已存在则直接复用、跳过计算（仅重绘图时用）；此时单剖面图从
-            `_curves.npz` 取，缺失的剖面才按需补算，默认 False。
-        make_figures: 是否渲染聚合图，默认 True。
-        save_fig: 是否把图保存到 output_dir，默认 True；批处理仅离线渲染。
-        profile_examples: 单剖面对比图（Argo / 同位 / 最佳匹配 三条廓线）要画的 Profile_number 列表；
-            None 时按 fine_ratio_best 等距自动选样。
-        n_example_profiles: 自动选样时的剖面数（按细结构比从最差到最好等距取），<=0 关闭该图，默认 8。
-        use_multiprocessing: 是否多进程并行计算 profile，默认 True。
-        num_workers: worker 数；None 时自动取 min(profile数, CPU数, 12)。
-        maxtasksperchild: 每个 worker 处理多少任务后重启；None 表示不重启（保留 Argo 年缓存）。
-        verbose: 是否打印每条 profile 的失败明细。
-        return_details: 是否在返回中附带逐 profile 结果 DataFrame，默认 False。
+        - start_year (int | None): anomalies_path=None 时用于定位默认 anomalies 文件。
+        - end_year (int | None): 同上，结束年份。
+        - anomalies_path (str | Path | None): anomalies parquet 路径；None 时按 plot_argo_hotspots 命名规则自动定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认输入输出路径。
+        - z_max_m (float): 残差比较的最大深度（m），默认来自 processing.yml。
+        - z_spacing_m (float): 潜温廓线统一插值的垂向间距（m），默认来自配置。
+        - fine_struct_window (int): 高通细结构的滚动窗口点数（×z_spacing_m 为物理尺度），默认来自配置。
+        - sameloc_radius_km (float): 同位 GLORYS 读取窗口半宽（km），默认来自配置。
+        - match_radius_km (float): 最佳匹配搜索的 GLORYS 读取窗口半宽（km），默认来自配置。
+        - match_window_deg (float): 最佳匹配的经纬度搜索半宽（°），默认来自配置。
+        - match_window_days (int): 最佳匹配的时间搜索半宽（天），默认来自配置。
+        - match_min_depth_coverage (float): 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，剔除浅海床截断列以截断深度刷低 RMS 误胜的伪匹配，默认来自配置。
+        - so_lat_threshold (float): 南大洋专项分界纬度（°），低于此值归为 SO，默认来自配置。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；None 时使用配置默认路径。
+        - output_dir (str | Path | None): 批处理专属输出根目录；None 时使用当前 method/region 默认目录。
+        - rows_path (str | Path | None): 逐剖面明细 parquet 路径；None 时落在 output_dir 下默认文件名；同目录另存同名 `_curves.npz`（全部廓线）供重绘单剖面对比图时零 GLORYS 读地复用。
+        - reuse_rows (bool): 明细 parquet 已存在时直接复用、跳过计算（仅重绘图时用），此时单剖面图从 `_curves.npz` 取、缺失剖面才补算，默认 False。
+        - make_figures (bool): 是否渲染聚合图，默认 True。
+        - save_fig (bool): 是否把图保存到 output_dir，默认 True。
+        - profile_examples (list[int] | None): 单剖面对比图（Argo/同位/最佳匹配三条廓线）要画的 Profile_number 列表；None 时按 fine_ratio_best 等距自动选样。
+        - n_example_profiles (int): 自动选样时的剖面数（按细结构比从最差到最好等距取），<=0 关闭该图，默认 8。
+        - use_multiprocessing (bool): 是否多进程并行计算 profile，默认 True。
+        - num_workers (int | None): worker 数；None 时自动取 min(profile数, CPU数, 12)。
+        - maxtasksperchild (int | None): 每个 worker 处理多少任务后重启；None 表示不重启（保留 Argo 年缓存）。
+        - verbose (bool): 是否打印每条 profile 的失败明细，默认 False。
+        - return_details (bool): 是否在返回中附带逐 profile 结果 DataFrame，默认 False。
 
     返回:
-        dict: 含 total_candidates/processed_profiles/skipped_profiles/rows_path/output_dir/
-              figures/southern_ocean 等摘要；return_details=True 时附 'rows'（DataFrame）。
+        - dict: 含 total_candidates/processed_profiles/skipped_profiles/rows_path/output_dir/figures/southern_ocean 等摘要；return_details=True 时附 'rows'（DataFrame）。
     """
     cfg = _resolve_detection_config(detection_config)
     method_name = cfg.method
@@ -16215,45 +16321,40 @@ def export_hotspot_anomaly_summary_table(
 ) -> dict:
     """导出 hotspot anomaly 检查用 summary 表。
 
-    该函数不重新做异常检测或 GLORYS 绘图。基础剖面信息与异常指标来自
-    ``plot_argo_hotspots`` 保存的 anomalies parquet；OI 与 GLORYS 绘图状态优先来自
-    ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值，若未传返回值则读取该函数默认保存的
-    summary parquet。若 heave 详情缺失，会在表中保留空值并给出提示。近岸 DO 形态指标优先读取
-    ``plot_argo_hotspots`` 新版 anomalies parquet 中已保存的列；旧版 parquet 缺列时才回查 Argo 年数据。
+    该函数不重新做异常检测或 GLORYS 绘图。基础剖面信息与异常指标来自 `plot_argo_hotspots` 保存的
+    anomalies parquet；OI 与 GLORYS 绘图状态优先来自 `plot_hotspot_anomaly_argo_glorys_overviews`
+    的返回值，若未传返回值则读取该函数默认保存的 summary parquet。若 heave 详情缺失，会在表中保留
+    空值并给出提示。近岸 DO 形态指标优先读取 `plot_argo_hotspots` 新版 anomalies parquet 中已保存的
+    列；旧版 parquet 缺列时才回查 Argo 年数据。
 
-    ``hotspot_type`` 用于快速人工复核，输出为类别名（与整数码一一对应，整数码本身仍保留在 anomalies parquet）：
-    ``OMZ``（原 3）表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；非近岸剖面中，heave 通风型为
-    ``ventilated``（原 1），否则为深层隔离型 ``isolated``（原 2）。
-
-    ``spice_type`` 是与 ``hotspot_type`` 正交的 T-S 水团轴，与之同构：整数码（``1`` cold-fresh /
-    ``2`` background-consistent / ``3`` warm-salty，阈值 ``detection_config.spice_percentile_threshold``）
-    由 plot_hotspot_anomaly_argo_glorys_overviews 写进 GLORYS overview summary parquet，导出时仅读码映射成名称。
-    二者叉乘即 T-S × 通风四宫格。
-    导出表把 ``hotspot_type``、``spice_type`` 连同身份-定位列前置到表头，其余为支撑证据列。
+    `hotspot_type` 用于快速人工复核，输出为类别名（与整数码一一对应，整数码本身仍保留在 anomalies
+    parquet）：`OMZ`（原 3）表示 Argo DO 剖面呈近岸型先快速降低再回升的形态；非近岸剖面中，heave
+    通风型为 `ventilated`（原 1），否则为深层隔离型 `isolated`（原 2）。`spice_type` 是与 `hotspot_type`
+    正交的 T-S 水团轴，与之同构：整数码（`1` cold-fresh / `2` background-consistent / `3` warm-salty，
+    阈值 `detection_config.spice_percentile_threshold`）由 `plot_hotspot_anomaly_argo_glorys_overviews`
+    写进 GLORYS overview summary parquet，导出时仅读码映射成名称；二者叉乘即 T-S × 通风四宫格。导出表
+    把 `hotspot_type`、`spice_type` 连同身份-定位列前置到表头，其余为支撑证据列。
 
     参数:
-        vertical_profiles_result: ``plot_hotspot_anomaly_vertical_profiles`` 的返回值。
-            仅用于兼容旧调用：若其中包含 ``anomalies_path``，可用来定位输入 parquet。
-        argo_glorys_result: ``plot_hotspot_anomaly_argo_glorys_overviews`` 的返回值。
-            若包含 ``results``，会合并 GLORYS 状态和 OI 字段。
-        start_year / end_year / anomalies_path: 当返回值中没有 anomalies_path 时用于定位输入 parquet。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        argo_glorys_summary_data_path: ``plot_hotspot_anomaly_argo_glorys_overviews`` 保存的明细 parquet。
-        output_path: 保存路径；None 时写到当前 method/region 的默认 summary 目录。
-        output_format: ``'csv'`` 或 ``'xlsx'``；None 时从 output_path 后缀推断，默认 ``'csv'``。
-        save_table: 是否保存表格文件，默认 True。
-        heave_z_threshold: 通风深度阈值 (m)，用于 hotspot_type 分类；设为 None 时不新增对应列。
-        diagnose_nearshore_do: 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
-        nearshore_do_min_threshold: 近岸型判据中，异常深度以上 DO 最小值阈值。
-        nearshore_do_drop_threshold: 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
-        nearshore_do_recovery_threshold: 近岸型判据中，最小 DO 到异常深度 DO 的最小回升幅度。
-        nearshore_do_depth_gap_threshold_m: 近岸型判据中，最小 DO 与异常深度的最小垂向间隔。
-        compact_columns: 是否删除人工检查中冗余的固定/重复列，默认 True。
-        require_glorys_details: True 时若缺少 GLORYS heave/OI 信息则报错。
-        verbose: 是否打印保存路径和缺失提示。
-
+        - vertical_profiles_result (dict | None): `plot_hotspot_anomaly_vertical_profiles` 的返回值。仅用于兼容旧调用：若含 `anomalies_path`，可用来定位输入 parquet。
+        - argo_glorys_result (dict | None): `plot_hotspot_anomaly_argo_glorys_overviews` 的返回值。若含 `results`，会合并 GLORYS 状态和 OI 字段。
+        - start_year / end_year / anomalies_path: 当返回值中没有 anomalies_path 时用于定位输入 parquet。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - argo_glorys_summary_data_path (str | Path | None): `plot_hotspot_anomaly_argo_glorys_overviews` 保存的明细 parquet。
+        - output_path (str | Path | None): 保存路径；None 时写到当前 method/region 的默认 summary 目录。
+        - output_format (str | None): `'csv'` 或 `'xlsx'`；None 时从 output_path 后缀推断，默认 `'csv'`。
+        - save_table (bool): 是否保存表格文件，默认 True。
+        - heave_z_threshold (float | None): 通风深度阈值 (m)，用于 hotspot_type 分类；None 时不新增对应列。
+        - diagnose_nearshore_do (bool): 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
+        - nearshore_do_min_threshold (float): 近岸型判据中，异常深度以上 DO 最小值阈值。
+        - nearshore_do_drop_threshold (float): 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
+        - nearshore_do_recovery_threshold (float): 近岸型判据中，最小 DO 到异常深度 DO 的最小回升幅度。
+        - nearshore_do_depth_gap_threshold_m (float): 近岸型判据中，最小 DO 与异常深度的最小垂向间隔。
+        - compact_columns (bool): 是否删除人工检查中冗余的固定/重复列，默认 True。
+        - require_glorys_details (bool): True 时若缺少 GLORYS heave/OI 信息则报错。
+        - verbose (bool): 是否打印保存路径和缺失提示。
     返回:
-        dict: 包含 ``summary_table``、``output_path``、``n_rows``、``warnings``。
+        - dict: 包含 `summary_table`、`output_path`、`n_rows`、`warnings`。
     """
 
     def _result_path(result: dict | None, key: str) -> Path | None:
@@ -17010,22 +17111,22 @@ def plot_single_hotspot_profile(
     """重绘单个 Hotspots Profile，并支持按变量单独调节横轴范围。
 
     参数:
-        profile_number: 目标剖面编号（Profile_number）。
-        profile_time: 时间输入，支持年份（如 2014）或日期/时间戳（如 '2014-05-09'）。
-        platform_number: 可选平台编号筛选。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        variables: 绘制变量列表，默认 ['DO', 'AOU', 'Temp', 'Salinity']。
-        xlim_overrides: 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}。
-                        键可用 'Temp' 或 'Temperature'。
-        remove_outliers: 与 plot_vertical 同义；False 时会显示 QC 异常标记与红色桥接线。
-        plot_normal_scatter: 是否绘制正常值的孤立散点标记，默认 True。
-        annotate_delta_ts: 是否在标题追加当前异常方法的判别变量、辅助 ΔT/ΔS 及深度。
-        save_fig/show_fig: 输出控制。
-        argo_data_dir: 年度 Argo parquet 目录，None 使用配置默认。
-        output_dir: 自定义输出目录；None 使用 plot_outputs/<method>/<region>/plot_argo_hotspots_vertical_profiles_single。
+        - profile_number (int): 目标剖面编号（Profile_number）。
+        - profile_time (int | str | pd.Timestamp): 时间输入，支持年份（如 2014）或日期/时间戳（如 '2014-05-09'）。
+        - platform_number (int | None): 可选平台编号筛选。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - variables (list): 绘制变量列表，默认 ['DO', 'AOU', 'Temp', 'Salinity']。
+        - xlim_overrides (dict[str, tuple[float, float]] | None): 横轴范围覆盖，如 {'DO': (0, 300), 'Temp': (-2, 30), 'Salinity': (33, 36)}；键可用 'Temp' 或 'Temperature'。
+        - remove_outliers (bool): 与 plot_vertical 同义；False 时显示 QC 异常标记与红色桥接线，默认 True。
+        - plot_normal_scatter (bool): 是否绘制正常值的孤立散点标记，默认 True。
+        - annotate_delta_ts (bool): 是否在标题追加当前异常方法的判别变量、辅助 ΔT/ΔS 及深度，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 时使用配置默认。
+        - output_dir (str | Path | None): 自定义输出目录；None 时使用 `plot_outputs/<method>/<region>/plot_argo_hotspots_vertical_profiles_single`。
 
     返回:
-        dict: 包含 save_path/profile_number/platform_number/date/ado/atemp/asalinity。
+        - dict: 含 save_path/profile_number/platform_number/date/ado/atemp/asalinity。
     """
     if argo_data_dir is None:
         argo_data_dir = argo_path
@@ -17986,21 +18087,20 @@ def build_glorys_eke_native_grid(
 ) -> dict:
     """在 GLORYS 原始网格上计算时段平均 EKE。
 
-    功能:
-        按天读取 GLORYS 的 uo/vo，在目标深度层计算
-        EKE = 0.5 * (u'^2 + v'^2)，并在时间维上聚合。
+    按天读取 GLORYS 的 uo/vo，在目标深度层计算 EKE = 0.5·(u'² + v'²) 并在时间维聚合。
 
     参数:
-        start_year, end_year: 年份范围（闭区间）。
-        depth: 目标深度（米），按最近深度层提取。
-        dask_scheduler: distributed 模式调度器（'threads'|'processes'）。
-        dask_workers: worker 数；None 自动估计。
-        dask_memory_limit: 每 worker 内存上限（如 '4GB'、'6GB'）。
-        dask_batch_size: 分批提交任务大小，用于限制同时在队列中的 futures 数量。
-        verbose: 是否打印进度。
+        - start_year (int): 起始年份（闭区间），默认 2002。
+        - end_year (int): 结束年份（闭区间），默认 2022。
+        - depth (float | int): 目标深度（米），按最近深度层提取，默认 0.0。
+        - dask_scheduler (str): distributed 调度器（'threads'|'processes'），默认 'processes'。
+        - dask_workers (int | None): worker 数；None 时自动估计。
+        - dask_memory_limit (str | None): 每 worker 内存上限（如 '4GB'、'6GB'）。
+        - dask_batch_size (int): 分批提交任务大小，限制同时在队列中的 futures 数量，默认 32。
+        - verbose (bool): 是否打印进度，默认 True。
 
     返回:
-        dict，含 'lon'、'lat'、'eke'、'count'、'meta'。
+        - dict: 含 'lon'、'lat'、'eke'、'count'、'meta'。
     """
     if end_year < start_year:
         raise ValueError("end_year 必须大于等于 start_year")
@@ -18168,7 +18268,16 @@ def remap_glorys_eke_to_euler_grid(
     grid_step_deg: float = 1.0,
     method: str = 'linear',
 ) -> dict:
-    """将 GLORYS 原网格 EKE 插值到当前区域的欧拉网格（默认 1°）。"""
+    """将 GLORYS 原网格 EKE 插值到当前区域的欧拉网格（默认 1°）。
+
+    参数:
+        - eke_native (dict): build_glorys_eke_native_grid 的输出（含 lon/lat/eke）。
+        - grid_step_deg (float): 目标欧拉网格步长（°），默认 1.0。
+        - method (str): RegularGridInterpolator 插值方法，默认 'linear'。
+
+    返回:
+        - dict: 含 'eke_grid'（区域外置 NaN）、'grid'（边与元信息）、'meta'。
+    """
     lon_src = np.asarray(eke_native['lon'], dtype=float)
     lat_src = np.asarray(eke_native['lat'], dtype=float)
     eke_src = np.asarray(eke_native['eke'], dtype=float)
@@ -18240,7 +18349,25 @@ def build_euler_eke_grid(
     dask_batch_size: int = 32,
     verbose: bool = True,
 ) -> dict:
-    """一站式计算：GLORYS 原网格 EKE -> 欧拉网格 EKE。"""
+    """一站式计算：GLORYS 原网格 EKE → 欧拉网格 EKE。
+
+    内部依次调用 build_glorys_eke_native_grid 与 remap_glorys_eke_to_euler_grid。
+
+    参数:
+        - start_year (int): 起始年份（闭区间），默认 2002。
+        - end_year (int): 结束年份（闭区间），默认 2022。
+        - depth (float | int): 目标深度（米），默认 0.0。
+        - grid_step_deg (float): 欧拉网格步长（°），默认 1.0。
+        - method (str): 插值方法，默认 'linear'。
+        - dask_scheduler (str): distributed 调度器，默认 'processes'。
+        - dask_workers (int | None): worker 数；None 时自动估计。
+        - dask_memory_limit (str | None): 每 worker 内存上限。
+        - dask_batch_size (int): 分批提交任务大小，默认 32。
+        - verbose (bool): 是否打印进度，默认 True。
+
+    返回:
+        - dict: 含 'native'（原网格结果）与 'euler'（重映射结果）。
+    """
     native = build_glorys_eke_native_grid(
         start_year=start_year,
         end_year=end_year,
@@ -18278,20 +18405,24 @@ def export_glorys_eke_native_dask(
 ) -> str:
     """使用 Dask 计算 GLORYS 原始分辨率 EKE 并保存到本地 zarr。
 
-    功能:
-        先调用 build_glorys_eke_native_grid 计算原始分辨率 EKE，
-        再写入 zarr（默认 GLORYS_processed/eke.zarr）。
-        默认参数为 8核 + 内存受限预设。
+    先调用 build_glorys_eke_native_grid 计算原始分辨率 EKE，再写入 zarr（默认 GLORYS_processed/eke.zarr）；
+    默认参数为 8 核 + 内存受限预设。
 
     参数:
-        start_year, end_year: 年份范围（闭区间）。
-        depth: 目标深度（米）。
-        output_path: 输出 zarr 路径；None 使用默认目录。
-        chunks: zarr 二维分块大小（lat, lon）。
-        dask_scheduler, dask_workers, dask_memory_limit,
-        dask_batch_size: 并行与内存控制参数。
-        overwrite: 输出已存在时是否覆盖。
-        verbose: 是否打印进度。
+        - start_year (int): 起始年份（闭区间），默认 2002。
+        - end_year (int): 结束年份（闭区间），默认 2022。
+        - depth (float | int): 目标深度（米），默认 0.0。
+        - output_path (str | Path | None): 输出 zarr 路径；None 时用默认目录。
+        - chunks (tuple[int, int]): zarr 二维分块大小 (lat, lon)，默认 (256, 256)。
+        - dask_scheduler (str): distributed 调度器，默认 'processes'。
+        - dask_workers (int | None): worker 数，默认 8。
+        - dask_memory_limit (str | None): 每 worker 内存上限，默认 '6GB'。
+        - dask_batch_size (int): 分批提交任务大小，默认 16。
+        - overwrite (bool): 输出已存在时是否覆盖，默认 False。
+        - verbose (bool): 是否打印进度，默认 True。
+
+    返回:
+        - str: 保存的 zarr 路径。
     """
     if output_path is None:
         output_path = glorys_processed_root / 'eke.zarr'
@@ -18347,7 +18478,14 @@ def export_glorys_eke_native_dask(
 
 
 def load_glorys_eke_native(file_path: str | Path) -> dict:
-    """从本地 zarr 文件加载 GLORYS 原始分辨率 EKE。"""
+    """从本地 zarr 文件加载 GLORYS 原始分辨率 EKE。
+
+    参数:
+        - file_path (str | Path): EKE zarr 目录路径（export_glorys_eke_native_dask 的输出）。
+
+    返回:
+        - dict: 含 lon/lat/eke/count 数组及 meta 元信息。
+    """
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(
@@ -18471,12 +18609,28 @@ def build_euler_grid_summary(
 ) -> dict:
     """构建欧拉网格汇总：ACE/CE 天数与 Argo 异常出现率。
 
-    统计口径：
-        1. 同日同网格同类型只计 1 天（按 date+grid 去重）。
-        2. 异常剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
-        3. 使用同一套区域边界与网格边界，确保三图可直接比较。
-        4. 深度筛选由 DetectionConfig 统一管理。
-        5. 关联分析默认使用异常出现率 anomaly_profiles / argo_baseline_profiles（仅 baseline>0 网格）。
+    参数:
+        - start_year (int): 起始年份（闭区间）。
+        - end_year (int): 结束年份（闭区间）。
+        - grid_step_deg (float): 欧拉网格步长（°），默认 1.0。
+        - meta_output_root (str | Path | None): META 导出根目录；None 时用默认。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时用默认。
+        - use_dask (bool): 是否用 Dask 并行，默认 True。
+        - dask_scheduler (str): distributed 调度器，默认 'processes'。
+        - dask_workers (int | None): worker 数；None 时自动估计。
+        - dask_show_progress (bool): 是否显示 Dask 进度，默认 True。
+
+    返回:
+        - dict: 含各类型网格天数、Argo baseline 与异常计数及网格元信息的汇总字典。
+
+    说明:
+        统计口径:
+
+            - 同日同网格同类型只计 1 天（按 date+grid 去重）。
+            - 异常剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
+            - 使用同一套区域边界与网格边界，确保三图可直接比较。
+            - 深度筛选由 DetectionConfig 统一管理。
+            - 关联分析默认用异常出现率 anomaly_profiles / argo_baseline_profiles（仅 baseline>0 网格）。
     """
     if end_year < start_year:
         raise ValueError("end_year 必须大于等于 start_year")
@@ -18694,7 +18848,21 @@ def plot_euler_grid_summary(
     cmap_eddy: str = 'YlOrRd',
     cmap_do: str = 'Reds',
 ) -> dict:
-    """绘制欧拉网格三图：ACE 天数、CE 天数、Argo 异常出现率。"""
+    """绘制欧拉网格三图：ACE 天数、CE 天数、Argo 异常出现率。
+
+    参数:
+        - summary (dict): build_euler_grid_summary 的输出。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_data (bool): 是否保存底层网格数据，默认 False。
+        - output_dir (str | Path | None): 输出目录；None 时使用默认路径。
+        - output_prefix (str): 输出文件名前缀，默认 'EddyDays'。
+        - cmap_eddy (str): 涡旋天数图色标，默认 'YlOrRd'。
+        - cmap_do (str): 异常出现率图色标，默认 'Reds'。
+
+    返回:
+        - dict: 含图/数据保存路径等信息。
+    """
     grid = summary['grid']
     meta = summary['meta']
 
@@ -19345,10 +19513,25 @@ def analyze_euler_ace_ce_association(
 ) -> dict:
     """在同一网格上分析并绘制 ACE/CE 与 Argo 异常出现率的关联性。
 
-    输出重点：
-        - 关联地图（ACE-Anomaly、CE-Anomaly）
-        - 正向指标：涡旋活跃区 vs 非活跃区的异常出现率提升
-        - 反向指标：异常出现率高区 vs 低区的涡旋天数提升
+    参数:
+        - summary (dict): build_euler_grid_summary 的输出。
+        - active_threshold (float | str | None): 涡旋活跃区分组阈值，可传数值或 'auto'，默认 'auto'。
+        - do_rate_high_low_threshold (float | str | None): 异常出现率高低分组阈值，可传数值或 'auto'，默认 'auto'。
+        - min_group_cells (int): 自动阈值扫描时每组最小网格数，默认 20。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - output_prefix (str): 输出文件名前缀，默认 'EddyDays'。
+        - output_dir (str | Path | None): 输出目录；None 时使用默认路径。
+
+    返回:
+        - dict: 含关联指标、阈值扫描结果与图像保存路径等。
+
+    说明:
+        分析输出:
+
+            - 关联地图（ACE-Anomaly、CE-Anomaly）。
+            - 正向指标：涡旋活跃区 vs 非活跃区的异常出现率提升。
+            - 反向指标：异常出现率高区 vs 低区的涡旋天数提升。
     """
     ace_days = np.asarray(summary['ace_days'], dtype=float)
     ce_days = np.asarray(summary['ce_days'], dtype=float)
@@ -19592,12 +19775,24 @@ def analyze_euler_eke_do_association(
 ) -> dict:
     """分析欧拉网格 EKE 与 Argo 异常出现率之间的关系并绘图。
 
-    输出两张图：
-        1) EKE 与 Argo Anomaly Occurrence Rate 概览图；
-        2) EKE-Anomaly Association 图。
-    同时输出双向 uplift：
-        - 正向：anomaly-rate uplift (EKE active vs inactive)
-        - 反向：EKE uplift (anomaly-rate high vs low)
+    参数:
+        - summary (dict): build_euler_grid_summary 的输出。
+        - eke_euler (dict | np.ndarray): 欧拉网格 EKE（remap/build_euler_eke_grid 的输出或其网格数组）。
+        - active_threshold (float | str | None): EKE active 分组阈值，可传数值或 'auto'，默认 'auto'。
+        - do_rate_high_low_threshold (float | str | None): 异常出现率高低分组阈值，可传数值或 'auto'，默认 'auto'。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - output_prefix (str): 输出文件名前缀，默认 'EKE'。
+        - output_dir (str | Path | None): 输出目录；None 时使用默认路径。
+
+    返回:
+        - dict: 含双向 uplift 指标与图像保存路径等。
+
+    说明:
+        分析输出:
+
+            - 两张图：EKE 与 Argo Anomaly Occurrence Rate 概览图、EKE-Anomaly Association 图。
+            - 双向 uplift：正向 anomaly-rate uplift（EKE active vs inactive）、反向 EKE uplift（anomaly-rate high vs low）。
     """
     grid = summary['grid']
     meta = summary.get('meta', {})
@@ -19858,40 +20053,34 @@ def run_euler_grid_analysis(
 ) -> dict:
     """执行欧拉网格统计与关联分析流程。
 
-        流程：
-            1. 调用 `build_euler_grid_summary` 生成网格统计底图；
-            2. 当 targets 包含 `eddy_days` 时绘制 ACE/CE 三联图；
-            3. 按 `analysis_targets` 可选执行 eddy-days 与 EKE 关联分析。
+    依次调用 build_euler_grid_summary 生成网格统计底图，当 targets 含 'eddy_days' 时绘制 ACE/CE 三联图，
+    并按 analysis_targets 可选执行 eddy-days 与 EKE 关联分析。
 
-    参数：
-        start_year / end_year: 统计年份范围（闭区间）。
-        analysis_targets: 分析内容开关。可选 'eddy_days'、'eke'；支持字符串或列表。
-        run_association: 是否执行关联分析。
-        grid_step_deg: 网格分辨率（度）。
-        detection_config: 异常识别配置；None 时使用 processing.yml 默认值。
-        analysis_depth: 统一分析深度（m），用于 DetectionConfig 的异常深度筛选与 EKE 采样深度；None 回退配置默认值。
-        active_threshold: 关联分析中 active 分组阈值；可传数值或 'auto'。
-        do_rate_high_low_threshold: 关联分析中异常出现率高低分组阈值；可传数值或 'auto'。
-        min_group_cells: 自动阈值扫描时每组最小网格数。
-        eke_file_path: 本地 EKE 原始分辨率 zarr 路径；None 时默认读取 GLORYS_processed/eke.zarr。
-        show_fig / save_fig / save_data: 图像与数据输出控制。
-        output_prefix: eddy-days 输出文件名前缀（默认 'EddyDays'）。
-        eke_output_prefix: EKE 关联图输出前缀。
-        meta_output_root: META 轨迹数据根目录（可选覆盖配置路径）。
-        use_dask: 是否对按年 Argo 处理启用 Dask 并行（默认 True）。
-        dask_scheduler: Dask 调度器（'processes'|'threads'|'synchronous'）。
-        dask_workers: Dask worker 数（None 采用 Dask 默认）。
-        dask_show_progress: 并行计算时是否显示 Dask 进度条。
+    参数:
+        - start_year (int): 统计起始年份（闭区间），默认 2002。
+        - end_year (int): 统计结束年份（闭区间），默认 2022。
+        - analysis_targets (str | list[str] | tuple[str, ...]): 分析内容开关，可选 'eddy_days'、'eke'，支持字符串或列表，默认 ('eke',)。
+        - run_association (bool): 是否执行关联分析，默认 True。
+        - grid_step_deg (float): 网格分辨率（°），默认 1.0。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
+        - analysis_depth (float | int | None): 统一分析深度（m），用于异常深度筛选与 EKE 采样深度；None 时回退配置默认。
+        - active_threshold (float | str | None): 关联分析 active 分组阈值，可传数值或 'auto'，默认 'auto'。
+        - do_rate_high_low_threshold (float | str | None): 关联分析异常出现率高低分组阈值，可传数值或 'auto'，默认 'auto'。
+        - min_group_cells (int): 自动阈值扫描时每组最小网格数，默认 20。
+        - eke_file_path (str | Path | None): 本地 EKE 原始分辨率 zarr 路径；None 时默认读取 GLORYS_processed/eke.zarr。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - save_data (bool): 是否保存网格数据，默认 False。
+        - output_prefix (str): eddy-days 输出文件名前缀，默认 'EddyDays'。
+        - eke_output_prefix (str): EKE 关联图输出前缀，默认 'EKE'。
+        - meta_output_root (str | Path | None): META 轨迹数据根目录（可选覆盖配置路径）。
+        - use_dask (bool): 是否对按年 Argo 处理启用 Dask 并行，默认 True。
+        - dask_scheduler (str): Dask 调度器（'processes'|'threads'|'synchronous'），默认 'processes'。
+        - dask_workers (int | None): Dask worker 数；None 时采用 Dask 默认。
+        - dask_show_progress (bool): 并行计算时是否显示 Dask 进度条，默认 True。
 
-    返回：
-        dict: {
-            'summary': 网格统计结果（原始矩阵与元信息），
-            'outputs': eddy-days 三联图/网格数据输出路径（若未启用则为空字典），
-            'association':
-                - 单目标时：直接返回该目标的关联结果；
-                - 多目标时：返回 {'eddy_days': ..., 'eke': ...} 平级字典；
-            'eke': EKE 网格结果（若未启用则为 None）
-        }
+    返回:
+        - dict: 含 'summary'（网格统计结果与元信息）、'outputs'（eddy-days 三联图/网格数据输出路径，未启用为空字典）、'association'（单目标时为该目标关联结果，多目标时为 {'eddy_days':..., 'eke':...} 平级字典）、'eke'（EKE 网格结果，未启用为 None）。
     """
     if isinstance(analysis_targets, str):
         targets = {analysis_targets.lower().strip()}
@@ -19997,44 +20186,29 @@ def calculate_delta_do(
     verbose: bool = False,
 ) -> pd.DataFrame:
     """
-     计算 Argo 垂向剖面中的“潜在俯冲异常”并支持多种识别模式。
+    计算 Argo 垂向剖面中的“潜在俯冲异常”并支持多种识别模式。
 
-     模式介绍：
-     1. do（基线模式）
-         - 先在每条剖面中找 DO 正峰（导数由正到负）。
-         - 以峰深度为中心，在 [p-Δp, p+Δp] 内用两端点连线构造参考值。
-         - 计算同深度的 delta_do / delta_salinity / delta_temperature。
-         - 以 delta_do >= do_threshold 为主判据；盐度与温度阈值（若 >0）为附加过滤。
-     2. aou（论文式 AOU+π 模式）
-         - 找 AOU 负峰，并在给定深度容差内配对最近的 π 峰。
-         - 在上下窗口分别取极值点连线，计算 delta_aou 与 delta_pi。
-         - 以 delta_aou <= aou_threshold 且 abs(delta_pi) >= pi_threshold 作为判据。
-     3. trim（分箱 + trimmed mean 模式）
-         - 先对 AOU 与绝对盐度做分箱降采样（候选检测分箱、梯度检查分箱）。
-         - 用 rolling trimmed mean 构造鲁棒残差并标准化，筛选异常候选。
-         - 再做局地梯度符号变化检查，最后回原剖面输出 delta_* 指标。
+    参数:
+        - data (pd.DataFrame): 含多个剖面数据的表；需含 Profile_number、深度、DO、盐度等列。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时由 make_detection_config() 使用 processing.yml 默认值。
+        - depth_col (str): 深度列名，默认 'Depth'。
+        - do_col (str): 溶解氧列名，默认 'DO'。
+        - salinity_col (str): 盐度列名，默认 'Salinity'。
+        - temperature_col (str): 温度列名，默认 'Temperature'。
+        - pi_col (str): aou 模式下优先使用的 π 列名；缺失时现场由 T/S/P 计算 surface-referenced potential spiciness，默认 'PI'。
+        - include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True；do 模式中 delta_aou 是在 delta_do 对应深度上按同一参考线计算，并非“基于 AOU 自身阈值先定深度”得到。
+        - remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
+        - verbose (bool): 是否打印进度信息，默认 False。
 
-    参数：
-        data (pd.DataFrame): 包含多个剖面数据的表；需包含 Profile_number、深度、DO、盐度等列。
-        detection_config (DetectionConfig | None): 异常识别配置；None 时由 make_detection_config() 使用 processing.yml 默认值。
-        depth_col (str): 深度列名，默认 'Depth'。
-        do_col (str): 溶解氧列名，默认 'DO'。
-        salinity_col (str): 盐度列名，默认 'Salinity'。
-        temperature_col (str): 温度列名，默认 'Temperature'。
-        pi_col (str): aou 模式下优先使用的 π 列名；缺失时现场由 T/S/P 计算 surface-referenced potential spiciness。
-        include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True。
-            在 do 模式中，delta_aou 是在 delta_do 对应深度上按同一参考线计算得到，
-            并非“基于 AOU 自身阈值先确定深度”得到的结果。
-        remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
-        verbose (bool): 是否打印进度信息（开始处理/已处理/未检测到/总共检测到），默认 False。
+    返回:
+        - pd.DataFrame: 每个满足条件的候选一行，始终含 Profile_number、depth、detection_method、primary_metric、primary_value、anomaly_score；do 模式额外含 delta_do/delta_salinity/delta_temperature/do_value 等，aou/trim 模式额外含 delta_aou/delta_pi/aou_value/pi_value/trim_* 等，并带 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）；无满足记录时返回空表。
 
-    返回：
-        pd.DataFrame: 每个满足条件的候选一行；始终包含
-        Profile_number, depth, detection_method, primary_metric, primary_value, anomaly_score。
-        do 模式会返回 delta_do、delta_salinity、delta_temperature、do_value 等字段；
-        aou/trim 模式会额外返回 delta_aou、delta_pi、aou_value、pi_value、trim_* 等字段。
-        以及 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）。
-        若无满足条件记录，返回空表。
+    说明:
+        识别模式:
+
+            - do（基线模式）：先找 DO 正峰（导数由正到负），以峰深度为中心在 [p-Δp, p+Δp] 内用两端点连线构造参考值，计算同深度 delta_do/delta_salinity/delta_temperature，以 delta_do ≥ do_threshold 为主判据、盐温阈值（若 >0）为附加过滤。
+            - aou（论文式 AOU+π 模式）：找 AOU 负峰并在深度容差内配对最近 π 峰，在上下窗口取极值点连线计算 delta_aou 与 delta_pi，以 delta_aou ≤ aou_threshold 且 |delta_pi| ≥ pi_threshold 为判据。
+            - trim（分箱 + trimmed mean 模式）：对 AOU 与绝对盐度分箱降采样，用 rolling trimmed mean 构造鲁棒残差并标准化筛选候选，再做局地梯度符号变化检查，最后回原剖面输出 delta_* 指标。
     """
 
     def _append_profile_metadata(result: dict, profile_df: pd.DataFrame) -> dict:
@@ -21090,23 +21264,20 @@ def export_all_interacting_argo(
     """
     计算并导出指定年份范围内所有位于涡旋内部的 Argo 剖面数据。
 
-    功能：
-        1. 遍历指定年份的 Argo 数据。
-        2. 加载对应的涡旋轨迹数据（META Tracks）。
-        3. 判断每个 Argo 剖面是否位于涡旋内部（支持多核并行加速）。
-        4. 将所有位于涡旋内的 Argo 剖面信息（包含匹配的涡旋ID、类型等）保存为 Parquet 文件。
-        5. 同时保存该区域内所有 Argo 剖面的基础信息（用于后续计算交互率分母）。
+    遍历指定年份的 Argo 数据，加载对应 META Tracks 涡旋轨迹，判断每个 Argo 剖面是否位于涡旋内部（支持
+    多核并行），将命中的剖面（含匹配涡旋 ID、类型等）保存为 Parquet，并同时保存该区域全部 Argo 剖面的
+    基础信息（用于后续计算交互率分母）。
 
     参数:
-        start_year (int): 起始年份。
-        end_year (int): 结束年份。
-        eddy_datasets (list, optional): 指定使用的涡旋数据集列表（如 ['acl', 'acs', 'cyclonic', 'anticyclonic']）。默认为 None，使用所有可用数据集。
-        circle_enlargement_factor (float, optional): 涡旋边界放大系数。默认为从 processing.yml 中读取。
-        output_path (str | Path, optional): 结果文件保存路径。默认为 `plot_outputs/shared/<region>/statistics/all_interacting_argo_<years>.parquet`。
-        num_workers (int): 并行进程数。默认为 1。
+        - start_year (int): 起始年份。
+        - end_year (int): 结束年份。
+        - eddy_datasets (dict | list[str] | tuple[str, ...] | None): 使用的涡旋数据集（如 ['acl','acs','cs','cl']）；None 时使用所有可用数据集。
+        - circle_enlargement_factor (float | None): 涡旋边界放大系数；None 时从 processing.yml 读取。
+        - output_path (str | Path | None): 结果文件保存路径；None 时用 `plot_outputs/shared/<region>/statistics/all_interacting_argo_<years>.parquet`。
+        - num_workers (int): 并行进程数，默认 1。
 
     输出:
-        生成一个 Parquet 文件，包含所有与涡旋发生交互的 Argo 剖面详细信息。
+        - 一个 Parquet 文件，含所有与涡旋发生交互的 Argo 剖面详细信息；另存区域基线 Argo 剖面信息。
     """
     if circle_enlargement_factor is None:
         circle_enlargement_factor = globals().get('circle_enlargement_factor', 1.2)
@@ -21184,29 +21355,31 @@ def query_argo_inside_eddy(
     region: str | None = None,
     return_matches: bool = True,
 ) -> dict:
-    """查询指定 Argo 剖面是否位于任一涡旋内部（基于export_all_interacting_argo预计算结果）。
+    """查询指定 Argo 剖面是否位于任一涡旋内部（基于 export_all_interacting_argo 预计算结果）。
 
-    说明:
-        - 本函数仅查询已落盘的交互记录，不做实时几何匹配。
-        - 默认优先读取
-          `plot_outputs/shared/<region>/statistics/all_interacting_argo_*.parquet`。
-        - 使用 parquet 过滤条件（Profile_number + Year + 可选 Month/Day），
-          仅扫描少量行以实现快速判定。
+    仅查询已落盘的交互记录，不做实时几何匹配。
 
     参数:
-        profile_number: Argo 剖面编号（Profile_number）。
-        year/month/day: 日期过滤；month/day 可选。
-        precomputed_file: 可选，显式指定交互记录 parquet 路径。
-        region: 可选区域 slug；None 时使用当前 region。
-        return_matches: True 时返回命中的明细表（DataFrame）。
+        - profile_number (int): Argo 剖面编号（Profile_number）。
+        - year (int): 年份过滤。
+        - month (int | None): 月份过滤（可选）。
+        - day (int | None): 日期过滤（可选）。
+        - precomputed_file (str | Path | None): 显式指定交互记录 parquet 路径（可选）。
+        - region (str | None): 区域 slug；None 时使用当前 region。
+        - return_matches (bool): True 时返回命中的明细表（DataFrame），默认 True。
 
     返回:
-        dict:
-            - inside_eddy (bool): 是否命中至少一条交互记录。
-            - hit_count (int): 命中记录数。
-            - source (str | None): 实际使用的数据源路径。
-            - message (str): 查询状态说明。
-            - matches (pd.DataFrame, optional): 命中的明细（去重后）。
+        - dict: 含以下键：
+
+            - inside_eddy (bool)：是否命中至少一条交互记录。
+            - hit_count (int)：命中记录数。
+            - source (str | None)：实际使用的数据源路径。
+            - message (str)：查询状态说明。
+            - matches (pd.DataFrame, 可选)：命中的明细（去重后）。
+
+    说明:
+        - 默认优先读取 `plot_outputs/shared/<region>/statistics/all_interacting_argo_*.parquet`。
+        - 使用 parquet 过滤条件（Profile_number + Year + 可选 Month/Day），仅扫描少量行以快速判定。
     """
     pnum = int(profile_number)
     y = int(year)
@@ -21315,16 +21488,26 @@ def calculate_interaction_statistics(
 ):
     """
     计算并对比 Argo 剖面与涡旋的交互概率（Baseline vs Anomalies）。
-    
-    功能：
-        1. 加载指定年份的所有 Argo 数据。
-        2. 加载预计算的交互记录文件（由 export_all_interacting_argo 生成）。
-           注意：必须先运行 export_all_interacting_argo 生成该文件，否则报错。
-        3. 计算 Baseline：所有 Argo 剖面中，有多少比例落在涡旋内。
-        4. 计算 Anomalies：按 detection_config 筛选异常剖面，计算其中有多少比例落在涡旋内。
-           - 若 use_precomputed_anomalies=True (默认)，会自动尝试查找 plot_argo_hotspots 生成的异常文件。
-           - 若找到文件，直接读取；若未找到或读取失败，回退到实时调用 calculate_delta_do 计算。
-        5. 输出对比报告。
+
+    加载指定年份的全部 Argo 数据与 export_all_interacting_argo 预计算的交互记录，计算 Baseline（全部剖面
+    落在涡旋内的比例）与 Anomalies（按 detection_config 筛选的异常剖面落在涡旋内的比例），并输出对比报告。
+
+    参数:
+        - start_year (int): 起始年份。
+        - end_year (int): 结束年份。
+        - eddy_datasets (dict | list[str] | tuple[str, ...] | None): 使用的涡旋数据集；None 时使用所有可用数据集。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时用默认。
+        - circle_enlargement_factor (float | None): 涡旋边界放大系数；None 时从 processing.yml 读取。
+        - save_report (bool): 是否保存对比报告，默认 True。
+        - precomputed_file (str | Path | None): 显式指定交互记录 parquet；None 时用默认路径。
+        - anomalies_file (str | Path | None): 显式指定异常剖面文件；None 时按默认查找。
+        - use_precomputed_anomalies (bool): True 时优先读取 plot_argo_hotspots 生成的异常文件，找不到再实时调用 calculate_delta_do，默认 True。
+
+    返回:
+        - dict: Baseline 与 Anomalies 交互概率的对比统计。
+
+    说明:
+        - 必须先运行 export_all_interacting_argo 生成交互记录文件，否则报错。
     """
     cfg = _resolve_detection_config(detection_config)
     method_name = cfg.method
