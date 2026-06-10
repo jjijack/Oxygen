@@ -102,6 +102,9 @@ plots_output_root = Path(_PATHS_CFG.get('paths', {}).get('plots_output', './plot
 _classification_overrides_path = Path(
     _PATHS_CFG.get('paths', {}).get('classification_overrides', './data/classification_overrides.csv')
 )
+_woa23_root = Path(
+    _PATHS_CFG.get('paths', {}).get('woa23_root', './data/woa23')
+)
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -1581,6 +1584,186 @@ def export_meta_tracks(ds: Dataset,
         written['contours_zarr'] = contours_zarr_written
     print(f"[export_meta_tracks] Completed kind={kind}. Daily: {out_hint}; Contours(zarr): {contours_zarr_written}")
     return written
+
+_woa23_cache: dict = {}
+
+
+def load_woa_oxygen(month: int = 0, *, root: str | Path | None = None) -> dict:
+    """加载 WOA23 溶解氧月气候态（analyzed climatology, o_an）。
+
+    读取 WOA23 1° netCDF，返回含 lon / lat / depth / data 四个 ndarray 的字典，
+    单位 μmol/kg。结果按 month 缓存，重复调用不再读盘。
+
+    参数:
+        - month (int): 0 = 年均，1–12 = 对应月份。
+        - root (str | Path | None): WOA23 根目录，None 时使用 paths.yml 中的 woa23_root。
+
+    返回:
+        dict: ``{'lon': 1-d, 'lat': 1-d, 'depth': 1-d, 'data': 3-d (depth, lat, lon)}``。
+    """
+    if month in _woa23_cache:
+        return _woa23_cache[month]
+    base = Path(root) if root is not None else _woa23_root
+    fname = f"woa23_all_o{month:02d}_01.nc"
+    fpath = base / "oxygen" / fname
+    if not fpath.exists():
+        raise FileNotFoundError(f"WOA23 file not found: {fpath}")
+    nc = Dataset(str(fpath), 'r')
+    result = {
+        'lon': np.asarray(nc.variables['lon'][:]),
+        'lat': np.asarray(nc.variables['lat'][:]),
+        'depth': np.asarray(nc.variables['depth'][:]),
+        'data': np.asarray(nc.variables['o_an'][0, :, :, :]),
+    }
+    nc.close()
+    _woa23_cache[month] = result
+    return result
+
+
+def get_woa_do_profile(
+    lon: float,
+    lat: float,
+    month: int = 0,
+    *,
+    max_depth: float = 1500.0,
+    root: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """从 WOA23 气候态提取指定位置的 DO(z) 廓线。
+
+    对 WOA 1° 网格做最近邻选点，返回有效（非 NaN）深度区间内的
+    (depths, do_values) 数组对。
+
+    参数:
+        - lon (float): 经度（−180 ~ 180 或 0 ~ 360 均可）。
+        - lat (float): 纬度。
+        - month (int): 0 = 年均，1–12 = 月气候态。
+        - max_depth (float): 截断深度 (m)。
+        - root (str | Path | None): 同 load_woa_oxygen。
+
+    返回:
+        (depths, do_values): 一维 ndarray 对，长度相同，仅含非 NaN 层。
+    """
+    woa = load_woa_oxygen(month, root=root)
+    lon_q = ((lon + 180) % 360) - 180
+    j = int(np.argmin(np.abs(woa['lon'] - lon_q)))
+    i = int(np.argmin(np.abs(woa['lat'] - lat)))
+    z = woa['depth']
+    vals = woa['data'][:, i, j]
+    mask = np.isfinite(vals) & (z <= max_depth)
+    return z[mask], vals[mask]
+
+
+def get_woa_do_at_point(
+    lon: float,
+    lat: float,
+    depth: float,
+    month: int = 0,
+    *,
+    root: str | Path | None = None,
+) -> float:
+    """从 WOA23 气候态插值单点 DO 值。
+
+    先提取最近邻经纬度处的 DO(z) 廓线，再沿深度方向线性插值到目标深度。
+    超出 WOA 有效深度范围时返回 NaN。
+
+    参数:
+        - lon (float): 经度。
+        - lat (float): 纬度。
+        - depth (float): 目标深度 (m)。
+        - month (int): 0 = 年均，1–12 = 月气候态。
+        - root (str | Path | None): 同 load_woa_oxygen。
+
+    返回:
+        float: 插值后的 DO (μmol/kg)；无数据时返回 np.nan。
+    """
+    z, vals = get_woa_do_profile(lon, lat, month, root=root)
+    if len(z) < 2 or depth < z[0] or depth > z[-1]:
+        return np.nan
+    return float(np.interp(depth, z, vals))
+
+
+def get_woa_ddo_dz(
+    lon: float,
+    lat: float,
+    depth: float,
+    month: int = 0,
+    *,
+    window: float = 50.0,
+    root: str | Path | None = None,
+) -> float:
+    """从 WOA23 气候态计算指定深度处的背景 dDO/dz 梯度。
+
+    在 [depth − window, depth + window] 区间内对 DO(z) 廓线做线性回归，
+    返回斜率 (μmol/kg/m)，正值表示 DO 随深度增加。通常深层 dDO/dz < 0。
+
+    参数:
+        - lon (float): 经度。
+        - lat (float): 纬度。
+        - depth (float): 目标深度 (m)。
+        - month (int): 0 = 年均，1–12 = 月气候态。
+        - window (float): 梯度估计的半窗口宽度 (m)。
+        - root (str | Path | None): 同 load_woa_oxygen。
+
+    返回:
+        float: dDO/dz (μmol/kg/m)；数据不足时返回 np.nan。
+    """
+    z, vals = get_woa_do_profile(lon, lat, month, root=root)
+    if len(z) < 2:
+        return np.nan
+    mask = (z >= depth - window) & (z <= depth + window)
+    zw, vw = z[mask], vals[mask]
+    if len(zw) < 2:
+        return np.nan
+    coeffs = np.polyfit(zw, vw, 1)
+    return float(coeffs[0])
+
+
+def get_woa_do_for_anomalies(
+    anomalies: pd.DataFrame,
+    *,
+    lon_col: str = 'Longitude',
+    lat_col: str = 'Latitude',
+    depth_col: str = 'depth',
+    month_col: str = 'Month',
+    gradient_window: float = 50.0,
+    root: str | Path | None = None,
+) -> pd.DataFrame:
+    """批量为异常表添加 WOA23 气候态 DO 值和梯度。
+
+    逐行查询 WOA23，在 anomalies 上追加三列并返回副本：
+    ``woa_do`` (气候态 DO)、``woa_ddo_dz`` (背景梯度)、
+    ``delta_do_vs_woa`` (实测 DO − 气候态 DO)。
+
+    参数:
+        - anomalies (DataFrame): 含经纬度、深度、月份列的异常表。
+        - lon_col (str): 经度列名。
+        - lat_col (str): 纬度列名。
+        - depth_col (str): 深度列名。
+        - month_col (str): 月份列名。
+        - gradient_window (float): dDO/dz 梯度估计半窗口 (m)。
+        - root (str | Path | None): 同 load_woa_oxygen。
+
+    返回:
+        DataFrame: 原表副本，追加 woa_do / woa_ddo_dz / delta_do_vs_woa 三列。
+    """
+    out = anomalies.copy()
+    woa_do = np.full(len(out), np.nan)
+    woa_grad = np.full(len(out), np.nan)
+    for i, (_, row) in enumerate(out.iterrows()):
+        lo = float(row[lon_col])
+        la = float(row[lat_col])
+        dep = float(row[depth_col])
+        mo = int(row[month_col]) if month_col in row.index and pd.notna(row[month_col]) else 0
+        if mo < 1 or mo > 12:
+            mo = 0
+        woa_do[i] = get_woa_do_at_point(lo, la, dep, mo, root=root)
+        woa_grad[i] = get_woa_ddo_dz(lo, la, dep, mo, window=gradient_window, root=root)
+    out['woa_do'] = woa_do
+    out['woa_ddo_dz'] = woa_grad
+    if 'do_value' in out.columns:
+        out['delta_do_vs_woa'] = pd.to_numeric(out['do_value'], errors='coerce') - out['woa_do']
+    return out
+
 
 def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: str | Path = None):
     """将某年份的逐月 Argo .mat 原始文件合并为单一 Parquet。
