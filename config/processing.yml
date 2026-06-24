@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.15 变更：
+#   - heave 小节新增 ventilation_mode（fixed / glorys_winter_mld / ht_external，默认 ht_external），
+#     把 V/I 通风判据从固定 depth_threshold 改为逐点本地冬季混合层深度阈值（与文件中存的 winter_mld_* 列比较）；
+#     新增 glorys_winter_mld_criterion（GLORYS 逐剖面冬季 MLD 的密度判据 kg/m³）。HT 气候态取用变量固定为 mld_dt_max（其余取值实测更差，不设旋钮）。
 # version 1.14 变更：
 #   - plot 下新增 hotspot_type_colors / hotspot_spice_colors / hotspot_cross_colors 三组配色，
 #     分别供 plot_argo_hotspots 的 hotspot_type / spice_type / cross 拆图模式使用。
@@ -34,7 +38,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.14
+version: 1.15
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -75,7 +79,9 @@ processing:
   # Heave + Ventilation 等密面出露诊断参数
   heave:
     search_range: 0.5               # σ 搜索范围 (kg/m³)，从 σ_argo 向上搜索
-    depth_threshold: 300.0          # 通风深度阈值 (m)，z_min 浅于此值视为出露
+    ventilation_mode: ht_external   # V/I 通风判据阈值来源：fixed（固定 depth_threshold）/ glorys_winter_mld（GLORYS 逐剖面冬季 MLD）/ ht_external（Holte-Talley 气候态本地冬季 MLD）
+    depth_threshold: 300.0          # 固定模式 / 单图标注用通风深度阈值 (m)，z_min 浅于此值视为出露
+    glorys_winter_mld_criterion: 0.125  # glorys_winter_mld 模式选用的密度判据 (kg/m³)：0.03 或 0.125
     magnitude_threshold: 100.0      # Heave 幅度阈值 (m)，等密面起伏 ≥ 此值视为显著位移
     x_window_km: 200.0              # 出露搜索水平窗口半宽 (km)
     local_x_window_km: 50.0         # Heave 局地搜索水平窗口半宽 (km)

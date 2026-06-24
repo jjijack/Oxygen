@@ -1,4 +1,6 @@
 # 数据路径配置
+# version 1.6 变更：
+#   - 新增 mld_clim_root：外部混合层深度气候态根目录（含 Holte-Talley Argo MLD netCDF），供 load_mld_climatology / get_winter_mld_ht 等使用。
 # version 1.5 变更：
 #   - 新增 woa23_root：WOA23 气候态数据根目录（含 oxygen/ 子目录），供 load_woa_oxygen / get_woa_do_profile 等使用。
 # version 1.4 变更：
@@ -11,7 +13,7 @@
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.5
+version: 1.6
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
@@ -25,3 +27,4 @@ paths:
   gpd_world_shp: ./external/natural_earth/ne_110m_admin_0_countries.shp
   classification_overrides: ./data/classification_overrides.csv
   woa23_root: ./data/woa23
+  mld_clim_root: ./data/mld_clim

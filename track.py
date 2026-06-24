@@ -105,6 +105,9 @@ _classification_overrides_path = Path(
 _woa23_root = Path(
     _PATHS_CFG.get('paths', {}).get('woa23_root', './data/woa23')
 )
+_mld_clim_root = Path(
+    _PATHS_CFG.get('paths', {}).get('mld_clim_root', './data/mld_clim')
+)
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -206,6 +209,12 @@ _heave_local_x_window_km = float(
 )
 _heave_z_search_m = float(
     _HEAVE_CFG.get('z_search_m', 200.0)
+)
+_heave_ventilation_mode = str(
+    _HEAVE_CFG.get('ventilation_mode', 'fixed')
+)
+_glorys_winter_mld_criterion = float(
+    _HEAVE_CFG.get('glorys_winter_mld_criterion', 0.125)
 )
 
 # Argo 3D 高斯核断面重建参数（从 processing.yml:processing.argo_reconstruction 读取）
@@ -1763,6 +1772,156 @@ def get_woa_do_for_anomalies(
     if 'do_value' in out.columns:
         out['delta_do_vs_woa'] = pd.to_numeric(out['do_value'], errors='coerce') - out['woa_do']
     return out
+
+
+_mld_clim_cache: dict = {}
+
+
+def load_mld_climatology(*, root: str | Path | None = None, variable: str | None = None) -> dict:
+    """加载 Holte-Talley Argo 混合层深度气候态，构建南北半球冬季 MLD 场。
+
+    读取 ``Argo_mixedlayers_monthlyclim_*.nc``（逐 Argo 剖面先算 MLD 再网格化 = mean-of-MLD，
+    规避格点平均 T/S 低估深对流的病），对所选变量取北半球（1–3 月）与南半球（7–9 月）隆冬月的
+    逐格最大，得到两张冬季深包络场。文件自带的 ``valid_min=95/valid_max=120`` 元数据有误，会把
+    真实深 MLD 全部屏蔽，故强制关闭 netCDF 自动 mask，仅按 ``_FillValue=-9999`` 处理缺测。结果按
+    variable 缓存。
+
+    参数:
+        - root (str | Path | None): 气候态根目录，None 时使用 paths.yml 中的 mld_clim_root。
+        - variable (str | None): 取用变量，None 时取 `mld_dt_max`（密度阈值深包络，与「通风-可达」取最深一致）。其余 HT 变量（da/mean/median）实测更浅或会削弱信号，仅供分析比对时显式传入。
+
+    返回:
+        dict: ``{'lat': 1-d, 'lon': 1-d (-180..180), 'nh': 2-d (lat,lon), 'sh': 2-d, 'variable': str}``。
+    """
+    var = variable if variable is not None else 'mld_dt_max'
+    if var in _mld_clim_cache:
+        return _mld_clim_cache[var]
+    base = Path(root) if root is not None else _mld_clim_root
+    matches = sorted(base.glob('Argo_mixedlayers_monthlyclim_*.nc'))
+    if not matches:
+        raise FileNotFoundError(f"Holte-Talley MLD climatology not found under: {base}")
+    nc = Dataset(str(matches[0]), 'r')
+    nc.set_auto_maskandscale(False)  # 文件 valid_min/valid_max 元数据有误，会误屏蔽真实深 MLD
+    lat = np.asarray(nc.variables['lat'][:], 'f8')
+    lon = np.asarray(nc.variables['lon'][:], 'f8')
+    raw = np.asarray(nc.variables[var][:], 'f8')  # (lat, lon, month)
+    nc.close()
+    fld = np.where(raw == -9999.0, np.nan, raw)
+    result = {
+        'lat': lat,
+        'lon': lon,
+        'nh': np.nanmax(fld[:, :, [0, 1, 2]], axis=2),
+        'sh': np.nanmax(fld[:, :, [6, 7, 8]], axis=2),
+        'variable': var,
+    }
+    _mld_clim_cache[var] = result
+    return result
+
+
+def get_winter_mld_ht(lon, lat, *, root: str | Path | None = None,
+                      variable: str | None = None) -> float | np.ndarray:
+    """查询 Holte-Talley 气候态在给定点的本地冬季混合层深度（按半球取对应冬季场）。
+
+    经度自动归一到气候态的 -180..180 网格，按纬度符号选用北/南半球冬季场，双线性插值。
+    支持标量或数组输入，缺测格点回退到全场中位以避免插值出 NaN。
+
+    参数:
+        - lon (float | array-like): 经度（0–360 或 -180–180 均可）。
+        - lat (float | array-like): 纬度。
+        - root (str | Path | None): 同 load_mld_climatology。
+        - variable (str | None): 同 load_mld_climatology。
+
+    返回:
+        float | np.ndarray: 本地冬季 MLD（m），形状与输入一致。
+    """
+    clim = load_mld_climatology(root=root, variable=variable)
+    lat_g, lon_g = clim['lat'], clim['lon']
+    plon = np.atleast_1d(np.asarray(lon, 'f8')) % 360.0
+    plat = np.atleast_1d(np.asarray(lat, 'f8'))
+    plon = np.where(plon > lon_g.max(), plon - 360.0, plon)
+    out = np.full(plat.shape, np.nan)
+    for hemi, field in (('nh', clim['nh']), ('sh', clim['sh'])):
+        sel = (plat >= 0) if hemi == 'nh' else (plat < 0)
+        if not sel.any():
+            continue
+        filled = np.where(np.isfinite(field), field, np.nanmedian(field))
+        it = RegularGridInterpolator((lat_g, lon_g), filled, bounds_error=False, fill_value=np.nan)
+        out[sel] = it(np.column_stack([plat[sel], plon[sel]]))
+    return float(out[0]) if np.isscalar(lon) or np.ndim(lon) == 0 else out
+
+
+def _winter_candidate_dates(obs_date, lat: float) -> list[str]:
+    """上一个隆冬的 5 个候选日期（北半球 1–3 月 / 南半球 7–9 月），供逐剖面 MLD 取最深值。"""
+    obs = pd.Timestamp(obs_date)
+    year = obs.year
+    if lat >= 0:
+        wy = year if obs.month >= 4 else year - 1
+        return [f'{wy}-01-15', f'{wy}-02-01', f'{wy}-02-15', f'{wy}-03-01', f'{wy}-03-15']
+    wy = year if (obs.month >= 10 or 7 <= obs.month <= 9) else year - 1
+    return [f'{wy}-07-15', f'{wy}-08-01', f'{wy}-08-15', f'{wy}-09-01', f'{wy}-09-15']
+
+
+def _mld_from_sigma(d_vals: np.ndarray, sig: np.ndarray, dthr: float, zref: float = 10.0) -> float:
+    """密度阈值法混合层深度：自 ~10m 参考层向下，σ₀ 较参考升高 dthr 处的（线性插值）深度。"""
+    if len(d_vals) < 3:
+        return np.nan
+    order = np.argsort(d_vals)
+    d_vals, sig = d_vals[order], sig[order]
+    iref = int(np.argmin(np.abs(d_vals - zref)))
+    sref = sig[iref]
+    over = np.where((d_vals > d_vals[iref]) & (sig - sref >= dthr))[0]
+    if len(over) == 0:
+        return float(d_vals[-1])  # 整个剖面未达阈值 → 取最深处封顶
+    k = over[0]
+    k0 = max(k - 1, iref)
+    s0, s1 = sig[k0] - sref, sig[k] - sref
+    if s1 == s0:
+        return float(d_vals[k])
+    return float(d_vals[k0] + (dthr - s0) / (s1 - s0) * (d_vals[k] - d_vals[k0]))
+
+
+def _compute_glorys_winter_mld(lon: float, lat: float, obs_date,
+                               *, criteria: tuple = (0.03, 0.125), half_deg: float = 0.2) -> dict:
+    """从上一个冬季的 GLORYS T/S 逐剖面算混合层深度（5 个候选日取最深值）。
+
+    返回 ``{criterion: mld_m}``；GLORYS 文件缺失或该点 T/S 无效时对应判据返回 NaN。
+    """
+    best = {c: 0.0 for c in criteria}
+    got = {c: False for c in criteria}
+    for wd in _winter_candidate_dates(obs_date, lat):
+        try:
+            get_glorys_filepath(pd.Timestamp(wd))
+        except Exception:
+            continue
+        try:
+            glon, glat, gdepth, gvars = _load_glorys_window_by_center(
+                needed_date=wd, center_lon_ref=lon,
+                lon_min_local=lon - half_deg, lon_max_local=lon + half_deg,
+                lat_min=lat - half_deg, lat_max=lat + half_deg,
+                variables=['thetao', 'so'])
+        except Exception:
+            continue
+        theta = np.ma.array(gvars['thetao'])
+        sal = np.ma.array(gvars['salinity'])
+        j = int(np.argmin(np.abs(np.asarray(glat) - lat)))
+        i = int(np.argmin(np.abs(np.asarray(glon) - lon)))
+        t_col, s_col = theta[:, j, i], sal[:, j, i]
+        valid = ~np.ma.getmaskarray(t_col) & ~np.ma.getmaskarray(s_col)
+        if int(valid.sum()) < 3:
+            continue
+        d_vals = np.asarray(gdepth)[valid]
+        t_vals = np.asarray(t_col[valid], float)
+        s_vals = np.asarray(s_col[valid], float)
+        p = gsw.p_from_z(-d_vals, lat)
+        SA = gsw.SA_from_SP(s_vals, p, lon, lat)
+        CT = gsw.CT_from_pt(SA, t_vals)
+        sig = gsw.sigma0(SA, CT)
+        for c in criteria:
+            m = _mld_from_sigma(d_vals, sig, float(c))
+            if np.isfinite(m):
+                best[c] = max(best[c], m)
+                got[c] = True
+    return {c: (best[c] if got[c] else np.nan) for c in criteria}
 
 
 def convert_mat_to_parquet(year: int, input_dir: str | Path = None, output_dir: str | Path = None):
@@ -13501,6 +13660,7 @@ def plot_argo_hotspots(
     use_glorys_heave: bool = False,
     argo_glorys_summary_data_path: str | Path | None = None,
     split_plots: bool | str = False,
+    ventilation_mode: str = _heave_ventilation_mode,
     hotspot_type_heave_threshold: float | None = _heave_depth_threshold,
 ) -> dict | None:
     """以 DetectionConfig 指定的异常识别方法绘制多年期 Argo 异常分布。
@@ -13529,7 +13689,11 @@ def plot_argo_hotspots(
             - `'hotspot_type'`：按 hotspot_type=1/2/3 拆图；
             - `'spice_type'`：按 spice_type=1/2/3 拆图，需 summary parquet 含 spice_type；
             - `'cross'`：按 hotspot_type{1,2} × spice_type{1,2} 叉乘 + type 3 OMZ 拆图。
-        - hotspot_type_heave_threshold (float | None): 当 anomalies 已含 `glorys_heave_zmin` 时，用于生成 hotspot_type 的出露深度阈值。
+        - ventilation_mode (str): 用哪条「本地冬季混合层深度」阈值来判 ventilated/isolated 分类，默认取 processing.yml:heave.ventilation_mode。仅 `use_glorys_heave=True` 时生效；hotspot_type 由 overview parquet 已落盘的 heave/winter_mld 列即时重算，换模式只需改本参数、不必重跑上游。三选一：
+            - `ht_external`：Holte-Talley 观测气候态的本地冬季 MLD（推荐）；
+            - `glorys_winter_mld`：GLORYS 算的本地冬季 MLD；
+            - `fixed`：不看本地、用固定的 `hotspot_type_heave_threshold`。
+        - hotspot_type_heave_threshold (float | None): `fixed` 模式下生成 hotspot_type 的固定出露深度阈值 (m)，也作为重算的回退标量。
     返回:
         - dict | None: 含 `summary`（剖面计数/比例与异常、深度统计等汇总 dict）、`figure_paths`（写出的图像路径列表）、`anomalies_path`（异常 Parquet 路径，未保存时为 None）；筛选后无数据时整体返回 None。
     输出:
@@ -13722,6 +13886,15 @@ def plot_argo_hotspots(
             try:
                 glorys_summary_df = pd.read_parquet(glorys_summary_path_used)
                 anomalies = _merge_hotspot_glorys_summary_fields(anomalies, glorys_summary_df)
+                # hotspot_type 按 ventilation_mode 从落盘的 heave 几何 + winter_mld 列即时重算（与 export 同源），
+                # 使同一份 overview parquet 可出任意通风模式的拆图而无需重跑上游
+                if 'glorys_heave_zmin' in anomalies.columns:
+                    vent_thr = _ventilation_threshold(
+                        anomalies, ventilation_mode,
+                        fixed=float(hotspot_type_heave_threshold or _heave_depth_threshold))
+                    anomalies['hotspot_type'] = _assign_hotspot_type(
+                        anomalies, heave_z_threshold=vent_thr,
+                        heave_m_threshold=float(_heave_magnitude_threshold))
                 # 存盘留纯自动版本；订正只施加到绘图用的 anomalies，使落盘 parquet 保持纯净
                 anomalies_pure_for_save = anomalies.copy()
                 anomalies = _apply_classification_overrides(anomalies)
@@ -14976,6 +15149,14 @@ def _plot_hotspot_argo_glorys_profile_worker(args: dict) -> dict:
                 if key in first_vertical:
                     value = first_vertical[key]
                     record[key] = value
+        if bool(args.get('compute_glorys_winter_mld', False)):
+            try:
+                wm = _compute_glorys_winter_mld(center_lon, center_lat, target_date)
+                record['winter_mld_glorys_dt03'] = wm.get(0.03, np.nan)
+                record['winter_mld_glorys_dt0125'] = wm.get(0.125, np.nan)
+            except Exception:
+                record['winter_mld_glorys_dt03'] = np.nan
+                record['winter_mld_glorys_dt0125'] = np.nan
         record['status'] = 'ok' if record['vertical_status'] == 'ok' else 'partial'
 
     except Exception as exc:
@@ -15036,6 +15217,8 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
     return_details: bool = False,
     save_summary_data: bool = True,
     summary_data_path: str | Path | None = None,
+    ventilation_mode: str = _heave_ventilation_mode,
+    compute_glorys_winter_mld: bool = True,
 ) -> dict:
     """为 hotspots 异常剖面批量绘制 Argo-centered GLORYS 水平图与垂向总览图。
 
@@ -15093,6 +15276,11 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         - return_details (bool): 是否返回每个 profile 的运行日志；默认 False，仅返回摘要。
         - save_summary_data (bool): 是否保存逐 profile GLORYS/Heave 诊断明细 parquet，默认 True。
         - summary_data_path (str | Path | None): 明细 parquet 保存路径；None 时使用批处理专属输出目录。
+        - ventilation_mode (str): 用哪条「本地冬季混合层深度」阈值来判 ventilated/isolated 分类，默认取 processing.yml:heave.ventilation_mode。三选一：
+            - `ht_external`：Holte-Talley 观测气候态的本地冬季 MLD（`winter_mld_ht` 列，推荐）；
+            - `glorys_winter_mld`：GLORYS 逐剖面算的本地冬季 MLD（`winter_mld_glorys_dt*` 列）；
+            - `fixed`：不看本地、用固定的 `heave_depth_threshold`。
+        - compute_glorys_winter_mld (bool): 是否在 worker 中逐剖面计算 GLORYS 冬季 MLD 并写入 `winter_mld_glorys_dt03/dt0125` 列，默认 True（较重，约 +47min/全球批；仅用 ht_external 时可设 False 跳过）。
 
     返回:
         - dict: 默认含 total_candidates/processed_profiles/skipped_profiles/output_dir/anomalies_path/summary_data_path 等摘要。
@@ -15319,6 +15507,7 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
             'annotate_spice': annotate_spice,
             'salinity_value': _to_float_or_none(row.get('salinity_value')),
             'temperature_value': _to_float_or_none(row.get('temperature_value')),
+            'compute_glorys_winter_mld': bool(compute_glorys_winter_mld),
         })
 
     if worker_count > 1:
@@ -15359,12 +15548,19 @@ def plot_hotspot_anomaly_argo_glorys_overviews(
         try:
             resolved_summary_data_path.parent.mkdir(parents=True, exist_ok=True)
             summary_df = pd.DataFrame(results)
+            # 本地冬季 MLD 阈值列：HT 气候态总是算（便宜），GLORYS 列由 worker 按需写入；
+            # 两列都落盘，下游切 ventilation_mode 只需重读列再 assign，无须重算
+            if {'center_lon', 'center_lat'}.issubset(summary_df.columns):
+                summary_df['winter_mld_ht'] = get_winter_mld_ht(
+                    summary_df['center_lon'].to_numpy(dtype='f8', na_value=np.nan),
+                    summary_df['center_lat'].to_numpy(dtype='f8', na_value=np.nan))
             # spice_type / hotspot_type 整数码一并落盘，使其成为一等列（导出仅映射成名称）
             summary_df['spice_type'] = _assign_spice_type(
                 summary_df, percentile_threshold=cfg.spice_percentile_threshold)
             summary_df['hotspot_type'] = _assign_hotspot_type(
                 summary_df,
-                heave_z_threshold=float(heave_depth_threshold),
+                heave_z_threshold=_ventilation_threshold(
+                    summary_df, ventilation_mode, fixed=float(heave_depth_threshold)),
                 heave_m_threshold=float(_heave_magnitude_threshold),
             )
             summary_df.to_parquet(resolved_summary_data_path, index=False)
@@ -16496,6 +16692,7 @@ def export_hotspot_anomaly_summary_table(
     output_path: str | Path | None = None,
     output_format: str | None = None,
     save_table: bool = True,
+    ventilation_mode: str = _heave_ventilation_mode,
     heave_z_threshold: float | None = _heave_depth_threshold,
     diagnose_nearshore_do: bool = True,
     nearshore_do_min_threshold: float = 50.0,
@@ -16531,7 +16728,11 @@ def export_hotspot_anomaly_summary_table(
         - output_path (str | Path | None): 保存路径；None 时写到当前 method/region 的默认 summary 目录。
         - output_format (str | None): `'csv'` 或 `'xlsx'`；None 时从 output_path 后缀推断，默认 `'csv'`。
         - save_table (bool): 是否保存表格文件，默认 True。
-        - heave_z_threshold (float | None): 通风深度阈值 (m)，用于 hotspot_type 分类；None 时不新增对应列。
+        - ventilation_mode (str): 用哪条「本地冬季混合层深度」阈值来判 ventilated/isolated 分类，默认取 processing.yml:heave.ventilation_mode。导出时 hotspot_type 由 overview parquet 已落盘的 heave/winter_mld 列即时重算，换模式只需改本参数、不必重跑上游；若 parquet 缺这些列则沿用落盘旧分类。三选一：
+            - `ht_external`：Holte-Talley 观测气候态的本地冬季 MLD（推荐）；
+            - `glorys_winter_mld`：GLORYS 算的本地冬季 MLD；
+            - `fixed`：不看本地、用固定的 `heave_z_threshold`。
+        - heave_z_threshold (float | None): `fixed` 模式的固定通风深度阈值 (m)，也作为重算的回退标量；None 时不新增 `heave_z_threshold` 列。
         - diagnose_nearshore_do (bool): 是否基于 Argo DO 剖面诊断近岸型先降后升曲线，默认 True。
         - nearshore_do_min_threshold (float): 近岸型判据中，异常深度以上 DO 最小值阈值。
         - nearshore_do_drop_threshold (float): 近岸型判据中，表层参考 DO 到最小 DO 的最小降幅。
@@ -17026,6 +17227,9 @@ def export_hotspot_anomaly_summary_table(
         ('glorys_heave_sigma_peak', 'glorys_heave_sigma_peak'),
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
         ('glorys_heave_m', 'glorys_heave_m'),
+        ('winter_mld_ht', 'winter_mld_ht'),
+        ('winter_mld_glorys_dt03', 'winter_mld_glorys_dt03'),
+        ('winter_mld_glorys_dt0125', 'winter_mld_glorys_dt0125'),
         ('heave_error', 'heave_error'),
         ('spice_anomaly', 'spice_anomaly'),
         ('spice_percentile', 'spice_percentile'),
@@ -17066,7 +17270,14 @@ def export_hotspot_anomaly_summary_table(
     elif not diagnose_nearshore_do:
         table['nearshore_do_dip'] = pd.Series(pd.NA, index=table.index, dtype='boolean')
 
-    # 读取 overview_summary.parquet 已落盘的完整分类，叠加人工修正
+    # hotspot_type 按 ventilation_mode 从落盘的 heave 几何 + winter_mld 列即时重算，
+    # 使同一份 overview parquet 可导出任意通风模式而无需重跑上游；缺 heave 列时沿用落盘分类
+    if 'glorys_heave_zmin' in table.columns:
+        vent_thr = _ventilation_threshold(
+            table, ventilation_mode, fixed=float(heave_z_threshold or _heave_depth_threshold))
+        table['hotspot_type'] = _assign_hotspot_type(
+            table, heave_z_threshold=vent_thr, heave_m_threshold=float(_heave_magnitude_threshold))
+    # 叠加人工修正（施加在重算后的分类之上）
     table = _apply_classification_overrides(table)
     hotspot_type_codes = pd.to_numeric(table.get('hotspot_type'), errors='coerce').astype('Int64')
     if not hotspot_type_codes.isin([1, 2, 3]).any():
@@ -17980,10 +18191,31 @@ def show_classification_overrides(
     return table if not table.empty else None
 
 
+def _ventilation_threshold(table: pd.DataFrame, mode: str, *, fixed: float,
+                           glorys_criterion: float = _glorys_winter_mld_criterion) -> float | pd.Series:
+    """按 ventilation_mode 取逐行通风深度阈值（与 glorys_heave_zmin 比较）。
+
+    `fixed` 返回标量 depth_threshold；`ht_external` 用 `winter_mld_ht` 列；`glorys_winter_mld`
+    按密度判据用 `winter_mld_glorys_dt03/dt0125` 列。所需列缺失时回退到固定标量阈值。
+    """
+    if mode == 'ht_external':
+        col = 'winter_mld_ht'
+    elif mode == 'glorys_winter_mld':
+        col = 'winter_mld_glorys_dt03' if float(glorys_criterion) < 0.07 else 'winter_mld_glorys_dt0125'
+    else:
+        return float(fixed)
+    if col not in table.columns:
+        # 静默回退会让人误以为出的是本地 MLD 结果，故显式告警（多半是用旧版/未重跑上游产生的 parquet）
+        print(f"[WARN] ventilation_mode='{mode}' 需要列 '{col}'，但 overview parquet 中缺失；"
+              f"回退到固定阈值 {float(fixed):.0f}m。请用新版 plot_hotspot_anomaly_argo_glorys_overviews 重跑以生成该列。")
+        return float(fixed)
+    return pd.to_numeric(table[col], errors='coerce')
+
+
 def _assign_hotspot_type(
     table: pd.DataFrame,
     *,
-    heave_z_threshold: float | None = _heave_depth_threshold,
+    heave_z_threshold: float | pd.Series | np.ndarray | None = _heave_depth_threshold,
     heave_z_col: str = 'glorys_heave_zmin',
     heave_m_threshold: float | None = _heave_magnitude_threshold,
     heave_m_col: str = 'glorys_heave_m',
@@ -17995,8 +18227,10 @@ def _assign_hotspot_type(
     - Type 2: 非近岸，不满足 heave 联合判定（深层隔离型）
     - Type 3: 近岸 DO dip
 
-    阈值默认值来自 processing.yml:processing.heave（运行时可覆盖），
-    若阈值参数为 None 或表中无对应列，则只分 Type 3 / 未分类。
+    heave_z_threshold 可为标量（固定阈值）或逐行 Series/数组（本地冬季 MLD，由 ventilation_mode
+    决定，见 _ventilation_threshold）；阈值默认值来自 processing.yml:processing.heave（运行时可覆盖），
+    若阈值参数为 None 或表中无对应列，则只分 Type 3 / 未分类。逐行阈值为 NaN 的行（如本地 MLD
+    缺测）无法判定通风，保持未分类（<NA>）。
     """
     nearshore_vals = (
         table[nearshore_col].astype('boolean')
@@ -18014,11 +18248,15 @@ def _assign_hotspot_type(
 
     z_vals = pd.to_numeric(table[heave_z_col], errors='coerce')
     m_vals = pd.to_numeric(table[heave_m_col], errors='coerce')
-    z_ok = z_vals.notna()
+    if np.isscalar(heave_z_threshold):
+        z_thr = pd.Series(float(heave_z_threshold), index=table.index)
+    else:
+        z_thr = pd.to_numeric(pd.Series(np.asarray(heave_z_threshold), index=table.index), errors='coerce')
+    z_ok = z_vals.notna() & z_thr.notna()
     m_ok = m_vals.notna()
     non_nearshore_mask = ~nearshore_mask
 
-    pass_z = z_vals < float(heave_z_threshold)
+    pass_z = z_vals < z_thr
     pass_m = m_vals >= float(heave_m_threshold)
     hotspot_type[non_nearshore_mask & z_ok & m_ok & pass_z & pass_m] = 1
     hotspot_type[non_nearshore_mask & z_ok & m_ok & ~(pass_z & pass_m)] = 2
@@ -18121,6 +18359,9 @@ def _merge_hotspot_glorys_summary_fields(
         ('glorys_heave_sigma_peak', 'glorys_heave_sigma_peak'),
         ('glorys_heave_zmin', 'glorys_heave_zmin'),
         ('glorys_heave_m', 'glorys_heave_m'),
+        ('winter_mld_ht', 'winter_mld_ht'),
+        ('winter_mld_glorys_dt03', 'winter_mld_glorys_dt03'),
+        ('winter_mld_glorys_dt0125', 'winter_mld_glorys_dt0125'),
         ('heave_error', 'heave_error'),
         ('spice_anomaly', 'spice_anomaly'),
         ('spice_percentile', 'spice_percentile'),
