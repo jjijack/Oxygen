@@ -108,6 +108,10 @@ _woa23_root = Path(
 _mld_clim_root = Path(
     _PATHS_CFG.get('paths', {}).get('mld_clim_root', './data/mld_clim')
 )
+_ofes_root = Path(
+    _PATHS_CFG.get('paths', {}).get('ofes_root', './data/OFES_NP30')
+)
+_OFES_CFG = _PROC_CFG.get('ofes', {})
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -22418,3 +22422,395 @@ def calculate_interaction_statistics(
         with open(fname, 'w') as f:
             f.write(report)
         print(f"Report saved to: {fname}")
+
+
+
+def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:
+    """返回单日单变量 OFES netCDF 文件路径。"""
+    d = pd.Timestamp(date)
+    pattern = _OFES_CFG.get('file_pattern', '{var}.{mm}.{dd}.{yyyy}.nc')
+    fname = pattern.format(var=var, mm=f'{d.month:02d}', dd=f'{d.day:02d}', yyyy=d.year)
+    return _ofes_root / fname
+
+
+def load_ofes_snapshot(
+    date: str | pd.Timestamp,
+    variables: list[str] | None = None,
+    depth_max: float | None = None,
+) -> dict:
+    """加载一天的 OFES NP30 数据并将所有变量统一到示踪物网格。
+
+    Arakawa-C 交错处理：u/v 在 (601×901) 网格上，半格插值到 (600×900) 示踪物格点；
+    w 的 lev 位于层界面，线性插值到示踪物层中心。速度单位从 cm/s 转换为 m/s。
+
+    参数:
+        - date (str | pd.Timestamp): 日期，格式 'YYYY-MM-DD' 或 Timestamp。
+        - variables (list[str] | None): 需要加载的变量名列表；None 时加载 do2/temp/salinity/u/v/w。
+        - depth_max (float | None): 截断深度（m）；None 时加载全部 75 层。
+
+    返回:
+        - dict: 键含 'lat', 'lon', 'lev', 'date' 及各变量名 → numpy 3-D 数组 (lev, lat, lon)。
+    """
+    if variables is None:
+        variables = list(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
+        variables += list(_OFES_CFG.get('velocity_vars', ['u', 'v', 'w']))
+
+    tracer_vars = set(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
+    vel_scale = float(_OFES_CFG.get('velocity_scale', 0.01))
+
+    result: dict = {'date': pd.Timestamp(date)}
+    tracer_coords_set = False
+
+    for var in variables:
+        fpath = _ofes_file_path(var, date)
+        if not fpath.exists():
+            raise FileNotFoundError(f"OFES file not found: {fpath}")
+        nc = Dataset(str(fpath), 'r')
+        raw = np.ma.filled(nc.variables[var][0], np.nan).astype(np.float32)
+
+        if not tracer_coords_set and var in tracer_vars:
+            lat_t = np.asarray(nc.variables['lat'][:])
+            lon_t = np.asarray(nc.variables['lon'][:])
+            lev_t = np.asarray(nc.variables['lev'][:])
+            if depth_max is not None:
+                lev_mask = lev_t <= depth_max
+                lev_t = lev_t[lev_mask]
+            result['lat'] = lat_t
+            result['lon'] = lon_t
+            result['lev'] = lev_t
+            tracer_coords_set = True
+        nc.close()
+
+        if raw.ndim == 2:
+            result[var] = raw.astype(np.float32)
+            continue
+
+        if var in ('u', 'v'):
+            raw = 0.5 * (raw[:, :-1, :-1] + (
+                raw[:, :-1, 1:] if var == 'u' else raw[:, 1:, :-1]
+            ))
+            raw = raw * vel_scale
+
+        if var == 'w':
+            nc_w = Dataset(str(fpath), 'r')
+            lev_w = np.asarray(nc_w.variables['lev'][:])
+            nc_w.close()
+            lev_t_ref = result.get('lev', None)
+            if lev_t_ref is None:
+                fpath_t = _ofes_file_path('do2', date)
+                if fpath_t.exists():
+                    nc_t = Dataset(str(fpath_t), 'r')
+                    lev_t_ref = np.asarray(nc_t.variables['lev'][:])
+                    nc_t.close()
+            if lev_t_ref is not None:
+                interped = np.empty((len(lev_t_ref), raw.shape[1], raw.shape[2]), dtype=np.float32)
+                for j in range(raw.shape[1]):
+                    for k in range(raw.shape[2]):
+                        interped[:, j, k] = np.interp(lev_t_ref, lev_w, raw[:, j, k])
+                raw = interped
+            raw = raw * vel_scale
+
+        if depth_max is not None and 'lev' in result and raw.ndim == 3:
+            nlev = len(result['lev'])
+            raw = raw[:nlev]
+
+        result[var] = raw.astype(np.float32)
+
+    if not tracer_coords_set:
+        tracer_ref = _ofes_file_path('do2', date)
+        if not tracer_ref.exists():
+            tracer_ref = _ofes_file_path('temp', date)
+        if tracer_ref.exists():
+            nc0 = Dataset(str(tracer_ref), 'r')
+        else:
+            nc0 = Dataset(str(_ofes_file_path(variables[0], date)), 'r')
+        result['lat'] = np.asarray(nc0.variables['lat'][:])
+        result['lon'] = np.asarray(nc0.variables['lon'][:])
+        if 'lev' in nc0.variables:
+            lev_vals = np.asarray(nc0.variables['lev'][:])
+            if depth_max is not None:
+                lev_vals = lev_vals[lev_vals <= depth_max]
+            result['lev'] = lev_vals
+        nc0.close()
+
+    return result
+
+
+def extract_ofes_profile(
+    snapshot: dict,
+    lon: float,
+    lat: float,
+    variables: list[str] | None = None,
+) -> pd.DataFrame:
+    """从 OFES 快照中提取指定经纬度的垂向剖面（最近邻）。
+
+    参数:
+        - snapshot (dict): load_ofes_snapshot 返回的字典。
+        - lon (float): 经度。
+        - lat (float): 纬度。
+        - variables (list[str] | None): 变量名列表；None 时提取快照中所有 3-D 变量。
+
+    返回:
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+    """
+    lat_arr = snapshot['lat']
+    lon_arr = snapshot['lon']
+    lev_arr = snapshot['lev']
+
+    j = int(np.argmin(np.abs(lat_arr - lat)))
+    i = int(np.argmin(np.abs(lon_arr - lon)))
+
+    if variables is None:
+        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
+                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
+
+    records = {'Depth': lev_arr.copy()}
+    for var in variables:
+        arr = snapshot[var]
+        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
+            records[var] = arr[:, j, i].copy()
+
+    return pd.DataFrame(records)
+
+
+def extract_ofes_profile_interp(
+    snapshot: dict,
+    lon: float,
+    lat: float,
+    variables: list[str] | None = None,
+) -> pd.DataFrame:
+    """双线性插值版——在水平网格上做双线性插值，垂向不插值。
+
+    参数:
+        - snapshot (dict): load_ofes_snapshot 返回的字典。
+        - lon (float): 经度。
+        - lat (float): 纬度。
+        - variables (list[str] | None): 变量名列表。
+
+    返回:
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+    """
+    lat_arr = snapshot['lat']
+    lon_arr = snapshot['lon']
+    lev_arr = snapshot['lev']
+
+    j = np.searchsorted(lat_arr, lat) - 1
+    i = np.searchsorted(lon_arr, lon) - 1
+    j = np.clip(j, 0, len(lat_arr) - 2)
+    i = np.clip(i, 0, len(lon_arr) - 2)
+
+    dy = (lat - lat_arr[j]) / (lat_arr[j + 1] - lat_arr[j])
+    dx = (lon - lon_arr[i]) / (lon_arr[i + 1] - lon_arr[i])
+    dy = np.clip(dy, 0.0, 1.0)
+    dx = np.clip(dx, 0.0, 1.0)
+
+    w00 = (1 - dy) * (1 - dx)
+    w01 = (1 - dy) * dx
+    w10 = dy * (1 - dx)
+    w11 = dy * dx
+
+    if variables is None:
+        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
+                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
+
+    records = {'Depth': lev_arr.copy()}
+    any_all_nan = False
+    for var in variables:
+        arr = snapshot[var]
+        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
+            col = (w00 * arr[:, j, i] + w01 * arr[:, j, i + 1]
+                   + w10 * arr[:, j + 1, i] + w11 * arr[:, j + 1, i + 1])
+            records[var] = col.astype(np.float32)
+            if np.all(np.isnan(col)):
+                any_all_nan = True
+
+    if any_all_nan:
+        return extract_ofes_profile(snapshot, lon, lat, variables)
+
+    return pd.DataFrame(records)
+
+
+def detect_ofes_delta_do(
+    snapshot: dict,
+    lon: float,
+    lat: float,
+    detection_config: DetectionConfig | None = None,
+    interp: bool = True,
+) -> pd.DataFrame:
+    """在 OFES 虚拟剖面上运行 δDO 检测（复用 calculate_delta_do）。
+
+    参数:
+        - snapshot (dict): load_ofes_snapshot 返回的字典（需含 do2/temp/salinity）。
+        - lon (float): 经度。
+        - lat (float): 纬度。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时使用默认。
+        - interp (bool): True 时用双线性插值取剖面，False 时用最近邻。
+
+    返回:
+        - pd.DataFrame: calculate_delta_do 的结果表（空表 = 无异常）。
+    """
+    extract_fn = extract_ofes_profile_interp if interp else extract_ofes_profile
+    prof = extract_fn(snapshot, lon, lat, variables=['do2', 'temp', 'salinity'])
+
+    col_map = {'do2': 'DO', 'temp': 'Temperature', 'salinity': 'Salinity'}
+    prof = prof.rename(columns=col_map)
+
+    prof['Profile_number'] = 0
+    prof['Longitude'] = lon
+    prof['Latitude'] = lat
+    prof['Year'] = snapshot['date'].year
+    prof['Month'] = snapshot['date'].month
+    prof['Day'] = snapshot['date'].day
+
+    cfg = detection_config or make_detection_config()
+    result = calculate_delta_do(prof, detection_config=cfg, verbose=False)
+    return _keep_best_anomaly_per_profile(result, cfg)
+
+
+def _ofes_interp3d(
+    field: np.ndarray,
+    lev: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    pts: np.ndarray,
+) -> np.ndarray:
+    """三线性插值——对 (N,3) 点阵 [depth, lat, lon] 返回插值值。"""
+    interp_fn = RegularGridInterpolator(
+        (lev, lat, lon), field,
+        method='linear', bounds_error=False, fill_value=np.nan,
+    )
+    return interp_fn(pts)
+
+
+def _rk4_step(
+    pos: np.ndarray,
+    u_field: np.ndarray,
+    v_field: np.ndarray,
+    w_field: np.ndarray,
+    lev: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    """单步 RK4 积分——pos 为 (N,3) [depth, lat, lon]，dt 秒，速度 m/s。"""
+    def vel_at(p):
+        u = _ofes_interp3d(u_field, lev, lat, lon, p)
+        v = _ofes_interp3d(v_field, lev, lat, lon, p)
+        w = _ofes_interp3d(w_field, lev, lat, lon, p)
+        geo = approximate_degree_length(p[:, 1])
+        dlat = v / geo['meters_per_degree_lat']
+        dlon = u / geo['meters_per_degree_lon']
+        return np.column_stack([w, dlat, dlon])
+
+    k1 = vel_at(pos)
+    k2 = vel_at(pos + 0.5 * dt * k1)
+    k3 = vel_at(pos + 0.5 * dt * k2)
+    k4 = vel_at(pos + dt * k3)
+    return pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+def advect_ofes_particles(
+    snapshots: dict[str, dict] | list[dict],
+    particles: np.ndarray,
+    backward: bool = False,
+    dt_seconds: float | None = None,
+) -> list[np.ndarray]:
+    """用 OFES 速度场做离线 RK4 粒子追踪（正向或反向）。
+
+    参数:
+        - snapshots (dict[str, dict] | list[dict]): 按日期排序的 OFES 快照集合。
+            字典形式 {date_str: snapshot_dict}；列表形式 [snapshot_dict, ...]（需含 'date' 键）。
+            每个快照需含 u/v/w 及 lat/lon/lev。
+        - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [depth, lat, lon]。
+        - backward (bool): True 时反向追踪（dt 取负）。
+        - dt_seconds (float | None): 积分步长（秒）；None 时从 processing.yml 读取。
+
+    返回:
+        - list[np.ndarray]: 逐步粒子轨迹列表，trajectory[0] = 初始位置，之后每步一帧。
+
+    说明:
+        两天快照之间假设速度场恒定（取时间较近的那天）。
+        单天内按 dt 亚步进多次 RK4。粒子越界后位置保持不变（NaN 速度 → 停留）。
+    """
+    if dt_seconds is None:
+        dt_seconds = float(_OFES_CFG.get('rk4_dt_seconds', 3600))
+
+    if isinstance(snapshots, dict):
+        snap_list = [snapshots[k] for k in sorted(snapshots.keys())]
+    else:
+        snap_list = sorted(snapshots, key=lambda s: s['date'])
+
+    if backward:
+        snap_list = list(reversed(snap_list))
+        dt_seconds = -dt_seconds
+
+    max_substeps = int(_OFES_CFG.get('rk4_max_substeps', 24))
+
+    pos = particles.copy().astype(np.float64)
+    trajectory = [pos.copy()]
+
+    for idx in range(len(snap_list) - 1):
+        snap = snap_list[idx]
+        u_f = snap['u']
+        v_f = snap['v']
+        w_f = snap['w']
+        lev = snap['lev'].astype(np.float64)
+        lat = snap['lat'].astype(np.float64)
+        lon = snap['lon'].astype(np.float64)
+
+        for _ in range(max_substeps):
+            new_pos = _rk4_step(pos, u_f, v_f, w_f, lev, lat, lon, dt_seconds)
+            valid = np.all(np.isfinite(new_pos), axis=1)
+            pos[valid] = new_pos[valid]
+
+        trajectory.append(pos.copy())
+
+    return trajectory
+
+
+def plot_ofes_snapshot_quick(
+    snapshot: dict,
+    variable: str = 'do2',
+    depth: float = 200.0,
+    ax=None,
+    show_fig: bool = True,
+) -> plt.Figure | None:
+    """OFES 快照水平切片快速可视化。
+
+    参数:
+        - snapshot (dict): load_ofes_snapshot 返回的字典。
+        - variable (str): 绘制的变量名。
+        - depth (float): 深度（m），取最近层。
+        - ax: 可选 matplotlib Axes（需为 GeoAxes）。
+        - show_fig (bool): 是否显示图形。
+
+    返回:
+        - plt.Figure | None: show_fig=False 时返回 Figure。
+    """
+    lev = snapshot['lev']
+    k = int(np.argmin(np.abs(lev - depth)))
+    data = snapshot[variable][k]
+    lat = snapshot['lat']
+    lon = snapshot['lon']
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 7),
+                               subplot_kw={'projection': ccrs.PlateCarree()})
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor(_BASEMAP_COLORS['ocean'])
+    im = ax.pcolormesh(lon, lat, data, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto')
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'],
+                   edgecolor=_BASEMAP_COLORS['coastline'], linewidth=0.5, zorder=2)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=_BASEMAP_COLORS['grid'], alpha=0.6)
+    gl.top_labels = False
+    gl.right_labels = False
+    ax.set_title(f"OFES {variable}  depth={lev[k]:.1f}m  {snapshot['date'].strftime('%Y-%m-%d')}")
+    fig.colorbar(im, ax=ax, shrink=0.7)
+
+    if show_fig:
+        plt.show()
+        return None
+    return fig

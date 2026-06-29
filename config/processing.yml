@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.16 变更：
+#   - 新增 ofes 配置小节，集中管理 OFES NP30 数据读取与拉格朗日追踪参数
+#     （变量名映射、速度单位转换、Arakawa-C 网格差值标志、RK4 积分步长）。
 # version 1.15 变更：
 #   - heave 小节新增 ventilation_mode（fixed / glorys_winter_mld / ht_external，默认 ht_external），
 #     把 V/I 通风判据从固定 depth_threshold 改为逐点本地冬季混合层深度阈值（与文件中存的 winter_mld_* 列比较）；
@@ -38,7 +41,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.15
+version: 1.16
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -117,6 +120,15 @@ processing:
     match_window_days: 1      # 最佳匹配的时间搜索半宽（天）
     match_min_depth_coverage: 0.8  # 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，防浅海床列以截断深度刷低 RMS 胜出
     so_lat_threshold: -40.0   # 南大洋专项分界纬度（°）
+
+ofes:
+  velocity_scale: 0.01            # cm/s → m/s
+  file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
+  tracer_vars: [do2, temp, salinity]
+  velocity_vars: [u, v, w]
+  surface_vars: [eta, pressur]
+  rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
+  rk4_max_substeps: 24            # 单日内最大亚步数（dt × max = 1 天）
 
 plot:
   basemap_colors:
