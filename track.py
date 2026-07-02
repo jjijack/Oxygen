@@ -22426,11 +22426,16 @@ def calculate_interaction_statistics(
 
 
 def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:
-    """返回单日单变量 OFES netCDF 文件路径。"""
+    """返回单日单变量 OFES netCDF 文件路径。
+
+    数据集按变量分子目录存放（速度用 `<var>_vel`，其余用变量名，映射见
+    `var_subdir`；未列出者用变量名本身）。
+    """
     d = pd.Timestamp(date)
     pattern = _OFES_CFG.get('file_pattern', '{var}.{mm}.{dd}.{yyyy}.nc')
     fname = pattern.format(var=var, mm=f'{d.month:02d}', dd=f'{d.day:02d}', yyyy=d.year)
-    return _ofes_root / fname
+    subdir = _OFES_CFG.get('var_subdir', {}).get(var, var)
+    return _ofes_root / subdir / fname
 
 
 def load_ofes_snapshot(
