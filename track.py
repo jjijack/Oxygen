@@ -16,6 +16,8 @@ import glob
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 from scipy.stats import pearsonr, spearmanr
+from scipy.linalg import eig
+from scipy.optimize import least_squares
 import copy
 import gsw
 from collections import defaultdict
@@ -110,6 +112,9 @@ _mld_clim_root = Path(
 )
 _ofes_root = Path(
     _PATHS_CFG.get('paths', {}).get('ofes_root', './data/OFES_NP30')
+)
+_mccoy_scv_csv = Path(
+    _PATHS_CFG.get('paths', {}).get('mccoy_scv_csv', './data/mccoy2020_scv/SCVs.csv')
 )
 _OFES_CFG = _PROC_CFG.get('ofes', {})
 
@@ -292,6 +297,94 @@ _glorys_resid_so_lat = float(
 # 残差 worker 进程内的 Argo 年缓存及其上限（防跨十几年累积把内存吃爆；任务按年份排序后命中率仍高）
 _RESID_ARGO_CACHE: dict = {}
 _RESID_ARGO_CACHE_MAX = 3
+
+# 单剖面次表层涡（低 PV 透镜）探测参数（从 processing.yml:processing.subsurface_lens 读取）
+_SUBSURF_LENS_CFG = _PROC_CFG.get('processing', {}).get('subsurface_lens', {})
+_subsurf_lens_bg_box_deg = float(
+    _SUBSURF_LENS_CFG.get('bg_box_deg', 3.0)
+)
+_subsurf_lens_bg_window_days = int(
+    _SUBSURF_LENS_CFG.get('bg_window_days', 45)
+)
+_subsurf_lens_z_max_m = float(
+    _SUBSURF_LENS_CFG.get('z_max_m', 1500.0)
+)
+_subsurf_lens_z_spacing_m = float(
+    _SUBSURF_LENS_CFG.get('z_spacing_m', 10.0)
+)
+_subsurf_lens_z_min_core_m = float(
+    _SUBSURF_LENS_CFG.get('z_min_core_m', 150.0)
+)
+_subsurf_lens_surf_layer_m = float(
+    _SUBSURF_LENS_CFG.get('surf_layer_m', 100.0)
+)
+_subsurf_lens_spice_bandwidth = float(
+    _SUBSURF_LENS_CFG.get('spice_sigma_bandwidth', 0.25)
+)
+_subsurf_lens_spice_anom_threshold = float(
+    _SUBSURF_LENS_CFG.get('spice_anom_threshold', 0.15)
+)
+_subsurf_lens_glorys_resolve_floor = float(
+    _SUBSURF_LENS_CFG.get('glorys_resolve_floor', 0.07)
+)
+_subsurf_lens_surf_core_ratio_max = float(
+    _SUBSURF_LENS_CFG.get('surf_core_ratio_max', 0.5)
+)
+_subsurf_lens_n2_ratio_max = float(
+    _SUBSURF_LENS_CFG.get('n2_ratio_max', 0.6)
+)
+_subsurf_lens_velocity_criterion = bool(
+    _SUBSURF_LENS_CFG.get('velocity_criterion', True)
+)
+_subsurf_lens_velocity_extent_frac = float(
+    _SUBSURF_LENS_CFG.get('velocity_extent_frac', 0.135)
+)
+_subsurf_lens_velocity_equator_lat = float(
+    _SUBSURF_LENS_CFG.get('velocity_equator_lat', 5.0)
+)
+_subsurf_lens_min_bg_profiles = int(
+    _SUBSURF_LENS_CFG.get('min_bg_profiles', 10)
+)
+_subsurf_lens_eddy_enlarge = float(
+    _SUBSURF_LENS_CFG.get('eddy_enlarge_factor', 1.2)
+)
+_subsurf_lens_glorys_repro_dpi_frac = float(
+    _SUBSURF_LENS_CFG.get('glorys_repro_dpi_frac', 0.5)
+)
+_subsurf_lens_glorys_sameloc_radius_km = float(
+    _SUBSURF_LENS_CFG.get('glorys_sameloc_radius_km', 40.0)
+)
+_subsurf_lens_mccoy_argo_min_dpi = float(
+    _SUBSURF_LENS_CFG.get('mccoy_argo_min_dpi', 0.05)
+)
+_subsurf_lens_mccoy_match_days = int(
+    _SUBSURF_LENS_CFG.get('mccoy_match_days', 5)
+)
+_subsurf_lens_glorys_bg_radius_km = float(
+    _SUBSURF_LENS_CFG.get('glorys_bg_radius_km', 120.0)
+)
+_subsurf_lens_glorys_core_exclude_km = float(
+    _SUBSURF_LENS_CFG.get('glorys_core_exclude_km', 30.0)
+)
+_subsurf_lens_coherence_window_days = int(
+    _SUBSURF_LENS_CFG.get('coherence_window_days', 20)
+)
+_subsurf_lens_coherence_radius_km = float(
+    _SUBSURF_LENS_CFG.get('coherence_radius_km', 150.0)
+)
+_subsurf_lens_coherence_sigma_tol = float(
+    _SUBSURF_LENS_CFG.get('coherence_sigma_tol', 0.3)
+)
+_subsurf_lens_coherence_min_profiles = int(
+    _SUBSURF_LENS_CFG.get('coherence_min_profiles', 2)
+)
+# 文献已知的次表层涡区域（阳性对照），验证探测器在非西北太平洋也能 fire；sign 为文献预期水团符号
+_LENS_LITERATURE_BOXES = {
+    'Meddy (Gulf of Cadiz)':      dict(lon=(-14.0, -6.0), lat=(33.0, 37.0), sign='warm-salty'),
+    'California Cuddy':           dict(lon=(-130.0, -120.0), lat=(28.0, 36.0), sign='warm-salty'),
+    'Arabian Sea (RSW/PGW)':      dict(lon=(58.0, 68.0), lat=(12.0, 22.0), sign='warm-salty'),
+    'Kuroshio Ext (mode water)':  dict(lon=(140.0, 160.0), lat=(28.0, 38.0), sign='cold-fresh'),
+}
 
 _DETECTION_METHODS = {'do', 'aou', 'trim'}
 _cfg_cbar_defaults = _PROC_CFG.get('processing', {}).get('cbar_defaults', {})
@@ -16684,6 +16777,1528 @@ def plot_glorys_detail_loss_residual_atlas(
     return summary
 
 
+def _subsurface_lens_derive(
+    za: np.ndarray, ti: np.ndarray, sa: np.ndarray,
+    zc: np.ndarray, lon: float, lat: float,
+    potential_temp: bool = False,
+) -> dict:
+    """把 (深度, 温, 盐) 廓线插值到统一 z 网格 zc 并派生 σ₀ / 潜温 / spiciness π / N²。
+
+    返回各物理量在 zc 上的一维数组（无法计算处为 NaN）：T/S 为插值后的温盐，pt 为潜温
+    （供 spiciness 背景对比函数，与 compute_spiciness_anomaly 的 p_ref=0 口径一致），
+    sigma0 / pi 为位势密度异常与 spiciness，N2 为浮力频率平方（中点导数插回 zc）。
+    potential_temp=True 时 ti 已是潜温（如 GLORYS thetao），跳过现场温换算。
+    """
+    nz = zc.size
+    out = {k: np.full(nz, np.nan) for k in ('T', 'S', 'pt', 'sigma0', 'pi', 'N2')}
+    za = np.asarray(za, float); ti = np.asarray(ti, float); sa = np.asarray(sa, float)
+    m = np.isfinite(za) & np.isfinite(ti) & np.isfinite(sa)
+    if m.sum() < 5:
+        return out
+    order = np.argsort(za[m])
+    zz, tt, ss = za[m][order], ti[m][order], sa[m][order]
+    T = np.interp(zc, zz, tt, left=np.nan, right=np.nan)
+    S = np.interp(zc, zz, ss, left=np.nan, right=np.nan)
+    pres = gsw.p_from_z(-zc, lat)
+    SA = gsw.SA_from_SP(S, pres, lon, lat)
+    if potential_temp:
+        CT = gsw.CT_from_pt(SA, T)
+        out['pt'] = T
+    else:
+        CT = gsw.CT_from_t(SA, T, pres)
+        out['pt'] = gsw.pt0_from_t(SA, T, pres)
+    out['T'], out['S'] = T, S
+    out['sigma0'] = gsw.sigma0(SA, CT)
+    out['pi'] = gsw.spiciness0(SA, CT)
+    fin = np.isfinite(SA) & np.isfinite(CT)
+    if fin.sum() >= 3:
+        n2_mid, _p_mid = gsw.Nsquared(SA[fin], CT[fin], pres[fin], lat=lat)
+        z_mid = 0.5 * (zc[fin][:-1] + zc[fin][1:])
+        gm = np.isfinite(n2_mid)
+        if gm.sum() >= 2:
+            out['N2'] = np.interp(zc, z_mid[gm], n2_mid[gm], left=np.nan, right=np.nan)
+    return out
+
+
+def _dynamic_modes(n2: np.ndarray, p: np.ndarray):
+    """垂直动力模态（移植自 McCoy 2020 dynmodes.m / Klinck 1999）。
+
+    从浮力频率 N²(p) 解 Sturm-Liouville 广义本征问题 A·w = e·B·w（B=diag(N²)，刚盖+底边界），
+    返回按本征值升序的 (wmodes 垂向速度结构, pmodes 水平速度结构, ce 模态速度 m/s, pmode_p 模态
+    压强网格 dbar)；pmodes[:, 0] 即第一斜压水平速度模 BC1。p 须递增，p[0]>0 时补一层 0 dbar 表层。
+    """
+    rho0 = 1028.0
+    n2 = np.asarray(n2, float); p = np.asarray(p, float)
+    if p[0] > 0:
+        z = np.concatenate([[0.0], -p]); N2 = np.concatenate([[n2[0]], n2])
+    else:
+        z = -p; N2 = n2.copy()
+    nz = z.size
+    dz = z[:-1] - z[1:]
+    zm = z[:-1] - 0.5 * dz
+    dzm = np.zeros(nz)
+    dzm[1:nz - 1] = zm[:nz - 2] - zm[1:nz - 1]
+    dzm[0] = dzm[1]; dzm[nz - 1] = dzm[nz - 2]
+    A = np.zeros((nz, nz)); B = np.zeros((nz, nz))
+    for ii in range(1, nz - 1):
+        A[ii, ii] = 1.0 / (dz[ii - 1] * dzm[ii]) + 1.0 / (dz[ii] * dzm[ii])
+        A[ii, ii - 1] = -1.0 / (dz[ii - 1] * dzm[ii])
+        A[ii, ii + 1] = -1.0 / (dz[ii] * dzm[ii])
+    for k in range(nz):
+        B[k, k] = N2[k]
+    A[0, 0] = -1.0; A[nz - 1, 0] = -1.0
+    w, v = eig(A, B)
+    real = np.abs(w.imag) < 1e-12
+    e = w[real].real; v = v[:, real].real
+    pos = e >= 1e-10
+    e = e[pos]; v = v[:, pos]
+    order = np.argsort(e)
+    e = e[order]; wmodes = v[:, order]
+    ce = 1.0 / np.sqrt(e)
+    pmodes = np.zeros_like(wmodes)
+    for i in range(e.size):
+        pr = np.diff(wmodes[:, i]) / dz * rho0 * ce[i] * ce[i]
+        pmodes[1:nz - 1, i] = 0.5 * (pr[1:nz - 1] + pr[0:nz - 2])
+        pmodes[0, i] = pr[0]; pmodes[nz - 1, i] = pr[nz - 2]
+    return wmodes, pmodes, ce, -z
+
+
+def _dynamic_height_velocity_criterion(
+    fg: dict, bg: dict, zc: np.ndarray, dpi: np.ndarray, ci: int,
+    lon: float, lat: float,
+    *, extent_frac: float = _subsurf_lens_velocity_extent_frac,
+    equator_lat: float = _subsurf_lens_velocity_equator_lat,
+) -> dict:
+    """McCoy 2020 动力高度速度判据（get_spicy_scvs.m FLAG-3 段移植），仅用单剖面 T/S。
+
+    剖面与局地背景各算地转动力高度（参考最深公共层），沿等压面取异常 DH'；用 _dynamic_modes
+    把背景 N² 分解出第一斜压模 BC1，拟合其振幅 α（排除核带与混合层、底层锚定）后从 DH' 扣除；
+    若残差在核带 [pl,ph] 内出现内部极大（次表层地转流核，反气旋 SCV 标志，spicy/minty 同向）则
+    判有速度结构。核带取 |δπ| 衰减到峰值 ``extent_frac`` 处（≈核 ±√2·H 的高斯 e⁻² 范围）；
+    |纬度|<``equator_lat`` 跳过（f→0 地转失效）。返回 has_velocity_peak（True/False/None=未算）、
+    dh_peak_mag（残差核峰幅值）、Rd_km（变形半径 N·H/f）、skip_reason。
+    """
+    out = {'has_velocity_peak': None, 'dh_peak_mag': np.nan, 'Rd_km': np.nan, 'skip_reason': None}
+    try:
+        if abs(lat) < float(equator_lat):
+            out['skip_reason'] = 'equatorial'; return out
+        pres = gsw.p_from_z(-np.asarray(zc, float), lat)
+        SA_c = gsw.SA_from_SP(fg['S'], pres, lon, lat)
+        CT_c = gsw.CT_from_t(SA_c, fg['T'], pres)
+        SA_r = gsw.SA_from_SP(bg['S'], pres, lon, lat)
+        CT_r = gsw.CT_from_pt(SA_r, bg['pt'])
+        fin = (np.isfinite(SA_c) & np.isfinite(CT_c) & np.isfinite(SA_r)
+               & np.isfinite(CT_r) & np.isfinite(pres))
+        if int(fin.sum()) < 10:
+            out['skip_reason'] = 'too_few_levels'; return out
+        pf = pres[fin]; p_ref = float(pf.max())
+        dh_anom = (gsw.geo_strf_dyn_height(SA_c[fin], CT_c[fin], pf, p_ref)
+                   - gsw.geo_strf_dyn_height(SA_r[fin], CT_r[fin], pf, p_ref))
+        bg_N2 = np.asarray(bg['N2'], float)
+        n2m = np.isfinite(bg_N2) & (bg_N2 > 0)
+        if int(n2m.sum()) < 5:
+            out['skip_reason'] = 'no_bg_n2'; return out
+        _, pmodes, _, pmode_p = _dynamic_modes(bg_N2[n2m], pres[n2m])
+        BC1 = np.interp(pf, pmode_p, pmodes[:, 0])
+        core_val = abs(float(dpi[ci])); thr = float(extent_frac) * core_val
+        lo_i = hi_i = int(ci)
+        while lo_i > 0 and np.isfinite(dpi[lo_i - 1]) and abs(dpi[lo_i - 1]) >= thr:
+            lo_i -= 1
+        while hi_i < dpi.size - 1 and np.isfinite(dpi[hi_i + 1]) and abs(dpi[hi_i + 1]) >= thr:
+            hi_i += 1
+        pl, ph = float(pres[lo_i]), float(pres[hi_i])
+        if ph - pl < 1.0:
+            out['skip_reason'] = 'core_band_degenerate'; return out
+        sig = np.asarray(fg['sigma0'], float); sfin = np.isfinite(sig)
+        ml = np.where(sfin & (sig > sig[sfin][0] + 0.03))[0]   # Talley MLD：σ₀ 首超表层+0.03
+        mld_p = float(pres[ml[0]]) if ml.size else 0.0
+        keep = (~((pf > pl) & (pf < ph))) & (pf >= mld_p)      # 拟合 BC1 时排除核带与混合层
+        if int(keep.sum()) < 3:
+            out['skip_reason'] = 'fit_too_few'; return out
+        xo, xf = BC1[keep], dh_anom[keep]
+        alpha = float(least_squares(                            # 底层锚定的 BC1 振幅拟合
+            lambda a: a * xo - xf + (xf[-1] - a * xo[-1]), 0.05, bounds=(-1.0, 1.0)).x[0])
+        dh_bc1 = dh_anom - (alpha * BC1 + (dh_anom[-1] - alpha * BC1[-1]))
+        core_sel = (pf >= pl) & (pf <= ph)
+        dh_low = float(dh_bc1[np.argmin(np.abs(pf - pl))])
+        dh_high = float(dh_bc1[np.argmin(np.abs(pf - ph))])
+        peak = float(dh_bc1[core_sel].max())                   # 反气旋 SCV：核处动力高度内部极大
+        out['has_velocity_peak'] = bool(peak > dh_low and peak > dh_high)
+        out['dh_peak_mag'] = round(peak, 4)
+        f = gsw.f(lat); n2c = float(bg_N2[ci])
+        if np.isfinite(n2c) and n2c > 0 and f != 0:
+            out['Rd_km'] = round(np.sqrt(n2c) * (ph - pl) / abs(f) / 1000.0, 1)
+    except Exception as exc:
+        out['skip_reason'] = str(exc)
+    return out
+
+
+def detect_subsurface_lens(
+    year: int,
+    profile_number: int,
+    *,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    z_max_m: float = _subsurf_lens_z_max_m,
+    z_spacing_m: float = _subsurf_lens_z_spacing_m,
+    z_min_core_m: float = _subsurf_lens_z_min_core_m,
+    surf_layer_m: float = _subsurf_lens_surf_layer_m,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    spice_anom_threshold: float = _subsurf_lens_spice_anom_threshold,
+    surf_core_ratio_max: float = _subsurf_lens_surf_core_ratio_max,
+    n2_ratio_max: float = _subsurf_lens_n2_ratio_max,
+    velocity_criterion: bool = _subsurf_lens_velocity_criterion,
+    min_bg_profiles: int = _subsurf_lens_min_bg_profiles,
+    argo_data_dir: str | Path | None = None,
+    return_curves: bool = False,
+) -> dict:
+    """单条 Argo 剖面的次表层涡（低 PV 透镜）判据，对比局地背景 Argo 气候态。
+
+    在等密面框架下检验三条次表层涡指纹：(1) 核处水团偏离——相对局地背景池在同 σ₀ 上的
+    spiciness 异常 δπ，``core`` 取 ``z_min_core_m`` 以下 |δπ| 最大处；(2) 次表层强化——表层
+    参考层 |δπ| 与核处 |δπ| 之比小（异常集中在水下而非混合层）；(3) 低 PV 透镜——核处浮力频率
+    N² 相对背景被均质化（``n2_ratio_core`` <1）。三条满足即判透镜。``velocity_criterion`` 时另算
+    McCoy 动力高度速度判据（扣第一斜压模后核带内动力高度异常是否有内部极大＝次表层地转流核），
+    仅报告不进 is_lens。仅用单条剖面 + 局地背景即可成立，是后续 SSH 盲筛 / GLORYS 复现 /
+    相干性确认链路的入口筛子。
+
+    参数:
+        year: Argo 年份（定位年度 parquet 与背景池）。
+        profile_number: 该年内的 Profile_number。
+        bg_box_deg: 局地背景 Argo 池的经纬度半宽（°），不跨日界线。
+        bg_window_days: 背景池时间半窗（天，同年）；深层 T-S(σ) 季节稳定故同年即可。
+        z_max_m: 诊断最大深度（m）。
+        z_spacing_m: 垂向统一插值间距（m）。
+        z_min_core_m: 核搜索最小深度（m），排除季节性混合层的虚假极值。
+        surf_layer_m: 表层参考层上界（m），其 |δπ| 均值作表-核比的分子。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³），透传 compute_spiciness_anomaly。
+        spice_anom_threshold: |δπ_core| 显著阈值，低于此值视为无水团偏离。
+        surf_core_ratio_max: 表-核 |δπ| 比上限，越小越要求"次表层强化"。
+        n2_ratio_max: N²_prof/N²_bg 上限，核处层结须被均质化到此比例以下才算低 PV 透镜。
+        velocity_criterion: 是否计算 McCoy 动力高度速度判据（report-only，不进 is_lens gate）。
+        min_bg_profiles: 背景池有效剖面数下限，不足则判背景不足直接跳过。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        return_curves: 是否在返回中附带统一 z 网格上的廓线（供诊断绘图），默认 False。
+
+    返回:
+        dict: 含 status/skip_reason、位置时间、n_bg_profiles、core_depth_m/core_sigma0/
+              core_dpi/core_percentile、surf_to_core_ratio、n2_ratio_core/n2_anom_core、
+              has_velocity_peak/dh_peak_mag/Rd_km、is_lens（bool）、lens_sign；
+              return_curves=True 时附 'curves'（zc 及前景/背景 T/S/sigma0/pi/N2、dpi、
+              percentile）。
+    """
+    rec = {
+        'year': int(year), 'profile_number': int(profile_number),
+        'lat': np.nan, 'lon': np.nan, 'date': None, 'n_bg_profiles': 0,
+        'core_depth_m': np.nan, 'core_sigma0': np.nan, 'core_dpi': np.nan,
+        'core_percentile': np.nan, 'surf_to_core_ratio': np.nan,
+        'n2_ratio_core': np.nan, 'n2_anom_core': np.nan,
+        'has_velocity_peak': None, 'dh_peak_mag': np.nan, 'Rd_km': np.nan,
+        'is_lens': False, 'lens_sign': None,
+        'status': 'failed', 'skip_reason': None,
+    }
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    try:
+        df = load_argo_data(int(year), data_dir=argo_data_dir)
+        prof = df[df['Profile_number'] == int(profile_number)].sort_values('Depth')
+        if len(prof) < 5:
+            rec['status'], rec['skip_reason'] = 'skipped', 'argo_profile<5pts'
+            return rec
+        clon = float(prof['Longitude'].iloc[0]); clat = float(prof['Latitude'].iloc[0])
+        platform = prof['Platform_number'].iloc[0]
+        date = pd.Timestamp(year=int(prof['Year'].iloc[0]),
+                            month=int(prof['Month'].iloc[0]), day=int(prof['Day'].iloc[0]))
+        rec['lon'], rec['lat'] = round(clon, 3), round(clat, 3)
+        rec['date'] = date.strftime('%Y-%m-%d')
+
+        zc = np.arange(0.0, float(z_max_m) + 0.1, float(z_spacing_m))
+        fg = _subsurface_lens_derive(
+            prof['Depth'].to_numpy(float), prof['Temperature'].to_numpy(float),
+            prof['Salinity'].to_numpy(float), zc, clon, clat)
+
+        pool = collect_argo_pool(
+            (clon - bg_box_deg, clon + bg_box_deg), (clat - bg_box_deg, clat + bg_box_deg),
+            date - pd.Timedelta(days=int(bg_window_days)), date + pd.Timedelta(days=int(bg_window_days)),
+            max_depth=float(z_max_m))
+        if len(pool):
+            pool = pool[~((pool['Platform_number'] == platform)
+                          & (pool['Profile_number'] == int(profile_number)))]
+        n_bg = pool.groupby(['Platform_number', 'Profile_number']).ngroups if len(pool) else 0
+        rec['n_bg_profiles'] = int(n_bg)
+        if n_bg < int(min_bg_profiles):
+            rec['status'], rec['skip_reason'] = 'skipped', 'bg_insufficient'
+            return rec
+
+        # 背景池现场温 → 潜温，喂 σ₀ 空间的 spiciness 异常（p_ref=0 口径，与前景 fg['pt'] 一致）
+        p_pool = gsw.p_from_z(-pool['Depth'].to_numpy(float), pool['Latitude'].to_numpy(float))
+        SA_pool = gsw.SA_from_SP(pool['PSAL_Adjusted'].to_numpy(float), p_pool,
+                                 pool['Longitude'].to_numpy(float), pool['Latitude'].to_numpy(float))
+        pt_pool = gsw.pt0_from_t(SA_pool, pool['Temp_Adjusted'].to_numpy(float), p_pool)
+        dpi, pct = compute_spiciness_anomaly(
+            pt_pool, pool['PSAL_Adjusted'].to_numpy(float), fg['pt'], fg['S'],
+            center_lat=clat, center_lon=clon, sigma_bandwidth=spice_sigma_bandwidth)
+
+        # 局地背景中值廓线：池内现场温盐按深度分箱取中值，再派生 σ₀/π/N²（背景参考）
+        edges = np.concatenate([zc - float(z_spacing_m) / 2.0, [zc[-1] + float(z_spacing_m) / 2.0]])
+        bin_idx = np.digitize(pool['Depth'].to_numpy(float), edges) - 1
+        keep = (bin_idx >= 0) & (bin_idx < zc.size)
+        binned = pd.DataFrame({'i': bin_idx[keep],
+                               'T': pool['Temp_Adjusted'].to_numpy(float)[keep],
+                               'S': pool['PSAL_Adjusted'].to_numpy(float)[keep]})
+        agg = binned.groupby('i').agg(T=('T', 'median'), S=('S', 'median'), n=('T', 'size'))
+        agg = agg[agg['n'] >= 3]
+        bg_T = np.full(zc.size, np.nan); bg_S = np.full(zc.size, np.nan)
+        bg_T[agg.index.to_numpy()] = agg['T'].to_numpy()
+        bg_S[agg.index.to_numpy()] = agg['S'].to_numpy()
+        bg = _subsurface_lens_derive(zc, bg_T, bg_S, zc, clon, clat)
+
+        core_band = (zc >= float(z_min_core_m)) & (zc <= float(z_max_m)) & np.isfinite(dpi)
+        if not core_band.any():
+            rec['status'], rec['skip_reason'] = 'skipped', 'no_core'
+            return rec
+        cand = np.where(core_band)[0]
+        ci = cand[np.argmax(np.abs(dpi[cand]))]
+        core_dpi = float(dpi[ci])
+        rec['core_depth_m'] = round(float(zc[ci]), 1)
+        rec['core_sigma0'] = round(float(fg['sigma0'][ci]), 3) if np.isfinite(fg['sigma0'][ci]) else np.nan
+        rec['core_dpi'] = round(core_dpi, 4)
+        rec['core_percentile'] = round(float(pct[ci]), 1) if np.isfinite(pct[ci]) else np.nan
+
+        surf = (zc <= float(surf_layer_m)) & np.isfinite(dpi)
+        surf_abs = float(np.mean(np.abs(dpi[surf]))) if surf.any() else np.nan
+        ratio = surf_abs / abs(core_dpi) if abs(core_dpi) > 0 else np.nan
+        rec['surf_to_core_ratio'] = round(ratio, 3) if np.isfinite(ratio) else np.nan
+
+        n2_core = float(fg['N2'][ci]); n2_bg_core = float(bg['N2'][ci])
+        if np.isfinite(n2_core) and np.isfinite(n2_bg_core) and n2_bg_core > 0:
+            rec['n2_ratio_core'] = round(n2_core / n2_bg_core, 3)
+            rec['n2_anom_core'] = float(n2_core - n2_bg_core)
+
+        if velocity_criterion:
+            vel = _dynamic_height_velocity_criterion(fg, bg, zc, dpi, ci, clon, clat)
+            rec['has_velocity_peak'] = vel['has_velocity_peak']
+            rec['dh_peak_mag'] = vel['dh_peak_mag']
+            rec['Rd_km'] = vel['Rd_km']
+
+        rec['lens_sign'] = 'warm-salty' if core_dpi > 0 else 'cold-fresh'
+        rec['is_lens'] = bool(
+            abs(core_dpi) >= float(spice_anom_threshold)
+            and np.isfinite(ratio) and ratio <= float(surf_core_ratio_max)
+            and np.isfinite(rec['n2_ratio_core']) and rec['n2_ratio_core'] <= float(n2_ratio_max))
+        rec['status'] = 'ok'
+
+        if return_curves:
+            rec['curves'] = {
+                'zc': zc, 'dpi': dpi, 'percentile': pct, 'core_index': int(ci),
+                'T': fg['T'], 'S': fg['S'], 'pt': fg['pt'],
+                'sigma0': fg['sigma0'], 'pi': fg['pi'], 'N2': fg['N2'],
+                'bg_sigma0': bg['sigma0'], 'bg_pi': bg['pi'], 'bg_N2': bg['N2'],
+                'bg_pt': bg['pt'], 'bg_S': bg['S'],
+                # 原始背景池（σ₀ 空间分布），供 GLORYS 复现测试对同一背景算 δπ_glorys
+                'pool_pt': pt_pool, 'pool_sal': pool['PSAL_Adjusted'].to_numpy(float),
+            }
+    except Exception as exc:
+        rec['skip_reason'] = str(exc)
+    return rec
+
+
+def plot_subsurface_lens_diagnostic(
+    year: int,
+    profile_number: int,
+    *,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    z_max_m: float = _subsurf_lens_z_max_m,
+    z_spacing_m: float = _subsurf_lens_z_spacing_m,
+    z_min_core_m: float = _subsurf_lens_z_min_core_m,
+    surf_layer_m: float = _subsurf_lens_surf_layer_m,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    spice_anom_threshold: float = _subsurf_lens_spice_anom_threshold,
+    surf_core_ratio_max: float = _subsurf_lens_surf_core_ratio_max,
+    n2_ratio_max: float = _subsurf_lens_n2_ratio_max,
+    min_bg_profiles: int = _subsurf_lens_min_bg_profiles,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = False,
+    save_path: str | Path | None = None,
+) -> dict:
+    """单剖面次表层涡诊断四联图：σ₀ / spiciness 异常 δπ / N² / T-S，对比局地背景气候态。
+
+    调用 detect_subsurface_lens 取判据与廓线，画 2×2：σ₀(z) 前景 vs 背景中值、δπ(z) 带符号
+    填色并标核、N²(z) 前景 vs 背景（低 PV 透镜在核处下凹）、T-S 图（背景云 + σ₀ 等值线 + 前景按
+    深度着色，核点星标）。标题汇总核深/σ₀/δπ/百分位/N² 比/速度判据峰 与是否判为透镜。
+
+    参数:
+        year: Argo 年份。
+        profile_number: 该年内的 Profile_number。
+        bg_box_deg / bg_window_days: 局地背景池的经纬度半宽（°）与时间半窗（天）。
+        z_max_m / z_spacing_m: 诊断最大深度与垂向插值间距（m）。
+        z_min_core_m: 核搜索最小深度（m），排除混合层。
+        surf_layer_m: 表层参考层上界（m），算表-核比。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³）。
+        spice_anom_threshold / surf_core_ratio_max / n2_ratio_max: 透镜三判据阈值。
+        min_bg_profiles: 背景池有效剖面数下限。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        output_dir: 图输出根目录；None 使用 shared/<region>/plot_subsurface_lens_diagnostic。
+        show_fig: 是否显示图，默认 True。
+        save_fig: 是否保存图，默认 False。
+        save_path: 显式保存路径；None 时按默认命名落在 output_dir 下。
+
+    返回:
+        dict: detect_subsurface_lens 的判据摘要（去掉廓线），save_fig 时附 'figure_path'。
+    """
+    det = detect_subsurface_lens(
+        year, profile_number,
+        bg_box_deg=bg_box_deg, bg_window_days=bg_window_days,
+        z_max_m=z_max_m, z_spacing_m=z_spacing_m, z_min_core_m=z_min_core_m,
+        surf_layer_m=surf_layer_m, spice_sigma_bandwidth=spice_sigma_bandwidth,
+        spice_anom_threshold=spice_anom_threshold, surf_core_ratio_max=surf_core_ratio_max,
+        n2_ratio_max=n2_ratio_max,
+        min_bg_profiles=min_bg_profiles,
+        argo_data_dir=argo_data_dir, return_curves=True)
+    if det.get('status') != 'ok':
+        print(f"[!] subsurface lens: P{profile_number}/{year} 跳过 ({det.get('skip_reason')})。")
+        return {k: v for k, v in det.items() if k != 'curves'}
+
+    cur = det['curves']
+    zc = cur['zc']; ci = cur['core_index']; core_depth = zc[ci]
+    clon, clat = det['lon'], det['lat']
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+    core_kw = dict(color='magenta', ls='--', lw=1.0, alpha=0.8)
+
+    ax = axes[0, 0]
+    ax.plot(cur['sigma0'], zc, color='tab:blue', lw=1.6, label='profile')
+    ax.plot(cur['bg_sigma0'], zc, color='0.55', lw=1.4, ls='-', label='local background')
+    ax.axhline(core_depth, **core_kw)
+    ax.set_xlabel('σ₀ (kg/m³)'); ax.set_ylabel('Depth (m)')
+    ax.set_ylim(z_max_m, 0); ax.legend(loc='lower left', fontsize=8); ax.set_title('Potential density')
+
+    ax = axes[0, 1]
+    dpi = cur['dpi']
+    ax.plot(dpi, zc, color='0.3', lw=1.0)
+    ax.fill_betweenx(zc, 0, np.where(dpi > 0, dpi, 0), color='tab:red', alpha=0.5, label='warm-salty (δπ>0)')
+    ax.fill_betweenx(zc, 0, np.where(dpi < 0, dpi, 0), color='tab:blue', alpha=0.5, label='cold-fresh (δπ<0)')
+    ax.axvline(0, color='k', lw=0.7)
+    ax.axhline(core_depth, **core_kw)
+    ax.axhspan(0, surf_layer_m, color='0.85', alpha=0.5, zorder=0)
+    ax.set_xlabel('δπ spiciness anomaly (kg/m³)'); ax.set_ylabel('Depth (m)')
+    ax.set_ylim(z_max_m, 0); ax.legend(loc='lower left', fontsize=8)
+    ax.set_title(f"Spiciness anomaly  (core δπ={det['core_dpi']:+.2f}, P{det['core_percentile']:.0f})")
+
+    ax = axes[1, 0]
+    ax.plot(cur['N2'], zc, color='tab:blue', lw=1.6, label='profile')
+    ax.plot(cur['bg_N2'], zc, color='0.55', lw=1.4, label='local background')
+    ax.axhline(core_depth, **core_kw)
+    ax.set_xscale('log'); ax.set_xlabel('N² (s⁻²)'); ax.set_ylabel('Depth (m)')
+    ax.set_ylim(z_max_m, 0); ax.legend(loc='lower left', fontsize=8)
+    n2r = det['n2_ratio_core']
+    ax.set_title(f"Stratification  (core N² ratio={n2r:.2f})" if np.isfinite(n2r) else "Stratification")
+
+    ax = axes[1, 1]
+    pt = cur['pt']; S = cur['S']
+    fin = np.isfinite(pt) & np.isfinite(S)
+    if fin.any():
+        s_lin = np.linspace(np.nanmin(S) - 0.1, np.nanmax(S) + 0.1, 60)
+        t_lin = np.linspace(np.nanmin(pt) - 1.0, np.nanmax(pt) + 1.0, 60)
+        SS, TT = np.meshgrid(s_lin, t_lin)
+        SA_g = gsw.SA_from_SP(SS, 0.0, clon, clat)
+        sig_g = gsw.sigma0(SA_g, gsw.CT_from_pt(SA_g, TT))
+        cs = ax.contour(SS, TT, sig_g, colors='0.7', linewidths=0.6)
+        ax.clabel(cs, inline=True, fontsize=6, fmt='%.1f')
+        ax.scatter(cur['bg_S'], cur['bg_pt'], s=6, color='0.6', alpha=0.5, label='local background')
+        sc = ax.scatter(S[fin], pt[fin], c=zc[fin], cmap='viridis', s=12)
+        ax.scatter([S[ci]], [pt[ci]], marker='*', s=260, color='magenta',
+                   edgecolor='k', zorder=5, label=f'core {core_depth:.0f} m')
+        fig.colorbar(sc, ax=ax, label='Depth (m)', shrink=0.85)
+    ax.set_xlabel('Salinity'); ax.set_ylabel('Potential temperature (°C)')
+    ax.legend(loc='upper left', fontsize=8); ax.set_title('T-S diagram')
+
+    verdict = 'LENS' if det['is_lens'] else 'no lens'
+    vp = {True: 'Y', False: 'N', None: '–'}.get(det['has_velocity_peak'], '–')
+    fig.suptitle(
+        f"P{profile_number} ({clat:.1f}°N, {clon:.1f}°E) {det['date']}  |  "
+        f"core {core_depth:.0f} m  σ₀={det['core_sigma0']:.2f}  δπ={det['core_dpi']:+.2f}  "
+        f"surf/core={det['surf_to_core_ratio']:.2f}  N²ratio={n2r:.2f}  "
+        f"vel_peak={vp}  |  {verdict}",
+        fontsize=12, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+
+    out = {k: v for k, v in det.items() if k != 'curves'}
+    if save_fig:
+        region_slug = _current_region_key()
+        base = Path(output_dir) if output_dir is not None else _shared_output_dir(
+            'plot_subsurface_lens_diagnostic', region_slug)
+        base.mkdir(parents=True, exist_ok=True)
+        fpath = (Path(save_path) if save_path is not None
+                 else base / f"argo{int(profile_number)}_subsurface_lens_{det['date'].replace('-', '')}.png")
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] subsurface lens diagnostic saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def _load_daily_eddies(
+    region_slug: str | None,
+    date_min: str | pd.Timestamp,
+    date_max: str | pd.Timestamp,
+    kinds: tuple[str, ...] = ('acl', 'acs', 'cl', 'cs'),
+) -> dict:
+    """读取 META 各类涡的日度表（time/center_lon/center_lat/radius），按日期范围预过滤。
+
+    返回 {kind: DataFrame}；缺失文件或无数据的 kind 不入字典。供测高盲筛的"在不在面涡内"判定。
+    """
+    slug = region_slug or _current_region_key()
+    root = _ensure_meta_tracks_root()
+    t0, t1 = pd.Timestamp(date_min).normalize(), pd.Timestamp(date_max).normalize()
+    cols = ['time', 'center_lon', 'center_lat', 'radius']
+    out = {}
+    for kind in kinds:
+        fp = Path(root) / str(slug) / f"{kind}_daily.parquet"
+        if not fp.exists():
+            continue
+        try:
+            df = pd.read_parquet(fp, columns=cols,
+                                 filters=[('time', '>=', t0), ('time', '<=', t1)])
+        except Exception:
+            df = pd.read_parquet(fp, columns=cols)
+            df = df[(df['time'] >= t0) & (df['time'] <= t1)]
+        if len(df):
+            df['time'] = pd.to_datetime(df['time']).dt.normalize()
+            out[kind] = df.reset_index(drop=True)
+    return out
+
+
+def _profile_in_any_surface_eddy(
+    clon: float, clat: float, date: str | pd.Timestamp,
+    daily_by_kind: dict, enlarge: float = _subsurf_lens_eddy_enlarge,
+) -> dict:
+    """判断 (clon,clat,date) 是否落在任一已检测面涡的圆判定范围内（center+radius×enlarge）。
+
+    daily_by_kind 由 _load_daily_eddies 预读。返回最贴合（dist/半径 最小）的命中信息：
+    in_eddy、eddy_kind、eddy_dist_km、eddy_radius_km；未命中 in_eddy=False。
+    """
+    day_ts = pd.Timestamp(date).normalize()
+    best = {'in_eddy': False, 'eddy_kind': None, 'eddy_dist_km': np.nan, 'eddy_radius_km': np.nan}
+    best_ratio = np.inf
+    for kind, df in daily_by_kind.items():
+        day = df[df['time'] == day_ts]
+        if not len(day):
+            continue
+        near = day[day['center_lat'].sub(clat).abs() <= 3.0]
+        if not len(near):
+            continue
+        dlon = _minimal_lon_diff_deg(near['center_lon'].to_numpy(float), clon)
+        keep = np.abs(dlon) <= 3.0
+        near = near[keep]
+        if not len(near):
+            continue
+        dist_m = adaptive_distance_m(
+            near['center_lon'].to_numpy(float), near['center_lat'].to_numpy(float),
+            np.full(len(near), clon), np.full(len(near), clat), wrap_dateline=True)
+        rad_m = near['radius'].to_numpy(float)
+        ratio = dist_m / np.maximum(rad_m * float(enlarge), 1.0)
+        j = int(np.argmin(ratio))
+        if ratio[j] <= 1.0 and ratio[j] < best_ratio:
+            best_ratio = ratio[j]
+            best = {'in_eddy': True, 'eddy_kind': kind,
+                    'eddy_dist_km': round(float(dist_m[j]) / 1000.0, 1),
+                    'eddy_radius_km': round(float(rad_m[j]) / 1000.0, 1)}
+    return best
+
+
+def _glorys_lens_reproduction(
+    clon: float, clat: float, date: pd.Timestamp,
+    zc: np.ndarray, ci: int, bg_pt: np.ndarray, bg_sal: np.ndarray,
+    dpi_argo_core: float, *,
+    sameloc_radius_km: float, spice_bandwidth: float, repro_dpi_frac: float,
+) -> dict:
+    """GLORYS 复现测试：读同位 thetao+so 列，在 Argo 核处对同一 Argo 背景算 δπ_glorys 与 N²。
+
+    glorys_dpi_ratio = δπ_glorys / δπ_argo（核处）：~1 复现、~0 或异号即 GLORYS 抹平了水团异常。
+    glorys_misses=True 当保留比例 < repro_dpi_frac（含异号）。返回判据标量。
+    """
+    out = {'glorys_dpi_core': np.nan, 'glorys_dpi_ratio': np.nan,
+           'glorys_n2_core': np.nan, 'glorys_misses': None,
+           'status': 'failed', 'skip_reason': None}
+    try:
+        lo, hi, la, lb = _window_bounds_from_center_km(clon, clat, sameloc_radius_km)
+        glon, glat, gdep, gdat = _load_glorys_window_by_center(
+            date, clon, lo, hi, la, lb, variables=['thetao', 'salinity'])
+        th = np.ma.filled(np.ma.array(gdat['thetao'], dtype=float), np.nan)
+        sl = np.ma.filled(np.ma.array(gdat['salinity'], dtype=float), np.nan)
+        qlat = float(np.clip(clat, glat.min(), glat.max()))
+        qlon = float(np.clip(clon, glon.min(), glon.max()))
+        pts = np.column_stack([gdep, np.full(gdep.size, qlat), np.full(gdep.size, qlon)])
+        th_col = RegularGridInterpolator((gdep, glat, glon), th, bounds_error=False, fill_value=np.nan)(pts)
+        sl_col = RegularGridInterpolator((gdep, glat, glon), sl, bounds_error=False, fill_value=np.nan)(pts)
+        gder = _subsurface_lens_derive(gdep, th_col, sl_col, zc, clon, clat, potential_temp=True)
+        dpi_g, _pct_g = compute_spiciness_anomaly(
+            bg_pt, bg_sal, gder['pt'], gder['S'],
+            center_lat=clat, center_lon=clon, sigma_bandwidth=spice_bandwidth)
+        gdpi = float(dpi_g[ci])
+        out['glorys_dpi_core'] = round(gdpi, 4)
+        out['glorys_n2_core'] = float(gder['N2'][ci])
+        if np.isfinite(dpi_argo_core) and abs(dpi_argo_core) > 0 and np.isfinite(gdpi):
+            ratio = gdpi / dpi_argo_core
+            out['glorys_dpi_ratio'] = round(ratio, 3)
+            out['glorys_misses'] = bool(ratio < float(repro_dpi_frac))
+        out['status'] = 'ok'
+    except Exception as exc:
+        out['skip_reason'] = str(exc)
+    return out
+
+
+def glorys_reproduces_mccoy_scv(
+    year: int,
+    profile_number: int,
+    core_pressure_db: float,
+    *,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    glorys_sameloc_radius_km: float = _subsurf_lens_glorys_sameloc_radius_km,
+    glorys_repro_dpi_frac: float = _subsurf_lens_glorys_repro_dpi_frac,
+    argo_min_dpi: float = _subsurf_lens_mccoy_argo_min_dpi,
+    argo_data_dir: str | Path | None = None,
+) -> dict:
+    """检验 GLORYS 能否复现 McCoy(2020) 已确认 SCV 在核处的水团异常（低 PV 透镜漏检判据）。
+
+    检测这一步外包给 McCoy 目录（其 SCV 已过动力高度速度判据），本函数不重跑 is_lens gate，只锚定
+    在 McCoy 报告的核压 ``core_pressure_db`` 上问一件事：GLORYS 是否把该处 spiciness 异常抹平。先对
+    该 Argo 剖面建局地背景池并算 δπ（复用 detect_subsurface_lens），取最接近 McCoy 核压处的 Argo δπ
+    作真值；若 |Argo δπ| < ``argo_min_dpi`` 判 ``argo_no_signal``（我们的局地池法看不到该异常，无从据
+    以判 GLORYS）。否则读 GLORYS 同位 thetao+so 列，对同一 Argo 背景在同一核处算 δπ_glorys，
+    ``glorys_dpi_ratio`` = δπ_glorys/δπ_argo；比值 < ``glorys_repro_dpi_frac``（含异号）即
+    ``glorys_misses``＝GLORYS 抹平了这个透镜。
+
+    参数:
+        year: Argo 年份（定位年度 parquet 与背景池）。
+        profile_number: 该年内的 Profile_number（已由 Platform+日期匹配到 McCoy SCV）。
+        core_pressure_db: McCoy 报告的核压（dbar），据此锚定核深，不再自行 argmax|δπ|。
+        bg_box_deg: 局地背景 Argo 池的经纬度半宽（°）。
+        bg_window_days: 局地背景池的时间半窗（天，同年）。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³），Argo 与 GLORYS 侧共用。
+        glorys_sameloc_radius_km: GLORYS 同位列读取窗口半宽（km）。
+        glorys_repro_dpi_frac: GLORYS 核处 |δπ| 保留低于该比例×Argo 即判 GLORYS 抹平。
+        argo_min_dpi: Argo 核处 |δπ| 下限，低于此值判 argo_no_signal。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+
+    返回:
+        dict: 含 status/skip_reason、year/profile_number、lat/lon/date、n_bg_profiles、
+              mccoy_core_pressure_db、core_depth_m、argo_dpi_core、argo_lens_sign、
+              glorys_dpi_core、glorys_dpi_ratio、glorys_n2_core、glorys_misses（bool/None）。
+    """
+    rec = {
+        'year': int(year), 'profile_number': int(profile_number),
+        'lat': np.nan, 'lon': np.nan, 'date': None, 'n_bg_profiles': 0,
+        'mccoy_core_pressure_db': float(core_pressure_db),
+        'core_depth_m': np.nan, 'argo_dpi_core': np.nan, 'argo_lens_sign': None,
+        'glorys_dpi_core': np.nan, 'glorys_dpi_ratio': np.nan,
+        'glorys_n2_core': np.nan, 'glorys_misses': None,
+        'status': 'failed', 'skip_reason': None,
+    }
+    try:
+        det = detect_subsurface_lens(
+            int(year), int(profile_number), bg_box_deg=bg_box_deg,
+            bg_window_days=bg_window_days, spice_sigma_bandwidth=spice_sigma_bandwidth,
+            velocity_criterion=False, argo_data_dir=argo_data_dir, return_curves=True)
+        rec['lat'], rec['lon'] = det['lat'], det['lon']
+        rec['date'], rec['n_bg_profiles'] = det['date'], det['n_bg_profiles']
+        if det.get('status') != 'ok':
+            rec['status'], rec['skip_reason'] = det.get('status'), det.get('skip_reason')
+            return rec
+        cur = det['curves']
+        zc, dpi = cur['zc'], cur['dpi']
+        clon, clat = float(det['lon']), float(det['lat'])
+        date = pd.Timestamp(det['date'])
+        # 锚定在 McCoy 核压（dbar→m 用同纬度换算）最近的有效 δπ 网格点，不自行 argmax
+        core_z = float(-gsw.z_from_p(float(core_pressure_db), clat))
+        finite = np.where(np.isfinite(dpi))[0]
+        if finite.size == 0:
+            rec['status'], rec['skip_reason'] = 'skipped', 'no_argo_dpi'
+            return rec
+        ci = int(finite[np.argmin(np.abs(zc[finite] - core_z))])
+        argo_dpi_core = float(dpi[ci])
+        rec['core_depth_m'] = round(float(zc[ci]), 1)
+        rec['argo_dpi_core'] = round(argo_dpi_core, 4)
+        rec['argo_lens_sign'] = 'warm-salty' if argo_dpi_core > 0 else 'cold-fresh'
+        if abs(argo_dpi_core) < float(argo_min_dpi):
+            rec['status'] = 'argo_no_signal'
+            return rec
+        rep = _glorys_lens_reproduction(
+            clon, clat, date, zc, ci, cur['pool_pt'], cur['pool_sal'], argo_dpi_core,
+            sameloc_radius_km=glorys_sameloc_radius_km,
+            spice_bandwidth=spice_sigma_bandwidth, repro_dpi_frac=glorys_repro_dpi_frac)
+        rec.update({k: rep[k] for k in ('glorys_dpi_core', 'glorys_dpi_ratio',
+                                        'glorys_n2_core', 'glorys_misses')})
+        rec['status'], rec['skip_reason'] = rep['status'], rep['skip_reason']
+    except Exception as exc:
+        rec['skip_reason'] = str(exc)
+    return rec
+
+
+def _match_mccoy_scvs_to_profiles(
+    scv: pd.DataFrame, argo_data_dir: str | Path, match_days: int,
+) -> pd.DataFrame:
+    """把 McCoy SCV 行按 Platform 编号 + 周期日期（±match_days 天）映射到我们年度 Argo 的 Profile_number。
+
+    逐年读年度 parquet 的 (Platform_number, Profile_number, 年月日) 索引，对每个 Platform 用日期二分
+    找最近剖面；匹配不上（无该年 parquet / 无该 Platform / 超容差）的 SCV 丢弃。返回带 year/
+    profile_number 列的匹配子集。"""
+    tol = np.timedelta64(int(match_days), 'D')
+    out = []
+    for yr, sub in scv.groupby(scv['date'].dt.year):
+        fp = Path(argo_data_dir) / f'Argo{int(yr)}.parquet'
+        if not fp.exists():
+            continue
+        idx = pq.read_table(fp, columns=['Profile_number', 'Platform_number',
+                                         'Year', 'Month', 'Day']).to_pandas()
+        idx = idx.groupby('Profile_number').first().reset_index()
+        idx['date'] = pd.to_datetime(dict(year=idx['Year'], month=idx['Month'], day=idx['Day']))
+        by_plat = {int(p): g.sort_values('date') for p, g in idx.groupby('Platform_number')}
+        for row in sub.itertuples(index=False):
+            g = by_plat.get(int(row.Platform))
+            if g is None:
+                continue
+            dates = g['date'].values.astype('datetime64[ns]')
+            j = int(np.searchsorted(dates, np.datetime64(row.date)))
+            best = min((k for k in (j - 1, j) if 0 <= k < dates.size),
+                       key=lambda k: abs(dates[k] - np.datetime64(row.date)), default=None)
+            if best is None or abs(dates[best] - np.datetime64(row.date)) > tol:
+                continue
+            out.append({'year': int(yr),
+                        'profile_number': int(g['Profile_number'].values[best]),
+                        'core_pressure_db': float(row.Core_Pressure),
+                        'scv_type': row.SCV_Type, 'basin': row.basin})
+    return pd.DataFrame(out)
+
+
+def screen_mccoy_scvs_against_glorys(
+    *,
+    mccoy_csv: str | Path | None = None,
+    basins: list[str] | None = None,
+    max_scvs: int | None = None,
+    match_days: int = _subsurf_lens_mccoy_match_days,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    glorys_sameloc_radius_km: float = _subsurf_lens_glorys_sameloc_radius_km,
+    glorys_repro_dpi_frac: float = _subsurf_lens_glorys_repro_dpi_frac,
+    argo_min_dpi: float = _subsurf_lens_mccoy_argo_min_dpi,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    rows_path: str | Path | None = None,
+    verbose: bool = False,
+    return_details: bool = False,
+) -> dict:
+    """在 McCoy(2020) 全球 SCV 目录上跑 GLORYS 漏检检验，按海盆汇总 GLORYS 抹平率。
+
+    读 McCoy SCV 目录（``mccoy_csv``），按 Platform 编号 + 周期日期（±``match_days`` 天）匹配到我们含
+    DO 的 BGC Argo 剖面（逐年 parquet），逐条调 glorys_reproduces_mccoy_scv 在 McCoy 核压处做 GLORYS
+    复现，输出明细 parquet 与按 _residual_basin_of 海盆分组的 GLORYS 抹平计数。仅覆盖同时被 McCoy 检测
+    且落在我们 BGC Argo 上的 SCV（约全目录 6%），是"GLORYS 漏检次表层涡"的正样本证据。**串行实现，
+    逐条重建局地背景池 + 读 GLORYS，大批量较慢**。
+
+    参数:
+        mccoy_csv: McCoy SCV 目录 CSV 路径；None 使用 paths.yml 中的 mccoy_scv_csv。
+        basins: 只保留这些海盆（_residual_basin_of 标签，如 ['Pacific','SO']）；None 全部。
+        max_scvs: 处理的匹配 SCV 数上限（截断），None 不限。
+        match_days: McCoy 周期日期 ↔ 我们剖面的 Platform+日期匹配容差（天）。
+        bg_box_deg: 局地背景 Argo 池的经纬度半宽（°）。
+        bg_window_days: 局地背景池的时间半窗（天，同年）。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³）。
+        glorys_sameloc_radius_km: GLORYS 同位列读取窗口半宽（km）。
+        glorys_repro_dpi_frac: GLORYS 核处 |δπ| 保留低于该比例×Argo 即判抹平。
+        argo_min_dpi: Argo 核处 |δπ| 下限，低于此值判 argo_no_signal。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        output_dir: 输出根目录；None 使用当前 method/region 下默认目录。
+        rows_path: 明细 parquet 路径；None 时落在 output_dir 下默认文件名。
+        verbose: 是否打印每条跳过明细。
+        return_details: 是否在返回中附带明细 DataFrame，默认 False。
+
+    返回:
+        dict: 含 n_catalog/n_matched/n_evaluated/argo_no_signal/glorys_miss_count/miss_rate/
+              by_basin/rows_path/output_dir 等摘要；return_details=True 时附 'rows'。
+    """
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    csv_path = Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv
+    scv = pd.read_csv(csv_path)
+    scv['date'] = pd.to_datetime(scv['Cycle_ISO_DateTime_UTC']).dt.tz_localize(None)
+    scv['basin'] = [_residual_basin_of(la, lo)
+                    for la, lo in zip(scv['Latitude'], scv['Longitude'])]
+    if basins is not None:
+        scv = scv[scv['basin'].isin(set(basins))]
+
+    matched = _match_mccoy_scvs_to_profiles(scv, argo_data_dir, match_days)
+    if max_scvs is not None:
+        matched = matched.iloc[:int(max_scvs)]
+
+    cfg = _resolve_detection_config(None)
+    region_slug = _current_region_key()
+    base = (Path(output_dir) if output_dir is not None
+            else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug))
+    base.mkdir(parents=True, exist_ok=True)
+    resolved_rows = (Path(rows_path) if rows_path is not None
+                     else base / "mccoy_glorys_miss.parquet")
+
+    rows = []
+    for row in tqdm(matched.itertuples(index=False), total=len(matched),
+                    desc="mccoy→glorys", unit="scv"):
+        rep = glorys_reproduces_mccoy_scv(
+            row.year, row.profile_number, row.core_pressure_db,
+            bg_box_deg=bg_box_deg, bg_window_days=bg_window_days,
+            spice_sigma_bandwidth=spice_sigma_bandwidth,
+            glorys_sameloc_radius_km=glorys_sameloc_radius_km,
+            glorys_repro_dpi_frac=glorys_repro_dpi_frac,
+            argo_min_dpi=argo_min_dpi, argo_data_dir=argo_data_dir)
+        rep['basin'] = row.basin
+        rep['scv_type'] = row.scv_type
+        rows.append(rep)
+        if verbose and rep['status'] not in ('ok', 'argo_no_signal'):
+            print(f"[skip] {row.year}/{row.profile_number}: {rep['skip_reason']}")
+
+    cand = pd.DataFrame(rows)
+    cand.to_parquet(resolved_rows, index=False)
+
+    ev = cand[cand['status'] == 'ok'] if len(cand) else cand
+    miss = ev['glorys_misses'].eq(True) if 'glorys_misses' in ev else pd.Series(dtype=bool)
+    by_basin = {}
+    if len(ev):
+        for bn, sub in ev.groupby('basin'):
+            m = sub['glorys_misses'].eq(True)
+            by_basin[bn] = {'evaluated': int(len(sub)), 'glorys_miss': int(m.sum()),
+                            'miss_pct': round(100.0 * m.mean(), 1)}
+    summary = {
+        'n_catalog': int(len(scv)),
+        'n_matched': int(len(matched)),
+        'n_evaluated': int(len(ev)),
+        'argo_no_signal': int((cand['status'] == 'argo_no_signal').sum()) if len(cand) else 0,
+        'glorys_miss_count': int(miss.sum()),
+        'miss_rate': round(float(miss.mean()), 3) if len(ev) else np.nan,
+        'by_basin': by_basin,
+        'rows_path': str(resolved_rows),
+        'output_dir': str(base),
+    }
+    print(f"[*] GLORYS misses {int(miss.sum())}/{len(ev)} evaluable McCoy SCVs "
+          f"({len(matched)} matched of {len(scv)}) → {resolved_rows}")
+    if return_details:
+        summary['rows'] = cand
+    return summary
+
+
+def glorys_resolves_scv(
+    clon: float,
+    clat: float,
+    date: str | pd.Timestamp,
+    core_pressure_db: float,
+    *,
+    bg_radius_km: float = _subsurf_lens_glorys_bg_radius_km,
+    core_exclude_km: float = _subsurf_lens_glorys_core_exclude_km,
+    z_max_m: float = _subsurf_lens_z_max_m,
+    z_spacing_m: float = _subsurf_lens_z_spacing_m,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    spice_anom_threshold: float = _subsurf_lens_glorys_resolve_floor,
+    n2_ratio_max: float = _subsurf_lens_n2_ratio_max,
+) -> dict:
+    """纯 GLORYS 检验：McCoy SCV 核位处，GLORYS 自身场里是否仍分辨得出这个低 PV 水团透镜。
+
+    只用 McCoy 给的核位经纬度 + 日期 + 核压，不依赖任何 Argo。读 (clon,clat) 周围 ``bg_radius_km``
+    的 GLORYS thetao+so 窗口：中心柱作前景，窗口内（排除中心 ``core_exclude_km`` 内网格，避免涡核
+    污染）所有网格点作 GLORYS 自身局地背景。在 McCoy 核压处算中心柱相对该背景的 σ₀ 空间 spiciness
+    异常 δπ 与 N² 比。``glorys_resolves`` = |δπ|≥``spice_anom_threshold``（GLORYS 那里确有显著水团
+    异常）；``glorys_misses`` = 无此显著异常（GLORYS 把透镜抹平/看不出）。因用 GLORYS 自身背景，覆盖
+    全 4084 而非 BGC Argo 子集，代价是无 Argo 观测异常作分母（判据改为 GLORYS 自身显著性）。
+
+    参数:
+        clon: McCoy 核位经度。
+        clat: McCoy 核位纬度。
+        date: McCoy 周期日期（定位 GLORYS 日文件）。
+        core_pressure_db: McCoy 报告的核压（dbar），据此锚定核深。
+        bg_radius_km: GLORYS 自身背景窗口半径（km）。
+        core_exclude_km: 背景排除中心此半径内网格（km），避免涡核拉低背景异常。
+        z_max_m: 诊断最大深度（m）。
+        z_spacing_m: 垂向统一插值间距（m）。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³）。
+        spice_anom_threshold: |δπ_core| 显著阈值，判 GLORYS 是否看到水团异常；默认 glorys_resolve_floor(0.07)，锚定 McCoy 确认涡振幅 10th 百分位 ≈ Chen2021 |Δπ|>0.05，与 lens 检测器 spice_anom_threshold(0.15) 解耦。
+        n2_ratio_max: N²_中心/N²_背景 上限（弱层结判据，附带报告）。
+
+    返回:
+        dict: 含 status/skip_reason、lon/lat/date、core_depth_m、glorys_dpi_core、
+              glorys_n2_ratio、glorys_lens_sign、glorys_resolves（bool，含弱层结）、
+              glorys_resolves_spice（bool，仅 δπ）、glorys_misses（bool）。
+    """
+    rec = {
+        'lon': round(float(clon), 3), 'lat': round(float(clat), 3),
+        'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+        'core_depth_m': np.nan, 'glorys_dpi_core': np.nan, 'glorys_n2_ratio': np.nan,
+        'glorys_lens_sign': None, 'glorys_resolves': None,
+        'glorys_resolves_spice': None, 'glorys_misses': None,
+        'status': 'failed', 'skip_reason': None,
+    }
+    try:
+        lo, hi, la, lb = _window_bounds_from_center_km(clon, clat, bg_radius_km)
+        glon, glat, gdep, gdat = _load_glorys_window_by_center(
+            date, clon, lo, hi, la, lb, variables=['thetao', 'salinity'])
+        th = np.ma.filled(np.ma.array(gdat['thetao'], dtype=float), np.nan)
+        sl = np.ma.filled(np.ma.array(gdat['salinity'], dtype=float), np.nan)
+        gdep = np.asarray(gdep, dtype=float)
+        zc = np.arange(0.0, float(z_max_m) + 0.1, float(z_spacing_m))
+
+        qlat = float(np.clip(clat, glat.min(), glat.max()))
+        qlon = float(np.clip(clon, glon.min(), glon.max()))
+        pts = np.column_stack([gdep, np.full(gdep.size, qlat), np.full(gdep.size, qlon)])
+        th_col = RegularGridInterpolator((gdep, glat, glon), th, bounds_error=False, fill_value=np.nan)(pts)
+        sl_col = RegularGridInterpolator((gdep, glat, glon), sl, bounds_error=False, fill_value=np.nan)(pts)
+        fg = _subsurface_lens_derive(gdep, th_col, sl_col, zc, clon, clat, potential_temp=True)
+
+        # GLORYS 自身背景：窗口内排除中心 core_exclude_km 的网格点作点云；等经纬近似算距离足够
+        LON, LAT = np.meshgrid(glon, glat)
+        dx = (LON - clon) * np.cos(np.radians(clat)) * 111320.0
+        dy = (LAT - clat) * 111320.0
+        outside = np.hypot(dx, dy) >= float(core_exclude_km) * 1000.0
+        thm = th[:, outside]; slm = sl[:, outside]
+        pool_pt = thm.ravel(); pool_sal = slm.ravel()
+        bg_T = np.nanmedian(thm, axis=1); bg_S = np.nanmedian(slm, axis=1)
+        bg = _subsurface_lens_derive(gdep, bg_T, bg_S, zc, clon, clat, potential_temp=True)
+
+        dpi, _pct = compute_spiciness_anomaly(
+            pool_pt, pool_sal, fg['pt'], fg['S'],
+            center_lat=clat, center_lon=clon, sigma_bandwidth=spice_sigma_bandwidth)
+        core_z = float(-gsw.z_from_p(float(core_pressure_db), clat))
+        finite = np.where(np.isfinite(dpi))[0]
+        if finite.size == 0:
+            rec['status'], rec['skip_reason'] = 'skipped', 'no_glorys_dpi'
+            return rec
+        ci = int(finite[np.argmin(np.abs(zc[finite] - core_z))])
+        dpi_core = float(dpi[ci])
+        rec['core_depth_m'] = round(float(zc[ci]), 1)
+        rec['glorys_dpi_core'] = round(dpi_core, 4)
+        rec['glorys_lens_sign'] = 'warm-salty' if dpi_core > 0 else 'cold-fresh'
+        n2c = float(fg['N2'][ci]); n2bg = float(bg['N2'][ci])
+        n2_ratio = n2c / n2bg if np.isfinite(n2c) and np.isfinite(n2bg) and n2bg > 0 else np.nan
+        rec['glorys_n2_ratio'] = round(n2_ratio, 3) if np.isfinite(n2_ratio) else np.nan
+        resolves_spice = abs(dpi_core) >= float(spice_anom_threshold)
+        rec['glorys_resolves_spice'] = bool(resolves_spice)
+        rec['glorys_resolves'] = bool(resolves_spice and np.isfinite(n2_ratio)
+                                      and n2_ratio <= float(n2_ratio_max))
+        rec['glorys_misses'] = bool(not resolves_spice)
+        rec['status'] = 'ok'
+    except Exception as exc:
+        rec['skip_reason'] = str(exc)
+    return rec
+
+
+def screen_mccoy_scvs_glorys_resolution(
+    *,
+    mccoy_csv: str | Path | None = None,
+    basins: list[str] | None = None,
+    max_scvs: int | None = None,
+    bg_radius_km: float = _subsurf_lens_glorys_bg_radius_km,
+    core_exclude_km: float = _subsurf_lens_glorys_core_exclude_km,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    spice_anom_threshold: float = _subsurf_lens_spice_anom_threshold,
+    n2_ratio_max: float = _subsurf_lens_n2_ratio_max,
+    output_dir: str | Path | None = None,
+    rows_path: str | Path | None = None,
+    verbose: bool = False,
+    return_details: bool = False,
+) -> dict:
+    """在 McCoy(2020) 全 SCV 目录上跑纯 GLORYS 分辨力检验，按海盆汇总 GLORYS 漏检率。
+
+    只读 McCoy 目录的核位经纬度 + 日期 + 核压（不做 Argo 匹配、不依赖 BGC 子集），逐条调
+    glorys_resolves_scv 在 GLORYS 自身局地背景下判核处是否仍有显著水团异常，输出明细 parquet 与
+    按 _residual_basin_of 海盆分组的漏检计数。覆盖全目录（约 4084），是无采样偏倚的 GLORYS 漏检率
+    头条；BGC Argo 子集版（screen_mccoy_scvs_against_glorys）留作同背景严格对照与 DO 叠加入口。
+    **串行实现，逐条读 GLORYS 窗口，大批量较慢**。
+
+    参数:
+        mccoy_csv: McCoy SCV 目录 CSV 路径；None 使用 paths.yml 中的 mccoy_scv_csv。
+        basins: 只保留这些海盆（_residual_basin_of 标签，如 ['Pacific','SO']）；None 全部。
+        max_scvs: 处理的 SCV 数上限（截断），None 不限。
+        bg_radius_km: GLORYS 自身背景窗口半径（km）。
+        core_exclude_km: 背景排除中心此半径内网格（km）。
+        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³）。
+        spice_anom_threshold: |δπ_core| 显著阈值，判 GLORYS 是否看到水团异常。
+        n2_ratio_max: N²_中心/N²_背景 上限（弱层结判据，附带报告）。
+        output_dir: 输出根目录；None 使用当前 method/region 下默认目录。
+        rows_path: 明细 parquet 路径；None 时落在 output_dir 下默认文件名。
+        verbose: 是否打印每条跳过明细。
+        return_details: 是否在返回中附带明细 DataFrame，默认 False。
+
+    返回:
+        dict: 含 n_catalog/n_evaluated/glorys_miss_count/miss_rate/by_basin/rows_path/
+              output_dir 等摘要；return_details=True 时附 'rows'。
+    """
+    csv_path = Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv
+    scv = pd.read_csv(csv_path)
+    scv['date'] = pd.to_datetime(scv['Cycle_ISO_DateTime_UTC']).dt.tz_localize(None)
+    scv['basin'] = [_residual_basin_of(la, lo)
+                    for la, lo in zip(scv['Latitude'], scv['Longitude'])]
+    if basins is not None:
+        scv = scv[scv['basin'].isin(set(basins))]
+    if max_scvs is not None:
+        scv = scv.iloc[:int(max_scvs)]
+
+    cfg = _resolve_detection_config(None)
+    region_slug = _current_region_key()
+    base = (Path(output_dir) if output_dir is not None
+            else cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug))
+    base.mkdir(parents=True, exist_ok=True)
+    resolved_rows = (Path(rows_path) if rows_path is not None
+                     else base / "mccoy_glorys_resolution.parquet")
+
+    rows = []
+    for row in tqdm(scv.itertuples(index=False), total=len(scv),
+                    desc="mccoy glorys-res", unit="scv"):
+        rep = glorys_resolves_scv(
+            float(row.Longitude), float(row.Latitude), row.date, float(row.Core_Pressure),
+            bg_radius_km=bg_radius_km, core_exclude_km=core_exclude_km,
+            spice_sigma_bandwidth=spice_sigma_bandwidth,
+            spice_anom_threshold=spice_anom_threshold, n2_ratio_max=n2_ratio_max)
+        rep['basin'] = row.basin
+        rep['scv_type'] = row.SCV_Type
+        rep['mccoy_core_spiciness'] = float(row.Core_Spiciness)
+        rows.append(rep)
+        if verbose and rep['status'] != 'ok':
+            print(f"[skip] {row.Longitude:.1f},{row.Latitude:.1f} {rep['date']}: {rep['skip_reason']}")
+
+    cand = pd.DataFrame(rows)
+    cand.to_parquet(resolved_rows, index=False)
+
+    ev = cand[cand['status'] == 'ok'] if len(cand) else cand
+    miss = ev['glorys_misses'].eq(True) if 'glorys_misses' in ev else pd.Series(dtype=bool)
+    by_basin = {}
+    if len(ev):
+        for bn, sub in ev.groupby('basin'):
+            m = sub['glorys_misses'].eq(True)
+            by_basin[bn] = {'evaluated': int(len(sub)), 'glorys_miss': int(m.sum()),
+                            'miss_pct': round(100.0 * m.mean(), 1)}
+    summary = {
+        'n_catalog': int(len(scv)),
+        'n_evaluated': int(len(ev)),
+        'glorys_miss_count': int(miss.sum()),
+        'miss_rate': round(float(miss.mean()), 3) if len(ev) else np.nan,
+        'by_basin': by_basin,
+        'rows_path': str(resolved_rows),
+        'output_dir': str(base),
+    }
+    print(f"[*] GLORYS misses {int(miss.sum())}/{len(ev)} evaluable McCoy SCVs "
+          f"(pure GLORYS, {len(scv)} catalog) → {resolved_rows}")
+    if return_details:
+        summary['rows'] = cand
+    return summary
+
+
+def augment_mccoy_scvs_altimetry_blind(
+    rows_path: str | Path,
+    *,
+    region_slug: str = 'global_ocean',
+    eddy_enlarge_factor: float = _subsurf_lens_eddy_enlarge,
+    verbose: bool = False,
+) -> dict:
+    """给一份 McCoy SCV 明细 parquet 追加测高盲列：核位当日是否落在任一 META 面涡内。
+
+    对每条 SCV 读当日 META 各类涡做圆判定（_profile_in_any_surface_eddy），得 ``in_meta_eddy``；
+    ``meta_miss`` = 不在任何面涡内（＝标准测高涡目录未捕获该次表层涡）。原地重写 parquet 追加两列，
+    并汇总 meta_miss 率与其和 ``glorys_misses`` 的联合（若存在）——即"数据缺陷"表的测高列。
+    **串行按日读 META（日涡表大），较慢**。
+
+    参数:
+        rows_path: 待增补的 SCV 明细 parquet（须含 lon/lat/date 列）。
+        region_slug: META 日涡表所在 slug，默认 'global_ocean'（全球）。
+        eddy_enlarge_factor: 面涡圆判定半径放大倍数。
+        verbose: 是否打印读取失败明细。
+
+    返回:
+        dict: 含 n/meta_miss_count/meta_miss_rate、joint（meta_miss × glorys_misses 交叉计数，
+              若 parquet 含 glorys_misses）、rows_path。
+    """
+    rp = Path(rows_path)
+    d = pd.read_parquet(rp)
+    daily_cache: dict = {}
+    in_eddy_col: list = []
+    for row in tqdm(d.itertuples(index=False), total=len(d), desc="meta-blind", unit="scv"):
+        try:
+            day = pd.Timestamp(row.date)
+            if day not in daily_cache:
+                daily_cache[day] = _load_daily_eddies(region_slug, day, day)
+            e = _profile_in_any_surface_eddy(float(row.lon), float(row.lat), day,
+                                             daily_cache[day], eddy_enlarge_factor)
+            in_eddy_col.append(bool(e['in_eddy']))
+        except Exception as exc:
+            if verbose:
+                print(f"[skip] {row.lon},{row.lat} {row.date}: {exc}")
+            in_eddy_col.append(None)
+    d['in_meta_eddy'] = in_eddy_col
+    d['meta_miss'] = [None if v is None else (not v) for v in in_eddy_col]
+    d.to_parquet(rp, index=False)
+
+    mm = d['meta_miss'].dropna().astype(bool)
+    summary = {'n': int(len(d)), 'meta_miss_count': int(mm.sum()),
+               'meta_miss_rate': round(float(mm.mean()), 3) if len(mm) else np.nan,
+               'rows_path': str(rp)}
+    if 'glorys_misses' in d.columns:
+        j = d.dropna(subset=['meta_miss'])
+        j = j[j['glorys_misses'].notna()]
+        gm = j['glorys_misses'].astype(bool); em = j['meta_miss'].astype(bool)
+        summary['joint'] = {
+            'n': int(len(j)),
+            'meta_blind_and_glorys_miss': int((em & gm).sum()),
+            'meta_blind_only': int((em & ~gm).sum()),
+            'glorys_miss_only': int((~em & gm).sum()),
+            'seen_by_both': int((~em & ~gm).sum())}
+    print(f"[*] META misses {summary['meta_miss_count']}/{len(mm)} SCVs "
+          f"({100 * summary['meta_miss_rate']:.1f}%) → {rp}")
+    return summary
+
+
+def augment_mccoy_scvs_delta_do(
+    rows_path: str | Path,
+    *,
+    do_threshold: float | None = None,
+    core_depth_tol_m: float = 200.0,
+    argo_data_dir: str | Path | None = None,
+    verbose: bool = False,
+) -> dict:
+    """给一份含 (year, profile_number) 的 McCoy SCV parquet 追加共址 Argo 剖面的 δDO 列。
+
+    对每条 SCV 载入该年 Argo 剖面跑 calculate_delta_do（do 模式，找 DO 正峰），记 ``has_delta_do``
+    （是否检出候选）、``delta_do_max``（全剖面最大 δDO）、``delta_do_core``（最接近 SCV 核深且
+    在 ``core_depth_tol_m`` 内的候选 δDO）。回答"漏掉的透镜带不带氧"——把 GLORYS 漏检接到 DO 主线。
+    原地重写 parquet 追加三列，汇总 δDO 阳性率及其与 ``glorys_misses`` 的联合。无 DO 的剖面记 None。
+
+    参数:
+        rows_path: 待增补的 SCV 明细 parquet（须含 year/profile_number；有 core_depth_m 则算核处）。
+        do_threshold: δDO 判据阈值（μmol/kg），None 用 processing.yml 默认。
+        core_depth_tol_m: 核处 δDO 取候选与 SCV 核深之差不超过此值（m）。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        verbose: 是否打印读取失败明细。
+
+    返回:
+        dict: 含 n/n_with_do/has_do_count/has_do_rate、by_glorys（GLORYS 漏 vs 未漏各自的 δDO
+              阳性率，若含 glorys_misses）、rows_path。
+    """
+    rp = Path(rows_path)
+    d = pd.read_parquet(rp)
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    cfg = make_detection_config('do', **({'do_threshold': do_threshold}
+                                         if do_threshold is not None else {}))
+    argo_cache: dict = {}
+    has: list = []; ddo_max: list = []; ddo_core: list = []
+    for row in tqdm(d.itertuples(index=False), total=len(d), desc="delta-do", unit="scv"):
+        try:
+            y = int(row.year); pn = int(row.profile_number)
+            if y not in argo_cache:
+                argo_cache[y] = load_argo_data(y, data_dir=argo_data_dir)
+            sub = argo_cache[y][argo_cache[y]['Profile_number'] == pn]
+            if 'DO' not in sub.columns or sub['DO'].notna().sum() < 5:
+                has.append(None); ddo_max.append(np.nan); ddo_core.append(np.nan); continue
+            cand = calculate_delta_do(sub, cfg)
+            if not len(cand):
+                has.append(False); ddo_max.append(np.nan); ddo_core.append(np.nan); continue
+            has.append(True)
+            ddo_max.append(float(cand['delta_do'].max()))
+            cz = getattr(row, 'core_depth_m', np.nan)
+            near = cand[(cand['depth'] - cz).abs() <= float(core_depth_tol_m)] if np.isfinite(cz) else cand.iloc[0:0]
+            ddo_core.append(float(near.loc[(near['depth'] - cz).abs().idxmin(), 'delta_do'])
+                            if len(near) else np.nan)
+        except Exception as exc:
+            if verbose:
+                print(f"[skip] {getattr(row, 'year', '?')}/{getattr(row, 'profile_number', '?')}: {exc}")
+            has.append(None); ddo_max.append(np.nan); ddo_core.append(np.nan)
+    d['has_delta_do'] = has
+    d['delta_do_max'] = ddo_max
+    d['delta_do_core'] = ddo_core
+    d.to_parquet(rp, index=False)
+
+    hv = d['has_delta_do']
+    with_do = hv.notna()
+    summary = {'n': int(len(d)), 'n_with_do': int(with_do.sum()),
+               'has_do_count': int((hv == True).sum()),
+               'has_do_rate': round(float((hv[with_do] == True).mean()), 3) if with_do.any() else np.nan,
+               'rows_path': str(rp)}
+    if 'glorys_misses' in d.columns:
+        j = d[with_do & d['glorys_misses'].notna()]
+        by = {}
+        for gm, sub in j.groupby(j['glorys_misses'].astype(bool)):
+            key = 'glorys_miss' if gm else 'glorys_seen'
+            by[key] = {'n': int(len(sub)),
+                       'has_do_pct': round(100.0 * (sub['has_delta_do'] == True).mean(), 1)}
+        summary['by_glorys'] = by
+    print(f"[*] δDO+ in {summary['has_do_count']}/{summary['n_with_do']} DO-bearing SCVs → {rp}")
+    return summary
+
+
+def augment_mccoy_scvs_do_core_anomaly(
+    rows_path: str | Path,
+    *,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    depth_tol_m: float = 25.0,
+    do_anom_threshold: float = 20.0,
+    argo_data_dir: str | Path | None = None,
+    verbose: bool = False,
+) -> dict:
+    """给含 (year, profile_number, core_depth_m) 的 McCoy SCV parquet 追加核处带符号 DO 异常列。
+
+    对每条 SCV 在核深处算 Argo 剖面 DO 相对局地背景（同年 ±``bg_box_deg`` ±``bg_window_days`` 池的同深
+    度中位）的带符号偏差 ``do_core_anom``（μmol/kg）：<−阈为缺氧核（depleted，SCV 经典低氧特征），
+    >+阈为通风核（ventilated）。补上 do 模式正峰 δDO 只抓通风所遗漏的缺氧型 SCV。原地重写 parquet
+    追加列，汇总缺氧/通风计数及其与 ``glorys_misses`` 的联合。**串行逐条建局地 DO 池，较慢**。
+
+    参数:
+        rows_path: 待增补的 SCV 明细 parquet（须含 year/profile_number/core_depth_m）。
+        bg_box_deg: 局地背景池经纬度半宽（°）。
+        bg_window_days: 局地背景池时间半窗（天，同年）。
+        depth_tol_m: 核处取背景/前景 DO 的深度容差（m）。
+        do_anom_threshold: |核处 DO 异常| 显著阈值（μmol/kg）。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        verbose: 是否打印读取失败明细。
+
+    返回:
+        dict: 含 n/n_with_do、depleted_count/ventilated_count/has_anom_count、by_glorys（GLORYS
+              漏 vs 未漏各自的核处 DO 异常阳性率，若含 glorys_misses）、rows_path。
+    """
+    rp = Path(rows_path)
+    d = pd.read_parquet(rp)
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    argo_cache: dict = {}
+    anom: list = []; bg_do: list = []; kind: list = []
+    for row in tqdm(d.itertuples(index=False), total=len(d), desc="do-core-anom", unit="scv"):
+        try:
+            y = int(row.year); pn = int(row.profile_number)
+            cz = float(getattr(row, 'core_depth_m', np.nan))
+            if not np.isfinite(cz):
+                anom.append(np.nan); bg_do.append(np.nan); kind.append(None); continue
+            if y not in argo_cache:
+                a = load_argo_data(y, data_dir=argo_data_dir)
+                a['_date'] = pd.to_datetime(dict(year=a['Year'], month=a['Month'], day=a['Day']))
+                argo_cache[y] = a
+            a = argo_cache[y]
+            prof = a[a['Profile_number'] == pn]
+            if 'DO' not in a.columns or prof['DO'].notna().sum() < 5:
+                anom.append(np.nan); bg_do.append(np.nan); kind.append(None); continue
+            clon = float(prof['Longitude'].iloc[0]); clat = float(prof['Latitude'].iloc[0])
+            date = prof['_date'].iloc[0]
+            pdo = prof[(prof['Depth'] - cz).abs() <= float(depth_tol_m)]['DO']
+            prof_do = float(pdo.mean()) if pdo.notna().any() else np.nan
+            pool = a[(a['Longitude'].sub(clon).abs() <= bg_box_deg)
+                     & (a['Latitude'].sub(clat).abs() <= bg_box_deg)
+                     & (a['_date'].sub(date).abs() <= pd.Timedelta(days=int(bg_window_days)))
+                     & (a['Profile_number'] != pn)]
+            bdo = pool[(pool['Depth'] - cz).abs() <= float(depth_tol_m)]['DO']
+            bg = float(bdo.median()) if bdo.notna().sum() >= 3 else np.nan
+            if not (np.isfinite(prof_do) and np.isfinite(bg)):
+                anom.append(np.nan); bg_do.append(np.nan); kind.append(None); continue
+            da = prof_do - bg
+            anom.append(round(da, 2)); bg_do.append(round(bg, 2))
+            kind.append('depleted' if da < -float(do_anom_threshold)
+                        else 'ventilated' if da > float(do_anom_threshold) else 'none')
+        except Exception as exc:
+            if verbose:
+                print(f"[skip] {getattr(row, 'year', '?')}/{getattr(row, 'profile_number', '?')}: {exc}")
+            anom.append(np.nan); bg_do.append(np.nan); kind.append(None)
+    d['do_core_anom'] = anom
+    d['do_bg_core'] = bg_do
+    d['do_anom_kind'] = kind
+
+    d.to_parquet(rp, index=False)
+
+    kv = pd.Series(kind)
+    evac = kv.notna()
+    has = kv.isin(['depleted', 'ventilated'])
+    summary = {'n': int(len(d)), 'n_with_do': int(evac.sum()),
+               'depleted_count': int((kv == 'depleted').sum()),
+               'ventilated_count': int((kv == 'ventilated').sum()),
+               'has_anom_count': int(has.sum()),
+               'has_anom_rate': round(float(has[evac].mean()), 3) if evac.any() else np.nan,
+               'rows_path': str(rp)}
+    if 'glorys_misses' in d.columns:
+        j = d[evac.values & d['glorys_misses'].notna().values]
+        by = {}
+        for gm, sub in j.groupby(j['glorys_misses'].astype(bool)):
+            key = 'glorys_miss' if gm else 'glorys_seen'
+            k = sub['do_anom_kind']
+            by[key] = {'n': int(len(sub)),
+                       'depleted_pct': round(100.0 * (k == 'depleted').mean(), 1),
+                       'ventilated_pct': round(100.0 * (k == 'ventilated').mean(), 1),
+                       'any_anom_pct': round(100.0 * k.isin(['depleted', 'ventilated']).mean(), 1)}
+        summary['by_glorys'] = by
+    print(f"[*] DO-core anomaly: {summary['depleted_count']} depleted / "
+          f"{summary['ventilated_count']} ventilated of {summary['n_with_do']} → {rp}")
+    return summary
+
+
+def check_lens_coherence(
+    year: int,
+    profile_number: int,
+    *,
+    window_days: int = _subsurf_lens_coherence_window_days,
+    radius_km: float = _subsurf_lens_coherence_radius_km,
+    sigma_tol: float = _subsurf_lens_coherence_sigma_tol,
+    min_profiles: int = _subsurf_lens_coherence_min_profiles,
+    max_same_platform: int = 6,
+    max_neighbors: int = 8,
+    bg_box_deg: float = _subsurf_lens_bg_box_deg,
+    bg_window_days: int = _subsurf_lens_bg_window_days,
+    spice_anom_threshold: float = _subsurf_lens_spice_anom_threshold,
+    surf_core_ratio_max: float = _subsurf_lens_surf_core_ratio_max,
+    n2_ratio_max: float = _subsurf_lens_n2_ratio_max,
+    spice_sigma_bandwidth: float = _subsurf_lens_spice_bandwidth,
+    argo_data_dir: str | Path | None = None,
+    return_details: bool = False,
+) -> dict:
+    """相干性确认：种子透镜是否被同浮标其他周期 / 邻近同期剖面独立拍到（排单剖面假象）。
+
+    对种子先 detect_subsurface_lens（须判为透镜）；再取该浮标时间最近的若干周期与半径内同期
+    邻剖面，逐条 detect，统计与种子**同号且核 σ₀ 相差 ≤ sigma_tol** 的透镜数。支持剖面数
+    （含种子）≥ min_profiles 即判 ``coherent``——一个被 2–3 条剖面拍到的透镜即证其为相干结构，
+    远比重建整场省。
+
+    参数:
+        year / profile_number: 种子剖面定位。
+        window_days: 同浮标其他周期 / 邻剖面的时间半窗（天）。
+        radius_km: 邻剖面搜索半径（km）。
+        sigma_tol: 判同一透镜的核 σ₀ 容差（kg/m³）。
+        min_profiles: 达成"相干"所需的同号透镜剖面数（含种子）。
+        max_same_platform: 同浮标参与判定的周期数上限（取时间最近）。
+        max_neighbors: 邻剖面参与判定的条数上限（取空间最近）。
+        bg_box_deg / bg_window_days / spice_anom_threshold / surf_core_ratio_max /
+            n2_ratio_max / spice_sigma_bandwidth: 透传探测器的背景池与判据参数。
+        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
+        return_details: 是否在返回中附带逐支持剖面 DataFrame，默认 False。
+
+    返回:
+        dict: 含 coherent（bool）、n_support、seed 信息（核深/σ₀/符号）、checked 数；
+              return_details=True 时附 'support'（支持剖面明细 DataFrame）。
+    """
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+
+    def _detect(y, p):
+        return detect_subsurface_lens(
+            int(y), int(p), bg_box_deg=bg_box_deg, bg_window_days=bg_window_days,
+            spice_anom_threshold=spice_anom_threshold, surf_core_ratio_max=surf_core_ratio_max,
+            n2_ratio_max=n2_ratio_max, spice_sigma_bandwidth=spice_sigma_bandwidth,
+            argo_data_dir=argo_data_dir)
+
+    seed = _detect(year, profile_number)
+    out = {'year': int(year), 'profile_number': int(profile_number),
+           'seed_is_lens': bool(seed.get('is_lens')), 'coherent': False, 'n_support': 0,
+           'checked': 0, 'seed_core_depth_m': seed.get('core_depth_m'),
+           'seed_core_sigma0': seed.get('core_sigma0'), 'seed_lens_sign': seed.get('lens_sign')}
+    if seed.get('status') != 'ok' or not seed.get('is_lens'):
+        out['skip_reason'] = seed.get('skip_reason') or 'seed_not_lens'
+        return out
+
+    clon, clat = seed['lon'], seed['lat']
+    sdate = pd.Timestamp(seed['date'])
+    s_sigma, s_sign = seed['core_sigma0'], seed['lens_sign']
+
+    years = sorted({(sdate - pd.Timedelta(days=window_days)).year,
+                    (sdate + pd.Timedelta(days=window_days)).year})
+    frames = []
+    for y in years:
+        try:
+            dfy = load_argo_data(y, data_dir=argo_data_dir)
+            dfy['__year'] = y
+            frames.append(dfy)
+        except FileNotFoundError:
+            continue
+    big = pd.concat(frames, ignore_index=True)
+    seed_plat = big.loc[big['Profile_number'] == int(profile_number), 'Platform_number'].iloc[0]
+    pos = big.drop_duplicates('Profile_number')[
+        ['Profile_number', 'Platform_number', 'Longitude', 'Latitude', '__year', 'Year', 'Month', 'Day']].copy()
+    pos['date'] = pd.to_datetime(pos[['Year', 'Month', 'Day']])
+    pos['ddays'] = (pos['date'] - sdate).dt.days.abs()
+    pos = pos[(pos['Profile_number'] != int(profile_number)) & (pos['ddays'] <= int(window_days))]
+    pos['dist_km'] = adaptive_distance_m(
+        pos['Longitude'].to_numpy(float), pos['Latitude'].to_numpy(float),
+        np.full(len(pos), clon), np.full(len(pos), clat)) / 1000.0
+
+    same_plat = pos[pos['Platform_number'] == seed_plat].sort_values('ddays').head(int(max_same_platform))
+    neigh = pos[(pos['Platform_number'] != seed_plat) & (pos['dist_km'] <= float(radius_km))] \
+        .sort_values('dist_km').head(int(max_neighbors))
+    cand = pd.concat([same_plat, neigh]).drop_duplicates('Profile_number')
+
+    support = []
+    for _, c in cand.iterrows():
+        d = _detect(int(c['__year']), int(c['Profile_number']))
+        is_match = (d.get('status') == 'ok' and d.get('is_lens')
+                    and d.get('lens_sign') == s_sign
+                    and np.isfinite(d.get('core_sigma0', np.nan))
+                    and abs(float(d['core_sigma0']) - float(s_sigma)) <= float(sigma_tol))
+        if is_match:
+            support.append({
+                'profile_number': int(c['Profile_number']),
+                'platform': c['Platform_number'],
+                'same_platform': bool(c['Platform_number'] == seed_plat),
+                'date': d['date'], 'dist_km': round(float(c['dist_km']), 1),
+                'day_off': int((pd.Timestamp(d['date']) - sdate).days),
+                'core_depth_m': d['core_depth_m'], 'core_sigma0': d['core_sigma0'],
+                'core_dpi': d['core_dpi']})
+
+    out['checked'] = int(len(cand))
+    out['n_support'] = 1 + len(support)
+    out['coherent'] = bool(out['n_support'] >= int(min_profiles))
+    if return_details:
+        out['support'] = pd.DataFrame(support)
+    return out
+
+
+def plot_mccoy_datagap_atlas(
+    resolution_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """McCoy SCV 数据缺陷总览：GLORYS/META 漏检世界图 + GLORYS×META 列联热图。
+
+    读纯 GLORYS 全目录 parquet（含 `glorys_misses` + `meta_miss`），画两联：（左）4084 个 McCoy SCV
+    世界地图，按数据缺陷分类着色（红＝两产品都漏、橙＝仅 GLORYS 漏、蓝＝仅 META 漏、灰＝都看到）；
+    （右）GLORYS×META 2×2 列联热图（四类计数与占比），量化两产品的互补失效。仅读缓存 parquet 渲染。
+
+    参数:
+        - resolution_path (str | Path | None): 纯 GLORYS 全目录 parquet；None 时按 `screen_mccoy_scvs_glorys_resolution` 默认定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认路径。
+        - output_dir (str | Path | None): 图输出根目录；None 使用 method/region 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 `n_scv` / `glorys_miss` / `meta_miss` / `both_miss` 与 `figure_path`（save_fig 时）等摘要。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    res_p = (Path(resolution_path) if resolution_path is not None
+             else cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug)
+             / "mccoy_glorys_resolution.parquet")
+    d = pd.read_parquet(res_p)
+    d = d[d['glorys_misses'].notna() & d['meta_miss'].notna()]
+    gm = d['glorys_misses'].astype(bool)
+    mm = d['meta_miss'].astype(bool)
+
+    fig = plt.figure(figsize=(17, 6.5))
+    ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
+    ax.set_global()
+    cats = [(~gm & ~mm, '0.6', 'seen by both', 3, 10),
+            (~gm & mm, 'tab:blue', 'META misses only', 4, 12),
+            (gm & ~mm, 'tab:orange', 'GLORYS misses only', 5, 12),
+            (gm & mm, 'tab:red', 'both miss', 6, 14)]
+    for sel, col, lab, z, s in cats:
+        ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=s, c=col, edgecolor='k',
+                   linewidth=0.15, transform=ccrs.PlateCarree(),
+                   label=f'{lab} ({int(sel.sum())})', zorder=z)
+    ax.legend(loc='lower left', fontsize=7, ncol=2)
+    ax.set_title(f'McCoy SCVs by data gap (n={len(d)})')
+
+    ax2 = fig.add_subplot(1, 2, 2)
+    mat = np.array([[int((gm & mm).sum()), int((gm & ~mm).sum())],
+                    [int((~gm & mm).sum()), int((~gm & ~mm).sum())]])
+    im = ax2.imshow(mat, cmap='Reds')
+    ax2.set_xticks([0, 1]); ax2.set_xticklabels(['META misses', 'META catches'])
+    ax2.set_yticks([0, 1]); ax2.set_yticklabels(['GLORYS misses', 'GLORYS catches'])
+    tot = mat.sum()
+    for i in range(2):
+        for j in range(2):
+            ax2.text(j, i, f'{mat[i, j]}\n{100 * mat[i, j] / tot:.0f}%', ha='center', va='center',
+                     fontsize=13, color='white' if mat[i, j] > mat.max() * 0.6 else 'black')
+    ax2.set_title('GLORYS × META contingency')
+    fig.colorbar(im, ax=ax2, shrink=0.8, label='count')
+
+    fig.suptitle(f"GLORYS/META miss {len(d)} McCoy SCVs  |  GLORYS {100*gm.mean():.0f}%  "
+                 f"META {100*mm.mean():.0f}%  both {100*(gm & mm).mean():.0f}%  "
+                 f"≥1 {100*(gm | mm).mean():.0f}%", fontsize=13, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+    out = {'n_scv': int(len(d)), 'glorys_miss': int(gm.sum()),
+           'meta_miss': int(mm.sum()), 'both_miss': int((gm & mm).sum())}
+    if save_fig:
+        base = (Path(output_dir) if output_dir is not None
+                else cfg.output_dir("plot_mccoy_datagap_atlas", region_slug))
+        base.mkdir(parents=True, exist_ok=True)
+        fpath = base / f"mccoy_datagap_atlas_{cfg.file_stem()}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] McCoy data-gap atlas saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_mccoy_do_enrichment(
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """GLORYS 漏检 SCV 的 δDO 富集：漏 vs 命中的 δDO 阳性率（数据缺陷的 DO 后果）。
+
+    读 Argo 锚定 263 parquet（含 `glorys_misses` + `has_delta_do`），画 GLORYS 漏检 vs 命中的两组 SCV
+    各自携显著正峰 δDO 的比例——量化“被漏掉的次表层涡更可能携氧异常”。仅读缓存 parquet 渲染。
+
+    参数:
+        - argo_anchored_path (str | Path | None): Argo 锚定 263 parquet；None 时按 `screen_mccoy_scvs_against_glorys` 默认定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认路径。
+        - output_dir (str | Path | None): 图输出根目录；None 使用 method/region 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 `n_with_do` / `miss_do_pct` / `seen_do_pct` 与 `figure_path`（save_fig 时）等摘要。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    do_p = (Path(argo_anchored_path) if argo_anchored_path is not None
+            else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
+            / "mccoy_glorys_miss.parquet")
+    d = pd.read_parquet(do_p)
+    d = d[(d['status'] == 'ok') & d['has_delta_do'].notna()]
+    gm = d['glorys_misses'].astype(bool)
+    do = d['has_delta_do'] == True
+    miss_pct = 100 * do[gm].mean() if gm.any() else np.nan
+    seen_pct = 100 * do[~gm].mean() if (~gm).any() else np.nan
+
+    fig, ax = plt.subplots(figsize=(6, 5.2))
+    ax.bar([f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
+           [miss_pct, seen_pct], color=['tab:red', '0.6'])
+    for i, v in enumerate([miss_pct, seen_pct]):
+        ax.text(i, v + 0.3, f'{v:.1f}%', ha='center', fontsize=11)
+    ax.set_ylabel('carry significant δDO %')
+    ax.set_title(f'δDO in GLORYS-missed vs seen McCoy SCVs (n={len(d)})')
+
+    out = {'n_with_do': int(len(d)), 'miss_do_pct': round(float(miss_pct), 1),
+           'seen_do_pct': round(float(seen_pct), 1)}
+    if save_fig:
+        base = (Path(output_dir) if output_dir is not None
+                else cfg.output_dir("plot_mccoy_do_enrichment", region_slug))
+        base.mkdir(parents=True, exist_ok=True)
+        fpath = base / f"mccoy_do_enrichment_{cfg.file_stem()}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] McCoy δDO enrichment saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
 def export_hotspot_anomaly_summary_table(
     vertical_profiles_result: dict | None = None,
     argo_glorys_result: dict | None = None,
@@ -22423,6 +24038,298 @@ def calculate_interaction_statistics(
             f.write(report)
         print(f"Report saved to: {fname}")
 
+
+def calculate_scv_frequency_statistics(
+    resolution_path: str | Path | None = None,
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    save_report: bool = True,
+) -> dict:
+    """McCoy SCV 频率分析：次表层涡相对基线 Argo 的入面涡率与 δDO 携带率富集。
+
+    以 McCoy 速度确认的次表层涡为子集、指定年份区域内的全部 Argo 剖面为基线，用 Fisher 精确检验两件事:
+    (1) SCV 落在 META 面涡内的比例是否显著区别于随机 Argo（读纯 GLORYS 全目录 parquet 的 meta_miss);
+    (2) 携显著正峰 δDO 的比例,三组对比——测氧基线 Argo / 落在 META 面涡内的测氧 Argo / McCoy SCV(读 Argo
+    锚定子集的 has_delta_do,基线分母为区域内 depth ≥ cfg.anomaly_min_depth 的有效测氧剖面数,META 组分母为其中落在面涡内者)。
+    核心:落在 META 表层涡内几乎不富集 δDO(≈背景),而 SCV 强富集——正是「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
+    入面涡轴另计 δDO 异常 Argo（= 原 Frequency Analysis 的 anomalies 组）的同轴入涡率,存报告/parquet 作参考(图只画 δDO 三组)。
+
+    参数:
+        - resolution_path (str | Path | None): 纯 GLORYS 全目录 SCV parquet（含 meta_miss/date）；None 时按默认定位。
+        - argo_anchored_path (str | Path | None): Argo 锚定 SCV parquet（含 has_delta_do）；None 时按默认定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region、深度阈值与默认路径。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - save_report (bool): 是否保存文本报告，默认 True。
+
+    返回:
+        - dict: `in_eddy`(baseline/anom/scv 入涡率 + odds_ratio/p_value + 样本量)与 `delta_do`(baseline/meta/scv 三组各 k/n/pct + odds_ratio/p_value + meta_odds_ratio/meta_p_value)。
+
+    输出:
+        - `plot_outputs/<method>/<region>/statistics/scv_frequency_stats_<y0>_<y1>_<stem>.txt`（save_report 时）。
+        - `plot_outputs/<method>/<region>/statistics/scv_frequency_stats_<y0>_<y1>_<stem>.parquet`：单行扁平摘要，供 plot_scv_frequency_enrichment 读取（save_report 时）。
+
+    说明:
+        - 基线入面涡数据来自 export_all_interacting_argo 预计算文件，须与 SCV 的 meta_miss 同用 1.2× 半径放大方可比。
+        - δDO 分母通过重载基线年份 Argo 现算（仅计 depth ≥ 阈值的有效 DO 剖面），与 anomalies 文件同口径。
+    """
+    from scipy.stats import fisher_exact
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    run_tag = cfg.file_stem()
+    y0, y1 = baseline_start_year, baseline_end_year
+
+    res_p = (Path(resolution_path) if resolution_path is not None
+             else cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug)
+             / "mccoy_glorys_resolution.parquet")
+    res = pd.read_parquet(res_p)
+    res['date'] = pd.to_datetime(res['date'])
+    scv = res[res['meta_miss'].notna() & res['date'].dt.year.between(y0, y1)]
+    n_scv = len(scv)
+    n_scv_in = int((~scv['meta_miss'].astype(bool)).sum())
+
+    stat_dir = _shared_output_dir("statistics", region_slug)
+    reg = pd.read_parquet(stat_dir / f"all_region_argo_{y0}_{y1}.parquet")
+    inter = pd.read_parquet(stat_dir / f"all_interacting_argo_{y0}_{y1}.parquet")
+    base_ids = set(reg['Profile_number'].unique())
+    n_base = len(base_ids)
+    inter_ids = set(inter['Profile_number'].unique()) & base_ids
+    n_base_in = len(inter_ids)
+    or_eddy, p_eddy = fisher_exact(
+        [[n_scv_in, n_scv - n_scv_in], [n_base_in, n_base - n_base_in]])
+
+    anc_p = (Path(argo_anchored_path) if argo_anchored_path is not None
+             else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
+             / "mccoy_glorys_miss.parquet")
+    anc = pd.read_parquet(anc_p)
+    scv_do_n = int(anc['has_delta_do'].notna().sum())
+    scv_do_pos = int((anc['has_delta_do'] == True).sum())
+
+    an_p = cfg.output_dir("plot_argo_hotspots", region_slug) / f"anomalies_{y0}_{y1}_{run_tag}.parquet"
+    anom_ids = set(pd.read_parquet(an_p)['Profile_number'].unique()) & base_ids
+    n_base_dopos = len(anom_ids)
+    n_anom_in = len(anom_ids & inter_ids)
+    or_anom, p_anom = fisher_exact(
+        [[n_anom_in, n_base_dopos - n_anom_in], [n_base_in, n_base - n_base_in]])
+    min_depth = float(cfg.anomaly_min_depth)
+    do_ids = set()
+    for y in range(y0, y1 + 1):
+        try:
+            df = load_argo_data(y)
+        except Exception:
+            continue
+        lon = df['Longitude'].to_numpy(dtype=float)
+        lat = df['Latitude'].to_numpy(dtype=float)
+        geo = _region_lon_mask(lon, lonmin, lonmax) & (lat >= latmin) & (lat <= latmax)
+        d = df[geo]
+        do_ids |= set(d[(d['Depth'] >= min_depth) & d['DO'].notna()]['Profile_number'].unique())
+    do_ids &= base_ids
+    n_base_do = len(do_ids)
+    n_do_in = len(do_ids & inter_ids)
+    n_pos_in = n_anom_in
+    or_do, p_do = fisher_exact(
+        [[scv_do_pos, scv_do_n - scv_do_pos], [n_base_dopos, n_base_do - n_base_dopos]])
+    or_meta, p_meta = fisher_exact(
+        [[n_pos_in, n_do_in - n_pos_in], [n_base_dopos, n_base_do - n_base_dopos]])
+
+    pct = lambda a, b: (100.0 * a / b) if b else float('nan')
+    report = (
+        f"========================================\n"
+        f"McCoy SCV Frequency Analysis ({y0}-{y1})\n"
+        f"Region: {region_slug} | Method: {cfg.method} | Depth>={min_depth:.0f}m\n"
+        f"----------------------------------------\n"
+        f"[Inside META surface eddy]\n"
+        f"  Baseline Argo:  {n_base_in}/{n_base} = {pct(n_base_in, n_base):.2f}%\n"
+        f"  δDO-anom Argo:  {n_anom_in}/{n_base_dopos} = {pct(n_anom_in, n_base_dopos):.2f}%  (orig. FA; OR={or_anom:.2f}, p={p_anom:.2e})\n"
+        f"  McCoy SCVs:     {n_scv_in}/{n_scv} = {pct(n_scv_in, n_scv):.2f}%  (OR={or_eddy:.2f}, p={p_eddy:.2e})\n"
+        f"----------------------------------------\n"
+        f"[Carry significant δDO (≥ threshold)]\n"
+        f"  Baseline DO Argo: {n_base_dopos}/{n_base_do} = {pct(n_base_dopos, n_base_do):.3f}%\n"
+        f"  In META eddy:     {n_pos_in}/{n_do_in} = {pct(n_pos_in, n_do_in):.3f}%  (OR={or_meta:.2f} vs baseline)\n"
+        f"  McCoy SCVs:       {scv_do_pos}/{scv_do_n} = {pct(scv_do_pos, scv_do_n):.2f}%  (OR={or_do:.2f} vs baseline)\n"
+        f"========================================"
+    )
+    print(report)
+
+    out = {
+        'in_eddy': {'baseline_pct': round(pct(n_base_in, n_base), 2),
+                    'anom_pct': round(pct(n_anom_in, n_base_dopos), 2),
+                    'scv_pct': round(pct(n_scv_in, n_scv), 2),
+                    'odds_ratio': round(float(or_eddy), 3), 'p_value': float(p_eddy),
+                    'anom_odds_ratio': round(float(or_anom), 3), 'anom_p_value': float(p_anom),
+                    'n_scv': n_scv, 'n_baseline': n_base, 'n_anom': n_base_dopos},
+        'delta_do': {'baseline_k': n_base_dopos, 'baseline_n': n_base_do,
+                     'baseline_pct': round(pct(n_base_dopos, n_base_do), 3),
+                     'meta_k': n_pos_in, 'meta_n': n_do_in,
+                     'meta_pct': round(pct(n_pos_in, n_do_in), 3),
+                     'scv_k': scv_do_pos, 'scv_n': scv_do_n,
+                     'scv_pct': round(pct(scv_do_pos, scv_do_n), 2),
+                     'odds_ratio': round(float(or_do), 3), 'p_value': float(p_do),
+                     'meta_odds_ratio': round(float(or_meta), 3), 'meta_p_value': float(p_meta)},
+    }
+    if save_report:
+        out_dir = cfg.output_dir("statistics", region_slug)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = out_dir / f"scv_frequency_stats_{y0}_{y1}_{run_tag}.txt"
+        with open(fname, 'w') as f:
+            f.write(report)
+        flat = {f"{axis}_{k}": v for axis, d in out.items() for k, v in d.items()}
+        pd.DataFrame([flat]).to_parquet(out_dir / f"scv_frequency_stats_{y0}_{y1}_{run_tag}.parquet")
+        print(f"Report saved to: {fname}")
+    return out
+
+
+def plot_scv_frequency_enrichment(
+    summary_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """McCoy SCV δDO 富集图：携显著 δDO 率按「涡探测器」三柱分层(测氧基线 / META 表层涡内 / SCV 次表层涡)。
+
+    读 calculate_scv_frequency_statistics 写出的单行摘要 parquet,画单联三柱:测氧基线 Argo、落在 META 面涡内的测氧
+    Argo、McCoy SCV 各自携显著正峰 δDO 的比例,每柱带 95% Wilson 置信区间误差棒(如实反映 SCV 小样本的不确定度)。
+    核心信息:落在 META 表层涡内几乎不富集 δDO(≈背景),而 SCV 强富集——即「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
+    灰=基线、橙=META 涡内、红=SCV。仅读缓存渲染,不重算。
+
+    参数:
+        - summary_path (str | Path | None): 摘要 parquet；None 时按 statistics 默认路径(含年份与 stem)定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认路径。
+        - baseline_start_year (int): 基线起始年份，用于定位默认 parquet，默认 2002。
+        - baseline_end_year (int): 基线结束年份，用于定位默认 parquet，默认 2023。
+        - output_dir (str | Path | None): 图输出根目录；None 使用 method/region 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 delta_do(baseline/meta/scv 各 pct 与 95%CI)、meta_odds_ratio、scv_odds_ratio 与 figure_path(save_fig 时)。
+    """
+    from scipy.stats import binomtest
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    run_tag = cfg.file_stem()
+    y0, y1 = baseline_start_year, baseline_end_year
+    sp = (Path(summary_path) if summary_path is not None
+          else cfg.output_dir("statistics", region_slug)
+          / f"scv_frequency_stats_{y0}_{y1}_{run_tag}.parquet")
+    s = pd.read_parquet(sp).iloc[0]
+
+    groups = [('baseline', 'baseline DO Argo', '0.6'),
+              ('meta', 'inside META eddy', 'tab:orange'),
+              ('scv', 'McCoy SCVs', 'tab:red')]
+    pcts, lo_err, hi_err, labels, colors, res = [], [], [], [], [], {}
+    for key, lab, col in groups:
+        k = int(s[f'delta_do_{key}_k']); n = int(s[f'delta_do_{key}_n'])
+        p = 100.0 * k / n
+        ci = binomtest(k, n).proportion_ci(0.95, method='wilson')
+        pcts.append(p); lo_err.append(p - 100 * ci.low); hi_err.append(100 * ci.high - p)
+        labels.append(f'{lab}\n({k}/{n})'); colors.append(col)
+        res[key] = {'pct': round(p, 3), 'ci95': [round(100 * ci.low, 3), round(100 * ci.high, 3)]}
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    ax.bar(labels, pcts, color=colors, yerr=[lo_err, hi_err], capsize=6, error_kw={'lw': 1.3})
+    for i, p in enumerate(pcts):
+        ax.text(i, p + hi_err[i], '  {:.2f}%'.format(p), ha='center', va='bottom', fontsize=11)
+    ax.set_ylim(0, max(pcts[j] + hi_err[j] for j in range(len(pcts))) * 1.2)
+    ax.set_ylabel('carry significant δDO %')
+    ax.set_title(f"δDO⁺ rate by eddy detector ({y0}-{y1}, {region_slug})\n"
+                 f"vs baseline OR:  META {float(s['delta_do_meta_odds_ratio']):.2f}"
+                 f"  ·  SCV {float(s['delta_do_odds_ratio']):.2f}  (95% CI error bars)")
+    fig.tight_layout()
+
+    out = {'delta_do': res,
+           'meta_odds_ratio': float(s['delta_do_meta_odds_ratio']),
+           'scv_odds_ratio': float(s['delta_do_odds_ratio'])}
+    if save_fig:
+        base = (Path(output_dir) if output_dir is not None
+                else cfg.output_dir("plot_scv_frequency_enrichment", region_slug))
+        base.mkdir(parents=True, exist_ok=True)
+        fpath = base / f"scv_frequency_enrichment_{run_tag}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] SCV frequency enrichment saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_scv_do_carrier_map(
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """携 δDO 次表层涡的地理分布:has_delta_do 为真的 McCoy SCV 世界图,按 GLORYS×META 数据缺陷四分类着色。
+
+    读 Argo 锚定 SCV parquet,只取携显著正峰 δDO 且 glorys_misses/meta_miss 均可评估的子集,画世界地图:
+    散点按四类数据缺陷着色(灰＝两产品都看到、蓝＝仅 META 漏、橙＝仅 GLORYS 漏、红＝两者都漏),配色与
+    plot_mccoy_datagap_atlas 左图一致,直观展示「携氧次表层涡多半落在被漏检的类别」。此处 glorys_misses
+    为 Argo 锚定的相对口径(δπ_glorys/δπ_argo<0.5)。仅读缓存 parquet 渲染。
+
+    参数:
+        - argo_anchored_path (str | Path | None): Argo 锚定 SCV parquet(含 has_delta_do/lat/lon/glorys_misses/meta_miss);None 时按 screen_mccoy_scvs_against_glorys 默认定位。
+        - detection_config (DetectionConfig | None): 异常识别配置;决定 method/region 与默认路径。
+        - output_dir (str | Path | None): 图输出根目录;None 使用 method/region 默认目录。
+        - show_fig (bool): 是否显示图,默认 True。
+        - save_fig (bool): 是否保存图,默认 True。
+
+    返回:
+        - dict: 含 n_carrier、n_both_miss、n_ge1_miss、figure_path(save_fig 时)等摘要。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    do_p = (Path(argo_anchored_path) if argo_anchored_path is not None
+            else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
+            / "mccoy_glorys_miss.parquet")
+    d = pd.read_parquet(do_p)
+    d = d[(d['has_delta_do'] == True) & d['glorys_misses'].notna() & d['meta_miss'].notna()]
+    gm = d['glorys_misses'].astype(bool)
+    mm = d['meta_miss'].astype(bool)
+
+    fig = plt.figure(figsize=(13, 6))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
+    ax.set_global()
+    cats = [(~gm & ~mm, '0.6', 'seen by both'),
+            (~gm & mm, 'tab:blue', 'META misses only'),
+            (gm & ~mm, 'tab:orange', 'GLORYS misses only'),
+            (gm & mm, 'tab:red', 'both miss')]
+    for sel, col, lab in cats:
+        if not sel.any():
+            continue
+        ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=90, c=col, edgecolor='k',
+                   linewidth=0.4, transform=ccrs.PlateCarree(),
+                   label=f'{lab} ({int(sel.sum())})', zorder=5)
+    ax.legend(loc='lower left', fontsize=9)
+    ax.set_title(f'δDO-carrying McCoy SCVs by data gap '
+                 f'(n={len(d)}, ≥1 product misses {int((gm | mm).sum())})')
+    fig.tight_layout()
+
+    out = {'n_carrier': int(len(d)), 'n_both_miss': int((gm & mm).sum()),
+           'n_ge1_miss': int((gm | mm).sum())}
+    if save_fig:
+        base = (Path(output_dir) if output_dir is not None
+                else cfg.output_dir("plot_scv_do_carrier_map", region_slug))
+        base.mkdir(parents=True, exist_ok=True)
+        fpath = base / f"scv_do_carrier_map_{cfg.file_stem()}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] SCV δDO carrier map saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
 
 
 def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:

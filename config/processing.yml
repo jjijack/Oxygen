@@ -1,4 +1,20 @@
 # 处理与算法参数配置
+# version 1.18 变更：
+#   - 新增 subsurface_lens 配置小节，围绕 McCoy et al. (2020) 速度确认 SCV 目录的次表层涡 δDO 分析；
+#     含单剖面低 PV 透镜探测三判据阈值（δπ / 表-核比 / N² 比）、局地背景池与诊断网格、候选筛选与
+#     相干性参数，供 detect_subsurface_lens 等使用。
+#   - 新增 McCoy 动力高度速度判据参数（velocity_criterion 开关、velocity_extent_frac 核带 e⁻² 范围、
+#     velocity_equator_lat 赤道跳过阈）：扣第一斜压模后判核带内动力高度异常是否有内部极大＝次表层
+#     地转流核，report-only 不进 is_lens gate，由 _dynamic_modes / _dynamic_height_velocity_criterion 支撑。
+#   - 新增 GLORYS 漏检检验参数（glorys_sameloc_radius_km 同位读取窗口、mccoy_argo_min_dpi Argo 无信号下限、
+#     mccoy_match_days Platform+日期匹配容差）：判 McCoy 核位在 GLORYS T/S 上是否复现 δπ，供
+#     glorys_reproduces_mccoy_scv / screen_mccoy_scvs_against_glorys 使用。
+#   - 新增纯 GLORYS 全目录检验参数（glorys_bg_radius_km 自身背景窗口、glorys_core_exclude_km 排核半径、
+#     glorys_resolve_floor 判"GLORYS 看见"的 |δπ| 绝对阈值 0.07）：仅用核位经纬度+日期+核压判 GLORYS
+#     自身背景下核处是否仍有显著 δπ + 弱层结（全 4084，不依赖 BGC Argo），供 glorys_resolves_scv /
+#     screen_mccoy_scvs_glorys_resolution 使用。glorys_resolve_floor=0.07 锚定 McCoy 确认涡振幅第 10 百分位
+#     ≈0.068 ≈ Chen et al. 2021 |Δπ|>0.05，与 lens 检测器 spice_anom_threshold(0.15) 解耦；相对判据
+#     ratio<0.5（Argo 锚定 263，glorys_repro_dpi_frac）不受影响，仍作最有依据的头条。
 # version 1.17 变更：
 #   - ofes 小节新增 var_subdir（变量名 → 子目录名映射），支持完整数据集按变量分目录布局
 #     （u/v/w → <var>_vel，其余用变量名）；_ofes_file_path 据此解析每日单变量文件路径。
@@ -44,7 +60,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.16
+version: 1.18
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -123,6 +139,35 @@ processing:
     match_window_days: 1      # 最佳匹配的时间搜索半宽（天）
     match_min_depth_coverage: 0.8  # 候选 GLORYS 列须覆盖 Argo 廓线深度范围的最低比例，防浅海床列以截断深度刷低 RMS 胜出
     so_lat_threshold: -40.0   # 南大洋专项分界纬度（°）
+
+  # 单剖面次表层涡（低 PV 透镜）探测（detect_subsurface_lens / plot_subsurface_lens_diagnostic）
+  subsurface_lens:
+    bg_box_deg: 3.0           # 局地背景 Argo 池的经纬度半宽（°）
+    bg_window_days: 45        # 局地背景池的时间半窗（天，同年；深层 T-S(σ) 季节稳定）
+    z_max_m: 1500.0           # 诊断最大深度（m）
+    z_spacing_m: 10.0         # 垂向统一插值间距（m）
+    z_min_core_m: 150.0       # 核搜索最小深度（m），排除季节性混合层
+    surf_layer_m: 100.0       # 表层参考层上界（m），算表-核 |δπ| 比
+    spice_sigma_bandwidth: 0.25  # δπ 的 σ₀ 高斯核带宽（kg/m³）
+    spice_anom_threshold: 0.15   # |δπ_core| 显著阈值，判定核处水团偏离
+    surf_core_ratio_max: 0.5     # 表-核 |δπ| 比上限（越小越"次表层强化"）
+    n2_ratio_max: 0.6            # N²_prof/N²_bg 上限（核处层结被均质化＝低 PV 透镜）
+    min_bg_profiles: 10          # 背景池有效剖面数下限，不足则判背景不足
+    eddy_enlarge_factor: 1.2     # 面涡圆判定的半径放大倍数（沿用 circle_enlargement_factor 语义）
+    glorys_repro_dpi_frac: 0.5   # GLORYS 核处 |δπ| 保留 < 该比例×Argo 则判 GLORYS 抹平（漏涡）
+    coherence_window_days: 20    # 相干性：同浮标其他周期 / 邻剖面的时间半窗（天）
+    coherence_radius_km: 150.0   # 相干性：邻剖面搜索半径（km）
+    coherence_sigma_tol: 0.3     # 相干性：判同一透镜的核 σ₀ 容差（kg/m³）
+    coherence_min_profiles: 2    # 相干性：达成"相干"所需的同号透镜剖面数（含种子）
+    velocity_criterion: true       # 是否计算 McCoy 动力高度速度判据（report-only，不进 is_lens gate）
+    velocity_extent_frac: 0.135    # 核带 [pl,ph] 取 |δπ| 衰减到峰值此比例处（≈ 核 ±√2·H 的高斯 e⁻² 范围）
+    velocity_equator_lat: 5.0      # |纬度|<此值跳过速度判据（赤道 f→0 地转失效；McCoy 同此阈）
+    glorys_sameloc_radius_km: 40.0 # GLORYS 同位 thetao+so 列读取窗口半宽（km，复现测试共用）
+    mccoy_argo_min_dpi: 0.05       # McCoy 核处 Argo |δπ| 下限；低于此值判"Argo 自身无信号"（我们的局地池法看不到该异常，无法据以判 GLORYS 漏检）
+    mccoy_match_days: 5            # McCoy SCV 周期日期 ↔ 我们 Argo 剖面的 Platform+日期匹配容差（天）
+    glorys_bg_radius_km: 120.0     # 纯 GLORYS 检验：核位周围取此半径窗口作 GLORYS 自身背景（km）
+    glorys_core_exclude_km: 30.0   # 纯 GLORYS 检验：背景排除中心此半径内网格（避免涡核污染背景，km）
+    glorys_resolve_floor: 0.07     # 纯 GLORYS 检验判"GLORYS 看见"的 |δπ| 绝对阈值；锚定 McCoy 确认涡在我们度量下振幅的 10th 百分位(≈0.068)≈Chen2021 |Δπ|>0.05；与 lens 检测器 spice_anom_threshold(0.15) 解耦
 
 ofes:
   velocity_scale: 0.01            # cm/s → m/s

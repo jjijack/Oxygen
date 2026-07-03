@@ -1,4 +1,7 @@
 # 数据路径配置
+# version 1.8 变更：
+#   - 新增 mccoy_scv_csv：McCoy et al. (2020) 全球 Argo SCV 检测目录 CSV 路径，供 GLORYS 漏检检验
+#     （screen_mccoy_scvs_against_glorys / glorys_reproduces_mccoy_scv）读取已确认 SCV 核位。
 # version 1.7 变更：
 #   - 新增 ofes_root：OFES NP30 高分辨率模型输出根目录（日均 netCDF），供 load_ofes_snapshot 等使用。
 # version 1.6 变更：
@@ -15,7 +18,7 @@
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.7
+version: 1.8
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
@@ -31,3 +34,4 @@ paths:
   woa23_root: ./data/woa23
   mld_clim_root: ./data/mld_clim
   ofes_root: ./data/OFES_NP30
+  mccoy_scv_csv: ./data/mccoy2020_scv/SCVs.csv
