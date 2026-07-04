@@ -18170,7 +18170,8 @@ def plot_mccoy_datagap_atlas(
     （右）GLORYS×META 2×2 列联热图（四类计数与占比），量化两产品的互补失效。仅读缓存 parquet 渲染。
 
     参数:
-        - resolution_path (str | Path | None): 纯 GLORYS 全目录 parquet；None 时按 `screen_mccoy_scvs_glorys_resolution` 默认定位。
+        - resolution_path (str | Path | None): 纯 GLORYS 全目录 parquet；None 时优先按当前 method 的
+          `screen_mccoy_scvs_glorys_resolution` 定位，缺失时回退到 DO 主线已生成文件。
         - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认路径。
         - output_dir (str | Path | None): 图输出根目录；None 使用 method/region 默认目录。
         - show_fig (bool): 是否显示图，默认 True。
@@ -18181,9 +18182,15 @@ def plot_mccoy_datagap_atlas(
     """
     cfg = _resolve_detection_config(detection_config)
     region_slug = _current_region_key()
-    res_p = (Path(resolution_path) if resolution_path is not None
-             else cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug)
-             / "mccoy_glorys_resolution.parquet")
+    if resolution_path is not None:
+        res_p = Path(resolution_path)
+    else:
+        res_p = (
+            cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug)
+            / "mccoy_glorys_resolution.parquet"
+        )
+        if not res_p.exists():
+            res_p = _default_mccoy_resolution_path(region_slug)
     d = pd.read_parquet(res_p)
     d = d[d['glorys_misses'].notna() & d['meta_miss'].notna()]
     gm = d['glorys_misses'].astype(bool)
@@ -24037,6 +24044,1000 @@ def calculate_interaction_statistics(
         with open(fname, 'w') as f:
             f.write(report)
         print(f"Report saved to: {fname}")
+
+
+def summarize_detector_relaxation(
+    start_year: int = 2002,
+    end_year: int = 2023,
+    methods: tuple[str, ...] | list[str] = ('do', 'aou', 'trim'),
+    *,
+    ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
+    ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
+    save_report: bool = True,
+    output_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """汇总 DO / AOU / TRIM 三类异常检测器的宽松化对照统计。
+
+    该函数只读取 `plot_argo_hotspots` 已经保存的 anomalies parquet，不重新做异常检测。它把三个
+    detector 放到同一分母下比较：总 Argo 分母、异常筛出率、异常剖面落入 META 表层涡的比例、粗海盆分布、
+    KE/OFES 盒内占比，以及相对 DO 严格集合的重叠关系。这个统计服务于会议叙事中的“global canvas
+    到更严格 DO/KE 图景”过渡；AOU、TRIM、DO 仍是三种不同 detector，不被解释为同一方法的三档阈值。
+
+    参数:
+        - start_year (int): 统计起始年份，默认 2002。
+        - end_year (int): 统计结束年份，默认 2023。
+        - methods (tuple[str, ...] | list[str]): 需要比较的 detector 名称，默认 `('do', 'aou', 'trim')`。
+        - ke_lon_bounds (tuple[float, float]): KE/OFES 叙事盒经度范围，默认 `(140, 170)`。
+        - ke_lat_bounds (tuple[float, float]): KE/OFES 叙事盒纬度范围，默认 `(25, 45)`。
+        - save_report (bool): 是否保存 parquet/csv/txt 三种摘要文件，默认 True。
+        - output_dir (str | Path | None): 输出目录；None 时使用 `plot_outputs/shared/<region>/detector_relaxation_summary`。
+
+    返回:
+        - pd.DataFrame: 每行一个 detector，含筛出率、META 入涡率、海盆占比、KE 占比和 DO 重叠率。
+
+    输出:
+        - `plot_outputs/shared/<region>/detector_relaxation_summary/detector_relaxation_summary_<y0>_<y1>.parquet`（save_report 时）。
+        - `plot_outputs/shared/<region>/detector_relaxation_summary/detector_relaxation_summary_<y0>_<y1>.csv`（save_report 时）。
+        - `plot_outputs/shared/<region>/detector_relaxation_summary/detector_relaxation_summary_<y0>_<y1>.txt`（save_report 时）。
+
+    说明:
+        - 需要先有共享分母文件 `all_region_argo_<y0>_<y1>.parquet` 与 `all_interacting_argo_<y0>_<y1>.parquet`。
+        - 默认 KE 盒采用 OFES 会议叙事盒 `(25-45N, 140-170E)`，不等同于 `kuroshio_extension` region。
+    """
+    from scipy.stats import fisher_exact
+
+    region_slug = _current_region_key()
+    stat_dir = _shared_output_dir("statistics", region_slug)
+    region_path = stat_dir / f"all_region_argo_{start_year}_{end_year}.parquet"
+    interact_path = stat_dir / f"all_interacting_argo_{start_year}_{end_year}.parquet"
+    if not region_path.exists():
+        raise FileNotFoundError(f"Missing shared Argo denominator parquet: {region_path}")
+    if not interact_path.exists():
+        raise FileNotFoundError(f"Missing shared META interaction parquet: {interact_path}")
+
+    region_df = pd.read_parquet(region_path)
+    interact_df = pd.read_parquet(interact_path)
+    base_ids = set(region_df['Profile_number'].unique())
+    inter_ids = set(interact_df['Profile_number'].unique()) & base_ids
+    n_base = len(base_ids)
+    n_base_in = len(inter_ids)
+    baseline_meta_pct = 100.0 * n_base_in / n_base if n_base else np.nan
+
+    method_cfgs = []
+    seen_methods: set[str] = set()
+    for method in methods:
+        cfg = make_detection_config(method)
+        if cfg.method in seen_methods:
+            continue
+        seen_methods.add(cfg.method)
+        method_cfgs.append(cfg)
+
+    id_sets: dict[str, set] = {}
+    rows: list[dict] = []
+    for cfg in method_cfgs:
+        run_tag = cfg.file_stem()
+        anomalies_path = (
+            cfg.output_dir("plot_argo_hotspots", region_slug)
+            / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+        if not anomalies_path.exists():
+            raise FileNotFoundError(
+                f"Missing anomalies parquet for method={cfg.method}: {anomalies_path}"
+            )
+
+        anomalies = pd.read_parquet(anomalies_path)
+        if 'detection_method' in anomalies.columns:
+            anomalies = anomalies[
+                anomalies['detection_method'].astype(str).str.lower().eq(cfg.method)
+            ].copy()
+        if 'Profile_number' not in anomalies.columns:
+            raise ValueError(f"Anomalies parquet lacks Profile_number: {anomalies_path}")
+
+        anomalies = anomalies[anomalies['Profile_number'].isin(base_ids)].copy()
+        anomaly_ids = set(anomalies['Profile_number'].unique())
+        id_sets[cfg.method] = anomaly_ids
+        n_anom = len(anomaly_ids)
+        n_anom_in = len(anomaly_ids & inter_ids)
+        anomaly_pct = 100.0 * n_anom / n_base if n_base else np.nan
+        anomaly_meta_pct = 100.0 * n_anom_in / n_anom if n_anom else np.nan
+
+        if n_base and n_anom:
+            odds_ratio, p_value = fisher_exact(
+                [[n_anom_in, n_anom - n_anom_in],
+                 [n_base_in, n_base - n_base_in]]
+            )
+        else:
+            odds_ratio, p_value = np.nan, np.nan
+
+        lons = pd.to_numeric(anomalies.get('Longitude'), errors='coerce')
+        lats = pd.to_numeric(anomalies.get('Latitude'), errors='coerce')
+        basin = pd.Series(
+            [_residual_basin_of(la, lo) if np.isfinite(la) and np.isfinite(lo) else None
+             for la, lo in zip(lats, lons)],
+            index=anomalies.index,
+            dtype='object',
+        )
+        basin_names = ('Pacific', 'Atlantic', 'Indian', 'SO', 'Arctic')
+        basin_counts = {
+            bn: int((basin == bn).sum())
+            for bn in basin_names
+        }
+        ke_mask = (
+            _region_lon_mask(lons.to_numpy(dtype=float), ke_lon_bounds[0], ke_lon_bounds[1])
+            & (lats.to_numpy(dtype=float) >= float(ke_lat_bounds[0]))
+            & (lats.to_numpy(dtype=float) <= float(ke_lat_bounds[1]))
+        )
+        ke_n = int(np.nansum(ke_mask))
+
+        row = {
+            'method': cfg.method,
+            'file_stem': run_tag,
+            'criteria': cfg.threshold_label(),
+            'anomalies_path': str(anomalies_path),
+            'n_baseline': int(n_base),
+            'n_baseline_in_meta': int(n_base_in),
+            'baseline_meta_pct': float(baseline_meta_pct),
+            'n_anomaly': int(n_anom),
+            'anomaly_pct_of_baseline': float(anomaly_pct),
+            'n_anomaly_in_meta': int(n_anom_in),
+            'anomaly_meta_pct': float(anomaly_meta_pct),
+            'meta_odds_ratio_vs_baseline': float(odds_ratio),
+            'meta_p_value_vs_baseline': float(p_value),
+            'ke_box_n': int(ke_n),
+            'ke_box_pct': float(100.0 * ke_n / n_anom) if n_anom else np.nan,
+        }
+        for bn, count in basin_counts.items():
+            row[f'basin_{bn}_n'] = count
+            row[f'basin_{bn}_pct'] = float(100.0 * count / n_anom) if n_anom else np.nan
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    if 'do' in id_sets and not summary.empty:
+        do_ids = id_sets['do']
+        for idx, row in summary.iterrows():
+            method_ids = id_sets.get(row['method'], set())
+            overlap_n = len(method_ids & do_ids)
+            n_method = len(method_ids)
+            summary.at[idx, 'overlap_with_do_n'] = int(overlap_n)
+            summary.at[idx, 'overlap_with_do_pct_of_method'] = (
+                float(100.0 * overlap_n / n_method) if n_method else np.nan
+            )
+            summary.at[idx, 'do_coverage_pct'] = (
+                float(100.0 * overlap_n / len(do_ids)) if do_ids else np.nan
+            )
+
+    order = {m: i for i, m in enumerate([cfg.method for cfg in method_cfgs])}
+    summary['_order'] = summary['method'].map(order)
+    summary = summary.sort_values('_order').drop(columns=['_order']).reset_index(drop=True)
+
+    if save_report:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else _shared_output_dir("detector_relaxation_summary", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"detector_relaxation_summary_{start_year}_{end_year}"
+        parquet_path = out_dir / f"{stem}.parquet"
+        csv_path = out_dir / f"{stem}.csv"
+        txt_path = out_dir / f"{stem}.txt"
+        summary.to_parquet(parquet_path, index=False)
+        summary.to_csv(csv_path, index=False)
+        lines = [
+            f"Detector relaxation summary ({start_year}-{end_year})",
+            f"Region: {region_slug}",
+            f"Baseline META surface-eddy rate: {n_base_in}/{n_base} = {baseline_meta_pct:.2f}%",
+            "",
+        ]
+        for rec in summary.to_dict('records'):
+            lines.append(
+                f"{rec['method'].upper():>4s}: "
+                f"n={int(rec['n_anomaly'])} ({rec['anomaly_pct_of_baseline']:.2f}% of baseline), "
+                f"META={rec['n_anomaly_in_meta']}/{int(rec['n_anomaly'])} "
+                f"({rec['anomaly_meta_pct']:.2f}%, OR={rec['meta_odds_ratio_vs_baseline']:.2f}), "
+                f"KE box={int(rec['ke_box_n'])} ({rec['ke_box_pct']:.2f}%), "
+                f"Pacific/Atlantic/Indian/SO/Arctic="
+                f"{rec['basin_Pacific_pct']:.1f}/"
+                f"{rec['basin_Atlantic_pct']:.1f}/"
+                f"{rec['basin_Indian_pct']:.1f}/"
+                f"{rec['basin_SO_pct']:.1f}/"
+                f"{rec['basin_Arctic_pct']:.1f}%"
+            )
+        txt_path.write_text("\n".join(lines) + "\n")
+        print(f"[*] Detector relaxation summary saved: {parquet_path}")
+        print(f"[*] Detector relaxation summary saved: {csv_path}")
+        print(f"[*] Detector relaxation summary saved: {txt_path}")
+
+    return summary
+
+
+def plot_detector_relaxation_summary(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    start_year: int = 2002,
+    end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 DO / AOU / TRIM 检测器宽松化对照摘要图。
+
+    读取 `summarize_detector_relaxation` 生成的单表摘要，画三联图：异常筛出率、异常海盆分布与 KE 盒占比、
+    以及异常剖面落入 META 表层涡的比例。图的用途是快速判断 detector 从 DO 扩展到 AOU/TRIM 后，信号是
+    向 Atlantic/Southern Ocean 等经典通风区扩散，还是仍主要集中在 KE。
+
+    参数:
+        - summary (pd.DataFrame | None): 已在内存中的摘要表；None 时从 `summary_path` 或默认路径读取。
+        - summary_path (str | Path | None): 摘要 parquet/csv 路径；None 时定位默认 parquet。
+        - start_year (int): 摘要起始年份，默认 2002。
+        - end_year (int): 摘要结束年份，默认 2023。
+        - output_dir (str | Path | None): 图输出目录；None 时使用 `plot_outputs/shared/<region>/detector_relaxation_summary`。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 `figure_path`（save_fig 时）、`methods`、`n_anomaly` 与 `baseline_meta_pct`。
+
+    输出:
+        - `plot_outputs/shared/<region>/detector_relaxation_summary/detector_relaxation_summary_<y0>_<y1>.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    if summary is None:
+        if summary_path is None:
+            summary_path = (
+                _shared_output_dir("detector_relaxation_summary", region_slug)
+                / f"detector_relaxation_summary_{start_year}_{end_year}.parquet"
+            )
+        sp = Path(summary_path)
+        if sp.suffix.lower() == '.csv':
+            summary = pd.read_csv(sp)
+        else:
+            summary = pd.read_parquet(sp)
+    else:
+        summary = summary.copy()
+    if summary.empty:
+        raise ValueError("summary is empty.")
+
+    method_label = {'do': 'DO', 'aou': 'AOU', 'trim': 'TRIM'}
+    labels = [
+        f"{method_label.get(str(m), str(m).upper())}\n(n={int(n)})"
+        for m, n in zip(summary['method'], summary['n_anomaly'])
+    ]
+    x = np.arange(len(summary))
+    basin_order = ['Pacific', 'Atlantic', 'Indian', 'SO', 'Arctic']
+    basin_colors = {
+        'Pacific': '#4c78a8',
+        'Atlantic': '#f58518',
+        'Indian': '#54a24b',
+        'SO': '#b279a2',
+        'Arctic': '#72b7b2',
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))
+
+    axes[0].bar(x, summary['anomaly_pct_of_baseline'], color='#6b7280')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels)
+    axes[0].set_ylabel('selected profiles / all Argo (%)')
+    axes[0].set_title('Detector yield')
+    axes[0].grid(axis='y', alpha=0.25)
+    for i, val in enumerate(summary['anomaly_pct_of_baseline']):
+        axes[0].text(i, val, f" {val:.2f}%", ha='center', va='bottom', fontsize=9)
+
+    bottom = np.zeros(len(summary), dtype=float)
+    for basin in basin_order:
+        vals = summary[f'basin_{basin}_pct'].to_numpy(dtype=float)
+        axes[1].bar(x, vals, bottom=bottom, color=basin_colors[basin], label=basin)
+        bottom += np.nan_to_num(vals)
+    axes[1].plot(x, summary['ke_box_pct'], color='black', marker='D', lw=1.2, label='KE box')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels)
+    axes[1].set_ylim(0, 100)
+    axes[1].set_ylabel('share of selected profiles (%)')
+    axes[1].set_title('Geographic redistribution')
+    axes[1].legend(fontsize=8, ncol=2, loc='upper right')
+    axes[1].grid(axis='y', alpha=0.25)
+
+    baseline_meta = float(summary['baseline_meta_pct'].iloc[0])
+    axes[2].bar(x, summary['anomaly_meta_pct'], color='#f59e0b')
+    axes[2].axhline(baseline_meta, color='0.35', ls='--', lw=1.2,
+                    label=f'baseline {baseline_meta:.1f}%')
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels)
+    axes[2].set_ylabel('inside META surface eddy (%)')
+    axes[2].set_title('Surface-eddy association')
+    axes[2].legend(fontsize=8)
+    axes[2].grid(axis='y', alpha=0.25)
+    for i, val in enumerate(summary['anomaly_meta_pct']):
+        axes[2].text(i, val, f" {val:.1f}%", ha='center', va='bottom', fontsize=9)
+
+    fig.suptitle(
+        f'DO / AOU / TRIM detector comparison ({start_year}-{end_year}, {region_slug})',
+        fontsize=13,
+    )
+    fig.tight_layout()
+
+    out = {
+        'methods': list(summary['method']),
+        'n_anomaly': [int(v) for v in summary['n_anomaly']],
+        'baseline_meta_pct': baseline_meta,
+    }
+    if save_fig:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else _shared_output_dir("detector_relaxation_summary", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fpath = out_dir / f"detector_relaxation_summary_{start_year}_{end_year}.png"
+        fig.savefig(fpath, dpi=160, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] Detector relaxation figure saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def _default_mccoy_resolution_path(region_slug: str) -> Path:
+    """返回 DO 主线中已生成的 McCoy 全目录 parquet。"""
+    do_cfg = make_detection_config('do')
+    return (
+        do_cfg.output_dir("screen_mccoy_scvs_glorys_resolution", region_slug)
+        / "mccoy_glorys_resolution.parquet"
+    )
+
+
+def _default_mccoy_anchored_path(region_slug: str) -> Path:
+    """返回 DO 主线中已生成的 Argo 锚定 McCoy SCV parquet。"""
+    do_cfg = make_detection_config('do')
+    return (
+        do_cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
+        / "mccoy_glorys_miss.parquet"
+    )
+
+
+def _detector_short_label(cfg: DetectionConfig) -> str:
+    """返回图标题里使用的 detector 标签。"""
+    return {'do': 'δDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
+
+
+def _load_detector_anomaly_ids(
+    cfg: DetectionConfig,
+    start_year: int,
+    end_year: int,
+    region_slug: str,
+) -> tuple[set[int], Path]:
+    """读取指定 detector 的 anomalies parquet，返回 Profile_number 集合与路径。"""
+    run_tag = cfg.file_stem()
+    anomalies_path = (
+        cfg.output_dir("plot_argo_hotspots", region_slug)
+        / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+    )
+    if not anomalies_path.exists():
+        raise FileNotFoundError(f"Missing anomalies parquet for method={cfg.method}: {anomalies_path}")
+    anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        anomalies = anomalies[
+            anomalies['detection_method'].astype(str).str.lower().eq(cfg.method)
+        ].copy()
+    if 'Profile_number' not in anomalies.columns:
+        raise ValueError(f"Anomalies parquet lacks Profile_number: {anomalies_path}")
+    ids = set(pd.to_numeric(anomalies['Profile_number'], errors='coerce').dropna().astype(int))
+    return ids, anomalies_path
+
+
+def _detector_evaluable_profile_ids(
+    cfg: DetectionConfig,
+    start_year: int,
+    end_year: int,
+    *,
+    argo_data_dir: str | Path | None = None,
+) -> set[int]:
+    """返回当前区域内指定 detector 可评估的 Argo profile 编号集合。"""
+    if argo_data_dir is None:
+        argo_data_dir = argo_path
+    min_depth = float(cfg.anomaly_min_depth or 0.0)
+    ids: set[int] = set()
+    for year in range(int(start_year), int(end_year) + 1):
+        try:
+            df = load_argo_data(year, data_dir=argo_data_dir)
+        except Exception:
+            continue
+        if df.empty or 'Profile_number' not in df.columns or 'Depth' not in df.columns:
+            continue
+        lon = pd.to_numeric(df['Longitude'], errors='coerce').to_numpy(dtype=float)
+        lat = pd.to_numeric(df['Latitude'], errors='coerce').to_numpy(dtype=float)
+        geo = _region_lon_mask(lon, lonmin, lonmax) & (lat >= latmin) & (lat <= latmax)
+        depth_ok = pd.to_numeric(df['Depth'], errors='coerce').ge(min_depth)
+        if cfg.method == 'do':
+            var_ok = pd.to_numeric(df.get('DO'), errors='coerce').notna()
+        else:
+            if 'AOU' in df.columns:
+                aou_ok = pd.to_numeric(df['AOU'], errors='coerce').notna()
+            else:
+                aou_ok = (
+                    pd.to_numeric(df.get('DO'), errors='coerce').notna()
+                    & pd.to_numeric(df.get('Temperature'), errors='coerce').notna()
+                    & pd.to_numeric(df.get('Salinity'), errors='coerce').notna()
+                )
+            var_ok = (
+                aou_ok
+                & pd.to_numeric(df.get('Temperature'), errors='coerce').notna()
+                & pd.to_numeric(df.get('Salinity'), errors='coerce').notna()
+            )
+        keep = df[geo & depth_ok & var_ok]
+        if not keep.empty:
+            ids |= set(pd.to_numeric(keep['Profile_number'], errors='coerce').dropna().astype(int))
+    return ids
+
+
+def _mccoy_detector_carrier_frame(
+    cfg: DetectionConfig,
+    argo_anchored_path: str | Path | None,
+    *,
+    start_year: int,
+    end_year: int,
+    evaluable_ids: set[int] | None = None,
+) -> tuple[pd.DataFrame, Path, Path]:
+    """返回 McCoy Argo 锚定子集，追加 detector-evaluable 与 carrier 布尔列。"""
+    region_slug = _current_region_key()
+    anc_path = Path(argo_anchored_path) if argo_anchored_path is not None else _default_mccoy_anchored_path(region_slug)
+    anc = pd.read_parquet(anc_path).copy()
+    profile_ids = pd.to_numeric(anc['profile_number'], errors='coerce').astype('Int64')
+    anomaly_ids, anomalies_path = _load_detector_anomaly_ids(cfg, start_year, end_year, region_slug)
+    if cfg.method == 'do' and 'has_delta_do' in anc.columns:
+        anc['detector_evaluable'] = anc['has_delta_do'].notna()
+        anc['has_detector_anomaly'] = anc['has_delta_do'] == True
+    else:
+        if evaluable_ids is None:
+            evaluable_ids = _detector_evaluable_profile_ids(cfg, start_year, end_year)
+        anc['detector_evaluable'] = profile_ids.isin(evaluable_ids)
+        anc['has_detector_anomaly'] = profile_ids.isin(anomaly_ids) & anc['detector_evaluable']
+    return anc, anc_path, anomalies_path
+
+
+def calculate_scv_detector_frequency_statistics(
+    resolution_path: str | Path | None = None,
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    save_report: bool = True,
+) -> dict:
+    """按任意异常 detector 计算 McCoy SCV 相对基线 Argo 的异常携带率富集。
+
+    这个函数是 `calculate_scv_frequency_statistics` 的 detector-neutral 版本。SCV 入 META 表层涡率仍来自
+    McCoy 全目录 parquet 的 `meta_miss`，不随 detector 改变；异常携带率则读取当前 detector 的
+    `plot_argo_hotspots` anomalies parquet，分别计算可评估基线 Argo、可评估且落入 META 表层涡的 Argo、
+    以及 McCoy SCV 子集中的异常比例。
+
+    参数:
+        - resolution_path (str | Path | None): McCoy 全目录 parquet；None 时使用 DO 主线已生成的默认文件。
+        - argo_anchored_path (str | Path | None): Argo 锚定 McCoy parquet；None 时使用 DO 主线已生成的默认文件。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 使用默认 detector。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - output_dir (str | Path | None): 输出目录；None 使用 `plot_outputs/<method>/<region>/statistics`。
+        - save_report (bool): 是否保存 txt/parquet 摘要，默认 True。
+
+    返回:
+        - dict: 含 `in_eddy` 与 `anomaly` 两组统计；`anomaly` 中 baseline/meta/scv 分别为异常携带率。
+
+    输出:
+        - `plot_outputs/<method>/<region>/statistics/scv_detector_frequency_<y0>_<y1>_<stem>.txt`（save_report 时）。
+        - `plot_outputs/<method>/<region>/statistics/scv_detector_frequency_<y0>_<y1>_<stem>.parquet`（save_report 时）。
+    """
+    from scipy.stats import fisher_exact
+
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    run_tag = cfg.file_stem()
+    y0, y1 = int(baseline_start_year), int(baseline_end_year)
+
+    res_p = Path(resolution_path) if resolution_path is not None else _default_mccoy_resolution_path(region_slug)
+    res = pd.read_parquet(res_p)
+    res['date'] = pd.to_datetime(res['date'])
+    scv = res[res['meta_miss'].notna() & res['date'].dt.year.between(y0, y1)]
+    n_scv = len(scv)
+    n_scv_in = int((~scv['meta_miss'].astype(bool)).sum())
+
+    stat_dir = _shared_output_dir("statistics", region_slug)
+    reg = pd.read_parquet(stat_dir / f"all_region_argo_{y0}_{y1}.parquet")
+    inter = pd.read_parquet(stat_dir / f"all_interacting_argo_{y0}_{y1}.parquet")
+    base_ids = set(pd.to_numeric(reg['Profile_number'], errors='coerce').dropna().astype(int))
+    inter_ids = set(pd.to_numeric(inter['Profile_number'], errors='coerce').dropna().astype(int)) & base_ids
+    n_base = len(base_ids)
+    n_base_in = len(inter_ids)
+    or_eddy, p_eddy = fisher_exact(
+        [[n_scv_in, n_scv - n_scv_in], [n_base_in, n_base - n_base_in]]
+    )
+
+    anomaly_ids, anomalies_path = _load_detector_anomaly_ids(cfg, y0, y1, region_slug)
+    anomaly_ids &= base_ids
+    n_anom = len(anomaly_ids)
+    n_anom_in = len(anomaly_ids & inter_ids)
+    or_anom, p_anom = fisher_exact(
+        [[n_anom_in, n_anom - n_anom_in], [n_base_in, n_base - n_base_in]]
+    )
+
+    eval_ids = _detector_evaluable_profile_ids(cfg, y0, y1)
+    eval_ids &= base_ids
+    n_base_eval = len(eval_ids)
+    eval_in_ids = eval_ids & inter_ids
+    n_eval_in = len(eval_in_ids)
+    n_base_pos = len(anomaly_ids & eval_ids)
+    n_pos_in = len(anomaly_ids & eval_in_ids)
+
+    carrier_frame, anc_p, _ = _mccoy_detector_carrier_frame(
+        cfg, argo_anchored_path, start_year=y0, end_year=y1, evaluable_ids=eval_ids
+    )
+    scv_eval = carrier_frame[carrier_frame['detector_evaluable'].astype(bool)]
+    scv_pos = carrier_frame[
+        carrier_frame['detector_evaluable'].astype(bool)
+        & carrier_frame['has_detector_anomaly'].astype(bool)
+    ]
+    scv_carrier_n = int(len(scv_eval))
+    scv_carrier_k = int(len(scv_pos))
+
+    or_detector, p_detector = fisher_exact(
+        [[scv_carrier_k, scv_carrier_n - scv_carrier_k],
+         [n_base_pos, n_base_eval - n_base_pos]]
+    )
+    or_meta, p_meta = fisher_exact(
+        [[n_pos_in, n_eval_in - n_pos_in],
+         [n_base_pos, n_base_eval - n_base_pos]]
+    )
+
+    pct = lambda a, b: (100.0 * a / b) if b else float('nan')
+    label = _detector_short_label(cfg)
+    report = (
+        f"========================================\n"
+        f"McCoy SCV Detector Frequency Analysis ({y0}-{y1})\n"
+        f"Region: {region_slug} | Method: {cfg.method} | Criteria: {cfg.threshold_label()}\n"
+        f"Resolution source: {res_p}\n"
+        f"Anchored source: {anc_p}\n"
+        f"Anomalies source: {anomalies_path}\n"
+        f"----------------------------------------\n"
+        f"[Inside META surface eddy]\n"
+        f"  Baseline Argo:  {n_base_in}/{n_base} = {pct(n_base_in, n_base):.2f}%\n"
+        f"  {label}-anom Argo: {n_anom_in}/{n_anom} = {pct(n_anom_in, n_anom):.2f}%  (OR={or_anom:.2f}, p={p_anom:.2e})\n"
+        f"  McCoy SCVs:     {n_scv_in}/{n_scv} = {pct(n_scv_in, n_scv):.2f}%  (OR={or_eddy:.2f}, p={p_eddy:.2e})\n"
+        f"----------------------------------------\n"
+        f"[Carry significant {label} anomaly]\n"
+        f"  Baseline evaluable Argo: {n_base_pos}/{n_base_eval} = {pct(n_base_pos, n_base_eval):.3f}%\n"
+        f"  In META eddy:            {n_pos_in}/{n_eval_in} = {pct(n_pos_in, n_eval_in):.3f}%  (OR={or_meta:.2f} vs baseline)\n"
+        f"  McCoy SCVs:              {scv_carrier_k}/{scv_carrier_n} = {pct(scv_carrier_k, scv_carrier_n):.2f}%  (OR={or_detector:.2f} vs baseline)\n"
+        f"========================================"
+    )
+    print(report)
+
+    out = {
+        'in_eddy': {
+            'baseline_pct': round(pct(n_base_in, n_base), 2),
+            'anom_pct': round(pct(n_anom_in, n_anom), 2),
+            'scv_pct': round(pct(n_scv_in, n_scv), 2),
+            'odds_ratio': round(float(or_eddy), 3),
+            'p_value': float(p_eddy),
+            'anom_odds_ratio': round(float(or_anom), 3),
+            'anom_p_value': float(p_anom),
+            'n_scv': int(n_scv),
+            'n_baseline': int(n_base),
+            'n_anom': int(n_anom),
+        },
+        'anomaly': {
+            'baseline_k': int(n_base_pos),
+            'baseline_n': int(n_base_eval),
+            'baseline_pct': round(pct(n_base_pos, n_base_eval), 3),
+            'meta_k': int(n_pos_in),
+            'meta_n': int(n_eval_in),
+            'meta_pct': round(pct(n_pos_in, n_eval_in), 3),
+            'scv_k': int(scv_carrier_k),
+            'scv_n': int(scv_carrier_n),
+            'scv_pct': round(pct(scv_carrier_k, scv_carrier_n), 3),
+            'odds_ratio': round(float(or_detector), 3),
+            'p_value': float(p_detector),
+            'meta_odds_ratio': round(float(or_meta), 3),
+            'meta_p_value': float(p_meta),
+        },
+    }
+    if save_report:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else cfg.output_dir("statistics", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"scv_detector_frequency_{y0}_{y1}_{run_tag}"
+        txt_path = out_dir / f"{stem}.txt"
+        txt_path.write_text(report + "\n")
+        flat = {f"{axis}_{k}": v for axis, d in out.items() for k, v in d.items()}
+        pd.DataFrame([flat]).to_parquet(out_dir / f"{stem}.parquet")
+        print(f"[*] SCV detector frequency report saved: {txt_path}")
+    return out
+
+
+def plot_scv_detector_frequency_enrichment(
+    summary_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制任意 detector 的 SCV 异常携带率富集图。
+
+    读取 `calculate_scv_detector_frequency_statistics` 写出的摘要 parquet，画三柱：可评估基线 Argo、
+    落在 META 表层涡内的可评估 Argo、McCoy SCV。它对应 GLORYS.ipynb 中
+    `plot_scv_frequency_enrichment` 的 detector-neutral 版本。
+
+    参数:
+        - summary_path (str | Path | None): 摘要 parquet；None 时按当前 method 的正式 statistics 路径定位。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 使用默认 detector。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - output_dir (str | Path | None): 图输出目录；None 使用 `plot_outputs/<method>/<region>/plot_scv_detector_frequency_enrichment`。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 baseline/meta/scv 各自比例与 95% Wilson CI，以及 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/<method>/<region>/plot_scv_detector_frequency_enrichment/scv_detector_frequency_enrichment_<stem>.png`（save_fig 时）。
+    """
+    from scipy.stats import binomtest
+
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    run_tag = cfg.file_stem()
+    y0, y1 = int(baseline_start_year), int(baseline_end_year)
+    sp = (
+        Path(summary_path) if summary_path is not None
+        else cfg.output_dir("statistics", region_slug)
+        / f"scv_detector_frequency_{y0}_{y1}_{run_tag}.parquet"
+    )
+    s = pd.read_parquet(sp).iloc[0]
+    label = _detector_short_label(cfg)
+    groups = [('baseline', f'baseline evaluable\nArgo', '0.6'),
+              ('meta', 'inside META\neddy', 'tab:orange'),
+              ('scv', 'McCoy\nSCVs', 'tab:red')]
+    pcts, lo_err, hi_err, labels, colors, res = [], [], [], [], [], {}
+    for key, lab, color in groups:
+        k = int(s[f'anomaly_{key}_k'])
+        n = int(s[f'anomaly_{key}_n'])
+        p = 100.0 * k / n if n else np.nan
+        if n:
+            ci = binomtest(k, n).proportion_ci(0.95, method='wilson')
+            lo, hi = 100.0 * ci.low, 100.0 * ci.high
+        else:
+            lo = hi = np.nan
+        pcts.append(p)
+        lo_err.append(p - lo if np.isfinite(p) else 0.0)
+        hi_err.append(hi - p if np.isfinite(p) else 0.0)
+        labels.append(f'{lab}\n({k}/{n})')
+        colors.append(color)
+        res[key] = {'pct': round(float(p), 3) if np.isfinite(p) else np.nan,
+                    'ci95': [round(float(lo), 3) if np.isfinite(lo) else np.nan,
+                             round(float(hi), 3) if np.isfinite(hi) else np.nan]}
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    ax.bar(labels, pcts, color=colors, yerr=[lo_err, hi_err], capsize=6, error_kw={'lw': 1.3})
+    top = max(pcts[i] + hi_err[i] for i in range(len(pcts)) if np.isfinite(pcts[i] + hi_err[i]))
+    ax.set_ylim(0, top * 1.2 if top > 0 else 1)
+    for i, p in enumerate(pcts):
+        if np.isfinite(p):
+            ax.text(i, p + hi_err[i], f'  {p:.2f}%', ha='center', va='bottom', fontsize=11)
+    ax.set_ylabel(f'carry significant {label} anomaly %')
+    ax.set_title(
+        f'{label} anomaly rate by eddy detector ({y0}-{y1}, {_current_region_key()})\n'
+        f"vs baseline OR: META {float(s['anomaly_meta_odds_ratio']):.2f}"
+        f" · SCV {float(s['anomaly_odds_ratio']):.2f} (95% CI error bars)"
+    )
+    fig.tight_layout()
+
+    out = {'anomaly': res,
+           'meta_odds_ratio': float(s['anomaly_meta_odds_ratio']),
+           'scv_odds_ratio': float(s['anomaly_odds_ratio'])}
+    if save_fig:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else cfg.output_dir("plot_scv_detector_frequency_enrichment", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fpath = out_dir / f"scv_detector_frequency_enrichment_{run_tag}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] SCV detector frequency enrichment saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_mccoy_detector_enrichment(
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 GLORYS 漏检 vs 命中 SCV 的 detector 异常携带率。
+
+    该图对应 GLORYS.ipynb 中 `plot_mccoy_do_enrichment`，但 carrier 判定来自当前 detector 的 anomalies
+    parquet，而不是固定的 `has_delta_do`。它用于检验“被 GLORYS 漏掉的 SCV 更容易携带异常”这条支线在
+    AOU/TRIM 宽松 detector 下是否仍成立。
+
+    参数:
+        - argo_anchored_path (str | Path | None): Argo 锚定 McCoy parquet；None 使用 DO 主线默认文件。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 使用默认 detector。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - output_dir (str | Path | None): 图输出目录；None 使用 `plot_outputs/<method>/<region>/plot_mccoy_detector_enrichment`。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 `n_evaluable` / `miss_pct` / `seen_pct` 与 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/<method>/<region>/plot_mccoy_detector_enrichment/mccoy_detector_enrichment_<stem>.png`（save_fig 时）。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    frame, _, _ = _mccoy_detector_carrier_frame(
+        cfg, argo_anchored_path,
+        start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year),
+    )
+    d = frame[
+        frame['detector_evaluable'].astype(bool)
+        & frame['glorys_misses'].notna()
+        & frame.get('status', pd.Series('ok', index=frame.index)).astype(str).eq('ok')
+    ].copy()
+    gm = d['glorys_misses'].astype(bool)
+    carrier = d['has_detector_anomaly'].astype(bool)
+    miss_pct = 100.0 * carrier[gm].mean() if gm.any() else np.nan
+    seen_pct = 100.0 * carrier[~gm].mean() if (~gm).any() else np.nan
+    label = _detector_short_label(cfg)
+
+    fig, ax = plt.subplots(figsize=(6, 5.2))
+    ax.bar([f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
+           [miss_pct, seen_pct], color=['tab:red', '0.6'])
+    for i, value in enumerate([miss_pct, seen_pct]):
+        if np.isfinite(value):
+            ax.text(i, value + 0.3, f'{value:.1f}%', ha='center', fontsize=11)
+    ax.set_ylabel(f'carry significant {label} anomaly %')
+    ax.set_title(f'{label} anomaly in GLORYS-missed vs seen McCoy SCVs (n={len(d)})')
+    fig.tight_layout()
+
+    out = {'n_evaluable': int(len(d)),
+           'miss_pct': round(float(miss_pct), 1) if np.isfinite(miss_pct) else np.nan,
+           'seen_pct': round(float(seen_pct), 1) if np.isfinite(seen_pct) else np.nan,
+           'miss_n': int(gm.sum()),
+           'seen_n': int((~gm).sum())}
+    if save_fig:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else cfg.output_dir("plot_mccoy_detector_enrichment", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fpath = out_dir / f"mccoy_detector_enrichment_{cfg.file_stem()}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] McCoy detector enrichment saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_scv_detector_carrier_map(
+    argo_anchored_path: str | Path | None = None,
+    *,
+    detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制携带当前 detector 异常的 McCoy SCV 世界图。
+
+    该图对应 `plot_scv_do_carrier_map` 的 detector-neutral 版本，只显示当前 detector 判定为 carrier 的
+    McCoy SCV，并按 GLORYS×META 数据缺陷四分类着色。
+
+    参数:
+        - argo_anchored_path (str | Path | None): Argo 锚定 McCoy parquet；None 使用 DO 主线默认文件。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 使用默认 detector。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - output_dir (str | Path | None): 图输出目录；None 使用 `plot_outputs/<method>/<region>/plot_scv_detector_carrier_map`。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 `n_carrier` / `n_both_miss` / `n_ge1_miss` 与 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/<method>/<region>/plot_scv_detector_carrier_map/scv_detector_carrier_map_<stem>.png`（save_fig 时）。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    region_slug = _current_region_key()
+    frame, _, _ = _mccoy_detector_carrier_frame(
+        cfg, argo_anchored_path,
+        start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year),
+    )
+    d = frame[
+        frame['has_detector_anomaly'].astype(bool)
+        & frame['glorys_misses'].notna()
+        & frame['meta_miss'].notna()
+    ].copy()
+    gm = d['glorys_misses'].astype(bool)
+    mm = d['meta_miss'].astype(bool)
+    label = _detector_short_label(cfg)
+
+    fig = plt.figure(figsize=(13, 6))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
+    ax.set_global()
+    cats = [(~gm & ~mm, '0.6', 'seen by both'),
+            (~gm & mm, 'tab:blue', 'META misses only'),
+            (gm & ~mm, 'tab:orange', 'GLORYS misses only'),
+            (gm & mm, 'tab:red', 'both miss')]
+    for sel, col, lab in cats:
+        if not sel.any():
+            continue
+        ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=90, c=col, edgecolor='k',
+                   linewidth=0.4, transform=ccrs.PlateCarree(),
+                   label=f'{lab} ({int(sel.sum())})', zorder=5)
+    ax.legend(loc='lower left', fontsize=9)
+    ax.set_title(f'{label}-carrying McCoy SCVs by data gap '
+                 f'(n={len(d)}, ≥1 product misses {int((gm | mm).sum())})')
+    fig.tight_layout()
+
+    out = {'n_carrier': int(len(d)),
+           'n_both_miss': int((gm & mm).sum()),
+           'n_ge1_miss': int((gm | mm).sum())}
+    if save_fig:
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else cfg.output_dir("plot_scv_detector_carrier_map", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fpath = out_dir / f"scv_detector_carrier_map_{cfg.file_stem()}.png"
+        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"[*] SCV detector carrier map saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def run_scv_detector_comparison(
+    methods: tuple[str, ...] | list[str] = ('do', 'aou', 'trim'),
+    *,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_root: str | Path | None = None,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> pd.DataFrame:
+    """批量生成 DO / AOU / TRIM 版 McCoy SCV 数据缺口与频率富集分析。
+
+    对每个 detector 依次生成四类结果：GLORYS×META 数据缺口 atlas、GLORYS 漏检 vs 命中 carrier
+    enrichment、SCV frequency enrichment、carrier map。SCV 漏检口径使用同一份 McCoy 全目录 / Argo 锚定
+    parquet；carrier 判定按 detector 各自的 anomalies parquet 重算，因此可直接比较宽松 detector 是否仍支撑
+    “surface-visible eddies 解释不足、SCV 更富集异常”这条故事。
+
+    参数:
+        - methods (tuple[str, ...] | list[str]): detector 名称列表，默认 `('do', 'aou', 'trim')`。
+        - baseline_start_year (int): 基线起始年份，默认 2002。
+        - baseline_end_year (int): 基线结束年份，默认 2023。
+        - output_root (str | Path | None): 输出根目录；None 使用 `plot_outputs/shared/<region>/scv_detector_comparison`。
+        - show_fig (bool): 是否显示图，默认 False。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - pd.DataFrame: 每行一个 detector，汇总 carrier rate、SCV OR、META OR、GLORYS 漏检 enrichment 与输出路径。
+
+    输出:
+        - `plot_outputs/shared/<region>/scv_detector_comparison/scv_detector_comparison_summary_<y0>_<y1>.parquet`。
+        - `plot_outputs/shared/<region>/scv_detector_comparison/scv_detector_comparison_summary_<y0>_<y1>.csv`。
+    """
+    region_slug = _current_region_key()
+    root = (
+        Path(output_root) if output_root is not None
+        else _shared_output_dir("scv_detector_comparison", region_slug)
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    resolution_path = _default_mccoy_resolution_path(region_slug)
+    anchored_path = _default_mccoy_anchored_path(region_slug)
+    rows: list[dict] = []
+    for method in methods:
+        cfg = make_detection_config(method)
+        datagap = plot_mccoy_datagap_atlas(
+            resolution_path=resolution_path,
+            detection_config=cfg,
+            output_dir=root / "datagap_atlas",
+            show_fig=show_fig,
+            save_fig=save_fig,
+        )
+        enrich = plot_mccoy_detector_enrichment(
+            argo_anchored_path=anchored_path,
+            detection_config=cfg,
+            baseline_start_year=baseline_start_year,
+            baseline_end_year=baseline_end_year,
+            output_dir=root / "mccoy_detector_enrichment",
+            show_fig=show_fig,
+            save_fig=save_fig,
+        )
+        freq = calculate_scv_detector_frequency_statistics(
+            resolution_path=resolution_path,
+            argo_anchored_path=anchored_path,
+            detection_config=cfg,
+            baseline_start_year=baseline_start_year,
+            baseline_end_year=baseline_end_year,
+            output_dir=root / "statistics",
+            save_report=True,
+        )
+        freq_plot = plot_scv_detector_frequency_enrichment(
+            summary_path=(
+                root / "statistics"
+                / f"scv_detector_frequency_{baseline_start_year}_{baseline_end_year}_{cfg.file_stem()}.parquet"
+            ),
+            detection_config=cfg,
+            baseline_start_year=baseline_start_year,
+            baseline_end_year=baseline_end_year,
+            output_dir=root / "frequency_enrichment",
+            show_fig=show_fig,
+            save_fig=save_fig,
+        )
+        carrier_map = plot_scv_detector_carrier_map(
+            argo_anchored_path=anchored_path,
+            detection_config=cfg,
+            baseline_start_year=baseline_start_year,
+            baseline_end_year=baseline_end_year,
+            output_dir=root / "carrier_map",
+            show_fig=show_fig,
+            save_fig=save_fig,
+        )
+        rows.append({
+            'method': cfg.method,
+            'file_stem': cfg.file_stem(),
+            'criteria': cfg.threshold_label(),
+            'baseline_carrier_pct': freq['anomaly']['baseline_pct'],
+            'meta_carrier_pct': freq['anomaly']['meta_pct'],
+            'scv_carrier_pct': freq['anomaly']['scv_pct'],
+            'scv_odds_ratio': freq['anomaly']['odds_ratio'],
+            'scv_p_value': freq['anomaly']['p_value'],
+            'meta_odds_ratio': freq['anomaly']['meta_odds_ratio'],
+            'meta_p_value': freq['anomaly']['meta_p_value'],
+            'glorys_miss_carrier_pct': enrich['miss_pct'],
+            'glorys_seen_carrier_pct': enrich['seen_pct'],
+            'carrier_map_n': carrier_map['n_carrier'],
+            'carrier_map_ge1_miss': carrier_map['n_ge1_miss'],
+            'datagap_path': datagap.get('figure_path'),
+            'enrichment_path': enrich.get('figure_path'),
+            'frequency_path': freq_plot.get('figure_path'),
+            'carrier_map_path': carrier_map.get('figure_path'),
+        })
+
+    summary = pd.DataFrame(rows)
+    stem = f"scv_detector_comparison_summary_{baseline_start_year}_{baseline_end_year}"
+    summary.to_parquet(root / f"{stem}.parquet", index=False)
+    summary.to_csv(root / f"{stem}.csv", index=False)
+    print(f"[*] SCV detector comparison summary saved: {root / f'{stem}.parquet'}")
+    print(f"[*] SCV detector comparison summary saved: {root / f'{stem}.csv'}")
+    return summary
 
 
 def calculate_scv_frequency_statistics(
