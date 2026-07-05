@@ -13920,8 +13920,9 @@ def plot_argo_hotspots(
                 try:
                     baseline_year, anomalies_year = fut.result()
                 except Exception as e:
-                    print(f"[hotspots] Dask task failed: {e}")
-                    continue
+                    raise RuntimeError(
+                        f"plot_argo_hotspots Dask task failed: {e}"
+                    ) from e
                 if not baseline_year.empty:
                     baselines_list.append(baseline_year)
                 if not anomalies_year.empty:
@@ -20114,9 +20115,6 @@ def _hotspot_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
     except FileNotFoundError:
         print(f"[hotspots] Missing year {year}, skip.")
         return pd.DataFrame(), pd.DataFrame()
-    except Exception as e:
-        print(f"[hotspots] Error loading year {year}: {e}")
-        return pd.DataFrame(), pd.DataFrame()
     # 地理过滤
     lon_vals = df_y['Longitude'].to_numpy(dtype=float, copy=False)
     lat_vals = df_y['Latitude'].to_numpy(dtype=float, copy=False)
@@ -20539,8 +20537,10 @@ def build_glorys_eke_native_grid(
                 done_tasks += 1
                 try:
                     _accumulate(fut.result())
-                except Exception:
-                    pass
+                except Exception as e:
+                    raise RuntimeError(
+                        f"build_glorys_eke_native_grid Dask task failed: {e}"
+                    ) from e
                 pbar.update(1)
     finally:
         pbar.close()
@@ -20843,9 +20843,6 @@ def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]
         df_year = load_argo_data(int(year))
     except FileNotFoundError:
         return pd.DataFrame(), pd.DataFrame()
-    except Exception as exc:
-        print(f"[build_euler_grid_summary] 读取 Argo {year} 失败: {exc}")
-        return pd.DataFrame(), pd.DataFrame()
 
     if df_year.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -21055,15 +21052,11 @@ def build_euler_grid_summary(
             compute_kwargs['num_workers'] = max(1, int(dask_workers))
 
         delayed_tasks = [delayed(_euler_summary_year_worker)(arg) for arg in year_args]
-        try:
-            if dask_show_progress:
-                with ProgressBar():
-                    year_results = list(compute(*delayed_tasks, **compute_kwargs))
-            else:
+        if dask_show_progress:
+            with ProgressBar():
                 year_results = list(compute(*delayed_tasks, **compute_kwargs))
-        except Exception as exc:
-            print(f"[build_euler_grid_summary] Dask 并行失败，回退串行: {exc}")
-            year_results = [_euler_summary_year_worker(arg) for arg in year_args]
+        else:
+            year_results = list(compute(*delayed_tasks, **compute_kwargs))
     else:
         year_results = [_euler_summary_year_worker(arg) for arg in year_args]
 
