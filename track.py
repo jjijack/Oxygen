@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import pickle
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
+from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
@@ -696,6 +696,139 @@ def _load_basemap_colors() -> dict:
     return merged
 
 _BASEMAP_COLORS = _load_basemap_colors()
+
+def _load_euler_grid_plot_config() -> dict:
+    """加载欧拉网格汇总图的显示样式配置。"""
+    defaults = {
+        'positive_vmax_quantile': 0.99,
+        'positive_power_gamma': 0.7,
+        'association_vmax_quantile': 0.99,
+        'mask_fill': '#e7edf4',
+    }
+    if not isinstance(_PROC_CFG, dict):
+        return defaults
+
+    plot_cfg = _PROC_CFG.get('plot', {})
+    raw = plot_cfg.get('euler_grid', {}) if isinstance(plot_cfg, dict) else {}
+    merged = defaults.copy()
+    if isinstance(raw, dict):
+        if 'mask_fill' in raw:
+            merged['mask_fill'] = str(raw['mask_fill'])
+        for key in ('positive_vmax_quantile', 'positive_power_gamma', 'association_vmax_quantile'):
+            if key in raw:
+                try:
+                    merged[key] = float(raw[key])
+                except Exception:
+                    pass
+
+    merged['positive_vmax_quantile'] = float(np.clip(merged['positive_vmax_quantile'], 0.8, 1.0))
+    merged['association_vmax_quantile'] = float(np.clip(merged['association_vmax_quantile'], 0.8, 1.0))
+    merged['positive_power_gamma'] = float(max(0.05, merged['positive_power_gamma']))
+    return merged
+
+_EULER_GRID_PLOT_CFG = _load_euler_grid_plot_config()
+
+def _copy_cmap_with_bad(cmap: str | Colormap, *, bad_rgba=(1.0, 1.0, 1.0, 0.0)):
+    """复制 colormap 并设置 bad 值透明，避免遮住背景掩膜。"""
+    cmap_obj = copy.copy(plt.get_cmap(cmap) if isinstance(cmap, str) else cmap)
+    try:
+        cmap_obj.set_bad(bad_rgba)
+    except Exception:
+        pass
+    return cmap_obj
+
+def _robust_positive_map_style(
+    mat: np.ndarray,
+    *,
+    display_mask: np.ndarray | None = None,
+    positive_only: bool = True,
+    vmax_quantile: float | None = None,
+    gamma: float | None = None,
+) -> tuple[np.ndarray, Normalize]:
+    """为正值地图准备显示矩阵与 robust norm。"""
+    arr = np.asarray(mat, dtype=float)
+    if display_mask is not None:
+        dm = np.asarray(display_mask, dtype=bool)
+        if dm.shape == arr.shape:
+            arr = np.where(dm, arr, np.nan)
+
+    if positive_only:
+        arr = np.where(np.isfinite(arr) & (arr > 0), arr, np.nan)
+    else:
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+
+    vals = arr[np.isfinite(arr)]
+    if vals.size == 0:
+        return arr, Normalize(vmin=0.0, vmax=1.0)
+
+    if vmax_quantile is None:
+        vmax_quantile = _EULER_GRID_PLOT_CFG['positive_vmax_quantile']
+    vmax = float(np.nanquantile(vals, float(vmax_quantile)))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanmax(vals))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    gamma_use = _EULER_GRID_PLOT_CFG['positive_power_gamma'] if gamma is None else float(gamma)
+    if np.isfinite(gamma_use) and gamma_use > 0 and not np.isclose(gamma_use, 1.0):
+        norm = PowerNorm(gamma=gamma_use, vmin=0.0, vmax=vmax, clip=True)
+    else:
+        norm = Normalize(vmin=0.0, vmax=vmax, clip=True)
+    return arr, norm
+
+def _robust_symmetric_vmax(
+    mat: np.ndarray,
+    *,
+    display_mask: np.ndarray | None = None,
+    vmax_quantile: float | None = None,
+) -> float:
+    """为双极性地图计算对称 robust vmax。"""
+    arr = np.asarray(mat, dtype=float)
+    if display_mask is not None:
+        dm = np.asarray(display_mask, dtype=bool)
+        if dm.shape == arr.shape:
+            arr = np.where(dm, arr, np.nan)
+
+    vals = np.abs(arr[np.isfinite(arr)])
+    vals = vals[vals > 0]
+    if vals.size == 0:
+        return 1.0
+
+    if vmax_quantile is None:
+        vmax_quantile = _EULER_GRID_PLOT_CFG['association_vmax_quantile']
+    vmax = float(np.nanquantile(vals, float(vmax_quantile)))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanmax(vals))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    return vmax
+
+def _plot_mask_background(
+    ax,
+    lon_mesh: np.ndarray,
+    lat_mesh: np.ndarray,
+    mask: np.ndarray | None,
+    *,
+    transform,
+    color: str,
+    zorder: float = 1.5,
+) -> None:
+    """在地图上铺一层浅色背景，突出被分析/被观测的格点覆盖区。"""
+    if mask is None:
+        return
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.size == 0 or not np.any(mask_arr):
+        return
+    bg = np.where(mask_arr, 1.0, np.nan)
+    ax.pcolormesh(
+        lon_mesh,
+        lat_mesh,
+        bg,
+        cmap=ListedColormap([color]),
+        shading='auto',
+        transform=transform,
+        zorder=zorder,
+    )
 
 def _load_hotspot_plot_colors() -> tuple[dict, dict, dict]:
     """加载 hotspot_type / spice_type / cross 三组拆图配色。"""
@@ -20391,6 +20524,160 @@ def _load_meta_daily_points_for_years(
     return df[['track_id', 'date', 'center_lon', 'center_lat']]
 
 
+def _build_profile_uid(df: pd.DataFrame) -> pd.Series:
+    """按 Year-Month-Day-Profile_number 构造稳定 profile_uid。"""
+    return (
+        df['Year'].astype(int).astype(str) + '-'
+        + df['Month'].astype(int).astype(str).str.zfill(2) + '-'
+        + df['Day'].astype(int).astype(str).str.zfill(2) + '-'
+        + df['Profile_number'].astype(str)
+    )
+
+
+def _filter_table_to_current_region(
+    df: pd.DataFrame,
+    *,
+    lon_col: str = 'Longitude',
+    lat_col: str = 'Latitude',
+) -> pd.DataFrame:
+    """按当前区域边界严格过滤表格中的经纬度点。"""
+    if df.empty:
+        return df.copy()
+    if lon_col not in df.columns or lat_col not in df.columns:
+        return df.copy()
+
+    lon_vals = pd.to_numeric(df[lon_col], errors='coerce').to_numpy(dtype=float, copy=False)
+    lat_vals = pd.to_numeric(df[lat_col], errors='coerce').to_numpy(dtype=float, copy=False)
+    lon_mask = _region_lon_mask(lon_vals, lonmin, lonmax)
+    lat_mask = (lat_vals >= latmin) & (lat_vals <= latmax)
+    return df[lon_mask & lat_mask].copy()
+
+
+def _select_covering_year_cache(
+    directory: str | Path,
+    *,
+    prefix: str,
+    suffix: str,
+    start_year: int,
+    end_year: int,
+) -> Path | None:
+    """在目录中选择能覆盖目标年份段的最紧凑缓存文件。"""
+    dir_path = Path(directory)
+    if not dir_path.exists():
+        return None
+
+    exact = dir_path / f"{prefix}{start_year}_{end_year}{suffix}"
+    if exact.exists() and exact.is_file():
+        return exact
+
+    pattern = re.compile(
+        rf"^{re.escape(prefix)}(?P<y0>\d{{4}})_(?P<y1>\d{{4}}){re.escape(suffix)}$"
+    )
+    candidates: list[tuple[int, int, float, Path]] = []
+    for path in dir_path.iterdir():
+        if not path.is_file():
+            continue
+        match = pattern.match(path.name)
+        if match is None:
+            continue
+        y0 = int(match.group('y0'))
+        y1 = int(match.group('y1'))
+        if y0 <= start_year and y1 >= end_year:
+            try:
+                mtime = float(path.stat().st_mtime)
+            except Exception:
+                mtime = 0.0
+            candidates.append((y0, y1, mtime, path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: (
+            item[1] - item[0],
+            abs(item[0] - start_year) + abs(item[1] - end_year),
+            -item[2],
+        )
+    )
+    return candidates[0][3]
+
+
+def _load_cached_euler_argo_tables(
+    *,
+    start_year: int,
+    end_year: int,
+    detection_config: DetectionConfig,
+) -> dict | None:
+    """尝试从已落盘 parquet 读取 Euler summary 所需的 baseline 与 anomaly 表。"""
+    region_slug = _current_region_key()
+    baseline_dir = _shared_output_dir('statistics', region_slug)
+    anomaly_dir = detection_config.output_dir('plot_argo_hotspots', region_slug)
+
+    baseline_path = _select_covering_year_cache(
+        baseline_dir,
+        prefix='all_region_argo_',
+        suffix='.parquet',
+        start_year=start_year,
+        end_year=end_year,
+    )
+    anomaly_path = _select_covering_year_cache(
+        anomaly_dir,
+        prefix='anomalies_',
+        suffix=f"_{detection_config.file_stem()}.parquet",
+        start_year=start_year,
+        end_year=end_year,
+    )
+    if baseline_path is None or anomaly_path is None:
+        return None
+
+    baseline = pd.read_parquet(
+        baseline_path,
+        columns=['Profile_number', 'Longitude', 'Latitude', 'Year', 'Month', 'Day'],
+    )
+    baseline = baseline[
+        (pd.to_numeric(baseline['Year'], errors='coerce') >= int(start_year))
+        & (pd.to_numeric(baseline['Year'], errors='coerce') <= int(end_year))
+    ].copy()
+    baseline = _filter_table_to_current_region(baseline)
+    if not baseline.empty:
+        baseline['profile_uid'] = _build_profile_uid(baseline)
+    else:
+        baseline = pd.DataFrame(columns=['profile_uid', 'Longitude', 'Latitude'])
+    baseline_out = baseline[['profile_uid', 'Longitude', 'Latitude']] if not baseline.empty else baseline
+
+    anomalies = pd.read_parquet(anomaly_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(detection_config.method)
+        anomalies = anomalies[method_mask].copy()
+    for col in ('Year', 'Month', 'Day', 'Profile_number', 'Longitude', 'Latitude'):
+        if col not in anomalies.columns:
+            raise ValueError(f"Cached anomalies parquet missing required column: {col}")
+    anomalies = anomalies[
+        (pd.to_numeric(anomalies['Year'], errors='coerce') >= int(start_year))
+        & (pd.to_numeric(anomalies['Year'], errors='coerce') <= int(end_year))
+    ].copy()
+    anomalies = _filter_table_to_current_region(anomalies)
+    if not anomalies.empty:
+        anomalies['profile_uid'] = _build_profile_uid(anomalies)
+
+    keep_cols = [
+        c for c in [
+            'profile_uid', 'Profile_number', 'Longitude', 'Latitude', 'delta_do',
+            'delta_aou', 'trim_score', 'anomaly_score', 'primary_metric',
+            'primary_value', 'depth'
+        ]
+        if c in anomalies.columns
+    ]
+    anomalies_out = anomalies[keep_cols].copy() if keep_cols else pd.DataFrame()
+
+    return {
+        'baseline': baseline_out,
+        'anomalies': anomalies_out,
+        'baseline_path': baseline_path,
+        'anomaly_path': anomaly_path,
+    }
+
+
 def build_glorys_eke_native_grid(
     start_year: int = 2002,
     end_year: int = 2022,
@@ -20942,6 +21229,7 @@ def build_euler_grid_summary(
     说明:
         统计口径:
 
+            - 默认优先读取已落盘的区域 baseline parquet 与 `plot_argo_hotspots` anomalies parquet；两者任一缺失时，再回退到逐年实时计算。
             - 同日同网格同类型只计 1 天（按 date+grid 去重）。
             - 异常剖面先按 Profile_number 去重，再按 profile_id+grid 计数，避免单剖面多峰值重复。
             - 使用同一套区域边界与网格边界，确保三图可直接比较。
@@ -21026,48 +21314,68 @@ def build_euler_grid_summary(
 
     ace_grid = acl_grid + acs_grid
     ce_grid = cl_grid + cs_grid
-
-    # 2) Argo 异常网格剖面数 + Argo 观测机会网格
-    do_frames = []
-    baseline_frames = []
-    year_args = [
-        (
-            year,
-            cfg,
-            lonmin,
-            lonmax,
-            latmin,
-            latmax,
+    cached_tables = None
+    try:
+        cached_tables = _load_cached_euler_argo_tables(
+            start_year=start_year,
+            end_year=end_year,
+            detection_config=cfg,
         )
-        for year in range(start_year, end_year + 1)
-    ]
+    except Exception as exc:
+        print(f"[euler_summary] Failed to load cached parquet, fallback to real-time calculation: {exc}")
 
-    year_results: list[tuple[pd.DataFrame, pd.DataFrame]] = []
-    if use_dask and len(year_args) > 1:
-        scheduler = str(dask_scheduler).lower().strip()
-        if scheduler not in {'threads', 'processes', 'synchronous'}:
-            scheduler = 'processes'
-        compute_kwargs: dict = {'scheduler': scheduler}
-        if dask_workers is not None and scheduler in {'threads', 'processes'}:
-            compute_kwargs['num_workers'] = max(1, int(dask_workers))
+    if cached_tables is not None:
+        baseline_df = cached_tables['baseline']
+        do_df = cached_tables['anomalies']
+        summary_source = 'cached'
+        baseline_source = str(cached_tables['baseline_path'])
+        anomaly_source = str(cached_tables['anomaly_path'])
+        print(f"[*] Euler summary baseline cache: {baseline_source}")
+        print(f"[*] Euler summary anomaly cache : {anomaly_source}")
+    else:
+        do_frames = []
+        baseline_frames = []
+        year_args = [
+            (
+                year,
+                cfg,
+                lonmin,
+                lonmax,
+                latmin,
+                latmax,
+            )
+            for year in range(start_year, end_year + 1)
+        ]
 
-        delayed_tasks = [delayed(_euler_summary_year_worker)(arg) for arg in year_args]
-        if dask_show_progress:
-            with ProgressBar():
+        year_results: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+        if use_dask and len(year_args) > 1:
+            scheduler = str(dask_scheduler).lower().strip()
+            if scheduler not in {'threads', 'processes', 'synchronous'}:
+                scheduler = 'processes'
+            compute_kwargs: dict = {'scheduler': scheduler}
+            if dask_workers is not None and scheduler in {'threads', 'processes'}:
+                compute_kwargs['num_workers'] = max(1, int(dask_workers))
+
+            delayed_tasks = [delayed(_euler_summary_year_worker)(arg) for arg in year_args]
+            if dask_show_progress:
+                with ProgressBar():
+                    year_results = list(compute(*delayed_tasks, **compute_kwargs))
+            else:
                 year_results = list(compute(*delayed_tasks, **compute_kwargs))
         else:
-            year_results = list(compute(*delayed_tasks, **compute_kwargs))
-    else:
-        year_results = [_euler_summary_year_worker(arg) for arg in year_args]
+            year_results = [_euler_summary_year_worker(arg) for arg in year_args]
 
-    for baseline_year, do_year in year_results:
-        if not baseline_year.empty:
-            baseline_frames.append(baseline_year)
-        if not do_year.empty:
-            do_frames.append(do_year)
+        for baseline_year, do_year in year_results:
+            if not baseline_year.empty:
+                baseline_frames.append(baseline_year)
+            if not do_year.empty:
+                do_frames.append(do_year)
 
-    do_df = pd.concat(do_frames, ignore_index=True) if do_frames else pd.DataFrame()
-    baseline_df = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
+        do_df = pd.concat(do_frames, ignore_index=True) if do_frames else pd.DataFrame()
+        baseline_df = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
+        summary_source = 'recomputed'
+        baseline_source = 'load_argo_data'
+        anomaly_source = 'calculate_delta_do'
 
     baseline_grid, baseline_grouped = _grid_count_from_points(
         baseline_df,
@@ -21118,6 +21426,9 @@ def build_euler_grid_summary(
             'do_threshold': float(cfg.do_threshold),
             'salinity_threshold': float(cfg.salinity_threshold),
             'temperature_threshold': float(cfg.temperature_threshold),
+            'summary_source': summary_source,
+            'baseline_source': baseline_source,
+            'anomaly_source': anomaly_source,
         },
         'grid': {
             'lon_edges': lon_edges,
@@ -21204,24 +21515,38 @@ def plot_euler_grid_summary(
     base_land = _BASEMAP_COLORS['land']
     coast_color = _BASEMAP_COLORS['coastline']
     grid_color = _BASEMAP_COLORS['grid']
+    ocean_mask = np.asarray(summary.get('ocean_mask'), dtype=bool) if 'ocean_mask' in summary else None
+    analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
+    mask_fill = _EULER_GRID_PLOT_CFG['mask_fill']
 
-    vmax_eddy = float(max(np.nanmax(ace_days), np.nanmax(ce_days), 1.0))
-    vmax_anom = float(np.nanmax(anomaly_rate)) if np.any(np.isfinite(anomaly_rate)) else 1.0
-    if not np.isfinite(vmax_anom) or vmax_anom <= 0:
-        vmax_anom = 1.0
+    ace_display, ace_norm = _robust_positive_map_style(
+        ace_days,
+        display_mask=ocean_mask,
+        positive_only=True,
+    )
+    ce_display, ce_norm = _robust_positive_map_style(
+        ce_days,
+        display_mask=ocean_mask,
+        positive_only=True,
+    )
+    anomaly_display, anomaly_norm = _robust_positive_map_style(
+        anomaly_rate,
+        display_mask=analysis_mask,
+        positive_only=True,
+    )
 
     lon_extent_min = float(lon_edges[0])
     lon_extent_max = float(lon_edges[-1])
 
     lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
     panel_defs = [
-        ('ACE Eddy Days', ace_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
-        ('CE Eddy Days', ce_days, cmap_eddy, Normalize(vmin=0.0, vmax=vmax_eddy)),
-        ('Anomaly Occurrence Rate', anomaly_rate, cmap_do, Normalize(vmin=0.0, vmax=vmax_anom)),
+        ('ACE Eddy Days', ace_display, _copy_cmap_with_bad(cmap_eddy), ace_norm, None),
+        ('CE Eddy Days', ce_display, _copy_cmap_with_bad(cmap_eddy), ce_norm, None),
+        ('Anomaly Occurrence Rate', anomaly_display, _copy_cmap_with_bad(cmap_do), anomaly_norm, analysis_mask),
     ]
 
     mappables = []
-    for ax, (title, mat, cmap, norm) in zip(axes, panel_defs):
+    for ax, (title, mat, cmap, norm, background_mask) in zip(axes, panel_defs):
         ax.set_facecolor(base_ocean)
         ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
         ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
@@ -21230,6 +21555,15 @@ def plot_euler_grid_summary(
         gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
         gl.top_labels = False
         gl.right_labels = False
+        if background_mask is not None:
+            _plot_mask_background(
+                ax,
+                lon_mesh,
+                lat_mesh,
+                background_mask,
+                transform=data_crs,
+                color=mask_fill,
+            )
 
         hm = ax.pcolormesh(
             lon_mesh,
@@ -21458,13 +21792,16 @@ def _plot_two_panel_association_figure(
     right_mat: np.ndarray,
     left_title: str,
     right_title: str,
-    left_cmap: str,
-    right_cmap: str,
+    left_cmap: str | Colormap,
+    right_cmap: str | Colormap,
     left_norm: Normalize,
     right_norm: Normalize,
     left_cbar_label: str,
     right_cbar_label: str,
     suptitle: str,
+    left_background_mask: np.ndarray | None = None,
+    right_background_mask: np.ndarray | None = None,
+    background_fill_color: str | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """通用双面板地理图绘制助手。"""
     crosses_dateline = bool(_REGION_CFG.get('crosses_dateline') and (lonmax < lonmin))
@@ -21490,8 +21827,9 @@ def _plot_two_panel_association_figure(
         (left_mat, left_title, left_cmap, left_norm),
         (right_mat, right_title, right_cmap, right_norm),
     ]
+    background_masks = [left_background_mask, right_background_mask]
     mappables = []
-    for ax, (mat, title, cmap, norm) in zip(axes, panels):
+    for ax, (mat, title, cmap, norm), bg_mask in zip(axes, panels, background_masks):
         ax.set_facecolor(base_ocean)
         ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
         ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
@@ -21499,6 +21837,15 @@ def _plot_two_panel_association_figure(
         gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
         gl.top_labels = False
         gl.right_labels = False
+        if background_fill_color is not None:
+            _plot_mask_background(
+                ax,
+                lon_mesh,
+                lat_mesh,
+                bg_mask,
+                transform=data_crs,
+                color=background_fill_color,
+            )
         hm = ax.pcolormesh(
             lon_mesh,
             lat_mesh,
@@ -21901,13 +22248,18 @@ def analyze_euler_ace_ce_association(
 
     ace_map = ace_stats['association_map']
     ce_map = ce_stats['association_map']
+    ace_display = np.where(np.isfinite(ace_map), ace_map, np.nan)
+    ce_display = np.where(np.isfinite(ce_map), ce_map, np.nan)
+    if analysis_mask is not None:
+        am = np.asarray(analysis_mask, dtype=bool)
+        if am.shape == ace_display.shape:
+            ace_display = np.where(am, ace_display, np.nan)
+            ce_display = np.where(am, ce_display, np.nan)
 
-    vmax = np.nanmax(np.abs(np.concatenate([
-        ace_map[np.isfinite(ace_map)],
-        ce_map[np.isfinite(ce_map)],
-    ]))) if (np.any(np.isfinite(ace_map)) or np.any(np.isfinite(ce_map))) else 1.0
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = 1.0
+    vmax = max(
+        _robust_symmetric_vmax(ace_display),
+        _robust_symmetric_vmax(ce_display),
+    )
 
     crosses_dateline = bool(grid.get('crosses_dateline', False))
     central_lon = 180 if crosses_dateline else 0
@@ -21926,10 +22278,12 @@ def analyze_euler_ace_ce_association(
     base_land = _BASEMAP_COLORS['land']
     coast_color = _BASEMAP_COLORS['coastline']
     grid_color = _BASEMAP_COLORS['grid']
+    mask_fill = _EULER_GRID_PLOT_CFG['mask_fill']
+    assoc_cmap = _copy_cmap_with_bad('RdBu_r')
 
     panel_defs = [
-        ('ACE', ace_map, ace_stats),
-        ('CE', ce_map, ce_stats),
+        ('ACE', ace_display, ace_stats),
+        ('CE', ce_display, ce_stats),
     ]
 
     mappables = []
@@ -21941,13 +22295,21 @@ def analyze_euler_ace_ce_association(
         gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
         gl.top_labels = False
         gl.right_labels = False
+        _plot_mask_background(
+            ax,
+            lon_mesh,
+            lat_mesh,
+            analysis_mask,
+            transform=data_crs,
+            color=mask_fill,
+        )
 
         hm = ax.pcolormesh(
             lon_mesh,
             lat_mesh,
             amap,
-            cmap='RdBu_r',
-            norm=Normalize(vmin=-vmax, vmax=vmax),
+            cmap=assoc_cmap,
+            norm=Normalize(vmin=-vmax, vmax=vmax, clip=True),
             shading='auto',
             transform=data_crs,
             zorder=2,
@@ -22113,6 +22475,7 @@ def analyze_euler_eke_do_association(
         detection_label = f"ΔDO ≥ {meta.get('do_threshold', np.nan):g} μmol kg⁻¹"
     high_do = np.asarray(summary.get('high_do_occurrence_ratio', summary['high_do_profiles']), dtype=float)
     base_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else np.ones_like(high_do, dtype=bool)
+    ocean_mask = np.asarray(summary.get('ocean_mask'), dtype=bool) if 'ocean_mask' in summary else None
 
     if isinstance(eke_euler, dict):
         if 'eke_grid' in eke_euler:
@@ -22179,17 +22542,16 @@ def analyze_euler_eke_do_association(
     lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
 
     # 图1：EKE + Argo 异常出现率概览
-    eke_vals = eke_grid[analysis_mask]
-    eke_vals = eke_vals[np.isfinite(eke_vals)]
-    eke_vmax = float(np.nanquantile(eke_vals, 0.99)) if eke_vals.size > 0 else np.nan
-    if not np.isfinite(eke_vmax) or eke_vmax <= 0:
-        eke_vmax = float(np.nanmax(eke_grid)) if np.any(np.isfinite(eke_grid)) else 1.0
-    if not np.isfinite(eke_vmax) or eke_vmax <= 0:
-        eke_vmax = 1.0
-
-    do_vmax = float(np.nanmax(high_do)) if np.any(np.isfinite(high_do)) else np.nan
-    if not np.isfinite(do_vmax) or do_vmax <= 0:
-        do_vmax = 1.0
+    eke_display, eke_norm = _robust_positive_map_style(
+        eke_grid,
+        display_mask=ocean_mask,
+        positive_only=False,
+    )
+    high_do_display, high_do_norm = _robust_positive_map_style(
+        high_do,
+        display_mask=analysis_mask,
+        positive_only=True,
+    )
 
     suptitle_summary = (
         f"EKE & Argo Anomaly Summary ({meta.get('region_key', 'region')}, "
@@ -22202,23 +22564,24 @@ def analyze_euler_eke_do_association(
     fig_summary, _ = _plot_two_panel_association_figure(
         lon_edges=lon_edges,
         lat_edges=lat_edges,
-        left_mat=eke_grid,
-        right_mat=high_do,
+        left_mat=eke_display,
+        right_mat=high_do_display,
         left_title='EKE (m² s⁻²)',
         right_title='Argo Anomaly Occurrence Rate',
-        left_cmap='YlOrRd',
-        right_cmap='Reds',
-        left_norm=Normalize(vmin=0.0, vmax=eke_vmax),
-        right_norm=Normalize(vmin=0.0, vmax=do_vmax),
+        left_cmap=_copy_cmap_with_bad('YlOrRd'),
+        right_cmap=_copy_cmap_with_bad('Reds'),
+        left_norm=eke_norm,
+        right_norm=high_do_norm,
         left_cbar_label='EKE (m² s⁻²)',
         right_cbar_label='Argo Anomaly Occurrence Rate per Grid Cell',
         suptitle=suptitle_summary,
+        right_background_mask=analysis_mask,
+        background_fill_color=_EULER_GRID_PLOT_CFG['mask_fill'],
     )
 
     # 图2：EKE-Anomaly 关联图
-    vmax_assoc = np.nanmax(np.abs(assoc_map[np.isfinite(assoc_map)])) if np.any(np.isfinite(assoc_map)) else 1.0
-    if not np.isfinite(vmax_assoc) or vmax_assoc <= 0:
-        vmax_assoc = 1.0
+    assoc_display = np.where(analysis_mask, assoc_map, np.nan)
+    vmax_assoc = _robust_symmetric_vmax(assoc_display)
     crosses_dateline = bool(grid.get('crosses_dateline', False))
     central_lon = 180 if crosses_dateline else 0
     data_crs = ccrs.PlateCarree()
@@ -22235,6 +22598,8 @@ def analyze_euler_eke_do_association(
     base_land = _BASEMAP_COLORS['land']
     coast_color = _BASEMAP_COLORS['coastline']
     grid_color = _BASEMAP_COLORS['grid']
+    mask_fill = _EULER_GRID_PLOT_CFG['mask_fill']
+    assoc_cmap = _copy_cmap_with_bad('RdBu_r')
 
     ax.set_facecolor(base_ocean)
     ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
@@ -22243,13 +22608,21 @@ def analyze_euler_eke_do_association(
     gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
     gl.top_labels = False
     gl.right_labels = False
+    _plot_mask_background(
+        ax,
+        lon_mesh,
+        lat_mesh,
+        analysis_mask,
+        transform=data_crs,
+        color=mask_fill,
+    )
 
     hm = ax.pcolormesh(
         lon_mesh,
         lat_mesh,
-        assoc_map,
-        cmap='RdBu_r',
-        norm=Normalize(vmin=-vmax_assoc, vmax=vmax_assoc),
+        assoc_display,
+        cmap=assoc_cmap,
+        norm=Normalize(vmin=-vmax_assoc, vmax=vmax_assoc, clip=True),
         shading='auto',
         transform=data_crs,
         zorder=2,

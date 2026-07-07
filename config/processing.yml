@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.19 变更：
+#   - plot 新增 euler_grid 小节，集中管理欧拉网格 Occurrence / Association 图的显示样式
+#     （正值色标 quantile + PowerNorm、观测背景底色、association 对称 quantile），供
+#     plot_euler_grid_summary / analyze_euler_ace_ce_association / analyze_euler_eke_do_association 共用。
 # version 1.18 变更：
 #   - 新增 subsurface_lens 配置小节，围绕 McCoy et al. (2020) 速度确认 SCV 目录的次表层涡 δDO 分析；
 #     含单剖面低 PV 透镜探测三判据阈值（δπ / 表-核比 / N² 比）、局地背景池与诊断网格、候选筛选与
@@ -60,7 +64,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.18
+version: 1.19
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -189,6 +193,11 @@ plot:
     coastline: "#787d85" # 海岸线颜色
     border: "#9aa0a8"    # 国界线颜色
     grid: "#b6bdc6"      # 格网线颜色
+  euler_grid:
+    positive_vmax_quantile: 0.99    # 正值地图（Occurrence / Eddy Days / EKE）色标上限的 robust quantile
+    positive_power_gamma: 0.7       # 正值地图 PowerNorm gamma；<1 会拉亮中低值
+    association_vmax_quantile: 0.99 # Association 图对称色标上限的 robust quantile
+    mask_fill: "#e7edf4"            # 已观测/已分析格点的浅色底板
   hotspot_type_colors:
     type_1: "black"              # Type 1 通风
     type_2: "dimgray"            # Type 2 隔离
