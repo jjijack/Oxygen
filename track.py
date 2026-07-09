@@ -37,6 +37,7 @@ import yaml
 import traceback
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
+import hashlib
 import zarr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -17999,25 +18000,35 @@ def augment_mccoy_scvs_delta_do(
     do_threshold: float | None = None,
     core_depth_tol_m: float = 200.0,
     argo_data_dir: str | Path | None = None,
+    output_path: str | Path | None = None,
+    force: bool = False,
     verbose: bool = False,
 ) -> dict:
-    """给一份含 (year, profile_number) 的 McCoy SCV parquet 追加共址 Argo 剖面的 δDO 列。
+    """为 McCoy SCV representation 表生成单阈值 ΔDO 派生表。
 
     对每条 SCV 载入该年 Argo 剖面跑 calculate_delta_do（do 模式，找 DO 正峰），记 ``has_delta_do``
     （是否检出候选）、``delta_do_max``（全剖面最大 δDO）、``delta_do_core``（最接近 SCV 核深且
-    在 ``core_depth_tol_m`` 内的候选 δDO）。回答"漏掉的透镜带不带氧"——把 GLORYS 漏检接到 DO 主线。
-    原地重写 parquet 追加三列，汇总 δDO 阳性率及其与 ``glorys_misses`` 的联合。无 DO 的剖面记 None。
+    在 ``core_depth_tol_m`` 内的候选 δDO）。结果写入带 detector stem 的新 parquet，不修改输入的
+    representation 表。无 DO 的剖面以 ``do_evaluable=False`` 明确保留。
 
     参数:
-        rows_path: 待增补的 SCV 明细 parquet（须含 year/profile_number；有 core_depth_m 则算核处）。
-        do_threshold: δDO 判据阈值（μmol/kg），None 用 processing.yml 默认。
-        core_depth_tol_m: 核处 δDO 取候选与 SCV 核深之差不超过此值（m）。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        verbose: 是否打印读取失败明细。
+        - rows_path (str | Path): detector-independent McCoy representation parquet。
+        - do_threshold (float | None): δDO 判据阈值（μmol kg⁻¹）；None 使用 processing.yml 默认。
+        - core_depth_tol_m (float): 核处候选与 SCV 核深最大距离（m），默认 200。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；None 使用配置默认路径。
+        - output_path (str | Path | None): 阈值特定派生 parquet；None 时写入标准 threshold 目录。
+        - force (bool): 是否覆盖已存在的同阈值派生表，默认 False。
+        - verbose (bool): 是否打印读取失败明细，默认 False。
 
     返回:
-        dict: 含 n/n_with_do/has_do_count/has_do_rate、by_glorys（GLORYS 漏 vs 未漏各自的 δDO
-              阳性率，若含 glorys_misses）、rows_path。
+        - dict: 含 n/n_with_do/has_do_count/has_do_rate、by_glorys、source_rows_path 与 rows_path。
+
+    输出:
+        - `plot_outputs/do/<region>/mccoy_scv_delta_do_thresholds/mccoy_scv_delta_do_<stem>.parquet`。
+
+    说明:
+        - 该单阈值入口保留给逐剖面复算；DO20/35/50 统一比较优先使用 `build_mccoy_scv_delta_do_threshold_table`。
+        - 输入 representation parquet 永不原地重写。
     """
     rp = Path(rows_path)
     d = pd.read_parquet(rp)
@@ -18025,6 +18036,18 @@ def augment_mccoy_scvs_delta_do(
         argo_data_dir = argo_path
     cfg = make_detection_config('do', **({'do_threshold': do_threshold}
                                          if do_threshold is not None else {}))
+    region_slug = _current_region_key()
+    resolved_output = (
+        Path(output_path)
+        if output_path is not None
+        else cfg.output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+        / f'mccoy_scv_delta_do_{cfg.file_stem()}.parquet'
+    )
+    if resolved_output.resolve() == rp.resolve():
+        raise ValueError('output_path must differ from the detector-independent input rows_path.')
+    if resolved_output.exists() and not force:
+        raise FileExistsError(f'Output already exists: {resolved_output}. Pass force=True to replace it.')
+    source_hash = _file_sha256(rp)
     argo_cache: dict = {}
     has: list = []; ddo_max: list = []; ddo_core: list = []
     for row in tqdm(d.itertuples(index=False), total=len(d), desc="delta-do", unit="scv"):
@@ -18049,16 +18072,26 @@ def augment_mccoy_scvs_delta_do(
                 print(f"[skip] {getattr(row, 'year', '?')}/{getattr(row, 'profile_number', '?')}: {exc}")
             has.append(None); ddo_max.append(np.nan); ddo_core.append(np.nan)
     d['has_delta_do'] = has
+    d['do_evaluable'] = pd.Series(has, index=d.index).notna()
     d['delta_do_max'] = ddo_max
     d['delta_do_core'] = ddo_core
-    d.to_parquet(rp, index=False)
+    d['do_threshold_umol_kg'] = float(cfg.do_threshold)
+    d['minimum_depth_m'] = float(cfg.anomaly_min_depth)
+    d['detector_file_stem'] = cfg.file_stem()
+    d['source_table_path'] = str(rp)
+    d['source_table_sha256'] = source_hash
+    d['generated_at'] = pd.Timestamp.now(tz='UTC').isoformat()
+    _atomic_write_parquet(d, resolved_output)
+    if _file_sha256(rp) != source_hash:
+        raise RuntimeError('Detector-independent McCoy representation table changed during augmentation.')
 
     hv = d['has_delta_do']
     with_do = hv.notna()
     summary = {'n': int(len(d)), 'n_with_do': int(with_do.sum()),
                'has_do_count': int((hv == True).sum()),
                'has_do_rate': round(float((hv[with_do] == True).mean()), 3) if with_do.any() else np.nan,
-               'rows_path': str(rp)}
+               'source_rows_path': str(rp),
+               'rows_path': str(resolved_output)}
     if 'glorys_misses' in d.columns:
         j = d[with_do & d['glorys_misses'].notna()]
         by = {}
@@ -18067,7 +18100,7 @@ def augment_mccoy_scvs_delta_do(
             by[key] = {'n': int(len(sub)),
                        'has_do_pct': round(100.0 * (sub['has_delta_do'] == True).mean(), 1)}
         summary['by_glorys'] = by
-    print(f"[*] δDO+ in {summary['has_do_count']}/{summary['n_with_do']} DO-bearing SCVs → {rp}")
+    print(f"[*] δDO+ in {summary['has_do_count']}/{summary['n_with_do']} DO-bearing SCVs → {resolved_output}")
     return summary
 
 
@@ -18385,18 +18418,22 @@ def plot_mccoy_do_enrichment(
     argo_anchored_path: str | Path | None = None,
     *,
     detection_config: DetectionConfig | None = None,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
     output_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
     """GLORYS 漏检 SCV 的 δDO 富集：漏 vs 命中的 δDO 阳性率（数据缺陷的 DO 后果）。
 
-    读 Argo 锚定 263 parquet（含 `glorys_misses` + `has_delta_do`），画 GLORYS 漏检 vs 命中的两组 SCV
-    各自携显著正峰 δDO 的比例——量化“被漏掉的次表层涡更可能携氧异常”。仅读缓存 parquet 渲染。
+    从阈值安全 McCoy long table 读取当前 DO threshold 的 carrier 判定，再与 Argo 锚定 representation
+    表的 `glorys_misses` 左连接，比较 GLORYS criterion 未满足/满足两组 SCV 的 carrier 率。
 
     参数:
         - argo_anchored_path (str | Path | None): Argo 锚定 263 parquet；None 时按 `screen_mccoy_scvs_against_glorys` 默认定位。
         - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region 与默认路径。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
         - output_dir (str | Path | None): 图输出根目录；None 使用 method/region 默认目录。
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存图，默认 True。
@@ -18406,13 +18443,21 @@ def plot_mccoy_do_enrichment(
     """
     cfg = _resolve_detection_config(detection_config)
     region_slug = _current_region_key()
-    do_p = (Path(argo_anchored_path) if argo_anchored_path is not None
-            else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
-            / "mccoy_glorys_miss.parquet")
-    d = pd.read_parquet(do_p)
-    d = d[(d['status'] == 'ok') & d['has_delta_do'].notna()]
+    if cfg.method != 'do':
+        raise ValueError('plot_mccoy_do_enrichment requires a DO detection_config.')
+    frame, _, _ = _mccoy_detector_carrier_frame(
+        cfg,
+        argo_anchored_path,
+        start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year),
+    )
+    d = frame[
+        frame['detector_evaluable'].astype(bool)
+        & frame['glorys_misses'].notna()
+        & frame.get('status', pd.Series('ok', index=frame.index)).astype(str).eq('ok')
+    ].copy()
     gm = d['glorys_misses'].astype(bool)
-    do = d['has_delta_do'] == True
+    do = d['has_detector_anomaly'].astype(bool)
     miss_pct = 100 * do[gm].mean() if gm.any() else np.nan
     seen_pct = 100 * do[~gm].mean() if (~gm).any() else np.nan
 
@@ -24762,6 +24807,533 @@ def _default_mccoy_anchored_path(region_slug: str) -> Path:
     )
 
 
+def _file_sha256(path: str | Path) -> str:
+    """返回文件的 SHA-256；文件不存在时返回空字符串。"""
+    target = Path(path)
+    if not target.exists():
+        return ''
+    digest = hashlib.sha256()
+    with target.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_parquet(frame: pd.DataFrame, path: str | Path) -> Path:
+    """在目标目录内先写临时 parquet，再原子替换目标文件。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f'.{target.name}.{os.getpid()}.tmp')
+    try:
+        frame.to_parquet(tmp, index=False)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return target
+
+
+def build_mccoy_scv_delta_do_threshold_table(
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    *,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    argo_anchored_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """构建 McCoy SCV 的阈值安全 long-format ΔDO 判定表。
+
+    每个 SCV/profile 与阈值各占一行。carrier 判定来自相同年份、深度门槛的正式
+    `plot_argo_hotspots` anomalies parquet，因此 DO20、DO35、DO50 可以同时存在，且运行顺序不会改变
+    结果。当前历史表中的 `has_delta_do.notna()` 只用于一次性迁移原有 DO-evaluable 分母，不再作为
+    任一阈值的 carrier 真值。
+
+    参数:
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值列表（μmol kg⁻¹），默认 (20, 35, 50)。
+        - baseline_start_year (int): 分析起始年份（闭区间），默认 2002。
+        - baseline_end_year (int): 分析结束年份（闭区间），默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - argo_anchored_path (str | Path | None): McCoy Argo 锚定 representation 表；None 使用默认路径。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - force (bool): True 时覆盖已存在的同参数结果；默认 False。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每行含稳定 SCV/profile 标识、阈值、可评估状态、carrier 判定、来源与哈希。
+
+    输出:
+        - `plot_outputs/do/<region>/mccoy_scv_delta_do_thresholds/mccoy_scv_delta_do_thresholds_<y0>_<y1>_depth<z>m.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - 当前迁移口径保留既有 244 个 DO-evaluable McCoy SCV 分母；新表生成后，绘图与统计不再读取裸 `has_delta_do`。
+        - anomalies parquet 是每个阈值的正式 detector 输出，carrier 集合不依赖本函数运行顺序。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+    if baseline_end_year < baseline_start_year:
+        raise ValueError('baseline_end_year must be >= baseline_start_year.')
+
+    region_slug = _current_region_key()
+    anchored_path = (
+        Path(argo_anchored_path)
+        if argo_anchored_path is not None
+        else _default_mccoy_anchored_path(region_slug)
+    )
+    anchored = pd.read_parquet(anchored_path).copy()
+    required = {'year', 'profile_number', 'lat', 'lon'}
+    missing = required.difference(anchored.columns)
+    if missing:
+        raise ValueError(f'McCoy anchored table missing columns: {sorted(missing)}')
+    if 'do_evaluable' in anchored.columns:
+        evaluable = anchored['do_evaluable'].fillna(False).astype(bool)
+        eligibility_source = 'do_evaluable'
+    elif 'has_delta_do' in anchored.columns:
+        evaluable = anchored['has_delta_do'].notna()
+        eligibility_source = 'legacy_has_delta_do_notna_migration'
+    else:
+        raise ValueError(
+            'McCoy anchored table lacks a DO evaluability field; run the explicit SCV DO evaluability builder first.'
+        )
+
+    profile_number = pd.to_numeric(anchored['profile_number'], errors='coerce').astype('Int64')
+    year = pd.to_numeric(anchored['year'], errors='coerce').astype('Int64')
+    in_period = year.between(int(baseline_start_year), int(baseline_end_year))
+    anchored = anchored.loc[in_period & profile_number.notna()].copy()
+    anchored['profile_number_int'] = profile_number.loc[anchored.index].astype(int)
+    anchored['year_int'] = year.loc[anchored.index].astype(int)
+    anchored['do_evaluable_internal'] = evaluable.loc[anchored.index].astype(bool)
+    if anchored['profile_number_int'].duplicated().any():
+        duplicates = anchored.loc[anchored['profile_number_int'].duplicated(False), 'profile_number_int'].tolist()
+        raise ValueError(f'Duplicate McCoy profile keys: {duplicates[:10]}')
+
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+    )
+    stem = (
+        f'mccoy_scv_delta_do_thresholds_{int(baseline_start_year)}_'
+        f'{int(baseline_end_year)}_depth{depth_tag}m'
+    )
+    parquet_path = out_dir / f'{stem}.parquet'
+    csv_path = out_dir / f'{stem}.csv'
+    if parquet_path.exists() and not force:
+        cached = pd.read_parquet(parquet_path)
+        cached_thresholds = sorted(pd.to_numeric(cached['threshold_umol_kg'], errors='coerce').dropna().unique())
+        if cached_thresholds == threshold_values:
+            return cached
+        raise FileExistsError(
+            f'Existing threshold table contains {cached_thresholds}, requested {threshold_values}; pass force=True to replace it.'
+        )
+
+    anchored_hash = _file_sha256(anchored_path)
+    generated_at = pd.Timestamp.now(tz='UTC').isoformat()
+    rows = []
+    for threshold in threshold_values:
+        cfg = make_detection_config(
+            'do',
+            do_threshold=float(threshold),
+            anomaly_min_depth=float(anomaly_min_depth),
+        )
+        anomaly_ids, anomaly_path = _load_detector_anomaly_ids(
+            cfg,
+            int(baseline_start_year),
+            int(baseline_end_year),
+            region_slug,
+        )
+        anomaly_table = pd.read_parquet(anomaly_path, columns=['Profile_number', 'delta_do', 'depth'])
+        anomaly_table['Profile_number'] = pd.to_numeric(anomaly_table['Profile_number'], errors='coerce')
+        anomaly_table['delta_do'] = pd.to_numeric(anomaly_table['delta_do'], errors='coerce')
+        anomaly_table['depth'] = pd.to_numeric(anomaly_table['depth'], errors='coerce')
+        best_index = anomaly_table.groupby('Profile_number')['delta_do'].idxmax().dropna()
+        best = anomaly_table.loc[best_index].set_index('Profile_number') if len(best_index) else pd.DataFrame()
+        anomaly_hash = _file_sha256(anomaly_path)
+
+        for rec in anchored.itertuples(index=False):
+            pn = int(rec.profile_number_int)
+            do_evaluable = bool(rec.do_evaluable_internal)
+            is_carrier = bool(do_evaluable and pn in anomaly_ids)
+            delta_value = np.nan
+            peak_depth = np.nan
+            if is_carrier and not best.empty and pn in best.index:
+                selected = best.loc[pn]
+                if isinstance(selected, pd.DataFrame):
+                    selected = selected.iloc[0]
+                delta_value = float(selected['delta_do'])
+                peak_depth = float(selected['depth'])
+            rows.append({
+                'stable_scv_id': f'{int(rec.year_int)}:{pn}',
+                'year': int(rec.year_int),
+                'profile_number': pn,
+                'lat': float(rec.lat),
+                'lon': float(rec.lon),
+                'threshold_umol_kg': float(threshold),
+                'minimum_depth_m': float(anomaly_min_depth),
+                'do_evaluable': do_evaluable,
+                'has_delta_do': is_carrier if do_evaluable else pd.NA,
+                'delta_do_value': delta_value,
+                'delta_do_peak_depth_m': peak_depth,
+                'calculation_status': 'evaluable' if do_evaluable else 'not_evaluable',
+                'skip_reason': '' if do_evaluable else 'legacy_do_eligibility_false',
+                'period_start': int(baseline_start_year),
+                'period_end': int(baseline_end_year),
+                'detector_file_stem': cfg.file_stem(),
+                'eligibility_source': eligibility_source,
+                'source_table_path': str(anchored_path),
+                'source_table_sha256': anchored_hash,
+                'anomalies_path': str(anomaly_path),
+                'anomalies_sha256': anomaly_hash,
+                'generated_at': generated_at,
+            })
+
+    table = pd.DataFrame(rows)
+    table['has_delta_do'] = table['has_delta_do'].astype('boolean')
+    if table.duplicated(['stable_scv_id', 'threshold_umol_kg']).any():
+        raise RuntimeError('Duplicate stable_scv_id/threshold rows were generated.')
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_parquet(table, parquet_path)
+        table.to_csv(csv_path, index=False)
+        print(f'[*] McCoy SCV ΔDO threshold table saved: {parquet_path}')
+        print(f'[*] McCoy SCV ΔDO threshold table saved: {csv_path}')
+    return table
+
+
+def _binomial_wilson_interval(successes: int, total: int) -> tuple[float, float]:
+    """返回二项比例的 95% Wilson 区间。"""
+    if total <= 0:
+        return np.nan, np.nan
+    from scipy.stats import binomtest
+    interval = binomtest(int(successes), int(total)).proportion_ci(0.95, method='wilson')
+    return float(interval.low), float(interval.high)
+
+
+def _fisher_odds_ratio_ci(
+    successes: int,
+    total: int,
+    baseline_successes: int,
+    baseline_total: int,
+) -> tuple[float, float, float, float]:
+    """返回 Fisher OR、Woolf 95% CI 与 nominal p 值。"""
+    from scipy.stats import fisher_exact
+    a = int(successes)
+    b = int(total) - a
+    c = int(baseline_successes)
+    d = int(baseline_total) - c
+    odds_ratio, p_value = fisher_exact([[a, b], [c, d]])
+    aa, bb, cc, dd = (float(value) for value in (a, b, c, d))
+    if min(aa, bb, cc, dd) == 0:
+        aa += 0.5
+        bb += 0.5
+        cc += 0.5
+        dd += 0.5
+    log_or = math.log((aa * dd) / (bb * cc))
+    se = math.sqrt(1.0 / aa + 1.0 / bb + 1.0 / cc + 1.0 / dd)
+    return float(odds_ratio), float(math.exp(log_or - 1.96 * se)), float(math.exp(log_or + 1.96 * se)), float(p_value)
+
+
+def summarize_scv_do_threshold_sweep(
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """汇总 DO-evaluable Argo、META 子集与 McCoy SCV 的 ΔDO carrier 频率。
+
+    三组统一计算 `P(DO_t | group)`，避免把 anomaly-centered 的 `P(META | DO_t)` 与
+    group-centered carrier 频率混在一张图中。全 Argo 与 META 的分母从既有 DO frequency summary
+    读取，阈值 numerator 来自正式 anomalies parquet；SCV numerator/denominator 来自阈值安全表。
+
+    参数:
+        - threshold_table (pd.DataFrame | None): 已构建的 SCV 阈值 long table；None 时读取路径或默认表。
+        - threshold_table_path (str | Path | None): SCV 阈值 parquet/CSV；None 时定位默认 parquet。
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值列表，默认 (20, 35, 50)。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个阈值与 group 一行，含 numerator、denominator、rate、Wilson CI、OR 与来源。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_do_threshold_sweep/scv_do_threshold_sweep_<y0>_<y1>_depth<z>m.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - Fisher p 值是 nominal 描述，不作空间独立性或因果证据。
+        - 三个阈值共享同一 DO-evaluable 分母；若输入表不满足该条件会直接报错。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+                / (
+                    f'mccoy_scv_delta_do_thresholds_{int(baseline_start_year)}_'
+                    f'{int(baseline_end_year)}_depth{depth_tag}m.parquet'
+                )
+            )
+        source = Path(threshold_table_path)
+        threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    else:
+        threshold_table = threshold_table.copy()
+        source = Path(threshold_table_path) if threshold_table_path is not None else Path('<memory>')
+
+    strict_cfg = make_detection_config(
+        'do', do_threshold=max(threshold_values), anomaly_min_depth=float(anomaly_min_depth)
+    )
+    stats_path = (
+        strict_cfg.output_dir('statistics', region_slug)
+        / f'scv_frequency_stats_{int(baseline_start_year)}_{int(baseline_end_year)}_{strict_cfg.file_stem()}.parquet'
+    )
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f'Missing DO-evaluable baseline summary: {stats_path}. Run calculate_scv_frequency_statistics for DO50 first.'
+        )
+    legacy_stats = pd.read_parquet(stats_path).iloc[0]
+    baseline_n = int(legacy_stats['delta_do_baseline_n'])
+    meta_n = int(legacy_stats['delta_do_meta_n'])
+    interacting_path = (
+        _shared_output_dir('statistics', region_slug)
+        / f'all_interacting_argo_{int(baseline_start_year)}_{int(baseline_end_year)}.parquet'
+    )
+    interacting_ids = set(
+        pd.to_numeric(pd.read_parquet(interacting_path, columns=['Profile_number'])['Profile_number'], errors='coerce')
+        .dropna().astype(int)
+    )
+
+    rows = []
+    baseline_counts: dict[float, int] = {}
+    for threshold in threshold_values:
+        cfg = make_detection_config(
+            'do', do_threshold=float(threshold), anomaly_min_depth=float(anomaly_min_depth)
+        )
+        anomaly_ids, anomaly_path = _load_detector_anomaly_ids(
+            cfg,
+            int(baseline_start_year),
+            int(baseline_end_year),
+            region_slug,
+        )
+        baseline_k = int(len(anomaly_ids))
+        meta_k = int(len(anomaly_ids & interacting_ids))
+        baseline_counts[threshold] = baseline_k
+
+        scv_rows = threshold_table[
+            np.isclose(
+                pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'),
+                float(threshold),
+            )
+        ].copy()
+        if scv_rows.empty:
+            raise ValueError(f'SCV threshold table lacks threshold {threshold:g}.')
+        scv_evaluable = scv_rows['do_evaluable'].fillna(False).astype(bool)
+        scv_n = int(scv_evaluable.sum())
+        scv_k = int(
+            scv_rows.loc[scv_evaluable, 'has_delta_do'].astype('boolean').fillna(False).sum()
+        )
+
+        for group, k, n, source_table in (
+            ('All DO-evaluable Argo', baseline_k, baseline_n, anomaly_path),
+            ('META-matched DO-evaluable Argo', meta_k, meta_n, interacting_path),
+            ('DO-evaluable McCoy SCVs', scv_k, scv_n, source),
+        ):
+            ci_low, ci_high = _binomial_wilson_interval(k, n)
+            if group == 'All DO-evaluable Argo':
+                odds_ratio, odds_low, odds_high, p_value = 1.0, 1.0, 1.0, 1.0
+            else:
+                odds_ratio, odds_low, odds_high, p_value = _fisher_odds_ratio_ci(
+                    k, n, baseline_k, baseline_n
+                )
+            rows.append({
+                'threshold_umol_kg': float(threshold),
+                'group': group,
+                'numerator': int(k),
+                'denominator': int(n),
+                'rate': float(k / n) if n else np.nan,
+                'confidence_interval_low': ci_low,
+                'confidence_interval_high': ci_high,
+                'odds_ratio_vs_all_argo': odds_ratio,
+                'odds_ratio_ci_low': odds_low,
+                'odds_ratio_ci_high': odds_high,
+                'fisher_p_nominal': p_value,
+                'period_start': int(baseline_start_year),
+                'period_end': int(baseline_end_year),
+                'minimum_depth_m': float(anomaly_min_depth),
+                'eligibility_definition': 'profile has evaluable DO at/under depth gate; McCoy migration preserves legacy 244-profile denominator',
+                'source_table': str(source_table),
+            })
+
+    summary = pd.DataFrame(rows)
+    denominator_counts = (
+        summary.pivot(index='threshold_umol_kg', columns='group', values='denominator').nunique()
+    )
+    if (denominator_counts > 1).any():
+        raise RuntimeError('DO-evaluable denominators differ across thresholds.')
+    if not (
+        set(threshold_table.loc[
+            np.isclose(pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'), max(threshold_values))
+            & threshold_table['has_delta_do'].astype('boolean').fillna(False),
+            'profile_number',
+        ].astype(int))
+        <= set(threshold_table.loc[
+            np.isclose(pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'), min(threshold_values))
+            & threshold_table['has_delta_do'].astype('boolean').fillna(False),
+            'profile_number',
+        ].astype(int))
+    ):
+        raise RuntimeError('Strict SCV carrier set is not nested in the relaxed carrier set.')
+
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('scv_do_threshold_sweep', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = (
+            f'scv_do_threshold_sweep_{int(baseline_start_year)}_'
+            f'{int(baseline_end_year)}_depth{depth_tag}m'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(f'[*] SCV DO threshold sweep saved: {out_dir / f"{stem}.parquet"}')
+    return summary
+
+
+def plot_scv_do_threshold_enrichment(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 DO20/DO35/DO50 下 baseline、META 与 McCoy SCV 的 carrier 频率。
+
+    图中所有曲线都是 group-centered 的 `P(DO_t | group)`。对数纵轴用于同时呈现低于 1% 的 Argo
+    背景率与较高的 SCV carrier 率，点旁直接标出 numerator/denominator，误差棒为 95% Wilson 区间。
+
+    参数:
+        - summary (pd.DataFrame | None): `summarize_scv_do_threshold_sweep` 输出；None 时读取路径或默认表。
+        - summary_path (str | Path | None): 摘要 parquet/CSV；None 时定位默认 parquet。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含每组阈值点、是否跨阈值持续富集及 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_do_threshold_sweep/scv_do_threshold_enrichment_<y0>_<y1>_depth<z>m.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    if summary is None:
+        if summary_path is None:
+            summary_path = (
+                make_detection_config('do').output_dir('scv_do_threshold_sweep', region_slug)
+                / (
+                    f'scv_do_threshold_sweep_{int(baseline_start_year)}_'
+                    f'{int(baseline_end_year)}_depth{depth_tag}m.parquet'
+                )
+            )
+        source = Path(summary_path)
+        summary = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    else:
+        summary = summary.copy()
+    if summary.empty:
+        raise ValueError('summary is empty.')
+
+    groups = [
+        ('All DO-evaluable Argo', '#6b7280', 'o', (5, -14), 'top'),
+        ('META-matched DO-evaluable Argo', '#d97706', 's', (5, 8), 'bottom'),
+        ('DO-evaluable McCoy SCVs', '#b91c1c', 'D', (5, 8), 'bottom'),
+    ]
+    fig, ax = plt.subplots(figsize=(8.4, 5.8))
+    plotted = {}
+    all_interval_lows = []
+    for group, color, marker, text_offset, vertical_alignment in groups:
+        part = summary[summary['group'].eq(group)].sort_values('threshold_umol_kg')
+        x = part['threshold_umol_kg'].to_numpy(dtype=float)
+        y = 100.0 * part['rate'].to_numpy(dtype=float)
+        low = 100.0 * part['confidence_interval_low'].to_numpy(dtype=float)
+        high = 100.0 * part['confidence_interval_high'].to_numpy(dtype=float)
+        all_interval_lows.extend(low[np.isfinite(low) & (low > 0)])
+        ax.errorbar(
+            x, y, yerr=[y - low, high - y], color=color, marker=marker,
+            linewidth=2.0, markersize=7, capsize=4, label=group,
+        )
+        for xv, yv, k, n in zip(x, y, part['numerator'], part['denominator']):
+            ax.annotate(
+                f'{int(k)}/{int(n)}', (xv, yv), xytext=text_offset,
+                textcoords='offset points', fontsize=8, color=color,
+                va=vertical_alignment,
+            )
+        plotted[group] = [
+            {'threshold': float(row.threshold_umol_kg), 'numerator': int(row.numerator),
+             'denominator': int(row.denominator), 'rate_pct': 100.0 * float(row.rate)}
+            for row in part.itertuples(index=False)
+        ]
+    ax.set_yscale('log')
+    if all_interval_lows:
+        ax.set_ylim(bottom=max(min(all_interval_lows) * 0.45, 1e-4))
+    ax.set_xticks(sorted(pd.to_numeric(summary['threshold_umol_kg'], errors='coerce').dropna().unique()))
+    ax.set_xlabel('ΔDO prominence threshold (μmol kg⁻¹)')
+    ax.set_ylabel('Profiles carrying a deep ΔDO anomaly (%) — log scale')
+    ax.grid(axis='y', which='both', alpha=0.25)
+    ax.legend(frameon=False, fontsize=9)
+    scv = summary[summary['group'].eq('DO-evaluable McCoy SCVs')]
+    persistent = bool((pd.to_numeric(scv['odds_ratio_vs_all_argo'], errors='coerce') > 1).all())
+    title = (
+        'McCoy SCVs are enriched in deep ΔDO carriers across thresholds'
+        if persistent
+        else 'Deep ΔDO carrier frequency across Argo, META, and McCoy SCV groups'
+    )
+    ax.set_title(title)
+    fig.tight_layout()
+
+    out = {'groups': plotted, 'persistent_scv_enrichment': persistent}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('scv_do_threshold_sweep', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            f'scv_do_threshold_enrichment_{int(baseline_start_year)}_'
+            f'{int(baseline_end_year)}_depth{depth_tag}m.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] SCV DO threshold enrichment figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
 def _detector_short_label(cfg: DetectionConfig) -> str:
     """返回图标题里使用的 detector 标签。"""
     return {'do': 'δDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
@@ -24850,10 +25422,40 @@ def _mccoy_detector_carrier_frame(
     anc_path = Path(argo_anchored_path) if argo_anchored_path is not None else _default_mccoy_anchored_path(region_slug)
     anc = pd.read_parquet(anc_path).copy()
     profile_ids = pd.to_numeric(anc['profile_number'], errors='coerce').astype('Int64')
+    anc['profile_number'] = profile_ids
     anomaly_ids, anomalies_path = _load_detector_anomaly_ids(cfg, start_year, end_year, region_slug)
-    if cfg.method == 'do' and 'has_delta_do' in anc.columns:
-        anc['detector_evaluable'] = anc['has_delta_do'].notna()
-        anc['has_detector_anomaly'] = anc['has_delta_do'] == True
+    if cfg.method == 'do':
+        depth_tag = _format_detection_value(float(cfg.anomaly_min_depth))
+        threshold_path = (
+            make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+            / f'mccoy_scv_delta_do_thresholds_{int(start_year)}_{int(end_year)}_depth{depth_tag}m.parquet'
+        )
+        if not threshold_path.exists():
+            build_mccoy_scv_delta_do_threshold_table(
+                thresholds=(20.0, 35.0, 50.0),
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=float(cfg.anomaly_min_depth),
+                argo_anchored_path=anc_path,
+                save_data=True,
+            )
+        threshold_table = pd.read_parquet(threshold_path)
+        selected = threshold_table[
+            np.isclose(
+                pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'),
+                float(cfg.do_threshold),
+            )
+        ][['profile_number', 'do_evaluable', 'has_delta_do']].copy()
+        if selected.empty:
+            raise ValueError(f'Threshold-safe McCoy table lacks DO{float(cfg.do_threshold):g}.')
+        selected['profile_number'] = pd.to_numeric(selected['profile_number'], errors='coerce').astype('Int64')
+        selected = selected.rename(columns={
+            'do_evaluable': 'detector_evaluable',
+            'has_delta_do': 'has_detector_anomaly',
+        })
+        anc = anc.merge(selected, on='profile_number', how='left', validate='one_to_one')
+        anc['detector_evaluable'] = anc['detector_evaluable'].fillna(False).astype(bool)
+        anc['has_detector_anomaly'] = anc['has_detector_anomaly'].astype('boolean').fillna(False).astype(bool)
     else:
         if evaluable_ids is None:
             evaluable_ids = _detector_evaluable_profile_ids(cfg, start_year, end_year)
@@ -25089,7 +25691,7 @@ def plot_scv_detector_frequency_enrichment(
                     'ci95': [round(float(lo), 3) if np.isfinite(lo) else np.nan,
                              round(float(hi), 3) if np.isfinite(hi) else np.nan]}
 
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+    fig, ax = plt.subplots(figsize=(7, 6.0))
     ax.bar(labels, pcts, color=colors, yerr=[lo_err, hi_err], capsize=6, error_kw={'lw': 1.3})
     top = max(pcts[i] + hi_err[i] for i in range(len(pcts)) if np.isfinite(pcts[i] + hi_err[i]))
     ax.set_ylim(0, top * 1.2 if top > 0 else 1)
@@ -25103,6 +25705,7 @@ def plot_scv_detector_frequency_enrichment(
         f" · SCV {float(s['anomaly_odds_ratio']):.2f} (95% CI error bars)"
     )
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
 
     out = {'anomaly': res,
            'meta_odds_ratio': float(s['anomaly_meta_odds_ratio']),
@@ -25114,7 +25717,7 @@ def plot_scv_detector_frequency_enrichment(
         )
         out_dir.mkdir(parents=True, exist_ok=True)
         fpath = out_dir / f"scv_detector_frequency_enrichment_{run_tag}.png"
-        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        fig.savefig(fpath, dpi=150, bbox_inches='tight', facecolor='white')
         out['figure_path'] = str(fpath)
         print(f"[*] SCV detector frequency enrichment saved: {fpath}")
     if show_fig:
@@ -25265,8 +25868,8 @@ def plot_scv_detector_carrier_map(
                    linewidth=0.4, transform=ccrs.PlateCarree(),
                    label=f'{lab} ({int(sel.sum())})', zorder=5)
     ax.legend(loc='lower left', fontsize=9)
-    ax.set_title(f'{label}-carrying McCoy SCVs by data gap '
-                 f'(n={len(d)}, ≥1 product misses {int((gm | mm).sum())})')
+    ax.set_title(f'{label}-carrying McCoy SCVs: representation status '
+                 f'(mapped subset n={len(d)}, ≥1 criterion not met {int((gm | mm).sum())})')
     fig.tight_layout()
 
     out = {'n_carrier': int(len(d)),
@@ -25406,6 +26009,290 @@ def run_scv_detector_comparison(
     return summary
 
 
+def plot_mccoy_scv_catalog_context(
+    *,
+    mccoy_csv: str | Path | None = None,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 McCoy et al. 外部 SCV 目录的干净地理背景图。
+
+    全目录统一着色，不叠加 GLORYS/META miss 类别。图内仅说明该目录是 Argo-derived、
+    velocity-confirmed subsurface coherent vortices，并报告完整目录与本项目 DO-evaluable 子集规模。
+
+    参数:
+        - mccoy_csv (str | Path | None): McCoy SCV 目录 CSV；None 使用 paths.yml 默认路径。
+        - threshold_table (pd.DataFrame | None): 阈值安全 SCV 表；用于读取 DO-evaluable 子集规模。
+        - threshold_table_path (str | Path | None): 阈值安全 parquet/CSV；None 时定位默认 DO20/35/50 表。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含完整目录数、DO-evaluable 子集数与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_mccoy_scv_catalog_context/mccoy_scv_catalog_context.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    catalog_path = Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv
+    catalog = pd.read_csv(catalog_path)
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+                / 'mccoy_scv_delta_do_thresholds_2002_2023_depth300m.parquet'
+            )
+        source = Path(threshold_table_path)
+        threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    unique_scv = threshold_table.drop_duplicates('stable_scv_id')
+    n_evaluable = int(unique_scv['do_evaluable'].fillna(False).astype(bool).sum())
+
+    fig = plt.figure(figsize=(12.5, 5.8))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], zorder=0)
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.5)
+    ax.set_global()
+    ax.scatter(
+        pd.to_numeric(catalog['Longitude'], errors='coerce'),
+        pd.to_numeric(catalog['Latitude'], errors='coerce'),
+        s=8, c='#245b78', alpha=0.55, linewidth=0,
+        transform=ccrs.PlateCarree(), zorder=2,
+    )
+    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
+    gridlines.top_labels = False
+    gridlines.right_labels = False
+    ax.set_title('McCoy et al. (2020) Argo-derived, velocity-confirmed subsurface coherent vortices')
+    ax.text(
+        0.015, 0.025,
+        f'Full catalogue: {len(catalog):,} SCVs\nDO-evaluable matched subset: {n_evaluable}',
+        transform=ax.transAxes, fontsize=10, va='bottom', ha='left',
+        bbox={'facecolor': 'white', 'edgecolor': '0.75', 'alpha': 0.9, 'boxstyle': 'round,pad=0.35'},
+    )
+    fig.tight_layout()
+
+    out = {'n_catalog': int(len(catalog)), 'n_do_evaluable': n_evaluable}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_mccoy_scv_catalog_context', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / 'mccoy_scv_catalog_context.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] McCoy SCV catalogue context figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_scv_do_carrier_distribution(
+    threshold: float = 50.0,
+    *,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制指定 ΔDO 阈值下 McCoy SCV carrier 的纯地理分布。
+
+    所有 DO-evaluable McCoy SCV 以浅灰作为分母背景，carrier 高亮；不按 GLORYS/META 表征状态筛选或着色，
+    因而地图 numerator 与频率统计保持一致。
+
+    参数:
+        - threshold (float): ΔDO prominence 阈值（μmol kg⁻¹），默认 50。
+        - threshold_table (pd.DataFrame | None): 阈值安全 SCV long table；None 时读取路径或默认表。
+        - threshold_table_path (str | Path | None): 阈值安全 parquet/CSV；None 时定位默认表。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 threshold、n_carrier、n_evaluable 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_scv_do_carrier_distribution/scv_do_carrier_distribution_do<t>_depth300m.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+                / 'mccoy_scv_delta_do_thresholds_2002_2023_depth300m.parquet'
+            )
+        source = Path(threshold_table_path)
+        threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    selected = threshold_table[
+        np.isclose(pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'), float(threshold))
+    ].copy()
+    if selected.empty:
+        raise ValueError(f'threshold table lacks ΔDO threshold {float(threshold):g}.')
+    evaluable = selected[selected['do_evaluable'].fillna(False).astype(bool)].copy()
+    carrier_mask = evaluable['has_delta_do'].astype('boolean').fillna(False).astype(bool)
+    carriers = evaluable[carrier_mask]
+
+    fig = plt.figure(figsize=(12.5, 5.8))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], zorder=0)
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.5)
+    ax.set_global()
+    ax.scatter(
+        evaluable['lon'], evaluable['lat'], s=18, c='0.78', alpha=0.75,
+        linewidth=0, transform=ccrs.PlateCarree(), label=f'DO-evaluable SCVs ({len(evaluable)})', zorder=2,
+    )
+    ax.scatter(
+        carriers['lon'], carriers['lat'], s=60, c='#b91c1c', edgecolor='white', linewidth=0.45,
+        transform=ccrs.PlateCarree(), label=f'DO{float(threshold):g} carriers ({len(carriers)})', zorder=3,
+    )
+    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
+    gridlines.top_labels = False
+    gridlines.right_labels = False
+    ax.legend(loc='lower left', frameon=True, fontsize=9)
+    ax.set_title(
+        f'DO{float(threshold):g} carriers within the DO-evaluable McCoy SCV subset: '
+        f'{len(carriers)}/{len(evaluable)}'
+    )
+    fig.tight_layout()
+
+    out = {'threshold': float(threshold), 'n_carrier': int(len(carriers)), 'n_evaluable': int(len(evaluable))}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_scv_do_carrier_distribution', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        threshold_tag = _format_detection_value(float(threshold))
+        path = out_dir / f'scv_do_carrier_distribution_do{threshold_tag}_depth300m.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] SCV DO carrier distribution saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_scv_do_carrier_representation_status(
+    threshold: float = 50.0,
+    *,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    argo_anchored_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制指定 ΔDO carrier 的 GLORYS/META representation status。
+
+    carrier 先由阈值安全表完整选出，再左连接 representation 字段。GLORYS 或 META 状态缺失的 carrier
+    保留为 unavailable，而不是从地图 numerator 中删除。
+
+    参数:
+        - threshold (float): ΔDO prominence 阈值（μmol kg⁻¹），默认 50。
+        - threshold_table (pd.DataFrame | None): 阈值安全 SCV long table；None 时读取路径或默认表。
+        - threshold_table_path (str | Path | None): 阈值安全 parquet/CSV；None 时定位默认表。
+        - argo_anchored_path (str | Path | None): 含 glorys_misses/meta_miss 的 representation 表；None 使用默认路径。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含完整 carrier 数、各 representation 类别计数与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_scv_do_carrier_representation_status/scv_do_carrier_representation_status_do<t>_depth300m.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+                / 'mccoy_scv_delta_do_thresholds_2002_2023_depth300m.parquet'
+            )
+        source = Path(threshold_table_path)
+        threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    selected = threshold_table[
+        np.isclose(pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'), float(threshold))
+        & threshold_table['do_evaluable'].fillna(False).astype(bool)
+        & threshold_table['has_delta_do'].astype('boolean').fillna(False).astype(bool)
+    ].copy()
+    anchored_path = (
+        Path(argo_anchored_path)
+        if argo_anchored_path is not None
+        else _default_mccoy_anchored_path(region_slug)
+    )
+    anchored = pd.read_parquet(anchored_path)
+    anchored['profile_number'] = pd.to_numeric(anchored['profile_number'], errors='coerce').astype('Int64')
+    fields = anchored[['profile_number', 'glorys_misses', 'meta_miss']].drop_duplicates('profile_number')
+    selected['profile_number'] = pd.to_numeric(selected['profile_number'], errors='coerce').astype('Int64')
+    carriers = selected.merge(fields, on='profile_number', how='left', validate='one_to_one')
+
+    gm = carriers['glorys_misses'].astype('boolean')
+    mm = carriers['meta_miss'].astype('boolean')
+    available = gm.notna() & mm.notna()
+    categories = [
+        (available & ~gm.fillna(False) & ~mm.fillna(False), '#737373', 'both criteria met'),
+        (available & ~gm.fillna(False) & mm.fillna(False), '#2b6cb0', 'META criterion not met'),
+        (available & gm.fillna(False) & ~mm.fillna(False), '#dd6b20', 'GLORYS criterion not met'),
+        (available & gm.fillna(False) & mm.fillna(False), '#c53030', 'neither criterion met'),
+        (~available, '#7c3aed', 'status unavailable'),
+    ]
+
+    fig = plt.figure(figsize=(12.5, 5.8))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], zorder=0)
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.5)
+    ax.set_global()
+    counts = {}
+    for mask, color, label in categories:
+        count = int(mask.sum())
+        counts[label] = count
+        if count:
+            ax.scatter(
+                carriers.loc[mask, 'lon'], carriers.loc[mask, 'lat'], s=65, c=color,
+                edgecolor='white', linewidth=0.45, transform=ccrs.PlateCarree(),
+                label=f'{label} ({count})', zorder=3,
+            )
+    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
+    gridlines.top_labels = False
+    gridlines.right_labels = False
+    ax.legend(loc='lower left', frameon=True, fontsize=8, ncol=2)
+    ax.set_title(
+        f'Representation status of all DO{float(threshold):g} McCoy SCV carriers '
+        f'(n={len(carriers)})'
+    )
+    fig.tight_layout()
+
+    out = {'threshold': float(threshold), 'n_carrier': int(len(carriers)), 'category_counts': counts}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_scv_do_carrier_representation_status', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        threshold_tag = _format_detection_value(float(threshold))
+        path = out_dir / f'scv_do_carrier_representation_status_do{threshold_tag}_depth300m.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] SCV DO carrier representation status saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
 def calculate_scv_frequency_statistics(
     resolution_path: str | Path | None = None,
     argo_anchored_path: str | Path | None = None,
@@ -25413,6 +26300,7 @@ def calculate_scv_frequency_statistics(
     detection_config: DetectionConfig | None = None,
     baseline_start_year: int = 2002,
     baseline_end_year: int = 2023,
+    threshold_table_path: str | Path | None = None,
     save_report: bool = True,
 ) -> dict:
     """McCoy SCV 频率分析：次表层涡相对基线 Argo 的入面涡率与 δDO 携带率富集。
@@ -25420,16 +26308,18 @@ def calculate_scv_frequency_statistics(
     以 McCoy 速度确认的次表层涡为子集、指定年份区域内的全部 Argo 剖面为基线，用 Fisher 精确检验两件事:
     (1) SCV 落在 META 面涡内的比例是否显著区别于随机 Argo（读纯 GLORYS 全目录 parquet 的 meta_miss);
     (2) 携显著正峰 δDO 的比例,三组对比——测氧基线 Argo / 落在 META 面涡内的测氧 Argo / McCoy SCV(读 Argo
-    锚定子集的 has_delta_do,基线分母为区域内 depth ≥ cfg.anomaly_min_depth 的有效测氧剖面数,META 组分母为其中落在面涡内者)。
+    锚定子集的阈值安全 long table，基线分母为区域内 depth ≥ cfg.anomaly_min_depth 的有效测氧剖面数，
+    META 组分母为其中落在面涡内者）。
     核心:落在 META 表层涡内几乎不富集 δDO(≈背景),而 SCV 强富集——正是「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
     入面涡轴另计 δDO 异常 Argo（= 原 Frequency Analysis 的 anomalies 组）的同轴入涡率,存报告/parquet 作参考(图只画 δDO 三组)。
 
     参数:
         - resolution_path (str | Path | None): 纯 GLORYS 全目录 SCV parquet（含 meta_miss/date）；None 时按默认定位。
-        - argo_anchored_path (str | Path | None): Argo 锚定 SCV parquet（含 has_delta_do）；None 时按默认定位。
+        - argo_anchored_path (str | Path | None): Argo 锚定 SCV representation parquet；None 时按默认定位。
         - detection_config (DetectionConfig | None): 异常识别配置；决定 method/region、深度阈值与默认路径。
         - baseline_start_year (int): 基线起始年份，默认 2002。
         - baseline_end_year (int): 基线结束年份，默认 2023。
+        - threshold_table_path (str | Path | None): McCoy SCV 阈值安全 long table；None 时定位或生成默认表。
         - save_report (bool): 是否保存文本报告，默认 True。
 
     返回:
@@ -25471,9 +26361,36 @@ def calculate_scv_frequency_statistics(
     anc_p = (Path(argo_anchored_path) if argo_anchored_path is not None
              else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
              / "mccoy_glorys_miss.parquet")
-    anc = pd.read_parquet(anc_p)
-    scv_do_n = int(anc['has_delta_do'].notna().sum())
-    scv_do_pos = int((anc['has_delta_do'] == True).sum())
+    depth_tag = _format_detection_value(float(cfg.anomaly_min_depth))
+    threshold_path = (
+        Path(threshold_table_path)
+        if threshold_table_path is not None
+        else make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+        / f'mccoy_scv_delta_do_thresholds_{int(y0)}_{int(y1)}_depth{depth_tag}m.parquet'
+    )
+    if not threshold_path.exists():
+        build_mccoy_scv_delta_do_threshold_table(
+            thresholds=(20.0, 35.0, 50.0),
+            baseline_start_year=int(y0),
+            baseline_end_year=int(y1),
+            anomaly_min_depth=float(cfg.anomaly_min_depth),
+            argo_anchored_path=anc_p,
+            save_data=True,
+        )
+    threshold_table = pd.read_parquet(threshold_path)
+    scv_rows = threshold_table[
+        np.isclose(
+            pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'),
+            float(cfg.do_threshold),
+        )
+    ].copy()
+    if scv_rows.empty:
+        raise ValueError(f'Threshold-safe McCoy table lacks DO{float(cfg.do_threshold):g}.')
+    scv_evaluable = scv_rows['do_evaluable'].fillna(False).astype(bool)
+    scv_do_n = int(scv_evaluable.sum())
+    scv_do_pos = int(
+        scv_rows.loc[scv_evaluable, 'has_delta_do'].astype('boolean').fillna(False).sum()
+    )
 
     an_p = cfg.output_dir("plot_argo_hotspots", region_slug) / f"anomalies_{y0}_{y1}_{run_tag}.parquet"
     anom_ids = set(pd.read_parquet(an_p)['Profile_number'].unique()) & base_ids
@@ -25636,67 +26553,35 @@ def plot_scv_do_carrier_map(
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """携 δDO 次表层涡的地理分布:has_delta_do 为真的 McCoy SCV 世界图,按 GLORYS×META 数据缺陷四分类着色。
+    """绘制当前 DO threshold carrier 的 GLORYS/META representation status。
 
-    读 Argo 锚定 SCV parquet,只取携显著正峰 δDO 且 glorys_misses/meta_miss 均可评估的子集,画世界地图:
-    散点按四类数据缺陷着色(灰＝两产品都看到、蓝＝仅 META 漏、橙＝仅 GLORYS 漏、红＝两者都漏),配色与
-    plot_mccoy_datagap_atlas 左图一致,直观展示「携氧次表层涡多半落在被漏检的类别」。此处 glorys_misses
-    为 Argo 锚定的相对口径(δπ_glorys/δπ_argo<0.5)。仅读缓存 parquet 渲染。
+    该入口保留原有函数名，但 carrier 集合改从阈值安全 long table读取，并委托
+    `plot_scv_do_carrier_representation_status` 绘图。所有 carrier 都会保留，缺失 representation
+    字段者单列为 unavailable。
 
     参数:
-        - argo_anchored_path (str | Path | None): Argo 锚定 SCV parquet(含 has_delta_do/lat/lon/glorys_misses/meta_miss);None 时按 screen_mccoy_scvs_against_glorys 默认定位。
-        - detection_config (DetectionConfig | None): 异常识别配置;决定 method/region 与默认路径。
-        - output_dir (str | Path | None): 图输出根目录;None 使用 method/region 默认目录。
-        - show_fig (bool): 是否显示图,默认 True。
-        - save_fig (bool): 是否保存图,默认 True。
+        - argo_anchored_path (str | Path | None): McCoy Argo 锚定 representation parquet；None 使用默认路径。
+        - detection_config (DetectionConfig | None): DO detector 配置；显式决定 threshold。
+        - output_dir (str | Path | None): 图输出目录；None 使用新的 representation-status 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
 
     返回:
-        - dict: 含 n_carrier、n_both_miss、n_ge1_miss、figure_path(save_fig 时)等摘要。
+        - dict: 含完整 carrier 数、representation 类别计数与 figure_path（save_fig 时）。
+
+    说明:
+        - 新叙事中的纯地理分布请调用 `plot_scv_do_carrier_distribution`。
     """
     cfg = _resolve_detection_config(detection_config)
-    region_slug = _current_region_key()
-    do_p = (Path(argo_anchored_path) if argo_anchored_path is not None
-            else cfg.output_dir("screen_mccoy_scvs_against_glorys", region_slug)
-            / "mccoy_glorys_miss.parquet")
-    d = pd.read_parquet(do_p)
-    d = d[(d['has_delta_do'] == True) & d['glorys_misses'].notna() & d['meta_miss'].notna()]
-    gm = d['glorys_misses'].astype(bool)
-    mm = d['meta_miss'].astype(bool)
-
-    fig = plt.figure(figsize=(13, 6))
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
-    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
-    ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
-    ax.set_global()
-    cats = [(~gm & ~mm, '0.6', 'seen by both'),
-            (~gm & mm, 'tab:blue', 'META misses only'),
-            (gm & ~mm, 'tab:orange', 'GLORYS misses only'),
-            (gm & mm, 'tab:red', 'both miss')]
-    for sel, col, lab in cats:
-        if not sel.any():
-            continue
-        ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=90, c=col, edgecolor='k',
-                   linewidth=0.4, transform=ccrs.PlateCarree(),
-                   label=f'{lab} ({int(sel.sum())})', zorder=5)
-    ax.legend(loc='lower left', fontsize=9)
-    ax.set_title(f'δDO-carrying McCoy SCVs by data gap '
-                 f'(n={len(d)}, ≥1 product misses {int((gm | mm).sum())})')
-    fig.tight_layout()
-
-    out = {'n_carrier': int(len(d)), 'n_both_miss': int((gm & mm).sum()),
-           'n_ge1_miss': int((gm | mm).sum())}
-    if save_fig:
-        base = (Path(output_dir) if output_dir is not None
-                else cfg.output_dir("plot_scv_do_carrier_map", region_slug))
-        base.mkdir(parents=True, exist_ok=True)
-        fpath = base / f"scv_do_carrier_map_{cfg.file_stem()}.png"
-        fig.savefig(fpath, dpi=150, bbox_inches='tight')
-        out['figure_path'] = str(fpath)
-        print(f"[*] SCV δDO carrier map saved: {fpath}")
-    if show_fig:
-        plt.show()
-    plt.close(fig)
-    return out
+    if cfg.method != 'do':
+        raise ValueError('plot_scv_do_carrier_map requires a DO detection_config.')
+    return plot_scv_do_carrier_representation_status(
+        threshold=float(cfg.do_threshold),
+        argo_anchored_path=argo_anchored_path,
+        output_dir=output_dir,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
 
 
 def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:
