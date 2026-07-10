@@ -21128,14 +21128,19 @@ def export_glorys_eke_native_dask(
     return str(out_path)
 
 
-def load_glorys_eke_native(file_path: str | Path) -> dict:
+def load_glorys_eke_native(
+    file_path: str | Path,
+    *,
+    include_count: bool = True,
+) -> dict:
     """从本地 zarr 文件加载 GLORYS 原始分辨率 EKE。
 
     参数:
         - file_path (str | Path): EKE zarr 目录路径（export_glorys_eke_native_dask 的输出）。
+        - include_count (bool): 是否同时加载逐格有效日数 `count`；默认 True。
 
     返回:
-        - dict: 含 lon/lat/eke/count 数组及 meta 元信息。
+        - dict: 含 lon/lat/eke、meta，以及可选 count 数组。
     """
     p = Path(file_path)
     if not p.exists():
@@ -21151,13 +21156,15 @@ def load_glorys_eke_native(file_path: str | Path) -> dict:
         raise RuntimeError("zarr 未安装，无法读取 zarr 格式。") from exc
     root = zarr.open_group(p, mode='r')
     meta = dict(root.attrs)
-    return {
+    result = {
         'lon': np.asarray(root['lon'], dtype=float),
         'lat': np.asarray(root['lat'], dtype=float),
         'eke': np.asarray(root['eke'], dtype=float),
-        'count': np.asarray(root['count'], dtype=float),
         'meta': meta,
     }
+    if include_count:
+        result['count'] = np.asarray(root['count'], dtype=float)
+    return result
 
 
 def _euler_summary_year_worker(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -21692,6 +21699,1396 @@ def plot_euler_grid_summary(
         out['npz'] = str(npz_path)
         print(f"Grid data saved: {npz_path}")
 
+    return out
+
+
+def build_euler_occurrence_summary(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    grid_step_deg: float = 1.0,
+    detection_config: DetectionConfig | None = None,
+) -> dict:
+    """构建只含 Argo 异常出现率的欧拉网格汇总。
+
+    该函数读取已落盘的区域 baseline parquet 与 `plot_argo_hotspots` anomalies parquet，
+    按当前区域的欧拉网格计算 anomaly_profiles / argo_baseline_profiles。它用于需要比较多个
+    detector 或多个阈值的轻量地图，不加载 META 轨迹，也不重做异常检测。
+
+    参数:
+        - start_year (int): 统计起始年份（闭区间），默认 2002。
+        - end_year (int): 统计结束年份（闭区间），默认 2022。
+        - grid_step_deg (float): 欧拉网格步长（°），默认 1.0。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时用默认。
+
+    返回:
+        - dict: 含 `grid`、`meta`、`anomaly_profiles`、`anomaly_occurrence_ratio`、`argo_baseline_profiles` 与掩膜数组的汇总字典。
+
+    说明:
+        - 该函数是 cache-only 的轻量路径；如果缓存缺失会直接报错，而不是回退到逐年重算。
+        - 需要先运行对应 detector/阈值的 `plot_argo_hotspots(..., save_data=True)`。
+    """
+    if end_year < start_year:
+        raise ValueError("end_year 必须大于等于 start_year")
+
+    cfg = _resolve_detection_config(detection_config)
+    cached_tables = _load_cached_euler_argo_tables(
+        start_year=start_year,
+        end_year=end_year,
+        detection_config=cfg,
+    )
+    if cached_tables is None:
+        raise FileNotFoundError(
+            f"Missing cached baseline/anomaly parquet for Euler occurrence summary: {cfg.file_stem()}"
+        )
+
+    lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(grid_step_deg=grid_step_deg)
+    lon_ref = float(grid_meta['lon_start_continuous'])
+    crosses_dateline = bool(grid_meta['crosses_dateline'])
+
+    baseline_df = cached_tables['baseline']
+    anomaly_df = cached_tables['anomalies']
+    baseline_grid, baseline_grouped = _grid_count_from_points(
+        baseline_df,
+        lon_col='Longitude',
+        lat_col='Latitude',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['profile_uid'],
+    )
+    anomaly_grid, anomaly_grouped = _grid_count_from_points(
+        anomaly_df,
+        lon_col='Longitude',
+        lat_col='Latitude',
+        lon_edges=lon_edges,
+        lat_edges=lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+        dedupe_cols=['profile_uid'],
+    )
+
+    anomaly_occurrence_ratio = np.full_like(anomaly_grid, np.nan, dtype=float)
+    valid_baseline = baseline_grid > 0
+    if np.any(valid_baseline):
+        anomaly_occurrence_ratio[valid_baseline] = anomaly_grid[valid_baseline] / baseline_grid[valid_baseline]
+
+    ocean_mask = _build_ocean_mask_for_grid(
+        lon_edges,
+        lat_edges,
+        crosses_dateline=crosses_dateline,
+        lon_ref=lon_ref,
+    )
+    observation_mask = baseline_grid > 0
+    analysis_mask = ocean_mask & observation_mask
+
+    return {
+        'meta': {
+            'region_key': _current_region_key(),
+            'start_year': int(start_year),
+            'end_year': int(end_year),
+            'grid_step_deg': float(grid_step_deg),
+            'detection_method': cfg.method,
+            'detection_label': cfg.threshold_label(),
+            'detection_file_stem': cfg.file_stem(),
+            'anomaly_min_depth': float(cfg.anomaly_min_depth) if cfg.anomaly_min_depth is not None else np.nan,
+            'do_threshold': float(cfg.do_threshold),
+            'summary_source': 'cached',
+            'baseline_source': str(cached_tables['baseline_path']),
+            'anomaly_source': str(cached_tables['anomaly_path']),
+        },
+        'grid': {
+            'lon_edges': lon_edges,
+            'lat_edges': lat_edges,
+            **grid_meta,
+        },
+        'anomaly_profiles': anomaly_grid,
+        'anomaly_occurrence_ratio': anomaly_occurrence_ratio,
+        'high_do_profiles': anomaly_grid,
+        'high_do_occurrence_ratio': anomaly_occurrence_ratio,
+        'argo_baseline_profiles': baseline_grid,
+        'argo_baseline_table': baseline_grouped,
+        'anomaly_table': anomaly_grouped,
+        'high_do_table': anomaly_grouped,
+        'ocean_mask': ocean_mask,
+        'observation_mask': observation_mask,
+        'analysis_mask': analysis_mask,
+    }
+
+
+def build_euler_occurrence_comparison_summaries(
+    detection_configs: list[DetectionConfig] | tuple[DetectionConfig, ...],
+    start_year: int = 2002,
+    end_year: int = 2022,
+    *,
+    grid_step_deg: float = 1.0,
+) -> list[dict]:
+    """批量构建多个 detector/阈值的欧拉异常出现率汇总。
+
+    该函数是 `build_euler_occurrence_summary` 的薄批处理包装，用来让 notebook 中的
+    “先构建 summary，再绘图”工作流保持简洁。
+
+    参数:
+        - detection_configs (list[DetectionConfig] | tuple[DetectionConfig, ...]): 需要比较的异常识别配置列表。
+        - start_year (int): 统计起始年份（闭区间），默认 2002。
+        - end_year (int): 统计结束年份（闭区间），默认 2022。
+        - grid_step_deg (float): 欧拉网格步长（°），默认 1.0。
+
+    返回:
+        - list[dict]: 每个元素为 `build_euler_occurrence_summary` 的输出。
+
+    说明:
+        - 该函数只读本地 parquet 缓存，不加载 META 轨迹，也不重做异常检测。
+    """
+    if not detection_configs:
+        raise ValueError("detection_configs must contain at least one DetectionConfig.")
+    return [
+        build_euler_occurrence_summary(
+            start_year=start_year,
+            end_year=end_year,
+            grid_step_deg=grid_step_deg,
+            detection_config=cfg,
+        )
+        for cfg in detection_configs
+    ]
+
+
+def plot_euler_occurrence_comparison(
+    summaries: list[dict] | tuple[dict, ...],
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    title: str | None = None,
+    save_fig: bool = False,
+    show_fig: bool = True,
+    output_dir: str | Path | None = None,
+    output_name: str | None = None,
+    cmap: str = 'Reds',
+) -> dict:
+    """绘制多个欧拉网格异常出现率的并排比较图。
+
+    该函数接收多个 `build_euler_occurrence_summary` 或 `build_euler_grid_summary` 的输出，
+    用同一套 robust PowerNorm 色标并排显示 anomaly_occurrence_ratio，适合比较 DO 阈值收紧
+    或 DO/AOU/TRIM detector 的空间分布差异。
+
+    参数:
+        - summaries (list[dict] | tuple[dict, ...]): 需要比较的欧拉网格汇总。
+        - labels (list[str] | tuple[str, ...] | None): 面板标题；None 时使用各 summary 的 `detection_label`。
+        - title (str | None): 总标题；None 时自动生成。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - output_dir (str | Path | None): 输出目录；None 时使用 `plot_outputs/shared/<region>/plot_euler_occurrence_comparison`。
+        - output_name (str | None): 输出文件名主干；None 时自动生成。
+        - cmap (str): 异常出现率 colormap，默认 `Reds`。
+
+    返回:
+        - dict: 含 `figure_path`（save_fig 时）、`labels`、`n_panels`、`vmax` 和 `gamma`。
+
+    输出:
+        - `plot_outputs/shared/<region>/plot_euler_occurrence_comparison/<output_name>.png`（save_fig 时）。
+    """
+    summaries = list(summaries)
+    if not summaries:
+        raise ValueError("summaries must contain at least one Euler summary.")
+
+    first_grid = summaries[0]['grid']
+    lon_edges = np.asarray(first_grid['lon_edges'], dtype=float)
+    lat_edges = np.asarray(first_grid['lat_edges'], dtype=float)
+    crosses_dateline = bool(first_grid.get('crosses_dateline', False))
+    central_lon = 180 if crosses_dateline else 0
+    for idx, summary in enumerate(summaries[1:], start=1):
+        grid = summary['grid']
+        if (
+            not np.array_equal(lon_edges, np.asarray(grid['lon_edges'], dtype=float))
+            or not np.array_equal(lat_edges, np.asarray(grid['lat_edges'], dtype=float))
+        ):
+            raise ValueError(f"summary at index {idx} uses different grid edges.")
+
+    if labels is None:
+        labels = [
+            str(summary.get('meta', {}).get('detection_label') or summary.get('meta', {}).get('detection_file_stem') or f'Panel {i + 1}')
+            for i, summary in enumerate(summaries)
+        ]
+    else:
+        labels = list(labels)
+    if len(labels) != len(summaries):
+        raise ValueError("labels length must match summaries length.")
+
+    displays = []
+    valid_values = []
+    for summary in summaries:
+        rate = np.asarray(
+            summary.get('anomaly_occurrence_ratio', summary.get('high_do_occurrence_ratio')),
+            dtype=float,
+        )
+        analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
+        display = np.where(np.isfinite(rate) & (rate > 0), rate, np.nan)
+        if analysis_mask is not None and analysis_mask.shape == display.shape:
+            display = np.where(analysis_mask, display, np.nan)
+        displays.append(display)
+        vals = display[np.isfinite(display)]
+        if vals.size:
+            valid_values.append(vals)
+
+    if valid_values:
+        all_vals = np.concatenate(valid_values)
+        vmax = float(np.nanquantile(all_vals, _EULER_GRID_PLOT_CFG['positive_vmax_quantile']))
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = float(np.nanmax(all_vals))
+    else:
+        vmax = 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    gamma = float(_EULER_GRID_PLOT_CFG['positive_power_gamma'])
+    if np.isfinite(gamma) and gamma > 0 and not np.isclose(gamma, 1.0):
+        norm = PowerNorm(gamma=gamma, vmin=0.0, vmax=vmax, clip=True)
+    else:
+        norm = Normalize(vmin=0.0, vmax=vmax, clip=True)
+
+    n_panels = len(summaries)
+    fig_width = max(5.4 * n_panels, 6.0)
+    fig, axes = plt.subplots(
+        1,
+        n_panels,
+        figsize=(fig_width, 4.8),
+        subplot_kw={'projection': ccrs.PlateCarree(central_longitude=central_lon)},
+        constrained_layout=True,
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    base_ocean = _BASEMAP_COLORS['ocean']
+    base_land = _BASEMAP_COLORS['land']
+    coast_color = _BASEMAP_COLORS['coastline']
+    grid_color = _BASEMAP_COLORS['grid']
+    mask_fill = _EULER_GRID_PLOT_CFG['mask_fill']
+    data_crs = ccrs.PlateCarree()
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+    lon_extent_min = float(lon_edges[0])
+    lon_extent_max = float(lon_edges[-1])
+    cmap_obj = _copy_cmap_with_bad(cmap)
+
+    mappable = None
+    for ax, summary, label, display in zip(axes, summaries, labels, displays):
+        ax.set_facecolor(base_ocean)
+        ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
+        if analysis_mask is not None:
+            _plot_mask_background(
+                ax,
+                lon_mesh,
+                lat_mesh,
+                analysis_mask,
+                transform=data_crs,
+                color=mask_fill,
+            )
+
+        mappable = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            display,
+            cmap=cmap_obj,
+            norm=norm,
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        ax.set_title(str(label), fontsize=12)
+        ax.set_extent([lon_extent_min, lon_extent_max, float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+
+    cbar = fig.colorbar(mappable, ax=axes, orientation='horizontal', fraction=0.055, pad=0.08)
+    cbar.set_label('Anomaly Occurrence Rate per Grid Cell', fontsize=11)
+
+    meta0 = summaries[0].get('meta', {})
+    if title is None:
+        title = (
+            f"Eulerian Anomaly Occurrence Comparison "
+            f"({meta0.get('region_key', _current_region_key())}, {meta0.get('start_year')}-{meta0.get('end_year')})"
+        )
+    fig.suptitle(title, fontsize=14)
+
+    out = {
+        'labels': list(labels),
+        'n_panels': int(n_panels),
+        'vmax': float(vmax),
+        'gamma': float(gamma),
+    }
+    if save_fig:
+        region_slug = str(meta0.get('region_key') or _current_region_key())
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else _shared_output_dir('plot_euler_occurrence_comparison', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if output_name is None:
+            stems = [
+                str(summary.get('meta', {}).get('detection_file_stem') or f'panel{i + 1}')
+                for i, summary in enumerate(summaries)
+            ]
+            output_name = (
+                f"euler_occurrence_comparison_{meta0.get('start_year')}_{meta0.get('end_year')}_"
+                f"{'_'.join(stems)}"
+            )
+        safe_name = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_name).strip())
+        if not safe_name:
+            safe_name = 'euler_occurrence_comparison'
+        fpath = out_dir / f"{safe_name}.png"
+        fig.savefig(fpath, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(fpath)
+        print(f"Figure saved: {fpath}")
+
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def _extract_euler_eke_grid(eke_euler: dict | np.ndarray) -> np.ndarray:
+    """从 EKE bundle 或数组中提取 Euler 网格。"""
+    if isinstance(eke_euler, dict):
+        if 'eke_grid' in eke_euler:
+            return np.asarray(eke_euler['eke_grid'], dtype=float)
+        if 'euler' in eke_euler and isinstance(eke_euler['euler'], dict):
+            if 'eke_grid' in eke_euler['euler']:
+                return np.asarray(eke_euler['euler']['eke_grid'], dtype=float)
+        raise ValueError('eke_euler dictionary lacks `eke_grid`.')
+    return np.asarray(eke_euler, dtype=float)
+
+
+def plot_do_threshold_eke_spatial_comparison(
+    summaries: list[dict] | tuple[dict, ...],
+    eke_euler: dict | np.ndarray,
+    *,
+    labels: list[str] | tuple[str, ...] = ('DO20', 'DO35', 'DO50'),
+    overlay_eke_contours: bool = True,
+    output_dir: str | Path | None = None,
+    output_name: str = 'do_threshold_eke_spatial_comparison_2002_2022_depth300m',
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """并排绘制 GLORYS EKE 与 DO20/DO35/DO50 occurrence maps。
+
+    四个面板共用投影和范围；三个 DO 面板使用统一 occurrence-rate 色标，可选叠加稀疏 EKE 分位数
+    等值线。EKE 在此仅表示 mesoscale-active 环境背景，不作为涡对象检测器。
+
+    参数:
+        - summaries (list[dict] | tuple[dict, ...]): DO20/DO35/DO50 Euler occurrence summaries。
+        - eke_euler (dict | np.ndarray): 重映射到相同 Euler 网格的 GLORYS EKE。
+        - labels (list[str] | tuple[str, ...]): 三个 DO 面板标签，默认 ('DO20', 'DO35', 'DO50')。
+        - overlay_eke_contours (bool): 是否在 DO 面板叠加 EKE 75/90 分位数等值线，默认 True。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - output_name (str): PNG 文件主干。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 labels、EKE contour levels、occurrence 色标参数与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_do_threshold_eke/<output_name>.png`（save_fig 时）。
+
+    说明:
+        - 地图用于空间共同定位，不提供普通 grid-cell p 值，也不单独证明涡致机制。
+    """
+    summaries = list(summaries)
+    labels = list(labels)
+    if len(summaries) != 3 or len(labels) != 3:
+        raise ValueError('Exactly three DO threshold summaries and labels are required.')
+    lon_edges, lat_edges, crosses_dateline = _validate_euler_summary_grid(summaries)
+    eke_grid = _extract_euler_eke_grid(eke_euler)
+    expected_shape = np.asarray(summaries[0]['argo_baseline_profiles']).shape
+    if eke_grid.shape != expected_shape:
+        raise ValueError(
+            f'EKE grid shape {eke_grid.shape} does not match Euler summaries {expected_shape}.'
+        )
+
+    occurrence_displays = []
+    occurrence_values = []
+    for summary in summaries:
+        rate = np.asarray(summary['anomaly_occurrence_ratio'], dtype=float)
+        mask = np.asarray(summary['analysis_mask'], dtype=bool)
+        display = np.where(mask & np.isfinite(rate) & (rate > 0), rate, np.nan)
+        occurrence_displays.append(display)
+        values = display[np.isfinite(display)]
+        if values.size:
+            occurrence_values.append(values)
+    combined = np.concatenate(occurrence_values) if occurrence_values else np.array([1.0])
+    occurrence_vmax = float(
+        np.nanquantile(combined, _EULER_GRID_PLOT_CFG['positive_vmax_quantile'])
+    )
+    if not np.isfinite(occurrence_vmax) or occurrence_vmax <= 0:
+        occurrence_vmax = float(np.nanmax(combined))
+    gamma = float(_EULER_GRID_PLOT_CFG['positive_power_gamma'])
+    occurrence_norm = PowerNorm(
+        gamma=gamma,
+        vmin=0.0,
+        vmax=occurrence_vmax,
+        clip=True,
+    )
+
+    eke_mask = np.asarray(summaries[0]['ocean_mask'], dtype=bool) & np.isfinite(eke_grid)
+    eke_values = eke_grid[eke_mask & (eke_grid > 0)]
+    if not eke_values.size:
+        raise ValueError('No positive EKE values are available in the analysis domain.')
+    eke_vmax = float(np.nanquantile(eke_values, 0.99))
+    eke_norm = PowerNorm(gamma=0.45, vmin=0.0, vmax=eke_vmax, clip=True)
+    contour_levels = np.unique(np.nanquantile(eke_values, [0.75, 0.90])).astype(float)
+
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=180 if crosses_dateline else 0)
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+    lon_centers = (lon_edges[:-1] + lon_edges[1:]) / 2.0
+    lat_centers = (lat_edges[:-1] + lat_edges[1:]) / 2.0
+    lon_center_mesh, lat_center_mesh = np.meshgrid(lon_centers, lat_centers)
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(14.2, 8.4),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+    flat_axes = axes.ravel()
+    for ax in flat_axes:
+        ax.set_facecolor(_BASEMAP_COLORS['ocean'])
+        ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+        ax.add_feature(
+            cfeature.LAND,
+            facecolor=_BASEMAP_COLORS['land'],
+            edgecolor=_BASEMAP_COLORS['coastline'],
+            linewidth=0.5,
+            zorder=4,
+        )
+        ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.55, zorder=5)
+        gridlines = ax.gridlines(
+            draw_labels=True,
+            linewidth=0.35,
+            color=_BASEMAP_COLORS['grid'],
+            alpha=0.4,
+            linestyle='--',
+        )
+        gridlines.top_labels = False
+        gridlines.right_labels = False
+        ax.set_extent(
+            [float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])],
+            crs=data_crs,
+        )
+
+    eke_display = np.where(eke_mask, eke_grid, np.nan)
+    eke_map = flat_axes[0].pcolormesh(
+        lon_mesh,
+        lat_mesh,
+        eke_display,
+        cmap=_copy_cmap_with_bad('YlOrRd'),
+        norm=eke_norm,
+        shading='auto',
+        transform=data_crs,
+        zorder=2,
+    )
+    flat_axes[0].set_title('GLORYS mean EKE: mesoscale-active context')
+    occurrence_map = None
+    for ax, summary, display, label in zip(
+        flat_axes[1:], summaries, occurrence_displays, labels
+    ):
+        _plot_mask_background(
+            ax,
+            lon_mesh,
+            lat_mesh,
+            np.asarray(summary['analysis_mask'], dtype=bool),
+            transform=data_crs,
+            color=_EULER_GRID_PLOT_CFG['mask_fill'],
+        )
+        occurrence_map = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            display,
+            cmap=_copy_cmap_with_bad('Reds'),
+            norm=occurrence_norm,
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        if overlay_eke_contours and contour_levels.size:
+            ax.contour(
+                lon_center_mesh,
+                lat_center_mesh,
+                eke_grid,
+                levels=contour_levels,
+                colors=['#4b5563', '#111827'][:len(contour_levels)],
+                linewidths=[0.55, 0.9][:len(contour_levels)],
+                transform=data_crs,
+                zorder=3,
+            )
+        n_anomaly = int(np.nansum(np.asarray(summary['anomaly_profiles'], dtype=float)))
+        ax.set_title(f'{label} occurrence rate (n={n_anomaly:,})')
+
+    cbar_eke = fig.colorbar(
+        eke_map,
+        ax=flat_axes[0],
+        orientation='horizontal',
+        fraction=0.06,
+        pad=0.08,
+    )
+    cbar_eke.set_ticks(np.linspace(0.0, eke_vmax, 4))
+    cbar_eke.set_label('Mean EKE (m² s⁻²)')
+    cbar_occurrence = fig.colorbar(
+        occurrence_map,
+        ax=flat_axes[1:],
+        orientation='horizontal',
+        fraction=0.045,
+        pad=0.08,
+    )
+    cbar_occurrence.set_label('Deep ΔDO anomaly occurrence rate per sampled grid cell')
+    fig.suptitle('Global deep ΔDO patterns and their mesoscale-energy context', fontsize=14)
+
+    out = {
+        'labels': labels,
+        'eke_contour_levels': [float(value) for value in contour_levels],
+        'occurrence_vmax': float(occurrence_vmax),
+        'occurrence_gamma': float(gamma),
+    }
+    if save_fig:
+        region_slug = _current_region_key()
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_do_threshold_eke', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = ''.join(
+            ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in output_name
+        ) or 'do_threshold_eke_spatial_comparison'
+        path = out_dir / f'{safe_name}.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] DO threshold/EKE spatial comparison saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def build_do_threshold_eke_binned_summary(
+    summaries: list[dict] | tuple[dict, ...],
+    eke_euler: dict | np.ndarray,
+    *,
+    labels: list[str] | tuple[str, ...] = ('DO20', 'DO35', 'DO50'),
+    n_quantile_bins: int = 5,
+    min_profiles_per_cell: int = 1,
+    output_dir: str | Path | None = None,
+    output_name: str = 'do_threshold_eke_binned_summary_2002_2022_depth300m',
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """按 EKE 分位箱汇总 DO20/DO35/DO50 occurrence rate。
+
+    分位箱由有采样的 Euler 网格 EKE 值定义；每个箱内先加总 anomaly numerator 与 sampled-profile
+    denominator，再计算发生率和 Wilson 区间。它是 denominator-aware 的地理共同定位描述。
+
+    参数:
+        - summaries (list[dict] | tuple[dict, ...]): DO20/DO35/DO50 Euler occurrence summaries。
+        - eke_euler (dict | np.ndarray): 重映射到相同网格的 GLORYS EKE。
+        - labels (list[str] | tuple[str, ...]): 阈值标签，默认 ('DO20', 'DO35', 'DO50')。
+        - n_quantile_bins (int): EKE 分位箱数，默认 5。
+        - min_profiles_per_cell (int): 入选网格的最小 sampled-profile 数，默认 1。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - output_name (str): CSV 文件主干。
+        - save_data (bool): 是否保存 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 threshold/EKE bin 一行，含 cells、numerator、denominator、rate 与 Wilson CI。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_do_threshold_eke/<output_name>.csv`（save_data 时）。
+
+    说明:
+        - EKE 分箱以网格单元为单位，occurrence rate 的权重来自箱内 profile denominator。
+        - 结果仍可能受 KE 等共同地理结构影响，不能单独证明涡致机制。
+    """
+    summaries = list(summaries)
+    labels = list(labels)
+    if len(summaries) != len(labels) or not summaries:
+        raise ValueError('summaries and labels must be non-empty and have equal length.')
+    if int(n_quantile_bins) < 2:
+        raise ValueError('n_quantile_bins must be at least 2.')
+    _validate_euler_summary_grid(summaries)
+    eke_grid = _extract_euler_eke_grid(eke_euler)
+    baseline = np.asarray(summaries[0]['argo_baseline_profiles'], dtype=float)
+    if eke_grid.shape != baseline.shape:
+        raise ValueError('EKE grid shape does not match Euler summaries.')
+    common_mask = (
+        np.asarray(summaries[0]['ocean_mask'], dtype=bool)
+        & np.isfinite(eke_grid)
+        & (eke_grid >= 0)
+        & np.isfinite(baseline)
+        & (baseline >= int(min_profiles_per_cell))
+    )
+    eke_values = eke_grid[common_mask]
+    if eke_values.size < int(n_quantile_bins):
+        raise ValueError('Not enough sampled cells for the requested EKE quantile bins.')
+    quantile_edges = np.quantile(
+        eke_values,
+        np.linspace(0.0, 1.0, int(n_quantile_bins) + 1),
+    )
+    quantile_edges = np.unique(quantile_edges)
+    if quantile_edges.size < 3:
+        raise ValueError('EKE values do not support at least two distinct quantile bins.')
+
+    rows = []
+    for summary, label in zip(summaries, labels):
+        numerator_grid = np.asarray(summary['anomaly_profiles'], dtype=float)
+        denominator_grid = np.asarray(summary['argo_baseline_profiles'], dtype=float)
+        for index in range(len(quantile_edges) - 1):
+            lower = float(quantile_edges[index])
+            upper = float(quantile_edges[index + 1])
+            if index == len(quantile_edges) - 2:
+                bin_mask = common_mask & (eke_grid >= lower) & (eke_grid <= upper)
+            else:
+                bin_mask = common_mask & (eke_grid >= lower) & (eke_grid < upper)
+            numerator = int(np.nansum(numerator_grid[bin_mask]))
+            denominator = int(np.nansum(denominator_grid[bin_mask]))
+            ci_low, ci_high = _binomial_wilson_interval(numerator, denominator)
+            rows.append({
+                'threshold_label': str(label),
+                'threshold_umol_kg': float(summary.get('meta', {}).get('do_threshold', np.nan)),
+                'eke_bin': int(index + 1),
+                'eke_bin_label': f'Q{index + 1}',
+                'eke_lower': lower,
+                'eke_upper': upper,
+                'eke_median': float(np.nanmedian(eke_grid[bin_mask])) if np.any(bin_mask) else np.nan,
+                'n_grid_cells': int(np.count_nonzero(bin_mask)),
+                'anomaly_numerator': numerator,
+                'sampled_profile_denominator': denominator,
+                'occurrence_rate': float(numerator / denominator) if denominator else np.nan,
+                'confidence_interval_low': ci_low,
+                'confidence_interval_high': ci_high,
+                'min_profiles_per_cell': int(min_profiles_per_cell),
+                'geographic_caveat': (
+                    'descriptive co-location; spatial autocorrelation and shared regional structure remain'
+                ),
+            })
+    table = pd.DataFrame(rows)
+    if save_data:
+        region_slug = _current_region_key()
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_do_threshold_eke', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = ''.join(
+            ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in output_name
+        ) or 'do_threshold_eke_binned_summary'
+        path = out_dir / f'{safe_name}.csv'
+        table.to_csv(path, index=False)
+        print(f'[*] DO threshold/EKE binned summary saved: {path}')
+    return table
+
+
+def plot_do_threshold_eke_binned_relationship(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    output_name: str = 'do_threshold_eke_binned_relationship_2002_2022_depth300m',
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 DO20/DO35/DO50 occurrence rate 随 EKE 分位箱的变化。
+
+    每条线对应一个 DO threshold，误差棒为箱内 profile counts 的 95% Wilson 区间。标题根据实际
+    箱序列是否整体上升选择中性或较强表述，不预设单调关系。
+
+    参数:
+        - summary (pd.DataFrame | None): `build_do_threshold_eke_binned_summary` 输出；None 时读取路径。
+        - summary_path (str | Path | None): 摘要 CSV/parquet；None 时定位默认 CSV。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - output_name (str): PNG 文件主干。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含各 threshold 的 bin rates、是否整体上升与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_do_threshold_eke/<output_name>.png`（save_fig 时）。
+
+    说明:
+        - 该图是 denominator-aware 的描述性共同定位，不替代区域留出或空间自相关检验。
+    """
+    region_slug = _current_region_key()
+    if summary is None:
+        if summary_path is None:
+            summary_path = (
+                make_detection_config('do').output_dir('plot_do_threshold_eke', region_slug)
+                / 'do_threshold_eke_binned_summary_2002_2022_depth300m.csv'
+            )
+        source = Path(summary_path)
+        summary = pd.read_parquet(source) if source.suffix.lower() == '.parquet' else pd.read_csv(source)
+    else:
+        summary = summary.copy()
+    if summary.empty:
+        raise ValueError('summary is empty.')
+
+    colors = {'DO20': '#6b7280', 'DO35': '#d97706', 'DO50': '#b91c1c'}
+    markers = {'DO20': 'o', 'DO35': 's', 'DO50': 'D'}
+    fig, ax = plt.subplots(figsize=(8.2, 5.6))
+    series = {}
+    monotonic_flags = []
+    for label, part in summary.groupby('threshold_label', sort=False):
+        part = part.sort_values('eke_bin')
+        x = part['eke_bin'].to_numpy(dtype=float)
+        y = 100.0 * part['occurrence_rate'].to_numpy(dtype=float)
+        low = 100.0 * part['confidence_interval_low'].to_numpy(dtype=float)
+        high = 100.0 * part['confidence_interval_high'].to_numpy(dtype=float)
+        ax.errorbar(
+            x,
+            y,
+            yerr=[y - low, high - y],
+            marker=markers.get(str(label), 'o'),
+            color=colors.get(str(label), None),
+            linewidth=2.0,
+            capsize=3,
+            label=str(label),
+        )
+        monotonic_flags.append(bool(np.all(np.diff(y) >= 0)))
+        series[str(label)] = [
+            {
+                'eke_bin': int(row.eke_bin),
+                'numerator': int(row.anomaly_numerator),
+                'denominator': int(row.sampled_profile_denominator),
+                'rate_pct': 100.0 * float(row.occurrence_rate),
+            }
+            for row in part.itertuples(index=False)
+        ]
+    bins = sorted(
+        pd.to_numeric(summary['eke_bin'], errors='coerce').dropna().astype(int).unique()
+    )
+    ax.set_xticks(bins, [f'Q{value}' for value in bins])
+    ax.set_xlabel('GLORYS EKE quantile among sampled grid cells (low → high)')
+    ax.set_ylabel('Deep ΔDO anomaly occurrence rate (%)')
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False)
+    all_monotonic = bool(monotonic_flags and all(monotonic_flags))
+    ax.set_title(
+        'Deep ΔDO occurrence rises across EKE environments'
+        if all_monotonic
+        else 'Deep ΔDO occurrence across EKE environments'
+    )
+    ax.text(
+        0.01,
+        0.01,
+        'Descriptive co-location; shared geography and spatial autocorrelation remain.',
+        transform=ax.transAxes,
+        fontsize=8,
+        color='0.35',
+        va='bottom',
+    )
+    fig.tight_layout()
+
+    out = {'series': series, 'all_thresholds_monotonic': all_monotonic}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_do_threshold_eke', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = ''.join(
+            ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in output_name
+        ) or 'do_threshold_eke_binned_relationship'
+        path = out_dir / f'{safe_name}.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] DO threshold/EKE binned relationship saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def _validate_euler_summary_grid(summaries: list[dict] | tuple[dict, ...]) -> tuple[np.ndarray, np.ndarray, bool]:
+    """验证多个 Euler summary 使用相同网格，并返回网格边界。"""
+    if not summaries:
+        raise ValueError("summaries must contain at least one Euler summary.")
+    first_grid = summaries[0]['grid']
+    lon_edges = np.asarray(first_grid['lon_edges'], dtype=float)
+    lat_edges = np.asarray(first_grid['lat_edges'], dtype=float)
+    for index, summary in enumerate(summaries[1:], start=1):
+        grid = summary['grid']
+        if (
+            not np.array_equal(lon_edges, np.asarray(grid['lon_edges'], dtype=float))
+            or not np.array_equal(lat_edges, np.asarray(grid['lat_edges'], dtype=float))
+        ):
+            raise ValueError(f"summary at index {index} uses different grid edges.")
+    return lon_edges, lat_edges, bool(first_grid.get('crosses_dateline', False))
+
+
+def _plot_euler_grid_value_comparison(
+    summaries: list[dict] | tuple[dict, ...],
+    *,
+    value_key: str,
+    labels: list[str] | tuple[str, ...] | None,
+    title: str,
+    colorbar_label: str,
+    cmap: str,
+    output_path: Path | None,
+    show_fig: bool,
+) -> dict:
+    """绘制共享色标的 Euler 网格计数比较图。"""
+    summaries = list(summaries)
+    lon_edges, lat_edges, crosses_dateline = _validate_euler_summary_grid(summaries)
+    if labels is None:
+        labels = [
+            str(summary.get('meta', {}).get('detection_label') or f'Panel {index + 1}')
+            for index, summary in enumerate(summaries)
+        ]
+    labels = list(labels)
+    if len(labels) != len(summaries):
+        raise ValueError("labels length must match summaries length.")
+
+    masks = [np.asarray(summary['analysis_mask'], dtype=bool) for summary in summaries]
+    values = [np.asarray(summary[value_key], dtype=float) for summary in summaries]
+    displays = [np.where(mask, value, np.nan) for value, mask in zip(values, masks)]
+    positive = [display[np.isfinite(display) & (display > 0)] for display in displays]
+    positive = [value for value in positive if value.size]
+    if positive:
+        vmax = float(np.nanquantile(np.concatenate(positive), _EULER_GRID_PLOT_CFG['positive_vmax_quantile']))
+        vmax = vmax if np.isfinite(vmax) and vmax > 0 else float(np.nanmax(np.concatenate(positive)))
+    else:
+        vmax = 1.0
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
+    gamma = float(_EULER_GRID_PLOT_CFG['positive_power_gamma'])
+    norm = PowerNorm(gamma=gamma, vmin=0.0, vmax=vmax, clip=True) if not np.isclose(gamma, 1.0) else Normalize(vmin=0.0, vmax=vmax, clip=True)
+
+    data_crs = ccrs.PlateCarree()
+    map_crs = ccrs.PlateCarree(central_longitude=180 if crosses_dateline else 0)
+    fig, axes = plt.subplots(
+        1,
+        len(summaries),
+        figsize=(max(5.4 * len(summaries), 6.0), 4.8),
+        subplot_kw={'projection': map_crs},
+        constrained_layout=True,
+    )
+    if len(summaries) == 1:
+        axes = [axes]
+    lon_mesh, lat_mesh = np.meshgrid(lon_edges, lat_edges)
+    mappable = None
+    for ax, display, mask, label in zip(axes, displays, masks, labels):
+        ax.set_facecolor(_BASEMAP_COLORS['ocean'])
+        ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+        ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], edgecolor=_BASEMAP_COLORS['coastline'], linewidth=0.5, zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=_BASEMAP_COLORS['coastline'], zorder=1)
+        gridlines = ax.gridlines(draw_labels=True, linewidth=0.4, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
+        gridlines.top_labels = False
+        gridlines.right_labels = False
+        _plot_mask_background(ax, lon_mesh, lat_mesh, mask, transform=data_crs, color=_EULER_GRID_PLOT_CFG['mask_fill'])
+        mappable = ax.pcolormesh(
+            lon_mesh,
+            lat_mesh,
+            display,
+            cmap=_copy_cmap_with_bad(cmap),
+            norm=norm,
+            shading='auto',
+            transform=data_crs,
+            zorder=2,
+        )
+        ax.set_title(label, fontsize=12)
+        ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
+    colorbar = fig.colorbar(mappable, ax=axes, orientation='horizontal', fraction=0.055, pad=0.08)
+    colorbar.set_label(colorbar_label, fontsize=11)
+    colorbar_ticks = np.linspace(0.0, vmax, 6)
+    colorbar.set_ticks(colorbar_ticks)
+    colorbar.set_ticklabels([f'{int(round(value))}' for value in colorbar_ticks])
+    fig.suptitle(title, fontsize=14)
+    out = {'vmax': float(vmax), 'gamma': float(gamma), 'labels': labels}
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+        out['figure_path'] = str(output_path)
+        print(f"Figure saved: {output_path}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_euler_occurrence_supporting_maps(
+    summaries: list[dict] | tuple[dict, ...],
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    title_prefix: str = 'Eulerian occurrence sampling support',
+    save_fig: bool = False,
+    show_fig: bool = True,
+    output_dir: str | Path | None = None,
+    output_stem: str = 'eulerian_occurrence',
+    denominator_output_name: str | None = None,
+    count_output_name: str | None = None,
+    include_sampling_denominator: bool = True,
+    include_anomaly_count: bool = True,
+) -> dict:
+    """绘制 Eulerian occurrence-rate 的采样分母与异常计数 companion maps。
+
+    参数:
+        - summaries (list[dict] | tuple[dict, ...]): 需要比较的 Euler occurrence summaries。
+        - labels (list[str] | tuple[str, ...] | None): 面板标题；None 时取 detection label。
+        - title_prefix (str): 两张图共同使用的标题前缀。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - output_dir (str | Path | None): 输出目录；None 时使用 shared Eulerian summary 目录。
+        - output_stem (str): 输出文件名前缀，默认 `eulerian_occurrence`。
+        - denominator_output_name (str | None): denominator PNG 文件名；None 时从 output_stem 自动生成。
+        - count_output_name (str | None): anomaly-count PNG 文件名；None 时从 output_stem 自动生成。
+        - include_sampling_denominator (bool): 是否绘制 sampled-profile denominator，默认 True。
+        - include_anomaly_count (bool): 是否绘制 anomaly-profile count，默认 True。
+
+    返回:
+        - dict: 含 denominator/count 图路径和共同显示范围。
+
+    输出:
+        - `<output_dir>/<denominator_output_name>` 或从 output_stem 派生的 denominator PNG（save_fig 时）。
+        - `<output_dir>/<count_output_name>` 或从 output_stem 派生的 anomaly-count PNG（save_fig 时）。
+
+    说明:
+        - 这两张图是 occurrence-rate map 的 companion，不改变 occurrence-rate 的定义。
+        - 只读取已构建的网格 summary，不触发 anomaly detection 或 GLORYS 提取。
+    """
+    summaries = list(summaries)
+    _validate_euler_summary_grid(summaries)
+    if not include_sampling_denominator and not include_anomaly_count:
+        raise ValueError("At least one supporting map must be enabled.")
+    if output_dir is None:
+        output_dir = _shared_output_dir('eulerian_association_summary')
+    output_dir = Path(output_dir)
+    safe_stem = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_stem))
+    if not safe_stem:
+        safe_stem = 'eulerian_occurrence'
+    denominator_name = denominator_output_name or f"{safe_stem}_sampling_denominator.png"
+    count_name = count_output_name or f"{safe_stem}_anomaly_count.png"
+    denominator_path = output_dir / denominator_name if save_fig else None
+    count_path = output_dir / count_name if save_fig else None
+    out = {}
+    if include_sampling_denominator:
+        out['sampling_denominator'] = _plot_euler_grid_value_comparison(
+            summaries,
+            value_key='argo_baseline_profiles',
+            labels=labels,
+            title=f"{title_prefix}: sampled Argo profiles per 1° grid cell",
+            colorbar_label='Sampled Argo profiles per grid cell',
+            cmap='YlGnBu',
+            output_path=denominator_path,
+            show_fig=show_fig,
+        )
+    if include_anomaly_count:
+        out['anomaly_count'] = _plot_euler_grid_value_comparison(
+            summaries,
+            value_key='anomaly_profiles',
+            labels=labels,
+            title=f"{title_prefix}: anomaly profiles per 1° grid cell",
+            colorbar_label='Anomaly profiles per grid cell',
+            cmap='OrRd',
+            output_path=count_path,
+            show_fig=show_fig,
+        )
+    return out
+
+
+def _euler_occurrence_grid_table(summaries: dict[str, dict]) -> pd.DataFrame:
+    """将多个 occurrence summaries 展平为一行一个已采样网格的表。"""
+    rows = []
+    for detector, summary in summaries.items():
+        lon_edges = np.asarray(summary['grid']['lon_edges'], dtype=float)
+        lat_edges = np.asarray(summary['grid']['lat_edges'], dtype=float)
+        lon2d, lat2d = np.meshgrid(0.5 * (lon_edges[:-1] + lon_edges[1:]), 0.5 * (lat_edges[:-1] + lat_edges[1:]))
+        sampled = np.asarray(summary['analysis_mask'], dtype=bool)
+        meta = summary['meta']
+        frame = pd.DataFrame({
+            'grid_lon': lon2d[sampled],
+            'grid_lat': lat2d[sampled],
+            'n_profiles': np.asarray(summary['argo_baseline_profiles'], dtype=float)[sampled].astype(int),
+            'n_anomalies': np.asarray(summary['anomaly_profiles'], dtype=float)[sampled].astype(int),
+            'occurrence_rate': np.asarray(summary['anomaly_occurrence_ratio'], dtype=float)[sampled],
+            'detector': detector,
+            'threshold_or_config': str(meta.get('detection_file_stem', detector)),
+            'period': f"{meta.get('start_year')}-{meta.get('end_year')}",
+            'min_depth': meta.get('anomaly_min_depth', np.nan),
+        })
+        rows.append(frame)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _euler_region_masks(summary: dict) -> dict[str, np.ndarray]:
+    """为 Euler summary 返回预定义的全球与海盆控制掩膜。"""
+    lon_edges = np.asarray(summary['grid']['lon_edges'], dtype=float)
+    lat_edges = np.asarray(summary['grid']['lat_edges'], dtype=float)
+    lon_centers = 0.5 * (lon_edges[:-1] + lon_edges[1:])
+    lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
+    lon2d, lat2d = np.meshgrid(lon_centers, lat_centers)
+    lon360 = np.mod(lon2d, 360.0)
+    ke = (lon360 >= 140.0) & (lon360 <= 170.0) & (lat2d >= 25.0) & (lat2d <= 45.0)
+    basin = np.empty(lon2d.shape, dtype=object)
+    for index in np.ndindex(lon2d.shape):
+        basin[index] = _residual_basin_of(float(lat2d[index]), float(lon2d[index]))
+    return {
+        'global': np.ones(lon2d.shape, dtype=bool),
+        'KE only': ke,
+        'global excluding KE': ~ke,
+        'Pacific excluding KE': (basin == 'Pacific') & ~ke,
+        'Atlantic': basin == 'Atlantic',
+        'Southern Ocean': basin == 'SO',
+    }
+
+
+def _extract_euler_proxy_grid(proxy: str, summary: dict, eke_euler: dict | np.ndarray) -> tuple[np.ndarray, str]:
+    """返回指定 surface proxy 的网格与来源说明。"""
+    if proxy == 'META eddy-days':
+        return np.asarray(summary['eddy_days_total'], dtype=float), 'META daily-track gridded eddy exposure'
+    if proxy == 'GLORYS EKE':
+        if isinstance(eke_euler, dict):
+            grid = eke_euler.get('eke_grid')
+            if grid is None and isinstance(eke_euler.get('euler'), dict):
+                grid = eke_euler['euler'].get('eke_grid')
+            if grid is None:
+                raise ValueError("eke_euler dictionary does not contain `eke_grid`.")
+        else:
+            grid = eke_euler
+        return np.asarray(grid, dtype=float), 'GLORYS EKE reanalysis grid'
+    raise ValueError(f"Unsupported Eulerian surface proxy: {proxy}")
+
+
+def _euler_association_row(
+    summary: dict,
+    *,
+    detector: str,
+    proxy: str,
+    eke_euler: dict | np.ndarray,
+    min_profiles_per_cell: int,
+    active_proxy_quantile: float,
+    region: str,
+    region_mask: np.ndarray,
+) -> dict:
+    """计算一个 detector-proxy-region 组合的描述性网格关联统计。"""
+    baseline = np.asarray(summary['argo_baseline_profiles'], dtype=float)
+    anomalies = np.asarray(summary['anomaly_profiles'], dtype=float)
+    occurrence = np.asarray(summary['anomaly_occurrence_ratio'], dtype=float)
+    proxy_grid, proxy_source = _extract_euler_proxy_grid(proxy, summary, eke_euler)
+    if proxy_grid.shape != occurrence.shape:
+        raise ValueError(f"{proxy} grid does not match Euler occurrence grid shape.")
+    analysis_mask = np.asarray(summary['analysis_mask'], dtype=bool)
+    usable = (
+        analysis_mask
+        & np.asarray(region_mask, dtype=bool)
+        & (baseline >= int(min_profiles_per_cell))
+        & np.isfinite(proxy_grid)
+        & np.isfinite(occurrence)
+    )
+    n_used = int(np.count_nonzero(usable))
+    meta = summary.get('meta', {})
+    notes = 'Descriptive grid-cell association only; not spatially independent and not causal.'
+    row = {
+        'detector': detector,
+        'detector_config': str(meta.get('detection_file_stem', detector)),
+        'period': f"{meta.get('start_year')}-{meta.get('end_year')}",
+        'grid_resolution': f"{float(meta.get('grid_step_deg', 1.0)):g} degree",
+        'region': region,
+        'n_grid_cells_total': int(np.count_nonzero(np.asarray(region_mask, dtype=bool) & np.asarray(summary['ocean_mask'], dtype=bool))),
+        'n_grid_cells_used': n_used,
+        'min_profiles_per_cell': int(min_profiles_per_cell),
+        'total_profiles': int(np.nansum(baseline[usable])),
+        'total_anomalies': int(np.nansum(anomalies[usable])),
+        'mean_occurrence_rate': np.nan,
+        'surface_proxy': proxy,
+        'proxy_source': proxy_source,
+        'spearman_rho': np.nan,
+        'spearman_p_nominal': np.nan,
+        'active_threshold_definition': f'positive proxy {float(active_proxy_quantile):.2f} quantile within region',
+        'active_threshold_value': np.nan,
+        'active_cells': 0,
+        'inactive_cells': 0,
+        'active_occurrence_rate': np.nan,
+        'inactive_occurrence_rate': np.nan,
+        'active_inactive_ratio': np.nan,
+        'active_inactive_difference': np.nan,
+        'notes': notes,
+    }
+    if not n_used:
+        return row
+
+    core = _compute_grid_association_core(
+        proxy_grid,
+        occurrence,
+        analysis_mask=usable,
+        active_threshold='auto',
+        active_quantile=float(active_proxy_quantile),
+        active_positive_only=True,
+        x_log_for_map=False,
+        y_log_for_map=False,
+    )
+    threshold = float(core['active_threshold'])
+    active = usable & (proxy_grid >= threshold)
+    inactive = usable & ~active
+    active_profiles = float(np.nansum(baseline[active]))
+    inactive_profiles = float(np.nansum(baseline[inactive]))
+    active_rate = float(np.nansum(anomalies[active]) / active_profiles) if active_profiles > 0 else np.nan
+    inactive_rate = float(np.nansum(anomalies[inactive]) / inactive_profiles) if inactive_profiles > 0 else np.nan
+    total_profiles = float(np.nansum(baseline[usable]))
+    total_rate = float(np.nansum(anomalies[usable]) / total_profiles) if total_profiles > 0 else np.nan
+    ratio = float(active_rate / inactive_rate) if np.isfinite(active_rate) and inactive_rate > 0 else np.nan
+    row.update({
+        'mean_occurrence_rate': total_rate,
+        'spearman_rho': float(core['spearman_rho']),
+        'spearman_p_nominal': float(core['spearman_p']),
+        'active_threshold_value': threshold,
+        'active_cells': int(np.count_nonzero(active)),
+        'inactive_cells': int(np.count_nonzero(inactive)),
+        'active_occurrence_rate': active_rate,
+        'inactive_occurrence_rate': inactive_rate,
+        'active_inactive_ratio': ratio,
+        'active_inactive_difference': float(active_rate - inactive_rate) if np.isfinite(active_rate) and np.isfinite(inactive_rate) else np.nan,
+    })
+    return row
+
+
+def summarize_eulerian_associations(
+    summaries: dict[str, dict],
+    eke_euler: dict | np.ndarray,
+    *,
+    min_profiles_per_cell: int = 1,
+    active_proxy_quantile: float = 0.90,
+    regions: tuple[str, ...] | list[str] = ('global',),
+    save_data: bool = False,
+    output_dir: str | Path | None = None,
+    output_stem: str = 'eulerian_association_summary',
+) -> pd.DataFrame:
+    """汇总多个 detector 的 Eulerian EKE/META 描述性关联统计。
+
+    参数:
+        - summaries (dict[str, dict]): detector 名到 `build_euler_grid_summary` 输出的映射。
+        - eke_euler (dict | np.ndarray): 已缓存 EKE 重映射结果或 EKE 网格数组。
+        - min_profiles_per_cell (int): 纳入统计的每格最小 sampled-profile 数，默认 1。
+        - active_proxy_quantile (float): active proxy 的正值分位数，默认 0.90。
+        - regions (tuple[str, ...] | list[str]): 需要汇总的 region control 名称，默认仅 global。
+        - save_data (bool): 是否写 CSV，默认 False。
+        - output_dir (str | Path | None): CSV 输出目录；None 时使用 shared Eulerian summary 目录。
+        - output_stem (str): CSV 文件主干，默认 `eulerian_association_summary`。
+
+    返回:
+        - pd.DataFrame: 每行一个 detector-proxy-region 的 grid-cell association 结果。
+
+    输出:
+        - `<output_dir>/<output_stem>.csv`（save_data 时）。
+
+    说明:
+        - EKE 只作为 energetic environmental context；META eddy-days 只作为 gridded surface-eddy exposure。
+        - 所有相关系数及 nominal p 都是描述性 grid-cell 指标，不处理空间自相关，也不构成因果检验。
+    """
+    if not summaries:
+        raise ValueError("summaries must contain at least one detector summary.")
+    if min_profiles_per_cell < 1:
+        raise ValueError("min_profiles_per_cell must be at least 1.")
+    if not 0 < float(active_proxy_quantile) < 1:
+        raise ValueError("active_proxy_quantile must be between 0 and 1.")
+    rows = []
+    for detector, summary in summaries.items():
+        masks = _euler_region_masks(summary)
+        missing = set(regions).difference(masks)
+        if missing:
+            raise ValueError(f"Unsupported Eulerian regions: {sorted(missing)}")
+        for region in regions:
+            for proxy in ('GLORYS EKE', 'META eddy-days'):
+                rows.append(_euler_association_row(
+                    summary,
+                    detector=str(detector),
+                    proxy=proxy,
+                    eke_euler=eke_euler,
+                    min_profiles_per_cell=min_profiles_per_cell,
+                    active_proxy_quantile=active_proxy_quantile,
+                    region=region,
+                    region_mask=masks[region],
+                ))
+    table = pd.DataFrame(rows)
+    if save_data:
+        out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('eulerian_association_summary')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f'{output_stem}.csv'
+        table.to_csv(csv_path, index=False)
+        print(f"Eulerian association table saved: {csv_path}")
+    return table
+
+
+def summarize_euler_association_by_region(
+    summary: dict,
+    eke_euler: dict | np.ndarray,
+    *,
+    detector: str = 'DO50',
+    min_profiles_per_cell: int = 1,
+    active_proxy_quantile: float = 0.90,
+    save_data: bool = False,
+    output_dir: str | Path | None = None,
+    output_stem: str = 'eulerian_association_by_region',
+) -> pd.DataFrame:
+    """对单一 detector 执行全球、KE 与海盆留出 Eulerian association control。
+
+    参数:
+        - summary (dict): `build_euler_grid_summary` 的单一 detector 输出。
+        - eke_euler (dict | np.ndarray): 已缓存 EKE 重映射结果或 EKE 网格数组。
+        - detector (str): 结果表的 detector 标签，默认 `DO50`。
+        - min_profiles_per_cell (int): 每格最小 sampled-profile 数，默认 1。
+        - active_proxy_quantile (float): active proxy 的正值分位数，默认 0.90。
+        - save_data (bool): 是否写 CSV，默认 False。
+        - output_dir (str | Path | None): CSV 输出目录；None 时使用 shared Eulerian summary 目录。
+        - output_stem (str): CSV 文件主干，默认 `eulerian_association_by_region`。
+
+    返回:
+        - pd.DataFrame: global、KE、KE 留出和海盆 control 的关联统计。
+
+    输出:
+        - `<output_dir>/<output_stem>.csv`（save_data 时）。
+
+    说明:
+        - KE only 使用 140–170°E、25–45°N 的固定 box；其余海盆采用项目现有的粗略 basin 分类。
+        - 这是地理共同定位的敏感性检查，不是空间独立的显著性检验。
+    """
+    regions = ('global', 'KE only', 'global excluding KE', 'Pacific excluding KE', 'Atlantic', 'Southern Ocean')
+    table = summarize_eulerian_associations(
+        {detector: summary},
+        eke_euler,
+        min_profiles_per_cell=min_profiles_per_cell,
+        active_proxy_quantile=active_proxy_quantile,
+        regions=regions,
+        save_data=False,
+    )
+    if save_data:
+        out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('eulerian_association_summary')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f'{output_stem}.csv'
+        table.to_csv(csv_path, index=False)
+        print(f"Eulerian regional association table saved: {csv_path}")
+    return table
+
+
+def summarize_eulerian_association_sensitivity(
+    summary: dict,
+    eke_euler: dict | np.ndarray,
+    *,
+    detector: str = 'DO50',
+    min_profiles_values: tuple[int, ...] | list[int] = (1, 3, 5, 10),
+    active_proxy_quantiles: tuple[float, ...] | list[float] = (0.75, 0.90, 0.95),
+    save_data: bool = False,
+    output_dir: str | Path | None = None,
+    output_stem: str = 'eulerian_association_sensitivity',
+) -> pd.DataFrame:
+    """扫描 Eulerian GLORYS EKE association 的分母与 active-threshold 敏感性。
+
+    参数:
+        - summary (dict): `build_euler_grid_summary` 的单一 detector 输出。
+        - eke_euler (dict | np.ndarray): 已缓存 EKE 重映射结果或 EKE 网格数组。
+        - detector (str): 结果表的 detector 标签，默认 `DO50`。
+        - min_profiles_values (tuple[int, ...] | list[int]): 每格最小 profile 数扫描，默认 (1, 3, 5, 10)。
+        - active_proxy_quantiles (tuple[float, ...] | list[float]): EKE active 分位数扫描，默认 (0.75, 0.90, 0.95)。
+        - save_data (bool): 是否写 CSV，默认 False。
+        - output_dir (str | Path | None): CSV 输出目录；None 时使用 shared Eulerian summary 目录。
+        - output_stem (str): CSV 文件主干，默认 `eulerian_association_sensitivity`。
+
+    返回:
+        - pd.DataFrame: 每个分母阈值和 EKE active 分位数组合的描述性统计。
+
+    输出:
+        - `<output_dir>/<output_stem>.csv`（save_data 时）。
+
+    说明:
+        - 该敏感性表仅评估 EKE 的 descriptive co-location；不改变 anomaly detector，也不重跑输入缓存。
+    """
+    rows = []
+    for min_profiles in min_profiles_values:
+        for quantile in active_proxy_quantiles:
+            row = _euler_association_row(
+                summary,
+                detector=detector,
+                proxy='GLORYS EKE',
+                eke_euler=eke_euler,
+                min_profiles_per_cell=int(min_profiles),
+                active_proxy_quantile=float(quantile),
+                region='global',
+                region_mask=_euler_region_masks(summary)['global'],
+            )
+            row['active_proxy_quantile'] = float(quantile)
+            rows.append(row)
+    table = pd.DataFrame(rows)
+    if save_data:
+        out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('eulerian_association_summary')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f'{output_stem}.csv'
+        table.to_csv(csv_path, index=False)
+        print(f"Eulerian sensitivity table saved: {csv_path}")
+    return table
+
+
+def plot_eulerian_association_sensitivity(
+    table: pd.DataFrame,
+    *,
+    detector: str = 'DO50',
+    save_fig: bool = False,
+    show_fig: bool = True,
+    output_dir: str | Path | None = None,
+    output_name: str = 'eulerian_association_sensitivity_do50_eke',
+) -> dict:
+    """绘制 Eulerian EKE association 的简单敏感性图。
+
+    参数:
+        - table (pd.DataFrame): `summarize_eulerian_association_sensitivity` 的输出。
+        - detector (str): 图标题使用的 detector 标签，默认 `DO50`。
+        - save_fig (bool): 是否保存图像，默认 False。
+        - show_fig (bool): 是否显示图像，默认 True。
+        - output_dir (str | Path | None): 输出目录；None 时使用 shared Eulerian summary 目录。
+        - output_name (str): PNG 文件主干，默认 `eulerian_association_sensitivity_do50_eke`。
+
+    返回:
+        - dict: 含图路径和绘制的 active quantiles。
+
+    输出:
+        - `<output_dir>/<output_name>.png`（save_fig 时）。
+
+    说明:
+        - 图展示 Spearman rho 和 active/inactive aggregate occurrence-rate ratio；两者均为描述性敏感性指标。
+    """
+    required = {'min_profiles_per_cell', 'active_proxy_quantile', 'spearman_rho', 'active_inactive_ratio'}
+    missing = required.difference(table.columns)
+    if missing:
+        raise ValueError(f"Sensitivity table missing columns: {sorted(missing)}")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), constrained_layout=True)
+    quantiles = sorted(pd.to_numeric(table['active_proxy_quantile'], errors='coerce').dropna().unique())
+    for quantile in quantiles:
+        subset = table[np.isclose(pd.to_numeric(table['active_proxy_quantile'], errors='coerce'), quantile)].sort_values('min_profiles_per_cell')
+        label = f'active EKE q={float(quantile):.2f}'
+        axes[0].plot(subset['min_profiles_per_cell'], subset['spearman_rho'], marker='o', label=label)
+        axes[1].plot(subset['min_profiles_per_cell'], subset['active_inactive_ratio'], marker='o', label=label)
+    axes[0].axhline(0.0, color='0.45', linewidth=0.8)
+    axes[0].set(xlabel='Minimum sampled profiles per grid cell', ylabel='Spearman rho', title='Grid-cell rank co-location')
+    axes[1].axhline(1.0, color='0.45', linewidth=0.8)
+    axes[1].set(xlabel='Minimum sampled profiles per grid cell', ylabel='Active / inactive occurrence-rate ratio', title='Aggregate occurrence-rate contrast')
+    for axis in axes:
+        axis.set_xticks(sorted(pd.to_numeric(table['min_profiles_per_cell'], errors='coerce').dropna().unique()))
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8)
+    fig.suptitle(f'{detector} occurrence co-location sensitivity with GLORYS EKE', fontsize=13)
+    out = {'active_proxy_quantiles': [float(value) for value in quantiles]}
+    if save_fig:
+        out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('eulerian_association_summary')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in str(output_name)) or 'eulerian_association_sensitivity'
+        path = out_dir / f'{safe_name}.png'
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f"Eulerian sensitivity figure saved: {path}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
     return out
 
 
@@ -22363,17 +23760,13 @@ def analyze_euler_ace_ce_association(
         forward_uplift = st.get('do_rate_uplift_pct_eddy_active_vs_inactive', np.nan)
         reverse_uplift = st.get('eddy_days_uplift_pct_do_rate_high_vs_low', np.nan)
         rho = st.get('spearman_rho', np.nan)
-        rho_p = st.get('spearman_p', np.nan)
         dcor = st.get('distance_corr', np.nan)
-        rho_p_label = "p=nan"
-        if np.isfinite(rho_p):
-            rho_p_label = "p<0.0001" if rho_p < 1e-4 else f"p={rho_p:.4f}"
         ax.set_title(
             (
                 f"{title}\n"
                 f"Anomaly-rate uplift (eddy high vs low)={forward_uplift:.1f}%\n"
                 f"Eddy-days uplift (anomaly-rate high vs low)={reverse_uplift:.1f}%\n"
-                f"{rho_p_label} | rho={rho:.3f} | dCor={dcor:.3f}"
+                f"rho={rho:.3f} | dCor={dcor:.3f}"
             ),
             fontsize=12,
         )
@@ -22384,10 +23777,9 @@ def analyze_euler_ace_ce_association(
 
     fig.suptitle(
         (
-            f"Eddy - Argo Anomaly Association ({meta.get('region_key', 'region')}, "
+            f"{detection_label} occurrence co-location with META eddy-days ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"{detection_label}"
-            f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+            f"depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | eddy-days threshold ≥ {shared_threshold:g} day"
             f" | anomaly-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
         ),
@@ -22510,7 +23902,7 @@ def analyze_euler_eke_do_association(
     说明:
         分析输出:
 
-            - 两张图：EKE 与 Argo Anomaly Occurrence Rate 概览图、EKE-Anomaly Association 图。
+            - 两张图：EKE 与 Argo Anomaly Occurrence Rate 概览图、Grid-wise EKE / occurrence co-location 图。
             - 双向 uplift：正向 anomaly-rate uplift（EKE active vs inactive）、反向 EKE uplift（anomaly-rate high vs low）。
     """
     grid = summary['grid']
@@ -22599,10 +23991,9 @@ def analyze_euler_eke_do_association(
     )
 
     suptitle_summary = (
-        f"EKE & Argo Anomaly Summary ({meta.get('region_key', 'region')}, "
+        f"{detection_label} occurrence co-location with GLORYS EKE ({meta.get('region_key', 'region')}, "
         f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-        f"{detection_label}"
-        f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+        f"depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
         f" | EKE threshold ≥ {active_thr:.4e}"
         f" | anomaly-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}"
     )
@@ -22672,24 +24063,20 @@ def analyze_euler_eke_do_association(
         transform=data_crs,
         zorder=2,
     )
-    ax.set_title('EKE-Anomaly Association', fontsize=12)
+    ax.set_title('Grid-wise EKE / occurrence co-location', fontsize=12)
     ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
     cbar_assoc = fig_assoc.colorbar(hm, ax=ax, orientation='horizontal', fraction=0.05, pad=0.08)
     cbar_assoc.set_label('z(EKE) * z(AnomalyRate)', fontsize=11)
-    spearman_p_label = "p=nan"
-    if np.isfinite(spearman_p):
-        spearman_p_label = "p<0.0001" if spearman_p < 1e-4 else f"p={spearman_p:.4f}"
     fig_assoc.suptitle(
         (
-            f"EKE - Argo Anomaly Association ({meta.get('region_key', 'region')}, "
+            f"{detection_label} occurrence co-location with GLORYS EKE ({meta.get('region_key', 'region')}, "
             f"{meta.get('start_year', '')}-{meta.get('end_year', '')})\n"
-            f"{detection_label}"
-            f" | depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
+            f"depth ≥ {meta.get('anomaly_min_depth', np.nan):g} m"
             f" | EKE threshold ≥ {active_thr:.4e}"
             f" | anomaly-rate threshold ≥ {do_rate_thr if np.isfinite(do_rate_thr) else np.nan:.4f}\n"
             f"Anomaly-rate uplift (EKE high vs low)={uplift_pct:.1f}%"
             f" | EKE uplift (anomaly-rate high vs low)={eke_uplift_pct:.1f}%\n"
-            f"{spearman_p_label} | rho={spearman_rho:.3f} | dCor={distance_corr:.3f}"
+            f"rho={spearman_rho:.3f} | dCor={distance_corr:.3f}"
         ),
         fontsize=14,
     )
@@ -24783,6 +26170,468 @@ def plot_detector_relaxation_summary(
         fig.savefig(fpath, dpi=160, bbox_inches='tight')
         out['figure_path'] = str(fpath)
         print(f"[*] Detector relaxation figure saved: {fpath}")
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def summarize_do_threshold_sweep(
+    start_year: int = 2002,
+    end_year: int = 2023,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    *,
+    anomaly_min_depth: float = 300.0,
+    ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
+    ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
+    save_report: bool = True,
+    output_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """汇总 DO detector 在不同 ΔDO 阈值下的筛选漏斗。
+
+    该函数只读取 `plot_argo_hotspots` 已经保存的 DO anomalies parquet，不重新做异常检测。
+    它把 DO20 / DO35 / DO50 等同一 detector 的不同阈值放到同一分母下比较，用于会议叙事中
+    “阈值越严格，结果越从全球画布收紧到 KE”的干净控制实验。
+
+    参数:
+        - start_year (int): 统计起始年份，默认 2002。
+        - end_year (int): 统计结束年份，默认 2023。
+        - thresholds (tuple[float, ...] | list[float]): 需要比较的 ΔDO 阈值，默认 `(20, 35, 50)`。
+        - anomaly_min_depth (float): 异常峰最浅深度阈值，默认 300 m。
+        - ke_lon_bounds (tuple[float, float]): KE/OFES 叙事盒经度范围，默认 `(140, 170)`。
+        - ke_lat_bounds (tuple[float, float]): KE/OFES 叙事盒纬度范围，默认 `(25, 45)`。
+        - save_report (bool): 是否保存 parquet/csv/txt 三种摘要文件，默认 True。
+        - output_dir (str | Path | None): 输出目录；None 时使用 `plot_outputs/do/<region>/do_threshold_sweep_summary`。
+
+    返回:
+        - pd.DataFrame: 每行一个 ΔDO 阈值，含筛出率、META 入涡率、海盆占比、KE 占比和严格阈值重叠率。
+
+    输出:
+        - `plot_outputs/do/<region>/do_threshold_sweep_summary/do_threshold_sweep_summary_<y0>_<y1>_depth<z>m.parquet`（save_report 时）。
+        - `plot_outputs/do/<region>/do_threshold_sweep_summary/do_threshold_sweep_summary_<y0>_<y1>_depth<z>m.csv`（save_report 时）。
+        - `plot_outputs/do/<region>/do_threshold_sweep_summary/do_threshold_sweep_summary_<y0>_<y1>_depth<z>m.txt`（save_report 时）。
+
+    说明:
+        - 需要先有共享分母文件 `all_region_argo_<y0>_<y1>.parquet` 与 `all_interacting_argo_<y0>_<y1>.parquet`。
+        - 该函数是 DO-only 控制实验；AOU/TRIM 应继续作为 detector-neutral cross-check，而不是阈值档位。
+    """
+    from scipy.stats import fisher_exact
+
+    threshold_values = sorted({float(t) for t in thresholds})
+    if not threshold_values:
+        raise ValueError("thresholds must contain at least one value.")
+
+    region_slug = _current_region_key()
+    stat_dir = _shared_output_dir("statistics", region_slug)
+    region_path = stat_dir / f"all_region_argo_{start_year}_{end_year}.parquet"
+    interact_path = stat_dir / f"all_interacting_argo_{start_year}_{end_year}.parquet"
+    if not region_path.exists():
+        raise FileNotFoundError(f"Missing shared Argo denominator parquet: {region_path}")
+    if not interact_path.exists():
+        raise FileNotFoundError(f"Missing shared META interaction parquet: {interact_path}")
+
+    region_df = pd.read_parquet(region_path)
+    interact_df = pd.read_parquet(interact_path)
+    base_ids = set(region_df['Profile_number'].unique())
+    inter_ids = set(interact_df['Profile_number'].unique()) & base_ids
+    n_base = len(base_ids)
+    n_base_in = len(inter_ids)
+    baseline_meta_pct = 100.0 * n_base_in / n_base if n_base else np.nan
+
+    rows: list[dict] = []
+    id_sets: dict[float, set] = {}
+    for threshold in threshold_values:
+        cfg = make_detection_config(
+            'do',
+            do_threshold=float(threshold),
+            anomaly_min_depth=float(anomaly_min_depth),
+        )
+        run_tag = cfg.file_stem()
+        anomalies_path = (
+            cfg.output_dir("plot_argo_hotspots", region_slug)
+            / f"anomalies_{start_year}_{end_year}_{run_tag}.parquet"
+        )
+        if not anomalies_path.exists():
+            raise FileNotFoundError(
+                f"Missing anomalies parquet for ΔDO threshold {threshold:g}: {anomalies_path}"
+            )
+
+        anomalies = pd.read_parquet(anomalies_path)
+        if 'detection_method' in anomalies.columns:
+            anomalies = anomalies[
+                anomalies['detection_method'].astype(str).str.lower().eq('do')
+            ].copy()
+        if 'Profile_number' not in anomalies.columns:
+            raise ValueError(f"Anomalies parquet lacks Profile_number: {anomalies_path}")
+
+        anomalies = anomalies[anomalies['Profile_number'].isin(base_ids)].copy()
+        anomalies = anomalies.drop_duplicates(subset=['Profile_number'])
+        anomaly_ids = set(anomalies['Profile_number'].unique())
+        id_sets[threshold] = anomaly_ids
+        n_anom = len(anomaly_ids)
+        n_anom_in = len(anomaly_ids & inter_ids)
+        anomaly_pct = 100.0 * n_anom / n_base if n_base else np.nan
+        anomaly_meta_pct = 100.0 * n_anom_in / n_anom if n_anom else np.nan
+
+        if n_base and n_anom:
+            odds_ratio, p_value = fisher_exact(
+                [[n_anom_in, n_anom - n_anom_in],
+                 [n_base_in, n_base - n_base_in]]
+            )
+        else:
+            odds_ratio, p_value = np.nan, np.nan
+
+        lons = pd.to_numeric(anomalies.get('Longitude'), errors='coerce')
+        lats = pd.to_numeric(anomalies.get('Latitude'), errors='coerce')
+        basin = pd.Series(
+            [_residual_basin_of(la, lo) if np.isfinite(la) and np.isfinite(lo) else None
+             for la, lo in zip(lats, lons)],
+            index=anomalies.index,
+            dtype='object',
+        )
+        basin_names = ('Pacific', 'Atlantic', 'Indian', 'SO', 'Arctic')
+        basin_counts = {
+            bn: int((basin == bn).sum())
+            for bn in basin_names
+        }
+        ke_mask = (
+            _region_lon_mask(lons.to_numpy(dtype=float), ke_lon_bounds[0], ke_lon_bounds[1])
+            & (lats.to_numpy(dtype=float) >= float(ke_lat_bounds[0]))
+            & (lats.to_numpy(dtype=float) <= float(ke_lat_bounds[1]))
+        )
+        ke_n = int(np.nansum(ke_mask))
+
+        row = {
+            'threshold': float(threshold),
+            'method': 'do',
+            'file_stem': run_tag,
+            'criteria': cfg.threshold_label(),
+            'anomalies_path': str(anomalies_path),
+            'n_baseline': int(n_base),
+            'n_baseline_in_meta': int(n_base_in),
+            'baseline_meta_pct': float(baseline_meta_pct),
+            'n_anomaly': int(n_anom),
+            'anomaly_pct_of_baseline': float(anomaly_pct),
+            'n_anomaly_in_meta': int(n_anom_in),
+            'anomaly_meta_pct': float(anomaly_meta_pct),
+            'meta_odds_ratio_vs_baseline': float(odds_ratio),
+            'meta_p_value_vs_baseline': float(p_value),
+            'ke_box_n': int(ke_n),
+            'ke_box_pct': float(100.0 * ke_n / n_anom) if n_anom else np.nan,
+        }
+        for bn, count in basin_counts.items():
+            row[f'basin_{bn}_n'] = count
+            row[f'basin_{bn}_pct'] = float(100.0 * count / n_anom) if n_anom else np.nan
+        rows.append(row)
+
+    summary = pd.DataFrame(rows).sort_values('threshold').reset_index(drop=True)
+    strict_threshold = max(threshold_values)
+    strict_ids = id_sets.get(strict_threshold, set())
+    if strict_ids:
+        for idx, row in summary.iterrows():
+            ids = id_sets.get(float(row['threshold']), set())
+            overlap_n = len(ids & strict_ids)
+            n_method = len(ids)
+            summary.at[idx, 'overlap_with_strict_n'] = int(overlap_n)
+            summary.at[idx, 'overlap_with_strict_pct_of_method'] = (
+                float(100.0 * overlap_n / n_method) if n_method else np.nan
+            )
+            summary.at[idx, 'strict_coverage_pct'] = (
+                float(100.0 * overlap_n / len(strict_ids)) if strict_ids else np.nan
+            )
+
+    if save_report:
+        cfg_for_dir = make_detection_config(
+            'do',
+            do_threshold=strict_threshold,
+            anomaly_min_depth=float(anomaly_min_depth),
+        )
+        out_dir = (
+            Path(output_dir) if output_dir is not None
+            else cfg_for_dir.output_dir("do_threshold_sweep_summary", region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        depth_tag = _format_detection_value(float(anomaly_min_depth))
+        stem = f"do_threshold_sweep_summary_{start_year}_{end_year}_depth{depth_tag}m"
+        parquet_path = out_dir / f"{stem}.parquet"
+        csv_path = out_dir / f"{stem}.csv"
+        txt_path = out_dir / f"{stem}.txt"
+        summary.to_parquet(parquet_path, index=False)
+        summary.to_csv(csv_path, index=False)
+        lines = [
+            f"DO threshold sweep summary ({start_year}-{end_year})",
+            f"Region: {region_slug}",
+            f"Depth: >= {float(anomaly_min_depth):g} m",
+            f"Baseline META surface-eddy rate: {n_base_in}/{n_base} = {baseline_meta_pct:.2f}%",
+            "",
+        ]
+        for rec in summary.to_dict('records'):
+            lines.append(
+                f"DO{rec['threshold']:g}: "
+                f"n={int(rec['n_anomaly'])} ({rec['anomaly_pct_of_baseline']:.2f}% of baseline), "
+                f"META={rec['n_anomaly_in_meta']}/{int(rec['n_anomaly'])} "
+                f"({rec['anomaly_meta_pct']:.2f}%, OR={rec['meta_odds_ratio_vs_baseline']:.2f}), "
+                f"KE box={int(rec['ke_box_n'])} ({rec['ke_box_pct']:.2f}%), "
+                f"Pacific/Atlantic/Indian/SO/Arctic="
+                f"{rec['basin_Pacific_pct']:.1f}/"
+                f"{rec['basin_Atlantic_pct']:.1f}/"
+                f"{rec['basin_Indian_pct']:.1f}/"
+                f"{rec['basin_SO_pct']:.1f}/"
+                f"{rec['basin_Arctic_pct']:.1f}%"
+            )
+        txt_path.write_text("\n".join(lines) + "\n")
+        print(f"[*] DO threshold sweep summary saved: {parquet_path}")
+        print(f"[*] DO threshold sweep summary saved: {csv_path}")
+        print(f"[*] DO threshold sweep summary saved: {txt_path}")
+
+    return summary
+
+
+def plot_do_threshold_counts_and_composition(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    start_year: int = 2002,
+    end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 DO 阈值漏斗的异常数量与地理组成。
+
+    左图显示 DO20、DO35、DO50 的异常 profile 数；右图显示海盆组成，并以单独折线标出 KE box
+    占比。该图只回答 detector 收紧后候选集合如何缩小和重新分布，不混入 META membership。
+
+    参数:
+        - summary (pd.DataFrame | None): `summarize_do_threshold_sweep` 输出；None 时读取路径或默认表。
+        - summary_path (str | Path | None): 摘要 parquet/CSV；None 时定位默认 parquet。
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 thresholds、n_anomaly、ke_box_pct 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_do_threshold_counts_and_composition/do_threshold_counts_and_composition_<y0>_<y1>_depth<z>m.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    if summary is None:
+        if summary_path is None:
+            summary_path = (
+                make_detection_config('do').output_dir('do_threshold_sweep_summary', region_slug)
+                / f'do_threshold_sweep_summary_{start_year}_{end_year}_depth{depth_tag}m.parquet'
+            )
+        source = Path(summary_path)
+        summary = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    else:
+        summary = summary.copy()
+    summary = summary.sort_values('threshold').reset_index(drop=True)
+    if summary.empty:
+        raise ValueError('summary is empty.')
+
+    x = np.arange(len(summary))
+    labels = [f'DO{float(value):g}' for value in summary['threshold']]
+    basin_order = ['Pacific', 'Atlantic', 'Indian', 'SO', 'Arctic']
+    basin_colors = {
+        'Pacific': '#4c78a8',
+        'Atlantic': '#f58518',
+        'Indian': '#54a24b',
+        'SO': '#b279a2',
+        'Arctic': '#72b7b2',
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.9), constrained_layout=True)
+    bars = axes[0].bar(x, summary['n_anomaly'], color=['#9ca3af', '#6b7280', '#374151'])
+    axes[0].set_xticks(x, labels)
+    axes[0].set_ylabel('Selected anomaly profiles')
+    axes[0].set_title('Candidate yield')
+    axes[0].grid(axis='y', alpha=0.25)
+    for bar, count in zip(bars, summary['n_anomaly']):
+        axes[0].text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f'{int(count):,}',
+            ha='center',
+            va='bottom',
+        )
+
+    bottom = np.zeros(len(summary), dtype=float)
+    for basin in basin_order:
+        values = pd.to_numeric(summary[f'basin_{basin}_pct'], errors='coerce').to_numpy(dtype=float)
+        axes[1].bar(x, values, bottom=bottom, color=basin_colors[basin], label=basin)
+        bottom += np.nan_to_num(values)
+    axes[1].plot(
+        x,
+        summary['ke_box_pct'],
+        color='black',
+        marker='D',
+        linewidth=1.5,
+        label='KE box',
+    )
+    axes[1].set_xticks(x, labels)
+    axes[1].set_ylim(0, 100)
+    axes[1].set_ylabel('Share of selected profiles (%)')
+    axes[1].set_title('Broad geographic composition')
+    axes[1].grid(axis='y', alpha=0.25)
+    axes[1].legend(fontsize=8, ncol=2, loc='upper right')
+    fig.suptitle(
+        f'Deep ΔDO threshold funnel ({start_year}-{end_year}, depth ≥ {float(anomaly_min_depth):g} m)'
+    )
+
+    out = {
+        'thresholds': [float(value) for value in summary['threshold']],
+        'n_anomaly': [int(value) for value in summary['n_anomaly']],
+        'ke_box_pct': [float(value) for value in summary['ke_box_pct']],
+    }
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'plot_do_threshold_counts_and_composition', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            f'do_threshold_counts_and_composition_{start_year}_{end_year}_depth{depth_tag}m.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] DO threshold counts/composition figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_do_threshold_meta_association(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    start_year: int = 2002,
+    end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 anomaly-centered 的 `P(META | DO_t)` 阈值比较。
+
+    y 轴从零开始，虚线给出全部 Argo profile 的 META membership baseline；每个阈值显示准确
+    numerator/denominator 与 95% Wilson 区间。该图不与 group-centered SCV carrier frequency 混用。
+
+    参数:
+        - summary (pd.DataFrame | None): `summarize_do_threshold_sweep` 输出；None 时读取路径或默认表。
+        - summary_path (str | Path | None): 摘要 parquet/CSV；None 时定位默认 parquet。
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含 baseline membership、各阈值 counts/rates 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_do_threshold_meta_association/do_threshold_meta_association_<y0>_<y1>_depth<z>m.png`（save_fig 时）。
+    """
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    if summary is None:
+        if summary_path is None:
+            summary_path = (
+                make_detection_config('do').output_dir('do_threshold_sweep_summary', region_slug)
+                / f'do_threshold_sweep_summary_{start_year}_{end_year}_depth{depth_tag}m.parquet'
+            )
+        source = Path(summary_path)
+        summary = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    else:
+        summary = summary.copy()
+    summary = summary.sort_values('threshold').reset_index(drop=True)
+    if summary.empty:
+        raise ValueError('summary is empty.')
+
+    rates = pd.to_numeric(summary['anomaly_meta_pct'], errors='coerce').to_numpy(dtype=float)
+    ci_low = []
+    ci_high = []
+    for successes, total in zip(summary['n_anomaly_in_meta'], summary['n_anomaly']):
+        low, high = _binomial_wilson_interval(int(successes), int(total))
+        ci_low.append(100.0 * low)
+        ci_high.append(100.0 * high)
+    ci_low = np.asarray(ci_low)
+    ci_high = np.asarray(ci_high)
+    x = np.arange(len(summary))
+    labels = [f'DO{float(value):g}' for value in summary['threshold']]
+    baseline = float(summary['baseline_meta_pct'].iloc[0])
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.2))
+    bars = ax.bar(
+        x,
+        rates,
+        color=['#fbbf24', '#f59e0b', '#d97706'],
+        yerr=[rates - ci_low, ci_high - rates],
+        capsize=5,
+    )
+    ax.axhline(
+        baseline,
+        color='0.35',
+        linestyle='--',
+        linewidth=1.4,
+        label=f'All-Argo baseline: {baseline:.2f}%',
+    )
+    ax.set_xticks(x, labels)
+    ax.set_ylim(0, max(60.0, float(np.nanmax(ci_high)) * 1.15))
+    ax.set_ylabel('Anomaly profiles inside a META surface eddy (%)')
+    ax.set_title('META membership is modest and non-monotonic across DO thresholds')
+    ax.grid(axis='y', alpha=0.25)
+    ax.legend(frameon=False)
+    for bar, rate, successes, total in zip(
+        bars,
+        rates,
+        summary['n_anomaly_in_meta'],
+        summary['n_anomaly'],
+    ):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 1.0,
+            f'{rate:.2f}%\n{int(successes):,}/{int(total):,}',
+            ha='center',
+            va='bottom',
+            fontsize=9,
+        )
+    fig.tight_layout()
+
+    out = {
+        'baseline_meta_pct': baseline,
+        'thresholds': [float(value) for value in summary['threshold']],
+        'counts': [
+            {'numerator': int(successes), 'denominator': int(total), 'rate_pct': float(rate)}
+            for successes, total, rate in zip(
+                summary['n_anomaly_in_meta'], summary['n_anomaly'], rates
+            )
+        ],
+    }
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'plot_do_threshold_meta_association', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            f'do_threshold_meta_association_{start_year}_{end_year}_depth{depth_tag}m.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] DO threshold META association figure saved: {path}')
     if show_fig:
         plt.show()
     plt.close(fig)
