@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.ticker import FormatStrFormatter
 from matplotlib.path import Path as MplPath
 import geopandas as gpd
 import inspect
@@ -28,6 +29,7 @@ import shutil
 from dataclasses import dataclass, field
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
+from matplotlib.text import Text
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster, as_completed
 from dask import delayed, compute
@@ -697,6 +699,106 @@ def _load_basemap_colors() -> dict:
     return merged
 
 _BASEMAP_COLORS = _load_basemap_colors()
+
+def _load_plot_mapping(name: str, defaults: dict) -> dict:
+    """加载 plot 下的有限键值映射，并对缺失或非法配置使用默认值。"""
+    plot_cfg = _PROC_CFG.get('plot', {}) if isinstance(_PROC_CFG, dict) else {}
+    raw = plot_cfg.get(name, {}) if isinstance(plot_cfg, dict) else {}
+    merged = defaults.copy()
+    if isinstance(raw, dict):
+        merged.update({key: str(value) for key, value in raw.items() if key in defaults})
+    return merged
+
+
+def _load_plot_typography() -> dict:
+    """加载会议图使用的集中字体与字号配置。"""
+    defaults = {
+        'figure_title': 18,
+        'panel_title': 15,
+        'axis_label': 13,
+        'tick_legend': 11,
+        'annotation': 10,
+        'font_family': 'sans-serif',
+    }
+    plot_cfg = _PROC_CFG.get('plot', {}) if isinstance(_PROC_CFG, dict) else {}
+    raw = plot_cfg.get('typography', {}) if isinstance(plot_cfg, dict) else {}
+    merged = defaults.copy()
+    if isinstance(raw, dict):
+        for key in defaults:
+            if key not in raw:
+                continue
+            if key == 'font_family':
+                merged[key] = str(raw[key])
+            else:
+                try:
+                    merged[key] = int(raw[key])
+                except (TypeError, ValueError):
+                    pass
+    return merged
+
+
+_PLOT_TYPOGRAPHY = _load_plot_typography()
+_THRESHOLD_COLORS = _load_plot_mapping(
+    'threshold_colors',
+    {'DO20': '#6b7280', 'DO35': '#d97706', 'DO50': '#b91c1c'},
+)
+_THRESHOLD_MARKERS = _load_plot_mapping(
+    'threshold_markers',
+    {'DO20': 'o', 'DO35': 's', 'DO50': 'D'},
+)
+_GROUP_COLORS = _load_plot_mapping(
+    'group_colors',
+    {'baseline': '#6b7280', 'meta': '#d97706', 'scv': '#b91c1c'},
+)
+_CARRIER_DISTRIBUTION_COLORS = _load_plot_mapping(
+    'carrier_distribution_colors',
+    {'DO20': '#3478a8', 'DO35': '#d97706', 'DO50': '#b91c1c'},
+)
+_REPRESENTATION_STATUS_COLORS = _load_plot_mapping(
+    'representation_status_colors',
+    {
+        'both_criteria_met': '#737373',
+        'meta_criterion_not_met': '#2b6cb0',
+        'glorys_criterion_not_met': '#dd6b20',
+        'neither_criterion_met': '#c53030',
+        'status_unavailable': '#7c3aed',
+    },
+)
+
+
+def _apply_plot_typography(fig) -> None:
+    """将配置中的默认字体族应用到一个已构建的活动图。"""
+    family = _PLOT_TYPOGRAPHY['font_family']
+    for text in fig.findobj(match=Text):
+        text.set_fontfamily(family)
+
+
+def _threshold_style(value_or_label) -> tuple[str, str, str, str]:
+    """返回 threshold 的存储键、显示标签、颜色和 marker。"""
+    text = str(value_or_label).upper()
+    match = re.fullmatch(r'(?:Δ?DO)?\s*(\d+(?:\.\d+)?)', text)
+    if match is None:
+        value = 50.0
+    else:
+        value = float(match.group(1))
+    key = f'DO{int(value):g}' if value.is_integer() else f'DO{value:g}'
+    display = f'ΔDO{value:g}'
+    return key, display, _THRESHOLD_COLORS.get(key, '#6b7280'), _THRESHOLD_MARKERS.get(key, 'o')
+
+
+def _apply_axis_typography(ax) -> None:
+    """应用活动坐标轴的 tick/label 默认字号。"""
+    ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
+
+
+def _apply_gridline_typography(gridlines) -> None:
+    """应用活动地图网格标签的字号与字体族。"""
+    style = {
+        'size': _PLOT_TYPOGRAPHY['tick_legend'],
+        'family': _PLOT_TYPOGRAPHY['font_family'],
+    }
+    gridlines.xlabel_style = style.copy()
+    gridlines.ylabel_style = style.copy()
 
 def _load_euler_grid_plot_config() -> dict:
     """加载欧拉网格汇总图的显示样式配置。"""
