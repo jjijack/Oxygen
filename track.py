@@ -13153,6 +13153,7 @@ def plot_all_tracks_in_range(
     gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
     gl.top_labels = False
     gl.right_labels = False
+    _apply_gridline_typography(gl)
 
     # 地图范围处理（跨日界线时扩展 longitude）
     lon_extent_min = lonmin
@@ -14693,7 +14694,7 @@ def plot_argo_hotspots(
         gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
         gl.top_labels = False
         gl.right_labels = False
-
+        _apply_gridline_typography(gl)
         # 设定范围（处理跨日界线）
         lon_extent_min = lonmin
         lon_extent_max = lonmax
@@ -18466,39 +18467,51 @@ def plot_mccoy_datagap_atlas(
     mm = d['meta_miss'].astype(bool)
 
     fig = plt.figure(figsize=(17, 6.5))
-    ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    grid_spec = fig.add_gridspec(1, 2, width_ratios=(1.35, 1.0), wspace=0.14)
+    ax = fig.add_subplot(grid_spec[0, 0], projection=ccrs.PlateCarree(central_longitude=180))
     ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
     ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
     ax.set_global()
-    cats = [(~gm & ~mm, '0.6', 'seen by both', 3, 10),
-            (~gm & mm, 'tab:blue', 'META misses only', 4, 12),
-            (gm & ~mm, 'tab:orange', 'GLORYS misses only', 5, 12),
-            (gm & mm, 'tab:red', 'both miss', 6, 14)]
+    cats = [
+        (~gm & ~mm, _REPRESENTATION_STATUS_COLORS['both_criteria_met'], 'seen by both', 3, 10),
+        (~gm & mm, _REPRESENTATION_STATUS_COLORS['meta_criterion_not_met'], 'META misses only', 4, 12),
+        (gm & ~mm, _REPRESENTATION_STATUS_COLORS['glorys_criterion_not_met'], 'GLORYS misses only', 5, 12),
+        (gm & mm, _REPRESENTATION_STATUS_COLORS['neither_criterion_met'], 'both miss', 6, 14),
+    ]
     for sel, col, lab, z, s in cats:
         ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=s, c=col, edgecolor='k',
                    linewidth=0.15, transform=ccrs.PlateCarree(),
                    label=f'{lab} ({int(sel.sum())})', zorder=z)
-    ax.legend(loc='lower left', fontsize=7, ncol=2)
-    ax.set_title(f'McCoy SCVs by data gap (n={len(d)})')
+    ax.legend(
+        loc='upper left',
+        bbox_to_anchor=(0.0, -0.13),
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        ncol=2,
+        borderaxespad=0,
+    )
+    ax.set_title(f'McCoy SCVs by data gap (n={len(d)})', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
 
-    ax2 = fig.add_subplot(1, 2, 2)
+    ax2 = fig.add_subplot(grid_spec[0, 1])
     mat = np.array([[int((gm & mm).sum()), int((gm & ~mm).sum())],
                     [int((~gm & mm).sum()), int((~gm & ~mm).sum())]])
     im = ax2.imshow(mat, cmap='Reds')
     ax2.set_xticks([0, 1]); ax2.set_xticklabels(['META misses', 'META catches'])
-    ax2.set_yticks([0, 1]); ax2.set_yticklabels(['GLORYS misses', 'GLORYS catches'])
+    ax2.set_yticks([0, 1]); ax2.set_yticklabels(['GLORYS\nmisses', 'GLORYS\ncatches'])
     tot = mat.sum()
     for i in range(2):
         for j in range(2):
             ax2.text(j, i, f'{mat[i, j]}\n{100 * mat[i, j] / tot:.0f}%', ha='center', va='center',
-                     fontsize=13, color='white' if mat[i, j] > mat.max() * 0.6 else 'black')
-    ax2.set_title('GLORYS × META contingency')
-    fig.colorbar(im, ax=ax2, shrink=0.8, label='count')
+                     fontsize=_PLOT_TYPOGRAPHY['annotation'], color='white' if mat[i, j] > mat.max() * 0.6 else 'black')
+    ax2.set_title('GLORYS × META contingency', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    cbar = fig.colorbar(im, ax=ax2, shrink=0.8)
+    cbar.set_label('count', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
 
     fig.suptitle(f"GLORYS/META miss {len(d)} McCoy SCVs  |  GLORYS {100*gm.mean():.0f}%  "
                  f"META {100*mm.mean():.0f}%  both {100*(gm & mm).mean():.0f}%  "
-                 f"≥1 {100*(gm | mm).mean():.0f}%", fontsize=13, y=0.99)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+                 f"≥1 {100*(gm | mm).mean():.0f}%", fontsize=_PLOT_TYPOGRAPHY['figure_title'], y=0.99)
+    _apply_plot_typography(fig)
+    fig.tight_layout(rect=(0, 0.13, 1, 0.95), w_pad=0.8)
 
     out = {'n_scv': int(len(d)), 'glorys_miss': int(gm.sum()),
            'meta_miss': int(mm.sum()), 'both_miss': int((gm & mm).sum())}
@@ -18564,12 +18577,20 @@ def plot_mccoy_do_enrichment(
     seen_pct = 100 * do[~gm].mean() if (~gm).any() else np.nan
 
     fig, ax = plt.subplots(figsize=(6, 5.2))
-    ax.bar([f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
-           [miss_pct, seen_pct], color=['tab:red', '0.6'])
+    ax.bar(
+        [f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
+        [miss_pct, seen_pct],
+        color=[_GROUP_COLORS['scv'], _GROUP_COLORS['baseline']],
+    )
     for i, v in enumerate([miss_pct, seen_pct]):
-        ax.text(i, v + 0.3, f'{v:.1f}%', ha='center', fontsize=11)
-    ax.set_ylabel('carry significant δDO %')
-    ax.set_title(f'δDO in GLORYS-missed vs seen McCoy SCVs (n={len(d)})')
+        ax.text(i, v + 0.3, f'{v:.1f}%', ha='center', fontsize=_PLOT_TYPOGRAPHY['annotation'])
+    ax.set_ylabel('Profiles carrying a deep ΔDO anomaly (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    ax.set_title(
+        f'ΔDO in GLORYS-missed vs seen McCoy SCVs (n={len(d)})',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
 
     out = {'n_with_do': int(len(d)), 'miss_do_pct': round(float(miss_pct), 1),
            'seen_do_pct': round(float(seen_pct), 1)}
@@ -22077,9 +22098,9 @@ def plot_euler_occurrence_comparison(
         ax.add_feature(cfeature.OCEAN, facecolor=base_ocean, zorder=0)
         ax.add_feature(cfeature.LAND, facecolor=base_land, edgecolor=coast_color, linewidth=0.5, zorder=0)
         ax.add_feature(cfeature.COASTLINE, linewidth=0.7, edgecolor=coast_color, zorder=1)
-        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
-        gl.top_labels = False
-        gl.right_labels = False
+        ax.gridlines(draw_labels=False, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
+        ax.set_xticks([])
+        ax.set_yticks([])
 
         analysis_mask = np.asarray(summary.get('analysis_mask'), dtype=bool) if 'analysis_mask' in summary else None
         if analysis_mask is not None:
@@ -22102,11 +22123,13 @@ def plot_euler_occurrence_comparison(
             transform=data_crs,
             zorder=2,
         )
-        ax.set_title(str(label), fontsize=12)
+        ax.set_title(str(label), fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+        _apply_axis_typography(ax)
         ax.set_extent([lon_extent_min, lon_extent_max, float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
 
     cbar = fig.colorbar(mappable, ax=axes, orientation='horizontal', fraction=0.055, pad=0.08)
-    cbar.set_label('Anomaly Occurrence Rate per Grid Cell', fontsize=11)
+    cbar.set_label('Anomaly Occurrence Rate per Grid Cell', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
 
     meta0 = summaries[0].get('meta', {})
     if title is None:
@@ -22114,7 +22137,8 @@ def plot_euler_occurrence_comparison(
             f"Eulerian Anomaly Occurrence Comparison "
             f"({meta0.get('region_key', _current_region_key())}, {meta0.get('start_year')}-{meta0.get('end_year')})"
         )
-    fig.suptitle(title, fontsize=14)
+    fig.suptitle(title, fontsize=_PLOT_TYPOGRAPHY['figure_title'])
+    _apply_plot_typography(fig)
 
     out = {
         'labels': list(labels),
@@ -22252,9 +22276,9 @@ def plot_do_threshold_eke_spatial_comparison(
     fig, axes = plt.subplots(
         2,
         2,
-        figsize=(14.2, 8.4),
+        figsize=(16.8, 8.8),
         subplot_kw={'projection': map_crs},
-        constrained_layout=True,
+        layout='compressed',
     )
     flat_axes = axes.ravel()
     for ax in flat_axes:
@@ -22268,15 +22292,6 @@ def plot_do_threshold_eke_spatial_comparison(
             zorder=4,
         )
         ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.55, zorder=5)
-        gridlines = ax.gridlines(
-            draw_labels=True,
-            linewidth=0.35,
-            color=_BASEMAP_COLORS['grid'],
-            alpha=0.4,
-            linestyle='--',
-        )
-        gridlines.top_labels = False
-        gridlines.right_labels = False
         ax.set_extent(
             [float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])],
             crs=data_crs,
@@ -22293,11 +22308,15 @@ def plot_do_threshold_eke_spatial_comparison(
         transform=data_crs,
         zorder=2,
     )
-    flat_axes[0].set_title('GLORYS mean EKE: mesoscale-active context')
+    flat_axes[0].set_title(
+        'GLORYS mean EKE',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
     occurrence_map = None
     for ax, summary, display, label in zip(
         flat_axes[1:], summaries, occurrence_displays, labels
     ):
+        _, display_label, _, _ = _threshold_style(label)
         _plot_mask_background(
             ax,
             lon_mesh,
@@ -22328,17 +22347,24 @@ def plot_do_threshold_eke_spatial_comparison(
                 zorder=3,
             )
         n_anomaly = int(np.nansum(np.asarray(summary['anomaly_profiles'], dtype=float)))
-        ax.set_title(f'{label} occurrence rate (n={n_anomaly:,})')
+        ax.set_title(
+            f'{display_label} occurrence rate (n={n_anomaly:,})',
+            fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+        )
+        _apply_axis_typography(ax)
 
     cbar_eke = fig.colorbar(
         eke_map,
         ax=flat_axes[0],
-        orientation='horizontal',
-        fraction=0.06,
-        pad=0.08,
+        orientation='vertical',
+        location='left',
+        fraction=0.035,
+        pad=0.025,
     )
-    cbar_eke.set_ticks(np.linspace(0.0, eke_vmax, 4))
-    cbar_eke.set_label('Mean EKE (m² s⁻²)')
+    cbar_eke.set_ticks(eke_norm.inverse(np.linspace(0.0, 1.0, 5)))
+    cbar_eke.ax.yaxis.set_major_formatter(FormatStrFormatter('%.3f'))
+    cbar_eke.set_label('Mean EKE (m² s⁻²)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar_eke.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
     cbar_occurrence = fig.colorbar(
         occurrence_map,
         ax=flat_axes[1:],
@@ -22346,8 +22372,16 @@ def plot_do_threshold_eke_spatial_comparison(
         fraction=0.045,
         pad=0.08,
     )
-    cbar_occurrence.set_label('Deep ΔDO anomaly occurrence rate per sampled grid cell')
-    fig.suptitle('Global deep ΔDO patterns and their mesoscale-energy context', fontsize=14)
+    cbar_occurrence.set_label(
+        'Deep ΔDO anomaly occurrence rate per sampled grid cell',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    cbar_occurrence.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
+    fig.suptitle(
+        'Global deep ΔDO patterns and their mesoscale-energy context',
+        fontsize=_PLOT_TYPOGRAPHY['figure_title'],
+    )
+    _apply_plot_typography(fig)
 
     out = {
         'labels': labels,
@@ -22537,13 +22571,37 @@ def plot_do_threshold_eke_binned_relationship(
     if summary.empty:
         raise ValueError('summary is empty.')
 
-    colors = {'DO20': '#6b7280', 'DO35': '#d97706', 'DO50': '#b91c1c'}
-    markers = {'DO20': 'o', 'DO35': 's', 'DO50': 'D'}
     fig, ax = plt.subplots(figsize=(8.2, 5.6))
+    tick_legend_size = 15
+    annotation_size = 14
     series = {}
     monotonic_flags = []
+    annotation_layout = {
+        'ΔDO20': {
+            1: ((10, 10), 'left', 'bottom'),
+            2: ((4, 10), 'right', 'bottom'),
+            3: ((-10, 10), 'right', 'bottom'),
+            4: ((-10, 10), 'right', 'bottom'),
+            5: ((-10, 10), 'right', 'bottom'),
+        },
+        'ΔDO35': {
+            1: ((10, 10), 'left', 'bottom'),
+            2: ((4, 10), 'right', 'bottom'),
+            3: ((-10, 10), 'right', 'bottom'),
+            4: ((-10, 10), 'right', 'bottom'),
+            5: ((-10, 10), 'right', 'bottom'),
+        },
+        'ΔDO50': {
+            1: ((10, -10), 'left', 'top'),
+            2: ((10, -10), 'left', 'top'),
+            3: ((10, -10), 'left', 'top'),
+            4: ((10, -10), 'left', 'top'),
+            5: ((-2, -10), 'right', 'top'),
+        },
+    }
     for label, part in summary.groupby('threshold_label', sort=False):
         part = part.sort_values('eke_bin')
+        _, display_label, color, marker = _threshold_style(label)
         x = part['eke_bin'].to_numpy(dtype=float)
         y = 100.0 * part['occurrence_rate'].to_numpy(dtype=float)
         low = 100.0 * part['confidence_interval_low'].to_numpy(dtype=float)
@@ -22552,12 +22610,37 @@ def plot_do_threshold_eke_binned_relationship(
             x,
             y,
             yerr=[y - low, high - y],
-            marker=markers.get(str(label), 'o'),
-            color=colors.get(str(label), None),
+            marker=marker,
+            color=color,
             linewidth=2.0,
             capsize=3,
-            label=str(label),
+            label=display_label,
         )
+        for point_index, (x_value, y_value) in enumerate(zip(x, y)):
+            label_offset, label_ha, label_va = annotation_layout.get(
+                display_label,
+                {},
+            ).get(
+                point_index + 1,
+                ((8, 10), 'left', 'bottom'),
+            )
+            ax.annotate(
+                f'{y_value:.2f}%',
+                xy=(x_value, y_value),
+                xytext=label_offset,
+                textcoords='offset points',
+                ha=label_ha,
+                va=label_va,
+                fontsize=annotation_size,
+                color=color,
+                bbox={
+                    'boxstyle': 'round,pad=0.18',
+                    'facecolor': 'white',
+                    'edgecolor': 'none',
+                    'alpha': 0.82,
+                },
+                zorder=6,
+            )
         monotonic_flags.append(bool(np.all(np.diff(y) >= 0)))
         series[str(label)] = [
             {
@@ -22571,26 +22654,30 @@ def plot_do_threshold_eke_binned_relationship(
     bins = sorted(
         pd.to_numeric(summary['eke_bin'], errors='coerce').dropna().astype(int).unique()
     )
-    ax.set_xticks(bins, [f'Q{value}' for value in bins])
-    ax.set_xlabel('GLORYS EKE quantile among sampled grid cells (low → high)')
-    ax.set_ylabel('Deep ΔDO anomaly occurrence rate (%)')
+    n_bins = len(bins)
+    pct_per_bin = 100.0 / max(n_bins, 1)
+    bin_labels = [
+        f'{pct_per_bin * (int(value) - 1):.0f}–{pct_per_bin * int(value):.0f}%'
+        for value in bins
+    ]
+    ax.set_xticks(bins, bin_labels)
+    ax.set_xlabel(
+        'GLORYS EKE percentile bin (low → high)',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    ax.set_ylabel('Deep ΔDO anomaly occurrence rate (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
     ax.grid(alpha=0.25)
-    ax.legend(frameon=False)
+    ax.margins(x=0.06, y=0.10)
+    ax.legend(frameon=False, fontsize=tick_legend_size)
     all_monotonic = bool(monotonic_flags and all(monotonic_flags))
     ax.set_title(
         'Deep ΔDO occurrence rises across EKE environments'
         if all_monotonic
-        else 'Deep ΔDO occurrence across EKE environments'
+        else 'Deep ΔDO occurrence across EKE environments',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
     )
-    ax.text(
-        0.01,
-        0.01,
-        'Descriptive co-location; shared geography and spatial autocorrelation remain.',
-        transform=ax.transAxes,
-        fontsize=8,
-        color='0.35',
-        va='bottom',
-    )
+    ax.tick_params(labelsize=tick_legend_size)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'series': series, 'all_thresholds_monotonic': all_monotonic}
@@ -22689,6 +22776,7 @@ def _plot_euler_grid_value_comparison(
         gridlines = ax.gridlines(draw_labels=True, linewidth=0.4, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
         gridlines.top_labels = False
         gridlines.right_labels = False
+        _apply_gridline_typography(gridlines)
         _plot_mask_background(ax, lon_mesh, lat_mesh, mask, transform=data_crs, color=_EULER_GRID_PLOT_CFG['mask_fill'])
         mappable = ax.pcolormesh(
             lon_mesh,
@@ -22700,14 +22788,16 @@ def _plot_euler_grid_value_comparison(
             transform=data_crs,
             zorder=2,
         )
-        ax.set_title(label, fontsize=12)
+        ax.set_title(label, fontsize=_PLOT_TYPOGRAPHY['panel_title'])
         ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
     colorbar = fig.colorbar(mappable, ax=axes, orientation='horizontal', fraction=0.055, pad=0.08)
-    colorbar.set_label(colorbar_label, fontsize=11)
+    colorbar.set_label(colorbar_label, fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    colorbar.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
     colorbar_ticks = np.linspace(0.0, vmax, 6)
     colorbar.set_ticks(colorbar_ticks)
     colorbar.set_ticklabels([f'{int(round(value))}' for value in colorbar_ticks])
-    fig.suptitle(title, fontsize=14)
+    fig.suptitle(title, fontsize=_PLOT_TYPOGRAPHY['figure_title'])
+    _apply_plot_typography(fig)
     out = {'vmax': float(vmax), 'gamma': float(gamma), 'labels': labels}
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -23177,8 +23267,16 @@ def plot_eulerian_association_sensitivity(
     for axis in axes:
         axis.set_xticks(sorted(pd.to_numeric(table['min_profiles_per_cell'], errors='coerce').dropna().unique()))
         axis.grid(alpha=0.25)
-        axis.legend(fontsize=8)
-    fig.suptitle(f'{detector} occurrence co-location sensitivity with GLORYS EKE', fontsize=13)
+        axis.legend(fontsize=_PLOT_TYPOGRAPHY['tick_legend'])
+        _apply_axis_typography(axis)
+    axes[0].set_xlabel('Minimum sampled profiles per grid cell', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[0].set_ylabel('Spearman rho', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[0].set_title('Grid-cell rank co-location', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    axes[1].set_xlabel('Minimum sampled profiles per grid cell', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[1].set_ylabel('Active / inactive occurrence-rate ratio', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[1].set_title('Aggregate occurrence-rate contrast', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    fig.suptitle(f'{detector} occurrence co-location sensitivity with GLORYS EKE', fontsize=_PLOT_TYPOGRAPHY['figure_title'])
+    _apply_plot_typography(fig)
     out = {'active_proxy_quantiles': [float(value) for value in quantiles]}
     if save_fig:
         out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('eulerian_association_summary')
@@ -23381,6 +23479,7 @@ def _plot_two_panel_association_figure(
         gl = ax.gridlines(draw_labels=True, linewidth=0.4, color=grid_color, alpha=0.45, linestyle='--')
         gl.top_labels = False
         gl.right_labels = False
+        _apply_gridline_typography(gl)
         if background_fill_color is not None:
             _plot_mask_background(
                 ax,
@@ -23401,15 +23500,18 @@ def _plot_two_panel_association_figure(
             zorder=2,
         )
         mappables.append(hm)
-        ax.set_title(title, fontsize=12)
+        ax.set_title(title, fontsize=_PLOT_TYPOGRAPHY['panel_title'])
         ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
 
     cbar0 = fig.colorbar(mappables[0], ax=axes[0], orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar0.set_label(left_cbar_label, fontsize=11)
+    cbar0.set_label(left_cbar_label, fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar0.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
     cbar1 = fig.colorbar(mappables[1], ax=axes[1], orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar1.set_label(right_cbar_label, fontsize=11)
+    cbar1.set_label(right_cbar_label, fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar1.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
 
-    fig.suptitle(suptitle, fontsize=14)
+    fig.suptitle(suptitle, fontsize=_PLOT_TYPOGRAPHY['figure_title'])
+    _apply_plot_typography(fig)
     return fig, axes
 
 
@@ -23870,12 +23972,16 @@ def analyze_euler_ace_ce_association(
                 f"Eddy-days uplift (anomaly-rate high vs low)={reverse_uplift:.1f}%\n"
                 f"rho={rho:.3f} | dCor={dcor:.3f}"
             ),
-            fontsize=12,
+            fontsize=_PLOT_TYPOGRAPHY['panel_title'],
         )
         ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
 
     cbar = fig.colorbar(mappables[0], ax=axes, orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar.set_label('Grid-wise Association Index (z(log1p(EddyDays))*z(AnomalyRate))', fontsize=11)
+    cbar.set_label(
+        'Grid-wise Association Index (z(log1p(EddyDays))*z(AnomalyRate))',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    cbar.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
 
     fig.suptitle(
         (
@@ -23885,7 +23991,7 @@ def analyze_euler_ace_ce_association(
             f" | eddy-days threshold ≥ {shared_threshold:g} day"
             f" | anomaly-rate threshold ≥ {shared_do_rate_threshold if shared_do_rate_threshold is not None else np.nan:.4f}"
         ),
-        fontsize=14,
+        fontsize=_PLOT_TYPOGRAPHY['figure_title'],
     )
 
     if output_dir is None:
@@ -24165,10 +24271,11 @@ def analyze_euler_eke_do_association(
         transform=data_crs,
         zorder=2,
     )
-    ax.set_title('Grid-wise EKE / occurrence co-location', fontsize=12)
+    ax.set_title('Grid-wise EKE / occurrence co-location', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
     ax.set_extent([float(lon_edges[0]), float(lon_edges[-1]), float(lat_edges[0]), float(lat_edges[-1])], crs=data_crs)
     cbar_assoc = fig_assoc.colorbar(hm, ax=ax, orientation='horizontal', fraction=0.05, pad=0.08)
-    cbar_assoc.set_label('z(EKE) * z(AnomalyRate)', fontsize=11)
+    cbar_assoc.set_label('z(EKE) * z(AnomalyRate)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    cbar_assoc.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
     fig_assoc.suptitle(
         (
             f"{detection_label} occurrence co-location with GLORYS EKE ({meta.get('region_key', 'region')}, "
@@ -24180,8 +24287,9 @@ def analyze_euler_eke_do_association(
             f" | EKE uplift (anomaly-rate high vs low)={eke_uplift_pct:.1f}%\n"
             f"rho={spearman_rho:.3f} | dCor={distance_corr:.3f}"
         ),
-        fontsize=14,
+        fontsize=_PLOT_TYPOGRAPHY['figure_title'],
     )
+    _apply_plot_typography(fig_assoc)
 
     if output_dir is None:
         output_dir = _detection_output_dir_from_meta('plot_euler_grid_summary', meta)
@@ -26199,6 +26307,10 @@ def plot_detector_relaxation_summary(
         raise ValueError("summary is empty.")
 
     method_label = {'do': 'DO', 'aou': 'AOU', 'trim': 'TRIM'}
+    method_colors = {
+        method: _THRESHOLD_COLORS.get(f'DO{value}', _GROUP_COLORS['baseline'])
+        for method, value in [('do', 20), ('aou', 35), ('trim', 50)]
+    }
     labels = [
         f"{method_label.get(str(m), str(m).upper())}\n(n={int(n)})"
         for m, n in zip(summary['method'], summary['n_anomaly'])
@@ -26215,46 +26327,53 @@ def plot_detector_relaxation_summary(
 
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))
 
-    axes[0].bar(x, summary['anomaly_pct_of_baseline'], color='#6b7280')
+    detector_colors = [method_colors.get(str(method), _GROUP_COLORS['baseline']) for method in summary['method']]
+    axes[0].bar(x, summary['anomaly_pct_of_baseline'], color=detector_colors)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels)
-    axes[0].set_ylabel('selected profiles / all Argo (%)')
-    axes[0].set_title('Detector yield')
+    axes[0].set_ylabel('Selected profiles / all Argo (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[0].set_title('Detector yield', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
     axes[0].grid(axis='y', alpha=0.25)
     for i, val in enumerate(summary['anomaly_pct_of_baseline']):
-        axes[0].text(i, val, f" {val:.2f}%", ha='center', va='bottom', fontsize=9)
+        axes[0].text(i, val, f" {val:.2f}%", ha='center', va='bottom', fontsize=_PLOT_TYPOGRAPHY['annotation'])
 
     bottom = np.zeros(len(summary), dtype=float)
     for basin in basin_order:
         vals = summary[f'basin_{basin}_pct'].to_numpy(dtype=float)
         axes[1].bar(x, vals, bottom=bottom, color=basin_colors[basin], label=basin)
         bottom += np.nan_to_num(vals)
-    axes[1].plot(x, summary['ke_box_pct'], color='black', marker='D', lw=1.2, label='KE box')
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels)
     axes[1].set_ylim(0, 100)
-    axes[1].set_ylabel('share of selected profiles (%)')
-    axes[1].set_title('Geographic redistribution')
-    axes[1].legend(fontsize=8, ncol=2, loc='upper right')
+    axes[1].set_ylabel('Share of selected profiles (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[1].set_title('Geographic redistribution', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    axes[1].legend(
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        ncol=1,
+        loc='lower right',
+    )
     axes[1].grid(axis='y', alpha=0.25)
 
     baseline_meta = float(summary['baseline_meta_pct'].iloc[0])
-    axes[2].bar(x, summary['anomaly_meta_pct'], color='#f59e0b')
+    axes[2].bar(x, summary['anomaly_meta_pct'], color=detector_colors)
     axes[2].axhline(baseline_meta, color='0.35', ls='--', lw=1.2,
                     label=f'baseline {baseline_meta:.1f}%')
     axes[2].set_xticks(x)
     axes[2].set_xticklabels(labels)
-    axes[2].set_ylabel('inside META surface eddy (%)')
-    axes[2].set_title('Surface-eddy association')
-    axes[2].legend(fontsize=8)
+    axes[2].set_ylabel('Inside META surface eddy (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[2].set_title('Surface-eddy association', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    axes[2].legend(fontsize=_PLOT_TYPOGRAPHY['tick_legend'], loc='lower right')
     axes[2].grid(axis='y', alpha=0.25)
     for i, val in enumerate(summary['anomaly_meta_pct']):
-        axes[2].text(i, val, f" {val:.1f}%", ha='center', va='bottom', fontsize=9)
+        axes[2].text(i, val, f" {val:.1f}%", ha='center', va='bottom', fontsize=_PLOT_TYPOGRAPHY['annotation'])
 
     fig.suptitle(
         f'DO / AOU / TRIM detector comparison ({start_year}-{end_year}, {region_slug})',
-        fontsize=13,
+        fontsize=_PLOT_TYPOGRAPHY['figure_title'],
     )
+    for axis in axes:
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {
@@ -26567,6 +26686,7 @@ def plot_do_threshold_counts_and_composition(
     axes[0].set_ylabel('Profiles carrying ΔDO anomaly (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
     axes[0].set_title('ΔDO candidate yield', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
     axes[0].grid(axis='y', alpha=0.25)
+    axes[0].set_ylim(0.0, float(np.nanmax(anomaly_rates)) * 1.18)
     for bar, rate in zip(bars, anomaly_rates):
         axes[0].text(
             bar.get_x() + bar.get_width() / 2,
@@ -26699,7 +26819,6 @@ def plot_do_threshold_meta_association(
     labels = [style[1] for style in styles]
     threshold_colors = [style[2] for style in styles]
     baseline = float(summary['baseline_meta_pct'].iloc[0])
-
     fig, ax = plt.subplots(figsize=(7.4, 5.2))
     bars = ax.bar(
         x,
@@ -26718,25 +26837,28 @@ def plot_do_threshold_meta_association(
         label=f'All-Argo baseline: {baseline:.2f}%',
     )
     ax.set_xticks(x, labels)
-    ax.set_ylim(0, max(60.0, float(np.nanmax(ci_high)) * 1.15))
-    ax.set_ylabel('Anomaly profiles inside a META surface eddy (%)')
-    ax.set_title('META membership is modest and non-monotonic across DO thresholds')
+    ax.set_ylim(20.0, max(60.0, float(np.nanmax(ci_high)) * 1.15))
+    ax.set_ylabel(
+        'META surface eddy membership (%)',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
     ax.grid(axis='y', alpha=0.25)
-    ax.legend(frameon=False)
-    for bar, rate, successes, total in zip(
+    ax.legend(frameon=False, fontsize=_PLOT_TYPOGRAPHY['tick_legend'])
+    ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
+    for bar, rate, high in zip(
         bars,
         rates,
-        summary['n_anomaly_in_meta'],
-        summary['n_anomaly'],
+        ci_high,
     ):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 1.0,
-            f'{rate:.2f}%\n{int(successes):,}/{int(total):,}',
+            high + 0.5,
+            f'{rate:.2f}%',
             ha='center',
             va='bottom',
-            fontsize=9,
+            fontsize=_PLOT_TYPOGRAPHY['annotation'],
         )
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {
@@ -27207,11 +27329,13 @@ def plot_scv_do_threshold_enrichment(
     show_fig: bool = True,
     save_fig: bool = True,
     log_scale: bool = False,
+    annotate_counts: bool = False,
 ) -> dict:
     """绘制 DO20/DO35/DO50 下 baseline、META 与 McCoy SCV 的 carrier 频率。
 
-    图中所有曲线都是 group-centered 的 `P(DO_t | group)`，点旁直接标出 numerator/denominator，误差棒为
-    95% Wilson 区间。默认使用线性纵轴；设置 `log_scale=True` 可切换到对数纵轴以突出低于 1% 的背景率。
+    图中所有曲线都是 group-centered 的 `P(DO_t | group)`，点旁默认标出百分比，误差棒为 95% Wilson 区间。
+    设置 `annotate_counts=True` 可改为标出 numerator/denominator。默认使用线性纵轴；设置 `log_scale=True`
+    可切换到对数纵轴以突出低于 1% 的背景率。
 
     参数:
         - summary (pd.DataFrame | None): `summarize_scv_do_threshold_sweep` 输出；None 时读取路径或默认表。
@@ -27223,6 +27347,7 @@ def plot_scv_do_threshold_enrichment(
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存图，默认 True。
         - log_scale (bool): 是否使用对数纵轴，默认 False。
+        - annotate_counts (bool): 是否将点旁标注切换为 numerator/denominator；默认 False，即标注百分比。
 
     返回:
         - dict: 含每组阈值点、是否跨阈值持续富集及 figure_path（save_fig 时）。
@@ -27257,19 +27382,19 @@ def plot_scv_do_threshold_enrichment(
     if log_scale:
         annotation_layout = {
             'All DO-evaluable Argo': {
-                20: ((8, -16), 'left', 'top'),
-                35: ((8, -16), 'left', 'top'),
+                20: ((8, -26), 'left', 'top'),
+                35: ((8, -26), 'left', 'top'),
                 50: ((-8, -16), 'right', 'top'),
             },
             'META-matched DO-evaluable Argo': {
                 20: ((8, 10), 'left', 'bottom'),
                 35: ((8, 10), 'left', 'bottom'),
-                50: ((-8, 10), 'right', 'bottom'),
+                50: ((-2, 22), 'right', 'bottom'),
             },
             'DO-evaluable McCoy SCVs': {
                 20: ((8, 10), 'left', 'bottom'),
                 35: ((8, 10), 'left', 'bottom'),
-                50: ((-8, 10), 'right', 'bottom'),
+                50: ((-8, 19), 'right', 'bottom'),
             },
         }
     else:
@@ -27280,14 +27405,14 @@ def plot_scv_do_threshold_enrichment(
                 50: ((-8, 10), 'right', 'bottom'),
             },
             'META-matched DO-evaluable Argo': {
-                20: ((8, 16), 'left', 'bottom'),
-                35: ((8, 20), 'left', 'bottom'),
-                50: ((-8, 24), 'right', 'bottom'),
+                20: ((8, 14), 'left', 'bottom'),
+                35: ((8, 24), 'left', 'bottom'),
+                50: ((-8, 28), 'right', 'bottom'),
             },
             'DO-evaluable McCoy SCVs': {
                 20: ((8, 10), 'left', 'bottom'),
                 35: ((8, 10), 'left', 'bottom'),
-                50: ((-8, 10), 'right', 'bottom'),
+                50: ((-8, 26), 'right', 'bottom'),
             },
         }
     fig, ax = plt.subplots(figsize=(8.4, 5.8))
@@ -27323,8 +27448,9 @@ def plot_scv_do_threshold_enrichment(
                 int(round(float(xv))),
                 ((6, 8), 'left', 'bottom'),
             )
+            annotation = f'{int(k)}/{int(n)}' if annotate_counts else f'{yv:.2f}%'
             ax.annotate(
-                f'{int(k)}/{int(n)}', (xv, yv), xytext=xytext,
+                annotation, (xv, yv), xytext=xytext,
                 textcoords='offset points', fontsize=_PLOT_TYPOGRAPHY['annotation'], color=color,
                 ha=ha,
                 va=va,
@@ -27361,12 +27487,6 @@ def plot_scv_do_threshold_enrichment(
     ax.legend(frameon=False, fontsize=_PLOT_TYPOGRAPHY['tick_legend'])
     scv = summary[summary['group'].eq('DO-evaluable McCoy SCVs')]
     persistent = bool((pd.to_numeric(scv['odds_ratio_vs_all_argo'], errors='coerce') > 1).all())
-    title = (
-        'McCoy SCVs are enriched in deep ΔDO carriers across thresholds'
-        if persistent
-        else 'Deep ΔDO carrier frequency across Argo, META, and McCoy SCV groups'
-    )
-    ax.set_title(title, fontsize=_PLOT_TYPOGRAPHY['panel_title'])
     _apply_axis_typography(ax)
     _apply_plot_typography(fig)
     fig.tight_layout()
@@ -27733,9 +27853,9 @@ def plot_scv_detector_frequency_enrichment(
     )
     s = pd.read_parquet(sp).iloc[0]
     label = _detector_short_label(cfg)
-    groups = [('baseline', f'baseline evaluable\nArgo', '0.6'),
-              ('meta', 'inside META\neddy', 'tab:orange'),
-              ('scv', 'McCoy\nSCVs', 'tab:red')]
+    groups = [('baseline', f'baseline evaluable\nArgo', _GROUP_COLORS['baseline']),
+              ('meta', 'inside META\neddy', _GROUP_COLORS['meta']),
+              ('scv', 'McCoy\nSCVs', _GROUP_COLORS['scv'])]
     pcts, lo_err, hi_err, labels, colors, res = [], [], [], [], [], {}
     for key, lab, color in groups:
         k = int(s[f'anomaly_{key}_k'])
@@ -27761,13 +27881,23 @@ def plot_scv_detector_frequency_enrichment(
     ax.set_ylim(0, top * 1.2 if top > 0 else 1)
     for i, p in enumerate(pcts):
         if np.isfinite(p):
-            ax.text(i, p + hi_err[i], f'  {p:.2f}%', ha='center', va='bottom', fontsize=11)
-    ax.set_ylabel(f'carry significant {label} anomaly %')
+            ax.text(
+                i,
+                p + hi_err[i],
+                f'  {p:.2f}%',
+                ha='center',
+                va='bottom',
+                fontsize=_PLOT_TYPOGRAPHY['annotation'],
+            )
+    ax.set_ylabel(f'carry significant {label} anomaly %', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
     ax.set_title(
         f'{label} anomaly rate by eddy detector ({y0}-{y1}, {_current_region_key()})\n'
         f"vs baseline OR: META {float(s['anomaly_meta_odds_ratio']):.2f}"
-        f" · SCV {float(s['anomaly_odds_ratio']):.2f} (95% CI error bars)"
+        f" · SCV {float(s['anomaly_odds_ratio']):.2f} (95% CI error bars)",
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
     )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.22)
 
@@ -27840,13 +27970,27 @@ def plot_mccoy_detector_enrichment(
     label = _detector_short_label(cfg)
 
     fig, ax = plt.subplots(figsize=(6, 5.2))
-    ax.bar([f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
-           [miss_pct, seen_pct], color=['tab:red', '0.6'])
+    ax.bar(
+        [f'GLORYS misses\n(n={int(gm.sum())})', f'GLORYS sees\n(n={int((~gm).sum())})'],
+        [miss_pct, seen_pct],
+        color=[_GROUP_COLORS['scv'], _GROUP_COLORS['baseline']],
+    )
     for i, value in enumerate([miss_pct, seen_pct]):
         if np.isfinite(value):
-            ax.text(i, value + 0.3, f'{value:.1f}%', ha='center', fontsize=11)
-    ax.set_ylabel(f'carry significant {label} anomaly %')
-    ax.set_title(f'{label} anomaly in GLORYS-missed vs seen McCoy SCVs (n={len(d)})')
+            ax.text(
+                i,
+                value + 0.3,
+                f'{value:.1f}%',
+                ha='center',
+                fontsize=_PLOT_TYPOGRAPHY['annotation'],
+            )
+    ax.set_ylabel(f'carry significant {label} anomaly %', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    ax.set_title(
+        f'{label} anomaly in GLORYS-missed vs seen McCoy SCVs (n={len(d)})',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'n_evaluable': int(len(d)),
@@ -27921,19 +28065,31 @@ def plot_scv_detector_carrier_map(
     ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
     ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
     ax.set_global()
-    cats = [(~gm & ~mm, '0.6', 'seen by both'),
-            (~gm & mm, 'tab:blue', 'META misses only'),
-            (gm & ~mm, 'tab:orange', 'GLORYS misses only'),
-            (gm & mm, 'tab:red', 'both miss')]
+    cats = [
+        (~gm & ~mm, _REPRESENTATION_STATUS_COLORS['both_criteria_met'], 'seen by both'),
+        (~gm & mm, _REPRESENTATION_STATUS_COLORS['meta_criterion_not_met'], 'META misses only'),
+        (gm & ~mm, _REPRESENTATION_STATUS_COLORS['glorys_criterion_not_met'], 'GLORYS misses only'),
+        (gm & mm, _REPRESENTATION_STATUS_COLORS['neither_criterion_met'], 'both miss'),
+    ]
     for sel, col, lab in cats:
         if not sel.any():
             continue
         ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=90, c=col, edgecolor='k',
                    linewidth=0.4, transform=ccrs.PlateCarree(),
                    label=f'{lab} ({int(sel.sum())})', zorder=5)
-    ax.legend(loc='lower left', fontsize=9)
-    ax.set_title(f'{label}-carrying McCoy SCVs: representation status '
-                 f'(mapped subset n={len(d)}, ≥1 criterion not met {int((gm | mm).sum())})')
+    ax.legend(
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        borderaxespad=0,
+    )
+    ax.set_title(
+        f'{label}-carrying McCoy SCVs: representation status '
+        f'(mapped subset n={len(d)}, ≥1 criterion not met {int((gm | mm).sum())})',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'n_carrier': int(len(d)),
@@ -28115,7 +28271,6 @@ def plot_mccoy_scv_catalog_context(
     unique_scv = threshold_table.drop_duplicates('stable_scv_id')
     evaluable_scv = unique_scv[unique_scv['do_evaluable'].fillna(False).astype(bool)].copy()
     n_evaluable = int(len(evaluable_scv))
-
     fig = plt.figure(figsize=(12.5, 5.8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
     ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
@@ -28141,10 +28296,6 @@ def plot_mccoy_scv_catalog_context(
         zorder=3,
         label=f'DO-evaluable matched subset ({n_evaluable})',
     )
-    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
-    gridlines.top_labels = False
-    gridlines.right_labels = False
-    _apply_gridline_typography(gridlines)
     ax.set_title(
         'McCoy et al. (2020) Argo-derived, velocity-confirmed subsurface coherent vortices',
         fontsize=_PLOT_TYPOGRAPHY['panel_title'],
@@ -28228,22 +28379,34 @@ def plot_scv_do_carrier_distribution(
     ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], zorder=0)
     ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.5)
     ax.set_global()
+    threshold_key, display_label, _, threshold_marker = _threshold_style(threshold)
+    threshold_color = _CARRIER_DISTRIBUTION_COLORS.get(
+        threshold_key,
+        _THRESHOLD_COLORS.get(threshold_key, '#b91c1c'),
+    )
     ax.scatter(
-        evaluable['lon'], evaluable['lat'], s=18, c='0.78', alpha=0.75,
+        evaluable['lon'], evaluable['lat'], s=18, c=_GROUP_COLORS['baseline'], alpha=0.75,
         linewidth=0, transform=ccrs.PlateCarree(), label=f'DO-evaluable SCVs ({len(evaluable)})', zorder=2,
     )
     ax.scatter(
-        carriers['lon'], carriers['lat'], s=60, c='#b91c1c', edgecolor='white', linewidth=0.45,
-        transform=ccrs.PlateCarree(), label=f'DO{float(threshold):g} carriers ({len(carriers)})', zorder=3,
+        carriers['lon'], carriers['lat'], s=60, c=threshold_color, marker=threshold_marker,
+        edgecolor='white', linewidth=0.45,
+        transform=ccrs.PlateCarree(), label=f'{display_label} carriers ({len(carriers)})', zorder=3,
     )
-    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
-    gridlines.top_labels = False
-    gridlines.right_labels = False
-    ax.legend(loc='lower left', frameon=True, fontsize=9)
+    ax.legend(
+        loc='lower left',
+        frameon=True,
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        borderaxespad=0.6,
+        framealpha=0.9,
+    )
     ax.set_title(
-        f'DO{float(threshold):g} carriers within the DO-evaluable McCoy SCV subset: '
-        f'{len(carriers)}/{len(evaluable)}'
+        f'{display_label} carriers within the DO-evaluable McCoy SCV subset: '
+        f'{len(carriers)}/{len(evaluable)}',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
     )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'threshold': float(threshold), 'n_carrier': int(len(carriers)), 'n_evaluable': int(len(evaluable))}
@@ -28380,16 +28543,6 @@ def plot_scv_do_carrier_distribution_comparison(
             label=f'{display_label} carriers ({len(carriers)})',
             zorder=3 + index,
         )
-    gridlines = ax.gridlines(
-        draw_labels=True,
-        linewidth=0.35,
-        color=_BASEMAP_COLORS['grid'],
-        alpha=0.45,
-        linestyle='--',
-    )
-    gridlines.top_labels = False
-    gridlines.right_labels = False
-    _apply_gridline_typography(gridlines)
     ax.legend(
         loc='lower left',
         frameon=True,
@@ -28490,11 +28643,11 @@ def plot_scv_do_carrier_representation_status(
     mm = carriers['meta_miss'].astype('boolean')
     available = gm.notna() & mm.notna()
     categories = [
-        (available & ~gm.fillna(False) & ~mm.fillna(False), '#737373', 'both criteria met'),
-        (available & ~gm.fillna(False) & mm.fillna(False), '#2b6cb0', 'META criterion not met'),
-        (available & gm.fillna(False) & ~mm.fillna(False), '#dd6b20', 'GLORYS criterion not met'),
-        (available & gm.fillna(False) & mm.fillna(False), '#c53030', 'neither criterion met'),
-        (~available, '#7c3aed', 'status unavailable'),
+        (available & ~gm.fillna(False) & ~mm.fillna(False), _REPRESENTATION_STATUS_COLORS['both_criteria_met'], 'both criteria met'),
+        (available & ~gm.fillna(False) & mm.fillna(False), _REPRESENTATION_STATUS_COLORS['meta_criterion_not_met'], 'META criterion not met'),
+        (available & gm.fillna(False) & ~mm.fillna(False), _REPRESENTATION_STATUS_COLORS['glorys_criterion_not_met'], 'GLORYS criterion not met'),
+        (available & gm.fillna(False) & mm.fillna(False), _REPRESENTATION_STATUS_COLORS['neither_criterion_met'], 'neither criterion met'),
+        (~available, _REPRESENTATION_STATUS_COLORS['status_unavailable'], 'status unavailable'),
     ]
 
     fig = plt.figure(figsize=(12.5, 5.8))
@@ -28513,14 +28666,22 @@ def plot_scv_do_carrier_representation_status(
                 edgecolor='white', linewidth=0.45, transform=ccrs.PlateCarree(),
                 label=f'{label} ({count})', zorder=3,
             )
-    gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
-    gridlines.top_labels = False
-    gridlines.right_labels = False
-    ax.legend(loc='lower left', frameon=True, fontsize=8, ncol=2)
-    ax.set_title(
-        f'Representation status of all DO{float(threshold):g} McCoy SCV carriers '
-        f'(n={len(carriers)})'
+    ax.legend(
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=True,
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        ncol=1,
+        borderaxespad=0,
     )
+    _, display_label, _, _ = _threshold_style(threshold)
+    ax.set_title(
+        f'Representation status of all {display_label} McCoy SCV carriers '
+        f'(n={len(carriers)})',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'threshold': float(threshold), 'n_carrier': int(len(carriers)), 'category_counts': counts}
@@ -28754,9 +28915,9 @@ def plot_scv_frequency_enrichment(
           / f"scv_frequency_stats_{y0}_{y1}_{run_tag}.parquet")
     s = pd.read_parquet(sp).iloc[0]
 
-    groups = [('baseline', 'baseline DO Argo', '0.6'),
-              ('meta', 'inside META eddy', 'tab:orange'),
-              ('scv', 'McCoy SCVs', 'tab:red')]
+    groups = [('baseline', 'baseline DO-evaluable Argo', _GROUP_COLORS['baseline']),
+              ('meta', 'inside META eddy', _GROUP_COLORS['meta']),
+              ('scv', 'McCoy SCVs', _GROUP_COLORS['scv'])]
     pcts, lo_err, hi_err, labels, colors, res = [], [], [], [], [], {}
     for key, lab, col in groups:
         k = int(s[f'delta_do_{key}_k']); n = int(s[f'delta_do_{key}_n'])
@@ -28766,15 +28927,25 @@ def plot_scv_frequency_enrichment(
         labels.append(f'{lab}\n({k}/{n})'); colors.append(col)
         res[key] = {'pct': round(p, 3), 'ci95': [round(100 * ci.low, 3), round(100 * ci.high, 3)]}
 
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+    fig, ax = plt.subplots(figsize=(9.2, 5.5))
     ax.bar(labels, pcts, color=colors, yerr=[lo_err, hi_err], capsize=6, error_kw={'lw': 1.3})
     for i, p in enumerate(pcts):
-        ax.text(i, p + hi_err[i], '  {:.2f}%'.format(p), ha='center', va='bottom', fontsize=11)
+        ax.text(
+            i,
+            p + hi_err[i],
+            '  {:.2f}%'.format(p),
+            ha='center',
+            va='bottom',
+            fontsize=_PLOT_TYPOGRAPHY['annotation'],
+        )
     ax.set_ylim(0, max(pcts[j] + hi_err[j] for j in range(len(pcts))) * 1.2)
-    ax.set_ylabel('carry significant δDO %')
-    ax.set_title(f"δDO⁺ rate by eddy detector ({y0}-{y1}, {region_slug})\n"
+    ax.set_ylabel('Profiles carrying a deep ΔDO anomaly (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    ax.set_title(f"ΔDO⁺ rate by eddy detector ({y0}-{y1}, {region_slug})\n"
                  f"vs baseline OR:  META {float(s['delta_do_meta_odds_ratio']):.2f}"
-                 f"  ·  SCV {float(s['delta_do_odds_ratio']):.2f}  (95% CI error bars)")
+                 f"  ·  SCV {float(s['delta_do_odds_ratio']):.2f}  (95% CI error bars)",
+                 fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'delta_do': res,
