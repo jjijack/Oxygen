@@ -18109,13 +18109,13 @@ def augment_mccoy_scvs_delta_do(
     """为 McCoy SCV representation 表生成单阈值 ΔDO 派生表。
 
     对每条 SCV 载入该年 Argo 剖面跑 calculate_delta_do（do 模式，找 DO 正峰），记 ``has_delta_do``
-    （是否检出候选）、``delta_do_max``（全剖面最大 δDO）、``delta_do_core``（最接近 SCV 核深且
-    在 ``core_depth_tol_m`` 内的候选 δDO）。结果写入带 detector stem 的新 parquet，不修改输入的
+    （是否检出候选）、``delta_do_max``（全剖面最大 ΔDO）、``delta_do_core``（最接近 SCV 核深且
+    在 ``core_depth_tol_m`` 内的候选 ΔDO）。结果写入带 detector stem 的新 parquet，不修改输入的
     representation 表。无 DO 的剖面以 ``do_evaluable=False`` 明确保留。
 
     参数:
         - rows_path (str | Path): detector-independent McCoy representation parquet。
-        - do_threshold (float | None): δDO 判据阈值（μmol kg⁻¹）；None 使用 processing.yml 默认。
+        - do_threshold (float | None): ΔDO 判据阈值（μmol kg⁻¹）；None 使用 processing.yml 默认。
         - core_depth_tol_m (float): 核处候选与 SCV 核深最大距离（m），默认 200。
         - argo_data_dir (str | Path | None): Argo 年数据目录；None 使用配置默认路径。
         - output_path (str | Path | None): 阈值特定派生 parquet；None 时写入标准 threshold 目录。
@@ -18202,7 +18202,7 @@ def augment_mccoy_scvs_delta_do(
             by[key] = {'n': int(len(sub)),
                        'has_do_pct': round(100.0 * (sub['has_delta_do'] == True).mean(), 1)}
         summary['by_glorys'] = by
-    print(f"[*] δDO+ in {summary['has_do_count']}/{summary['n_with_do']} DO-bearing SCVs → {resolved_output}")
+    print(f"[*] ΔDO+ in {summary['has_do_count']}/{summary['n_with_do']} DO-bearing SCVs → {resolved_output}")
     return summary
 
 
@@ -18220,7 +18220,7 @@ def augment_mccoy_scvs_do_core_anomaly(
 
     对每条 SCV 在核深处算 Argo 剖面 DO 相对局地背景（同年 ±``bg_box_deg`` ±``bg_window_days`` 池的同深
     度中位）的带符号偏差 ``do_core_anom``（μmol/kg）：<−阈为缺氧核（depleted，SCV 经典低氧特征），
-    >+阈为通风核（ventilated）。补上 do 模式正峰 δDO 只抓通风所遗漏的缺氧型 SCV。原地重写 parquet
+    >+阈为通风核（ventilated）。补上 do 模式正峰 ΔDO 只抓通风所遗漏的缺氧型 SCV。原地重写 parquet
     追加列，汇总缺氧/通风计数及其与 ``glorys_misses`` 的联合。**串行逐条建局地 DO 池，较慢**。
 
     参数:
@@ -18526,7 +18526,7 @@ def plot_mccoy_do_enrichment(
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """GLORYS 漏检 SCV 的 δDO 富集：漏 vs 命中的 δDO 阳性率（数据缺陷的 DO 后果）。
+    """GLORYS 漏检 SCV 的 ΔDO 富集：漏 vs 命中的 ΔDO 阳性率（数据缺陷的 DO 后果）。
 
     从阈值安全 McCoy long table 读取当前 DO threshold 的 carrier 判定，再与 Argo 锚定 representation
     表的 `glorys_misses` 左连接，比较 GLORYS criterion 未满足/满足两组 SCV 的 carrier 率。
@@ -18580,7 +18580,7 @@ def plot_mccoy_do_enrichment(
         fpath = base / f"mccoy_do_enrichment_{cfg.file_stem()}.png"
         fig.savefig(fpath, dpi=150, bbox_inches='tight')
         out['figure_path'] = str(fpath)
-        print(f"[*] McCoy δDO enrichment saved: {fpath}")
+        print(f"[*] McCoy ΔDO enrichment saved: {fpath}")
     if show_fig:
         plt.show()
     plt.close(fig)
@@ -22168,22 +22168,22 @@ def plot_do_threshold_eke_spatial_comparison(
     summaries: list[dict] | tuple[dict, ...],
     eke_euler: dict | np.ndarray,
     *,
-    labels: list[str] | tuple[str, ...] = ('DO20', 'DO35', 'DO50'),
+    labels: list[str] | tuple[str, ...] = ('ΔDO20', 'ΔDO35', 'ΔDO50'),
     overlay_eke_contours: bool = True,
     output_dir: str | Path | None = None,
     output_name: str = 'do_threshold_eke_spatial_comparison_2002_2022_depth300m',
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """并排绘制 GLORYS EKE 与 DO20/DO35/DO50 occurrence maps。
+    """并排绘制 GLORYS EKE 与 ΔDO20/ΔDO35/ΔDO50 occurrence maps。
 
-    四个面板共用投影和范围；三个 DO 面板使用统一 occurrence-rate 色标，可选叠加稀疏 EKE 分位数
+    四个面板共用投影和范围；三个 ΔDO 面板使用统一 occurrence-rate 色标，可选叠加稀疏 EKE 分位数
     等值线。EKE 在此仅表示 mesoscale-active 环境背景，不作为涡对象检测器。
 
     参数:
-        - summaries (list[dict] | tuple[dict, ...]): DO20/DO35/DO50 Euler occurrence summaries。
+        - summaries (list[dict] | tuple[dict, ...]): ΔDO20/ΔDO35/ΔDO50 Euler occurrence summaries。
         - eke_euler (dict | np.ndarray): 重映射到相同 Euler 网格的 GLORYS EKE。
-        - labels (list[str] | tuple[str, ...]): 三个 DO 面板标签，默认 ('DO20', 'DO35', 'DO50')。
+        - labels (list[str] | tuple[str, ...]): 三个 ΔDO 面板标签，默认 ('ΔDO20', 'ΔDO35', 'ΔDO50')。
         - overlay_eke_contours (bool): 是否在 DO 面板叠加 EKE 75/90 分位数等值线，默认 True。
         - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
         - output_name (str): PNG 文件主干。
@@ -26502,8 +26502,8 @@ def plot_do_threshold_counts_and_composition(
 ) -> dict:
     """绘制 DO 阈值漏斗的异常数量与地理组成。
 
-    左图显示 DO20、DO35、DO50 的异常 profile 数；右图显示海盆组成，并以单独折线标出 KE box
-    占比。该图只回答 detector 收紧后候选集合如何缩小和重新分布，不混入 META membership。
+    左图显示 ΔDO20、ΔDO35、ΔDO50 异常 profile 在全部可评估 Argo profile 中的比例；右图显示海盆组成。
+    该图只回答 detector 收紧后候选集合如何缩小和重新分布，不混入 META membership。
 
     参数:
         - summary (pd.DataFrame | None): `summarize_do_threshold_sweep` 输出；None 时读取路径或默认表。
@@ -26538,7 +26538,9 @@ def plot_do_threshold_counts_and_composition(
         raise ValueError('summary is empty.')
 
     x = np.arange(len(summary))
-    labels = [f'DO{float(value):g}' for value in summary['threshold']]
+    styles = [_threshold_style(value) for value in summary['threshold']]
+    labels = [style[1] for style in styles]
+    threshold_colors = [style[2] for style in styles]
     basin_order = ['Pacific', 'Atlantic', 'Indian', 'SO', 'Arctic']
     basin_colors = {
         'Pacific': '#4c78a8',
@@ -26547,44 +26549,68 @@ def plot_do_threshold_counts_and_composition(
         'SO': '#b279a2',
         'Arctic': '#72b7b2',
     }
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.9), constrained_layout=True)
-    bars = axes[0].bar(x, summary['n_anomaly'], color=['#9ca3af', '#6b7280', '#374151'])
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(12.8, 4.9),
+        sharex=True,
+        constrained_layout=True,
+    )
+    anomaly_rates = pd.to_numeric(summary['anomaly_pct_of_baseline'], errors='coerce').to_numpy(dtype=float)
+    bars = axes[0].bar(
+        x,
+        anomaly_rates,
+        color=threshold_colors,
+        edgecolor='white',
+        linewidth=0.7,
+    )
     axes[0].set_xticks(x, labels)
-    axes[0].set_ylabel('Selected anomaly profiles')
-    axes[0].set_title('Candidate yield')
+    axes[0].set_ylabel('Profiles carrying ΔDO anomaly (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[0].set_title('ΔDO candidate yield', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
     axes[0].grid(axis='y', alpha=0.25)
-    for bar, count in zip(bars, summary['n_anomaly']):
+    for bar, rate in zip(bars, anomaly_rates):
         axes[0].text(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height(),
-            f'{int(count):,}',
+            f'{rate:.2f}%',
             ha='center',
             va='bottom',
+            fontsize=_PLOT_TYPOGRAPHY['annotation'],
         )
 
     bottom = np.zeros(len(summary), dtype=float)
     for basin in basin_order:
         values = pd.to_numeric(summary[f'basin_{basin}_pct'], errors='coerce').to_numpy(dtype=float)
-        axes[1].bar(x, values, bottom=bottom, color=basin_colors[basin], label=basin)
+        axes[1].bar(
+            x,
+            values,
+            bottom=bottom,
+            color=basin_colors[basin],
+            edgecolor=threshold_colors,
+            linewidth=0.35,
+            label=basin,
+        )
         bottom += np.nan_to_num(values)
-    axes[1].plot(
-        x,
-        summary['ke_box_pct'],
-        color='black',
-        marker='D',
-        linewidth=1.5,
-        label='KE box',
-    )
     axes[1].set_xticks(x, labels)
     axes[1].set_ylim(0, 100)
-    axes[1].set_ylabel('Share of selected profiles (%)')
-    axes[1].set_title('Broad geographic composition')
+    axes[1].set_ylabel('Share of selected profiles (%)', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
+    axes[1].set_title('Broad geographic composition', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    axes[1].tick_params(axis='x', labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
     axes[1].grid(axis='y', alpha=0.25)
-    axes[1].legend(fontsize=8, ncol=2, loc='upper right')
-    fig.suptitle(
-        f'Deep ΔDO threshold funnel ({start_year}-{end_year}, depth ≥ {float(anomaly_min_depth):g} m)'
+    axes[1].legend(
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        ncol=1,
+        loc='lower right',
+        borderaxespad=0,
+        framealpha=0.9,
     )
-
+    axes[0].set_xlim(-0.5, len(summary) - 0.5)
+    for axis in axes:
+        _apply_axis_typography(axis)
+    fig.suptitle(
+        f'Deep ΔDO threshold funnel ({start_year}-{end_year}, depth ≥ {float(anomaly_min_depth):g} m)',
+        fontsize=_PLOT_TYPOGRAPHY['figure_title'],
+    )
+    _apply_plot_typography(fig)
     out = {
         'thresholds': [float(value) for value in summary['threshold']],
         'n_anomaly': [int(value) for value in summary['n_anomaly']],
@@ -26669,14 +26695,18 @@ def plot_do_threshold_meta_association(
     ci_low = np.asarray(ci_low)
     ci_high = np.asarray(ci_high)
     x = np.arange(len(summary))
-    labels = [f'DO{float(value):g}' for value in summary['threshold']]
+    styles = [_threshold_style(value) for value in summary['threshold']]
+    labels = [style[1] for style in styles]
+    threshold_colors = [style[2] for style in styles]
     baseline = float(summary['baseline_meta_pct'].iloc[0])
 
     fig, ax = plt.subplots(figsize=(7.4, 5.2))
     bars = ax.bar(
         x,
         rates,
-        color=['#fbbf24', '#f59e0b', '#d97706'],
+        color=threshold_colors,
+        edgecolor='white',
+        linewidth=0.7,
         yerr=[rates - ci_low, ci_high - rates],
         capsize=5,
     )
@@ -27176,11 +27206,12 @@ def plot_scv_do_threshold_enrichment(
     output_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = True,
+    log_scale: bool = False,
 ) -> dict:
     """绘制 DO20/DO35/DO50 下 baseline、META 与 McCoy SCV 的 carrier 频率。
 
-    图中所有曲线都是 group-centered 的 `P(DO_t | group)`。对数纵轴用于同时呈现低于 1% 的 Argo
-    背景率与较高的 SCV carrier 率，点旁直接标出 numerator/denominator，误差棒为 95% Wilson 区间。
+    图中所有曲线都是 group-centered 的 `P(DO_t | group)`，点旁直接标出 numerator/denominator，误差棒为
+    95% Wilson 区间。默认使用线性纵轴；设置 `log_scale=True` 可切换到对数纵轴以突出低于 1% 的背景率。
 
     参数:
         - summary (pd.DataFrame | None): `summarize_scv_do_threshold_sweep` 输出；None 时读取路径或默认表。
@@ -27191,12 +27222,14 @@ def plot_scv_do_threshold_enrichment(
         - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存图，默认 True。
+        - log_scale (bool): 是否使用对数纵轴，默认 False。
 
     返回:
         - dict: 含每组阈值点、是否跨阈值持续富集及 figure_path（save_fig 时）。
 
     输出:
-        - `plot_outputs/do/<region>/scv_do_threshold_sweep/scv_do_threshold_enrichment_<y0>_<y1>_depth<z>m.png`（save_fig 时）。
+        - 线性版：`plot_outputs/do/<region>/scv_do_threshold_sweep/scv_do_threshold_enrichment_<y0>_<y1>_depth<z>m.png`。
+        - 对数版：`..._depth<z>m_log.png`（`log_scale=True` 时）。
     """
     region_slug = _current_region_key()
     depth_tag = _format_detection_value(float(anomaly_min_depth))
@@ -27217,43 +27250,115 @@ def plot_scv_do_threshold_enrichment(
         raise ValueError('summary is empty.')
 
     groups = [
-        ('All DO-evaluable Argo', '#6b7280', 'o', (5, -14), 'top'),
-        ('META-matched DO-evaluable Argo', '#d97706', 's', (5, 8), 'bottom'),
-        ('DO-evaluable McCoy SCVs', '#b91c1c', 'D', (5, 8), 'bottom'),
+        ('All DO-evaluable Argo', _GROUP_COLORS['baseline']),
+        ('META-matched DO-evaluable Argo', _GROUP_COLORS['meta']),
+        ('DO-evaluable McCoy SCVs', _GROUP_COLORS['scv']),
     ]
+    if log_scale:
+        annotation_layout = {
+            'All DO-evaluable Argo': {
+                20: ((8, -16), 'left', 'top'),
+                35: ((8, -16), 'left', 'top'),
+                50: ((-8, -16), 'right', 'top'),
+            },
+            'META-matched DO-evaluable Argo': {
+                20: ((8, 10), 'left', 'bottom'),
+                35: ((8, 10), 'left', 'bottom'),
+                50: ((-8, 10), 'right', 'bottom'),
+            },
+            'DO-evaluable McCoy SCVs': {
+                20: ((8, 10), 'left', 'bottom'),
+                35: ((8, 10), 'left', 'bottom'),
+                50: ((-8, 10), 'right', 'bottom'),
+            },
+        }
+    else:
+        annotation_layout = {
+            'All DO-evaluable Argo': {
+                20: ((8, -14), 'left', 'top'),
+                35: ((8, 8), 'left', 'bottom'),
+                50: ((-8, 10), 'right', 'bottom'),
+            },
+            'META-matched DO-evaluable Argo': {
+                20: ((8, 16), 'left', 'bottom'),
+                35: ((8, 20), 'left', 'bottom'),
+                50: ((-8, 24), 'right', 'bottom'),
+            },
+            'DO-evaluable McCoy SCVs': {
+                20: ((8, 10), 'left', 'bottom'),
+                35: ((8, 10), 'left', 'bottom'),
+                50: ((-8, 10), 'right', 'bottom'),
+            },
+        }
     fig, ax = plt.subplots(figsize=(8.4, 5.8))
     plotted = {}
     all_interval_lows = []
-    for group, color, marker, text_offset, vertical_alignment in groups:
+    all_interval_highs = []
+    for group, color in groups:
         part = summary[summary['group'].eq(group)].sort_values('threshold_umol_kg')
         x = part['threshold_umol_kg'].to_numpy(dtype=float)
         y = 100.0 * part['rate'].to_numpy(dtype=float)
         low = 100.0 * part['confidence_interval_low'].to_numpy(dtype=float)
         high = 100.0 * part['confidence_interval_high'].to_numpy(dtype=float)
         all_interval_lows.extend(low[np.isfinite(low) & (low > 0)])
+        all_interval_highs.extend(high[np.isfinite(high)])
         ax.errorbar(
-            x, y, yerr=[y - low, high - y], color=color, marker=marker,
-            linewidth=2.0, markersize=7, capsize=4, label=group,
+            x, y, yerr=[y - low, high - y], color=color, marker=None,
+            linewidth=2.0, capsize=4, label=group,
         )
+        for xv, yv in zip(x, y):
+            _, _, _, marker = _threshold_style(xv)
+            ax.plot(
+                xv,
+                yv,
+                linestyle='none',
+                marker=marker,
+                color=color,
+                markeredgecolor='white',
+                markeredgewidth=0.5,
+                markersize=7,
+            )
         for xv, yv, k, n in zip(x, y, part['numerator'], part['denominator']):
+            xytext, ha, va = annotation_layout.get(group, {}).get(
+                int(round(float(xv))),
+                ((6, 8), 'left', 'bottom'),
+            )
             ax.annotate(
-                f'{int(k)}/{int(n)}', (xv, yv), xytext=text_offset,
-                textcoords='offset points', fontsize=8, color=color,
-                va=vertical_alignment,
+                f'{int(k)}/{int(n)}', (xv, yv), xytext=xytext,
+                textcoords='offset points', fontsize=_PLOT_TYPOGRAPHY['annotation'], color=color,
+                ha=ha,
+                va=va,
+                bbox={
+                    'boxstyle': 'round,pad=0.18',
+                    'facecolor': 'white',
+                    'edgecolor': 'none',
+                    'alpha': 0.82,
+                },
+                zorder=6,
             )
         plotted[group] = [
             {'threshold': float(row.threshold_umol_kg), 'numerator': int(row.numerator),
              'denominator': int(row.denominator), 'rate_pct': 100.0 * float(row.rate)}
             for row in part.itertuples(index=False)
         ]
-    ax.set_yscale('log')
-    if all_interval_lows:
-        ax.set_ylim(bottom=max(min(all_interval_lows) * 0.45, 1e-4))
+    if log_scale:
+        ax.set_yscale('log')
+        if all_interval_lows:
+            ax.set_ylim(bottom=max(min(all_interval_lows) * 0.45, 1e-4))
+    else:
+        upper = max(all_interval_highs, default=1.0)
+        ax.set_ylim(0.0, upper * 1.18)
     ax.set_xticks(sorted(pd.to_numeric(summary['threshold_umol_kg'], errors='coerce').dropna().unique()))
-    ax.set_xlabel('ΔDO prominence threshold (μmol kg⁻¹)')
-    ax.set_ylabel('Profiles carrying a deep ΔDO anomaly (%) — log scale')
-    ax.grid(axis='y', which='both', alpha=0.25)
-    ax.legend(frameon=False, fontsize=9)
+    ax.set_xlabel(
+        'ΔDO prominence threshold (μmol kg⁻¹)',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    ax.set_ylabel(
+        'Deep ΔDO anomaly rate (%)' + (' — log scale' if log_scale else ''),
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    ax.grid(axis='y', which='both' if log_scale else 'major', alpha=0.25)
+    ax.legend(frameon=False, fontsize=_PLOT_TYPOGRAPHY['tick_legend'])
     scv = summary[summary['group'].eq('DO-evaluable McCoy SCVs')]
     persistent = bool((pd.to_numeric(scv['odds_ratio_vs_all_argo'], errors='coerce') > 1).all())
     title = (
@@ -27261,10 +27366,16 @@ def plot_scv_do_threshold_enrichment(
         if persistent
         else 'Deep ΔDO carrier frequency across Argo, META, and McCoy SCV groups'
     )
-    ax.set_title(title)
+    ax.set_title(title, fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
-    out = {'groups': plotted, 'persistent_scv_enrichment': persistent}
+    out = {
+        'groups': plotted,
+        'persistent_scv_enrichment': persistent,
+        'log_scale': bool(log_scale),
+    }
     if save_fig:
         out_dir = (
             Path(output_dir)
@@ -27272,10 +27383,12 @@ def plot_scv_do_threshold_enrichment(
             else make_detection_config('do').output_dir('scv_do_threshold_sweep', region_slug)
         )
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / (
+        filename = (
             f'scv_do_threshold_enrichment_{int(baseline_start_year)}_'
-            f'{int(baseline_end_year)}_depth{depth_tag}m.png'
+            f'{int(baseline_end_year)}_depth{depth_tag}m'
+            f'{"_log" if log_scale else ""}.png'
         )
+        path = out_dir / filename
         fig.savefig(path, dpi=240, bbox_inches='tight')
         out['figure_path'] = str(path)
         print(f'[*] SCV DO threshold enrichment figure saved: {path}')
@@ -27287,7 +27400,7 @@ def plot_scv_do_threshold_enrichment(
 
 def _detector_short_label(cfg: DetectionConfig) -> str:
     """返回图标题里使用的 detector 标签。"""
-    return {'do': 'δDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
+    return {'do': 'ΔDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
 
 
 def _load_detector_anomaly_ids(
@@ -28000,7 +28113,8 @@ def plot_mccoy_scv_catalog_context(
         source = Path(threshold_table_path)
         threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
     unique_scv = threshold_table.drop_duplicates('stable_scv_id')
-    n_evaluable = int(unique_scv['do_evaluable'].fillna(False).astype(bool).sum())
+    evaluable_scv = unique_scv[unique_scv['do_evaluable'].fillna(False).astype(bool)].copy()
+    n_evaluable = int(len(evaluable_scv))
 
     fig = plt.figure(figsize=(12.5, 5.8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
@@ -28011,19 +28125,37 @@ def plot_mccoy_scv_catalog_context(
     ax.scatter(
         pd.to_numeric(catalog['Longitude'], errors='coerce'),
         pd.to_numeric(catalog['Latitude'], errors='coerce'),
-        s=8, c='#245b78', alpha=0.55, linewidth=0,
+        s=8, c='#6e8796', alpha=0.4, linewidth=0,
         transform=ccrs.PlateCarree(), zorder=2,
+        label=f'Full McCoy catalogue ({len(catalog):,})',
+    )
+    ax.scatter(
+        evaluable_scv['lon'],
+        evaluable_scv['lat'],
+        s=32,
+        c='#d97706',
+        edgecolor='white',
+        linewidth=0.35,
+        alpha=0.95,
+        transform=ccrs.PlateCarree(),
+        zorder=3,
+        label=f'DO-evaluable matched subset ({n_evaluable})',
     )
     gridlines = ax.gridlines(draw_labels=True, linewidth=0.35, color=_BASEMAP_COLORS['grid'], alpha=0.45, linestyle='--')
     gridlines.top_labels = False
     gridlines.right_labels = False
-    ax.set_title('McCoy et al. (2020) Argo-derived, velocity-confirmed subsurface coherent vortices')
-    ax.text(
-        0.015, 0.025,
-        f'Full catalogue: {len(catalog):,} SCVs\nDO-evaluable matched subset: {n_evaluable}',
-        transform=ax.transAxes, fontsize=10, va='bottom', ha='left',
-        bbox={'facecolor': 'white', 'edgecolor': '0.75', 'alpha': 0.9, 'boxstyle': 'round,pad=0.35'},
+    _apply_gridline_typography(gridlines)
+    ax.set_title(
+        'McCoy et al. (2020) Argo-derived, velocity-confirmed subsurface coherent vortices',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
     )
+    ax.legend(
+        loc='lower left',
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        framealpha=0.9,
+        borderaxespad=0.4,
+    )
+    _apply_plot_typography(fig)
     fig.tight_layout()
 
     out = {'n_catalog': int(len(catalog)), 'n_do_evaluable': n_evaluable}
@@ -28127,6 +28259,172 @@ def plot_scv_do_carrier_distribution(
         fig.savefig(path, dpi=240, bbox_inches='tight')
         out['figure_path'] = str(path)
         print(f'[*] SCV DO carrier distribution saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_scv_do_carrier_distribution_comparison(
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    *,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制多个 ΔDO 阈值下 McCoy SCV carrier 的嵌套地理分布。
+
+    所有 DO-evaluable McCoy SCV 作为浅灰背景，按宽松到严格的阈值依次叠加 carrier；DO20、DO35、DO50
+    使用不同颜色与 marker。该图强调阈值集合的包含关系，不改变单阈值地图的正式输出。
+
+    参数:
+        - thresholds (tuple[float, ...] | list[float]): 要叠加的 ΔDO 阈值列表，默认 (20, 35, 50)。
+        - threshold_table (pd.DataFrame | None): 阈值安全 SCV long table；None 时读取默认表。
+        - threshold_table_path (str | Path | None): 阈值安全 parquet/CSV；None 时定位默认表。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存图，默认 True。
+
+    返回:
+        - dict: 含各阈值 carrier 计数、共同 DO-evaluable 分母、嵌套性检查结果与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/plot_scv_do_carrier_distribution/scv_do_carrier_distribution_all_thresholds_depth<z>m.png`（save_fig 时）。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    if not threshold_values:
+        raise ValueError('thresholds must contain at least one value.')
+
+    region_slug = _current_region_key()
+    if threshold_table is None:
+        if threshold_table_path is None:
+            depth_tag = _format_detection_value(float(anomaly_min_depth))
+            threshold_table_path = (
+                make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
+                / f'mccoy_scv_delta_do_thresholds_2002_2023_depth{depth_tag}m.parquet'
+            )
+        source = Path(threshold_table_path)
+        threshold_table = pd.read_csv(source) if source.suffix.lower() == '.csv' else pd.read_parquet(source)
+    else:
+        threshold_table = threshold_table.copy()
+
+    evaluable_by_threshold: dict[float, pd.DataFrame] = {}
+    carriers_by_threshold: dict[float, pd.DataFrame] = {}
+    ids_by_threshold: dict[float, set] = {}
+    for threshold in threshold_values:
+        selected = threshold_table[
+            np.isclose(
+                pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'),
+                threshold,
+            )
+        ].copy()
+        if selected.empty:
+            raise ValueError(f'threshold table lacks ΔDO threshold {threshold:g}.')
+        evaluable = selected[selected['do_evaluable'].fillna(False).astype(bool)].copy()
+        carriers = evaluable[
+            evaluable['has_delta_do'].astype('boolean').fillna(False).astype(bool)
+        ].copy()
+        evaluable_by_threshold[threshold] = evaluable
+        carriers_by_threshold[threshold] = carriers
+        ids_by_threshold[threshold] = set(carriers['stable_scv_id'])
+
+    reference_ids = set(evaluable_by_threshold[threshold_values[0]]['stable_scv_id'])
+    common_denominator = all(
+        set(frame['stable_scv_id']) == reference_ids
+        for frame in evaluable_by_threshold.values()
+    )
+    nested = all(
+        ids_by_threshold[lo] >= ids_by_threshold[hi]
+        for lo, hi in zip(threshold_values[:-1], threshold_values[1:])
+    )
+    background = evaluable_by_threshold[threshold_values[0]]
+
+    fig = plt.figure(figsize=(12.5, 5.8))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree(central_longitude=180))
+    ax.add_feature(cfeature.OCEAN, facecolor=_BASEMAP_COLORS['ocean'], zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'], zorder=0)
+    ax.coastlines(color=_BASEMAP_COLORS['coastline'], linewidth=0.5)
+    ax.set_global()
+    ax.scatter(
+        background['lon'],
+        background['lat'],
+        s=18,
+        c=_GROUP_COLORS['baseline'],
+        alpha=0.55,
+        linewidth=0,
+        transform=ccrs.PlateCarree(),
+        label=f'DO-evaluable SCVs ({len(background)})',
+        zorder=2,
+    )
+    for index, threshold in enumerate(threshold_values):
+        threshold_key, display_label, _, marker = _threshold_style(threshold)
+        color = _CARRIER_DISTRIBUTION_COLORS.get(
+            threshold_key,
+            _THRESHOLD_COLORS.get(threshold_key, '#b91c1c'),
+        )
+        carriers = carriers_by_threshold[threshold]
+        ax.scatter(
+            carriers['lon'],
+            carriers['lat'],
+            s=42 + 8 * index,
+            c=color,
+            marker=marker,
+            edgecolor='white',
+            linewidth=0.45,
+            alpha=0.95,
+            transform=ccrs.PlateCarree(),
+            label=f'{display_label} carriers ({len(carriers)})',
+            zorder=3 + index,
+        )
+    gridlines = ax.gridlines(
+        draw_labels=True,
+        linewidth=0.35,
+        color=_BASEMAP_COLORS['grid'],
+        alpha=0.45,
+        linestyle='--',
+    )
+    gridlines.top_labels = False
+    gridlines.right_labels = False
+    _apply_gridline_typography(gridlines)
+    ax.legend(
+        loc='lower left',
+        frameon=True,
+        fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
+        borderaxespad=0.6,
+        framealpha=0.9,
+    )
+    ax.set_title(
+        'Nested ΔDO carrier distributions in McCoy SCVs',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    out = {
+        'thresholds': threshold_values,
+        'n_evaluable': int(len(background)),
+        'n_evaluable_common': bool(common_denominator),
+        'nested_carriers': bool(nested),
+        'n_carrier': {str(threshold): int(len(carriers_by_threshold[threshold]))
+                      for threshold in threshold_values},
+    }
+    if save_fig:
+        depth_tag = _format_detection_value(float(anomaly_min_depth))
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir('plot_scv_do_carrier_distribution', region_slug)
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f'scv_do_carrier_distribution_all_thresholds_depth{depth_tag}m.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] SCV DO carrier distribution comparison saved: {path}')
     if show_fig:
         plt.show()
     plt.close(fig)
@@ -28254,15 +28552,15 @@ def calculate_scv_frequency_statistics(
     threshold_table_path: str | Path | None = None,
     save_report: bool = True,
 ) -> dict:
-    """McCoy SCV 频率分析：次表层涡相对基线 Argo 的入面涡率与 δDO 携带率富集。
+    """McCoy SCV 频率分析：次表层涡相对基线 Argo 的入面涡率与 ΔDO 携带率富集。
 
     以 McCoy 速度确认的次表层涡为子集、指定年份区域内的全部 Argo 剖面为基线，用 Fisher 精确检验两件事:
     (1) SCV 落在 META 面涡内的比例是否显著区别于随机 Argo（读纯 GLORYS 全目录 parquet 的 meta_miss);
-    (2) 携显著正峰 δDO 的比例,三组对比——测氧基线 Argo / 落在 META 面涡内的测氧 Argo / McCoy SCV(读 Argo
+    (2) 携显著正峰 ΔDO 的比例,三组对比——测氧基线 Argo / 落在 META 面涡内的测氧 Argo / McCoy SCV(读 Argo
     锚定子集的阈值安全 long table，基线分母为区域内 depth ≥ cfg.anomaly_min_depth 的有效测氧剖面数，
     META 组分母为其中落在面涡内者）。
-    核心:落在 META 表层涡内几乎不富集 δDO(≈背景),而 SCV 强富集——正是「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
-    入面涡轴另计 δDO 异常 Argo（= 原 Frequency Analysis 的 anomalies 组）的同轴入涡率,存报告/parquet 作参考(图只画 δDO 三组)。
+    核心:落在 META 表层涡内几乎不富集 ΔDO(≈背景),而 SCV 强富集——正是「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
+    入面涡轴另计 ΔDO 异常 Argo（= 原 Frequency Analysis 的 anomalies 组）的同轴入涡率,存报告/parquet 作参考(图只画 ΔDO 三组)。
 
     参数:
         - resolution_path (str | Path | None): 纯 GLORYS 全目录 SCV parquet（含 meta_miss/date）；None 时按默认定位。
@@ -28282,7 +28580,7 @@ def calculate_scv_frequency_statistics(
 
     说明:
         - 基线入面涡数据来自 export_all_interacting_argo 预计算文件，须与 SCV 的 meta_miss 同用 1.2× 半径放大方可比。
-        - δDO 分母通过重载基线年份 Argo 现算（仅计 depth ≥ 阈值的有效 DO 剖面），与 anomalies 文件同口径。
+        - ΔDO 分母通过重载基线年份 Argo 现算（仅计 depth ≥ 阈值的有效 DO 剖面），与 anomalies 文件同口径。
     """
     from scipy.stats import fisher_exact
     cfg = _resolve_detection_config(detection_config)
@@ -28378,10 +28676,10 @@ def calculate_scv_frequency_statistics(
         f"----------------------------------------\n"
         f"[Inside META surface eddy]\n"
         f"  Baseline Argo:  {n_base_in}/{n_base} = {pct(n_base_in, n_base):.2f}%\n"
-        f"  δDO-anom Argo:  {n_anom_in}/{n_base_dopos} = {pct(n_anom_in, n_base_dopos):.2f}%  (orig. FA; OR={or_anom:.2f}, p={p_anom:.2e})\n"
+        f"  ΔDO-anom Argo:  {n_anom_in}/{n_base_dopos} = {pct(n_anom_in, n_base_dopos):.2f}%  (orig. FA; OR={or_anom:.2f}, p={p_anom:.2e})\n"
         f"  McCoy SCVs:     {n_scv_in}/{n_scv} = {pct(n_scv_in, n_scv):.2f}%  (OR={or_eddy:.2f}, p={p_eddy:.2e})\n"
         f"----------------------------------------\n"
-        f"[Carry significant δDO (≥ threshold)]\n"
+        f"[Carry significant ΔDO (≥ threshold)]\n"
         f"  Baseline DO Argo: {n_base_dopos}/{n_base_do} = {pct(n_base_dopos, n_base_do):.3f}%\n"
         f"  In META eddy:     {n_pos_in}/{n_do_in} = {pct(n_pos_in, n_do_in):.3f}%  (OR={or_meta:.2f} vs baseline)\n"
         f"  McCoy SCVs:       {scv_do_pos}/{scv_do_n} = {pct(scv_do_pos, scv_do_n):.2f}%  (OR={or_do:.2f} vs baseline)\n"
@@ -28427,11 +28725,11 @@ def plot_scv_frequency_enrichment(
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """McCoy SCV δDO 富集图：携显著 δDO 率按「涡探测器」三柱分层(测氧基线 / META 表层涡内 / SCV 次表层涡)。
+    """McCoy SCV ΔDO 富集图：携显著 ΔDO 率按「涡探测器」三柱分层(测氧基线 / META 表层涡内 / SCV 次表层涡)。
 
     读 calculate_scv_frequency_statistics 写出的单行摘要 parquet,画单联三柱:测氧基线 Argo、落在 META 面涡内的测氧
-    Argo、McCoy SCV 各自携显著正峰 δDO 的比例,每柱带 95% Wilson 置信区间误差棒(如实反映 SCV 小样本的不确定度)。
-    核心信息:落在 META 表层涡内几乎不富集 δDO(≈背景),而 SCV 强富集——即「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
+    Argo、McCoy SCV 各自携显著正峰 ΔDO 的比例,每柱带 95% Wilson 置信区间误差棒(如实反映 SCV 小样本的不确定度)。
+    核心信息:落在 META 表层涡内几乎不富集 ΔDO(≈背景),而 SCV 强富集——即「表层涡解释不了氧异常、次表层涡能」的漏检侧证。
     灰=基线、橙=META 涡内、红=SCV。仅读缓存渲染,不重算。
 
     参数:
@@ -28752,7 +29050,7 @@ def detect_ofes_delta_do(
     detection_config: DetectionConfig | None = None,
     interp: bool = True,
 ) -> pd.DataFrame:
-    """在 OFES 虚拟剖面上运行 δDO 检测（复用 calculate_delta_do）。
+    """在 OFES 虚拟剖面上运行 ΔDO 检测（复用 calculate_delta_do）。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典（需含 do2/temp/salinity）。
