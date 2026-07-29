@@ -16,9 +16,11 @@ from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.stats import pearsonr, spearmanr
 from scipy.linalg import eig
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, linear_sum_assignment
 import copy
 import gsw
 from collections import defaultdict
@@ -29969,3 +29971,2534 @@ def plot_ofes_snapshot_quick(
         plt.show()
         return None
     return fig
+
+
+def _ofes_delta_do_catalog_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES ΔDO event catalog 配置。"""
+    raw = dict(_OFES_CFG.get('delta_do_catalog', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES delta_do_catalog override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    thresholds = tuple(
+        sorted({float(value) for value in raw.get(
+            'thresholds', (20.0, 35.0, 50.0)
+        )})
+    )
+    if not thresholds or any(
+        not np.isfinite(value) or value <= 0 for value in thresholds
+    ):
+        raise ValueError(
+            'OFES delta_do_catalog thresholds must be finite positive values.'
+        )
+
+    settings = {
+        'thresholds': thresholds,
+        'candidate_pressure_min_dbar': float(
+            raw.get('candidate_pressure_min_dbar', 300.0)
+        ),
+        'candidate_pressure_max_dbar': float(
+            raw.get('candidate_pressure_max_dbar', 1000.0)
+        ),
+        'latitude_chunk_size': int(raw.get('latitude_chunk_size', 100)),
+        'parity_dates': tuple(str(value) for value in raw.get(
+            'parity_dates',
+            ('2003-01-01', '2003-04-05', '2003-07-01', '2003-10-01'),
+        )),
+        'parity_lon_bounds': tuple(float(value) for value in raw.get(
+            'parity_lon_bounds', (142.0, 150.0)
+        )),
+        'parity_lat_bounds': tuple(float(value) for value in raw.get(
+            'parity_lat_bounds', (32.0, 39.0)
+        )),
+        'parity_random_profiles': int(
+            raw.get('parity_random_profiles', 300)
+        ),
+        'parity_top_profiles': int(raw.get('parity_top_profiles', 200)),
+        'parity_seed': int(raw.get('parity_seed', 20260730)),
+        'object_connectivity': int(raw.get('object_connectivity', 8)),
+        'object_pressure_tolerance_dbar': float(
+            raw.get('object_pressure_tolerance_dbar', 100.0)
+        ),
+        'min_object_pixels': int(raw.get('min_object_pixels', 12)),
+        'event_max_missing_days': int(
+            raw.get('event_max_missing_days', 1)
+        ),
+        'event_max_centroid_distance_km': float(
+            raw.get('event_max_centroid_distance_km', 80.0)
+        ),
+        'event_max_pressure_difference_dbar': float(
+            raw.get('event_max_pressure_difference_dbar', 100.0)
+        ),
+        'event_bbox_padding_pixels': int(
+            raw.get('event_bbox_padding_pixels', 6)
+        ),
+        'event_gap_cost_per_missing_day': float(
+            raw.get('event_gap_cost_per_missing_day', 0.25)
+        ),
+        'min_ranked_event_days': int(
+            raw.get('min_ranked_event_days', 3)
+        ),
+        'rank_area_reference_km2': float(
+            raw.get('rank_area_reference_km2', 500.0)
+        ),
+        'rank_thickness_reference_dbar': float(
+            raw.get('rank_thickness_reference_dbar', 100.0)
+        ),
+        'rank_duration_reference_days': float(
+            raw.get('rank_duration_reference_days', 5.0)
+        ),
+        'output_region_slug': str(
+            raw.get('output_region_slug', 'ofes_np30_ke')
+        ),
+    }
+    if (
+        settings['candidate_pressure_min_dbar'] < 0
+        or settings['candidate_pressure_max_dbar']
+        <= settings['candidate_pressure_min_dbar']
+    ):
+        raise ValueError(
+            'OFES catalog candidate pressure bounds must be ordered and '
+            'non-negative.'
+        )
+    if settings['latitude_chunk_size'] <= 0:
+        raise ValueError('OFES catalog latitude_chunk_size must be positive.')
+    if settings['object_connectivity'] not in (4, 8):
+        raise ValueError('OFES object_connectivity must be 4 or 8.')
+    positive_keys = (
+        'object_pressure_tolerance_dbar',
+        'min_object_pixels',
+        'event_max_centroid_distance_km',
+        'event_max_pressure_difference_dbar',
+        'min_ranked_event_days',
+        'rank_area_reference_km2',
+        'rank_thickness_reference_dbar',
+        'rank_duration_reference_days',
+    )
+    if any(settings[key] <= 0 for key in positive_keys):
+        raise ValueError(
+            'OFES catalog object, event, and ranking scales must be positive.'
+        )
+    if (
+        settings['event_max_missing_days'] < 0
+        or settings['event_bbox_padding_pixels'] < 0
+        or settings['event_gap_cost_per_missing_day'] < 0
+    ):
+        raise ValueError(
+            'OFES event gap, bbox padding, and gap cost settings must '
+            'be non-negative.'
+        )
+    return settings
+
+
+def _ofes_vectorized_do_peaks(
+    do_values: np.ndarray,
+    pressure: np.ndarray,
+    detection_config: DetectionConfig,
+    *,
+    valid_mask: np.ndarray | None = None,
+    minimum_delta: float = 20.0,
+) -> dict:
+    """按唯一有效层模式分组，向量化复现 DO 单剖面峰值判据。"""
+    if detection_config.method != 'do':
+        raise ValueError('The OFES vectorized scanner supports DO mode only.')
+    if (
+        detection_config.salinity_threshold > 0
+        or detection_config.temperature_threshold > 0
+    ):
+        raise ValueError(
+            'The OFES DO-only scanner requires disabled salinity and '
+            'temperature filters.'
+        )
+
+    values = np.asarray(do_values, dtype=np.float64)
+    pressure_arr = np.asarray(pressure, dtype=np.float64)
+    if values.ndim != 3 or pressure_arr.ndim != 1:
+        raise ValueError(
+            'do_values must have shape (pressure, lat, lon) and pressure '
+            'must be one-dimensional.'
+        )
+    if values.shape[0] != pressure_arr.size:
+        raise ValueError(
+            f'OFES DO pressure axis mismatch: {values.shape[0]} != '
+            f'{pressure_arr.size}.'
+        )
+    if not np.all(np.diff(pressure_arr) > 0):
+        raise ValueError('OFES pressure coordinate must be strictly increasing.')
+
+    horizontal_shape = values.shape[1:]
+    flat = values.reshape(values.shape[0], -1)
+    if valid_mask is None:
+        valid = np.ones(flat.shape, dtype=bool)
+    else:
+        supplied = np.asarray(valid_mask, dtype=bool)
+        if supplied.shape != values.shape:
+            raise ValueError(
+                f'valid_mask shape {supplied.shape} does not match '
+                f'do_values shape {values.shape}.'
+            )
+        valid = supplied.reshape(flat.shape).copy()
+
+    near_zero_threshold = float(detection_config.do_near_zero_threshold)
+    near_zero = np.isfinite(flat) & (flat <= near_zero_threshold)
+    near_zero_count = np.count_nonzero(near_zero, axis=0)
+    max_near_zero = detection_config.do_near_zero_max_count
+    if max_near_zero is None or int(max_near_zero) < 0:
+        rejected = np.zeros(flat.shape[1], dtype=bool)
+    else:
+        rejected = near_zero_count > int(max_near_zero)
+    valid &= np.isfinite(flat) & (flat > near_zero_threshold)
+
+    packed = np.packbits(valid.T, axis=1)
+    _, inverse = np.unique(packed, axis=0, return_inverse=True)
+    best_delta = np.full(flat.shape[1], np.nan, dtype=np.float64)
+    best_pressure = np.full(flat.shape[1], np.nan, dtype=np.float64)
+    best_level = np.full(flat.shape[1], -1, dtype=np.int16)
+    candidate_count = np.zeros(flat.shape[1], dtype=np.int16)
+    valid_level_count = np.count_nonzero(valid, axis=0).astype(np.int16)
+    thickness = np.full(flat.shape[1], np.nan, dtype=np.float64)
+
+    pressure_min = float(detection_config.anomaly_min_depth)
+    pressure_max = float(detection_config.anomaly_max_depth)
+    half_window = float(detection_config.depth_interval)
+
+    for pattern_id in range(int(inverse.max()) + 1):
+        columns = np.flatnonzero((inverse == pattern_id) & ~rejected)
+        if columns.size == 0:
+            continue
+        levels = np.flatnonzero(valid[:, columns[0]])
+        if levels.size < 5:
+            continue
+
+        pattern_pressure = pressure_arr[levels]
+        pattern_values = flat[np.ix_(levels, columns)]
+        slopes = np.gradient(
+            pattern_values, pattern_pressure, axis=0
+        )
+        candidates = np.zeros(pattern_values.shape, dtype=bool)
+        candidates[1:-1] = (
+            (slopes[:-2] > 0)
+            & (slopes[2:] < 0)
+        )
+        if pressure_min > 0:
+            candidates &= pattern_pressure[:, None] >= pressure_min
+        if pressure_max > 0:
+            candidates &= pattern_pressure[:, None] <= pressure_max
+
+        deltas = np.full(pattern_values.shape, np.nan, dtype=np.float64)
+        endpoint_indices: dict[int, tuple[int, int]] = {}
+        for local_index, target_pressure in enumerate(pattern_pressure):
+            if pressure_min > 0 and target_pressure < pressure_min:
+                continue
+            if pressure_max > 0 and target_pressure > pressure_max:
+                continue
+            lower = int(np.searchsorted(
+                pattern_pressure,
+                max(0.0, target_pressure - half_window),
+                side='left',
+            ))
+            upper = int(np.searchsorted(
+                pattern_pressure,
+                target_pressure + half_window,
+                side='right',
+            ) - 1)
+            if lower >= upper:
+                continue
+            endpoint_indices[local_index] = (lower, upper)
+            fraction = (
+                (target_pressure - pattern_pressure[lower])
+                / (pattern_pressure[upper] - pattern_pressure[lower])
+            )
+            reference = (
+                pattern_values[lower]
+                + fraction
+                * (pattern_values[upper] - pattern_values[lower])
+            )
+            delta = pattern_values[local_index] - reference
+            deltas[local_index] = np.where(
+                candidates[local_index], delta, np.nan
+            )
+
+        finite = np.isfinite(deltas)
+        candidate_count[columns] = np.count_nonzero(
+            finite, axis=0
+        ).astype(np.int16)
+        if not np.any(finite):
+            continue
+        score = np.where(finite, deltas, -np.inf)
+        local_best = np.argmax(score, axis=0)
+        has_candidate = np.any(finite, axis=0)
+        selected_positions = np.flatnonzero(has_candidate)
+        selected_columns = columns[has_candidate]
+        selected_local = local_best[has_candidate]
+        selected_delta = deltas[
+            selected_local, selected_positions
+        ]
+        best_delta[selected_columns] = selected_delta
+        best_pressure[selected_columns] = pattern_pressure[selected_local]
+        best_level[selected_columns] = levels[selected_local]
+
+        qualifying_positions = np.flatnonzero(
+            has_candidate
+            & (
+                deltas[local_best, np.arange(columns.size)]
+                >= float(minimum_delta)
+            )
+        )
+        for position in qualifying_positions:
+            local_index = int(local_best[position])
+            endpoint = endpoint_indices.get(local_index)
+            if endpoint is None:
+                continue
+            lower, upper = endpoint
+            peak_delta = float(deltas[local_index, position])
+            segment_pressure = pattern_pressure[lower:upper + 1]
+            segment_values = pattern_values[
+                lower:upper + 1, position
+            ]
+            fraction = (
+                (segment_pressure - pattern_pressure[lower])
+                / (pattern_pressure[upper] - pattern_pressure[lower])
+            )
+            reference = (
+                pattern_values[lower, position]
+                + fraction
+                * (
+                    pattern_values[upper, position]
+                    - pattern_values[lower, position]
+                )
+            )
+            above_half = (
+                segment_values - reference
+            ) >= (0.5 * peak_delta)
+            peak_in_segment = local_index - lower
+            if not above_half[peak_in_segment]:
+                continue
+            start = peak_in_segment
+            stop = peak_in_segment
+            while start > 0 and above_half[start - 1]:
+                start -= 1
+            while stop + 1 < above_half.size and above_half[stop + 1]:
+                stop += 1
+
+            if start > 0:
+                upper_edge = 0.5 * (
+                    segment_pressure[start - 1]
+                    + segment_pressure[start]
+                )
+            else:
+                upper_edge = segment_pressure[start]
+            if stop + 1 < segment_pressure.size:
+                lower_edge = 0.5 * (
+                    segment_pressure[stop]
+                    + segment_pressure[stop + 1]
+                )
+            else:
+                lower_edge = segment_pressure[stop]
+            thickness[columns[position]] = max(
+                0.0, float(lower_edge - upper_edge)
+            )
+
+    result = {
+        'delta_do': best_delta.reshape(horizontal_shape).astype(np.float32),
+        'peak_pressure': best_pressure.reshape(
+            horizontal_shape
+        ).astype(np.float32),
+        'peak_level_index': best_level.reshape(horizontal_shape),
+        'half_amplitude_thickness_dbar': thickness.reshape(
+            horizontal_shape
+        ).astype(np.float32),
+        'candidate_count': candidate_count.reshape(horizontal_shape),
+        'valid_level_count': valid_level_count.reshape(horizontal_shape),
+        'rejected_near_zero': rejected.reshape(horizontal_shape),
+    }
+    return result
+
+
+def _ofes_threshold_tag(threshold: float) -> str:
+    """返回稳定的 DO threshold 列名/对象键标签。"""
+    return f'do{_format_detection_value(float(threshold))}'
+
+
+def _ofes_depth_aware_components(
+    rows: np.ndarray,
+    columns: np.ndarray,
+    pressure: np.ndarray,
+    grid_shape: tuple[int, int],
+    *,
+    pressure_tolerance: float,
+    connectivity: int,
+) -> tuple[int, np.ndarray]:
+    """连接水平相邻且峰值 pressure 足够接近的稀疏异常像元。"""
+    rows_arr = np.asarray(rows, dtype=np.int32)
+    columns_arr = np.asarray(columns, dtype=np.int32)
+    pressure_arr = np.asarray(pressure, dtype=float)
+    if not (
+        rows_arr.shape == columns_arr.shape == pressure_arr.shape
+    ):
+        raise ValueError(
+            'OFES object rows, columns, and pressure must share one shape.'
+        )
+    node_count = rows_arr.size
+    if node_count == 0:
+        return 0, np.empty(0, dtype=np.int32)
+    if (
+        np.any(rows_arr < 0)
+        or np.any(rows_arr >= grid_shape[0])
+        or np.any(columns_arr < 0)
+        or np.any(columns_arr >= grid_shape[1])
+    ):
+        raise ValueError('OFES object pixel indices lie outside the scan grid.')
+
+    node_grid = np.full(grid_shape, -1, dtype=np.int32)
+    pressure_grid = np.full(grid_shape, np.nan, dtype=np.float32)
+    node_grid[rows_arr, columns_arr] = np.arange(
+        node_count, dtype=np.int32
+    )
+    pressure_grid[rows_arr, columns_arr] = pressure_arr
+
+    offsets = [(0, 1), (1, 0)]
+    if connectivity == 8:
+        offsets += [(1, -1), (1, 1)]
+    edge_left = [np.arange(node_count, dtype=np.int32)]
+    edge_right = [np.arange(node_count, dtype=np.int32)]
+    nrows, ncolumns = grid_shape
+    for row_offset, column_offset in offsets:
+        source_rows = slice(
+            max(0, -row_offset),
+            min(nrows, nrows - row_offset),
+        )
+        target_rows = slice(
+            max(0, row_offset),
+            min(nrows, nrows + row_offset),
+        )
+        source_columns = slice(
+            max(0, -column_offset),
+            min(ncolumns, ncolumns - column_offset),
+        )
+        target_columns = slice(
+            max(0, column_offset),
+            min(ncolumns, ncolumns + column_offset),
+        )
+        left = node_grid[source_rows, source_columns]
+        right = node_grid[target_rows, target_columns]
+        left_pressure = pressure_grid[source_rows, source_columns]
+        right_pressure = pressure_grid[target_rows, target_columns]
+        connected = (
+            (left >= 0)
+            & (right >= 0)
+            & np.isfinite(left_pressure)
+            & np.isfinite(right_pressure)
+            & (
+                np.abs(left_pressure - right_pressure)
+                <= float(pressure_tolerance)
+            )
+        )
+        if np.any(connected):
+            edge_left.append(left[connected])
+            edge_right.append(right[connected])
+
+    left_nodes = np.concatenate(edge_left)
+    right_nodes = np.concatenate(edge_right)
+    graph = coo_matrix(
+        (
+            np.ones(left_nodes.size, dtype=np.uint8),
+            (left_nodes, right_nodes),
+        ),
+        shape=(node_count, node_count),
+    ).tocsr()
+    component_count, labels = connected_components(
+        graph, directed=False, return_labels=True
+    )
+    return int(component_count), labels.astype(np.int32)
+
+
+def _ofes_grid_cell_area_km2(
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """计算规则经纬网格每个中心点所代表的近似面积。"""
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    if lon_arr.size < 2 or lat_arr.size < 2:
+        raise ValueError(
+            'At least two OFES longitude and latitude points are required.'
+        )
+    lon_width = np.abs(np.gradient(lon_arr))
+    lat_width = np.abs(np.gradient(lat_arr))
+    scale = approximate_degree_length(lat_arr)
+    meridional = (
+        lat_width * np.asarray(scale['meters_per_degree_lat'], dtype=float)
+    )
+    zonal = (
+        lon_width[None, :]
+        * np.asarray(
+            scale['meters_per_degree_lon'], dtype=float
+        )[:, None]
+    )
+    return (meridional[:, None] * zonal) / 1e6
+
+
+def _ofes_empty_peak_pixels() -> pd.DataFrame:
+    """返回带稳定 schema 的空 OFES peak-pixel 表。"""
+    return pd.DataFrame(
+        {
+            'date': pd.Series(dtype='datetime64[ns]'),
+            'lat_index': pd.Series(dtype='int16'),
+            'lon_index': pd.Series(dtype='int16'),
+            'source_lat_index': pd.Series(dtype='int16'),
+            'source_lon_index': pd.Series(dtype='int16'),
+            'lat': pd.Series(dtype='float32'),
+            'lon': pd.Series(dtype='float32'),
+            'delta_do': pd.Series(dtype='float32'),
+            'peak_pressure': pd.Series(dtype='float32'),
+            'peak_level_index': pd.Series(dtype='int16'),
+            'half_amplitude_thickness_dbar': pd.Series(dtype='float32'),
+            'candidate_count': pd.Series(dtype='int16'),
+            'valid_level_count': pd.Series(dtype='int16'),
+        }
+    )
+
+
+def _ofes_empty_daily_objects() -> pd.DataFrame:
+    """返回带稳定 schema 的空 OFES daily-object 表。"""
+    return pd.DataFrame(
+        {
+            'date': pd.Series(dtype='datetime64[ns]'),
+            'threshold': pd.Series(dtype='float32'),
+            'threshold_tag': pd.Series(dtype='object'),
+            'daily_object_id': pd.Series(dtype='int32'),
+            'daily_object_key': pd.Series(dtype='object'),
+            'pixel_count': pd.Series(dtype='int32'),
+            'area_km2': pd.Series(dtype='float64'),
+            'equivalent_radius_km': pd.Series(dtype='float64'),
+            'centroid_lon': pd.Series(dtype='float64'),
+            'centroid_lat': pd.Series(dtype='float64'),
+            'lon_min': pd.Series(dtype='float64'),
+            'lon_max': pd.Series(dtype='float64'),
+            'lat_min': pd.Series(dtype='float64'),
+            'lat_max': pd.Series(dtype='float64'),
+            'row_min': pd.Series(dtype='int16'),
+            'row_max': pd.Series(dtype='int16'),
+            'column_min': pd.Series(dtype='int16'),
+            'column_max': pd.Series(dtype='int16'),
+            'delta_do_max': pd.Series(dtype='float64'),
+            'delta_do_mean': pd.Series(dtype='float64'),
+            'delta_do_p90': pd.Series(dtype='float64'),
+            'peak_lon': pd.Series(dtype='float64'),
+            'peak_lat': pd.Series(dtype='float64'),
+            'peak_pressure_at_max': pd.Series(dtype='float64'),
+            'pressure_mean': pd.Series(dtype='float64'),
+            'pressure_min': pd.Series(dtype='float64'),
+            'pressure_max': pd.Series(dtype='float64'),
+            'pressure_span_dbar': pd.Series(dtype='float64'),
+            'thickness_median_dbar': pd.Series(dtype='float64'),
+            'thickness_max_dbar': pd.Series(dtype='float64'),
+        }
+    )
+
+
+def _ofes_build_daily_objects(
+    pixels: pd.DataFrame,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    date: pd.Timestamp,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """为每个 DO threshold 构建 depth-aware daily connected objects。"""
+    working = pixels.copy()
+    object_records: list[dict] = []
+    if working.empty:
+        for threshold in settings['thresholds']:
+            working[f'object_id_{_ofes_threshold_tag(threshold)}'] = (
+                pd.Series(dtype='int32')
+            )
+        return working, _ofes_empty_daily_objects()
+
+    rows = working['lat_index'].to_numpy(dtype=np.int32)
+    columns = working['lon_index'].to_numpy(dtype=np.int32)
+    delta = working['delta_do'].to_numpy(dtype=float)
+    peak_pressure = working['peak_pressure'].to_numpy(dtype=float)
+    thickness = working[
+        'half_amplitude_thickness_dbar'
+    ].to_numpy(dtype=float)
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    cell_area = _ofes_grid_cell_area_km2(lon_arr, lat_arr)
+
+    for threshold in settings['thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        object_column = f'object_id_{tag}'
+        assigned = np.full(len(working), -1, dtype=np.int32)
+        active_positions = np.flatnonzero(
+            np.isfinite(delta) & (delta >= float(threshold))
+        )
+        if active_positions.size == 0:
+            working[object_column] = assigned
+            continue
+
+        _, raw_labels = _ofes_depth_aware_components(
+            rows[active_positions],
+            columns[active_positions],
+            peak_pressure[active_positions],
+            (lat_arr.size, lon_arr.size),
+            pressure_tolerance=settings[
+                'object_pressure_tolerance_dbar'
+            ],
+            connectivity=settings['object_connectivity'],
+        )
+        labels, counts = np.unique(raw_labels, return_counts=True)
+        kept_labels = labels[
+            counts >= int(settings['min_object_pixels'])
+        ]
+        for object_id, raw_label in enumerate(kept_labels, start=1):
+            member_local = np.flatnonzero(raw_labels == raw_label)
+            member_positions = active_positions[member_local]
+            assigned[member_positions] = object_id
+            member_rows = rows[member_positions]
+            member_columns = columns[member_positions]
+            member_area = cell_area[member_rows, member_columns]
+            member_lon = lon_arr[member_columns]
+            member_lat = lat_arr[member_rows]
+            member_delta = delta[member_positions]
+            member_pressure = peak_pressure[member_positions]
+            member_thickness = thickness[member_positions]
+            total_area = float(np.sum(member_area))
+            max_position = member_positions[
+                int(np.nanargmax(member_delta))
+            ]
+            if total_area > 0:
+                centroid_lon = float(np.average(
+                    member_lon, weights=member_area
+                ))
+                centroid_lat = float(np.average(
+                    member_lat, weights=member_area
+                ))
+            else:
+                centroid_lon = float(np.nanmean(member_lon))
+                centroid_lat = float(np.nanmean(member_lat))
+            object_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'threshold': float(threshold),
+                    'threshold_tag': tag,
+                    'daily_object_id': int(object_id),
+                    'daily_object_key': (
+                        f'{pd.Timestamp(date):%Y%m%d}_'
+                        f'{tag.upper()}_{object_id:04d}'
+                    ),
+                    'pixel_count': int(member_positions.size),
+                    'area_km2': total_area,
+                    'equivalent_radius_km': float(
+                        np.sqrt(total_area / np.pi)
+                    ),
+                    'centroid_lon': centroid_lon,
+                    'centroid_lat': centroid_lat,
+                    'lon_min': float(np.min(member_lon)),
+                    'lon_max': float(np.max(member_lon)),
+                    'lat_min': float(np.min(member_lat)),
+                    'lat_max': float(np.max(member_lat)),
+                    'row_min': int(np.min(member_rows)),
+                    'row_max': int(np.max(member_rows)),
+                    'column_min': int(np.min(member_columns)),
+                    'column_max': int(np.max(member_columns)),
+                    'delta_do_max': float(np.nanmax(member_delta)),
+                    'delta_do_mean': float(np.nanmean(member_delta)),
+                    'delta_do_p90': float(
+                        np.nanpercentile(member_delta, 90)
+                    ),
+                    'peak_lon': float(
+                        lon_arr[columns[max_position]]
+                    ),
+                    'peak_lat': float(
+                        lat_arr[rows[max_position]]
+                    ),
+                    'peak_pressure_at_max': float(
+                        peak_pressure[max_position]
+                    ),
+                    'pressure_mean': float(
+                        np.nanmean(member_pressure)
+                    ),
+                    'pressure_min': float(
+                        np.nanmin(member_pressure)
+                    ),
+                    'pressure_max': float(
+                        np.nanmax(member_pressure)
+                    ),
+                    'pressure_span_dbar': float(
+                        np.nanmax(member_pressure)
+                        - np.nanmin(member_pressure)
+                    ),
+                    'thickness_median_dbar': float(
+                        np.nanmedian(member_thickness)
+                    ),
+                    'thickness_max_dbar': float(
+                        np.nanmax(member_thickness)
+                    ),
+                }
+            )
+        working[object_column] = assigned
+
+    objects = (
+        pd.DataFrame(object_records)
+        if object_records
+        else _ofes_empty_daily_objects()
+    )
+    return working, objects
+
+
+def scan_ofes_delta_do_day(
+    date: str | pd.Timestamp,
+    *,
+    detection_config: DetectionConfig | None = None,
+    thresholds: tuple[float, ...] | list[float] | None = None,
+    lon_bounds: tuple[float, float] | None = None,
+    lat_bounds: tuple[float, float] | None = None,
+    catalog_overrides: dict | None = None,
+) -> dict:
+    """向量化扫描单日 OFES ΔDO peaks 并构建逐日异常对象。
+
+    本入口只读取 `do2`，按纬度块直接切片 NetCDF；DO/T/S 的共同海陆及
+    垂向掩码由年度 preflight 另行验证。峰值判据逐项复现
+    `calculate_delta_do` 的 DO 模式，并对 ΔDO20/35/50 共用一次计算。
+
+    参数:
+        - date (str | pd.Timestamp): 待扫描日期。
+        - detection_config (DetectionConfig | None): DO 检测配置；None 时使用 processing.yml 默认，并由 catalog 固定候选 pressure 范围。
+        - thresholds (tuple[float, ...] | list[float] | None): 同时保留的 ΔDO 阈值；None 时使用 `ofes.delta_do_catalog.thresholds`。
+        - lon_bounds (tuple[float, float] | None): 可选连续经度窗口；None 读取交付区域全部经度。
+        - lat_bounds (tuple[float, float] | None): 可选纬度窗口；None 读取交付区域全部纬度。
+        - catalog_overrides (dict | None): 临时覆盖 catalog 配置，仅接受 processing.yml 已声明键。
+
+    返回:
+        - dict: 含稀疏 peak `pixels`、`objects`、扫描 `metadata` 以及 lon/lat/pressure 坐标。
+
+    输出:
+        - 不写文件；年度 catalog 驱动负责将返回表原子写入带签名的逐日 fragments。
+
+    说明:
+        - 每个水平列只保留 observation detector 定义下 ΔDO 最大的候选。
+        - daily object 使用水平 4/8 邻接，并要求相邻像元 peak pressure 差不超过配置容差。
+        - half-amplitude thickness 是局地端点参考线之上、峰值半振幅连续核的 pressure 宽度。
+    """
+    settings = _ofes_delta_do_catalog_settings(catalog_overrides)
+    if thresholds is not None:
+        settings['thresholds'] = tuple(
+            sorted({float(value) for value in thresholds})
+        )
+        if not settings['thresholds']:
+            raise ValueError('thresholds must contain at least one value.')
+
+    base_config = detection_config or make_detection_config('do')
+    if base_config.method != 'do':
+        raise ValueError(
+            'scan_ofes_delta_do_day requires a DO DetectionConfig.'
+        )
+    cfg = make_detection_config(
+        base_config,
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_pressure_min_dbar'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_pressure_max_dbar'
+        ],
+    )
+    if cfg.salinity_threshold > 0 or cfg.temperature_threshold > 0:
+        raise ValueError(
+            'scan_ofes_delta_do_day does not support auxiliary T/S gates.'
+        )
+
+    started = tm.monotonic()
+    date_ts = pd.Timestamp(date).normalize()
+    (
+        lon_all,
+        lat_all,
+        pressure,
+        pressure_attr_units,
+        reference_path,
+    ) = _ofes_tracer_coordinates(date_ts)
+    lon_slice = _ofes_contiguous_slice(
+        lon_all, lon_bounds, 'longitude', longitude=True
+    )
+    lat_slice = _ofes_contiguous_slice(
+        lat_all, lat_bounds, 'latitude'
+    )
+    lon = lon_all[lon_slice]
+    lat = lat_all[lat_slice]
+    fpath = _ofes_file_path('do2', date_ts)
+    if not fpath.exists():
+        raise FileNotFoundError(f'OFES file not found: {fpath}')
+
+    pixel_frames: list[pd.DataFrame] = []
+    chunk_size = int(settings['latitude_chunk_size'])
+    scale = float(
+        _OFES_CFG.get('variable_scale', {}).get('do2', 1.0)
+    )
+    with Dataset(str(fpath), 'r') as dataset:
+        variable = dataset.variables['do2']
+        source_shape = tuple(int(value) for value in variable.shape)
+        for local_start in range(0, lat.size, chunk_size):
+            local_stop = min(local_start + chunk_size, lat.size)
+            source_lat_slice = slice(
+                lat_slice.start + local_start,
+                lat_slice.start + local_stop,
+            )
+            raw = _ofes_subset_to_float32(
+                variable,
+                (0, slice(0, pressure.size), source_lat_slice, lon_slice),
+            )
+            values = np.asarray(raw * scale, dtype=np.float32)
+            peaks = _ofes_vectorized_do_peaks(
+                values,
+                pressure,
+                cfg,
+                minimum_delta=min(settings['thresholds']),
+            )
+            active = (
+                np.isfinite(peaks['delta_do'])
+                & (
+                    peaks['delta_do']
+                    >= min(settings['thresholds'])
+                )
+            )
+            if not np.any(active):
+                continue
+            chunk_rows, chunk_columns = np.where(active)
+            local_rows = chunk_rows + local_start
+            source_rows = chunk_rows + source_lat_slice.start
+            source_columns = chunk_columns + lon_slice.start
+            pixel_frames.append(
+                pd.DataFrame(
+                    {
+                        'date': pd.Timestamp(date_ts),
+                        'lat_index': local_rows.astype(np.int16),
+                        'lon_index': chunk_columns.astype(np.int16),
+                        'source_lat_index': source_rows.astype(np.int16),
+                        'source_lon_index': source_columns.astype(np.int16),
+                        'lat': lat[local_rows].astype(np.float32),
+                        'lon': lon[chunk_columns].astype(np.float32),
+                        'delta_do': peaks['delta_do'][active],
+                        'peak_pressure': peaks['peak_pressure'][active],
+                        'peak_level_index': peaks[
+                            'peak_level_index'
+                        ][active],
+                        'half_amplitude_thickness_dbar': peaks[
+                            'half_amplitude_thickness_dbar'
+                        ][active],
+                        'candidate_count': peaks[
+                            'candidate_count'
+                        ][active],
+                        'valid_level_count': peaks[
+                            'valid_level_count'
+                        ][active],
+                    }
+                )
+            )
+
+    pixels = (
+        pd.concat(pixel_frames, ignore_index=True)
+        if pixel_frames
+        else _ofes_empty_peak_pixels()
+    )
+    pixels, objects = _ofes_build_daily_objects(
+        pixels, lon, lat, date_ts, settings
+    )
+    threshold_counts = {
+        _ofes_threshold_tag(threshold): int(
+            np.count_nonzero(
+                pixels['delta_do'].to_numpy(dtype=float)
+                >= float(threshold)
+            )
+        )
+        for threshold in settings['thresholds']
+    }
+    metadata = {
+        'date': date_ts.strftime('%Y-%m-%d'),
+        'source_file': str(fpath),
+        'reference_file': str(reference_path),
+        'source_shape': source_shape,
+        'loaded_shape': (
+            int(pressure.size), int(lat.size), int(lon.size)
+        ),
+        'read_slices': {
+            'time': 0,
+            'pressure': (0, int(pressure.size)),
+            'lat': (int(lat_slice.start), int(lat_slice.stop)),
+            'lon': (int(lon_slice.start), int(lon_slice.stop)),
+        },
+        'pressure_units': str(
+            _OFES_CFG.get('pressure_units', 'dbar')
+        ),
+        'file_pressure_units': pressure_attr_units,
+        'native_units': str(
+            _OFES_CFG.get('native_units', {}).get(
+                'do2', 'umol kg-1'
+            )
+        ),
+        'output_units': str(
+            _OFES_CFG.get('output_units', {}).get(
+                'do2', 'umol kg-1'
+            )
+        ),
+        'detector': {
+            'method': cfg.method,
+            'depth_interval': float(cfg.depth_interval),
+            'anomaly_min_depth': float(cfg.anomaly_min_depth),
+            'anomaly_max_depth': float(cfg.anomaly_max_depth),
+            'do_near_zero_threshold': float(
+                cfg.do_near_zero_threshold
+            ),
+            'do_near_zero_max_count': int(
+                cfg.do_near_zero_max_count
+            ),
+        },
+        'catalog_settings': settings,
+        'mask_basis': (
+            'finite do2 after the calculate_delta_do near-zero rule; '
+            'DO/T/S mask parity is a required annual preflight'
+        ),
+        'peak_pixel_counts': threshold_counts,
+        'daily_object_counts': {
+            _ofes_threshold_tag(threshold): int(np.count_nonzero(
+                objects['threshold'].to_numpy(dtype=float)
+                == float(threshold)
+            ))
+            for threshold in settings['thresholds']
+        },
+        'elapsed_seconds': float(tm.monotonic() - started),
+    }
+    return {
+        'date': date_ts,
+        'lon': lon,
+        'lat': lat,
+        'pressure': pressure,
+        'pixels': pixels,
+        'objects': objects,
+        'metadata': metadata,
+    }
+
+
+def _ofes_json_default(value):
+    """把 OFES provenance 中的常见科学 Python 类型转为 JSON 类型。"""
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    raise TypeError(
+        f'Object of type {type(value).__name__} is not JSON serializable.'
+    )
+
+
+def _ofes_atomic_write_json(
+    payload: dict,
+    path: str | Path,
+) -> Path:
+    """在目标目录内原子写入 OFES JSON provenance。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=_ofes_json_default,
+            )
+            + '\n',
+            encoding='utf-8',
+        )
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _ofes_common_mask_audit_day(
+    date: pd.Timestamp,
+    settings: dict,
+    detection_config: DetectionConfig,
+) -> dict:
+    """分纬度块审计单日 OFES DO/T/S 全域掩码与坐标一致性。"""
+    variables = ('do2', 'temp', 'salinity')
+    datasets = {
+        variable: Dataset(
+            str(_ofes_file_path(variable, date)), 'r'
+        )
+        for variable in variables
+    }
+    try:
+        reference = datasets['do2']
+        reference_lon = np.asarray(
+            reference.variables['lon'][:], dtype=float
+        )
+        reference_lat = np.asarray(
+            reference.variables['lat'][:], dtype=float
+        )
+        reference_pressure = np.asarray(
+            reference.variables['lev'][:], dtype=float
+        )
+        coordinate_errors: dict[str, dict[str, float]] = {}
+        reference_shape = tuple(
+            int(value) for value in reference.variables['do2'].shape
+        )
+        for variable in variables:
+            dataset = datasets[variable]
+            variable_shape = tuple(
+                int(value)
+                for value in dataset.variables[variable].shape
+            )
+            if variable_shape != reference_shape:
+                raise ValueError(
+                    f'OFES {variable} shape {variable_shape} differs '
+                    f'from do2 shape {reference_shape} on '
+                    f'{date:%Y-%m-%d}.'
+                )
+            coordinate_errors[variable] = {
+                'lon_max_abs_error': _ofes_assert_coordinate_match(
+                    np.asarray(
+                        dataset.variables['lon'][:], dtype=float
+                    ),
+                    reference_lon,
+                    f'{variable} longitude',
+                ),
+                'lat_max_abs_error': _ofes_assert_coordinate_match(
+                    np.asarray(
+                        dataset.variables['lat'][:], dtype=float
+                    ),
+                    reference_lat,
+                    f'{variable} latitude',
+                ),
+                'pressure_max_abs_error': (
+                    _ofes_assert_coordinate_match(
+                        np.asarray(
+                            dataset.variables['lev'][:],
+                            dtype=float,
+                        ),
+                        reference_pressure,
+                        f'{variable} pressure',
+                    )
+                ),
+            }
+
+        npressure = reference_pressure.size
+        nlat = reference_lat.size
+        nlon = reference_lon.size
+        level_index = np.arange(npressure)[:, None, None]
+        mask_mismatch = {'temp': 0, 'salinity': 0}
+        checked_values = 0
+        near_zero_values = 0
+        rejected_near_zero_profiles = 0
+        noncontiguous_profiles = 0
+        valid_profiles = 0
+        count_histogram: dict[int, int] = {}
+        chunk_size = int(settings['latitude_chunk_size'])
+        near_zero_threshold = float(
+            detection_config.do_near_zero_threshold
+        )
+        max_near_zero = detection_config.do_near_zero_max_count
+
+        for start in range(0, nlat, chunk_size):
+            stop = min(start + chunk_size, nlat)
+            values: dict[str, np.ndarray] = {}
+            masks: dict[str, np.ndarray] = {}
+            for variable in variables:
+                data = _ofes_subset_to_float32(
+                    datasets[variable].variables[variable],
+                    (0, slice(None), slice(start, stop), slice(None)),
+                )
+                values[variable] = data
+                masks[variable] = np.isfinite(data)
+
+            do_mask = masks['do2']
+            for variable in ('temp', 'salinity'):
+                mask_mismatch[variable] += int(
+                    np.count_nonzero(
+                        do_mask != masks[variable]
+                    )
+                )
+            checked_values += int(do_mask.size)
+            near_zero = (
+                np.isfinite(values['do2'])
+                & (values['do2'] <= near_zero_threshold)
+            )
+            near_zero_values += int(np.count_nonzero(near_zero))
+            near_zero_count = np.count_nonzero(near_zero, axis=0)
+            if max_near_zero is not None and int(max_near_zero) >= 0:
+                rejected_near_zero_profiles += int(
+                    np.count_nonzero(
+                        near_zero_count > int(max_near_zero)
+                    )
+                )
+
+            valid = (
+                do_mask
+                & (values['do2'] > near_zero_threshold)
+            )
+            counts = np.count_nonzero(valid, axis=0)
+            expected_surface_contiguous = (
+                level_index < counts[None, :, :]
+            )
+            noncontiguous_profiles += int(
+                np.count_nonzero(
+                    np.any(
+                        valid != expected_surface_contiguous,
+                        axis=0,
+                    )
+                )
+            )
+            valid_profiles += int(np.count_nonzero(counts >= 5))
+            unique_counts, frequencies = np.unique(
+                counts, return_counts=True
+            )
+            for count, frequency in zip(
+                unique_counts, frequencies
+            ):
+                count_int = int(count)
+                count_histogram[count_int] = (
+                    count_histogram.get(count_int, 0)
+                    + int(frequency)
+                )
+
+        common_mask_passed = all(
+            count == 0 for count in mask_mismatch.values()
+        )
+        return {
+            'date': date.strftime('%Y-%m-%d'),
+            'source_files': {
+                variable: str(_ofes_file_path(variable, date))
+                for variable in variables
+            },
+            'source_shape': reference_shape,
+            'grid_profiles': int(nlat * nlon),
+            'valid_profiles': int(valid_profiles),
+            'mask_values_checked': int(checked_values),
+            'mask_mismatch_values': mask_mismatch,
+            'common_mask_passed': bool(common_mask_passed),
+            'near_zero_values': int(near_zero_values),
+            'rejected_near_zero_profiles': int(
+                rejected_near_zero_profiles
+            ),
+            'noncontiguous_profiles': int(
+                noncontiguous_profiles
+            ),
+            'unique_valid_level_counts': int(
+                len(count_histogram)
+            ),
+            'most_common_valid_level_counts': [
+                {
+                    'valid_level_count': int(count),
+                    'profile_count': int(frequency),
+                }
+                for count, frequency in sorted(
+                    count_histogram.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:10]
+            ],
+            'coordinate_max_abs_errors': coordinate_errors,
+        }
+    finally:
+        for dataset in datasets.values():
+            dataset.close()
+
+
+def _ofes_detector_parity_day(
+    date: pd.Timestamp,
+    settings: dict,
+    detection_config: DetectionConfig,
+) -> dict:
+    """抽样比较向量化 OFES detector 与 calculate_delta_do。"""
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity'],
+        lon_bounds=settings['parity_lon_bounds'],
+        lat_bounds=settings['parity_lat_bounds'],
+    )
+    common_valid = (
+        np.isfinite(snapshot['do2'])
+        & np.isfinite(snapshot['temp'])
+        & np.isfinite(snapshot['salinity'])
+    )
+    minimum_threshold = min(settings['thresholds'])
+    vector = _ofes_vectorized_do_peaks(
+        snapshot['do2'],
+        snapshot['pressure'],
+        detection_config,
+        valid_mask=common_valid,
+        minimum_delta=minimum_threshold,
+    )
+
+    ocean_profiles = np.flatnonzero(
+        np.count_nonzero(common_valid, axis=0).ravel() >= 5
+    )
+    rng = np.random.default_rng(
+        int(settings['parity_seed'])
+        + int(date.strftime('%Y%j'))
+    )
+    random_count = min(
+        int(settings['parity_random_profiles']),
+        int(ocean_profiles.size),
+    )
+    random_sample = (
+        rng.choice(
+            ocean_profiles,
+            size=random_count,
+            replace=False,
+        )
+        if random_count
+        else np.empty(0, dtype=np.int64)
+    )
+    candidate_flat = np.flatnonzero(
+        np.isfinite(vector['delta_do'].ravel())
+        & (
+            vector['delta_do'].ravel()
+            >= float(minimum_threshold)
+        )
+    )
+    candidate_order = candidate_flat[
+        np.argsort(
+            vector['delta_do'].ravel()[candidate_flat]
+        )[::-1]
+    ]
+    top_sample = candidate_order[
+        :int(settings['parity_top_profiles'])
+    ]
+    sample = np.unique(
+        np.concatenate([random_sample, top_sample])
+    )
+    rows, columns = np.unravel_index(
+        sample, vector['delta_do'].shape
+    )
+
+    profile_count = int(sample.size)
+    pressure_count = int(snapshot['pressure'].size)
+    profile_table = pd.DataFrame(
+        {
+            'Profile_number': np.repeat(
+                np.arange(profile_count), pressure_count
+            ),
+            'Pressure': np.tile(
+                snapshot['pressure'], profile_count
+            ),
+            'DO': (
+                snapshot['do2'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+            'Salinity': (
+                snapshot['salinity'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+            'Temperature': (
+                snapshot['temp'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+        }
+    )
+    golden = calculate_delta_do(
+        profile_table,
+        detection_config=detection_config,
+        depth_col='Pressure',
+        include_aou=False,
+        verbose=False,
+    )
+    golden = _keep_best_anomaly_per_profile(
+        golden, detection_config
+    )
+    if not golden.empty:
+        golden = golden.copy()
+        golden['Profile_number'] = pd.to_numeric(
+            golden['Profile_number'], errors='raise'
+        ).astype(int)
+        golden_by_profile = golden.set_index(
+            'Profile_number', verify_integrity=True
+        )
+    else:
+        golden_by_profile = pd.DataFrame()
+
+    sampled_delta = vector['delta_do'][rows, columns]
+    sampled_pressure = vector['peak_pressure'][rows, columns]
+    threshold_results: dict[str, dict] = {}
+    failure_examples: list[dict] = []
+    total_failure_count = 0
+    for threshold in settings['thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        vector_hit = (
+            np.isfinite(sampled_delta)
+            & (sampled_delta >= float(threshold))
+        )
+        golden_ids = (
+            set(
+                golden.loc[
+                    golden['delta_do'] >= float(threshold),
+                    'Profile_number',
+                ].astype(int)
+            )
+            if not golden.empty
+            else set()
+        )
+        golden_hit = np.asarray(
+            [
+                profile_number in golden_ids
+                for profile_number in range(profile_count)
+            ],
+            dtype=bool,
+        )
+        membership_mismatch = np.flatnonzero(
+            vector_hit != golden_hit
+        )
+        delta_mismatch: list[int] = []
+        pressure_mismatch: list[int] = []
+        delta_errors: list[float] = []
+        pressure_errors: list[float] = []
+        for profile_number in np.flatnonzero(
+            vector_hit & golden_hit
+        ):
+            golden_row = golden_by_profile.loc[
+                int(profile_number)
+            ]
+            delta_error = abs(
+                float(sampled_delta[profile_number])
+                - float(golden_row['delta_do'])
+            )
+            pressure_error = abs(
+                float(sampled_pressure[profile_number])
+                - float(golden_row['depth'])
+            )
+            delta_errors.append(delta_error)
+            pressure_errors.append(pressure_error)
+            if delta_error > 2e-5:
+                delta_mismatch.append(int(profile_number))
+            if pressure_error > 1e-6:
+                pressure_mismatch.append(int(profile_number))
+
+        failure_count = (
+            int(membership_mismatch.size)
+            + len(delta_mismatch)
+            + len(pressure_mismatch)
+        )
+        total_failure_count += failure_count
+        threshold_results[tag] = {
+            'threshold': float(threshold),
+            'vector_hits': int(np.count_nonzero(vector_hit)),
+            'golden_hits': int(np.count_nonzero(golden_hit)),
+            'membership_mismatch_count': int(
+                membership_mismatch.size
+            ),
+            'delta_mismatch_count': int(len(delta_mismatch)),
+            'pressure_mismatch_count': int(
+                len(pressure_mismatch)
+            ),
+            'max_abs_delta_error': (
+                float(max(delta_errors)) if delta_errors else 0.0
+            ),
+            'max_abs_pressure_error_dbar': (
+                float(max(pressure_errors))
+                if pressure_errors
+                else 0.0
+            ),
+            'passed': bool(failure_count == 0),
+        }
+        for kind, indices in (
+            ('membership', membership_mismatch),
+            ('delta', np.asarray(delta_mismatch, dtype=int)),
+            ('pressure', np.asarray(
+                pressure_mismatch, dtype=int
+            )),
+        ):
+            for profile_number in indices:
+                if len(failure_examples) >= 20:
+                    break
+                failure_examples.append(
+                    {
+                        'threshold_tag': tag,
+                        'kind': kind,
+                        'sample_profile_number': int(
+                            profile_number
+                        ),
+                        'lon': float(
+                            snapshot['lon'][
+                                columns[profile_number]
+                            ]
+                        ),
+                        'lat': float(
+                            snapshot['lat'][rows[profile_number]]
+                        ),
+                        'vector_delta_do': (
+                            float(sampled_delta[profile_number])
+                            if np.isfinite(
+                                sampled_delta[profile_number]
+                            )
+                            else None
+                        ),
+                        'vector_peak_pressure': (
+                            float(
+                                sampled_pressure[profile_number]
+                            )
+                            if np.isfinite(
+                                sampled_pressure[profile_number]
+                            )
+                            else None
+                        ),
+                    }
+                )
+
+    return {
+        'date': date.strftime('%Y-%m-%d'),
+        'lon_bounds': list(settings['parity_lon_bounds']),
+        'lat_bounds': list(settings['parity_lat_bounds']),
+        'regional_shape': [
+            int(snapshot['pressure'].size),
+            int(snapshot['lat'].size),
+            int(snapshot['lon'].size),
+        ],
+        'ocean_profiles': int(ocean_profiles.size),
+        'random_profiles_requested': int(
+            settings['parity_random_profiles']
+        ),
+        'random_profiles_sampled': int(random_count),
+        'top_candidate_profiles_requested': int(
+            settings['parity_top_profiles']
+        ),
+        'top_candidate_profiles_sampled': int(
+            top_sample.size
+        ),
+        'unique_profiles_compared': int(profile_count),
+        'thresholds': threshold_results,
+        'failure_count': int(total_failure_count),
+        'failure_examples': failure_examples,
+        'passed': bool(total_failure_count == 0),
+    }
+
+
+def validate_ofes_delta_do_vectorization(
+    *,
+    catalog_overrides: dict | None = None,
+    output_path: str | Path | None = None,
+    raise_on_failure: bool = True,
+) -> dict:
+    """验证 OFES 年度向量化 ΔDO 扫描器与 observation detector 等价。
+
+    对配置中的四个季节日期先分块审计全域 DO/T/S 坐标与有效值掩码，再在固定
+    黑潮延伸体窗口抽取随机海洋列和最强候选列，与 `calculate_delta_do`
+    逐廓线比较 DO20/35/50 的成员、振幅及 peak pressure。
+
+    参数:
+        - catalog_overrides (dict | None): 临时覆盖已声明的 OFES catalog 配置。
+        - output_path (str | Path | None): 可选 JSON 报告路径；None 时只返回结果。
+        - raise_on_failure (bool): 任一掩码或 detector parity 失败时是否抛出 AssertionError，默认 True。
+
+    返回:
+        - dict: 含逐日全域 mask audit、逐阈值 detector parity、容差和总通过状态。
+
+    输出:
+        - `output_path` 指定的 JSON preflight 报告。
+
+    说明:
+        - 全年扫描只读 DO 的前提是四季全域 DO/T/S 掩码逐值相同；内部缺层不判失败，因为向量化实现按唯一有效层模式分组处理。
+        - parity 固定绝对容差为 ΔDO 2e-5 μmol kg⁻¹、pressure 1e-6 dbar。
+    """
+    settings = _ofes_delta_do_catalog_settings(
+        catalog_overrides
+    )
+    detection_config = make_detection_config(
+        'do',
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_pressure_min_dbar'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_pressure_max_dbar'
+        ],
+    )
+    mask_audits: list[dict] = []
+    detector_parity: list[dict] = []
+    for date_text in settings['parity_dates']:
+        date = pd.Timestamp(date_text).normalize()
+        mask_audits.append(
+            _ofes_common_mask_audit_day(
+                date, settings, detection_config
+            )
+        )
+        detector_parity.append(
+            _ofes_detector_parity_day(
+                date, settings, detection_config
+            )
+        )
+
+    mask_passed = all(
+        audit['common_mask_passed'] for audit in mask_audits
+    )
+    parity_passed = all(
+        result['passed'] for result in detector_parity
+    )
+    report = {
+        'schema_version': 1,
+        'generated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'purpose': (
+            'preflight gate for the OFES annual DO-only vectorized '
+            'delta-DO catalog'
+        ),
+        'catalog_settings': settings,
+        'detector': {
+            'method': detection_config.method,
+            'do_threshold': float(
+                detection_config.do_threshold
+            ),
+            'depth_interval_dbar': float(
+                detection_config.depth_interval
+            ),
+            'candidate_pressure_min_dbar': float(
+                detection_config.anomaly_min_depth
+            ),
+            'candidate_pressure_max_dbar': float(
+                detection_config.anomaly_max_depth
+            ),
+            'do_near_zero_threshold': float(
+                detection_config.do_near_zero_threshold
+            ),
+            'do_near_zero_max_count': int(
+                detection_config.do_near_zero_max_count
+            ),
+        },
+        'tolerances': {
+            'delta_do_abs': 2e-5,
+            'pressure_dbar_abs': 1e-6,
+        },
+        'mask_audits': mask_audits,
+        'detector_parity': detector_parity,
+        'mask_passed': bool(mask_passed),
+        'parity_passed': bool(parity_passed),
+        'passed': bool(mask_passed and parity_passed),
+    }
+    if output_path is not None:
+        _ofes_atomic_write_json(report, output_path)
+    if raise_on_failure and not report['passed']:
+        raise AssertionError(
+            'OFES annual scanner preflight failed; inspect mask and '
+            'detector parity details.'
+        )
+    return report
+
+
+def _ofes_link_daily_objects(
+    daily_objects: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """以一对一最小代价链接逐日 OFES 对象并汇总 event catalog。"""
+    working = daily_objects.copy()
+    required = {
+        'date',
+        'threshold',
+        'daily_object_key',
+        'centroid_lon',
+        'centroid_lat',
+        'row_min',
+        'row_max',
+        'column_min',
+        'column_max',
+        'pressure_mean',
+        'delta_do_max',
+        'area_km2',
+        'thickness_max_dbar',
+    }
+    missing = sorted(required.difference(working.columns))
+    if missing:
+        raise ValueError(
+            f'OFES daily object table missing columns: {missing}.'
+        )
+    working['date'] = pd.to_datetime(working['date']).dt.normalize()
+    working = working.sort_values(
+        ['threshold', 'date', 'daily_object_id'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    working['event_id'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    working['event_day_index'] = np.zeros(
+        len(working), dtype=np.int16
+    )
+    working['predecessor_daily_object_key'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    working['link_gap_days'] = pd.Series(
+        [pd.NA] * len(working), dtype='Int16'
+    )
+    working['link_distance_km'] = np.nan
+    working['link_pressure_difference_dbar'] = np.nan
+    working['link_cost'] = np.nan
+    working['link_status'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    if working.empty:
+        return working, pd.DataFrame()
+
+    maximum_gap_days = (
+        int(settings['event_max_missing_days']) + 1
+    )
+    maximum_distance_km = float(
+        settings['event_max_centroid_distance_km']
+    )
+    maximum_pressure_difference = float(
+        settings['event_max_pressure_difference_dbar']
+    )
+    padding_pixels = int(settings['event_bbox_padding_pixels'])
+    gap_cost = float(
+        settings['event_gap_cost_per_missing_day']
+    )
+
+    for threshold in sorted(
+        working['threshold'].dropna().unique()
+    ):
+        threshold_positions = np.flatnonzero(
+            working['threshold'].to_numpy(dtype=float)
+            == float(threshold)
+        )
+        threshold_dates = working.loc[
+            threshold_positions, 'date'
+        ]
+        active_tracks: dict[str, dict] = {}
+        next_event_number = 1
+        tag = _ofes_threshold_tag(float(threshold)).upper()
+
+        for date in sorted(threshold_dates.unique()):
+            date_ts = pd.Timestamp(date)
+            current_positions = threshold_positions[
+                (
+                    threshold_dates.to_numpy(
+                        dtype='datetime64[ns]'
+                    )
+                    == np.datetime64(date_ts)
+                )
+            ]
+            current_positions = np.asarray(
+                current_positions, dtype=np.int64
+            )
+            candidate_tracks: list[str] = []
+            candidate_gaps: list[int] = []
+            for event_id, state in active_tracks.items():
+                day_gap = int(
+                    (
+                        date_ts - pd.Timestamp(state['last_date'])
+                    ).days
+                )
+                if 1 <= day_gap <= maximum_gap_days:
+                    candidate_tracks.append(event_id)
+                    candidate_gaps.append(day_gap)
+
+            assigned_current: set[int] = set()
+            if candidate_tracks and current_positions.size:
+                cost = np.full(
+                    (
+                        len(candidate_tracks),
+                        current_positions.size,
+                    ),
+                    np.inf,
+                    dtype=float,
+                )
+                distance_matrix = np.full_like(cost, np.nan)
+                pressure_matrix = np.full_like(cost, np.nan)
+                current_lon = working.loc[
+                    current_positions, 'centroid_lon'
+                ].to_numpy(dtype=float)
+                current_lat = working.loc[
+                    current_positions, 'centroid_lat'
+                ].to_numpy(dtype=float)
+                current_pressure = working.loc[
+                    current_positions, 'pressure_mean'
+                ].to_numpy(dtype=float)
+                current_row_min = working.loc[
+                    current_positions, 'row_min'
+                ].to_numpy(dtype=float)
+                current_row_max = working.loc[
+                    current_positions, 'row_max'
+                ].to_numpy(dtype=float)
+                current_column_min = working.loc[
+                    current_positions, 'column_min'
+                ].to_numpy(dtype=float)
+                current_column_max = working.loc[
+                    current_positions, 'column_max'
+                ].to_numpy(dtype=float)
+
+                for track_index, (
+                    event_id,
+                    day_gap,
+                ) in enumerate(
+                    zip(candidate_tracks, candidate_gaps)
+                ):
+                    previous_position = int(
+                        active_tracks[event_id]['last_position']
+                    )
+                    previous = working.loc[previous_position]
+                    distance = np.asarray(
+                        adaptive_distance_m(
+                            current_lon,
+                            current_lat,
+                            float(previous['centroid_lon']),
+                            float(previous['centroid_lat']),
+                        ),
+                        dtype=float,
+                    ) / 1000.0
+                    pressure_difference = np.abs(
+                        current_pressure
+                        - float(previous['pressure_mean'])
+                    )
+                    padding = float(padding_pixels * day_gap)
+                    bbox_overlap = (
+                        (
+                            current_row_min
+                            <= float(previous['row_max']) + padding
+                        )
+                        & (
+                            current_row_max
+                            >= float(previous['row_min']) - padding
+                        )
+                        & (
+                            current_column_min
+                            <= (
+                                float(previous['column_max'])
+                                + padding
+                            )
+                        )
+                        & (
+                            current_column_max
+                            >= (
+                                float(previous['column_min'])
+                                - padding
+                            )
+                        )
+                    )
+                    distance_limit = (
+                        maximum_distance_km * day_gap
+                    )
+                    accepted = (
+                        np.isfinite(distance)
+                        & np.isfinite(pressure_difference)
+                        & (distance <= distance_limit)
+                        & (
+                            pressure_difference
+                            <= maximum_pressure_difference
+                        )
+                        & bbox_overlap
+                    )
+                    distance_matrix[track_index] = distance
+                    pressure_matrix[
+                        track_index
+                    ] = pressure_difference
+                    cost[track_index, accepted] = (
+                        distance[accepted] / distance_limit
+                        + pressure_difference[accepted]
+                        / maximum_pressure_difference
+                        + gap_cost * (day_gap - 1)
+                    )
+
+                if np.any(np.isfinite(cost)):
+                    finite_cost = np.where(
+                        np.isfinite(cost), cost, 1e9
+                    )
+                    track_indices, current_indices = (
+                        linear_sum_assignment(finite_cost)
+                    )
+                    for track_index, current_index in zip(
+                        track_indices, current_indices
+                    ):
+                        if not np.isfinite(
+                            cost[track_index, current_index]
+                        ):
+                            continue
+                        event_id = candidate_tracks[track_index]
+                        position = int(
+                            current_positions[current_index]
+                        )
+                        day_gap = int(
+                            candidate_gaps[track_index]
+                        )
+                        previous_position = int(
+                            active_tracks[event_id][
+                                'last_position'
+                            ]
+                        )
+                        working.at[position, 'event_id'] = event_id
+                        working.at[
+                            position,
+                            'predecessor_daily_object_key',
+                        ] = working.at[
+                            previous_position,
+                            'daily_object_key',
+                        ]
+                        working.at[
+                            position, 'link_gap_days'
+                        ] = day_gap
+                        working.at[
+                            position, 'link_distance_km'
+                        ] = float(
+                            distance_matrix[
+                                track_index, current_index
+                            ]
+                        )
+                        working.at[
+                            position,
+                            'link_pressure_difference_dbar',
+                        ] = float(
+                            pressure_matrix[
+                                track_index, current_index
+                            ]
+                        )
+                        working.at[
+                            position, 'link_cost'
+                        ] = float(
+                            cost[track_index, current_index]
+                        )
+                        working.at[
+                            position, 'link_status'
+                        ] = (
+                            'matched_next_day'
+                            if day_gap == 1
+                            else 'matched_after_gap'
+                        )
+                        active_tracks[event_id] = {
+                            'last_position': position,
+                            'last_date': date_ts,
+                        }
+                        assigned_current.add(position)
+
+            for position in current_positions:
+                position = int(position)
+                if position in assigned_current:
+                    continue
+                event_id = (
+                    f'OFES_{tag}_E{next_event_number:06d}'
+                )
+                next_event_number += 1
+                working.at[position, 'event_id'] = event_id
+                working.at[position, 'link_status'] = 'seed'
+                active_tracks[event_id] = {
+                    'last_position': position,
+                    'last_date': date_ts,
+                }
+
+    working['event_day_index'] = (
+        working.groupby('event_id', sort=False).cumcount() + 1
+    ).astype(np.int16)
+
+    event_records: list[dict] = []
+    for event_id, group in working.groupby(
+        'event_id', sort=False
+    ):
+        group = group.sort_values('date', kind='mergesort')
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        start_date = pd.Timestamp(first['date'])
+        end_date = pd.Timestamp(last['date'])
+        span_days = int((end_date - start_date).days + 1)
+        observed_days = int(group['date'].nunique())
+        peak_index = group['delta_do_max'].astype(float).idxmax()
+        peak = group.loc[peak_index]
+        area = group['area_km2'].to_numpy(dtype=float)
+        if np.sum(area) > 0:
+            mean_centroid_lon = float(np.average(
+                group['centroid_lon'].to_numpy(dtype=float),
+                weights=area,
+            ))
+            mean_centroid_lat = float(np.average(
+                group['centroid_lat'].to_numpy(dtype=float),
+                weights=area,
+            ))
+        else:
+            mean_centroid_lon = float(
+                group['centroid_lon'].mean()
+            )
+            mean_centroid_lat = float(
+                group['centroid_lat'].mean()
+            )
+        link_distances = group[
+            'link_distance_km'
+        ].to_numpy(dtype=float)
+        track_length = float(
+            np.nansum(link_distances)
+        )
+        displacement = float(
+            great_circle_distance_m(
+                float(last['centroid_lon']),
+                float(last['centroid_lat']),
+                float(first['centroid_lon']),
+                float(first['centroid_lat']),
+            )
+            / 1000.0
+        )
+        thickness = group[
+            'thickness_max_dbar'
+        ].to_numpy(dtype=float)
+        finite_thickness = thickness[np.isfinite(thickness)]
+        maximum_thickness = (
+            float(np.max(finite_thickness))
+            if finite_thickness.size
+            else 0.0
+        )
+        median_thickness = (
+            float(np.median(finite_thickness))
+            if finite_thickness.size
+            else 0.0
+        )
+        event_records.append(
+            {
+                'event_id': str(event_id),
+                'threshold': float(first['threshold']),
+                'threshold_tag': str(first['threshold_tag']),
+                'start_date': start_date,
+                'end_date': end_date,
+                'span_days': span_days,
+                'observed_days': observed_days,
+                'missing_days': int(span_days - observed_days),
+                'persistence_fraction': float(
+                    observed_days / span_days
+                ),
+                'daily_object_count': int(len(group)),
+                'first_daily_object_key': str(
+                    first['daily_object_key']
+                ),
+                'last_daily_object_key': str(
+                    last['daily_object_key']
+                ),
+                'peak_daily_object_key': str(
+                    peak['daily_object_key']
+                ),
+                'peak_date': pd.Timestamp(peak['date']),
+                'delta_do_max': float(
+                    group['delta_do_max'].max()
+                ),
+                'delta_do_mean_of_daily_means': float(
+                    group['delta_do_mean'].mean()
+                ),
+                'area_km2_max': float(
+                    group['area_km2'].max()
+                ),
+                'area_km2_mean': float(
+                    group['area_km2'].mean()
+                ),
+                'equivalent_radius_km_max': float(
+                    group['equivalent_radius_km'].max()
+                ),
+                'thickness_max_dbar': maximum_thickness,
+                'thickness_median_of_daily_max_dbar': (
+                    median_thickness
+                ),
+                'pressure_mean_dbar': float(
+                    group['pressure_mean'].mean()
+                ),
+                'pressure_min_dbar': float(
+                    group['pressure_min'].min()
+                ),
+                'pressure_max_dbar': float(
+                    group['pressure_max'].max()
+                ),
+                'mean_centroid_lon': mean_centroid_lon,
+                'mean_centroid_lat': mean_centroid_lat,
+                'start_centroid_lon': float(
+                    first['centroid_lon']
+                ),
+                'start_centroid_lat': float(
+                    first['centroid_lat']
+                ),
+                'end_centroid_lon': float(
+                    last['centroid_lon']
+                ),
+                'end_centroid_lat': float(
+                    last['centroid_lat']
+                ),
+                'peak_lon': float(peak['peak_lon']),
+                'peak_lat': float(peak['peak_lat']),
+                'peak_pressure_dbar': float(
+                    peak['peak_pressure_at_max']
+                ),
+                'track_length_km': track_length,
+                'net_displacement_km': displacement,
+                'mean_observed_translation_km_per_day': (
+                    float(track_length / (observed_days - 1))
+                    if observed_days > 1
+                    else 0.0
+                ),
+                'maximum_link_gap_days': int(
+                    group['link_gap_days'].dropna().max()
+                )
+                if group['link_gap_days'].notna().any()
+                else 0,
+            }
+        )
+
+    events = pd.DataFrame(event_records)
+    minimum_days = int(settings['min_ranked_event_days'])
+    events['rank_eligible'] = (
+        events['observed_days'] >= minimum_days
+    )
+    events['rank_amplitude_component'] = np.log1p(
+        events['delta_do_max'] / events['threshold']
+    )
+    events['rank_area_component'] = np.log1p(
+        events['area_km2_max']
+        / float(settings['rank_area_reference_km2'])
+    )
+    events['rank_thickness_component'] = np.log1p(
+        events['thickness_max_dbar']
+        / float(settings['rank_thickness_reference_dbar'])
+    )
+    events['rank_duration_component'] = np.log1p(
+        events['observed_days']
+        / float(settings['rank_duration_reference_days'])
+    )
+    component_columns = [
+        'rank_amplitude_component',
+        'rank_area_component',
+        'rank_thickness_component',
+        'rank_duration_component',
+    ]
+    events['rank_score'] = events[component_columns].sum(axis=1)
+    events['rank_within_threshold'] = pd.Series(
+        [pd.NA] * len(events), dtype='Int32'
+    )
+    for threshold in sorted(events['threshold'].unique()):
+        eligible = events.loc[
+            (events['threshold'] == threshold)
+            & events['rank_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        for rank, index in enumerate(eligible.index, start=1):
+            events.at[index, 'rank_within_threshold'] = rank
+    events = events.sort_values(
+        [
+            'threshold',
+            'rank_eligible',
+            'rank_within_threshold',
+            'start_date',
+            'event_id',
+        ],
+        ascending=[True, False, True, True, True],
+        na_position='last',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    return working, events
+
+
+def _ofes_coordinate_sha256(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    pressure: np.ndarray,
+) -> str:
+    """返回带 dtype/shape 边界的 OFES 三坐标 SHA-256。"""
+    digest = hashlib.sha256()
+    for name, values in (
+        ('lon', lon),
+        ('lat', lat),
+        ('pressure', pressure),
+    ):
+        array = np.ascontiguousarray(
+            np.asarray(values, dtype=np.float64)
+        )
+        digest.update(name.encode('utf-8'))
+        digest.update(str(array.shape).encode('ascii'))
+        digest.update(array.dtype.str.encode('ascii'))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _ofes_catalog_run_identity(
+    dates: pd.DatetimeIndex,
+    settings: dict,
+    detection_config: DetectionConfig,
+) -> tuple[dict, pd.DataFrame]:
+    """构建年度 catalog 的稳定签名与扫描/preflight 源文件 inventory。"""
+    inventory_roles: dict[
+        tuple[str, pd.Timestamp], set[str]
+    ] = {}
+    for date in dates:
+        key = ('do2', pd.Timestamp(date).normalize())
+        inventory_roles.setdefault(key, set()).add('annual_scan')
+    for date_text in settings['parity_dates']:
+        date = pd.Timestamp(date_text).normalize()
+        for variable in ('do2', 'temp', 'salinity'):
+            key = (variable, date)
+            inventory_roles.setdefault(key, set()).add(
+                'preflight'
+            )
+
+    inventory_records: list[dict] = []
+    for (variable, date), roles in sorted(
+        inventory_roles.items(),
+        key=lambda item: (item[0][1], item[0][0]),
+    ):
+        path = _ofes_file_path(variable, date)
+        if not path.exists():
+            raise FileNotFoundError(
+                f'OFES source file not found: {path}'
+            )
+        stat = path.stat()
+        inventory_records.append(
+            {
+                'date': pd.Timestamp(date),
+                'variable': variable,
+                'roles': ','.join(sorted(roles)),
+                'source_file': str(path),
+                'size_bytes': int(stat.st_size),
+                'mtime_ns': int(stat.st_mtime_ns),
+            }
+        )
+    inventory = pd.DataFrame(inventory_records)
+    inventory_payload = inventory.assign(
+        date=inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+
+    lon, lat, pressure, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(dates[0])
+    )
+    coordinate_sha256 = _ofes_coordinate_sha256(
+        lon, lat, pressure
+    )
+    code_sources = '\n\n'.join(
+        inspect.getsource(function)
+        for function in (
+            _ofes_vectorized_do_peaks,
+            _ofes_depth_aware_components,
+            _ofes_build_daily_objects,
+            scan_ofes_delta_do_day,
+            _ofes_common_mask_audit_day,
+            _ofes_detector_parity_day,
+            validate_ofes_delta_do_vectorization,
+            _ofes_link_daily_objects,
+        )
+    )
+    code_sha256 = hashlib.sha256(
+        code_sources.encode('utf-8')
+    ).hexdigest()
+    repo_root = Path(__file__).resolve().parent
+    signature_payload = {
+        'schema_version': 1,
+        'start_date': pd.Timestamp(dates[0]).strftime(
+            '%Y-%m-%d'
+        ),
+        'end_date': pd.Timestamp(dates[-1]).strftime(
+            '%Y-%m-%d'
+        ),
+        'date_count': int(len(dates)),
+        'catalog_settings': settings,
+        'detector': detection_config.__dict__,
+        'source_root': str(_ofes_root),
+        'source_root_resolved': str(_ofes_root.resolve()),
+        'source_inventory_sha256': inventory_sha256,
+        'coordinate_sha256': coordinate_sha256,
+        'scanner_code_sha256': code_sha256,
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+    }
+    canonical = json.dumps(
+        signature_payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    run_tag = (
+        f'{pd.Timestamp(dates[0]):%Y%m%d}_'
+        f'{pd.Timestamp(dates[-1]):%Y%m%d}_'
+        f'{run_signature[:12]}'
+    )
+    identity = {
+        **signature_payload,
+        'run_signature': run_signature,
+        'run_tag': run_tag,
+        'source_identity_basis': (
+            'scan and preflight source path, size_bytes, and '
+            'mtime_ns; large NetCDF payloads are not content-hashed'
+        ),
+    }
+    return identity, inventory
+
+
+def build_ofes_delta_do_event_catalog(
+    start_date: str | pd.Timestamp = '2003-01-01',
+    end_date: str | pd.Timestamp = '2003-12-31',
+    *,
+    catalog_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+    validate_preflight: bool = True,
+) -> dict:
+    """扫描 OFES 日场并建立可续跑的 ΔDO20/35/50 event catalog。
+
+    运行先以固定四季日期执行掩码和 observation-detector parity gate；通过后
+    才逐日读取 DO、写入稀疏 peak pixels 与 depth-aware objects。跨日对象按
+    距离、peak pressure、bbox 门槛进行一对一全局最小代价匹配，最后用预先
+    固定的振幅、面积、厚度和持续时间公式分阈值排名。
+
+    参数:
+        - start_date (str | pd.Timestamp): 扫描起始日期（闭区间），默认 2003-01-01。
+        - end_date (str | pd.Timestamp): 扫描结束日期（闭区间），默认 2003-12-31。
+        - catalog_overrides (dict | None): 临时覆盖已声明的 catalog 配置。
+        - output_dir (str | Path | None): catalog 根目录；None 时写入标准 DO/OFES 区域输出目录，实际运行另加签名子目录。
+        - resume (bool): 是否复用签名一致且三件套完整的逐日 fragment，默认 True。
+        - validate_preflight (bool): 是否运行四季全域 mask 与 detector parity gate，正式运行必须保持 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、preflight、逐日扫描摘要、已链接 daily_objects 与 event_catalog。
+
+    输出:
+        - `<run_dir>/days/peak_pixels_YYYYMMDD.parquet`、`daily_objects_YYYYMMDD.parquet` 与 `metadata_YYYYMMDD.json`。
+        - `<run_dir>/daily_objects.parquet`、`event_catalog.parquet`、`scan_summary.parquet`、`source_inventory.parquet`、`preflight.json` 与 `manifest.json`。
+
+    说明:
+        - run signature 固定日期、配置、坐标、scanner 源码和 DO 文件 path/size/mtime；不对数十 GB NetCDF 内容逐文件哈希。
+        - event 允许配置数目的缺日，位移门槛按实际日间隔线性放宽；Hungarian assignment 保证每个对象至多一个前驱和后继。
+        - rank_score = log1p(max ΔDO/threshold) + log1p(max area/area_ref) + log1p(max thickness/thickness_ref) + log1p(observed days/duration_ref)。
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError('end_date must be on or after start_date.')
+    dates = pd.date_range(start, end, freq='D')
+    settings = _ofes_delta_do_catalog_settings(
+        catalog_overrides
+    )
+    detection_config = make_detection_config(
+        'do',
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_pressure_min_dbar'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_pressure_max_dbar'
+        ],
+    )
+    identity, source_inventory = _ofes_catalog_run_identity(
+        dates, settings, detection_config
+    )
+    catalog_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            Path(plots_output_root)
+            / 'do'
+            / settings['output_region_slug']
+            / 'ofes_delta_do_catalog'
+        )
+    )
+    run_dir = catalog_root / identity['run_tag']
+    if (
+        run_dir.exists()
+        and not resume
+        and any(run_dir.iterdir())
+    ):
+        raise FileExistsError(
+            f'OFES catalog run directory is not empty: {run_dir}'
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    days_dir = run_dir / 'days'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    previous_manifest = {}
+    if manifest_path.exists():
+        previous_manifest = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        previous_signature = previous_manifest.get(
+            'run_signature'
+        )
+        if (
+            previous_signature
+            and previous_signature != identity['run_signature']
+        ):
+            raise RuntimeError(
+                'Existing OFES manifest signature does not match '
+                'the requested run.'
+            )
+
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': previous_manifest.get(
+            'created_at_utc',
+            pd.Timestamp.now(tz='UTC').isoformat(),
+        ),
+        'updated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'completed_days': 0,
+        'total_days': int(len(dates)),
+        'resume_enabled': bool(resume),
+        'preflight_required': bool(validate_preflight),
+        'rank_formula': (
+            'log1p(max_delta_do/threshold) + '
+            'log1p(max_area_km2/area_reference_km2) + '
+            'log1p(max_thickness_dbar/thickness_reference_dbar) '
+            '+ log1p(observed_days/duration_reference_days)'
+        ),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+
+    preflight_path = run_dir / 'preflight.json'
+    if validate_preflight:
+        preflight = validate_ofes_delta_do_vectorization(
+            catalog_overrides=catalog_overrides,
+            output_path=preflight_path,
+            raise_on_failure=True,
+        )
+    else:
+        preflight = {
+            'passed': None,
+            'status': 'skipped_by_caller',
+            'warning': (
+                'Formal annual OFES catalog runs require preflight.'
+            ),
+        }
+        _ofes_atomic_write_json(preflight, preflight_path)
+
+    reference_lon, reference_lat, reference_pressure, _, _ = (
+        _ofes_tracer_coordinates(start)
+    )
+    reference_coordinate_sha256 = _ofes_coordinate_sha256(
+        reference_lon, reference_lat, reference_pressure
+    )
+    object_frames: list[pd.DataFrame] = []
+    summary_records: list[dict] = []
+    completed_days = 0
+    try:
+        for day_number, date in enumerate(dates, start=1):
+            tag = pd.Timestamp(date).strftime('%Y%m%d')
+            pixel_path = (
+                days_dir / f'peak_pixels_{tag}.parquet'
+            )
+            object_path = (
+                days_dir / f'daily_objects_{tag}.parquet'
+            )
+            metadata_path = days_dir / f'metadata_{tag}.json'
+            reused = False
+            if (
+                resume
+                and pixel_path.exists()
+                and object_path.exists()
+                and metadata_path.exists()
+            ):
+                day_metadata = json.loads(
+                    metadata_path.read_text(encoding='utf-8')
+                )
+                if (
+                    day_metadata.get('run_signature')
+                    == identity['run_signature']
+                    and day_metadata.get('date')
+                    == pd.Timestamp(date).strftime('%Y-%m-%d')
+                    and day_metadata.get('coordinate_sha256')
+                    == reference_coordinate_sha256
+                ):
+                    day_objects = pd.read_parquet(object_path)
+                    reused = True
+
+            if not reused:
+                result = scan_ofes_delta_do_day(
+                    date,
+                    detection_config=detection_config,
+                    thresholds=settings['thresholds'],
+                    catalog_overrides=catalog_overrides,
+                )
+                coordinate_sha256 = _ofes_coordinate_sha256(
+                    result['lon'],
+                    result['lat'],
+                    result['pressure'],
+                )
+                if (
+                    coordinate_sha256
+                    != reference_coordinate_sha256
+                ):
+                    raise RuntimeError(
+                        'OFES coordinate hash changed within the '
+                        f'catalog on {pd.Timestamp(date):%Y-%m-%d}.'
+                    )
+                day_metadata = {
+                    **result['metadata'],
+                    'run_signature': identity['run_signature'],
+                    'coordinate_sha256': coordinate_sha256,
+                }
+                day_objects = result['objects']
+                _atomic_write_parquet(
+                    result['pixels'], pixel_path
+                )
+                _atomic_write_parquet(
+                    day_objects, object_path
+                )
+                _ofes_atomic_write_json(
+                    day_metadata, metadata_path
+                )
+
+            object_frames.append(day_objects)
+            for threshold in settings['thresholds']:
+                threshold_tag = _ofes_threshold_tag(threshold)
+                summary_records.append(
+                    {
+                        'date': pd.Timestamp(date),
+                        'threshold': float(threshold),
+                        'threshold_tag': threshold_tag,
+                        'peak_pixel_count': int(
+                            day_metadata[
+                                'peak_pixel_counts'
+                            ][threshold_tag]
+                        ),
+                        'daily_object_count': int(
+                            day_metadata[
+                                'daily_object_counts'
+                            ][threshold_tag]
+                        ),
+                        'scan_elapsed_seconds': float(
+                            day_metadata['elapsed_seconds']
+                        ),
+                        'fragment_reused': bool(reused),
+                    }
+                )
+            completed_days = day_number
+            if (
+                day_number == 1
+                or day_number == len(dates)
+                or day_number % 10 == 0
+            ):
+                print(
+                    '[OFES catalog] '
+                    f'{day_number:03d}/{len(dates):03d} '
+                    f'{pd.Timestamp(date):%Y-%m-%d} '
+                    f'({"reused" if reused else "scanned"})'
+                )
+                manifest['completed_days'] = int(completed_days)
+                manifest['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(
+                    manifest, manifest_path
+                )
+
+        daily_objects = (
+            pd.concat(object_frames, ignore_index=True)
+            if object_frames
+            else _ofes_empty_daily_objects()
+        )
+        linked_objects, event_catalog = _ofes_link_daily_objects(
+            daily_objects, settings
+        )
+        scan_summary = pd.DataFrame(summary_records)
+        _atomic_write_parquet(
+            linked_objects, run_dir / 'daily_objects.parquet'
+        )
+        _atomic_write_parquet(
+            event_catalog, run_dir / 'event_catalog.parquet'
+        )
+        _atomic_write_parquet(
+            scan_summary, run_dir / 'scan_summary.parquet'
+        )
+        eligible_counts = {
+            _ofes_threshold_tag(threshold): int(
+                np.count_nonzero(
+                    (
+                        event_catalog['threshold'].to_numpy(
+                            dtype=float
+                        )
+                        == float(threshold)
+                    )
+                    & event_catalog[
+                        'rank_eligible'
+                    ].to_numpy(dtype=bool)
+                )
+            )
+            for threshold in settings['thresholds']
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'completed_days': int(completed_days),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'daily_object_rows': int(
+                    len(linked_objects)
+                ),
+                'event_rows': int(len(event_catalog)),
+                'rank_eligible_event_counts': eligible_counts,
+                'outputs': {
+                    'source_inventory': str(
+                        run_dir / 'source_inventory.parquet'
+                    ),
+                    'preflight': str(preflight_path),
+                    'daily_objects': str(
+                        run_dir / 'daily_objects.parquet'
+                    ),
+                    'event_catalog': str(
+                        run_dir / 'event_catalog.parquet'
+                    ),
+                    'scan_summary': str(
+                        run_dir / 'scan_summary.parquet'
+                    ),
+                    'day_fragments': str(days_dir),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_days': int(completed_days),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'preflight': preflight,
+        'scan_summary': scan_summary,
+        'daily_objects': linked_objects,
+        'event_catalog': event_catalog,
+    }

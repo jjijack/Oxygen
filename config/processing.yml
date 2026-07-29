@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.23 变更：
+#   - 新增 OFES 年度向量化 ΔDO20/35/50 扫描、逐日 depth-aware connected objects、跨日 event
+#     catalog 与客观排序配置；固定 parity、掩码审计、缓存 provenance 和事件链接门槛。
 # version 1.22 变更：
 #   - 修正 OFES 为 MOM3 Arakawa B-grid：u/v 均从四个角点共置到示踪物中心；集中记录原生/输出单位、
 #     pressure 坐标与 w 向上为正约定，并将轨迹限制为未验证日场上的定压二维诊断。
@@ -74,7 +77,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.22
+version: 1.23
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -227,6 +230,30 @@ ofes:
   velocity_vars: [u, v, w]
   surface_vars: [eta, pressur]
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
+  delta_do_catalog:
+    thresholds: [20.0, 35.0, 50.0]
+    candidate_pressure_min_dbar: 300.0
+    candidate_pressure_max_dbar: 1000.0
+    latitude_chunk_size: 100
+    parity_dates: ["2003-01-01", "2003-04-05", "2003-07-01", "2003-10-01"]
+    parity_lon_bounds: [142.0, 150.0]
+    parity_lat_bounds: [32.0, 39.0]
+    parity_random_profiles: 300
+    parity_top_profiles: 200
+    parity_seed: 20260730
+    object_connectivity: 8
+    object_pressure_tolerance_dbar: 100.0
+    min_object_pixels: 12
+    event_max_missing_days: 1
+    event_max_centroid_distance_km: 80.0
+    event_max_pressure_difference_dbar: 100.0
+    event_bbox_padding_pixels: 6
+    event_gap_cost_per_missing_day: 0.25
+    min_ranked_event_days: 3
+    rank_area_reference_km2: 500.0
+    rank_thickness_reference_dbar: 100.0
+    rank_duration_reference_days: 5.0
+    output_region_slug: ofes_np30_ke
 
 plot:
   basemap_colors:
