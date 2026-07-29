@@ -16,6 +16,7 @@ from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
 from scipy.stats import pearsonr, spearmanr
 from scipy.linalg import eig
 from scipy.optimize import least_squares
@@ -25673,6 +25674,421 @@ def export_all_interacting_argo(
         print("No region profiles found.")
 
 
+def _spherical_unit_vectors(
+    longitude: np.ndarray | pd.Series,
+    latitude: np.ndarray | pd.Series,
+) -> np.ndarray:
+    """将经纬度转换为球面三维单位向量，供 dateline-safe KD-tree 粗筛。"""
+    lon_rad = np.deg2rad(np.asarray(longitude, dtype=float))
+    lat_rad = np.deg2rad(np.asarray(latitude, dtype=float))
+    cos_lat = np.cos(lat_rad)
+    return np.column_stack(
+        (
+            cos_lat * np.cos(lon_rad),
+            cos_lat * np.sin(lon_rad),
+            np.sin(lat_rad),
+        )
+    )
+
+
+def _meta_daily_catalog_bounds(paths: list[Path]) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """从 META daily parquet 行组统计中读取共同时间覆盖范围。"""
+    starts: list[pd.Timestamp] = []
+    ends: list[pd.Timestamp] = []
+    for path in paths:
+        parquet = pq.ParquetFile(path)
+        names = parquet.schema.names
+        if 'time' not in names:
+            raise ValueError(f'META daily parquet lacks time: {path}')
+        time_index = names.index('time')
+        path_starts: list[pd.Timestamp] = []
+        path_ends: list[pd.Timestamp] = []
+        for row_group in range(parquet.num_row_groups):
+            stats = parquet.metadata.row_group(row_group).column(
+                time_index
+            ).statistics
+            if stats is not None and stats.has_min_max:
+                path_starts.append(pd.Timestamp(stats.min))
+                path_ends.append(pd.Timestamp(stats.max))
+        if not path_starts:
+            raise ValueError(
+                f'META daily parquet has no usable time statistics: {path}'
+            )
+        starts.append(min(path_starts))
+        ends.append(max(path_ends))
+    return max(starts), min(ends)
+
+
+def _argo_meta_radius_distance_year_worker(args: tuple) -> pd.DataFrame:
+    """构建单年 Argo profile 到同日最近 META 涡的距离/半径比。"""
+    (
+        year,
+        baseline_path,
+        daily_paths,
+        search_max_radius_factor,
+        catalog_start,
+        catalog_end,
+    ) = args
+    baseline = pd.read_parquet(
+        baseline_path,
+        columns=[
+            'Profile_number', 'Longitude', 'Latitude',
+            'Year', 'Month', 'Day', 'date',
+        ],
+        filters=[('Year', '==', int(year))],
+    ).copy()
+    baseline['date'] = pd.to_datetime(
+        baseline['date'], errors='coerce'
+    ).dt.normalize()
+    if baseline.empty:
+        return baseline.assign(
+            meta_catalog_covered=pd.Series(dtype=bool),
+            nearest_meta_radius_ratio=pd.Series(dtype=float),
+            nearest_meta_distance_m=pd.Series(dtype=float),
+            nearest_meta_radius_m=pd.Series(dtype=float),
+            nearest_meta_track_id=pd.Series(dtype='Int64'),
+            nearest_meta_kind=pd.Series(dtype=object),
+        )
+    if baseline['Profile_number'].duplicated().any():
+        raise ValueError(f'Year {year} baseline has duplicate Profile_number.')
+    invalid_baseline = (
+        pd.to_numeric(baseline['Longitude'], errors='coerce').isna()
+        | pd.to_numeric(baseline['Latitude'], errors='coerce').isna()
+        | baseline['date'].isna()
+    )
+    if invalid_baseline.any():
+        raise ValueError(
+            f'Year {year} baseline has {int(invalid_baseline.sum())} '
+            'profiles with invalid date or coordinates.'
+        )
+
+    start = pd.Timestamp(year=int(year), month=1, day=1)
+    end = pd.Timestamp(year=int(year) + 1, month=1, day=1)
+    eddy_parts: list[pd.DataFrame] = []
+    for kind, path_string in daily_paths:
+        path = Path(path_string)
+        eddies = pd.read_parquet(
+            path,
+            columns=[
+                'track_id', 'time', 'center_lon', 'center_lat', 'radius',
+            ],
+            filters=[('time', '>=', start), ('time', '<', end)],
+        )
+        if eddies.empty:
+            continue
+        eddies['kind'] = str(kind).upper()
+        eddies['date'] = pd.to_datetime(
+            eddies['time'], errors='coerce'
+        ).dt.normalize()
+        for column in ('center_lon', 'center_lat', 'radius'):
+            eddies[column] = pd.to_numeric(
+                eddies[column], errors='coerce'
+            )
+        eddies = eddies[
+            eddies['date'].notna()
+            & eddies['center_lon'].notna()
+            & eddies['center_lat'].notna()
+            & eddies['radius'].gt(0)
+        ].copy()
+        eddy_parts.append(eddies)
+    eddy_table = (
+        pd.concat(eddy_parts, ignore_index=True)
+        if eddy_parts
+        else pd.DataFrame()
+    )
+    eddy_by_date = (
+        {date: frame for date, frame in eddy_table.groupby('date', sort=False)}
+        if not eddy_table.empty
+        else {}
+    )
+
+    baseline = baseline.reset_index(drop=True)
+    n_profiles = len(baseline)
+    nearest_ratio = np.full(n_profiles, np.nan, dtype=float)
+    nearest_distance = np.full(n_profiles, np.nan, dtype=float)
+    nearest_radius = np.full(n_profiles, np.nan, dtype=float)
+    nearest_track = np.full(n_profiles, np.nan, dtype=float)
+    nearest_kind = np.full(n_profiles, None, dtype=object)
+    profile_vectors = _spherical_unit_vectors(
+        baseline['Longitude'], baseline['Latitude']
+    )
+    for date, profiles_on_date in baseline.groupby('date', sort=False):
+        eddies_on_date = eddy_by_date.get(date)
+        if eddies_on_date is None or eddies_on_date.empty:
+            continue
+        eddy_vectors = _spherical_unit_vectors(
+            eddies_on_date['center_lon'],
+            eddies_on_date['center_lat'],
+        )
+        tree = cKDTree(eddy_vectors)
+        max_search_m = (
+            float(search_max_radius_factor)
+            * float(eddies_on_date['radius'].max())
+            * 1.05
+        )
+        chord_radius = 2.0 * np.sin(
+            min(max_search_m / 6371000.0, np.pi) / 2.0
+        )
+        for profile_index in profiles_on_date.index:
+            candidates = tree.query_ball_point(
+                profile_vectors[profile_index], chord_radius
+            )
+            if not candidates:
+                continue
+            candidate_eddies = eddies_on_date.iloc[candidates]
+            count = len(candidate_eddies)
+            distances = great_circle_distance_m(
+                np.full(count, float(baseline.at[profile_index, 'Longitude'])),
+                np.full(count, float(baseline.at[profile_index, 'Latitude'])),
+                candidate_eddies['center_lon'].to_numpy(dtype=float),
+                candidate_eddies['center_lat'].to_numpy(dtype=float),
+            )
+            ratios = (
+                np.asarray(distances, dtype=float)
+                / candidate_eddies['radius'].to_numpy(dtype=float)
+            )
+            if not np.isfinite(ratios).any():
+                continue
+            nearest_local = int(np.nanargmin(ratios))
+            ratio = float(ratios[nearest_local])
+            if ratio > float(search_max_radius_factor):
+                continue
+            nearest_row = candidate_eddies.iloc[nearest_local]
+            nearest_ratio[profile_index] = ratio
+            nearest_distance[profile_index] = float(
+                np.asarray(distances, dtype=float)[nearest_local]
+            )
+            nearest_radius[profile_index] = float(nearest_row['radius'])
+            nearest_track[profile_index] = float(nearest_row['track_id'])
+            nearest_kind[profile_index] = str(nearest_row['kind'])
+
+    baseline['meta_catalog_covered'] = baseline['date'].between(
+        pd.Timestamp(catalog_start), pd.Timestamp(catalog_end)
+    )
+    baseline['nearest_meta_radius_ratio'] = nearest_ratio
+    baseline['nearest_meta_distance_m'] = nearest_distance
+    baseline['nearest_meta_radius_m'] = nearest_radius
+    baseline['nearest_meta_track_id'] = pd.Series(
+        nearest_track, dtype='Int64'
+    )
+    baseline['nearest_meta_kind'] = nearest_kind
+    return baseline
+
+
+def build_argo_meta_radius_distance_table(
+    start_year: int = 2002,
+    end_year: int = 2023,
+    *,
+    search_max_radius_factor: float = 2.0,
+    eddy_kinds: tuple[str, ...] | list[str] = ('acs', 'acl', 'cs', 'cl'),
+    baseline_path: str | Path | None = None,
+    meta_tracks_root: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    num_workers: int | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """构建 Argo profile 到同日最近 META 涡的距离/有效半径比缓存。
+
+    现有 META membership 使用圆形判定，轮廓只区分命中后的 `poly`/`circle` 标签。该表只读取
+    META daily parquet 的涡心和有效半径，在最大搜索倍数内保存每个 profile 的最小
+    `distance / radius`，从而可在不重复几何匹配的情况下扫描多个半径倍数。
+
+    参数:
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - search_max_radius_factor (float): 缓存支持的最大半径倍数，默认 2.0。
+        - eddy_kinds (tuple[str, ...] | list[str]): META 类别，默认全部四类。
+        - baseline_path (str | Path | None): `all_region_argo` parquet；None 自动定位覆盖年份的缓存。
+        - meta_tracks_root (str | Path | None): META_tracks 根目录；None 读取 paths.yml。
+        - output_dir (str | Path | None): 输出目录；None 使用 shared statistics 目录。
+        - num_workers (int | None): 年度进程数；None 使用至多 8 个进程。
+        - force (bool): 是否忽略并覆盖同参数缓存，默认 False。
+        - save_data (bool): 是否保存 parquet，默认 True。
+
+    返回:
+        - pd.DataFrame: 一行一个 Argo profile，含最近 META 涡的距离比、命中涡信息和目录时间覆盖标记。
+
+    输出:
+        - `plot_outputs/shared/<region>/statistics/argo_meta_radius_distance_<y0>_<y1>_max<f>x.parquet`（save_data 时）。
+
+    说明:
+        - worker 任一年失败都会使整次构建失败，不会把失败年份当作零命中。
+        - `nearest_meta_radius_ratio` 仅在最大搜索倍数内有值；对不大于该上限的 membership 判定是完备的。
+        - 球面 KD-tree 只作候选粗筛，最终距离固定使用大圆距离，确保结果不随最大搜索倍数改变。
+    """
+    if int(end_year) < int(start_year):
+        raise ValueError('end_year must be >= start_year.')
+    max_factor = float(search_max_radius_factor)
+    if not np.isfinite(max_factor) or max_factor <= 0:
+        raise ValueError('search_max_radius_factor must be positive.')
+    kinds = tuple(dict.fromkeys(str(kind).lower() for kind in eddy_kinds))
+    invalid_kinds = sorted(set(kinds).difference({'acs', 'acl', 'cs', 'cl'}))
+    if not kinds or invalid_kinds:
+        raise ValueError(f'Invalid META eddy kinds: {invalid_kinds}')
+
+    region_slug = _current_region_key()
+    statistics_dir = _shared_output_dir('statistics', region_slug)
+    if baseline_path is None:
+        baseline_path = _select_covering_year_cache(
+            statistics_dir,
+            prefix='all_region_argo_',
+            suffix='.parquet',
+            start_year=int(start_year),
+            end_year=int(end_year),
+        )
+    if baseline_path is None or not Path(baseline_path).exists():
+        raise FileNotFoundError(
+            'A covering all_region_argo parquet is required.'
+        )
+    baseline_path = Path(baseline_path)
+    root = _ensure_meta_tracks_root(meta_tracks_root) / region_slug
+    daily_paths: list[tuple[str, Path]] = []
+    for kind in kinds:
+        path = root / f'{kind}_daily.parquet'
+        if not path.exists():
+            raise FileNotFoundError(f'Missing META daily parquet: {path}')
+        daily_paths.append((kind, path))
+    catalog_start, catalog_end = _meta_daily_catalog_bounds(
+        [path for _, path in daily_paths]
+    )
+
+    out_dir = Path(output_dir) if output_dir is not None else statistics_dir
+    factor_tag = _format_detection_value(max_factor)
+    output_path = out_dir / (
+        f'argo_meta_radius_distance_{int(start_year)}_{int(end_year)}_'
+        f'max{factor_tag}x.parquet'
+    )
+    required_columns = {
+        'Profile_number', 'date', 'meta_catalog_covered',
+        'nearest_meta_radius_ratio', 'nearest_meta_distance_m',
+        'nearest_meta_radius_m', 'nearest_meta_track_id',
+        'nearest_meta_kind', 'search_max_radius_factor',
+    }
+    if output_path.exists() and not force:
+        cached = pd.read_parquet(output_path)
+        missing = required_columns.difference(cached.columns)
+        cached_factor = set(
+            pd.to_numeric(
+                cached.get(
+                    'search_max_radius_factor', pd.Series(dtype=float)
+                ),
+                errors='coerce',
+            ).dropna().unique()
+        )
+        if not missing and cached_factor == {max_factor}:
+            return cached
+        raise FileExistsError(
+            f'Existing META radius-distance cache is incompatible: '
+            f'missing={sorted(missing)}, factor={sorted(cached_factor)}'
+        )
+
+    years = list(range(int(start_year), int(end_year) + 1))
+    worker_count = (
+        max(1, min(int(num_workers), len(years)))
+        if num_workers is not None
+        else max(1, min(multiprocessing.cpu_count(), 8, len(years)))
+    )
+    worker_args = [
+        (
+            year,
+            str(baseline_path),
+            [(kind, str(path)) for kind, path in daily_paths],
+            max_factor,
+            catalog_start,
+            catalog_end,
+        )
+        for year in years
+    ]
+    yearly_tables: list[pd.DataFrame] = []
+    if worker_count == 1:
+        iterator = map(_argo_meta_radius_distance_year_worker, worker_args)
+        for year, table in zip(
+            years,
+            tqdm(iterator, total=len(years), desc='META radius distance'),
+        ):
+            yearly_tables.append(table)
+            print(
+                f'[meta-radius] {year}: {len(table)} profiles, '
+                f'{int(table["nearest_meta_radius_ratio"].notna().sum())} '
+                f'within {max_factor:g}×'
+            )
+    else:
+        with multiprocessing.Pool(
+            processes=worker_count, maxtasksperchild=1
+        ) as pool:
+            iterator = pool.imap_unordered(
+                _argo_meta_radius_distance_year_worker, worker_args
+            )
+            for table in tqdm(
+                iterator, total=len(years), desc='META radius distance'
+            ):
+                yearly_tables.append(table)
+                year_values = pd.to_numeric(
+                    table['Year'], errors='coerce'
+                ).dropna().unique()
+                year_label = (
+                    str(int(year_values[0])) if len(year_values) == 1 else '?'
+                )
+                print(
+                    f'[meta-radius] {year_label}: {len(table)} profiles, '
+                    f'{int(table["nearest_meta_radius_ratio"].notna().sum())} '
+                    f'within {max_factor:g}×'
+                )
+    if len(yearly_tables) != len(years):
+        raise RuntimeError(
+            f'Expected {len(years)} yearly META-distance tables, '
+            f'got {len(yearly_tables)}.'
+        )
+    table = pd.concat(yearly_tables, ignore_index=True)
+    table = table.sort_values(
+        ['Year', 'Month', 'Day', 'Profile_number']
+    ).reset_index(drop=True)
+    if table['Profile_number'].duplicated().any():
+        duplicates = table.loc[
+            table['Profile_number'].duplicated(False), 'Profile_number'
+        ].astype(int).tolist()
+        raise RuntimeError(
+            f'META radius-distance table has duplicate profiles: '
+            f'{duplicates[:10]}'
+        )
+    baseline = pd.read_parquet(
+        baseline_path, columns=['Profile_number', 'Year']
+    )
+    baseline_year = pd.to_numeric(baseline['Year'], errors='coerce')
+    expected_ids = set(
+        pd.to_numeric(
+            baseline.loc[
+                baseline_year.between(int(start_year), int(end_year)),
+                'Profile_number',
+            ],
+            errors='coerce',
+        ).dropna().astype(int)
+    )
+    actual_ids = set(
+        pd.to_numeric(
+            table['Profile_number'], errors='coerce'
+        ).dropna().astype(int)
+    )
+    if actual_ids != expected_ids:
+        raise RuntimeError(
+            'META radius-distance output does not cover the baseline exactly: '
+            f'missing={len(expected_ids - actual_ids)}, '
+            f'extra={len(actual_ids - expected_ids)}.'
+        )
+    table['search_max_radius_factor'] = max_factor
+    table['meta_catalog_start'] = catalog_start
+    table['meta_catalog_end'] = catalog_end
+    table['baseline_source'] = str(baseline_path)
+    table['meta_tracks_source'] = str(root)
+    table['distance_method'] = 'great_circle_distance_m'
+    table['generated_at'] = pd.Timestamp.now(tz='UTC').isoformat()
+    if save_data:
+        _atomic_write_parquet(table, output_path)
+        print(f'[*] Argo-META radius-distance table saved: {output_path}')
+    return table
+
+
 def query_argo_inside_eddy(
     profile_number: int,
     year: int,
@@ -26890,6 +27306,570 @@ def plot_do_threshold_meta_association(
         plt.show()
     plt.close(fig)
     return out
+
+
+def summarize_meta_association_sensitivity(
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    radius_factors: tuple[float, ...] | list[float] = (
+        1.0, 1.2, 1.5, 2.0,
+    ),
+    start_year: int = 2002,
+    end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    meta_distance: pd.DataFrame | None = None,
+    meta_distance_path: str | Path | None = None,
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    force_distance_cache: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """检验 ΔDO–META association 对半径倍数和 baseline 口径的敏感性。
+
+    函数以 profile 到最近同日 META 涡的 `distance / radius` 缓存重建不同半径倍数下的
+    membership，并同时比较全体 Argo、DO-evaluable Argo、完整请求时段和 META 实际时间覆盖
+    四种 denominator。正式 OR 使用互斥的 anomaly 与 non-anomaly profiles，而不是把 anomaly
+    同时包含在 baseline 行中。
+
+    参数:
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值，默认 (20, 35, 50)。
+        - radius_factors (tuple[float, ...] | list[float]): META 有效半径倍数，默认 (1.0, 1.2, 1.5, 2.0)。
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
+        - meta_distance (pd.DataFrame | None): 已加载的 META 距离比表；None 时读取或构建缓存。
+        - meta_distance_path (str | Path | None): META 距离比 parquet；None 使用默认路径。
+        - profile_eligibility (pd.DataFrame | None): 对应深度的 Argo eligibility；None 时读取或构建。
+        - profile_eligibility_path (str | Path | None): eligibility parquet 路径；None 使用默认路径。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - force_distance_cache (bool): 是否强制重建 META 距离缓存，默认 False。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 threshold、radius factor 和 denominator mode 一行的 membership 与 exact OR。
+
+    输出:
+        - `plot_outputs/do/<region>/meta_association_sensitivity/meta_association_sensitivity_<y0>_<y1>_depth<z>m_radius<...>x.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - `requested_period` 保留既有 2002–2023 口径；`meta_period` 排除 META 目录结束后的剖面。
+        - OR 的参照组是同一 denominator 内的 non-anomaly profiles；membership 百分比另保留全 denominator baseline。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    radius_values = sorted({float(value) for value in radius_factors})
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+    if not radius_values or any(value <= 0 for value in radius_values):
+        raise ValueError('radius_factors must contain positive values.')
+    if int(end_year) < int(start_year):
+        raise ValueError('end_year must be >= start_year.')
+
+    region_slug = _current_region_key()
+    max_factor = max(radius_values)
+    statistics_dir = _shared_output_dir('statistics', region_slug)
+    if meta_distance is None:
+        if meta_distance_path is None:
+            meta_distance_path = statistics_dir / (
+                f'argo_meta_radius_distance_{int(start_year)}_'
+                f'{int(end_year)}_max'
+                f'{_format_detection_value(max_factor)}x.parquet'
+            )
+        distance_path = Path(meta_distance_path)
+        if distance_path.exists() and not force_distance_cache:
+            meta_distance = pd.read_parquet(distance_path)
+        else:
+            meta_distance = build_argo_meta_radius_distance_table(
+                start_year=int(start_year),
+                end_year=int(end_year),
+                search_max_radius_factor=max_factor,
+                output_dir=distance_path.parent,
+                force=bool(force_distance_cache),
+                save_data=True,
+            )
+    else:
+        meta_distance = meta_distance.copy()
+        distance_path = (
+            Path(meta_distance_path)
+            if meta_distance_path is not None
+            else None
+        )
+    required_distance = {
+        'Profile_number', 'nearest_meta_radius_ratio',
+        'meta_catalog_covered', 'search_max_radius_factor',
+        'meta_catalog_start', 'meta_catalog_end',
+    }
+    missing_distance = required_distance.difference(meta_distance.columns)
+    if missing_distance:
+        raise ValueError(
+            f'META distance table missing columns: {sorted(missing_distance)}'
+        )
+    supported_factors = pd.to_numeric(
+        meta_distance['search_max_radius_factor'], errors='coerce'
+    ).dropna().unique()
+    if (
+        len(supported_factors) != 1
+        or float(supported_factors[0]) + 1e-12 < max_factor
+    ):
+        raise ValueError(
+            f'META distance cache supports {supported_factors}, '
+            f'but radius factors require {max_factor:g}.'
+        )
+    profile_ids = pd.to_numeric(
+        meta_distance['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    if profile_ids.isna().any() or profile_ids.duplicated().any():
+        raise ValueError(
+            'META distance table requires unique, non-null Profile_number.'
+        )
+    meta_distance['Profile_number'] = profile_ids.astype(int)
+    meta_distance = meta_distance.set_index('Profile_number', drop=False)
+    all_ids = set(meta_distance.index.astype(int))
+
+    match_cfg = _scv_matched_control_config()
+    eligibility_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                eligibility_dir,
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
+            )
+        eligibility_path = Path(profile_eligibility_path)
+        if eligibility_path.exists():
+            profile_eligibility = pd.read_parquet(eligibility_path)
+        else:
+            profile_eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                output_dir=eligibility_dir,
+                save_data=True,
+            )
+    else:
+        profile_eligibility = profile_eligibility.copy()
+        eligibility_path = (
+            Path(profile_eligibility_path)
+            if profile_eligibility_path is not None
+            else None
+        )
+    required_eligibility = {'Profile_number', 'do_evaluable'}
+    missing_eligibility = required_eligibility.difference(
+        profile_eligibility.columns
+    )
+    if missing_eligibility:
+        raise ValueError(
+            f'Eligibility table missing columns: '
+            f'{sorted(missing_eligibility)}'
+        )
+    eligibility_ids = pd.to_numeric(
+        profile_eligibility['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    do_evaluable_ids = set(
+        eligibility_ids.loc[
+            eligibility_ids.notna()
+            & profile_eligibility['do_evaluable'].fillna(False).astype(bool)
+        ].astype(int)
+    ) & all_ids
+    covered_ids = set(
+        meta_distance.loc[
+            meta_distance['meta_catalog_covered'].fillna(False).astype(bool)
+        ].index.astype(int)
+    )
+    denominator_modes = {
+        'all_argo_requested_period': all_ids,
+        'do_evaluable_requested_period': do_evaluable_ids,
+        'all_argo_meta_period': all_ids & covered_ids,
+        'do_evaluable_meta_period': do_evaluable_ids & covered_ids,
+    }
+
+    anomaly_lookup, anomaly_paths = _do_threshold_anomaly_lookup(
+        threshold_values,
+        start_year=int(start_year),
+        end_year=int(end_year),
+        anomaly_min_depth=float(anomaly_min_depth),
+        region_slug=region_slug,
+    )
+    ratio = pd.to_numeric(
+        meta_distance['nearest_meta_radius_ratio'], errors='coerce'
+    )
+    rows: list[dict] = []
+    catalog_start = pd.Timestamp(
+        meta_distance['meta_catalog_start'].dropna().iloc[0]
+    )
+    catalog_end = pd.Timestamp(
+        meta_distance['meta_catalog_end'].dropna().iloc[0]
+    )
+    for radius_factor in radius_values:
+        member_ids = set(
+            meta_distance.loc[
+                ratio.le(float(radius_factor))
+            ].index.astype(int)
+        )
+        for threshold in threshold_values:
+            anomaly_all = set(
+                anomaly_lookup[float(threshold)].index.astype(int)
+            ) & all_ids
+            for denominator_mode, denominator_ids in denominator_modes.items():
+                anomaly_ids = anomaly_all & denominator_ids
+                non_anomaly_ids = denominator_ids.difference(anomaly_ids)
+                baseline_member_n = len(denominator_ids & member_ids)
+                anomaly_member_n = len(anomaly_ids & member_ids)
+                non_anomaly_member_n = len(
+                    non_anomaly_ids & member_ids
+                )
+                (
+                    odds_ratio,
+                    ci_low,
+                    ci_high,
+                    fisher_p,
+                ) = _conditional_exact_odds_ratio_ci(
+                    anomaly_member_n,
+                    len(anomaly_ids),
+                    non_anomaly_member_n,
+                    len(non_anomaly_ids),
+                )
+                rows.append({
+                    'threshold_umol_kg': float(threshold),
+                    'radius_factor': float(radius_factor),
+                    'denominator_mode': denominator_mode,
+                    'baseline_n': int(len(denominator_ids)),
+                    'baseline_meta_n': int(baseline_member_n),
+                    'baseline_membership_rate': (
+                        float(baseline_member_n / len(denominator_ids))
+                        if denominator_ids else np.nan
+                    ),
+                    'anomaly_total_requested_n': int(len(anomaly_all)),
+                    'anomaly_n': int(len(anomaly_ids)),
+                    'anomaly_meta_n': int(anomaly_member_n),
+                    'anomaly_membership_rate': (
+                        float(anomaly_member_n / len(anomaly_ids))
+                        if anomaly_ids else np.nan
+                    ),
+                    'non_anomaly_n': int(len(non_anomaly_ids)),
+                    'non_anomaly_meta_n': int(non_anomaly_member_n),
+                    'non_anomaly_membership_rate': (
+                        float(
+                            non_anomaly_member_n / len(non_anomaly_ids)
+                        )
+                        if non_anomaly_ids else np.nan
+                    ),
+                    'anomaly_vs_non_anomaly_or': odds_ratio,
+                    'or_ci_low': ci_low,
+                    'or_ci_high': ci_high,
+                    'fisher_p': fisher_p,
+                    'meta_catalog_start': catalog_start,
+                    'meta_catalog_end': catalog_end,
+                    'anomaly_source': str(anomaly_paths[float(threshold)]),
+                    'meta_distance_source': (
+                        str(distance_path) if distance_path is not None else ''
+                    ),
+                    'profile_eligibility_source': (
+                        str(eligibility_path)
+                        if eligibility_path is not None else ''
+                    ),
+                })
+    summary = pd.DataFrame(rows).sort_values(
+        ['denominator_mode', 'threshold_umol_kg', 'radius_factor']
+    ).reset_index(drop=True)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'meta_association_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        depth_tag = _format_detection_value(float(anomaly_min_depth))
+        radius_tag = '-'.join(
+            _format_detection_value(value) for value in radius_values
+        )
+        stem = (
+            f'meta_association_sensitivity_{int(start_year)}_'
+            f'{int(end_year)}_depth{depth_tag}m_radius{radius_tag}x'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] META association sensitivity saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return summary
+
+
+def plot_meta_association_sensitivity(
+    summary: pd.DataFrame,
+    *,
+    primary_denominator_mode: str = 'do_evaluable_meta_period',
+    default_radius_factor: float = 1.2,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 META 半径和 denominator 敏感性。
+
+    左图比较 META-covered、DO-evaluable 口径下 baseline 与 ΔDO20/35/50 membership；
+    中图给出 anomaly 相对互斥 non-anomaly profiles 的 exact OR；右图在默认 1.2× 半径下
+    展示四种 denominator 对 baseline 和 anomaly membership 的影响。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_meta_association_sensitivity` 输出。
+        - primary_denominator_mode (str): 左、中图使用的 denominator mode，默认 `do_evaluable_meta_period`。
+        - default_radius_factor (float): 右图比较 baseline 口径时的半径倍数，默认 1.2。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含绘图数据、denominator mode 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/meta_association_sensitivity/meta_association_radius_baseline_sensitivity.png`（save_fig 时）。
+    """
+    required = {
+        'threshold_umol_kg', 'radius_factor', 'denominator_mode',
+        'baseline_membership_rate', 'anomaly_membership_rate',
+        'anomaly_vs_non_anomaly_or', 'or_ci_low', 'or_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'META sensitivity summary missing columns: {sorted(missing)}'
+        )
+    primary = summary[
+        summary['denominator_mode'].astype(str).eq(
+            str(primary_denominator_mode)
+        )
+    ].copy()
+    if primary.empty:
+        raise ValueError(
+            f'No rows for denominator mode={primary_denominator_mode}.'
+        )
+    thresholds = sorted(
+        pd.to_numeric(
+            primary['threshold_umol_kg'], errors='coerce'
+        ).dropna().unique()
+    )
+    radii = sorted(
+        pd.to_numeric(
+            primary['radius_factor'], errors='coerce'
+        ).dropna().unique()
+    )
+    if not thresholds or not radii:
+        raise ValueError('META sensitivity summary has no plottable values.')
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.4))
+    baseline_rows = primary[
+        pd.to_numeric(
+            primary['threshold_umol_kg'], errors='coerce'
+        ).eq(float(thresholds[0]))
+    ].sort_values('radius_factor')
+    axes[0].plot(
+        baseline_rows['radius_factor'],
+        pd.to_numeric(
+            baseline_rows['baseline_membership_rate'], errors='coerce'
+        ) * 100.0,
+        color=_GROUP_COLORS['baseline'],
+        marker='o',
+        linestyle='--',
+        linewidth=2.0,
+        label='DO-evaluable baseline',
+    )
+    for threshold in thresholds:
+        rows = primary[
+            pd.to_numeric(
+                primary['threshold_umol_kg'], errors='coerce'
+            ).eq(float(threshold))
+        ].sort_values('radius_factor')
+        label = f'ΔDO{_format_detection_value(float(threshold))}'
+        axes[0].plot(
+            rows['radius_factor'],
+            pd.to_numeric(
+                rows['anomaly_membership_rate'], errors='coerce'
+            ) * 100.0,
+            color=_THRESHOLD_COLORS.get(
+                f'DO{_format_detection_value(float(threshold))}',
+                _GROUP_COLORS['scv'],
+            ),
+            marker=_THRESHOLD_MARKERS.get(
+                f'DO{_format_detection_value(float(threshold))}', 'o'
+            ),
+            linewidth=2.2,
+            label=label,
+        )
+    axes[0].set_xlabel('META effective-radius factor')
+    axes[0].set_ylabel('META membership (%)')
+    axes[0].set_title('Membership versus radius')
+    axes[0].legend(frameon=False, loc='lower right')
+    axes[0].grid(axis='y', alpha=0.25)
+
+    finite_upper: list[float] = []
+    for threshold in thresholds:
+        rows = primary[
+            pd.to_numeric(
+                primary['threshold_umol_kg'], errors='coerce'
+            ).eq(float(threshold))
+        ].sort_values('radius_factor')
+        estimate = pd.to_numeric(
+            rows['anomaly_vs_non_anomaly_or'], errors='coerce'
+        ).to_numpy(dtype=float)
+        low = pd.to_numeric(
+            rows['or_ci_low'], errors='coerce'
+        ).to_numpy(dtype=float)
+        high = pd.to_numeric(
+            rows['or_ci_high'], errors='coerce'
+        ).to_numpy(dtype=float)
+        finite_upper.extend(high[np.isfinite(high)].tolist())
+        axes[1].errorbar(
+            rows['radius_factor'],
+            estimate,
+            yerr=np.vstack([estimate - low, high - estimate]),
+            color=_THRESHOLD_COLORS.get(
+                f'DO{_format_detection_value(float(threshold))}',
+                _GROUP_COLORS['scv'],
+            ),
+            marker=_THRESHOLD_MARKERS.get(
+                f'DO{_format_detection_value(float(threshold))}', 'o'
+            ),
+            linewidth=2.0,
+            capsize=3,
+            label=f'ΔDO{_format_detection_value(float(threshold))}',
+        )
+    axes[1].axhline(1.0, color='0.35', linestyle='--', linewidth=1.2)
+    axes[1].set_xlabel('META effective-radius factor')
+    axes[1].set_ylabel('Membership odds ratio')
+    axes[1].set_title('Anomaly versus non-anomaly')
+    axes[1].legend(frameon=False, loc='best')
+    axes[1].grid(axis='y', alpha=0.25)
+    if finite_upper:
+        axes[1].set_ylim(
+            max(0.0, min(
+                pd.to_numeric(
+                    primary['or_ci_low'], errors='coerce'
+                ).min(),
+                1.0,
+            ) * 0.9),
+            max(finite_upper) * 1.08,
+        )
+
+    mode_order = [
+        'all_argo_requested_period',
+        'do_evaluable_requested_period',
+        'all_argo_meta_period',
+        'do_evaluable_meta_period',
+    ]
+    mode_labels = {
+        'all_argo_requested_period': 'All\nfull',
+        'do_evaluable_requested_period': 'DO eval.\nfull',
+        'all_argo_meta_period': 'All\ncovered',
+        'do_evaluable_meta_period': 'DO eval.\ncovered',
+    }
+    default_rows = summary[
+        np.isclose(
+            pd.to_numeric(
+                summary['radius_factor'], errors='coerce'
+            ).to_numpy(dtype=float),
+            float(default_radius_factor),
+        )
+        & summary['denominator_mode'].isin(mode_order)
+    ].copy()
+    if default_rows.empty:
+        raise ValueError(
+            f'No rows for default radius factor={default_radius_factor:g}.'
+        )
+    x = np.arange(len(mode_order), dtype=float)
+    first_threshold = float(thresholds[0])
+    baseline_default = default_rows[
+        pd.to_numeric(
+            default_rows['threshold_umol_kg'], errors='coerce'
+        ).eq(first_threshold)
+    ].set_index('denominator_mode')
+    axes[2].scatter(
+        x - 0.18,
+        [
+            float(baseline_default.at[mode, 'baseline_membership_rate'])
+            * 100.0
+            for mode in mode_order
+        ],
+        facecolors='none',
+        edgecolors=_GROUP_COLORS['baseline'],
+        marker='o',
+        s=70,
+        linewidths=1.8,
+        label='Baseline',
+        zorder=3,
+    )
+    offsets = np.linspace(-0.06, 0.18, len(thresholds))
+    for threshold, offset in zip(thresholds, offsets):
+        rows = default_rows[
+            pd.to_numeric(
+                default_rows['threshold_umol_kg'], errors='coerce'
+            ).eq(float(threshold))
+        ].set_index('denominator_mode')
+        key = f'DO{_format_detection_value(float(threshold))}'
+        axes[2].scatter(
+            x + offset,
+            [
+                float(rows.at[mode, 'anomaly_membership_rate']) * 100.0
+                for mode in mode_order
+            ],
+            color=_THRESHOLD_COLORS.get(key, _GROUP_COLORS['scv']),
+            marker=_THRESHOLD_MARKERS.get(key, 'o'),
+            s=70,
+            label=f'ΔDO{_format_detection_value(float(threshold))}',
+            zorder=3,
+        )
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels([mode_labels[mode] for mode in mode_order])
+    axes[2].set_ylabel('META membership (%)')
+    axes[2].set_xlabel('Profile subset / time window')
+    axes[2].set_title(
+        f'Denominator sensitivity at {default_radius_factor:g}×'
+    )
+    axes[2].legend(frameon=False, loc='lower right')
+    axes[2].grid(axis='y', alpha=0.25)
+
+    for axis in axes:
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    result = {
+        'rows': summary.copy(),
+        'primary_denominator_mode': str(primary_denominator_mode),
+        'default_radius_factor': float(default_radius_factor),
+    }
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'meta_association_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            'meta_association_radius_baseline_sensitivity.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] META association sensitivity figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
 
 
 def _default_mccoy_resolution_path(region_slug: str) -> Path:
