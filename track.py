@@ -18,6 +18,7 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 from scipy.stats import pearsonr, spearmanr
 from scipy.linalg import eig
 from scipy.optimize import least_squares, linear_sum_assignment
@@ -32501,4 +32502,2338 @@ def build_ofes_delta_do_event_catalog(
         'scan_summary': scan_summary,
         'daily_objects': linked_objects,
         'event_catalog': event_catalog,
+    }
+
+
+def _ofes_event_diagnostic_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES event 水团诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_diagnostics', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_diagnostics override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    settings = {
+        'candidate_threshold': float(
+            raw.get('candidate_threshold', 50.0)
+        ),
+        'candidate_count': int(raw.get('candidate_count', 5)),
+        'maximum_sampled_event_days': int(
+            raw.get('maximum_sampled_event_days', 31)
+        ),
+        'deep_pressure_min_dbar': float(
+            raw.get('deep_pressure_min_dbar', 500.0)
+        ),
+        'deep_pressure_max_dbar': float(
+            raw.get('deep_pressure_max_dbar', 900.0)
+        ),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_load_margin_km': float(
+            raw.get('background_load_margin_km', 50.0)
+        ),
+        'background_min_valid_columns': int(
+            raw.get('background_min_valid_columns', 100)
+        ),
+        'velocity_smoothing_sigma_pixels': float(
+            raw.get('velocity_smoothing_sigma_pixels', 1.5)
+        ),
+        'negative_control_distance_min_km': float(
+            raw.get('negative_control_distance_min_km', 300.0)
+        ),
+        'negative_control_distance_max_km': float(
+            raw.get('negative_control_distance_max_km', 700.0)
+        ),
+        'negative_control_latitude_tolerance_deg': float(
+            raw.get(
+                'negative_control_latitude_tolerance_deg',
+                3.0,
+            )
+        ),
+        'negative_control_do20_exclusion_radius_km': float(
+            raw.get(
+                'negative_control_do20_exclusion_radius_km',
+                100.0,
+            )
+        ),
+        'negative_control_grid_stride': int(
+            raw.get('negative_control_grid_stride', 5)
+        ),
+        'control_match_sigma0_scale': float(
+            raw.get('control_match_sigma0_scale', 0.05)
+        ),
+        'control_match_theta_scale_deg_c': float(
+            raw.get('control_match_theta_scale_deg_c', 1.0)
+        ),
+        'control_match_salinity_scale': float(
+            raw.get('control_match_salinity_scale', 0.10)
+        ),
+        'control_match_do_scale_umol_kg': float(
+            raw.get('control_match_do_scale_umol_kg', 10.0)
+        ),
+        'control_match_vorticity_scale': float(
+            raw.get('control_match_vorticity_scale', 0.20)
+        ),
+        'control_match_strain_scale': float(
+            raw.get('control_match_strain_scale', 0.20)
+        ),
+        'context_days': int(raw.get('context_days', 10)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_diagnostics')
+        ),
+    }
+    positive_keys = (
+        'candidate_threshold',
+        'candidate_count',
+        'maximum_sampled_event_days',
+        'deep_pressure_min_dbar',
+        'deep_pressure_max_dbar',
+        'background_inner_radius_km',
+        'background_outer_radius_km',
+        'background_load_margin_km',
+        'background_min_valid_columns',
+        'velocity_smoothing_sigma_pixels',
+        'negative_control_distance_min_km',
+        'negative_control_distance_max_km',
+        'negative_control_latitude_tolerance_deg',
+        'negative_control_do20_exclusion_radius_km',
+        'negative_control_grid_stride',
+        'control_match_sigma0_scale',
+        'control_match_theta_scale_deg_c',
+        'control_match_salinity_scale',
+        'control_match_do_scale_umol_kg',
+        'control_match_vorticity_scale',
+        'control_match_strain_scale',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES event diagnostic counts, radii, and match scales '
+            'must be finite and positive.'
+        )
+    if (
+        settings['deep_pressure_max_dbar']
+        <= settings['deep_pressure_min_dbar']
+    ):
+        raise ValueError(
+            'OFES deep diagnostic pressure bounds must be ordered.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES background annulus radii must be ordered.'
+        )
+    if (
+        settings['negative_control_distance_max_km']
+        <= settings['negative_control_distance_min_km']
+    ):
+        raise ValueError(
+            'OFES negative-control distance bounds must be ordered.'
+        )
+    if settings['maximum_sampled_event_days'] < 3:
+        raise ValueError(
+            'OFES maximum_sampled_event_days must be at least 3 '
+            'to retain event start, peak, and end.'
+        )
+    if settings['context_days'] < 0:
+        raise ValueError(
+            'OFES event diagnostic context_days must be non-negative.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES event diagnostic output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_profile_value_at_pressure(
+    pressure: np.ndarray,
+    values: np.ndarray,
+    target_pressure: float,
+) -> float:
+    """在有效且递增的 pressure 剖面上线性插值单个值。"""
+    pressure_arr = np.asarray(pressure, dtype=float)
+    values_arr = np.asarray(values, dtype=float)
+    valid = np.isfinite(pressure_arr) & np.isfinite(values_arr)
+    if np.count_nonzero(valid) < 2:
+        return np.nan
+    x = pressure_arr[valid]
+    y = values_arr[valid]
+    if (
+        float(target_pressure) < float(x[0])
+        or float(target_pressure) > float(x[-1])
+    ):
+        return np.nan
+    return float(np.interp(float(target_pressure), x, y))
+
+
+def _ofes_sigma0_profile(
+    pressure: np.ndarray,
+    salinity: np.ndarray,
+    potential_temperature: np.ndarray,
+    lon: float,
+    lat: float,
+) -> np.ndarray:
+    """从 OFES PSS-78 盐度和位温计算 TEOS-10 sigma0 剖面。"""
+    pressure_arr = np.asarray(pressure, dtype=float)
+    salinity_arr = np.asarray(salinity, dtype=float)
+    theta_arr = np.asarray(potential_temperature, dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_arr,
+        pressure_arr,
+        float(lon),
+        float(lat),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta_arr
+    )
+    return np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+
+
+def _ofes_point_thermodynamics(
+    pressure: float,
+    salinity: float,
+    potential_temperature: float,
+    oxygen: float,
+    lon: float,
+    lat: float,
+) -> dict:
+    """计算单点 TEOS-10 密度、spiciness 与 AOU 诊断。"""
+    values = (
+        pressure,
+        salinity,
+        potential_temperature,
+        oxygen,
+        lon,
+        lat,
+    )
+    keys = (
+        'absolute_salinity',
+        'conservative_temperature',
+        'sigma0',
+        'spiciness0',
+        'oxygen_saturation',
+        'aou',
+    )
+    if not all(np.isfinite(value) for value in values):
+        return {key: np.nan for key in keys}
+    absolute_salinity = float(
+        gsw.SA_from_SP(
+            float(salinity),
+            float(pressure),
+            float(lon),
+            float(lat),
+        )
+    )
+    conservative_temperature = float(
+        gsw.CT_from_pt(
+            absolute_salinity, float(potential_temperature)
+        )
+    )
+    sigma0 = float(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        )
+    )
+    spiciness0 = float(
+        gsw.spiciness0(
+            absolute_salinity, conservative_temperature
+        )
+    )
+    oxygen_saturation = float(
+        gsw.O2sol(
+            absolute_salinity,
+            conservative_temperature,
+            float(pressure),
+            float(lon),
+            float(lat),
+        )
+    )
+    return {
+        'absolute_salinity': absolute_salinity,
+        'conservative_temperature': conservative_temperature,
+        'sigma0': sigma0,
+        'spiciness0': spiciness0,
+        'oxygen_saturation': oxygen_saturation,
+        'aou': oxygen_saturation - float(oxygen),
+    }
+
+
+def _ofes_n2_at_pressure(
+    pressure: np.ndarray,
+    salinity: np.ndarray,
+    potential_temperature: np.ndarray,
+    lon: float,
+    lat: float,
+    target_pressure: float,
+) -> float:
+    """在目标 pressure 插值 TEOS-10 浮力频率平方。"""
+    pressure_arr = np.asarray(pressure, dtype=float)
+    salinity_arr = np.asarray(salinity, dtype=float)
+    theta_arr = np.asarray(potential_temperature, dtype=float)
+    valid = (
+        np.isfinite(pressure_arr)
+        & np.isfinite(salinity_arr)
+        & np.isfinite(theta_arr)
+    )
+    if np.count_nonzero(valid) < 3:
+        return np.nan
+    pressure_valid = pressure_arr[valid]
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_arr[valid],
+        pressure_valid,
+        float(lon),
+        float(lat),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta_arr[valid]
+    )
+    n2, pressure_mid = gsw.Nsquared(
+        absolute_salinity,
+        conservative_temperature,
+        pressure_valid,
+        lat=float(lat),
+    )
+    finite = np.isfinite(n2) & np.isfinite(pressure_mid)
+    return _ofes_profile_value_at_pressure(
+        pressure_mid[finite],
+        n2[finite],
+        float(target_pressure),
+    )
+
+
+def _ofes_density_crossing_near_pressure(
+    pressure: np.ndarray,
+    sigma0: np.ndarray,
+    target_sigma0: float,
+    reference_pressure: float,
+    fields: dict[str, np.ndarray],
+) -> dict:
+    """返回离参考 pressure 最近的 target-sigma0 线性交点。"""
+    pressure_arr = np.asarray(pressure, dtype=float)
+    sigma_arr = np.asarray(sigma0, dtype=float)
+    result = {
+        'pressure': np.nan,
+        'crossing_count': 0,
+        **{key: np.nan for key in fields},
+    }
+    if (
+        pressure_arr.ndim != 1
+        or sigma_arr.shape != pressure_arr.shape
+        or not np.isfinite(target_sigma0)
+    ):
+        return result
+    lower = sigma_arr[:-1] - float(target_sigma0)
+    upper = sigma_arr[1:] - float(target_sigma0)
+    valid = (
+        np.isfinite(pressure_arr[:-1])
+        & np.isfinite(pressure_arr[1:])
+        & np.isfinite(lower)
+        & np.isfinite(upper)
+        & (lower * upper <= 0)
+        & (sigma_arr[1:] != sigma_arr[:-1])
+    )
+    candidates = np.flatnonzero(valid)
+    result['crossing_count'] = int(candidates.size)
+    if candidates.size == 0:
+        return result
+    fraction = (
+        float(target_sigma0) - sigma_arr[candidates]
+    ) / (
+        sigma_arr[candidates + 1]
+        - sigma_arr[candidates]
+    )
+    crossing_pressure = (
+        pressure_arr[candidates]
+        + fraction
+        * (
+            pressure_arr[candidates + 1]
+            - pressure_arr[candidates]
+        )
+    )
+    choice = int(
+        np.argmin(
+            np.abs(
+                crossing_pressure - float(reference_pressure)
+            )
+        )
+    )
+    index = int(candidates[choice])
+    fraction_value = float(fraction[choice])
+    result['pressure'] = float(crossing_pressure[choice])
+    for key, values in fields.items():
+        values_arr = np.asarray(values, dtype=float)
+        if (
+            values_arr.shape == pressure_arr.shape
+            and np.isfinite(values_arr[index])
+            and np.isfinite(values_arr[index + 1])
+        ):
+            result[key] = float(
+                values_arr[index]
+                + fraction_value
+                * (
+                    values_arr[index + 1]
+                    - values_arr[index]
+                )
+            )
+    return result
+
+
+def _ofes_masked_median_profiles(
+    values: np.ndarray,
+    horizontal_mask: np.ndarray,
+) -> np.ndarray:
+    """沿水平掩码返回逐层有限值中位数而不发出空层 warning。"""
+    array = np.asarray(values, dtype=float)
+    mask = np.asarray(horizontal_mask, dtype=bool)
+    if array.ndim != 3 or array.shape[1:] != mask.shape:
+        raise ValueError(
+            'OFES profile field and horizontal mask shapes do not match.'
+        )
+    selected = array[:, mask]
+    if selected.shape[1] == 0:
+        return np.full(array.shape[0], np.nan, dtype=float)
+    masked = np.ma.masked_invalid(selected)
+    return np.asarray(
+        np.ma.median(masked, axis=1).filled(np.nan),
+        dtype=float,
+    )
+
+
+def _ofes_nan_gaussian(
+    field: np.ndarray,
+    sigma_pixels: float,
+) -> np.ndarray:
+    """以有限值权重做 Gaussian 平滑并保留缺测支配区域。"""
+    values = np.asarray(field, dtype=float)
+    valid = np.isfinite(values)
+    numerator = gaussian_filter(
+        np.where(valid, values, 0.0),
+        sigma=float(sigma_pixels),
+        mode='nearest',
+    )
+    denominator = gaussian_filter(
+        valid.astype(float),
+        sigma=float(sigma_pixels),
+        mode='nearest',
+    )
+    smoothed = np.full(values.shape, np.nan, dtype=float)
+    np.divide(
+        numerator,
+        denominator,
+        out=smoothed,
+        where=denominator >= 0.5,
+    )
+    return smoothed
+
+
+def _ofes_fixed_pressure_kinematic_fields(
+    snapshot: dict,
+    target_pressure: float,
+    smoothing_sigma_pixels: float,
+) -> dict:
+    """计算最近原生 pressure 层的平滑速度梯度与无量纲动力量。"""
+    pressure = np.asarray(snapshot['pressure'], dtype=float)
+    if pressure.size == 0:
+        raise ValueError('OFES snapshot contains no pressure level.')
+    level_index = int(
+        np.argmin(np.abs(pressure - float(target_pressure)))
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    u = _ofes_nan_gaussian(
+        snapshot['u'][level_index],
+        float(smoothing_sigma_pixels),
+    )
+    v = _ofes_nan_gaussian(
+        snapshot['v'][level_index],
+        float(smoothing_sigma_pixels),
+    )
+    scale = approximate_degree_length(lat)
+    meters_per_degree_lon = np.asarray(
+        scale['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    meters_per_degree_lat = np.asarray(
+        scale['meters_per_degree_lat'], dtype=float
+    )[:, None]
+    du_dx = np.gradient(u, lon, axis=1) / meters_per_degree_lon
+    dv_dx = np.gradient(v, lon, axis=1) / meters_per_degree_lon
+    du_dy = np.gradient(u, lat, axis=0) / meters_per_degree_lat
+    dv_dy = np.gradient(v, lat, axis=0) / meters_per_degree_lat
+    relative_vorticity = dv_dx - du_dy
+    normal_strain = du_dx - dv_dy
+    shear_strain = dv_dx + du_dy
+    total_strain = np.hypot(normal_strain, shear_strain)
+    okubo_weiss = total_strain**2 - relative_vorticity**2
+    coriolis = np.asarray(gsw.f(lat), dtype=float)[:, None]
+    rossby_number = np.full(relative_vorticity.shape, np.nan)
+    normalized_strain = np.full(total_strain.shape, np.nan)
+    normalized_okubo_weiss = np.full(
+        okubo_weiss.shape, np.nan
+    )
+    np.divide(
+        relative_vorticity,
+        coriolis,
+        out=rossby_number,
+        where=np.abs(coriolis) > 0,
+    )
+    np.divide(
+        total_strain,
+        np.abs(coriolis),
+        out=normalized_strain,
+        where=np.abs(coriolis) > 0,
+    )
+    np.divide(
+        okubo_weiss,
+        coriolis**2,
+        out=normalized_okubo_weiss,
+        where=np.abs(coriolis) > 0,
+    )
+    return {
+        'pressure_dbar': float(pressure[level_index]),
+        'level_index': int(level_index),
+        'u': u,
+        'v': v,
+        'relative_vorticity': relative_vorticity,
+        'normal_strain': normal_strain,
+        'shear_strain': shear_strain,
+        'total_strain': total_strain,
+        'okubo_weiss': okubo_weiss,
+        'coriolis': np.broadcast_to(
+            coriolis, relative_vorticity.shape
+        ),
+        'rossby_number': rossby_number,
+        'normalized_strain': normalized_strain,
+        'normalized_okubo_weiss': normalized_okubo_weiss,
+    }
+
+
+def _ofes_kinematics_at_point(
+    fields: dict,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    target_lon: float,
+    target_lat: float,
+) -> dict:
+    """从已计算的二维动力场提取最近网格点诊断。"""
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    column = int(
+        np.argmin(
+            np.abs(
+                _minimal_lon_diff_deg(
+                    lon_arr, float(target_lon)
+                )
+            )
+        )
+    )
+    row = int(np.argmin(np.abs(lat_arr - float(target_lat))))
+    u = float(fields['u'][row, column])
+    v = float(fields['v'][row, column])
+    return {
+        'kinematic_pressure_dbar': float(
+            fields['pressure_dbar']
+        ),
+        'u_m_s': u,
+        'v_m_s': v,
+        'speed_m_s': float(np.hypot(u, v)),
+        'relative_vorticity_s_1': float(
+            fields['relative_vorticity'][row, column]
+        ),
+        'normal_strain_s_1': float(
+            fields['normal_strain'][row, column]
+        ),
+        'shear_strain_s_1': float(
+            fields['shear_strain'][row, column]
+        ),
+        'total_strain_s_1': float(
+            fields['total_strain'][row, column]
+        ),
+        'okubo_weiss_s_2': float(
+            fields['okubo_weiss'][row, column]
+        ),
+        'coriolis_s_1': float(
+            fields['coriolis'][row, column]
+        ),
+        'rossby_number': float(
+            fields['rossby_number'][row, column]
+        ),
+        'normalized_strain': float(
+            fields['normalized_strain'][row, column]
+        ),
+        'normalized_okubo_weiss': float(
+            fields['normalized_okubo_weiss'][row, column]
+        ),
+    }
+
+
+def _ofes_unit_sphere_xyz(
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """把等形经纬数组转换为单位球三维坐标行。"""
+    lon_arr, lat_arr = np.broadcast_arrays(
+        np.asarray(lon, dtype=float),
+        np.asarray(lat, dtype=float),
+    )
+    lon_radians = np.radians(lon_arr.ravel())
+    lat_radians = np.radians(lat_arr.ravel())
+    cos_lat = np.cos(lat_radians)
+    return np.column_stack(
+        (
+            cos_lat * np.cos(lon_radians),
+            cos_lat * np.sin(lon_radians),
+            np.sin(lat_radians),
+        )
+    )
+
+
+def _ofes_quality_event_catalog(
+    catalog_run_dir: str | Path,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """标记交付边界截断并生成正式与深层敏感性排名。"""
+    root = Path(catalog_run_dir)
+    manifest = json.loads(
+        (root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES event diagnostics require a complete catalog.'
+        )
+    events = pd.read_parquet(root / 'event_catalog.parquet')
+    objects = pd.read_parquet(root / 'daily_objects.parquet')
+    lon, lat, pressure, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(manifest['start_date'])
+    )
+    edge_by_event = objects.assign(
+        touches_delivery_edge=(
+            (objects['row_min'] <= 0)
+            | (objects['row_max'] >= lat.size - 1)
+            | (objects['column_min'] <= 0)
+            | (objects['column_max'] >= lon.size - 1)
+        )
+    ).groupby('event_id', sort=False)[
+        'touches_delivery_edge'
+    ].any()
+    events = events.copy()
+    events['touches_delivery_edge'] = (
+        events['event_id'].map(edge_by_event).fillna(True)
+    ).astype(bool)
+    events['quality_eligible'] = (
+        events['rank_eligible']
+        & ~events['touches_delivery_edge']
+    )
+    events['quality_rank_within_threshold'] = pd.Series(
+        [pd.NA] * len(events), dtype='Int32'
+    )
+    for threshold in sorted(events['threshold'].unique()):
+        ranked = events.loc[
+            (events['threshold'] == threshold)
+            & events['quality_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        events.loc[
+            ranked.index, 'quality_rank_within_threshold'
+        ] = np.arange(1, len(ranked) + 1)
+
+    catalog_settings = manifest['catalog_settings']
+    candidate_pressure = pressure[
+        (
+            pressure
+            >= float(
+                catalog_settings[
+                    'candidate_pressure_min_dbar'
+                ]
+            )
+        )
+        & (
+            pressure
+            <= float(
+                catalog_settings[
+                    'candidate_pressure_max_dbar'
+                ]
+            )
+        )
+    ]
+    if candidate_pressure.size == 0:
+        raise RuntimeError(
+            'The catalog pressure window contains no native level.'
+        )
+    lower_search_level = float(candidate_pressure[0])
+    upper_search_level = float(candidate_pressure[-1])
+    events['peak_on_lower_search_level'] = np.isclose(
+        events['peak_pressure_dbar'],
+        lower_search_level,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    events['peak_on_upper_search_level'] = np.isclose(
+        events['peak_pressure_dbar'],
+        upper_search_level,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    events['deep_sensitivity_eligible'] = (
+        events['quality_eligible']
+        & events['peak_pressure_dbar'].between(
+            float(settings['deep_pressure_min_dbar']),
+            float(settings['deep_pressure_max_dbar']),
+        )
+    )
+    events[
+        'deep_sensitivity_rank_within_threshold'
+    ] = pd.Series([pd.NA] * len(events), dtype='Int32')
+    for threshold in sorted(events['threshold'].unique()):
+        ranked = events.loc[
+            (events['threshold'] == threshold)
+            & events['deep_sensitivity_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        events.loc[
+            ranked.index,
+            'deep_sensitivity_rank_within_threshold',
+        ] = np.arange(1, len(ranked) + 1)
+
+    selected = events.loc[
+        (
+            events['threshold']
+            == float(settings['candidate_threshold'])
+        )
+        & events['quality_eligible']
+    ].sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).head(int(settings['candidate_count']))
+    if len(selected) != int(settings['candidate_count']):
+        raise RuntimeError(
+            'The OFES catalog does not contain the requested number '
+            'of quality-eligible candidate events.'
+        )
+    threshold_events = events.loc[
+        events['threshold']
+        == float(settings['candidate_threshold'])
+    ]
+    ranked_threshold_events = threshold_events.loc[
+        threshold_events['rank_eligible']
+    ]
+    audit = {
+        'lower_search_level_dbar': lower_search_level,
+        'upper_search_level_dbar': upper_search_level,
+        'candidate_threshold': float(
+            settings['candidate_threshold']
+        ),
+        'raw_event_count': int(len(threshold_events)),
+        'rank_eligible_event_count': int(
+            len(ranked_threshold_events)
+        ),
+        'delivery_edge_truncated_count': int(
+            np.count_nonzero(
+                ranked_threshold_events[
+                    'touches_delivery_edge'
+                ]
+            )
+        ),
+        'quality_eligible_event_count': int(
+            np.count_nonzero(
+                ranked_threshold_events['quality_eligible']
+            )
+        ),
+        'lower_search_level_event_count': int(
+            np.count_nonzero(
+                ranked_threshold_events[
+                    'peak_on_lower_search_level'
+                ]
+            )
+        ),
+        'lower_search_level_event_fraction': float(
+            ranked_threshold_events[
+                'peak_on_lower_search_level'
+            ].mean()
+        ),
+        'deep_sensitivity_event_count': int(
+            np.count_nonzero(
+                threshold_events['deep_sensitivity_eligible']
+            )
+        ),
+        'selected_event_ids': selected[
+            'event_id'
+        ].astype(str).tolist(),
+    }
+    return events, objects, audit
+
+
+def _ofes_sample_event_objects(
+    group: pd.DataFrame,
+    peak_daily_object_key: str,
+    maximum_days: int,
+) -> pd.DataFrame:
+    """等间隔抽取长事件并强制保留首、峰、末对象。"""
+    ordered = group.sort_values(
+        'date', kind='mergesort'
+    ).reset_index(drop=True)
+    if ordered['date'].duplicated().any():
+        raise ValueError(
+            'An OFES event contains more than one object per date.'
+        )
+    if len(ordered) <= int(maximum_days):
+        result = ordered.copy()
+        result['diagnostic_sample_index'] = np.arange(
+            1, len(result) + 1, dtype=np.int16
+        )
+        return result
+    peak_positions = np.flatnonzero(
+        ordered['daily_object_key'].astype(str).to_numpy()
+        == str(peak_daily_object_key)
+    )
+    if peak_positions.size != 1:
+        raise ValueError(
+            'The OFES peak daily object key is absent or duplicated.'
+        )
+    peak_position = int(peak_positions[0])
+    selected = set(
+        np.linspace(
+            0, len(ordered) - 1, int(maximum_days)
+        ).round().astype(int)
+    )
+    required = {0, peak_position, len(ordered) - 1}
+    selected.update(required)
+    while len(selected) > int(maximum_days):
+        removable = sorted(selected - required)
+        if not removable:
+            raise RuntimeError(
+                'Unable to satisfy OFES event-day sampling limit.'
+            )
+        redundancy: list[tuple[int, int]] = []
+        for position in removable:
+            others = np.asarray(
+                sorted(selected - {position}), dtype=int
+            )
+            redundancy.append(
+                (
+                    int(np.min(np.abs(others - position))),
+                    int(position),
+                )
+            )
+        _, remove = min(redundancy)
+        selected.remove(remove)
+    result = ordered.iloc[
+        sorted(selected)
+    ].reset_index(drop=True)
+    result['diagnostic_sample_index'] = np.arange(
+        1, len(result) + 1, dtype=np.int16
+    )
+    return result
+
+
+def _ofes_delivery_edge_distance_km(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    lon_min: float,
+    lon_max: float,
+    lat_min: float,
+    lat_max: float,
+) -> np.ndarray:
+    """计算点到矩形交付窗口四边的最短大圆距离。"""
+    lon_arr, lat_arr = np.broadcast_arrays(
+        np.asarray(lon, dtype=float),
+        np.asarray(lat, dtype=float),
+    )
+    distances = (
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, float(lon_min), lat_arr
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, float(lon_max), lat_arr
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, lon_arr, float(lat_min)
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, lon_arr, float(lat_max)
+            ),
+            dtype=float,
+        ),
+    )
+    return np.minimum.reduce(distances) / 1000.0
+
+
+def _ofes_diagnose_water_mass_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_pressure: float,
+    settings: dict,
+) -> dict:
+    """诊断单日 OFES 核心相对环带背景的水团与 heave 分量。"""
+    date_ts = pd.Timestamp(date).normalize()
+    outer_radius = float(
+        settings['background_outer_radius_km']
+    )
+    load_radius = (
+        outer_radius
+        + float(settings['background_load_margin_km'])
+    )
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    pressure = np.asarray(snapshot['pressure'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(core_lon),
+                float(core_lat),
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    background_mask = (
+        distance_km
+        >= float(settings['background_inner_radius_km'])
+    ) & (distance_km <= outer_radius)
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(
+                _minimal_lon_diff_deg(lon, float(core_lon))
+            )
+        )
+    )
+    actual_lon = float(lon[column])
+    actual_lat = float(lat[row])
+    reference_level = int(
+        np.argmin(
+            np.abs(pressure - float(reference_pressure))
+        )
+    )
+    native_reference_pressure = float(
+        pressure[reference_level]
+    )
+    valid_reference = (
+        background_mask
+        & np.isfinite(snapshot['do2'][reference_level])
+        & np.isfinite(snapshot['temp'][reference_level])
+        & np.isfinite(snapshot['salinity'][reference_level])
+    )
+    background_valid_columns = int(
+        np.count_nonzero(valid_reference)
+    )
+    core_profiles = {
+        'do': np.asarray(
+            snapshot['do2'][:, row, column], dtype=float
+        ),
+        'theta': np.asarray(
+            snapshot['temp'][:, row, column], dtype=float
+        ),
+        'salinity': np.asarray(
+            snapshot['salinity'][:, row, column], dtype=float
+        ),
+    }
+    background_profiles = {
+        'do': _ofes_masked_median_profiles(
+            snapshot['do2'], background_mask
+        ),
+        'theta': _ofes_masked_median_profiles(
+            snapshot['temp'], background_mask
+        ),
+        'salinity': _ofes_masked_median_profiles(
+            snapshot['salinity'], background_mask
+        ),
+    }
+    core_sigma0 = _ofes_sigma0_profile(
+        pressure,
+        core_profiles['salinity'],
+        core_profiles['theta'],
+        actual_lon,
+        actual_lat,
+    )
+    background_sigma0 = _ofes_sigma0_profile(
+        pressure,
+        background_profiles['salinity'],
+        background_profiles['theta'],
+        actual_lon,
+        actual_lat,
+    )
+    core_fixed = {
+        key: _ofes_profile_value_at_pressure(
+            pressure, values, float(reference_pressure)
+        )
+        for key, values in core_profiles.items()
+    }
+    background_fixed = {
+        key: _ofes_profile_value_at_pressure(
+            pressure, values, float(reference_pressure)
+        )
+        for key, values in background_profiles.items()
+    }
+    target_sigma0 = _ofes_profile_value_at_pressure(
+        pressure, core_sigma0, float(reference_pressure)
+    )
+    background_on_sigma = (
+        _ofes_density_crossing_near_pressure(
+            pressure,
+            background_sigma0,
+            target_sigma0,
+            float(reference_pressure),
+            background_profiles,
+        )
+    )
+    core_thermodynamics = _ofes_point_thermodynamics(
+        float(reference_pressure),
+        core_fixed['salinity'],
+        core_fixed['theta'],
+        core_fixed['do'],
+        actual_lon,
+        actual_lat,
+    )
+    background_fixed_thermodynamics = (
+        _ofes_point_thermodynamics(
+            float(reference_pressure),
+            background_fixed['salinity'],
+            background_fixed['theta'],
+            background_fixed['do'],
+            actual_lon,
+            actual_lat,
+        )
+    )
+    background_sigma_thermodynamics = (
+        _ofes_point_thermodynamics(
+            float(background_on_sigma['pressure']),
+            float(background_on_sigma['salinity']),
+            float(background_on_sigma['theta']),
+            float(background_on_sigma['do']),
+            actual_lon,
+            actual_lat,
+        )
+    )
+    core_n2 = _ofes_n2_at_pressure(
+        pressure,
+        core_profiles['salinity'],
+        core_profiles['theta'],
+        actual_lon,
+        actual_lat,
+        float(reference_pressure),
+    )
+    background_n2 = _ofes_n2_at_pressure(
+        pressure,
+        background_profiles['salinity'],
+        background_profiles['theta'],
+        actual_lon,
+        actual_lat,
+        float(background_on_sigma['pressure']),
+    )
+    fixed_pressure_do_contrast = (
+        core_fixed['do'] - background_fixed['do']
+    )
+    water_mass_do_contrast = (
+        core_fixed['do'] - background_on_sigma['do']
+    )
+    heave_do_contribution = (
+        background_on_sigma['do'] - background_fixed['do']
+    )
+    closure_error = (
+        fixed_pressure_do_contrast
+        - water_mass_do_contrast
+        - heave_do_contribution
+    )
+    n2_ratio = (
+        float(core_n2 / background_n2)
+        if (
+            np.isfinite(core_n2)
+            and np.isfinite(background_n2)
+            and background_n2 != 0
+        )
+        else np.nan
+    )
+    kinematic_fields = (
+        _ofes_fixed_pressure_kinematic_fields(
+            snapshot,
+            float(reference_pressure),
+            float(
+                settings[
+                    'velocity_smoothing_sigma_pixels'
+                ]
+            ),
+        )
+    )
+    kinematics = _ofes_kinematics_at_point(
+        kinematic_fields,
+        lon,
+        lat,
+        actual_lon,
+        actual_lat,
+    )
+    full_lon, full_lat, _, _, _ = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    delivery_edge_distance = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(actual_lon),
+            np.asarray(actual_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    core_grid_distance_m = float(
+        great_circle_distance_m(
+            actual_lon,
+            actual_lat,
+            float(core_lon),
+            float(core_lat),
+        )
+    )
+
+    failure_reasons: list[str] = []
+    if (
+        background_valid_columns
+        < int(settings['background_min_valid_columns'])
+    ):
+        failure_reasons.append('insufficient_background_columns')
+    if not np.isfinite(target_sigma0):
+        failure_reasons.append('missing_core_sigma0')
+    if not np.isfinite(background_on_sigma['pressure']):
+        failure_reasons.append('missing_background_sigma_crossing')
+    required_metrics = (
+        fixed_pressure_do_contrast,
+        water_mass_do_contrast,
+        heave_do_contribution,
+        closure_error,
+        core_thermodynamics['spiciness0'],
+        background_sigma_thermodynamics['spiciness0'],
+        core_thermodynamics['aou'],
+        background_sigma_thermodynamics['aou'],
+        core_n2,
+        background_n2,
+        kinematics['rossby_number'],
+        kinematics['normalized_strain'],
+        kinematics['normalized_okubo_weiss'],
+    )
+    if not all(np.isfinite(value) for value in required_metrics):
+        failure_reasons.append('nonfinite_required_metric')
+    if (
+        np.isfinite(closure_error)
+        and abs(float(closure_error)) > 1e-10
+    ):
+        failure_reasons.append('decomposition_closure_failure')
+
+    result = {
+        'date': date_ts,
+        'requested_core_lon': float(core_lon),
+        'requested_core_lat': float(core_lat),
+        'core_lon': actual_lon,
+        'core_lat': actual_lat,
+        'core_grid_distance_m': core_grid_distance_m,
+        'reference_pressure_dbar': float(reference_pressure),
+        'native_reference_pressure_dbar': (
+            native_reference_pressure
+        ),
+        'reference_pressure_native_offset_dbar': float(
+            native_reference_pressure - float(reference_pressure)
+        ),
+        'background_inner_radius_km': float(
+            settings['background_inner_radius_km']
+        ),
+        'background_outer_radius_km': outer_radius,
+        'background_annulus_grid_columns': int(
+            np.count_nonzero(background_mask)
+        ),
+        'background_valid_columns': background_valid_columns,
+        'delivery_edge_distance_km': delivery_edge_distance,
+        'background_annulus_within_delivery_window': bool(
+            delivery_edge_distance >= outer_radius
+        ),
+        'target_sigma0': float(target_sigma0),
+        'background_sigma0_fixed': float(
+            background_fixed_thermodynamics['sigma0']
+        ),
+        'background_sigma_pressure_dbar': float(
+            background_on_sigma['pressure']
+        ),
+        'background_sigma_crossing_count': int(
+            background_on_sigma['crossing_count']
+        ),
+        'core_minus_background_isopycnal_pressure_dbar': float(
+            float(reference_pressure)
+            - float(background_on_sigma['pressure'])
+        ),
+        'core_do_fixed': float(core_fixed['do']),
+        'background_do_fixed': float(
+            background_fixed['do']
+        ),
+        'background_do_same_sigma': float(
+            background_on_sigma['do']
+        ),
+        'fixed_pressure_do_contrast': float(
+            fixed_pressure_do_contrast
+        ),
+        'water_mass_do_contrast': float(
+            water_mass_do_contrast
+        ),
+        'heave_do_contribution': float(
+            heave_do_contribution
+        ),
+        'decomposition_closure_error': float(
+            closure_error
+        ),
+        'core_theta_fixed': float(core_fixed['theta']),
+        'background_theta_fixed': float(
+            background_fixed['theta']
+        ),
+        'background_theta_same_sigma': float(
+            background_on_sigma['theta']
+        ),
+        'same_sigma_theta_contrast': float(
+            core_fixed['theta']
+            - background_on_sigma['theta']
+        ),
+        'core_salinity_fixed': float(
+            core_fixed['salinity']
+        ),
+        'background_salinity_fixed': float(
+            background_fixed['salinity']
+        ),
+        'background_salinity_same_sigma': float(
+            background_on_sigma['salinity']
+        ),
+        'same_sigma_salinity_contrast': float(
+            core_fixed['salinity']
+            - background_on_sigma['salinity']
+        ),
+        'core_spiciness0': float(
+            core_thermodynamics['spiciness0']
+        ),
+        'background_spiciness0_same_sigma': float(
+            background_sigma_thermodynamics['spiciness0']
+        ),
+        'same_sigma_spiciness0_contrast': float(
+            core_thermodynamics['spiciness0']
+            - background_sigma_thermodynamics[
+                'spiciness0'
+            ]
+        ),
+        'core_aou_umol_kg': float(
+            core_thermodynamics['aou']
+        ),
+        'background_aou_same_sigma_umol_kg': float(
+            background_sigma_thermodynamics['aou']
+        ),
+        'same_sigma_aou_contrast': float(
+            core_thermodynamics['aou']
+            - background_sigma_thermodynamics['aou']
+        ),
+        'core_n2_s_2': float(core_n2),
+        'background_n2_same_sigma_s_2': float(
+            background_n2
+        ),
+        'n2_ratio_core_to_background': n2_ratio,
+        'diagnostic_passed': bool(not failure_reasons),
+        'diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(dict.fromkeys(failure_reasons))
+        ),
+    }
+    result.update(kinematics)
+    return result
+
+
+def _ofes_select_negative_control(
+    catalog_run_dir: str | Path,
+    peak_date: str | pd.Timestamp,
+    event_lon: float,
+    event_lat: float,
+    reference_pressure: float,
+    event_peak_diagnostic: dict,
+    settings: dict,
+) -> dict:
+    """按预先声明的水团和动力距离选择同日无 DO20 负对照。"""
+    date_ts = pd.Timestamp(peak_date).normalize()
+    pressure = _ofes_tracer_coordinates(date_ts)[2]
+    pressure_level = int(
+        np.argmin(
+            np.abs(
+                np.asarray(pressure, dtype=float)
+                - float(reference_pressure)
+            )
+        )
+    )
+    native_pressure = float(pressure[pressure_level])
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        pressure_bounds=(native_pressure, native_pressure),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    event_distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(event_lon),
+                float(event_lat),
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    day_tag = date_ts.strftime('%Y%m%d')
+    peak_path = (
+        Path(catalog_run_dir)
+        / 'days'
+        / f'peak_pixels_{day_tag}.parquet'
+    )
+    catalog_thresholds = {
+        float(value)
+        for value in json.loads(
+            (
+                Path(catalog_run_dir) / 'manifest.json'
+            ).read_text(encoding='utf-8')
+        )['catalog_settings']['thresholds']
+    }
+    if 20.0 not in catalog_thresholds:
+        raise RuntimeError(
+            'Negative-control selection requires a DO20 catalog.'
+        )
+    peaks = pd.read_parquet(
+        peak_path, columns=['lon', 'lat', 'delta_do']
+    )
+    peaks = peaks.loc[
+        peaks['delta_do'] >= 20.0
+    ]
+    if peaks.empty:
+        raise RuntimeError(
+            'The headline-event date contains no DO20 peak pixel.'
+        )
+    peak_xyz = _ofes_unit_sphere_xyz(
+        peaks['lon'].to_numpy(dtype=float),
+        peaks['lat'].to_numpy(dtype=float),
+    )
+    candidate_xyz = _ofes_unit_sphere_xyz(
+        lon_grid, lat_grid
+    )
+    nearest_peak_chord = cKDTree(peak_xyz).query(
+        candidate_xyz, k=1
+    )[0]
+    nearest_do20_distance_km = (
+        2.0
+        * 6371.0088
+        * np.arcsin(
+            np.clip(nearest_peak_chord / 2.0, 0.0, 1.0)
+        )
+    ).reshape(lon_grid.shape)
+
+    salinity = np.asarray(
+        snapshot['salinity'][0], dtype=float
+    )
+    theta = np.asarray(snapshot['temp'][0], dtype=float)
+    oxygen = np.asarray(snapshot['do2'][0], dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        native_pressure,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    sigma0 = np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+    kinematic_fields = (
+        _ofes_fixed_pressure_kinematic_fields(
+            snapshot,
+            native_pressure,
+            float(
+                settings[
+                    'velocity_smoothing_sigma_pixels'
+                ]
+            ),
+        )
+    )
+    delivery_edge_distance_km = (
+        _ofes_delivery_edge_distance_km(
+            lon_grid,
+            lat_grid,
+            float(lon[0]),
+            float(lon[-1]),
+            float(lat[0]),
+            float(lat[-1]),
+        )
+    )
+    candidate = (
+        (
+            event_distance_km
+            >= float(
+                settings[
+                    'negative_control_distance_min_km'
+                ]
+            )
+        )
+        & (
+            event_distance_km
+            <= float(
+                settings[
+                    'negative_control_distance_max_km'
+                ]
+            )
+        )
+        & (
+            np.abs(lat_grid - float(event_lat))
+            <= float(
+                settings[
+                    'negative_control_latitude_tolerance_deg'
+                ]
+            )
+        )
+        & (
+            nearest_do20_distance_km
+            >= float(
+                settings[
+                    'negative_control_do20_exclusion_radius_km'
+                ]
+            )
+        )
+        & (
+            delivery_edge_distance_km
+            >= float(settings['background_outer_radius_km'])
+        )
+        & np.isfinite(sigma0)
+        & np.isfinite(theta)
+        & np.isfinite(salinity)
+        & np.isfinite(oxygen)
+        & np.isfinite(kinematic_fields['rossby_number'])
+        & np.isfinite(
+            kinematic_fields['normalized_strain']
+        )
+    )
+    stride = int(settings['negative_control_grid_stride'])
+    stride_mask = np.zeros(candidate.shape, dtype=bool)
+    stride_mask[::stride, ::stride] = True
+    candidate &= stride_mask
+
+    match_components = {
+        'match_sigma0_normalized': (
+            sigma0
+            - float(
+                event_peak_diagnostic[
+                    'background_sigma0_fixed'
+                ]
+            )
+        )
+        / float(settings['control_match_sigma0_scale']),
+        'match_theta_normalized': (
+            theta
+            - float(
+                event_peak_diagnostic[
+                    'background_theta_fixed'
+                ]
+            )
+        )
+        / float(
+            settings['control_match_theta_scale_deg_c']
+        ),
+        'match_salinity_normalized': (
+            salinity
+            - float(
+                event_peak_diagnostic[
+                    'background_salinity_fixed'
+                ]
+            )
+        )
+        / float(settings['control_match_salinity_scale']),
+        'match_do_normalized': (
+            oxygen
+            - float(
+                event_peak_diagnostic['background_do_fixed']
+            )
+        )
+        / float(
+            settings['control_match_do_scale_umol_kg']
+        ),
+        'match_vorticity_normalized': (
+            kinematic_fields['rossby_number']
+            - float(event_peak_diagnostic['rossby_number'])
+        )
+        / float(
+            settings['control_match_vorticity_scale']
+        ),
+        'match_strain_normalized': (
+            kinematic_fields['normalized_strain']
+            - float(
+                event_peak_diagnostic['normalized_strain']
+            )
+        )
+        / float(settings['control_match_strain_scale']),
+    }
+    match_score = np.sqrt(
+        sum(values**2 for values in match_components.values())
+    )
+    match_score[~candidate] = np.inf
+    if not np.any(np.isfinite(match_score)):
+        raise RuntimeError(
+            'No OFES negative-control candidate passed the '
+            'predeclared distance, DO20, and delivery-window gates.'
+        )
+    flat_index = int(np.argmin(match_score))
+    row, column = np.unravel_index(
+        flat_index, match_score.shape
+    )
+    result = {
+        'date': date_ts,
+        'lon': float(lon[column]),
+        'lat': float(lat[row]),
+        'reference_pressure_dbar': native_pressure,
+        'event_lon': float(event_lon),
+        'event_lat': float(event_lat),
+        'event_distance_km': float(
+            event_distance_km[row, column]
+        ),
+        'nearest_do20_peak_distance_km': float(
+            nearest_do20_distance_km[row, column]
+        ),
+        'delivery_edge_distance_km': float(
+            delivery_edge_distance_km[row, column]
+        ),
+        'candidate_count': int(np.count_nonzero(candidate)),
+        'match_score': float(match_score[row, column]),
+        'sigma0': float(sigma0[row, column]),
+        'theta': float(theta[row, column]),
+        'salinity': float(salinity[row, column]),
+        'do': float(oxygen[row, column]),
+        'rossby_number': float(
+            kinematic_fields['rossby_number'][row, column]
+        ),
+        'normalized_strain': float(
+            kinematic_fields['normalized_strain'][
+                row, column
+            ]
+        ),
+    }
+    for key, values in match_components.items():
+        result[key] = float(values[row, column])
+    return result
+
+
+def _ofes_event_diagnostic_summary(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+) -> pd.DataFrame:
+    """把逐日水团诊断汇总到预锁定候选事件。"""
+    records: list[dict] = []
+    for event in selected_events.itertuples(index=False):
+        group = daily_diagnostics.loc[
+            daily_diagnostics['event_id'] == event.event_id
+        ].sort_values('date', kind='mergesort')
+        peak_rows = group.loc[
+            group['daily_object_key']
+            == event.peak_daily_object_key
+        ]
+        if len(peak_rows) != 1:
+            raise RuntimeError(
+                f'Expected one peak diagnostic for {event.event_id}.'
+            )
+        peak = peak_rows.iloc[0]
+        passed = group.loc[group['diagnostic_passed']]
+        records.append(
+            {
+                'event_id': str(event.event_id),
+                'raw_rank_within_threshold': int(
+                    event.rank_within_threshold
+                ),
+                'quality_rank_within_threshold': int(
+                    event.quality_rank_within_threshold
+                ),
+                'start_date': pd.Timestamp(event.start_date),
+                'peak_date': pd.Timestamp(event.peak_date),
+                'end_date': pd.Timestamp(event.end_date),
+                'observed_days': int(event.observed_days),
+                'diagnosed_days': int(len(group)),
+                'passed_days': int(len(passed)),
+                'all_sampled_days_passed': bool(
+                    len(passed) == len(group)
+                ),
+                'peak_target_sigma0': float(
+                    peak['target_sigma0']
+                ),
+                'peak_fixed_pressure_do_contrast': float(
+                    peak['fixed_pressure_do_contrast']
+                ),
+                'peak_water_mass_do_contrast': float(
+                    peak['water_mass_do_contrast']
+                ),
+                'peak_heave_do_contribution': float(
+                    peak['heave_do_contribution']
+                ),
+                'peak_same_sigma_theta_contrast': float(
+                    peak['same_sigma_theta_contrast']
+                ),
+                'peak_same_sigma_salinity_contrast': float(
+                    peak['same_sigma_salinity_contrast']
+                ),
+                'peak_same_sigma_spiciness0_contrast': float(
+                    peak['same_sigma_spiciness0_contrast']
+                ),
+                'peak_same_sigma_aou_contrast': float(
+                    peak['same_sigma_aou_contrast']
+                ),
+                'peak_n2_ratio_core_to_background': float(
+                    peak['n2_ratio_core_to_background']
+                ),
+                'peak_rossby_number': float(
+                    peak['rossby_number']
+                ),
+                'peak_normalized_strain': float(
+                    peak['normalized_strain']
+                ),
+                'peak_normalized_okubo_weiss': float(
+                    peak['normalized_okubo_weiss']
+                ),
+                'median_fixed_pressure_do_contrast': float(
+                    passed[
+                        'fixed_pressure_do_contrast'
+                    ].median()
+                ),
+                'median_water_mass_do_contrast': float(
+                    passed['water_mass_do_contrast'].median()
+                ),
+                'median_heave_do_contribution': float(
+                    passed['heave_do_contribution'].median()
+                ),
+                'maximum_abs_decomposition_closure_error': (
+                    float(
+                        group[
+                            'decomposition_closure_error'
+                        ].abs().max()
+                    )
+                ),
+                'background_annulus_clipped_days': int(
+                    np.count_nonzero(
+                        ~group[
+                            'background_annulus_within_delivery_window'
+                        ]
+                    )
+                ),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_event_diagnostic_run_identity(
+    catalog_run_dir: str | Path,
+    settings: dict,
+    selected_events: pd.DataFrame,
+    sampled_objects: pd.DataFrame,
+) -> tuple[dict, pd.DataFrame]:
+    """构建 OFES 水团诊断的输入 inventory 与稳定签名。"""
+    catalog_root = Path(catalog_run_dir)
+    catalog_manifest = json.loads(
+        (catalog_root / 'manifest.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    dates = sorted(
+        pd.to_datetime(
+            sampled_objects['date']
+        ).dt.normalize().unique()
+    )
+    inventory_records: list[dict] = []
+    for date_value in dates:
+        date = pd.Timestamp(date_value)
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+            path = _ofes_file_path(variable, date)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f'OFES diagnostic source file not found: {path}'
+                )
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': date,
+                    'variable': variable,
+                    'roles': (
+                        'event_daily_diagnostic,'
+                        'headline_control_candidate'
+                        if (
+                            date
+                            == pd.Timestamp(
+                                selected_events.iloc[0][
+                                    'peak_date'
+                                ]
+                            ).normalize()
+                        )
+                        else 'event_daily_diagnostic'
+                    ),
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    inventory = pd.DataFrame(inventory_records)
+    inventory_payload = inventory.assign(
+        date=inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_file_path,
+            _ofes_contiguous_slice,
+            _ofes_assert_coordinate_match,
+            _ofes_subset_to_float32,
+            load_ofes_snapshot,
+            _ofes_tracer_coordinates,
+            approximate_degree_length,
+            great_circle_distance_m,
+            adaptive_distance_m,
+            _minimal_lon_diff_deg,
+            _ofes_event_diagnostic_settings,
+            _ofes_profile_value_at_pressure,
+            _ofes_sigma0_profile,
+            _ofes_point_thermodynamics,
+            _ofes_n2_at_pressure,
+            _ofes_density_crossing_near_pressure,
+            _ofes_masked_median_profiles,
+            _ofes_nan_gaussian,
+            _ofes_fixed_pressure_kinematic_fields,
+            _ofes_kinematics_at_point,
+            _ofes_unit_sphere_xyz,
+            _ofes_quality_event_catalog,
+            _ofes_sample_event_objects,
+            _ofes_delivery_edge_distance_km,
+            _ofes_diagnose_water_mass_day,
+            _ofes_select_negative_control,
+            _ofes_event_diagnostic_summary,
+            _ofes_event_diagnostic_run_identity,
+            diagnose_ofes_ranked_events,
+        )
+    )
+    code_sha256 = hashlib.sha256(
+        code_sources.encode('utf-8')
+    ).hexdigest()
+    catalog_inputs = {}
+    for name in (
+        'manifest.json',
+        'preflight.json',
+        'event_catalog.parquet',
+        'daily_objects.parquet',
+    ):
+        catalog_inputs[name] = _file_sha256(
+            catalog_root / name
+        )
+    repo_root = Path(__file__).resolve().parent
+    signature_payload = {
+        'schema_version': 1,
+        'catalog_run_dir': str(catalog_root),
+        'catalog_run_signature': catalog_manifest[
+            'run_signature'
+        ],
+        'catalog_input_sha256': catalog_inputs,
+        'settings': settings,
+        'selected_event_ids': selected_events[
+            'event_id'
+        ].astype(str).tolist(),
+        'sampled_daily_object_keys': sampled_objects[
+            'daily_object_key'
+        ].astype(str).tolist(),
+        'source_inventory_sha256': inventory_sha256,
+        'diagnostic_code_sha256': code_sha256,
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+    }
+    canonical = json.dumps(
+        signature_payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    return (
+        {
+            **signature_payload,
+            'run_signature': run_signature,
+            'run_tag': f'ofes_events_{run_signature[:12]}',
+            'source_identity_basis': (
+                'selected-date OFES path, size_bytes, and mtime_ns; '
+                'catalog inputs are content-hashed'
+            ),
+        },
+        inventory,
+    )
+
+
+def diagnose_ofes_ranked_events(
+    catalog_run_dir: str | Path,
+    *,
+    diagnostic_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """诊断客观排名 OFES 事件的等密度水团、heave、动力量与负对照。
+
+    入口先从完整年度 catalog 排除触及 900 x 600 交付边界的截断事件，再按
+    原定 score 重排并固定 DO50 前五名。每个事件最多诊断 31 个观测日，核心
+    取逐日对象最大 ΔDO 列，参考层固定为事件峰值 pressure；同日 120–240 km
+    环带给出精确的固定 pressure DO = 同密度水团项 + heave 项分解。第一名
+    事件另按预声明的六维水团/动力距离选择一个无 DO20 的空间负对照。
+
+    参数:
+        - catalog_run_dir (str | Path): 已完成且带 manifest 的 OFES 年度 event catalog 运行目录。
+        - diagnostic_overrides (dict | None): 临时覆盖已声明的 event_diagnostics 配置。
+        - output_dir (str | Path | None): 诊断根目录；None 时写到 catalog 目录下配置的子目录。
+        - resume (bool): 是否复用签名一致的逐事件日原子 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、边界审计、质量 catalog、固定候选、逐日/事件诊断与负对照表。
+
+    输出:
+        - `<run_dir>/days/<event_id>_YYYYMMDD.parquet`。
+        - `<run_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet`、`source_inventory.parquet` 与 `manifest.json`。
+
+    说明:
+        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–900 dbar 仅是另表敏感性排名。
+        - sigma0、spiciness0、氧饱和度与 N2 使用 TEOS-10；OFES temp 按原生位温解释。
+        - u/v 先在原生网格上以 1.5 像元 Gaussian 平滑，再计算相对涡度、总应变与 Okubo-Weiss。
+        - 负对照必须距事件 300–700 km、纬差不超过 3°、距任一 DO20 像元至少 100 km，且完整 240 km 环带留在交付窗口内。
+    """
+    catalog_root = Path(catalog_run_dir)
+    settings = _ofes_event_diagnostic_settings(
+        diagnostic_overrides
+    )
+    catalog_manifest = json.loads(
+        (catalog_root / 'manifest.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if catalog_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'diagnose_ofes_ranked_events requires a complete catalog.'
+        )
+    catalog_thresholds = {
+        float(value)
+        for value in catalog_manifest[
+            'catalog_settings'
+        ]['thresholds']
+    }
+    if (
+        float(settings['candidate_threshold'])
+        not in catalog_thresholds
+    ):
+        raise ValueError(
+            'The diagnostic candidate threshold is absent from '
+            'the catalog.'
+        )
+    quality_events, linked_objects, quality_audit = (
+        _ofes_quality_event_catalog(
+            catalog_root, settings
+        )
+    )
+    selected_events = quality_events.loc[
+        (
+            quality_events['threshold']
+            == float(settings['candidate_threshold'])
+        )
+        & quality_events['quality_eligible']
+    ].sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).head(int(settings['candidate_count'])).copy()
+    selected_events['selected_candidate'] = True
+
+    sampled_frames: list[pd.DataFrame] = []
+    for event in selected_events.itertuples(index=False):
+        event_objects = linked_objects.loc[
+            linked_objects['event_id'] == event.event_id
+        ]
+        sampled = _ofes_sample_event_objects(
+            event_objects,
+            str(event.peak_daily_object_key),
+            int(settings['maximum_sampled_event_days']),
+        )
+        sampled['quality_rank_within_threshold'] = int(
+            event.quality_rank_within_threshold
+        )
+        sampled['raw_rank_within_threshold'] = int(
+            event.rank_within_threshold
+        )
+        sampled['event_peak_pressure_dbar'] = float(
+            event.peak_pressure_dbar
+        )
+        sampled['event_peak_daily_object_key'] = str(
+            event.peak_daily_object_key
+        )
+        sampled_frames.append(sampled)
+    sampled_objects = pd.concat(
+        sampled_frames, ignore_index=True
+    )
+    identity, source_inventory = (
+        _ofes_event_diagnostic_run_identity(
+            catalog_root,
+            settings,
+            selected_events,
+            sampled_objects,
+        )
+    )
+    diagnostic_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else catalog_root / settings['output_subdir']
+    )
+    run_dir = diagnostic_root / identity['run_tag']
+    if (
+        run_dir.exists()
+        and not resume
+        and any(run_dir.iterdir())
+    ):
+        raise FileExistsError(
+            f'OFES diagnostic run directory is not empty: {run_dir}'
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    days_dir = run_dir / 'days'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    previous_manifest = {}
+    if manifest_path.exists():
+        previous_manifest = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        previous_signature = previous_manifest.get(
+            'run_signature'
+        )
+        if (
+            previous_signature
+            and previous_signature != identity['run_signature']
+        ):
+            raise RuntimeError(
+                'Existing OFES diagnostic manifest signature '
+                'does not match the requested run.'
+            )
+
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': previous_manifest.get(
+            'created_at_utc',
+            pd.Timestamp.now(tz='UTC').isoformat(),
+        ),
+        'updated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'quality_audit': quality_audit,
+        'completed_fragments': 0,
+        'total_fragments': int(len(sampled_objects)),
+        'resume_enabled': bool(resume),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        quality_events,
+        run_dir / 'quality_event_catalog.parquet',
+    )
+    _atomic_write_parquet(
+        selected_events,
+        run_dir / 'selected_events.parquet',
+    )
+    deep_ranking = quality_events.loc[
+        quality_events['deep_sensitivity_eligible']
+    ].sort_values(
+        [
+            'threshold',
+            'deep_sensitivity_rank_within_threshold',
+        ],
+        kind='mergesort',
+    )
+    _atomic_write_parquet(
+        deep_ranking,
+        run_dir / 'deep_sensitivity_ranking.parquet',
+    )
+    _atomic_write_parquet(
+        source_inventory,
+        run_dir / 'source_inventory.parquet',
+    )
+
+    daily_frames: list[pd.DataFrame] = []
+    completed_fragments = 0
+    try:
+        for row in sampled_objects.itertuples(index=False):
+            date = pd.Timestamp(row.date).normalize()
+            fragment_path = (
+                days_dir
+                / (
+                    f'{row.event_id}_'
+                    f'{date:%Y%m%d}.parquet'
+                )
+            )
+            reused = False
+            if resume and fragment_path.exists():
+                frame = pd.read_parquet(fragment_path)
+                if (
+                    len(frame) == 1
+                    and frame.iloc[0][
+                        'diagnostic_run_signature'
+                    ]
+                    == identity['run_signature']
+                    and frame.iloc[0]['daily_object_key']
+                    == row.daily_object_key
+                ):
+                    reused = True
+            if not reused:
+                diagnosis = _ofes_diagnose_water_mass_day(
+                    date,
+                    float(row.peak_lon),
+                    float(row.peak_lat),
+                    float(row.event_peak_pressure_dbar),
+                    settings,
+                )
+                diagnosis.update(
+                    {
+                        'diagnostic_run_signature': (
+                            identity['run_signature']
+                        ),
+                        'event_id': str(row.event_id),
+                        'threshold': float(row.threshold),
+                        'raw_rank_within_threshold': int(
+                            row.raw_rank_within_threshold
+                        ),
+                        'quality_rank_within_threshold': int(
+                            row.quality_rank_within_threshold
+                        ),
+                        'daily_object_key': str(
+                            row.daily_object_key
+                        ),
+                        'diagnostic_sample_index': int(
+                            row.diagnostic_sample_index
+                        ),
+                        'event_day_index': int(
+                            row.event_day_index
+                        ),
+                        'event_peak_daily_object_key': str(
+                            row.event_peak_daily_object_key
+                        ),
+                        'catalog_delta_do': float(
+                            row.delta_do_max
+                        ),
+                        'daily_peak_pressure_dbar': float(
+                            row.peak_pressure_at_max
+                        ),
+                        'daily_object_area_km2': float(
+                            row.area_km2
+                        ),
+                        'daily_object_pixel_count': int(
+                            row.pixel_count
+                        ),
+                    }
+                )
+                frame = pd.DataFrame([diagnosis])
+                _atomic_write_parquet(frame, fragment_path)
+            daily_frames.append(frame)
+            completed_fragments += 1
+            if (
+                completed_fragments == 1
+                or completed_fragments == len(sampled_objects)
+                or completed_fragments % 10 == 0
+            ):
+                print(
+                    '[OFES diagnostics] '
+                    f'{completed_fragments:03d}/'
+                    f'{len(sampled_objects):03d} '
+                    f'{row.event_id} {date:%Y-%m-%d} '
+                    f'({"reused" if reused else "diagnosed"})'
+                )
+                manifest['completed_fragments'] = int(
+                    completed_fragments
+                )
+                manifest['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(
+                    manifest, manifest_path
+                )
+
+        daily_diagnostics = pd.concat(
+            daily_frames, ignore_index=True
+        )
+        daily_diagnostics = daily_diagnostics.sort_values(
+            [
+                'quality_rank_within_threshold',
+                'date',
+            ],
+            kind='mergesort',
+        ).reset_index(drop=True)
+        event_summary = _ofes_event_diagnostic_summary(
+            selected_events, daily_diagnostics
+        )
+        _atomic_write_parquet(
+            daily_diagnostics,
+            run_dir / 'daily_diagnostics.parquet',
+        )
+        _atomic_write_parquet(
+            event_summary,
+            run_dir / 'event_diagnostic_summary.parquet',
+        )
+
+        headline_event = selected_events.sort_values(
+            'quality_rank_within_threshold',
+            kind='mergesort',
+        ).iloc[0]
+        headline_peak_rows = daily_diagnostics.loc[
+            daily_diagnostics['daily_object_key']
+            == headline_event['peak_daily_object_key']
+        ]
+        if len(headline_peak_rows) != 1:
+            raise RuntimeError(
+                'The headline event lacks exactly one peak diagnosis.'
+            )
+        headline_peak = headline_peak_rows.iloc[0]
+        if not bool(headline_peak['diagnostic_passed']):
+            raise RuntimeError(
+                'The headline peak failed the water-mass diagnostic '
+                'gate; the candidate is retained but a matched '
+                'negative control cannot be defined.'
+            )
+        negative_control = _ofes_select_negative_control(
+            catalog_root,
+            headline_event['peak_date'],
+            float(headline_event['peak_lon']),
+            float(headline_event['peak_lat']),
+            float(headline_event['peak_pressure_dbar']),
+            headline_peak.to_dict(),
+            settings,
+        )
+        negative_control.update(
+            {
+                'control_id': (
+                    f"{headline_event['event_id']}_CONTROL"
+                ),
+                'event_id': str(headline_event['event_id']),
+                'quality_rank_within_threshold': int(
+                    headline_event[
+                        'quality_rank_within_threshold'
+                    ]
+                ),
+            }
+        )
+        negative_control_frame = pd.DataFrame(
+            [negative_control]
+        )
+        control_diagnosis = _ofes_diagnose_water_mass_day(
+            negative_control['date'],
+            float(negative_control['lon']),
+            float(negative_control['lat']),
+            float(
+                negative_control[
+                    'reference_pressure_dbar'
+                ]
+            ),
+            settings,
+        )
+        control_diagnosis.update(
+            {
+                'diagnostic_run_signature': (
+                    identity['run_signature']
+                ),
+                'control_id': negative_control['control_id'],
+                'event_id': str(headline_event['event_id']),
+                'role': 'matched_negative_control',
+            }
+        )
+        control_diagnostic_frame = pd.DataFrame(
+            [control_diagnosis]
+        )
+        _atomic_write_parquet(
+            negative_control_frame,
+            run_dir / 'negative_control.parquet',
+        )
+        _atomic_write_parquet(
+            control_diagnostic_frame,
+            run_dir / 'negative_control_diagnostic.parquet',
+        )
+
+        diagnostic_gate_passed = bool(
+            daily_diagnostics['diagnostic_passed'].all()
+            and control_diagnostic_frame[
+                'diagnostic_passed'
+            ].all()
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_fragments': int(
+                    completed_fragments
+                ),
+                'daily_diagnostic_rows': int(
+                    len(daily_diagnostics)
+                ),
+                'selected_event_count': int(
+                    len(selected_events)
+                ),
+                'diagnostic_gate_passed': (
+                    diagnostic_gate_passed
+                ),
+                'failed_daily_diagnostic_count': int(
+                    np.count_nonzero(
+                        ~daily_diagnostics[
+                            'diagnostic_passed'
+                        ]
+                    )
+                ),
+                'negative_control_passed': bool(
+                    control_diagnostic_frame.iloc[0][
+                        'diagnostic_passed'
+                    ]
+                ),
+                'outputs': {
+                    'quality_event_catalog': str(
+                        run_dir
+                        / 'quality_event_catalog.parquet'
+                    ),
+                    'selected_events': str(
+                        run_dir / 'selected_events.parquet'
+                    ),
+                    'deep_sensitivity_ranking': str(
+                        run_dir
+                        / 'deep_sensitivity_ranking.parquet'
+                    ),
+                    'daily_diagnostics': str(
+                        run_dir / 'daily_diagnostics.parquet'
+                    ),
+                    'event_diagnostic_summary': str(
+                        run_dir
+                        / 'event_diagnostic_summary.parquet'
+                    ),
+                    'negative_control': str(
+                        run_dir / 'negative_control.parquet'
+                    ),
+                    'negative_control_diagnostic': str(
+                        run_dir
+                        / 'negative_control_diagnostic.parquet'
+                    ),
+                    'source_inventory': str(
+                        run_dir / 'source_inventory.parquet'
+                    ),
+                    'day_fragments': str(days_dir),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_fragments': int(
+                    completed_fragments
+                ),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'quality_audit': quality_audit,
+        'quality_event_catalog': quality_events,
+        'selected_events': selected_events,
+        'deep_sensitivity_ranking': deep_ranking,
+        'daily_diagnostics': daily_diagnostics,
+        'event_diagnostic_summary': event_summary,
+        'negative_control': negative_control_frame,
+        'negative_control_diagnostic': (
+            control_diagnostic_frame
+        ),
     }

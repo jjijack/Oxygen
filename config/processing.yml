@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.24 变更：
+#   - 新增 OFES 客观候选的等密度水团/heave 分解、动力量、深层敏感性排名与匹配负对照配置。
 # version 1.23 变更：
 #   - 新增 OFES 年度向量化 ΔDO20/35/50 扫描、逐日 depth-aware connected objects、跨日 event
 #     catalog 与客观排序配置；固定 parity、掩码审计、缓存 provenance 和事件链接门槛。
@@ -77,7 +79,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.23
+version: 1.24
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -254,6 +256,30 @@ ofes:
     rank_thickness_reference_dbar: 100.0
     rank_duration_reference_days: 5.0
     output_region_slug: ofes_np30_ke
+  event_diagnostics:
+    candidate_threshold: 50.0
+    candidate_count: 5
+    maximum_sampled_event_days: 31
+    deep_pressure_min_dbar: 500.0
+    deep_pressure_max_dbar: 900.0
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_load_margin_km: 50.0
+    background_min_valid_columns: 100
+    velocity_smoothing_sigma_pixels: 1.5
+    negative_control_distance_min_km: 300.0
+    negative_control_distance_max_km: 700.0
+    negative_control_latitude_tolerance_deg: 3.0
+    negative_control_do20_exclusion_radius_km: 100.0
+    negative_control_grid_stride: 5
+    control_match_sigma0_scale: 0.05
+    control_match_theta_scale_deg_c: 1.0
+    control_match_salinity_scale: 0.10
+    control_match_do_scale_umol_kg: 10.0
+    control_match_vorticity_scale: 0.20
+    control_match_strain_scale: 0.20
+    context_days: 10
+    output_subdir: event_diagnostics
 
 plot:
   basemap_colors:
