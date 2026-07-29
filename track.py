@@ -29017,107 +29017,429 @@ def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:
     return _ofes_root / subdir / fname
 
 
+def _ofes_contiguous_slice(
+    values: np.ndarray,
+    bounds: tuple[float, float] | None,
+    name: str,
+    *,
+    longitude: bool = False,
+) -> slice:
+    """把坐标范围转换为连续 netCDF slice，避免先读整场再做布尔筛选。"""
+    coords = np.asarray(values, dtype=float)
+    if coords.ndim != 1 or coords.size == 0 or not np.all(np.diff(coords) > 0):
+        raise ValueError(f'OFES {name} coordinate must be a non-empty increasing 1-D array.')
+    if bounds is None:
+        return slice(0, coords.size)
+    if len(bounds) != 2 or not np.all(np.isfinite(bounds)):
+        raise ValueError(f'{name}_bounds must contain two finite values.')
+
+    lower, upper = (float(bounds[0]), float(bounds[1]))
+    if longitude:
+        mask = _region_lon_mask(coords, lower, upper)
+    else:
+        if lower > upper:
+            raise ValueError(f'{name}_bounds must be ordered from low to high.')
+        mask = (coords >= lower) & (coords <= upper)
+
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        raise ValueError(
+            f'Requested OFES {name} bounds {bounds} do not overlap '
+            f'[{coords[0]:g}, {coords[-1]:g}].'
+        )
+    if indices.size > 1 and not np.all(np.diff(indices) == 1):
+        raise ValueError(
+            f'OFES {name} bounds {bounds} form a non-contiguous window; '
+            'split dateline-crossing requests into two regional reads.'
+        )
+    return slice(int(indices[0]), int(indices[-1]) + 1)
+
+
+def _ofes_assert_coordinate_match(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    label: str,
+    *,
+    atol: float = 2e-6,
+) -> float:
+    """断言两个 OFES 坐标完全同形且数值在指定绝对误差内，并返回最大误差。"""
+    actual_arr = np.asarray(actual, dtype=float)
+    expected_arr = np.asarray(expected, dtype=float)
+    if actual_arr.shape != expected_arr.shape:
+        raise ValueError(
+            f'OFES {label} coordinate shape mismatch: '
+            f'{actual_arr.shape} != {expected_arr.shape}.'
+        )
+    max_error = float(np.max(np.abs(actual_arr - expected_arr))) if actual_arr.size else 0.0
+    if not np.allclose(actual_arr, expected_arr, rtol=0.0, atol=atol):
+        raise ValueError(
+            f'OFES {label} coordinate mismatch after colocation '
+            f'(max abs error={max_error:.3e}).'
+        )
+    return max_error
+
+
+def _ofes_tracer_coordinates(
+    date: pd.Timestamp,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, Path]:
+    """读取小型一维示踪物坐标，不读取任何三维变量。"""
+    tracer_candidates = list(
+        _OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity'])
+    )
+    reference_path = next(
+        (
+            _ofes_file_path(var, date)
+            for var in tracer_candidates
+            if _ofes_file_path(var, date).exists()
+        ),
+        None,
+    )
+    if reference_path is None:
+        raise FileNotFoundError(
+            f'No OFES tracer reference file found for {date:%Y-%m-%d}.'
+        )
+
+    with Dataset(str(reference_path), 'r') as nc:
+        lon = np.asarray(nc.variables['lon'][:], dtype=float)
+        lat = np.asarray(nc.variables['lat'][:], dtype=float)
+        pressure_native = np.asarray(nc.variables['lev'][:], dtype=float)
+        pressure_attr_units = str(getattr(nc.variables['lev'], 'units', 'unknown'))
+
+    pressure_scale = float(_OFES_CFG.get('pressure_scale', 1.0))
+    pressure = pressure_native * pressure_scale
+    return lon, lat, pressure, pressure_attr_units, reference_path
+
+
+def _ofes_subset_to_float32(variable, indexer: tuple) -> np.ndarray:
+    """按 netCDF indexer 直接读取子集，并把掩码值转换为 float32 NaN。"""
+    subset = variable[indexer]
+    return np.asarray(np.ma.filled(subset, np.nan), dtype=np.float32)
+
+
 def load_ofes_snapshot(
     date: str | pd.Timestamp,
     variables: list[str] | None = None,
-    depth_max: float | None = None,
+    lon_bounds: tuple[float, float] | None = None,
+    lat_bounds: tuple[float, float] | None = None,
+    pressure_bounds: tuple[float, float] | None = None,
 ) -> dict:
-    """加载一天的 OFES NP30 数据并将所有变量统一到示踪物网格。
+    """按日期和区域加载 OFES NP30 快照，并校正 MOM3 B-grid 坐标。
 
-    Arakawa-C 交错处理：u/v 在 (601×901) 网格上，半格插值到 (600×900) 示踪物格点；
-    w 的 lev 位于层界面，线性插值到示踪物层中心。速度单位从 cm/s 转换为 m/s。
+    函数先读取一维坐标并构造 netCDF slice，再物化所请求的变量子集。`u` 和 `v`
+    同处 B-grid 角点，均由四个角点平均到示踪物中心；`w` 保留原生层界面压力
+    `pressure_w`，不再静默插值到示踪物层中心。变量单位按 `processing.yml`
+    集中转换，原生与输出单位均记录在 `metadata`。
 
     参数:
         - date (str | pd.Timestamp): 日期，格式 'YYYY-MM-DD' 或 Timestamp。
         - variables (list[str] | None): 需要加载的变量名列表；None 时加载 do2/temp/salinity/u/v/w。
-        - depth_max (float | None): 截断深度（m）；None 时加载全部 75 层。
+        - lon_bounds (tuple[float, float] | None): 经度窗口；None 时读取全部已交付经度。
+        - lat_bounds (tuple[float, float] | None): 纬度窗口；None 时读取全部已交付纬度。
+        - pressure_bounds (tuple[float, float] | None): 压力窗口（dbar-like OFES pressure coordinate）；None 时读取全部层。
 
     返回:
-        - dict: 键含 'lat', 'lon', 'lev', 'date' 及各变量名 → numpy 3-D 数组 (lev, lat, lon)。
+        - dict: 含 date/lon/lat/pressure、请求变量和 metadata；u/v 与示踪物数组维度为 (pressure, lat, lon)，w 为 (pressure_w, lat, lon)。
+
+    说明:
+        - 文件中的 `lev.units` 写作 millibar；这里保留其数值为约等于 dbar 的原生压力坐标，不把它宣称为精确几何深度。
+        - `w` 按 MOM3 约定向上为正，已通过局地连续性符号检验；本函数只负责读取，不据此授权三维轨迹解释。
+        - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
+    date_ts = pd.Timestamp(date).normalize()
     if variables is None:
         variables = list(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
         variables += list(_OFES_CFG.get('velocity_vars', ['u', 'v', 'w']))
+    variables = list(dict.fromkeys(variables))
+    if not variables:
+        raise ValueError('variables must contain at least one OFES variable name.')
 
-    tracer_vars = set(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
-    vel_scale = float(_OFES_CFG.get('velocity_scale', 0.01))
+    lon_all, lat_all, pressure_all, pressure_attr_units, reference_path = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    lon_slice = _ofes_contiguous_slice(
+        lon_all, lon_bounds, 'longitude', longitude=True
+    )
+    lat_slice = _ofes_contiguous_slice(lat_all, lat_bounds, 'latitude')
+    pressure_slice = _ofes_contiguous_slice(
+        pressure_all, pressure_bounds, 'pressure'
+    )
+    lon = lon_all[lon_slice]
+    lat = lat_all[lat_slice]
+    pressure = pressure_all[pressure_slice]
 
-    result: dict = {'date': pd.Timestamp(date)}
-    tracer_coords_set = False
+    variable_scale = _OFES_CFG.get('variable_scale', {})
+    native_units_cfg = _OFES_CFG.get('native_units', {})
+    output_units_cfg = _OFES_CFG.get('output_units', {})
+    metadata: dict = {
+        'horizontal_grid': str(_OFES_CFG.get('horizontal_grid', 'arakawa_b')),
+        'horizontal_location': 'tracer_center',
+        'pressure_units': str(_OFES_CFG.get('pressure_units', 'dbar')),
+        'native_pressure_units': str(
+            _OFES_CFG.get('native_pressure_units', pressure_attr_units)
+        ),
+        'file_pressure_units': pressure_attr_units,
+        'pressure_semantics': 'native OFES pressure coordinate; not exact geometric depth',
+        'vertical_velocity_positive': str(
+            _OFES_CFG.get('vertical_velocity_positive', 'up')
+        ),
+        'vertical_velocity_sign_basis': str(
+            _OFES_CFG.get(
+                'vertical_velocity_sign_basis',
+                'MOM3 convention; dataset-specific validation required',
+            )
+        ),
+        'w_vertical_location': 'lower_interface',
+        'reference_file': str(reference_path),
+        'variable_dims': {},
+        'native_units': {},
+        'output_units': {},
+        'unit_scales': {},
+        'source_shapes': {},
+        'loaded_shapes': {},
+        'read_slices': {},
+        'coordinate_max_abs_error': {},
+    }
+    result: dict = {
+        'date': date_ts,
+        'lon': lon,
+        'lat': lat,
+        'pressure': pressure,
+    }
 
     for var in variables:
-        fpath = _ofes_file_path(var, date)
+        fpath = _ofes_file_path(var, date_ts)
         if not fpath.exists():
             raise FileNotFoundError(f"OFES file not found: {fpath}")
-        nc = Dataset(str(fpath), 'r')
-        raw = np.ma.filled(nc.variables[var][0], np.nan).astype(np.float32)
 
-        if not tracer_coords_set and var in tracer_vars:
-            lat_t = np.asarray(nc.variables['lat'][:])
-            lon_t = np.asarray(nc.variables['lon'][:])
-            lev_t = np.asarray(nc.variables['lev'][:])
-            if depth_max is not None:
-                lev_mask = lev_t <= depth_max
-                lev_t = lev_t[lev_mask]
-            result['lat'] = lat_t
-            result['lon'] = lon_t
-            result['lev'] = lev_t
-            tracer_coords_set = True
-        nc.close()
+        with Dataset(str(fpath), 'r') as nc:
+            if var not in nc.variables:
+                raise KeyError(f'Variable {var!r} is absent from {fpath}.')
+            nc_var = nc.variables[var]
+            metadata['source_shapes'][var] = tuple(int(v) for v in nc_var.shape)
+            if 'time' in nc.variables:
+                time_units = str(getattr(nc.variables['time'], 'units', ''))
+                if time_units and date_ts.strftime('%Y-%m-%d') not in time_units:
+                    raise ValueError(
+                        f'OFES file time metadata does not match requested date: '
+                        f'{fpath} ({time_units!r}).'
+                    )
 
-        if raw.ndim == 2:
-            result[var] = raw.astype(np.float32)
-            continue
+            if var in ('u', 'v'):
+                pressure_var = (
+                    np.asarray(nc.variables['lev'][pressure_slice], dtype=float)
+                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                )
+                _ofes_assert_coordinate_match(
+                    pressure_var, pressure, f'{var} pressure'
+                )
+                corner_lat_slice = slice(lat_slice.start, lat_slice.stop + 1)
+                corner_lon_slice = slice(lon_slice.start, lon_slice.stop + 1)
+                corner_lat = np.asarray(
+                    nc.variables['lat'][corner_lat_slice], dtype=float
+                )
+                corner_lon = np.asarray(
+                    nc.variables['lon'][corner_lon_slice], dtype=float
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var,
+                    (0, pressure_slice, corner_lat_slice, corner_lon_slice),
+                )
+                expected_corner_shape = (
+                    pressure.size, lat.size + 1, lon.size + 1
+                )
+                if raw.shape != expected_corner_shape:
+                    raise ValueError(
+                        f'OFES {var} B-grid subset shape {raw.shape} does not '
+                        f'match expected corner shape {expected_corner_shape}.'
+                    )
+                collocated = 0.25 * (
+                    raw[:, :-1, :-1]
+                    + raw[:, :-1, 1:]
+                    + raw[:, 1:, :-1]
+                    + raw[:, 1:, 1:]
+                )
+                metadata['coordinate_max_abs_error'][f'{var}_lon'] = (
+                    _ofes_assert_coordinate_match(
+                        0.5 * (corner_lon[:-1] + corner_lon[1:]),
+                        lon,
+                        f'{var} longitude',
+                    )
+                )
+                metadata['coordinate_max_abs_error'][f'{var}_lat'] = (
+                    _ofes_assert_coordinate_match(
+                        0.5 * (corner_lat[:-1] + corner_lat[1:]),
+                        lat,
+                        f'{var} latitude',
+                    )
+                )
+                raw = collocated
+                metadata['variable_dims'][var] = (
+                    'pressure', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'pressure': (pressure_slice.start, pressure_slice.stop),
+                    'lat_corner': (
+                        corner_lat_slice.start, corner_lat_slice.stop
+                    ),
+                    'lon_corner': (
+                        corner_lon_slice.start, corner_lon_slice.stop
+                    ),
+                }
+            elif var == 'w':
+                pressure_w_all = (
+                    np.asarray(nc.variables['lev'][:], dtype=float)
+                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                )
+                pressure_w_slice = _ofes_contiguous_slice(
+                    pressure_w_all, pressure_bounds, 'w pressure'
+                )
+                pressure_w = pressure_w_all[pressure_w_slice]
+                if 'pressure_w' in result:
+                    _ofes_assert_coordinate_match(
+                        result['pressure_w'], pressure_w, 'w pressure'
+                    )
+                else:
+                    result['pressure_w'] = pressure_w
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    'w latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    'w longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, pressure_w_slice, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = (
+                    'pressure_w', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'pressure_w': (
+                        pressure_w_slice.start, pressure_w_slice.stop
+                    ),
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            elif nc_var.ndim == 4:
+                pressure_var = (
+                    np.asarray(nc.variables['lev'][pressure_slice], dtype=float)
+                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                )
+                _ofes_assert_coordinate_match(
+                    pressure_var, pressure, f'{var} pressure'
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    f'{var} latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    f'{var} longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, pressure_slice, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = (
+                    'pressure', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'pressure': (pressure_slice.start, pressure_slice.stop),
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            elif nc_var.ndim == 3:
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    f'{var} latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    f'{var} longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = ('lat', 'lon')
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            else:
+                raise ValueError(
+                    f'Unsupported OFES variable dimensions for {var}: '
+                    f'{nc_var.dimensions}.'
+                )
 
-        if var in ('u', 'v'):
-            raw = 0.5 * (raw[:, :-1, :-1] + (
-                raw[:, :-1, 1:] if var == 'u' else raw[:, 1:, :-1]
-            ))
-            raw = raw * vel_scale
+            file_units = getattr(nc_var, 'units', None)
 
-        if var == 'w':
-            nc_w = Dataset(str(fpath), 'r')
-            lev_w = np.asarray(nc_w.variables['lev'][:])
-            nc_w.close()
-            lev_t_ref = result.get('lev', None)
-            if lev_t_ref is None:
-                fpath_t = _ofes_file_path('do2', date)
-                if fpath_t.exists():
-                    nc_t = Dataset(str(fpath_t), 'r')
-                    lev_t_ref = np.asarray(nc_t.variables['lev'][:])
-                    nc_t.close()
-            if lev_t_ref is not None:
-                interped = np.empty((len(lev_t_ref), raw.shape[1], raw.shape[2]), dtype=np.float32)
-                for j in range(raw.shape[1]):
-                    for k in range(raw.shape[2]):
-                        interped[:, j, k] = np.interp(lev_t_ref, lev_w, raw[:, j, k])
-                raw = interped
-            raw = raw * vel_scale
+        scale = float(variable_scale.get(var, 1.0))
+        result[var] = np.asarray(raw * scale, dtype=np.float32)
+        metadata['unit_scales'][var] = scale
+        metadata['native_units'][var] = str(
+            native_units_cfg.get(var, file_units or 'unknown')
+        )
+        metadata['output_units'][var] = str(
+            output_units_cfg.get(var, file_units or 'unknown')
+        )
+        metadata['loaded_shapes'][var] = tuple(
+            int(v) for v in result[var].shape
+        )
 
-        if depth_max is not None and 'lev' in result and raw.ndim == 3:
-            nlev = len(result['lev'])
-            raw = raw[:nlev]
-
-        result[var] = raw.astype(np.float32)
-
-    if not tracer_coords_set:
-        tracer_ref = _ofes_file_path('do2', date)
-        if not tracer_ref.exists():
-            tracer_ref = _ofes_file_path('temp', date)
-        if tracer_ref.exists():
-            nc0 = Dataset(str(tracer_ref), 'r')
-        else:
-            nc0 = Dataset(str(_ofes_file_path(variables[0], date)), 'r')
-        result['lat'] = np.asarray(nc0.variables['lat'][:])
-        result['lon'] = np.asarray(nc0.variables['lon'][:])
-        if 'lev' in nc0.variables:
-            lev_vals = np.asarray(nc0.variables['lev'][:])
-            if depth_max is not None:
-                lev_vals = lev_vals[lev_vals <= depth_max]
-            result['lev'] = lev_vals
-        nc0.close()
+    result['metadata'] = metadata
 
     return result
+
+
+def _ofes_profile_variables(
+    snapshot: dict,
+    variables: list[str] | None,
+) -> list[str]:
+    """解析与示踪物 pressure 网格同位、可合并成单张剖面表的变量。"""
+    variable_dims = snapshot.get('metadata', {}).get('variable_dims', {})
+    if variables is None:
+        return [
+            var
+            for var, dims in variable_dims.items()
+            if tuple(dims) == ('pressure', 'lat', 'lon')
+        ]
+
+    selected = list(dict.fromkeys(variables))
+    for var in selected:
+        if var not in snapshot:
+            raise KeyError(f'Variable {var!r} is absent from the OFES snapshot.')
+        dims = tuple(variable_dims.get(var, ()))
+        if dims != ('pressure', 'lat', 'lon'):
+            raise ValueError(
+                f'Variable {var!r} uses coordinates {dims}; only variables on '
+                '(pressure, lat, lon) can share this profile table.'
+            )
+    return selected
+
+
+def _ofes_validate_profile_point(snapshot: dict, lon: float, lat: float) -> None:
+    """拒绝落在已加载区域之外的剖面请求，避免边界静默夹取。"""
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    if not (
+        lon_arr[0] <= float(lon) <= lon_arr[-1]
+        and lat_arr[0] <= float(lat) <= lat_arr[-1]
+    ):
+        raise ValueError(
+            f'Requested point ({lon:g}, {lat:g}) lies outside loaded OFES '
+            f'window lon=[{lon_arr[0]:g}, {lon_arr[-1]:g}], '
+            f'lat=[{lat_arr[0]:g}, {lat_arr[-1]:g}].'
+        )
 
 
 def extract_ofes_profile(
@@ -29126,33 +29448,33 @@ def extract_ofes_profile(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """从 OFES 快照中提取指定经纬度的垂向剖面（最近邻）。
+    """从 OFES 快照中提取指定经纬度的定压剖面（最近邻）。
+
+    仅合并已经位于 `(pressure, lat, lon)` 示踪物网格的变量。`w` 保留在
+    `pressure_w` 层界面上，不能由本入口静默混入中心层剖面。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - lon (float): 经度。
         - lat (float): 纬度。
-        - variables (list[str] | None): 变量名列表；None 时提取快照中所有 3-D 变量。
+        - variables (list[str] | None): 变量名列表；None 时提取所有中心层 3-D 变量。
 
     返回:
-        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+        - pd.DataFrame: 含 Pressure 列及各变量列的剖面表，Pressure 单位见 snapshot metadata。
     """
-    lat_arr = snapshot['lat']
-    lon_arr = snapshot['lon']
-    lev_arr = snapshot['lev']
+    _ofes_validate_profile_point(snapshot, lon, lat)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    pressure_arr = np.asarray(snapshot['pressure'], dtype=float)
 
     j = int(np.argmin(np.abs(lat_arr - lat)))
     i = int(np.argmin(np.abs(lon_arr - lon)))
+    selected = _ofes_profile_variables(snapshot, variables)
 
-    if variables is None:
-        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
-                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
-
-    records = {'Depth': lev_arr.copy()}
-    for var in variables:
+    records = {'Pressure': pressure_arr.copy()}
+    for var in selected:
         arr = snapshot[var]
-        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
-            records[var] = arr[:, j, i].copy()
+        records[var] = arr[:, j, i].copy()
 
     return pd.DataFrame(records)
 
@@ -29163,20 +29485,27 @@ def extract_ofes_profile_interp(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """双线性插值版——在水平网格上做双线性插值，垂向不插值。
+    """从 OFES 快照中提取指定经纬度的定压剖面（水平双线性插值）。
+
+    垂向保留原生示踪物 pressure 层；若任一请求变量的四角整列均为陆地 NaN，
+    整张表回退到最近邻剖面。`w` 的层界面 pressure 不在此处插值。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - lon (float): 经度。
         - lat (float): 纬度。
-        - variables (list[str] | None): 变量名列表。
+        - variables (list[str] | None): 位于示踪物 pressure 网格的变量名列表；None 时自动选择。
 
     返回:
-        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+        - pd.DataFrame: 含 Pressure 列及各变量列的剖面表，Pressure 单位见 snapshot metadata。
     """
-    lat_arr = snapshot['lat']
-    lon_arr = snapshot['lon']
-    lev_arr = snapshot['lev']
+    _ofes_validate_profile_point(snapshot, lon, lat)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    pressure_arr = np.asarray(snapshot['pressure'], dtype=float)
+    selected = _ofes_profile_variables(snapshot, variables)
+    if lat_arr.size < 2 or lon_arr.size < 2:
+        return extract_ofes_profile(snapshot, lon, lat, selected)
 
     j = np.searchsorted(lat_arr, lat) - 1
     i = np.searchsorted(lon_arr, lon) - 1
@@ -29193,23 +29522,22 @@ def extract_ofes_profile_interp(
     w10 = dy * (1 - dx)
     w11 = dy * dx
 
-    if variables is None:
-        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
-                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
-
-    records = {'Depth': lev_arr.copy()}
+    records = {'Pressure': pressure_arr.copy()}
     any_all_nan = False
-    for var in variables:
+    for var in selected:
         arr = snapshot[var]
-        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
-            col = (w00 * arr[:, j, i] + w01 * arr[:, j, i + 1]
-                   + w10 * arr[:, j + 1, i] + w11 * arr[:, j + 1, i + 1])
-            records[var] = col.astype(np.float32)
-            if np.all(np.isnan(col)):
-                any_all_nan = True
+        col = (
+            w00 * arr[:, j, i]
+            + w01 * arr[:, j, i + 1]
+            + w10 * arr[:, j + 1, i]
+            + w11 * arr[:, j + 1, i + 1]
+        )
+        records[var] = col.astype(np.float32)
+        if np.all(np.isnan(col)):
+            any_all_nan = True
 
     if any_all_nan:
-        return extract_ofes_profile(snapshot, lon, lat, variables)
+        return extract_ofes_profile(snapshot, lon, lat, selected)
 
     return pd.DataFrame(records)
 
@@ -29221,7 +29549,11 @@ def detect_ofes_delta_do(
     detection_config: DetectionConfig | None = None,
     interp: bool = True,
 ) -> pd.DataFrame:
-    """在 OFES 虚拟剖面上运行 ΔDO 检测（复用 calculate_delta_do）。
+    """在 OFES 定压虚拟剖面上运行 ΔDO 检测。
+
+    本入口直接复用 `calculate_delta_do` 作为单剖面真值实现，并显式把
+    `Pressure` 传为剖面坐标。OFES 的 `temp` 是位温，送入通用 detector 前
+    先用 TEOS-10 转为原位温度；返回结果中的候选坐标命名为 `pressure`。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典（需含 do2/temp/salinity）。
@@ -29231,13 +29563,39 @@ def detect_ofes_delta_do(
         - interp (bool): True 时用双线性插值取剖面，False 时用最近邻。
 
     返回:
-        - pd.DataFrame: calculate_delta_do 的结果表（空表 = 无异常）。
+        - pd.DataFrame: 每个剖面最多一个最强候选，含 pressure 和 ΔDO 指标；空表表示无异常。
+
+    说明:
+        - DetectionConfig 中沿用通用入口的 `anomaly_*_depth` 字段名，但本入口按 dbar-like pressure 数值解释这些阈值。
+        - 返回的 delta_temperature 基于转换后的原位温度；快照中的 `temp` 本身仍保留 OFES 原生位温。
     """
     extract_fn = extract_ofes_profile_interp if interp else extract_ofes_profile
     prof = extract_fn(snapshot, lon, lat, variables=['do2', 'temp', 'salinity'])
 
-    col_map = {'do2': 'DO', 'temp': 'Temperature', 'salinity': 'Salinity'}
+    col_map = {
+        'do2': 'DO',
+        'temp': 'Potential_temperature',
+        'salinity': 'Salinity',
+    }
     prof = prof.rename(columns=col_map)
+    pressure_values = prof['Pressure'].to_numpy(dtype=float)
+    salinity_values = prof['Salinity'].to_numpy(dtype=float)
+    potential_temperature = prof['Potential_temperature'].to_numpy(dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_values,
+        pressure_values,
+        np.full_like(pressure_values, float(lon)),
+        np.full_like(pressure_values, float(lat)),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity,
+        potential_temperature,
+    )
+    prof['Temperature'] = gsw.t_from_CT(
+        absolute_salinity,
+        conservative_temperature,
+        pressure_values,
+    )
 
     prof['Profile_number'] = 0
     prof['Longitude'] = lon
@@ -29246,51 +29604,103 @@ def detect_ofes_delta_do(
     prof['Month'] = snapshot['date'].month
     prof['Day'] = snapshot['date'].day
 
-    cfg = detection_config or make_detection_config()
-    result = calculate_delta_do(prof, detection_config=cfg, verbose=False)
-    return _keep_best_anomaly_per_profile(result, cfg)
+    cfg = _resolve_detection_config(detection_config)
+    result = calculate_delta_do(
+        prof,
+        detection_config=cfg,
+        depth_col='Pressure',
+        verbose=False,
+    )
+    result = _keep_best_anomaly_per_profile(result, cfg).rename(
+        columns={'depth': 'pressure'}
+    )
+    result.attrs['pressure_units'] = snapshot.get('metadata', {}).get(
+        'pressure_units', 'dbar'
+    )
+    result.attrs['temperature_basis'] = (
+        'in_situ_from_ofes_potential_temperature'
+    )
+    return result
 
 
 def _ofes_interp3d(
     field: np.ndarray,
-    lev: np.ndarray,
+    pressure: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     pts: np.ndarray,
 ) -> np.ndarray:
-    """三线性插值——对 (N,3) 点阵 [depth, lat, lon] 返回插值值。"""
+    """对 (N,3) 点阵 [pressure, lat, lon] 做三线性插值。"""
     interp_fn = RegularGridInterpolator(
-        (lev, lat, lon), field,
+        (pressure, lat, lon), field,
         method='linear', bounds_error=False, fill_value=np.nan,
     )
     return interp_fn(pts)
 
 
-def _rk4_step(
+def _ofes_fixed_pressure_tendency(
     pos: np.ndarray,
     u_field: np.ndarray,
     v_field: np.ndarray,
-    w_field: np.ndarray,
-    lev: np.ndarray,
+    pressure: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """返回固定 pressure 粒子的 [0, dlat/dt, dlon/dt]。"""
+    u = _ofes_interp3d(u_field, pressure, lat, lon, pos)
+    v = _ofes_interp3d(v_field, pressure, lat, lon, pos)
+    geo = approximate_degree_length(pos[:, 1])
+    dlat = v / geo['meters_per_degree_lat']
+    dlon = u / geo['meters_per_degree_lon']
+    return np.column_stack([np.zeros_like(u), dlat, dlon])
+
+
+def _ofes_rk4_fixed_pressure_step(
+    pos: np.ndarray,
+    u_field: np.ndarray,
+    v_field: np.ndarray,
+    pressure: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     dt: float,
-) -> np.ndarray:
-    """单步 RK4 积分——pos 为 (N,3) [depth, lat, lon]，dt 秒，速度 m/s。"""
-    def vel_at(p):
-        u = _ofes_interp3d(u_field, lev, lat, lon, p)
-        v = _ofes_interp3d(v_field, lev, lat, lon, p)
-        w = _ofes_interp3d(w_field, lev, lat, lon, p)
-        geo = approximate_degree_length(p[:, 1])
-        dlat = v / geo['meters_per_degree_lat']
-        dlon = u / geo['meters_per_degree_lon']
-        return np.column_stack([w, dlat, dlon])
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """执行一步固定 pressure RK4，并返回用于越界判定的中间位置。"""
+    k1 = _ofes_fixed_pressure_tendency(
+        pos, u_field, v_field, pressure, lat, lon
+    )
+    pos2 = pos + 0.5 * dt * k1
+    k2 = _ofes_fixed_pressure_tendency(
+        pos2, u_field, v_field, pressure, lat, lon
+    )
+    pos3 = pos + 0.5 * dt * k2
+    k3 = _ofes_fixed_pressure_tendency(
+        pos3, u_field, v_field, pressure, lat, lon
+    )
+    pos4 = pos + dt * k3
+    k4 = _ofes_fixed_pressure_tendency(
+        pos4, u_field, v_field, pressure, lat, lon
+    )
+    new_pos = pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return new_pos, (pos2, pos3, pos4, new_pos)
 
-    k1 = vel_at(pos)
-    k2 = vel_at(pos + 0.5 * dt * k1)
-    k3 = vel_at(pos + 0.5 * dt * k2)
-    k4 = vel_at(pos + dt * k3)
-    return pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+def _ofes_positions_in_bounds(
+    pos: np.ndarray,
+    pressure: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """返回有限且位于当前区域插值网格内的粒子掩码。"""
+    finite = np.all(np.isfinite(pos), axis=1)
+    return (
+        finite
+        & (pos[:, 0] >= pressure[0])
+        & (pos[:, 0] <= pressure[-1])
+        & (pos[:, 1] >= lat[0])
+        & (pos[:, 1] <= lat[-1])
+        & (pos[:, 2] >= lon[0])
+        & (pos[:, 2] <= lon[-1])
+    )
 
 
 def advect_ofes_particles(
@@ -29298,82 +29708,235 @@ def advect_ofes_particles(
     particles: np.ndarray,
     backward: bool = False,
     dt_seconds: float | None = None,
-) -> list[np.ndarray]:
-    """用 OFES 速度场做离线 RK4 粒子追踪（正向或反向）。
+    vertical_mode: str = 'fixed_pressure',
+) -> dict:
+    """用 OFES 日均水平速度做固定 pressure 的二维 RK4 粒子诊断。
+
+    该入口严格保留各个积分时刻，并为每个粒子记录 active、invalid 或 escaped
+    状态。失败粒子从失败时刻起位置记为 NaN，不再伪装成静止粒子。当前只允许
+    `fixed_pressure`；三维 pressure/depth 与 `w` 耦合尚未通过验证门槛。
 
     参数:
         - snapshots (dict[str, dict] | list[dict]): 按日期排序的 OFES 快照集合。
-            字典形式 {date_str: snapshot_dict}；列表形式 [snapshot_dict, ...]（需含 'date' 键）。
-            每个快照需含 u/v/w 及 lat/lon/lev。
-        - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [depth, lat, lon]。
-        - backward (bool): True 时反向追踪（dt 取负）。
-        - dt_seconds (float | None): 积分步长（秒）；None 时从 processing.yml 读取。
+        - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [pressure, lat, lon]。
+        - backward (bool): True 时从最后一个快照向前积分，默认 False。
+        - dt_seconds (float | None): 最大积分步长（秒）；None 时从 processing.yml 读取，末步自动缩短以精确落在下个快照时刻。
+        - vertical_mode (str): 垂向处理；当前仅支持 'fixed_pressure'。
 
     返回:
-        - list[np.ndarray]: 逐步粒子轨迹列表，trajectory[0] = 初始位置，之后每步一帧。
+        - dict: 含 times、positions、status、final_status、failure_time、coordinate_columns 和 metadata；positions 形状为 (time, particle, 3)。
 
     说明:
-        两天快照之间假设速度场恒定（取时间较近的那天）。
-        单天内按 dt 亚步进多次 RK4。粒子越界后位置保持不变（NaN 速度 → 停留）。
+        - 每个相邻日场之间仍使用积分方向起点的速度场，属于未验证的分段恒定时间近似；metadata 会显式记录。
+        - `w` 虽已确认向上为正，但 pressure-depth 转换和日均三维速度时间插值尚未验证，因此本入口不使用 `w`。
+        - 该结果适合作为 pressure-surface 水平输运诊断，不构成三维水团来源证明。
     """
+    if vertical_mode != 'fixed_pressure':
+        raise NotImplementedError(
+            'Only vertical_mode="fixed_pressure" is enabled. Three-dimensional '
+            'OFES trajectories remain disabled until pressure-depth conversion '
+            'and daily u/v/w interpolation are validated.'
+        )
     if dt_seconds is None:
         dt_seconds = float(_OFES_CFG.get('rk4_dt_seconds', 3600))
+    dt_seconds = float(dt_seconds)
+    if not np.isfinite(dt_seconds) or dt_seconds <= 0:
+        raise ValueError('dt_seconds must be a finite positive number.')
 
     if isinstance(snapshots, dict):
-        snap_list = [snapshots[k] for k in sorted(snapshots.keys())]
+        snap_list = list(snapshots.values())
     else:
-        snap_list = sorted(snapshots, key=lambda s: s['date'])
+        snap_list = list(snapshots)
+    if len(snap_list) < 2:
+        raise ValueError('At least two OFES snapshots are required.')
+    snap_list = sorted(snap_list, key=lambda s: pd.Timestamp(s['date']))
+    snap_times = [pd.Timestamp(snap['date']) for snap in snap_list]
+    if any(
+        later <= earlier
+        for earlier, later in zip(snap_times[:-1], snap_times[1:])
+    ):
+        raise ValueError('OFES snapshot dates must be unique and increasing.')
 
     if backward:
         snap_list = list(reversed(snap_list))
-        dt_seconds = -dt_seconds
+        snap_times = list(reversed(snap_times))
 
-    max_substeps = int(_OFES_CFG.get('rk4_max_substeps', 24))
+    pos = np.asarray(particles, dtype=np.float64).copy()
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(
+            'particles must have shape (N, 3) with columns '
+            '[pressure, lat, lon].'
+        )
 
-    pos = particles.copy().astype(np.float64)
-    trajectory = [pos.copy()]
+    first = snap_list[0]
+    first_pressure = np.asarray(first['pressure'], dtype=float)
+    first_lat = np.asarray(first['lat'], dtype=float)
+    first_lon = np.asarray(first['lon'], dtype=float)
+    status = np.full(pos.shape[0], 'active', dtype='<U8')
+    finite_initial = np.all(np.isfinite(pos), axis=1)
+    status[~finite_initial] = 'invalid'
+    status[
+        finite_initial
+        & ~_ofes_positions_in_bounds(
+            pos, first_pressure, first_lat, first_lon
+        )
+    ] = 'escaped'
+
+    failure_time = np.full(pos.shape[0], np.datetime64('NaT'), dtype='datetime64[ns]')
+    initial_failed = status != 'active'
+    failure_time[initial_failed] = np.datetime64(snap_times[0].to_datetime64())
+    pos[initial_failed] = np.nan
+    positions = [pos.copy()]
+    statuses = [status.copy()]
+    times = [snap_times[0]]
 
     for idx in range(len(snap_list) - 1):
         snap = snap_list[idx]
-        u_f = snap['u']
-        v_f = snap['v']
-        w_f = snap['w']
-        lev = snap['lev'].astype(np.float64)
-        lat = snap['lat'].astype(np.float64)
-        lon = snap['lon'].astype(np.float64)
+        u_field = np.asarray(snap['u'], dtype=float)
+        v_field = np.asarray(snap['v'], dtype=float)
+        pressure = np.asarray(snap['pressure'], dtype=float)
+        lat = np.asarray(snap['lat'], dtype=float)
+        lon = np.asarray(snap['lon'], dtype=float)
+        expected_shape = (pressure.size, lat.size, lon.size)
+        if u_field.shape != expected_shape or v_field.shape != expected_shape:
+            raise ValueError(
+                f'OFES u/v shape must equal pressure/lat/lon shape '
+                f'{expected_shape}; got u={u_field.shape}, v={v_field.shape}.'
+            )
 
-        for _ in range(max_substeps):
-            new_pos = _rk4_step(pos, u_f, v_f, w_f, lev, lat, lon, dt_seconds)
-            valid = np.all(np.isfinite(new_pos), axis=1)
-            pos[valid] = new_pos[valid]
+        current_time = snap_times[idx]
+        target_time = snap_times[idx + 1]
+        direction = 1.0 if target_time > current_time else -1.0
+        while current_time != target_time:
+            remaining = abs((target_time - current_time).total_seconds())
+            is_final_step = remaining <= dt_seconds
+            step_seconds = direction * (
+                remaining if is_final_step else dt_seconds
+            )
+            active_idx = np.flatnonzero(status == 'active')
+            if active_idx.size:
+                active_pos = pos[active_idx]
+                new_pos, stages = _ofes_rk4_fixed_pressure_step(
+                    active_pos,
+                    u_field,
+                    v_field,
+                    pressure,
+                    lat,
+                    lon,
+                    step_seconds,
+                )
+                new_inside = _ofes_positions_in_bounds(
+                    new_pos, pressure, lat, lon
+                )
+                stage_escaped = np.zeros(active_idx.size, dtype=bool)
+                for stage in stages:
+                    stage_finite = np.all(np.isfinite(stage), axis=1)
+                    stage_escaped |= (
+                        stage_finite
+                        & ~_ofes_positions_in_bounds(
+                            stage, pressure, lat, lon
+                        )
+                    )
 
-        trajectory.append(pos.copy())
+                escaped_local = (~new_inside) & stage_escaped
+                invalid_local = (~new_inside) & ~stage_escaped
+                valid_local = new_inside
+                pos[active_idx[valid_local]] = new_pos[valid_local]
+                status[active_idx[escaped_local]] = 'escaped'
+                status[active_idx[invalid_local]] = 'invalid'
+                failed_local = escaped_local | invalid_local
+                pos[active_idx[failed_local]] = np.nan
 
-    return trajectory
+            current_time = (
+                target_time
+                if is_final_step
+                else current_time + pd.to_timedelta(step_seconds, unit='s')
+            )
+            newly_failed = (status != 'active') & np.isnat(failure_time)
+            failure_time[newly_failed] = np.datetime64(
+                current_time.to_datetime64()
+            )
+            times.append(current_time)
+            positions.append(pos.copy())
+            statuses.append(status.copy())
+
+    return {
+        'times': np.asarray(
+            [time.to_datetime64() for time in times],
+            dtype='datetime64[ns]',
+        ),
+        'positions': np.stack(positions),
+        'status': np.stack(statuses),
+        'final_status': status.copy(),
+        'failure_time': failure_time,
+        'coordinate_columns': ('pressure', 'lat', 'lon'),
+        'metadata': {
+            'vertical_mode': vertical_mode,
+            'pressure_units': str(
+                first.get('metadata', {}).get('pressure_units', 'dbar')
+            ),
+            'temporal_interpolation': str(
+                _OFES_CFG.get(
+                    'temporal_interpolation',
+                    'piecewise_constant_unvalidated',
+                )
+            ),
+            'w_used': False,
+            'unresolved_validation': (
+                'daily_velocity_interpolation',
+                'pressure_depth_conversion',
+                'three_dimensional_vertical_motion',
+            ),
+        },
+    }
 
 
 def plot_ofes_snapshot_quick(
     snapshot: dict,
     variable: str = 'do2',
-    depth: float = 200.0,
+    pressure: float = 200.0,
     ax=None,
     show_fig: bool = True,
 ) -> plt.Figure | None:
-    """OFES 快照水平切片快速可视化。
+    """快速绘制 OFES 定压或表面变量的水平切片。
+
+    三维变量按其 metadata 选择 `pressure` 或 `pressure_w` 最近层；二维表面变量
+    直接绘制。色标使用 loader 记录的输出单位。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - variable (str): 绘制的变量名。
-        - depth (float): 深度（m），取最近层。
-        - ax: 可选 matplotlib Axes（需为 GeoAxes）。
+        - pressure (float): 三维变量的目标压力（dbar-like），取最近层，默认 200.0。
+        - ax (matplotlib.axes.Axes | None): 可选 GeoAxes。
         - show_fig (bool): 是否显示图形。
 
     返回:
         - plt.Figure | None: show_fig=False 时返回 Figure。
     """
-    lev = snapshot['lev']
-    k = int(np.argmin(np.abs(lev - depth)))
-    data = snapshot[variable][k]
+    if variable not in snapshot:
+        raise KeyError(f'Variable {variable!r} is absent from the OFES snapshot.')
+    variable_dims = tuple(
+        snapshot.get('metadata', {})
+        .get('variable_dims', {})
+        .get(variable, ())
+    )
+    if variable_dims == ('pressure', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['pressure'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - pressure)))
+        data = snapshot[variable][k]
+        vertical_title = f'pressure={vertical_coord[k]:.1f} dbar'
+    elif variable_dims == ('pressure_w', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['pressure_w'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - pressure)))
+        data = snapshot[variable][k]
+        vertical_title = f'interface pressure={vertical_coord[k]:.1f} dbar'
+    elif variable_dims == ('lat', 'lon'):
+        data = snapshot[variable]
+        vertical_title = 'surface'
+    else:
+        raise ValueError(
+            f'Unsupported coordinate layout for {variable!r}: {variable_dims}.'
+        )
     lat = snapshot['lat']
     lon = snapshot['lon']
 
@@ -29391,8 +29954,16 @@ def plot_ofes_snapshot_quick(
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=_BASEMAP_COLORS['grid'], alpha=0.6)
     gl.top_labels = False
     gl.right_labels = False
-    ax.set_title(f"OFES {variable}  depth={lev[k]:.1f}m  {snapshot['date'].strftime('%Y-%m-%d')}")
-    fig.colorbar(im, ax=ax, shrink=0.7)
+    ax.set_title(
+        f"OFES {variable}  {vertical_title}  "
+        f"{snapshot['date'].strftime('%Y-%m-%d')}"
+    )
+    units = (
+        snapshot.get('metadata', {})
+        .get('output_units', {})
+        .get(variable, 'unknown')
+    )
+    fig.colorbar(im, ax=ax, shrink=0.7, label=units)
 
     if show_fig:
         plt.show()

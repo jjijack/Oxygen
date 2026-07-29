@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.22 变更：
+#   - 修正 OFES 为 MOM3 Arakawa B-grid：u/v 均从四个角点共置到示踪物中心；集中记录原生/输出单位、
+#     pressure 坐标与 w 向上为正约定，并将轨迹限制为未验证日场上的定压二维诊断。
 # version 1.21 变更：
 #   - plot typography 整体提升 2 pt，固化会议投影与后续正式图的可读性标准：
 #     figure/panel/axis/tick/annotation 分别为 24/20/17/17/16 pt。
@@ -31,7 +34,7 @@
 #     （u/v/w → <var>_vel，其余用变量名）；_ofes_file_path 据此解析每日单变量文件路径。
 # version 1.16 变更：
 #   - 新增 ofes 配置小节，集中管理 OFES NP30 数据读取与拉格朗日追踪参数
-#     （变量名映射、速度单位转换、Arakawa-C 网格差值标志、RK4 积分步长）。
+#     （变量名映射、原型速度单位转换与 RK4 积分步长；网格约定已由 version 1.22 更正为 B-grid）。
 # version 1.15 变更：
 #   - heave 小节新增 ventilation_mode（fixed / glorys_winter_mld / ht_external，默认 ht_external），
 #     把 V/I 通风判据从固定 depth_threshold 改为逐点本地冬季混合层深度阈值（与文件中存的 winter_mld_* 列比较）；
@@ -71,7 +74,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.21
+version: 1.22
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -181,7 +184,40 @@ processing:
     glorys_resolve_floor: 0.07     # 纯 GLORYS 检验判"GLORYS 看见"的 |δπ| 绝对阈值；锚定 McCoy 确认涡在我们度量下振幅的 10th 百分位(≈0.068)≈Chen2021 |Δπ|>0.05；与 lens 检测器 spice_anom_threshold(0.15) 解耦
 
 ofes:
-  velocity_scale: 0.01            # cm/s → m/s
+  horizontal_grid: arakawa_b      # MOM3 B-grid：u/v 同处角点，均需四角平均到示踪物中心
+  pressure_scale: 1.0             # lev attribute 写作 millibar；数值保留为 OFES 的 dbar-like pressure 坐标
+  pressure_units: dbar
+  native_pressure_units: millibar
+  variable_scale:                 # 原生值 → 对外值
+    do2: 1.0
+    temp: 1.0
+    salinity: 1.0
+    u: 0.01
+    v: 0.01
+    w: 0.01
+    eta: 0.01
+    pressur: 1.0
+  native_units:
+    do2: "umol kg-1"
+    temp: "degC potential temperature"
+    salinity: "PSS-78"
+    u: "cm s-1"
+    v: "cm s-1"
+    w: "cm s-1"
+    eta: "cm"
+    pressur: "hPa"
+  output_units:
+    do2: "umol kg-1"
+    temp: "degC potential temperature"
+    salinity: "PSS-78"
+    u: "m s-1"
+    v: "m s-1"
+    w: "m s-1"
+    eta: "m"
+    pressur: "hPa"
+  vertical_velocity_positive: up  # MOM3 z/w 向上为正；本数据另经局地连续性符号检验
+  vertical_velocity_sign_basis: "MOM3 convention and 2003-04-05 KE discrete-continuity check"
+  temporal_interpolation: piecewise_constant_unvalidated
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
     u: u_vel
@@ -191,7 +227,6 @@ ofes:
   velocity_vars: [u, v, w]
   surface_vars: [eta, pressur]
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
-  rk4_max_substeps: 24            # 单日内最大亚步数（dt × max = 1 天）
 
 plot:
   basemap_colors:
