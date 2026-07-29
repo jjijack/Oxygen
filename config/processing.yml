@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.22 变更：
+#   - processing 新增 scv_matched_control，集中管理 McCoy SCV 与 non-catalogued BGC-Argo
+#     空间、时间、EKE 和垂向覆盖匹配，以及 platform-cluster bootstrap 参数。
+#   - 新增 SCV matched-control 区域分解与多网格空间标准化，供论文稳健性分析。
 # version 1.21 变更：
 #   - plot typography 整体提升 2 pt，固化会议投影与后续正式图的可读性标准：
 #     figure/panel/axis/tick/annotation 分别为 24/20/17/17/16 pt。
@@ -71,7 +75,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.21
+version: 1.22
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -179,6 +183,27 @@ processing:
     glorys_bg_radius_km: 120.0     # 纯 GLORYS 检验：核位周围取此半径窗口作 GLORYS 自身背景（km）
     glorys_core_exclude_km: 30.0   # 纯 GLORYS 检验：背景排除中心此半径内网格（避免涡核污染背景，km）
     glorys_resolve_floor: 0.07     # 纯 GLORYS 检验判"GLORYS 看见"的 |δπ| 绝对阈值；锚定 McCoy 确认涡在我们度量下振幅的 10th 百分位(≈0.068)≈Chen2021 |Δπ|>0.05；与 lens 检测器 spice_anom_threshold(0.15) 解耦
+
+  # McCoy SCV 与 DO-evaluable non-catalogued BGC-Argo 的 matched-control enrichment
+  scv_matched_control:
+    controls_per_scv: 3           # 每个 SCV 最多匹配的独立 control platforms 数量
+    spatial_caliper_km: 750.0     # control 与 SCV 的最大水平距离（km）
+    year_caliper: 2               # control 与 SCV 的最大年份差
+    month_caliper: 2              # control 与 SCV 的最大循环月份差
+    core_depth_margin_m: 50.0     # control DO/T/S 必须覆盖 SCV core 上下此范围
+    max_depth_caliper_m: 500.0    # control 与 SCV 的最深有效 DO 深度最大差
+    core_anomaly_tolerance_m: 150.0 # ΔDO peak 与 SCV core 距离不超过此值时记为 core-aligned
+    min_do_levels_below_gate: 1   # profile 在 depth gate 以下至少需要的有效 DO 层数
+    min_ts_levels_below_gate: 1   # McCoy-eligible proxy 在 depth gate 以下至少需要的有效 T/S 层数
+    without_replacement: true     # control 是否在不同 matched sets 间禁止重复使用
+    exclude_scv_platforms: true   # control 池排除所有出现过 McCoy SCV 的浮标，避免相邻 cycle 污染
+    unique_control_platforms_per_set: true # 每个 matched set 内每台 control 浮标最多贡献一个剖面
+    match_mean_eke: true          # 是否要求 control 与 SCV 位于相同 GLORYS mean-EKE 分位箱
+    eke_quantile_bins: 10         # mean-EKE 分位箱数量（按 DO-evaluable Argo 背景定义）
+    eke_log_scale: 0.15           # matching score 中 log1p(EKE×1e4) 差值的标准化尺度
+    bootstrap_cluster_unit: anchor_platform # 主 CI 按重复采样的 SCV float 聚类；dependency_component 仅作网络依赖敏感性
+    bootstrap_iterations: 2000    # matched OR 聚类 bootstrap 次数
+    random_seed: 42               # bootstrap 随机种子
 
 ofes:
   velocity_scale: 0.01            # cm/s → m/s

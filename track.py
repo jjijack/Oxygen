@@ -27518,6 +27518,2526 @@ def plot_scv_do_threshold_enrichment(
     return out
 
 
+def _scv_matched_control_config() -> dict:
+    """返回 SCV matched-control 配置，并补齐向后兼容默认值。"""
+    defaults = {
+        'controls_per_scv': 3,
+        'spatial_caliper_km': 750.0,
+        'year_caliper': 2,
+        'month_caliper': 2,
+        'core_depth_margin_m': 50.0,
+        'max_depth_caliper_m': 500.0,
+        'core_anomaly_tolerance_m': 150.0,
+        'min_do_levels_below_gate': 1,
+        'min_ts_levels_below_gate': 1,
+        'without_replacement': True,
+        'exclude_scv_platforms': True,
+        'unique_control_platforms_per_set': True,
+        'match_mean_eke': True,
+        'eke_quantile_bins': 10,
+        'eke_log_scale': 0.15,
+        'bootstrap_cluster_unit': 'anchor_platform',
+        'bootstrap_iterations': 2000,
+        'random_seed': 42,
+    }
+    configured = _PROC_CFG.get('processing', {}).get('scv_matched_control', {})
+    return {**defaults, **(configured if isinstance(configured, dict) else {})}
+
+
+def _first_available_column(names: set[str], candidates: tuple[str, ...]) -> str | None:
+    """返回 parquet schema 中第一个存在的候选列。"""
+    return next((name for name in candidates if name in names), None)
+
+
+def _vector_great_circle_distance_km(
+    lon: float,
+    lat: float,
+    other_lon: np.ndarray,
+    other_lat: np.ndarray,
+) -> np.ndarray:
+    """向量化计算单点到一组经纬度点的大圆距离（km）。"""
+    lon0 = np.deg2rad(float(lon))
+    lat0 = np.deg2rad(float(lat))
+    lon1 = np.deg2rad(np.asarray(other_lon, dtype=float))
+    lat1 = np.deg2rad(np.asarray(other_lat, dtype=float))
+    dlon = (lon1 - lon0 + np.pi) % (2.0 * np.pi) - np.pi
+    dlat = lat1 - lat0
+    hav = np.sin(dlat / 2.0) ** 2 + np.cos(lat0) * np.cos(lat1) * np.sin(dlon / 2.0) ** 2
+    return 6371.0088 * 2.0 * np.arcsin(np.sqrt(np.clip(hav, 0.0, 1.0)))
+
+
+def sample_glorys_eke_at_profiles(
+    profiles: pd.DataFrame,
+    *,
+    lon_col: str = 'lon',
+    lat_col: str = 'lat',
+    eke_file_path: str | Path | None = None,
+    output_col: str = 'mean_eke',
+) -> pd.DataFrame:
+    """在 profile 位置采样 GLORYS 气候态 mean EKE。
+
+    函数从 `export_glorys_eke_native_dask` 生成的原生分辨率 zarr 读取 EKE，先将无有效日数的
+    网格置为缺测，再以周期经度安全的最近邻采样追加到 profile 表。该场是环境协变量，不代表
+    profile 当日的瞬时涡动能。
+
+    参数:
+        - profiles (pd.DataFrame): 含经纬度列的 profile-level 表。
+        - lon_col (str): 经度列名，默认 `lon`。
+        - lat_col (str): 纬度列名，默认 `lat`。
+        - eke_file_path (str | Path | None): 原生 EKE zarr；None 使用 `GLORYS_processed/eke.zarr`。
+        - output_col (str): 输出 EKE 列名，默认 `mean_eke`，单位 m² s⁻²。
+
+    返回:
+        - pd.DataFrame: profiles 的副本，追加采样 EKE 与 EKE 来源列。
+
+    输出:
+        - 无；本函数不写盘。
+
+    说明:
+        - 经度按 source grid convention 周期归一，避免 ±180° 附近错配。
+        - 最近邻与现有临时稳健性分析保持一致；不在这里进行空间平滑或时间插值。
+    """
+    missing = {lon_col, lat_col}.difference(profiles.columns)
+    if missing:
+        raise ValueError(f'Profile table missing coordinate columns: {sorted(missing)}')
+    source = (
+        Path(eke_file_path)
+        if eke_file_path is not None
+        else glorys_processed_root / 'eke.zarr'
+    )
+    native = load_glorys_eke_native(source, include_count=True)
+    lon_grid = np.asarray(native['lon'], dtype=float)
+    lat_grid = np.asarray(native['lat'], dtype=float)
+    eke_grid = np.asarray(native['eke'], dtype=float)
+    count_grid = np.asarray(native['count'], dtype=float)
+    if eke_grid.shape != (lat_grid.size, lon_grid.size):
+        raise ValueError('Native EKE grid shape does not match its coordinates.')
+
+    lon_step = float(np.nanmedian(np.diff(lon_grid)))
+    lat_step = float(np.nanmedian(np.diff(lat_grid)))
+    if lon_step <= 0 or lat_step <= 0:
+        raise ValueError('Native EKE coordinates must be monotonically increasing.')
+    coordinate_tolerance = max(abs(lon_step), abs(lat_step)) * 2e-4
+    if not (
+        np.allclose(
+            np.diff(lon_grid), lon_step, rtol=0.0, atol=coordinate_tolerance
+        )
+        and np.allclose(
+            np.diff(lat_grid), lat_step, rtol=0.0, atol=coordinate_tolerance
+        )
+    ):
+        raise ValueError('Native EKE coordinates must be regularly spaced.')
+    query_lon_raw = pd.to_numeric(
+        profiles[lon_col], errors='coerce'
+    ).to_numpy(dtype=float)
+    query_lon = (
+        np.mod(query_lon_raw, 360.0)
+        if float(np.nanmin(lon_grid)) >= 0.0
+        else _normalize_lon_array(query_lon_raw)
+    )
+    query_lat = pd.to_numeric(
+        profiles[lat_col], errors='coerce'
+    ).to_numpy(dtype=float)
+    valid = (
+        np.isfinite(query_lon)
+        & np.isfinite(query_lat)
+        & (query_lat >= lat_grid[0] - lat_step / 2.0)
+        & (query_lat <= lat_grid[-1] + lat_step / 2.0)
+    )
+    lon_index = np.zeros(len(profiles), dtype=int)
+    lat_index = np.zeros(len(profiles), dtype=int)
+    lon_index[valid] = np.mod(
+        np.rint(
+            (query_lon[valid] - lon_grid[0]) / lon_step
+        ).astype(int),
+        len(lon_grid),
+    )
+    lat_index[valid] = np.clip(
+        np.rint(
+            (query_lat[valid] - lat_grid[0]) / lat_step
+        ).astype(int),
+        0,
+        len(lat_grid) - 1,
+    )
+    sampled = np.full(len(profiles), np.nan, dtype=float)
+    sampled[valid] = eke_grid[lat_index[valid], lon_index[valid]]
+    sampled_count = count_grid[lat_index[valid], lon_index[valid]]
+    sampled[np.flatnonzero(valid)[
+        ~np.isfinite(sampled_count) | (sampled_count <= 0)
+    ]] = np.nan
+
+    result = profiles.copy()
+    result[output_col] = sampled
+    result[f'{output_col}_source'] = str(source)
+    return result
+
+
+def _argo_profile_eligibility_path(
+    output_dir: str | Path,
+    *,
+    baseline_start_year: int,
+    baseline_end_year: int,
+    anomaly_min_depth: float,
+    min_do_levels_below_gate: int,
+    min_ts_levels_below_gate: int,
+) -> Path:
+    """返回包含资格阈值 provenance 的 profile eligibility 缓存路径。"""
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    return Path(output_dir) / (
+        f'argo_profile_eligibility_{int(baseline_start_year)}_'
+        f'{int(baseline_end_year)}_depth{depth_tag}m_'
+        f'dolevels{int(min_do_levels_below_gate)}_'
+        f'tslevels{int(min_ts_levels_below_gate)}.parquet'
+    )
+
+
+def build_argo_profile_eligibility_table(
+    *,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    argo_data_dir: str | Path | None = None,
+    shared_baseline_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    min_do_levels_below_gate: int | None = None,
+    min_ts_levels_below_gate: int | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """构建 matched-control 分析所需的 profile-level Argo eligibility 缓存。
+
+    函数逐年读取 Argo parquet 的必要列，将垂向长表压缩为一行一个 profile，并严格限制到既有
+    `all_region_argo` shared baseline。输出记录 DO/T/S 垂向覆盖、platform、日期、海盆和 KE 标记；
+    `mccoy_eligible_proxy` 表示该 profile 同时具备 depth gate 以下的 DO 与 T/S，而不是声称它已经通过
+    McCoy detector。
+
+    参数:
+        - baseline_start_year (int): 分析起始年份（闭区间），默认 2002。
+        - baseline_end_year (int): 分析结束年份（闭区间），默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 的最浅深度门槛（m），默认 300。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 使用 `paths.argo_parquet`。
+        - shared_baseline_path (str | Path | None): `all_region_argo` parquet；None 自动选择覆盖目标年份的最紧缓存。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - min_do_levels_below_gate (int | None): depth gate 以下最少有效 DO 层数；None 读取配置，默认 1。
+        - min_ts_levels_below_gate (int | None): depth gate 以下最少同时有效 T/S 层数；None 读取配置，默认 1。
+        - force (bool): True 时忽略并覆盖同参数缓存，默认 False。
+        - save_data (bool): 是否保存 profile-level parquet，默认 True。
+
+    返回:
+        - pd.DataFrame: 一行一个 Argo profile 的采样资格与垂向覆盖表。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control/argo_profile_eligibility_<y0>_<y1>_depth<z>m_dolevels<n>_tslevels<n>.parquet`（save_data 时）。
+
+    说明:
+        - DO evaluability 与现有 frequency analysis 一致，至少要求 depth gate 以下有一个有效 DO 值。
+        - `mccoy_eligible_proxy` 只控制观测资格；非目录 control 必须称为 non-catalogued，而不是已证实的 non-SCV。
+    """
+    if int(baseline_end_year) < int(baseline_start_year):
+        raise ValueError('baseline_end_year must be >= baseline_start_year.')
+    if float(anomaly_min_depth) < 0:
+        raise ValueError('anomaly_min_depth must be non-negative.')
+    match_cfg = _scv_matched_control_config()
+    min_do = int(
+        match_cfg['min_do_levels_below_gate']
+        if min_do_levels_below_gate is None else min_do_levels_below_gate
+    )
+    min_ts = int(
+        match_cfg['min_ts_levels_below_gate']
+        if min_ts_levels_below_gate is None else min_ts_levels_below_gate
+    )
+    if min_do < 1 or min_ts < 1:
+        raise ValueError('Minimum valid-level counts must be positive.')
+
+    region_slug = _current_region_key()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir('scv_matched_control', region_slug)
+    )
+    path = _argo_profile_eligibility_path(
+        out_dir,
+        baseline_start_year=int(baseline_start_year),
+        baseline_end_year=int(baseline_end_year),
+        anomaly_min_depth=float(anomaly_min_depth),
+        min_do_levels_below_gate=min_do,
+        min_ts_levels_below_gate=min_ts,
+    )
+    if path.exists() and not force:
+        return pd.read_parquet(path)
+    legacy_path = out_dir / (
+        f'argo_profile_eligibility_{int(baseline_start_year)}_'
+        f'{int(baseline_end_year)}_depth'
+        f'{_format_detection_value(float(anomaly_min_depth))}m.parquet'
+    )
+    if legacy_path.exists() and not force:
+        legacy = pd.read_parquet(legacy_path)
+        legacy_do_values = (
+            legacy['minimum_do_levels']
+            if 'minimum_do_levels' in legacy.columns
+            else pd.Series(dtype=float)
+        )
+        legacy_ts_values = (
+            legacy['minimum_ts_levels']
+            if 'minimum_ts_levels' in legacy.columns
+            else pd.Series(dtype=float)
+        )
+        legacy_do = set(
+            pd.to_numeric(
+                legacy_do_values, errors='coerce'
+            ).dropna().astype(int)
+        )
+        legacy_ts = set(
+            pd.to_numeric(
+                legacy_ts_values, errors='coerce'
+            ).dropna().astype(int)
+        )
+        if legacy_do == {min_do} and legacy_ts == {min_ts}:
+            if save_data:
+                _atomic_write_parquet(legacy, path)
+                print(f'[*] Eligibility cache migrated to parameter-safe path: {path}')
+            return legacy
+
+    baseline_dir = _shared_output_dir('statistics', region_slug)
+    if shared_baseline_path is None:
+        shared_baseline_path = _select_covering_year_cache(
+            baseline_dir,
+            prefix='all_region_argo_',
+            suffix='.parquet',
+            start_year=int(baseline_start_year),
+            end_year=int(baseline_end_year),
+        )
+    if shared_baseline_path is None or not Path(shared_baseline_path).exists():
+        raise FileNotFoundError('A covering all_region_argo shared baseline parquet is required.')
+    baseline = pd.read_parquet(
+        shared_baseline_path,
+        columns=['Profile_number', 'Year'],
+    )
+    baseline_year = pd.to_numeric(baseline['Year'], errors='coerce')
+    baseline = baseline[
+        baseline_year.between(int(baseline_start_year), int(baseline_end_year))
+    ]
+    baseline_ids = set(
+        pd.to_numeric(baseline['Profile_number'], errors='coerce').dropna().astype(int)
+    )
+
+    data_dir = Path(argo_data_dir) if argo_data_dir is not None else Path(argo_path)
+    yearly_tables: list[pd.DataFrame] = []
+    for year in range(int(baseline_start_year), int(baseline_end_year) + 1):
+        year_path = data_dir / f'Argo{year}.parquet'
+        if not year_path.exists():
+            raise FileNotFoundError(f'Missing annual Argo parquet: {year_path}')
+        schema_names = set(pq.ParquetFile(year_path).schema_arrow.names)
+        depth_col = _first_available_column(schema_names, ('Depth', 'Depth_m'))
+        do_col = _first_available_column(schema_names, ('DOXY_Adjusted', 'DOXY', 'DO_mol_kg'))
+        temp_col = _first_available_column(schema_names, ('Temp_Adjusted', 'Temp', 'Temperature_degC'))
+        sal_col = _first_available_column(schema_names, ('PSAL_Adjusted', 'PSAL', 'Salinity_psu'))
+        required_map = {
+            'Depth': depth_col,
+            'DO': do_col,
+            'Temperature': temp_col,
+            'Salinity': sal_col,
+        }
+        missing_data = [name for name, column in required_map.items() if column is None]
+        base_cols = {
+            'Year', 'Month', 'Day', 'Longitude', 'Latitude',
+            'Profile_number', 'Platform_number',
+        }
+        missing_base = sorted(base_cols.difference(schema_names))
+        if missing_base or missing_data:
+            raise ValueError(
+                f'Argo{year}.parquet lacks required columns: base={missing_base}, data={missing_data}'
+            )
+        selected_columns = list(base_cols | {column for column in required_map.values() if column})
+        frame = pd.read_parquet(year_path, columns=selected_columns).rename(
+            columns={column: name for name, column in required_map.items()}
+        )
+        profile_number = pd.to_numeric(frame['Profile_number'], errors='coerce')
+        frame = frame[profile_number.isin(baseline_ids)].copy()
+        if frame.empty:
+            print(f'[eligibility] {year}: 0 profiles in shared baseline')
+            continue
+        frame['Profile_number'] = pd.to_numeric(frame['Profile_number'], errors='coerce').astype(int)
+        for column in ('Depth', 'DO', 'Temperature', 'Salinity', 'Longitude', 'Latitude'):
+            frame[column] = pd.to_numeric(frame[column], errors='coerce')
+
+        grouped = frame.groupby('Profile_number', sort=False)
+        profile = grouped.agg(
+            year=('Year', 'first'),
+            month=('Month', 'first'),
+            day=('Day', 'first'),
+            lon=('Longitude', 'first'),
+            lat=('Latitude', 'first'),
+            platform_number=('Platform_number', 'first'),
+            n_profile_levels=('Depth', 'count'),
+            max_profile_depth_m=('Depth', 'max'),
+        )
+        do_valid = frame['Depth'].notna() & frame['DO'].notna()
+        ts_valid = (
+            frame['Depth'].notna()
+            & frame['Temperature'].notna()
+            & frame['Salinity'].notna()
+        )
+        do_stats = frame.loc[do_valid].groupby('Profile_number')['Depth'].agg(
+            do_min_depth_m='min', do_max_depth_m='max', n_do_levels='count'
+        )
+        ts_stats = frame.loc[ts_valid].groupby('Profile_number')['Depth'].agg(
+            ts_min_depth_m='min', ts_max_depth_m='max', n_ts_levels='count'
+        )
+        deep_do = frame.loc[do_valid & frame['Depth'].ge(float(anomaly_min_depth))].groupby(
+            'Profile_number'
+        )['Depth'].count().rename('n_do_levels_below_gate')
+        deep_ts = frame.loc[ts_valid & frame['Depth'].ge(float(anomaly_min_depth))].groupby(
+            'Profile_number'
+        )['Depth'].count().rename('n_ts_levels_below_gate')
+        profile = profile.join(do_stats).join(ts_stats).join(deep_do).join(deep_ts).reset_index()
+        for column in (
+            'n_do_levels', 'n_ts_levels',
+            'n_do_levels_below_gate', 'n_ts_levels_below_gate',
+        ):
+            profile[column] = pd.to_numeric(profile[column], errors='coerce').fillna(0).astype(int)
+        profile['do_evaluable'] = profile['n_do_levels_below_gate'].ge(min_do)
+        profile['ts_evaluable_proxy'] = profile['n_ts_levels_below_gate'].ge(min_ts)
+        profile['mccoy_eligible_proxy'] = profile['do_evaluable'] & profile['ts_evaluable_proxy']
+        profile['date'] = pd.to_datetime(
+            {'year': profile['year'], 'month': profile['month'], 'day': profile['day']},
+            errors='coerce',
+        )
+        profile['basin'] = [
+            _residual_basin_of(float(lat), float(lon))
+            for lat, lon in zip(profile['lat'], profile['lon'])
+        ]
+        profile['is_ke'] = (
+            profile['lon'].between(140.0, 170.0)
+            & profile['lat'].between(25.0, 45.0)
+        )
+        yearly_tables.append(profile)
+        print(
+            f'[eligibility] {year}: {len(profile)} profiles, '
+            f'{int(profile["do_evaluable"].sum())} DO-evaluable'
+        )
+
+    if not yearly_tables:
+        raise RuntimeError('No Argo profile eligibility rows were generated.')
+    table = pd.concat(yearly_tables, ignore_index=True)
+    if table['Profile_number'].duplicated().any():
+        duplicates = table.loc[
+            table['Profile_number'].duplicated(False), 'Profile_number'
+        ].astype(int).tolist()
+        raise RuntimeError(f'Profile_number is not unique in eligibility table: {duplicates[:10]}')
+    table['minimum_depth_m'] = float(anomaly_min_depth)
+    table['minimum_do_levels'] = int(min_do)
+    table['minimum_ts_levels'] = int(min_ts)
+    table['shared_baseline_path'] = str(shared_baseline_path)
+    table['shared_baseline_sha256'] = _file_sha256(shared_baseline_path)
+    table['generated_at'] = pd.Timestamp.now(tz='UTC').isoformat()
+    if save_data:
+        _atomic_write_parquet(table, path)
+        print(f'[*] Argo profile eligibility table saved: {path}')
+    return table
+
+
+def _do_threshold_anomaly_lookup(
+    thresholds: list[float],
+    *,
+    start_year: int,
+    end_year: int,
+    anomaly_min_depth: float,
+    region_slug: str,
+) -> tuple[dict[float, pd.DataFrame], dict[float, Path]]:
+    """返回每个 ΔDO 阈值按 profile 去重后的最强异常与来源路径。"""
+    lookups: dict[float, pd.DataFrame] = {}
+    paths: dict[float, Path] = {}
+    for threshold in thresholds:
+        cfg = make_detection_config(
+            'do',
+            do_threshold=float(threshold),
+            anomaly_min_depth=float(anomaly_min_depth),
+        )
+        _, path = _load_detector_anomaly_ids(
+            cfg, int(start_year), int(end_year), region_slug
+        )
+        anomalies = pd.read_parquet(
+            path,
+            columns=['Profile_number', 'delta_do', 'depth'],
+        )
+        anomalies['Profile_number'] = pd.to_numeric(
+            anomalies['Profile_number'], errors='coerce'
+        ).astype('Int64')
+        anomalies['delta_do'] = pd.to_numeric(anomalies['delta_do'], errors='coerce')
+        anomalies['depth'] = pd.to_numeric(anomalies['depth'], errors='coerce')
+        anomalies = anomalies[anomalies['Profile_number'].notna()].copy()
+        if anomalies.empty:
+            lookup = pd.DataFrame(columns=['delta_do', 'depth'])
+            lookup.index.name = 'Profile_number'
+        else:
+            best_index = anomalies.groupby('Profile_number')['delta_do'].idxmax().dropna()
+            lookup = anomalies.loc[best_index].set_index('Profile_number')[['delta_do', 'depth']]
+            lookup.index = lookup.index.astype(int)
+        lookups[float(threshold)] = lookup
+        paths[float(threshold)] = path
+    return lookups, paths
+
+
+def _matched_control_run_tag(
+    *,
+    thresholds: list[float],
+    controls_per_scv: int,
+    spatial_caliper_km: float,
+    year_caliper: int,
+    month_caliper: int,
+    core_depth_margin_m: float,
+    max_depth_caliper_m: float,
+    core_anomaly_tolerance_m: float,
+    without_replacement: bool,
+    exclude_scv_platforms: bool,
+    unique_control_platforms_per_set: bool,
+    match_mean_eke: bool,
+    eke_quantile_bins: int,
+    eke_log_scale: float,
+    eke_file_path: str | Path | None,
+) -> str:
+    """将关键 matching 参数编码为稳定文件名标签。"""
+    platform_tag = (
+        'externalplat' if exclude_scv_platforms else 'allplat'
+    ) + ('_uniqueplat' if unique_control_platforms_per_set else '_profile')
+    spec = {
+        'thresholds': [float(value) for value in thresholds],
+        'controls_per_scv': int(controls_per_scv),
+        'spatial_caliper_km': float(spatial_caliper_km),
+        'year_caliper': int(year_caliper),
+        'month_caliper': int(month_caliper),
+        'core_depth_margin_m': float(core_depth_margin_m),
+        'max_depth_caliper_m': float(max_depth_caliper_m),
+        'core_anomaly_tolerance_m': float(core_anomaly_tolerance_m),
+        'without_replacement': bool(without_replacement),
+        'exclude_scv_platforms': bool(exclude_scv_platforms),
+        'unique_control_platforms_per_set': bool(unique_control_platforms_per_set),
+        'match_mean_eke': bool(match_mean_eke),
+        'eke_quantile_bins': int(eke_quantile_bins),
+        'eke_log_scale': float(eke_log_scale),
+        'eke_file_path': str(eke_file_path) if eke_file_path is not None else None,
+    }
+    spec_digest = hashlib.sha256(
+        json.dumps(spec, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()[:10]
+    eke_tag = f'ekeq{int(eke_quantile_bins)}' if match_mean_eke else 'noeke'
+    replacement_tag = 'noreuse' if without_replacement else 'reuse'
+    return (
+        f'n{int(controls_per_scv)}_space{_format_detection_value(float(spatial_caliper_km))}km_'
+        f'y{int(year_caliper)}_m{int(month_caliper)}_'
+        f'core{_format_detection_value(float(core_depth_margin_m))}m_'
+        f'{platform_tag}_{replacement_tag}_{eke_tag}_spec{spec_digest}'
+    )
+
+
+def _default_matched_control_run_tag(thresholds: list[float]) -> str:
+    """按 processing.yml 的 matched-control 默认配置生成运行标签。"""
+    cfg = _scv_matched_control_config()
+    use_eke = bool(cfg['match_mean_eke'])
+    return _matched_control_run_tag(
+        thresholds=thresholds,
+        controls_per_scv=int(cfg['controls_per_scv']),
+        spatial_caliper_km=float(cfg['spatial_caliper_km']),
+        year_caliper=int(cfg['year_caliper']),
+        month_caliper=int(cfg['month_caliper']),
+        core_depth_margin_m=float(cfg['core_depth_margin_m']),
+        max_depth_caliper_m=float(cfg['max_depth_caliper_m']),
+        core_anomaly_tolerance_m=float(cfg['core_anomaly_tolerance_m']),
+        without_replacement=bool(cfg['without_replacement']),
+        exclude_scv_platforms=bool(cfg['exclude_scv_platforms']),
+        unique_control_platforms_per_set=bool(
+            cfg['unique_control_platforms_per_set']
+        ),
+        match_mean_eke=use_eke,
+        eke_quantile_bins=int(cfg['eke_quantile_bins']),
+        eke_log_scale=float(cfg['eke_log_scale']),
+        eke_file_path=(
+            glorys_processed_root / 'eke.zarr' if use_eke else None
+        ),
+    )
+
+
+def build_scv_matched_control_cohort(
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    argo_anchored_path: str | Path | None = None,
+    controls_per_scv: int | None = None,
+    spatial_caliper_km: float | None = None,
+    year_caliper: int | None = None,
+    month_caliper: int | None = None,
+    core_depth_margin_m: float | None = None,
+    max_depth_caliper_m: float | None = None,
+    core_anomaly_tolerance_m: float | None = None,
+    without_replacement: bool | None = None,
+    exclude_scv_platforms: bool | None = None,
+    unique_control_platforms_per_set: bool | None = None,
+    match_mean_eke: bool | None = None,
+    eke_file_path: str | Path | None = None,
+    eke_quantile_bins: int | None = None,
+    eke_log_scale: float | None = None,
+    output_dir: str | Path | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """将 DO-evaluable McCoy SCVs 匹配到空间、时间和垂向覆盖相近的 Argo controls。
+
+    matching 完全不读取 ΔDO carrier outcome：McCoy 原始 `Core_Pressure` 先按纬度换算为稳定核深，再在同海盆、
+    同 KE status 内按空间距离、年份、循环月份和最深 DO 覆盖形成候选。默认排除所有出现过 McCoy SCV 的浮标，
+    且每个 matched set 内每台 control 浮标最多贡献一个剖面。每套匹配同时追加 ΔDO20/35/50 profile-level
+    carrier 和相对 anchor SCV core 的 core-aligned carrier，避免阈值之间更换 control cohort。
+
+    参数:
+        - profile_eligibility (pd.DataFrame | None): `build_argo_profile_eligibility_table` 输出；None 时读取路径或默认缓存。
+        - profile_eligibility_path (str | Path | None): profile eligibility parquet；None 定位默认缓存。
+        - threshold_table (pd.DataFrame | None): threshold-safe McCoy SCV long table；None 时读取路径或默认缓存。
+        - threshold_table_path (str | Path | None): McCoy threshold table parquet/CSV；None 定位默认缓存。
+        - thresholds (tuple[float, ...] | list[float]): 共同评估的 ΔDO 阈值，默认 (20, 35, 50)。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - argo_anchored_path (str | Path | None): Argo-anchored McCoy parquet；None 使用默认路径。
+        - controls_per_scv (int | None): 每个 SCV 最多匹配的 control 数；None 读取配置，默认 3。
+        - spatial_caliper_km (float | None): 最大水平距离（km）；None 读取配置，默认 750。
+        - year_caliper (int | None): 最大年份差；None 读取配置，默认 2。
+        - month_caliper (int | None): 最大循环月份差；None 读取配置，默认 2。
+        - core_depth_margin_m (float | None): DO/T/S 覆盖 SCV core 上下的边界（m）；None 读取配置，默认 50。
+        - max_depth_caliper_m (float | None): control 与 SCV 最深 DO 覆盖最大差（m）；None 读取配置，默认 500。
+        - core_anomaly_tolerance_m (float | None): ΔDO peak 与 SCV core 的 core-aligned 容差（m）；None 读取配置，默认 150。
+        - without_replacement (bool | None): control 是否跨 matched sets 禁止复用；None 读取配置，默认 True。
+        - exclude_scv_platforms (bool | None): control 池是否排除所有 McCoy SCV 浮标；None 读取配置，默认 True。
+        - unique_control_platforms_per_set (bool | None): 每组每台 control 浮标是否最多取一个剖面；None 读取配置，默认 True。
+        - match_mean_eke (bool | None): 是否要求 SCV/control 位于同一 mean-EKE 分位箱；None 读取配置，默认 True。
+        - eke_file_path (str | Path | None): GLORYS 气候态 mean-EKE zarr；None 使用 `GLORYS_processed/eke.zarr`。
+        - eke_quantile_bins (int | None): EKE 分位箱数量；None 读取配置，默认 10。
+        - eke_log_scale (float | None): matching score 中 log-EKE 差值的标准化尺度；None 读取配置，默认 0.15。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - force (bool): True 时覆盖同参数缓存，默认 False。
+        - save_data (bool): 是否保存 cohort parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每行一个 SCV 或 matched control，含 matched-set、采样协变量和各阈值 outcome。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control/scv_matched_control_cohort_<y0>_<y1>_depth<z>m_<matching>.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - Controls 是符合观测资格但未进入 McCoy catalog 的 profiles，不能据此断言其绝对不是 SCV。
+        - `anchor_core_depth_m` 来自 McCoy 原始核压的 TEOS-10 转换，不依赖局地 Argo background 或 GLORYS 复现状态。
+        - profile-level outcome 延续现有 frequency analysis；core-aligned outcome 是更严格的垂向共位敏感性检查。
+        - matching 不使用 outcome，避免 ΔDO 阈值影响 control 选择。
+        - 默认 EKE 匹配使用 2002–2022 气候态 mean EKE，是环境共变量控制，不是瞬时涡旋识别。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+    match_cfg = _scv_matched_control_config()
+    n_controls = int(match_cfg['controls_per_scv'] if controls_per_scv is None else controls_per_scv)
+    space_caliper = float(match_cfg['spatial_caliper_km'] if spatial_caliper_km is None else spatial_caliper_km)
+    year_limit = int(match_cfg['year_caliper'] if year_caliper is None else year_caliper)
+    month_limit = int(match_cfg['month_caliper'] if month_caliper is None else month_caliper)
+    core_margin = float(match_cfg['core_depth_margin_m'] if core_depth_margin_m is None else core_depth_margin_m)
+    max_depth_limit = float(match_cfg['max_depth_caliper_m'] if max_depth_caliper_m is None else max_depth_caliper_m)
+    core_tolerance = float(
+        match_cfg['core_anomaly_tolerance_m']
+        if core_anomaly_tolerance_m is None else core_anomaly_tolerance_m
+    )
+    no_reuse = bool(
+        match_cfg['without_replacement']
+        if without_replacement is None else without_replacement
+    )
+    exclude_scv_plats = bool(
+        match_cfg['exclude_scv_platforms']
+        if exclude_scv_platforms is None else exclude_scv_platforms
+    )
+    unique_control_plats = bool(
+        match_cfg['unique_control_platforms_per_set']
+        if unique_control_platforms_per_set is None else unique_control_platforms_per_set
+    )
+    use_eke = bool(
+        match_cfg['match_mean_eke']
+        if match_mean_eke is None else match_mean_eke
+    )
+    n_eke_bins = int(
+        match_cfg['eke_quantile_bins']
+        if eke_quantile_bins is None else eke_quantile_bins
+    )
+    log_eke_scale = float(
+        match_cfg['eke_log_scale']
+        if eke_log_scale is None else eke_log_scale
+    )
+    eke_source = (
+        Path(eke_file_path)
+        if eke_file_path is not None
+        else glorys_processed_root / 'eke.zarr'
+    )
+    if n_controls < 1 or space_caliper <= 0 or year_limit < 0 or month_limit < 0:
+        raise ValueError('Matching counts/calipers are invalid.')
+    if month_limit > 6 or core_margin < 0 or max_depth_limit <= 0 or core_tolerance < 0:
+        raise ValueError('Month/depth matching parameters are invalid.')
+    if n_eke_bins < 2 or log_eke_scale <= 0:
+        raise ValueError('EKE matching parameters are invalid.')
+
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    match_tag = _matched_control_run_tag(
+        thresholds=threshold_values,
+        controls_per_scv=n_controls,
+        spatial_caliper_km=space_caliper,
+        year_caliper=year_limit,
+        month_caliper=month_limit,
+        core_depth_margin_m=core_margin,
+        max_depth_caliper_m=max_depth_limit,
+        core_anomaly_tolerance_m=core_tolerance,
+        without_replacement=no_reuse,
+        exclude_scv_platforms=exclude_scv_plats,
+        unique_control_platforms_per_set=unique_control_plats,
+        match_mean_eke=use_eke,
+        eke_quantile_bins=n_eke_bins,
+        eke_log_scale=log_eke_scale,
+        eke_file_path=eke_source if use_eke else None,
+    )
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir('scv_matched_control', region_slug)
+    )
+    stem = (
+        f'scv_matched_control_cohort_{int(baseline_start_year)}_'
+        f'{int(baseline_end_year)}_depth{depth_tag}m_{match_tag}'
+    )
+    parquet_path = out_dir / f'{stem}.parquet'
+    csv_path = out_dir / f'{stem}.csv'
+    if parquet_path.exists() and not force:
+        return pd.read_parquet(parquet_path)
+
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                out_dir,
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                min_do_levels_below_gate=int(match_cfg['min_do_levels_below_gate']),
+                min_ts_levels_below_gate=int(match_cfg['min_ts_levels_below_gate']),
+            )
+        profile_source = Path(profile_eligibility_path)
+        if not profile_source.exists():
+            profile_eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                output_dir=out_dir,
+                save_data=True,
+            )
+        else:
+            profile_eligibility = pd.read_parquet(profile_source)
+    else:
+        profile_eligibility = profile_eligibility.copy()
+        profile_source = (
+            Path(profile_eligibility_path)
+            if profile_eligibility_path is not None else Path('<memory>')
+        )
+    required_profile = {
+        'Profile_number', 'year', 'month', 'lon', 'lat', 'platform_number',
+        'date', 'basin', 'is_ke', 'do_min_depth_m', 'do_max_depth_m',
+        'ts_min_depth_m', 'ts_max_depth_m', 'do_evaluable', 'mccoy_eligible_proxy',
+    }
+    missing_profile = required_profile.difference(profile_eligibility.columns)
+    if missing_profile:
+        raise ValueError(f'Profile eligibility table missing columns: {sorted(missing_profile)}')
+    profile_eligibility['Profile_number'] = pd.to_numeric(
+        profile_eligibility['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    profile_eligibility = profile_eligibility[
+        profile_eligibility['Profile_number'].notna()
+    ].copy()
+    profile_eligibility['Profile_number'] = profile_eligibility['Profile_number'].astype(int)
+    if use_eke:
+        profile_eligibility = sample_glorys_eke_at_profiles(
+            profile_eligibility,
+            eke_file_path=eke_source,
+            output_col='mean_eke',
+        )
+
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir(
+                    'mccoy_scv_delta_do_thresholds', region_slug
+                )
+                / (
+                    f'mccoy_scv_delta_do_thresholds_{int(baseline_start_year)}_'
+                    f'{int(baseline_end_year)}_depth{depth_tag}m.parquet'
+                )
+            )
+        threshold_source = Path(threshold_table_path)
+        threshold_table = (
+            pd.read_csv(threshold_source)
+            if threshold_source.suffix.lower() == '.csv'
+            else pd.read_parquet(threshold_source)
+        )
+    else:
+        threshold_table = threshold_table.copy()
+        threshold_source = (
+            Path(threshold_table_path) if threshold_table_path is not None else Path('<memory>')
+        )
+    threshold_table['profile_number'] = pd.to_numeric(
+        threshold_table['profile_number'], errors='coerce'
+    ).astype('Int64')
+    threshold_table['threshold_umol_kg'] = pd.to_numeric(
+        threshold_table['threshold_umol_kg'], errors='coerce'
+    )
+    threshold_table = threshold_table[
+        threshold_table['profile_number'].notna()
+        & threshold_table['threshold_umol_kg'].isin(threshold_values)
+    ].copy()
+    present_thresholds = sorted(threshold_table['threshold_umol_kg'].dropna().unique())
+    if present_thresholds != threshold_values:
+        raise ValueError(
+            f'Threshold table contains {present_thresholds}; requested {threshold_values}.'
+        )
+    evaluability_counts = threshold_table.groupby('profile_number')['do_evaluable'].nunique()
+    if (evaluability_counts > 1).any():
+        raise RuntimeError('SCV DO evaluability differs across thresholds.')
+    scv_evaluable_ids = set(
+        threshold_table.loc[
+            threshold_table['do_evaluable'].fillna(False).astype(bool), 'profile_number'
+        ].astype(int)
+    )
+
+    anchored_path = (
+        Path(argo_anchored_path)
+        if argo_anchored_path is not None
+        else _default_mccoy_anchored_path(region_slug)
+    )
+    anchored = pd.read_parquet(anchored_path).copy()
+    anchored['profile_number'] = pd.to_numeric(
+        anchored['profile_number'], errors='coerce'
+    ).astype('Int64')
+    all_anchored_ids = set(
+        anchored.loc[anchored['profile_number'].notna(), 'profile_number'].astype(int)
+    )
+    anchored = anchored[
+        anchored['profile_number'].notna()
+        & anchored['profile_number'].astype(int).isin(scv_evaluable_ids)
+    ].copy()
+    anchored['profile_number'] = anchored['profile_number'].astype(int)
+    if 'mccoy_core_pressure_db' not in anchored.columns:
+        raise ValueError('McCoy anchored table lacks mccoy_core_pressure_db.')
+    anchored['mccoy_core_pressure_db'] = pd.to_numeric(
+        anchored['mccoy_core_pressure_db'], errors='coerce'
+    )
+    anchored = anchored[anchored['mccoy_core_pressure_db'].notna()].copy()
+    if 'core_depth_m' in anchored.columns:
+        anchored = anchored.rename(
+            columns={'core_depth_m': 'representation_core_depth_m'}
+        )
+    eligibility_for_merge = profile_eligibility.rename(
+        columns={'Profile_number': 'profile_number'}
+    )
+    anchors = anchored.merge(
+        eligibility_for_merge,
+        on='profile_number',
+        how='inner',
+        suffixes=('_mccoy', ''),
+        validate='one_to_one',
+    )
+    anchors['mccoy_core_depth_m'] = -gsw.z_from_p(
+        anchors['mccoy_core_pressure_db'].to_numpy(dtype=float),
+        pd.to_numeric(anchors['lat'], errors='coerce').to_numpy(dtype=float),
+    )
+    anchors = anchors[
+        np.isfinite(anchors['mccoy_core_depth_m'])
+    ].copy()
+    anchor_core_covered = (
+        pd.to_numeric(anchors['do_min_depth_m'], errors='coerce').le(
+            anchors['mccoy_core_depth_m'] - core_margin
+        )
+        & pd.to_numeric(anchors['do_max_depth_m'], errors='coerce').ge(
+            anchors['mccoy_core_depth_m'] + core_margin
+        )
+        & pd.to_numeric(anchors['ts_min_depth_m'], errors='coerce').le(
+            anchors['mccoy_core_depth_m'] - core_margin
+        )
+        & pd.to_numeric(anchors['ts_max_depth_m'], errors='coerce').ge(
+            anchors['mccoy_core_depth_m'] + core_margin
+        )
+    )
+    anchors['anchor_core_covered'] = anchor_core_covered
+    before_core_filter = len(anchors)
+    anchors = anchors[
+        anchors['do_evaluable'].astype(bool)
+        & anchors['mccoy_eligible_proxy'].astype(bool)
+        & anchors['anchor_core_covered'].astype(bool)
+    ].copy()
+    if anchors.empty:
+        raise RuntimeError('No DO-evaluable McCoy SCVs retain DO/T/S coverage around the core.')
+    print(
+        f'[matching] anchors with comparable core coverage: '
+        f'{len(anchors)}/{before_core_filter}'
+    )
+
+    anomaly_lookup, anomaly_paths = _do_threshold_anomaly_lookup(
+        threshold_values,
+        start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year),
+        anomaly_min_depth=float(anomaly_min_depth),
+        region_slug=region_slug,
+    )
+    interacting_path = (
+        _shared_output_dir('statistics', region_slug)
+        / f'all_interacting_argo_{int(baseline_start_year)}_{int(baseline_end_year)}.parquet'
+    )
+    interacting_ids = set(
+        pd.to_numeric(
+            pd.read_parquet(interacting_path, columns=['Profile_number'])['Profile_number'],
+            errors='coerce',
+        ).dropna().astype(int)
+    )
+    if not _mccoy_scv_csv.exists():
+        raise FileNotFoundError(f'Missing McCoy SCV catalogue: {_mccoy_scv_csv}')
+    all_scv_platforms = set(
+        pd.to_numeric(
+            pd.read_csv(_mccoy_scv_csv, usecols=['Platform'])['Platform'],
+            errors='coerce',
+        ).dropna().astype(int)
+    )
+    control_mask = (
+        profile_eligibility['mccoy_eligible_proxy'].fillna(False).astype(bool)
+        & ~profile_eligibility['Profile_number'].isin(all_anchored_ids)
+    )
+    if exclude_scv_plats:
+        control_mask &= ~pd.to_numeric(
+            profile_eligibility['platform_number'], errors='coerce'
+        ).isin(all_scv_platforms)
+    controls = profile_eligibility[control_mask].copy().reset_index(drop=True)
+    controls['in_meta_eddy'] = controls['Profile_number'].isin(interacting_ids)
+    anchors['in_meta_eddy'] = anchors['profile_number'].isin(interacting_ids)
+    if controls.empty:
+        raise RuntimeError('No eligible non-catalogued control profiles are available.')
+    eke_edges: np.ndarray | None = None
+    if use_eke:
+        reference_eke = pd.to_numeric(
+            profile_eligibility.loc[
+                profile_eligibility['do_evaluable'].fillna(False).astype(bool),
+                'mean_eke',
+            ],
+            errors='coerce',
+        )
+        reference_eke = reference_eke[
+            np.isfinite(reference_eke) & reference_eke.ge(0.0)
+        ]
+        if reference_eke.empty:
+            raise RuntimeError('No finite EKE values are available for quantile matching.')
+        eke_edges = np.unique(
+            np.nanquantile(
+                reference_eke.to_numpy(dtype=float),
+                np.linspace(0.0, 1.0, n_eke_bins + 1),
+            )
+        )
+        if len(eke_edges) < 3:
+            raise RuntimeError('Mean-EKE field does not support at least two quantile bins.')
+        anchors['eke_quantile_bin'] = pd.cut(
+            pd.to_numeric(anchors['mean_eke'], errors='coerce'),
+            bins=eke_edges,
+            labels=False,
+            include_lowest=True,
+        ).astype('Int64')
+        controls['eke_quantile_bin'] = pd.cut(
+            pd.to_numeric(controls['mean_eke'], errors='coerce'),
+            bins=eke_edges,
+            labels=False,
+            include_lowest=True,
+        ).astype('Int64')
+        before_eke_filter = len(anchors)
+        anchors = anchors[anchors['eke_quantile_bin'].notna()].copy()
+        controls = controls[controls['eke_quantile_bin'].notna()].copy()
+        print(
+            f'[matching] anchors with finite mean EKE: '
+            f'{len(anchors)}/{before_eke_filter}'
+        )
+        if anchors.empty or controls.empty:
+            raise RuntimeError('EKE matching removed all anchors or controls.')
+    else:
+        anchors['mean_eke'] = np.nan
+        controls['mean_eke'] = np.nan
+        anchors['eke_quantile_bin'] = pd.Series(
+            pd.NA, index=anchors.index, dtype='Int64'
+        )
+        controls['eke_quantile_bin'] = pd.Series(
+            pd.NA, index=controls.index, dtype='Int64'
+        )
+
+    for threshold in threshold_values:
+        tag = _format_detection_value(float(threshold))
+        lookup = anomaly_lookup[float(threshold)]
+        delta_map = lookup['delta_do'].to_dict() if not lookup.empty else {}
+        depth_map = lookup['depth'].to_dict() if not lookup.empty else {}
+        controls[f'has_delta_do_{tag}'] = controls['Profile_number'].isin(lookup.index)
+        controls[f'delta_do_value_{tag}'] = controls['Profile_number'].map(delta_map)
+        controls[f'delta_do_peak_depth_m_{tag}'] = controls['Profile_number'].map(depth_map)
+        anchors[f'has_delta_do_{tag}'] = anchors['profile_number'].isin(lookup.index)
+        anchors[f'delta_do_value_{tag}'] = anchors['profile_number'].map(delta_map)
+        anchors[f'delta_do_peak_depth_m_{tag}'] = anchors['profile_number'].map(depth_map)
+
+    if use_eke:
+        control_groups = {
+            key: frame.copy()
+            for key, frame in controls.groupby(
+                ['basin', 'eke_quantile_bin'],
+                sort=False,
+                dropna=False,
+            )
+        }
+    else:
+        control_groups = {
+            basin: frame.copy()
+            for basin, frame in controls.groupby('basin', sort=False)
+        }
+
+    def candidate_table(anchor: pd.Series, used_ids: set[int]) -> pd.DataFrame:
+        group_key = (
+            (anchor['basin'], anchor['eke_quantile_bin'])
+            if use_eke else anchor['basin']
+        )
+        pool = control_groups.get(group_key)
+        if pool is None or pool.empty:
+            return pd.DataFrame()
+        year_delta = (
+            pd.to_numeric(pool['year'], errors='coerce') - float(anchor['year'])
+        ).abs()
+        month_raw = (
+            pd.to_numeric(pool['month'], errors='coerce') - float(anchor['month'])
+        ).abs()
+        month_delta = np.minimum(month_raw, 12.0 - month_raw)
+        core_depth = float(anchor['mccoy_core_depth_m'])
+        depth_delta = (
+            pd.to_numeric(pool['do_max_depth_m'], errors='coerce')
+            - float(anchor['do_max_depth_m'])
+        ).abs()
+        eligible = (
+            year_delta.le(year_limit)
+            & month_delta.le(month_limit)
+            & pool['is_ke'].fillna(False).astype(bool).eq(bool(anchor['is_ke']))
+            & pd.to_numeric(pool['do_min_depth_m'], errors='coerce').le(core_depth - core_margin)
+            & pd.to_numeric(pool['do_max_depth_m'], errors='coerce').ge(core_depth + core_margin)
+            & pd.to_numeric(pool['ts_min_depth_m'], errors='coerce').le(core_depth - core_margin)
+            & pd.to_numeric(pool['ts_max_depth_m'], errors='coerce').ge(core_depth + core_margin)
+            & depth_delta.le(max_depth_limit)
+        )
+        if no_reuse and used_ids:
+            eligible &= ~pool['Profile_number'].isin(used_ids)
+        candidate = pool.loc[eligible].copy()
+        if candidate.empty:
+            return candidate
+        distance = _vector_great_circle_distance_km(
+            float(anchor['lon']),
+            float(anchor['lat']),
+            candidate['lon'].to_numpy(dtype=float),
+            candidate['lat'].to_numpy(dtype=float),
+        )
+        candidate['match_distance_km'] = distance
+        candidate = candidate[candidate['match_distance_km'].le(space_caliper)].copy()
+        if candidate.empty:
+            return candidate
+        candidate['match_year_delta'] = (
+            pd.to_numeric(candidate['year'], errors='coerce') - float(anchor['year'])
+        ).abs()
+        month_raw = (
+            pd.to_numeric(candidate['month'], errors='coerce') - float(anchor['month'])
+        ).abs()
+        candidate['match_month_delta'] = np.minimum(month_raw, 12.0 - month_raw)
+        candidate['match_max_depth_delta_m'] = (
+            pd.to_numeric(candidate['do_max_depth_m'], errors='coerce')
+            - float(anchor['do_max_depth_m'])
+        ).abs()
+        if use_eke:
+            candidate['match_log_eke_delta'] = (
+                np.log1p(
+                    pd.to_numeric(candidate['mean_eke'], errors='coerce')
+                    * 1e4
+                )
+                - np.log1p(float(anchor['mean_eke']) * 1e4)
+            ).abs()
+        else:
+            candidate['match_log_eke_delta'] = 0.0
+        candidate['match_score'] = (
+            (candidate['match_distance_km'] / space_caliper) ** 2
+            + (candidate['match_year_delta'] / max(year_limit, 1)) ** 2
+            + (candidate['match_month_delta'] / max(month_limit, 1)) ** 2
+            + (candidate['match_max_depth_delta_m'] / max_depth_limit) ** 2
+            + (candidate['match_log_eke_delta'] / log_eke_scale) ** 2
+        )
+        return candidate.sort_values([
+            'match_score', 'match_log_eke_delta', 'Profile_number',
+        ])
+
+    empty_used: set[int] = set()
+
+    def candidate_count(anchor: pd.Series) -> int:
+        candidate = candidate_table(anchor, empty_used)
+        if candidate.empty:
+            return 0
+        if unique_control_plats:
+            return int(candidate['platform_number'].nunique())
+        return int(len(candidate))
+
+    candidate_counts = {
+        int(anchor.profile_number): candidate_count(anchor)
+        for _, anchor in anchors.iterrows()
+    }
+    anchors['_candidate_count'] = anchors['profile_number'].map(candidate_counts).fillna(0).astype(int)
+    anchors = anchors.sort_values(['_candidate_count', 'profile_number'])
+
+    rows: list[dict] = []
+    used_control_ids: set[int] = set()
+    generated_at = pd.Timestamp.now(tz='UTC').isoformat()
+    for _, anchor in anchors.iterrows():
+        candidates = candidate_table(anchor, used_control_ids)
+        if unique_control_plats and not candidates.empty:
+            candidates = candidates.drop_duplicates('platform_number', keep='first')
+        selected = candidates.head(n_controls).copy()
+        selected_ids = set(selected['Profile_number'].astype(int))
+        if no_reuse:
+            used_control_ids |= selected_ids
+        match_set_id = f'{int(anchor["year"])}:{int(anchor["profile_number"])}'
+        n_matched = int(len(selected))
+
+        def participant_record(
+            participant: pd.Series,
+            *,
+            is_scv: bool,
+            distance_km: float,
+            year_delta: float,
+            month_delta: float,
+            max_depth_delta_m: float,
+            log_eke_delta: float,
+            score: float,
+        ) -> dict:
+            profile_id = int(
+                participant['profile_number'] if is_scv else participant['Profile_number']
+            )
+            record = {
+                'match_set_id': match_set_id,
+                'group': 'McCoy SCV' if is_scv else 'Matched non-catalogued Argo',
+                'is_scv': bool(is_scv),
+                'profile_number': profile_id,
+                'platform_number': int(participant['platform_number']),
+                'year': int(participant['year']),
+                'month': int(participant['month']),
+                'date': pd.Timestamp(participant['date']),
+                'lon': float(participant['lon']),
+                'lat': float(participant['lat']),
+                'basin': str(participant['basin']),
+                'is_ke': bool(participant['is_ke']),
+                'in_meta_eddy': bool(participant['in_meta_eddy']),
+                'do_min_depth_m': float(participant['do_min_depth_m']),
+                'do_max_depth_m': float(participant['do_max_depth_m']),
+                'ts_min_depth_m': float(participant['ts_min_depth_m']),
+                'ts_max_depth_m': float(participant['ts_max_depth_m']),
+                'mean_eke': float(participant.get('mean_eke', np.nan)),
+                'eke_quantile_bin': (
+                    int(participant['eke_quantile_bin'])
+                    if pd.notna(participant.get('eke_quantile_bin', pd.NA))
+                    else pd.NA
+                ),
+                'anchor_profile_number': int(anchor['profile_number']),
+                'anchor_platform_number': int(anchor['platform_number']),
+                'anchor_year': int(anchor['year']),
+                'anchor_month': int(anchor['month']),
+                'anchor_lon': float(anchor['lon']),
+                'anchor_lat': float(anchor['lat']),
+                'anchor_basin': str(anchor['basin']),
+                'anchor_is_ke': bool(anchor['is_ke']),
+                'anchor_core_pressure_db': float(anchor['mccoy_core_pressure_db']),
+                'anchor_core_depth_m': float(anchor['mccoy_core_depth_m']),
+                'anchor_representation_core_depth_m': float(
+                    anchor.get('representation_core_depth_m', np.nan)
+                ),
+                'anchor_core_depth_source': 'McCoy Core_Pressure converted with gsw.z_from_p',
+                'anchor_scv_type': str(anchor.get('scv_type', '')),
+                'match_distance_km': float(distance_km),
+                'match_year_delta': float(year_delta),
+                'match_month_delta': float(month_delta),
+                'match_max_depth_delta_m': float(max_depth_delta_m),
+                'match_log_eke_delta': float(log_eke_delta),
+                'match_score': float(score),
+                'n_controls_requested': int(n_controls),
+                'n_controls_matched': int(n_matched),
+                'match_status': 'complete' if n_matched == n_controls else (
+                    'partial' if n_matched else 'no_control'
+                ),
+                'minimum_depth_m': float(anomaly_min_depth),
+                'spatial_caliper_km': float(space_caliper),
+                'year_caliper': int(year_limit),
+                'month_caliper': int(month_limit),
+                'core_depth_margin_m': float(core_margin),
+                'max_depth_caliper_m': float(max_depth_limit),
+                'core_anomaly_tolerance_m': float(core_tolerance),
+                'without_replacement': bool(no_reuse),
+                'exclude_scv_platforms': bool(exclude_scv_plats),
+                'unique_control_platforms_per_set': bool(unique_control_plats),
+                'match_mean_eke': bool(use_eke),
+                'eke_quantile_bins_requested': int(n_eke_bins),
+                'eke_quantile_bins_realized': (
+                    int(len(eke_edges) - 1) if eke_edges is not None else 0
+                ),
+                'eke_log_scale': float(log_eke_scale),
+                'eke_source': str(eke_source) if use_eke else '',
+                'cohort_tag': match_tag,
+                'generated_at': generated_at,
+            }
+            for threshold in threshold_values:
+                tag = _format_detection_value(float(threshold))
+                has_anomaly = bool(participant[f'has_delta_do_{tag}'])
+                peak_depth = pd.to_numeric(
+                    pd.Series([participant[f'delta_do_peak_depth_m_{tag}']]),
+                    errors='coerce',
+                ).iloc[0]
+                record[f'has_delta_do_{tag}'] = has_anomaly
+                record[f'delta_do_value_{tag}'] = participant[f'delta_do_value_{tag}']
+                record[f'delta_do_peak_depth_m_{tag}'] = peak_depth
+                record[f'has_core_aligned_delta_do_{tag}'] = bool(
+                    has_anomaly
+                    and pd.notna(peak_depth)
+                    and abs(
+                        float(peak_depth) - float(anchor['mccoy_core_depth_m'])
+                    ) <= core_tolerance
+                )
+            return record
+
+        rows.append(
+            participant_record(
+                anchor,
+                is_scv=True,
+                distance_km=0.0,
+                year_delta=0.0,
+                month_delta=0.0,
+                max_depth_delta_m=0.0,
+                log_eke_delta=0.0,
+                score=0.0,
+            )
+        )
+        for _, control in selected.iterrows():
+            rows.append(
+                participant_record(
+                    control,
+                    is_scv=False,
+                    distance_km=float(control['match_distance_km']),
+                    year_delta=float(control['match_year_delta']),
+                    month_delta=float(control['match_month_delta']),
+                    max_depth_delta_m=float(control['match_max_depth_delta_m']),
+                    log_eke_delta=float(control['match_log_eke_delta']),
+                    score=float(control['match_score']),
+                )
+            )
+
+    cohort = pd.DataFrame(rows)
+    if cohort.empty:
+        raise RuntimeError('No matched-control cohort rows were generated.')
+    matched_sets = cohort.groupby('match_set_id')['is_scv'].agg(['sum', 'count'])
+    if not matched_sets['sum'].eq(1).all():
+        raise RuntimeError('Every matched set must contain exactly one McCoy SCV anchor.')
+    cohort['profile_eligibility_source'] = str(profile_source)
+    cohort['threshold_table_source'] = str(threshold_source)
+    cohort['argo_anchored_source'] = str(anchored_path)
+    cohort['mccoy_catalog_source'] = str(_mccoy_scv_csv)
+    cohort['interacting_argo_source'] = str(interacting_path)
+    cohort['anomaly_sources'] = json.dumps(
+        {str(key): str(value) for key, value in anomaly_paths.items()},
+        sort_keys=True,
+    )
+    cohort['eke_quantile_edges'] = (
+        json.dumps([float(value) for value in eke_edges])
+        if eke_edges is not None else '[]'
+    )
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_parquet(cohort, parquet_path)
+        cohort.to_csv(csv_path, index=False)
+        print(f'[*] SCV matched-control cohort saved: {parquet_path}')
+        print(f'[*] SCV matched-control cohort saved: {csv_path}')
+    anchor_rows = cohort[cohort['is_scv'].astype(bool)].drop_duplicates('match_set_id')
+    complete_sets = int(anchor_rows['n_controls_matched'].eq(n_controls).sum())
+    matched_anchors = int(anchor_rows['n_controls_matched'].gt(0).sum())
+    print(
+        f'[matching] {matched_anchors}/{len(anchor_rows)} anchors matched; '
+        f'{complete_sets} complete matched sets'
+    )
+    return cohort
+
+
+def _matched_set_cells(frame: pd.DataFrame, outcome_col: str) -> pd.DataFrame:
+    """把 long cohort 压缩为每个 matched set 的 2×2 table cells。"""
+    rows = []
+    for match_set_id, group in frame.groupby('match_set_id', sort=False):
+        scv = group[group['is_scv'].astype(bool)]
+        controls = group[~group['is_scv'].astype(bool)]
+        if len(scv) != 1 or controls.empty:
+            continue
+        scv_value = bool(scv.iloc[0][outcome_col])
+        control_values = controls[outcome_col].fillna(False).astype(bool)
+        rows.append({
+            'match_set_id': match_set_id,
+            'anchor_platform_number': int(scv.iloc[0]['anchor_platform_number']),
+            'a': int(scv_value),
+            'b': int(not scv_value),
+            'c': int(control_values.sum()),
+            'd': int((~control_values).sum()),
+            'n': int(1 + len(control_values)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _mantel_haenszel_odds_ratio(
+    cells: pd.DataFrame,
+    weights: np.ndarray | None = None,
+) -> float:
+    """从 matched-set 2×2 cells 计算 Mantel-Haenszel common OR。"""
+    if cells.empty:
+        return np.nan
+    if weights is None:
+        weights = np.ones(len(cells), dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    n = pd.to_numeric(cells['n'], errors='coerce').to_numpy(dtype=float)
+    numerator = np.sum(
+        weights
+        * pd.to_numeric(cells['a'], errors='coerce').to_numpy(dtype=float)
+        * pd.to_numeric(cells['d'], errors='coerce').to_numpy(dtype=float)
+        / n
+    )
+    denominator = np.sum(
+        weights
+        * pd.to_numeric(cells['b'], errors='coerce').to_numpy(dtype=float)
+        * pd.to_numeric(cells['c'], errors='coerce').to_numpy(dtype=float)
+        / n
+    )
+    if denominator == 0:
+        return np.inf if numerator > 0 else np.nan
+    return float(numerator / denominator)
+
+
+def _conditional_exact_odds_ratio_ci(
+    successes: int,
+    total: int,
+    control_successes: int,
+    control_total: int,
+) -> tuple[float, float, float, float]:
+    """返回聚合 2×2 表的 conditional exact OR、95% CI 与 Fisher p 值。"""
+    from scipy.stats import fisher_exact
+    from scipy.stats.contingency import odds_ratio
+
+    table = np.asarray([
+        [int(successes), int(total) - int(successes)],
+        [int(control_successes), int(control_total) - int(control_successes)],
+    ], dtype=int)
+    fisher = fisher_exact(table)
+    try:
+        conditional = odds_ratio(table, kind='conditional')
+        interval = conditional.confidence_interval(confidence_level=0.95)
+        estimate = float(conditional.statistic)
+        low = float(interval.low)
+        high = float(interval.high)
+    except Exception:
+        estimate, low, high, _ = _fisher_odds_ratio_ci(
+            successes, total, control_successes, control_total
+        )
+    return estimate, low, high, float(fisher.pvalue)
+
+
+def _matched_dependency_components(frame: pd.DataFrame) -> pd.DataFrame:
+    """将共享 anchor/control platform 的 matched sets 合并为依赖连通分量。"""
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    set_anchor_nodes: dict[str, str] = {}
+    for match_set_id, group in frame.groupby('match_set_id', sort=False):
+        scv = group[group['is_scv'].astype(bool)]
+        controls = group[~group['is_scv'].astype(bool)]
+        if len(scv) != 1 or controls.empty:
+            continue
+        anchor_node = f'platform:{int(scv.iloc[0]["anchor_platform_number"])}'
+        set_anchor_nodes[str(match_set_id)] = anchor_node
+        find(anchor_node)
+        control_platforms = pd.to_numeric(
+            controls['platform_number'], errors='coerce'
+        ).dropna().astype(int).unique()
+        for platform in control_platforms:
+            union(anchor_node, f'platform:{int(platform)}')
+
+    roots = sorted({find(node) for node in set_anchor_nodes.values()})
+    root_codes = {root: index for index, root in enumerate(roots)}
+    return pd.DataFrame([
+        {
+            'match_set_id': match_set_id,
+            'dependency_component': int(root_codes[find(anchor_node)]),
+        }
+        for match_set_id, anchor_node in set_anchor_nodes.items()
+    ])
+
+
+def _bootstrap_matched_or_by_cluster(
+    cells: pd.DataFrame,
+    *,
+    cluster_col: str,
+    iterations: int,
+    random_seed: int,
+) -> tuple[float, float, int, int, int]:
+    """按指定依赖 cluster bootstrap Mantel-Haenszel OR。"""
+    if cells.empty or int(iterations) <= 0:
+        return np.nan, np.nan, 0, 0, 0
+    if cluster_col not in cells.columns:
+        raise ValueError(f'Matched cells lack bootstrap cluster column: {cluster_col}')
+    clusters = pd.unique(cells[cluster_col])
+    if len(clusters) < 2:
+        return np.nan, np.nan, 0, 0, 0
+    cluster_codes = pd.Categorical(
+        cells[cluster_col], categories=clusters
+    ).codes
+    rng = np.random.default_rng(int(random_seed))
+    estimates = []
+    for _ in range(int(iterations)):
+        sampled = rng.integers(0, len(clusters), size=len(clusters))
+        multiplicity = np.bincount(sampled, minlength=len(clusters)).astype(float)
+        weights = multiplicity[cluster_codes]
+        estimate = _mantel_haenszel_odds_ratio(cells, weights=weights)
+        if not np.isnan(estimate):
+            estimates.append(float(estimate))
+    if not estimates:
+        return np.nan, np.nan, 0, 0, 0
+    estimates_array = np.asarray(estimates, dtype=float)
+    zero_draws = int(np.count_nonzero(estimates_array == 0.0))
+    infinite_draws = int(np.count_nonzero(np.isposinf(estimates_array)))
+    low = np.quantile(estimates_array, 0.025, method='lower')
+    high = np.quantile(estimates_array, 0.975, method='higher')
+    return (
+        float(low),
+        float(high),
+        int(len(estimates_array)),
+        zero_draws,
+        infinite_draws,
+    )
+
+
+def _standardized_mean_difference(
+    left: pd.Series | np.ndarray,
+    right: pd.Series | np.ndarray,
+) -> float:
+    """返回两组有限值的 pooled-SD standardized mean difference。"""
+    left_values = pd.to_numeric(
+        pd.Series(left), errors='coerce'
+    ).dropna().to_numpy(dtype=float)
+    right_values = pd.to_numeric(
+        pd.Series(right), errors='coerce'
+    ).dropna().to_numpy(dtype=float)
+    if len(left_values) < 2 or len(right_values) < 2:
+        return np.nan
+    pooled_sd = math.sqrt(
+        (
+            float(np.var(left_values, ddof=1))
+            + float(np.var(right_values, ddof=1))
+        ) / 2.0
+    )
+    if not np.isfinite(pooled_sd) or pooled_sd <= 0:
+        return np.nan
+    return float((np.mean(left_values) - np.mean(right_values)) / pooled_sd)
+
+
+def _scv_matched_scope_mask(anchor_rows: pd.DataFrame, scope: str) -> pd.Series:
+    """按 anchor SCV 位置返回 region/KE sensitivity scope。"""
+    basin = anchor_rows['anchor_basin'].astype(str)
+    is_ke = anchor_rows['anchor_is_ke'].fillna(False).astype(bool)
+    lat = pd.to_numeric(anchor_rows['anchor_lat'], errors='coerce')
+    if scope == 'Global':
+        return pd.Series(True, index=anchor_rows.index)
+    if scope == 'KE':
+        return is_ke
+    if scope == 'North Pacific':
+        return basin.eq('Pacific') & lat.ge(0.0)
+    if scope == 'Global excluding KE':
+        return ~is_ke
+    if scope == 'Pacific excluding KE':
+        return basin.eq('Pacific') & ~is_ke
+    if scope == 'Atlantic':
+        return basin.eq('Atlantic')
+    if scope == 'Southern Ocean':
+        return basin.eq('SO')
+    raise ValueError(f'Unsupported matched-control scope: {scope}')
+
+
+def summarize_scv_matched_control_enrichment(
+    cohort: pd.DataFrame | None = None,
+    cohort_path: str | Path | None = None,
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    scopes: tuple[str, ...] | list[str] = (
+        'Global', 'KE', 'North Pacific', 'Global excluding KE',
+        'Pacific excluding KE', 'Atlantic', 'Southern Ocean',
+    ),
+    outcome_mode: str = 'profile',
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    bootstrap_cluster_unit: str | None = None,
+    bootstrap_iterations: int | None = None,
+    random_seed: int | None = None,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """汇总 McCoy SCV 相对 matched non-catalogued Argo controls 的 ΔDO enrichment。
+
+    每个 region scope 只按 anchor SCV 定义，随后保留整个 matched set。主效应是 matched-set
+    Mantel-Haenszel OR；95% uncertainty 默认按重复采样的 anchor SCV float platform 聚类
+    bootstrap。函数同时报告忽略 matched-set 结构的 conditional exact OR/CI，作为小样本
+    可复核的聚合描述而非主调整估计；dependency-component 聚类可作为双侧平台网络敏感性。
+
+    参数:
+        - cohort (pd.DataFrame | None): `build_scv_matched_control_cohort` 输出；None 时读取路径或默认缓存。
+        - cohort_path (str | Path | None): matched cohort parquet/CSV；None 定位默认参数缓存。
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值列表，默认 (20, 35, 50)。
+        - scopes (tuple[str, ...] | list[str]): 区域与 KE sensitivity scopes，默认含 global、KE、North Pacific、KE 留出和主要海盆。
+        - outcome_mode (str): `profile` 使用任意深层 carrier；`core_aligned` 只计 SCV core 附近 carrier，默认 `profile`。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - bootstrap_cluster_unit (str | None): `anchor_platform`（主分析）或 `dependency_component`（网络敏感性）；None 读取配置。
+        - bootstrap_iterations (int | None): cluster bootstrap 次数；None 读取配置，默认 2000。
+        - random_seed (int | None): bootstrap 随机种子；None 读取配置，默认 42。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - save_data (bool): 是否保存 summary parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 threshold/scope 一行，含 carrier counts、exact OR/CI、matched OR 和 bootstrap CI。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control/scv_matched_control_summary_<outcome>_<y0>_<y1>_depth<z>m_<matching>_boot<cluster>.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - 主 bootstrap 以 anchor platform 为抽样单位；输出同时报告 control-platform 复用程度。
+        - `dependency_component` 会连接重复 anchor 与 control platforms，适合检查双侧依赖，但局部区域
+          可能只剩少数大型连通分量，不应将退化 CI 当作精确 uncertainty。
+        - bootstrap 保留 OR=0 与 OR=∞ 的有效抽样；稀疏结局若有至少 2.5% 的无穷抽样，上限正确报告为∞。
+        - 分区样本很小时 CI 可能无穷或 bootstrap 有效次数不足；保留结果但不以单区 nominal p 值作结论。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    if outcome_mode not in {'profile', 'core_aligned'}:
+        raise ValueError("outcome_mode must be 'profile' or 'core_aligned'.")
+    match_cfg = _scv_matched_control_config()
+    iterations = int(
+        match_cfg['bootstrap_iterations']
+        if bootstrap_iterations is None else bootstrap_iterations
+    )
+    cluster_unit = str(
+        match_cfg['bootstrap_cluster_unit']
+        if bootstrap_cluster_unit is None else bootstrap_cluster_unit
+    )
+    if cluster_unit not in {'dependency_component', 'anchor_platform'}:
+        raise ValueError(
+            "bootstrap_cluster_unit must be 'dependency_component' or 'anchor_platform'."
+        )
+    seed = int(match_cfg['random_seed'] if random_seed is None else random_seed)
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir('scv_matched_control', region_slug)
+    )
+    if cohort is None:
+        if cohort_path is None:
+            match_tag = _default_matched_control_run_tag(threshold_values)
+            cohort_path = out_dir / (
+                f'scv_matched_control_cohort_{int(baseline_start_year)}_'
+                f'{int(baseline_end_year)}_depth{depth_tag}m_{match_tag}.parquet'
+            )
+        cohort_source = Path(cohort_path)
+        cohort = (
+            pd.read_csv(cohort_source)
+            if cohort_source.suffix.lower() == '.csv'
+            else pd.read_parquet(cohort_source)
+        )
+    else:
+        cohort = cohort.copy()
+        cohort_source = Path(cohort_path) if cohort_path is not None else Path('<memory>')
+    required = {
+        'match_set_id', 'is_scv', 'anchor_platform_number', 'anchor_basin',
+        'anchor_is_ke', 'anchor_lat', 'match_distance_km',
+    }
+    missing = required.difference(cohort.columns)
+    if missing:
+        raise ValueError(f'Matched cohort missing columns: {sorted(missing)}')
+    match_tags = pd.unique(cohort.get('cohort_tag', pd.Series(['custom'])).astype(str))
+    if len(match_tags) != 1:
+        raise ValueError(f'Cohort contains mixed matching configurations: {match_tags.tolist()}')
+    cohort_tag = str(match_tags[0])
+    anchor_rows = cohort[cohort['is_scv'].astype(bool)].drop_duplicates('match_set_id')
+
+    rows = []
+    for scope in scopes:
+        scope_anchor = anchor_rows[_scv_matched_scope_mask(anchor_rows, str(scope))]
+        scope_ids = set(scope_anchor['match_set_id'])
+        scoped = cohort[cohort['match_set_id'].isin(scope_ids)].copy()
+        dependency_components = _matched_dependency_components(scoped)
+        for threshold in threshold_values:
+            tag = _format_detection_value(float(threshold))
+            outcome_col = (
+                f'has_delta_do_{tag}'
+                if outcome_mode == 'profile'
+                else f'has_core_aligned_delta_do_{tag}'
+            )
+            if outcome_col not in scoped.columns:
+                raise ValueError(f'Matched cohort lacks outcome column: {outcome_col}')
+            cells = _matched_set_cells(scoped, outcome_col)
+            if not cells.empty:
+                cells = cells.merge(
+                    dependency_components,
+                    on='match_set_id',
+                    how='left',
+                    validate='one_to_one',
+                )
+                cells['anchor_platform'] = cells['anchor_platform_number']
+            valid_ids = set(cells['match_set_id']) if not cells.empty else set()
+            valid = scoped[scoped['match_set_id'].isin(valid_ids)]
+            scv = valid[valid['is_scv'].astype(bool)]
+            controls = valid[~valid['is_scv'].astype(bool)]
+            scv_values = scv[outcome_col].fillna(False).astype(bool)
+            control_values = controls[outcome_col].fillna(False).astype(bool)
+            scv_k, scv_n = int(scv_values.sum()), int(len(scv_values))
+            control_k, control_n = int(control_values.sum()), int(len(control_values))
+            if scv_n and control_n:
+                exact_or, exact_low, exact_high, fisher_p = _conditional_exact_odds_ratio_ci(
+                    scv_k, scv_n, control_k, control_n
+                )
+                matched_or = _mantel_haenszel_odds_ratio(cells)
+                bootstrap_col = (
+                    'dependency_component'
+                    if cluster_unit == 'dependency_component'
+                    else 'anchor_platform'
+                )
+                (
+                    boot_low,
+                    boot_high,
+                    boot_valid,
+                    boot_zero,
+                    boot_infinite,
+                ) = _bootstrap_matched_or_by_cluster(
+                    cells,
+                    cluster_col=bootstrap_col,
+                    iterations=iterations,
+                    random_seed=seed + int(round(float(threshold) * 10)) + len(rows),
+                )
+            else:
+                exact_or = exact_low = exact_high = fisher_p = np.nan
+                matched_or = boot_low = boot_high = np.nan
+                boot_valid = boot_zero = boot_infinite = 0
+            control_distance = pd.to_numeric(
+                controls['match_distance_km'], errors='coerce'
+            ).dropna()
+            control_year_delta = pd.to_numeric(
+                controls['match_year_delta'], errors='coerce'
+            ).dropna()
+            control_month_delta = pd.to_numeric(
+                controls['match_month_delta'], errors='coerce'
+            ).dropna()
+            control_depth_delta = pd.to_numeric(
+                controls['match_max_depth_delta_m'], errors='coerce'
+            ).dropna()
+            scv_meta = scv['in_meta_eddy'].fillna(False).astype(bool)
+            control_meta = controls['in_meta_eddy'].fillna(False).astype(bool)
+            control_platform_counts = controls.groupby('platform_number').size()
+            scv_eke = (
+                scv['mean_eke']
+                if 'mean_eke' in scv.columns
+                else pd.Series(np.nan, index=scv.index)
+            )
+            control_eke = (
+                controls['mean_eke']
+                if 'mean_eke' in controls.columns
+                else pd.Series(np.nan, index=controls.index)
+            )
+            scv_log_eke = np.log1p(
+                pd.to_numeric(scv_eke, errors='coerce') * 1e4
+            )
+            control_log_eke = np.log1p(
+                pd.to_numeric(control_eke, errors='coerce') * 1e4
+            )
+            log_eke_delta = pd.to_numeric(
+                (
+                    controls['match_log_eke_delta']
+                    if 'match_log_eke_delta' in controls.columns
+                    else pd.Series(np.nan, index=controls.index)
+                ),
+                errors='coerce',
+            ).dropna()
+            rows.append({
+                'threshold_umol_kg': float(threshold),
+                'scope': str(scope),
+                'outcome_mode': outcome_mode,
+                'n_matched_sets': int(len(cells)),
+                'n_anchor_platforms': int(cells['anchor_platform_number'].nunique()) if not cells.empty else 0,
+                'n_control_platforms': int(control_platform_counts.size),
+                'n_reused_control_platforms': int(
+                    control_platform_counts.gt(1).sum()
+                ),
+                'max_profiles_per_control_platform': int(
+                    control_platform_counts.max()
+                ) if not control_platform_counts.empty else 0,
+                'bootstrap_cluster_unit': cluster_unit,
+                'n_bootstrap_clusters': int(
+                    cells[
+                        'dependency_component'
+                        if cluster_unit == 'dependency_component'
+                        else 'anchor_platform'
+                    ].nunique()
+                ) if not cells.empty else 0,
+                'scv_numerator': scv_k,
+                'scv_denominator': scv_n,
+                'scv_rate': float(scv_k / scv_n) if scv_n else np.nan,
+                'control_numerator': control_k,
+                'control_denominator': control_n,
+                'control_rate': float(control_k / control_n) if control_n else np.nan,
+                'pooled_conditional_exact_or': exact_or,
+                'pooled_exact_ci_low': exact_low,
+                'pooled_exact_ci_high': exact_high,
+                'fisher_p_nominal': fisher_p,
+                'matched_mantel_haenszel_or': matched_or,
+                'matched_bootstrap_ci_low': boot_low,
+                'matched_bootstrap_ci_high': boot_high,
+                'bootstrap_iterations_requested': int(iterations),
+                'bootstrap_iterations_valid': int(boot_valid),
+                'bootstrap_zero_or_draws': int(boot_zero),
+                'bootstrap_infinite_or_draws': int(boot_infinite),
+                'median_controls_per_set': float(
+                    cells[['c', 'd']].sum(axis=1).median()
+                ) if not cells.empty else np.nan,
+                'median_match_distance_km': float(control_distance.median()) if len(control_distance) else np.nan,
+                'p90_match_distance_km': float(control_distance.quantile(0.9)) if len(control_distance) else np.nan,
+                'median_match_year_delta': float(control_year_delta.median()) if len(control_year_delta) else np.nan,
+                'median_match_month_delta': float(control_month_delta.median()) if len(control_month_delta) else np.nan,
+                'median_match_max_depth_delta_m': float(control_depth_delta.median()) if len(control_depth_delta) else np.nan,
+                'median_match_log_eke_delta': float(
+                    log_eke_delta.median()
+                ) if len(log_eke_delta) else np.nan,
+                'log_eke_standardized_mean_difference': _standardized_mean_difference(
+                    scv_log_eke,
+                    control_log_eke,
+                ),
+                'scv_meta_membership_rate': float(scv_meta.mean()) if len(scv_meta) else np.nan,
+                'control_meta_membership_rate': float(control_meta.mean()) if len(control_meta) else np.nan,
+                'period_start': int(baseline_start_year),
+                'period_end': int(baseline_end_year),
+                'minimum_depth_m': float(anomaly_min_depth),
+                'cohort_tag': cohort_tag,
+                'cohort_source': str(cohort_source),
+                'estimand': 'SCV vs matched non-catalogued BGC-Argo profile odds of carrying a deep ΔDO anomaly',
+            })
+    summary = pd.DataFrame(rows)
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = (
+            f'scv_matched_control_summary_{outcome_mode}_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_{cohort_tag}_boot{cluster_unit}'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(f'[*] SCV matched-control summary saved: {out_dir / f"{stem}.parquet"}')
+    return summary
+
+
+def plot_scv_matched_control_enrichment(
+    summary: pd.DataFrame | None = None,
+    summary_path: str | Path | None = None,
+    *,
+    outcome_mode: str = 'profile',
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    bootstrap_cluster_unit: str | None = None,
+    output_dir: str | Path | None = None,
+    annotate_counts: bool = False,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制各区域与 ΔDO 阈值的 SCV matched-control enrichment forest plot。
+
+    横轴使用 matched-set Mantel-Haenszel OR 的对数坐标；误差线优先使用所选 platform-cluster
+    bootstrap 95% CI，非有限区间退回聚合 conditional exact CI。颜色和 marker 沿用 ΔDO20/35/50
+    presentation 配置。
+
+    参数:
+        - summary (pd.DataFrame | None): `summarize_scv_matched_control_enrichment` 输出；None 时读取路径。
+        - summary_path (str | Path | None): matched summary parquet/CSV；None 定位默认参数缓存。
+        - outcome_mode (str): `profile` 或 `core_aligned`，默认 `profile`。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - bootstrap_cluster_unit (str | None): summary 使用的 bootstrap cluster unit；None 读取配置。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - annotate_counts (bool): 是否在点旁标注 SCV/control carrier counts，默认 False。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含 plotted rows、outcome_mode 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control/scv_matched_control_enrichment_<outcome>_<y0>_<y1>_depth<z>m_<matching>_boot<cluster>.png`（save_fig 时）。
+
+    说明:
+        - OR>1 表示 McCoy SCVs 比匹配的 non-catalogued profiles 更常携带深层 ΔDO 异常。
+        - 分区点共享样本且三个阈值嵌套；forest plot 用于 robustness，不应把每个 nominal p 值当独立发现。
+    """
+    if outcome_mode not in {'profile', 'core_aligned'}:
+        raise ValueError("outcome_mode must be 'profile' or 'core_aligned'.")
+    match_cfg = _scv_matched_control_config()
+    cluster_unit = str(
+        match_cfg['bootstrap_cluster_unit']
+        if bootstrap_cluster_unit is None else bootstrap_cluster_unit
+    )
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir('scv_matched_control', region_slug)
+    )
+    if summary is None:
+        if summary_path is None:
+            cohort_tag = _default_matched_control_run_tag([20.0, 35.0, 50.0])
+            summary_path = out_dir / (
+                f'scv_matched_control_summary_{outcome_mode}_'
+                f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+                f'depth{depth_tag}m_{cohort_tag}_boot{cluster_unit}.parquet'
+            )
+        summary_source = Path(summary_path)
+        summary = (
+            pd.read_csv(summary_source)
+            if summary_source.suffix.lower() == '.csv'
+            else pd.read_parquet(summary_source)
+        )
+    else:
+        summary = summary.copy()
+        summary_source = Path(summary_path) if summary_path is not None else Path('<memory>')
+    summary = summary[summary['outcome_mode'].astype(str).eq(outcome_mode)].copy()
+    if summary.empty:
+        raise ValueError(f'No matched-control summary rows for outcome_mode={outcome_mode}.')
+    if 'bootstrap_cluster_unit' in summary.columns:
+        summary_cluster_units = pd.unique(
+            summary['bootstrap_cluster_unit'].dropna().astype(str)
+        )
+        if len(summary_cluster_units) > 1:
+            raise ValueError(
+                'Summary contains mixed bootstrap cluster units: '
+                f'{summary_cluster_units.tolist()}'
+            )
+        if len(summary_cluster_units) == 1:
+            summary_cluster_unit = str(summary_cluster_units[0])
+            if (
+                bootstrap_cluster_unit is not None
+                and summary_cluster_unit != cluster_unit
+            ):
+                raise ValueError(
+                    f'Summary uses {summary_cluster_unit}, not {cluster_unit}.'
+                )
+            cluster_unit = summary_cluster_unit
+    cohort_tags = pd.unique(summary['cohort_tag'].astype(str))
+    if len(cohort_tags) != 1:
+        raise ValueError(f'Summary contains mixed cohort tags: {cohort_tags.tolist()}')
+    cohort_tag = str(cohort_tags[0])
+    scope_order = [
+        scope for scope in (
+            'Global', 'KE', 'North Pacific', 'Global excluding KE',
+            'Pacific excluding KE', 'Atlantic', 'Southern Ocean',
+        )
+        if scope in set(summary['scope'])
+    ]
+    thresholds = sorted(
+        pd.to_numeric(summary['threshold_umol_kg'], errors='coerce').dropna().unique()
+    )
+    y_base = np.arange(len(scope_order), dtype=float)
+    offsets = np.linspace(-0.22, 0.22, max(len(thresholds), 1))
+    fig, ax = plt.subplots(figsize=(11.5, max(6.5, 0.8 * len(scope_order) + 2.2)))
+    plotted = []
+    finite_bounds = []
+    for offset, threshold in zip(offsets, thresholds):
+        key, label, color, marker = _threshold_style(float(threshold))
+        part = summary[np.isclose(summary['threshold_umol_kg'], float(threshold))].set_index('scope')
+        for index, scope in enumerate(scope_order):
+            if scope not in part.index:
+                continue
+            row = part.loc[scope]
+            estimate = float(row['matched_mantel_haenszel_or'])
+            low = float(row['matched_bootstrap_ci_low'])
+            high = float(row['matched_bootstrap_ci_high'])
+            bootstrap_interval_valid = (
+                np.isfinite(estimate) and estimate > 0
+                and np.isfinite(low) and low > 0
+                and np.isfinite(high) and high >= low
+                and low <= estimate <= high
+            )
+            if not bootstrap_interval_valid:
+                estimate = float(row['pooled_conditional_exact_or'])
+                low = float(row['pooled_exact_ci_low'])
+                high = float(row['pooled_exact_ci_high'])
+            if not (
+                np.isfinite(estimate) and estimate > 0
+                and np.isfinite(low) and low > 0
+                and np.isfinite(high) and high >= estimate
+            ):
+                continue
+            y = float(y_base[index] + offset)
+            ax.errorbar(
+                estimate,
+                y,
+                xerr=[[estimate - low], [high - estimate]],
+                fmt=marker,
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor='white',
+                markeredgewidth=0.8,
+                markersize=8,
+                capsize=3,
+                linewidth=1.5,
+                label=label if index == 0 else None,
+                zorder=3,
+            )
+            if annotate_counts:
+                ax.annotate(
+                    f'{int(row["scv_numerator"])}/{int(row["scv_denominator"])} vs '
+                    f'{int(row["control_numerator"])}/{int(row["control_denominator"])}',
+                    (estimate, y),
+                    xytext=(6, 0),
+                    textcoords='offset points',
+                    va='center',
+                    fontsize=_PLOT_TYPOGRAPHY['annotation'],
+                    color=color,
+                )
+            finite_bounds.extend([low, high])
+            plotted.append({
+                'scope': scope,
+                'threshold': float(threshold),
+                'estimate': estimate,
+                'ci_low': low,
+                'ci_high': high,
+            })
+    ax.axvline(1.0, color='#4b5563', linestyle='--', linewidth=1.2, zorder=1)
+    ax.set_xscale('log')
+    if finite_bounds:
+        lower = max(min(finite_bounds) / 1.35, 0.05)
+        upper = max(finite_bounds) * 1.35
+        ax.set_xlim(lower, upper)
+    ax.set_yticks(y_base)
+    ax.set_yticklabels(scope_order)
+    ax.invert_yaxis()
+    ax.set_xlabel(
+        'Matched odds ratio for carrying a deep ΔDO anomaly',
+        fontsize=_PLOT_TYPOGRAPHY['axis_label'],
+    )
+    ax.set_title(
+        'SCV enrichment after environment matching'
+        if outcome_mode == 'profile'
+        else 'Core-aligned SCV enrichment after environment matching',
+        fontsize=_PLOT_TYPOGRAPHY['panel_title'],
+    )
+    ax.grid(axis='x', which='both', alpha=0.22)
+    ax.legend(frameon=False, fontsize=_PLOT_TYPOGRAPHY['tick_legend'], loc='best')
+    fig.text(
+        0.01,
+        0.01,
+        'Controls are DO/T/S-eligible non-catalogued BGC-Argo profiles; '
+        f'intervals use {cluster_unit.replace("_", " ")} bootstrap when finite.',
+        fontsize=_PLOT_TYPOGRAPHY['annotation'],
+        color='#4b5563',
+    )
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
+    fig.tight_layout(rect=(0.0, 0.045, 1.0, 1.0))
+    out = {
+        'rows': plotted,
+        'outcome_mode': outcome_mode,
+        'summary_source': str(summary_source),
+    }
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            f'scv_matched_control_enrichment_{outcome_mode}_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_{cohort_tag}_boot{cluster_unit}.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        out['figure_path'] = str(path)
+        print(f'[*] SCV matched-control enrichment figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def _scv_standardization_scope_mask(
+    frame: pd.DataFrame,
+    scope: str,
+) -> pd.Series:
+    """返回 SCV 空间标准化所用的海盆/KE scope mask。"""
+    basin = frame['basin'].astype(str)
+    is_ke = frame['is_ke'].fillna(False).astype(bool)
+    lat = pd.to_numeric(frame['lat'], errors='coerce')
+    if scope == 'Global':
+        return pd.Series(True, index=frame.index)
+    if scope == 'KE':
+        return is_ke
+    if scope == 'North Pacific':
+        return basin.eq('Pacific') & lat.ge(0.0)
+    if scope == 'Global excluding KE':
+        return ~is_ke
+    if scope == 'Pacific':
+        return basin.eq('Pacific')
+    if scope == 'Pacific excluding KE':
+        return basin.eq('Pacific') & ~is_ke
+    if scope == 'Atlantic':
+        return basin.eq('Atlantic')
+    if scope == 'Indian':
+        return basin.eq('Indian')
+    if scope == 'Southern Ocean':
+        return basin.eq('SO')
+    raise ValueError(f'Unsupported SCV standardization scope: {scope}')
+
+
+def _assign_scv_standardization_grid(
+    frame: pd.DataFrame,
+    grid_size_deg: float,
+) -> pd.DataFrame:
+    """给 profile 表追加 dateline-safe 全球经纬网格索引。"""
+    result = frame.copy()
+    lon = _normalize_lon_array(
+        pd.to_numeric(result['lon'], errors='coerce').to_numpy(dtype=float)
+    )
+    lat = np.clip(
+        pd.to_numeric(result['lat'], errors='coerce').to_numpy(dtype=float),
+        -90.0,
+        np.nextafter(90.0, -np.inf),
+    )
+    result['lon_bin'] = np.floor(
+        (lon + 180.0) / float(grid_size_deg)
+    ).astype(int)
+    result['lat_bin'] = np.floor(
+        (lat + 90.0) / float(grid_size_deg)
+    ).astype(int)
+    return result
+
+
+def _fixed_background_poisson_ratio_ci(
+    observed: int,
+    expected: float,
+) -> tuple[float, float]:
+    """返回 expected 固定时 Poisson standardized ratio 的 95% CI。"""
+    from scipy.stats import chi2
+
+    if expected <= 0:
+        return np.nan, np.nan
+    lower_count = (
+        0.0
+        if int(observed) == 0
+        else 0.5 * chi2.ppf(0.025, 2 * int(observed))
+    )
+    upper_count = 0.5 * chi2.ppf(0.975, 2 * (int(observed) + 1))
+    return float(lower_count / expected), float(upper_count / expected)
+
+
+def _poisson_binomial_upper_tail(
+    probabilities: np.ndarray,
+    observed: int,
+) -> float:
+    """返回独立 Bernoulli、非等概率固定背景 null 的上尾概率。"""
+    distribution = np.asarray([1.0], dtype=float)
+    for probability in np.asarray(probabilities, dtype=float):
+        distribution = np.convolve(
+            distribution,
+            np.asarray([1.0 - probability, probability], dtype=float),
+        )
+    return float(distribution[int(observed):].sum())
+
+
+def summarize_scv_spatial_standardization(
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
+    threshold_table: pd.DataFrame | None = None,
+    threshold_table_path: str | Path | None = None,
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    grid_sizes_deg: tuple[float, ...] | list[float] = (5.0, 10.0, 15.0, 20.0),
+    scopes: tuple[str, ...] | list[str] = (
+        'Global', 'KE', 'Global excluding KE', 'Pacific',
+        'Atlantic', 'Indian', 'Southern Ocean',
+    ),
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """按 SCV 地理分布标准化 ordinary-Argo 的深层 ΔDO 背景发生率。
+
+    每个空间格内先估计 DO-evaluable、非 McCoy-catalogued Argo 的异常率，再用同格 SCV 数量
+    加权得到 expected carriers。输出 observed/expected ratio 的网格尺度和区域敏感性，用于回答
+    SCV enrichment 是否只是 SCV 集中采样于高异常率海区。
+
+    参数:
+        - profile_eligibility (pd.DataFrame | None): profile eligibility 表；None 时读取路径或默认缓存。
+        - profile_eligibility_path (str | Path | None): eligibility parquet；None 定位默认参数缓存。
+        - threshold_table (pd.DataFrame | None): threshold-safe McCoy SCV long table；None 时读取路径。
+        - threshold_table_path (str | Path | None): McCoy threshold table parquet/CSV；None 定位默认缓存。
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值，默认 (20, 35, 50)。
+        - grid_sizes_deg (tuple[float, ...] | list[float]): 全球网格尺寸（°），默认 (5, 10, 15, 20)。
+        - scopes (tuple[str, ...] | list[str]): global、KE 与海盆 sensitivity scopes。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - save_data (bool): 是否保存 summary、cell details 和 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 threshold/scope/grid size 一行的 observed、expected 与 O/E。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_spatial_standardization/scv_spatial_standardization_summary_*.parquet`。
+        - 同参数的 summary CSV 与 cell-details parquet（save_data 时）。
+
+    说明:
+        - Ordinary-Argo background 排除 McCoy threshold table 中所有 catalogued profiles。
+        - Poisson CI 与 fixed-background tail 把格内背景率视为固定，仅作描述性 sensitivity；
+          主推断仍是 matched-control dependency-cluster bootstrap。
+        - 网格大小扫描用于检查地理分层任意性，不应选择结果最强的单一网格作 headline。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    grid_values = sorted({float(value) for value in grid_sizes_deg})
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+    if not grid_values or any(value <= 0 or value > 90 for value in grid_values):
+        raise ValueError('grid_sizes_deg must be within (0, 90].')
+
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir(
+            'scv_spatial_standardization', region_slug
+        )
+    )
+    match_cfg = _scv_matched_control_config()
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                make_detection_config('do').output_dir(
+                    'scv_matched_control', region_slug
+                ),
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
+            )
+        profile_source = Path(profile_eligibility_path)
+        profile_eligibility = pd.read_parquet(profile_source)
+    else:
+        profile_eligibility = profile_eligibility.copy()
+        profile_source = (
+            Path(profile_eligibility_path)
+            if profile_eligibility_path is not None else Path('<memory>')
+        )
+    required_profile = {
+        'Profile_number', 'lon', 'lat', 'basin', 'is_ke', 'do_evaluable',
+    }
+    missing_profile = required_profile.difference(profile_eligibility.columns)
+    if missing_profile:
+        raise ValueError(
+            f'Profile eligibility table missing columns: {sorted(missing_profile)}'
+        )
+    profile_eligibility['Profile_number'] = pd.to_numeric(
+        profile_eligibility['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    profile_eligibility = profile_eligibility[
+        profile_eligibility['Profile_number'].notna()
+    ].copy()
+    profile_eligibility['Profile_number'] = (
+        profile_eligibility['Profile_number'].astype(int)
+    )
+
+    if threshold_table is None:
+        if threshold_table_path is None:
+            threshold_table_path = (
+                make_detection_config('do').output_dir(
+                    'mccoy_scv_delta_do_thresholds', region_slug
+                )
+                / (
+                    f'mccoy_scv_delta_do_thresholds_{int(baseline_start_year)}_'
+                    f'{int(baseline_end_year)}_depth{depth_tag}m.parquet'
+                )
+            )
+        threshold_source = Path(threshold_table_path)
+        threshold_table = (
+            pd.read_csv(threshold_source)
+            if threshold_source.suffix.lower() == '.csv'
+            else pd.read_parquet(threshold_source)
+        )
+    else:
+        threshold_table = threshold_table.copy()
+        threshold_source = (
+            Path(threshold_table_path)
+            if threshold_table_path is not None else Path('<memory>')
+        )
+    required_threshold = {
+        'profile_number', 'threshold_umol_kg', 'do_evaluable',
+    }
+    missing_threshold = required_threshold.difference(threshold_table.columns)
+    if missing_threshold:
+        raise ValueError(
+            f'McCoy threshold table missing columns: {sorted(missing_threshold)}'
+        )
+    threshold_table['profile_number'] = pd.to_numeric(
+        threshold_table['profile_number'], errors='coerce'
+    ).astype('Int64')
+    threshold_table['threshold_umol_kg'] = pd.to_numeric(
+        threshold_table['threshold_umol_kg'], errors='coerce'
+    )
+    threshold_table = threshold_table[
+        threshold_table['profile_number'].notna()
+        & threshold_table['threshold_umol_kg'].isin(threshold_values)
+    ].copy()
+    present_thresholds = sorted(
+        threshold_table['threshold_umol_kg'].dropna().unique()
+    )
+    if present_thresholds != threshold_values:
+        raise ValueError(
+            f'Threshold table contains {present_thresholds}; '
+            f'requested {threshold_values}.'
+        )
+    evaluability_counts = threshold_table.groupby(
+        'profile_number'
+    )['do_evaluable'].nunique()
+    if evaluability_counts.gt(1).any():
+        raise RuntimeError('SCV DO evaluability differs across thresholds.')
+    scv_ids = set(
+        threshold_table.loc[
+            threshold_table['do_evaluable'].fillna(False).astype(bool),
+            'profile_number',
+        ].astype(int)
+    )
+    all_catalogued_ids = set(
+        threshold_table['profile_number'].dropna().astype(int)
+    )
+
+    evaluable = profile_eligibility[
+        profile_eligibility['do_evaluable'].fillna(False).astype(bool)
+    ].copy()
+    scvs = evaluable[
+        evaluable['Profile_number'].isin(scv_ids)
+    ].copy()
+    background = evaluable[
+        ~evaluable['Profile_number'].isin(all_catalogued_ids)
+    ].copy()
+    if len(scvs) != len(scv_ids):
+        missing_ids = sorted(scv_ids.difference(scvs['Profile_number']))
+        raise RuntimeError(
+            f'{len(missing_ids)} DO-evaluable SCVs are absent from eligibility: '
+            f'{missing_ids[:10]}'
+        )
+    anomaly_lookup, anomaly_paths = _do_threshold_anomaly_lookup(
+        threshold_values,
+        start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year),
+        anomaly_min_depth=float(anomaly_min_depth),
+        region_slug=region_slug,
+    )
+
+    summary_rows: list[dict] = []
+    cell_frames: list[pd.DataFrame] = []
+    grid_keys = ['lon_bin', 'lat_bin', 'basin', 'is_ke']
+    for scope in scopes:
+        scoped_scvs = scvs[
+            _scv_standardization_scope_mask(scvs, str(scope))
+        ].copy()
+        scoped_background = background[
+            _scv_standardization_scope_mask(background, str(scope))
+        ].copy()
+        for grid_size in grid_values:
+            scv_grid = _assign_scv_standardization_grid(
+                scoped_scvs, grid_size
+            )
+            background_grid = _assign_scv_standardization_grid(
+                scoped_background, grid_size
+            )
+            for threshold in threshold_values:
+                anomaly_ids = set(anomaly_lookup[float(threshold)].index)
+                scv_grid['has_anomaly'] = (
+                    scv_grid['Profile_number'].isin(anomaly_ids)
+                )
+                background_grid['has_anomaly'] = (
+                    background_grid['Profile_number'].isin(anomaly_ids)
+                )
+                background_cells = (
+                    background_grid.groupby(grid_keys, as_index=False)
+                    .agg(
+                        background_n=('Profile_number', 'size'),
+                        background_anomalies=('has_anomaly', 'sum'),
+                    )
+                )
+                background_cells['background_rate'] = (
+                    background_cells['background_anomalies']
+                    / background_cells['background_n']
+                )
+                scv_cells = (
+                    scv_grid.groupby(grid_keys, as_index=False)
+                    .agg(
+                        scv_n=('Profile_number', 'size'),
+                        observed=('has_anomaly', 'sum'),
+                    )
+                    .merge(background_cells, on=grid_keys, how='left')
+                )
+                missing_background = scv_cells['background_n'].isna()
+                if missing_background.any():
+                    missing_n = int(
+                        scv_cells.loc[missing_background, 'scv_n'].sum()
+                    )
+                    raise RuntimeError(
+                        f'{scope} at {grid_size:g}° has {missing_n} SCVs '
+                        'without ordinary-Argo background.'
+                    )
+                scv_cells['expected'] = (
+                    scv_cells['scv_n'] * scv_cells['background_rate']
+                )
+                probabilities = np.repeat(
+                    scv_cells['background_rate'].to_numpy(dtype=float),
+                    scv_cells['scv_n'].to_numpy(dtype=int),
+                )
+                observed = int(scv_cells['observed'].sum())
+                expected = float(scv_cells['expected'].sum())
+                ratio = observed / expected if expected > 0 else np.nan
+                ci_low, ci_high = _fixed_background_poisson_ratio_ci(
+                    observed, expected
+                )
+                n_scv = int(scv_cells['scv_n'].sum())
+                summary_rows.append({
+                    'threshold_umol_kg': float(threshold),
+                    'scope': str(scope),
+                    'grid_size_deg': float(grid_size),
+                    'n_scv': n_scv,
+                    'n_scv_cells': int(len(scv_cells)),
+                    'observed': observed,
+                    'expected': expected,
+                    'scv_observed_rate': (
+                        float(observed / n_scv) if n_scv else np.nan
+                    ),
+                    'spatially_expected_rate': (
+                        float(expected / n_scv) if n_scv else np.nan
+                    ),
+                    'observed_expected_ratio': ratio,
+                    'fixed_background_ratio_ci_low': ci_low,
+                    'fixed_background_ratio_ci_high': ci_high,
+                    'fixed_background_null_pvalue': (
+                        _poisson_binomial_upper_tail(
+                            probabilities, observed
+                        ) if probabilities.size else np.nan
+                    ),
+                    'weighted_mean_background_n_per_scv': (
+                        float(np.average(
+                            scv_cells['background_n'],
+                            weights=scv_cells['scv_n'],
+                        )) if n_scv else np.nan
+                    ),
+                    'minimum_background_n_in_scv_cell': (
+                        int(scv_cells['background_n'].min())
+                        if not scv_cells.empty else 0
+                    ),
+                    'scvs_in_cells_with_zero_background_anomalies': int(
+                        scv_cells.loc[
+                            scv_cells['background_anomalies'].eq(0),
+                            'scv_n',
+                        ].sum()
+                    ),
+                    'period_start': int(baseline_start_year),
+                    'period_end': int(baseline_end_year),
+                    'minimum_depth_m': float(anomaly_min_depth),
+                    'profile_eligibility_source': str(profile_source),
+                    'threshold_table_source': str(threshold_source),
+                    'anomaly_source': str(anomaly_paths[float(threshold)]),
+                    'inference_note': (
+                        'Descriptive fixed-background spatial standardization; '
+                        'profile/platform dependence is not included in this CI.'
+                    ),
+                })
+                cell_detail = scv_cells.copy()
+                cell_detail['threshold_umol_kg'] = float(threshold)
+                cell_detail['scope'] = str(scope)
+                cell_detail['grid_size_deg'] = float(grid_size)
+                cell_frames.append(cell_detail)
+
+    summary = pd.DataFrame(summary_rows)
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        threshold_tag = '-'.join(
+            _format_detection_value(value) for value in threshold_values
+        )
+        grid_tag = '-'.join(
+            _format_detection_value(value) for value in grid_values
+        )
+        stem = (
+            f'scv_spatial_standardization_{int(baseline_start_year)}_'
+            f'{int(baseline_end_year)}_depth{depth_tag}m_'
+            f'do{threshold_tag}_grid{grid_tag}deg'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}_summary.parquet')
+        summary.to_csv(out_dir / f'{stem}_summary.csv', index=False)
+        cells = (
+            pd.concat(cell_frames, ignore_index=True)
+            if cell_frames else pd.DataFrame()
+        )
+        _atomic_write_parquet(cells, out_dir / f'{stem}_cells.parquet')
+        print(
+            f'[*] SCV spatial-standardization summary saved: '
+            f'{out_dir / f"{stem}_summary.parquet"}'
+        )
+    return summary
+
+
+def plot_scv_spatial_standardization(
+    summary: pd.DataFrame,
+    *,
+    scope: str = 'Global',
+    output_dir: str | Path | None = None,
+    log_scale: bool = True,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 SCV spatial-standardization 的网格尺度敏感性。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_spatial_standardization` 输出。
+        - scope (str): 要绘制的区域 scope，默认 `Global`。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - log_scale (bool): 是否使用对数纵轴，默认 True。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含 plotted rows、scope 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_spatial_standardization/scv_spatial_standardization_<scope>.png`。
+
+    说明:
+        - 横向虚线 O/E=1 表示按 SCV 地理分布加权后的 ordinary-Argo 背景期望。
+        - 误差线是 fixed-background Poisson interval，不替代 matched-control 主推断。
+    """
+    required = {
+        'threshold_umol_kg', 'scope', 'grid_size_deg',
+        'observed_expected_ratio', 'fixed_background_ratio_ci_low',
+        'fixed_background_ratio_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Spatial-standardization summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary[summary['scope'].astype(str).eq(str(scope))].copy()
+    if plotted.empty:
+        raise ValueError(f'No spatial-standardization rows for scope={scope}.')
+    fig, ax = plt.subplots(figsize=(9.2, 6.2))
+    for threshold in sorted(
+        pd.to_numeric(
+            plotted['threshold_umol_kg'], errors='coerce'
+        ).dropna().unique()
+    ):
+        part = plotted[
+            pd.to_numeric(
+                plotted['threshold_umol_kg'], errors='coerce'
+            ).eq(float(threshold))
+        ].sort_values('grid_size_deg')
+        _, display, color, marker = _threshold_style(float(threshold))
+        estimate = pd.to_numeric(
+            part['observed_expected_ratio'], errors='coerce'
+        ).to_numpy(dtype=float)
+        low = pd.to_numeric(
+            part['fixed_background_ratio_ci_low'], errors='coerce'
+        ).to_numpy(dtype=float)
+        high = pd.to_numeric(
+            part['fixed_background_ratio_ci_high'], errors='coerce'
+        ).to_numpy(dtype=float)
+        ax.errorbar(
+            part['grid_size_deg'],
+            estimate,
+            yerr=np.vstack([estimate - low, high - estimate]),
+            marker=marker,
+            color=color,
+            linewidth=2.2,
+            markersize=8,
+            capsize=4,
+            label=display,
+        )
+    ax.axhline(1.0, color='#4b5563', linestyle='--', linewidth=1.3)
+    if log_scale:
+        ax.set_yscale('log')
+    ax.set_xlabel('Spatial-stratum grid size (degrees)')
+    ax.set_ylabel('Observed / spatially expected')
+    ax.set_title(f'SCV ΔDO enrichment after spatial standardization: {scope}')
+    ax.legend(frameon=False)
+    ax.grid(axis='y', color='#d1d5db', linewidth=0.7, alpha=0.65)
+    _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir(
+            'scv_spatial_standardization', region_slug
+        )
+    )
+    output = {'rows': plotted, 'scope': str(scope)}
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scope_tag = re.sub(r'[^A-Za-z0-9]+', '_', str(scope)).strip('_').lower()
+        path = out_dir / (
+            f'scv_spatial_standardization_{scope_tag}'
+            f'{"_log" if log_scale else ""}.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        output['figure_path'] = str(path)
+        print(f'[*] SCV spatial-standardization figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return output
+
+
 def _detector_short_label(cfg: DetectionConfig) -> str:
     """返回图标题里使用的 detector 标签。"""
     return {'do': 'ΔDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
