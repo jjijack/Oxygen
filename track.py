@@ -35605,7 +35605,7 @@ def _ofes_population_summary(
                 'same-sigma salinity < 0, AOU < 0, and N2 ratio < 1'
             ),
             'aou_independence_caveat': (
-                'AOU contains observed DO and is not independent of the '
+                'AOU directly contains DO and is not independent of the '
                 'positive-DO event detector'
             ),
             'wilson_interval_caveat': (
