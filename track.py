@@ -34876,6 +34876,1484 @@ def diagnose_ofes_ranked_events(
     }
 
 
+def _ofes_event_population_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 深层事件总体诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_population', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_population override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'candidate_threshold': float(
+            raw.get('candidate_threshold', 50.0)
+        ),
+        'expected_event_count': int(
+            raw.get('expected_event_count', 59)
+        ),
+        'heave_important_absolute_fraction_min': float(
+            raw.get('heave_important_absolute_fraction_min', 1 / 3)
+        ),
+        'surface_search_radius_km': float(
+            raw.get('surface_search_radius_km', 50.0)
+        ),
+        'surface_weight_scale_factor': float(
+            raw.get('surface_weight_scale_factor', 1.0)
+        ),
+        'surface_weight_support_factor': float(
+            raw.get('surface_weight_support_factor', 2.0)
+        ),
+        'surface_attenuation_ratio_max': float(
+            raw.get('surface_attenuation_ratio_max', 0.5)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_population')
+        ),
+    }
+    if (
+        not np.isfinite(settings['candidate_threshold'])
+        or settings['candidate_threshold'] <= 0
+    ):
+        raise ValueError(
+            'OFES population candidate_threshold must be positive.'
+        )
+    if settings['expected_event_count'] <= 0:
+        raise ValueError(
+            'OFES population expected_event_count must be positive.'
+        )
+    heave_fraction = settings[
+        'heave_important_absolute_fraction_min'
+    ]
+    if (
+        not np.isfinite(heave_fraction)
+        or not 0 < heave_fraction <= 0.5
+    ):
+        raise ValueError(
+            'OFES heave-important fraction must lie in (0, 0.5].'
+        )
+    ratio = settings['surface_attenuation_ratio_max']
+    if not np.isfinite(ratio) or not 0 < ratio < 1:
+        raise ValueError(
+            'OFES surface attenuation ratio must lie between 0 and 1.'
+        )
+    search_radius = settings['surface_search_radius_km']
+    if (
+        not np.isfinite(search_radius)
+        or search_radius <= 0
+        or search_radius
+        >= float(
+            _ofes_event_diagnostic_settings()[
+                'background_inner_radius_km'
+            ]
+        )
+    ):
+        raise ValueError(
+            'OFES surface search radius must be positive and smaller '
+            'than the diagnostic background inner radius.'
+        )
+    for key in (
+        'surface_weight_scale_factor',
+        'surface_weight_support_factor',
+    ):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(
+                f'OFES population {key} must be finite and positive.'
+            )
+    if settings['surface_weight_support_factor'] <= 1:
+        raise ValueError(
+            'OFES surface weight support factor must exceed 1.'
+        )
+    if settings['figure_dpi'] <= 0:
+        raise ValueError('OFES population figure_dpi must be positive.')
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES population output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_surface_expression_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    subsurface_rossby_number: float,
+    event_equivalent_radius_km: float,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> dict:
+    """诊断事件核心同日 SSH 异常与最上层速度梯度。"""
+    date_ts = pd.Timestamp(date).normalize()
+    outer_radius = float(
+        diagnostic_settings['background_outer_radius_km']
+    )
+    load_radius = (
+        outer_radius
+        + float(
+            diagnostic_settings['background_load_margin_km']
+        )
+    )
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    surface_depth = float(_ofes_tracer_coordinates(date_ts)[2][0])
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['eta', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+        depth_bounds=(surface_depth, surface_depth),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(core_lon),
+                float(core_lat),
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    background_mask = (
+        distance_km
+        >= float(diagnostic_settings['background_inner_radius_km'])
+    ) & (distance_km <= outer_radius)
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, float(core_lon)))
+        )
+    )
+    eta = np.asarray(snapshot['eta'], dtype=float)
+    eta_valid = background_mask & np.isfinite(eta)
+    valid_count = int(np.count_nonzero(eta_valid))
+    eta_background = (
+        float(np.median(eta[eta_valid]))
+        if valid_count
+        else np.nan
+    )
+    eta_core = float(eta[row, column])
+    kinematic_fields = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        surface_depth,
+        float(
+            diagnostic_settings['velocity_smoothing_sigma_pixels']
+        ),
+    )
+    kinematics = _ofes_kinematics_at_point(
+        kinematic_fields,
+        lon,
+        lat,
+        float(lon[column]),
+        float(lat[row]),
+    )
+    search_radius = float(
+        population_settings['surface_search_radius_km']
+    )
+    surface_rossby = np.asarray(
+        kinematic_fields['rossby_number'], dtype=float
+    )
+    local_mask = (
+        (distance_km <= search_radius)
+        & np.isfinite(surface_rossby)
+    )
+    subsurface_sign = np.sign(float(subsurface_rossby_number))
+    same_sign_mask = (
+        local_mask
+        & (surface_rossby * subsurface_sign > 0)
+    )
+    if np.count_nonzero(same_sign_mask):
+        candidate_rows, candidate_columns = np.nonzero(
+            same_sign_mask
+        )
+        candidate_values = np.abs(
+            surface_rossby[same_sign_mask]
+        )
+        choice = int(np.argmax(candidate_values))
+        nearby_row = int(candidate_rows[choice])
+        nearby_column = int(candidate_columns[choice])
+        nearby_abs_rossby = float(candidate_values[choice])
+        nearby_distance = float(
+            distance_km[nearby_row, nearby_column]
+        )
+    else:
+        nearby_abs_rossby = 0.0
+        nearby_distance = np.nan
+    if (
+        not np.isfinite(event_equivalent_radius_km)
+        or float(event_equivalent_radius_km) <= 0
+    ):
+        raise ValueError(
+            'OFES peak-event equivalent radius must be positive.'
+        )
+    weight_scale = (
+        float(event_equivalent_radius_km)
+        * float(population_settings['surface_weight_scale_factor'])
+    )
+    weight_support = (
+        weight_scale
+        * float(population_settings['surface_weight_support_factor'])
+    )
+    if weight_support >= float(
+        diagnostic_settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES surface core-weight support overlaps the background '
+            'annulus.'
+        )
+    weight_mask = (
+        (distance_km <= weight_support)
+        & np.isfinite(surface_rossby)
+    )
+    weights = np.exp(
+        -0.5 * (distance_km[weight_mask] / weight_scale) ** 2
+    )
+    weighted_surface_rossby = (
+        float(
+            np.sum(weights * surface_rossby[weight_mask])
+            / np.sum(weights)
+        )
+        if weights.size and float(np.sum(weights)) > 0
+        else np.nan
+    )
+    required = (
+        eta_core,
+        eta_background,
+        kinematics['rossby_number'],
+        kinematics['normalized_strain'],
+        kinematics['normalized_okubo_weiss'],
+        weighted_surface_rossby,
+    )
+    failure_reasons: list[str] = []
+    if valid_count < int(
+        diagnostic_settings['background_min_valid_columns']
+    ):
+        failure_reasons.append('insufficient_surface_background_columns')
+    if not all(np.isfinite(value) for value in required):
+        failure_reasons.append('nonfinite_surface_metric')
+    return {
+        'surface_depth_m': surface_depth,
+        'surface_eta_core_m': eta_core,
+        'surface_eta_background_median_m': eta_background,
+        'surface_eta_contrast_m': float(
+            eta_core - eta_background
+        ),
+        'surface_background_valid_columns': valid_count,
+        'surface_speed_m_s': float(kinematics['speed_m_s']),
+        'surface_relative_vorticity_s_1': float(
+            kinematics['relative_vorticity_s_1']
+        ),
+        'surface_rossby_number': float(
+            kinematics['rossby_number']
+        ),
+        'surface_normalized_strain': float(
+            kinematics['normalized_strain']
+        ),
+        'surface_normalized_okubo_weiss': float(
+            kinematics['normalized_okubo_weiss']
+        ),
+        'surface_search_radius_km': search_radius,
+        'surface_same_sign_abs_rossby_max': nearby_abs_rossby,
+        'surface_same_sign_abs_rossby_max_distance_km': (
+            nearby_distance
+        ),
+        'surface_weight_scale_km': weight_scale,
+        'surface_weight_support_km': weight_support,
+        'surface_core_weighted_rossby_number': (
+            weighted_surface_rossby
+        ),
+        'surface_diagnostic_passed': bool(not failure_reasons),
+        'surface_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(dict.fromkeys(failure_reasons))
+        ),
+    }
+
+
+def _ofes_add_population_metrics(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """为峰值诊断表添加连续比率和透明的运算分类。"""
+    result = diagnostics.copy()
+    water_mass_abs = result['water_mass_do_contrast'].abs()
+    heave_abs = result['heave_do_contribution'].abs()
+    contribution_total = water_mass_abs + heave_abs
+    result['water_mass_absolute_fraction'] = np.divide(
+        water_mass_abs,
+        contribution_total,
+        out=np.full(len(result), np.nan, dtype=float),
+        where=contribution_total.to_numpy(dtype=float) > 0,
+    )
+    result['heave_absolute_fraction'] = (
+        1.0 - result['water_mass_absolute_fraction']
+    )
+    result['water_mass_dominated'] = (
+        water_mass_abs > heave_abs
+    )
+    result['heave_important'] = (
+        result['heave_absolute_fraction']
+        >= float(
+            settings['heave_important_absolute_fraction_min']
+        )
+    )
+    result['contribution_regime'] = np.select(
+        [water_mass_abs > heave_abs, heave_abs > water_mass_abs],
+        ['water_mass_dominated', 'heave_dominated'],
+        default='balanced',
+    )
+    result['low_salinity_fingerprint'] = (
+        result['same_sigma_salinity_contrast'] < 0
+    )
+    result['low_aou_fingerprint'] = (
+        result['same_sigma_aou_contrast'] < 0
+    )
+    result['weak_n2_fingerprint'] = (
+        result['n2_ratio_core_to_background'] < 1
+    )
+    result['joint_water_mass_fingerprint'] = (
+        result['low_salinity_fingerprint']
+        & result['low_aou_fingerprint']
+        & result['weak_n2_fingerprint']
+    )
+    result['absolute_subsurface_rossby_number'] = (
+        result['rossby_number'].abs()
+    )
+    result['absolute_surface_rossby_number'] = (
+        result['surface_rossby_number'].abs()
+    )
+    result['absolute_surface_core_weighted_rossby_number'] = (
+        result['surface_core_weighted_rossby_number'].abs()
+    )
+    result[
+        'surface_to_subsurface_colocated_rotation_ratio'
+    ] = np.divide(
+        result['absolute_surface_rossby_number'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result[
+        'surface_to_subsurface_nearby_rotation_ratio'
+    ] = np.divide(
+        result['surface_same_sign_abs_rossby_max'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result[
+        'surface_to_subsurface_core_weighted_rotation_ratio'
+    ] = np.divide(
+        result['absolute_surface_core_weighted_rossby_number'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result['rotation_dominated'] = (
+        result['absolute_subsurface_rossby_number']
+        > result['normalized_strain']
+    )
+    result['kinematic_regime'] = np.select(
+        [
+            result['absolute_subsurface_rossby_number']
+            > result['normalized_strain'],
+            result['normalized_strain']
+            > result['absolute_subsurface_rossby_number'],
+        ],
+        ['rotation_dominated', 'strain_dominated'],
+        default='balanced',
+    )
+    result['negative_subsurface_rossby_number'] = (
+        result['rossby_number'] < 0
+    )
+    result['surface_core_rotation_polarity_match'] = (
+        result['surface_core_weighted_rossby_number']
+        * result['rossby_number']
+        > 0
+    )
+    result['surface_attenuated_rotation'] = (
+        result['rotation_dominated']
+        & result['surface_core_rotation_polarity_match']
+        & (
+            result[
+                'surface_to_subsurface_core_weighted_rotation_ratio'
+            ]
+            <= float(settings['surface_attenuation_ratio_max'])
+        )
+    )
+    result['surface_weak_or_reversed_rotation'] = (
+        result['rotation_dominated']
+        & (
+            ~result['surface_core_rotation_polarity_match']
+            | (
+                result[
+                    'surface_to_subsurface_core_weighted_rotation_ratio'
+                ]
+                <= float(settings['surface_attenuation_ratio_max'])
+            )
+        )
+    )
+    result['absolute_surface_eta_contrast_m'] = (
+        result['surface_eta_contrast_m'].abs()
+    )
+    result['population_diagnostic_passed'] = (
+        result['diagnostic_passed']
+        & result['surface_diagnostic_passed']
+        & result['background_annulus_within_delivery_window']
+    )
+    result['population_diagnostic_status'] = np.select(
+        [
+            ~result['diagnostic_passed'],
+            ~result['surface_diagnostic_passed'],
+            ~result['background_annulus_within_delivery_window'],
+        ],
+        [
+            'failed_subsurface_diagnostic',
+            'failed_surface_diagnostic',
+            'delivery_edge_clipped_background',
+        ],
+        default='passed',
+    )
+    return result
+
+
+def _ofes_population_boolean_summary(
+    values: pd.Series,
+) -> dict:
+    """返回布尔指标的计数、比例与 95% Wilson 区间。"""
+    clean = values.dropna().astype(bool)
+    total = int(len(clean))
+    successes = int(clean.sum())
+    if total == 0:
+        return {
+            'count': 0,
+            'total': 0,
+            'fraction': None,
+            'wilson95': [None, None],
+        }
+    proportion = successes / total
+    z_value = 1.959963984540054
+    denominator = 1 + z_value**2 / total
+    center = (
+        proportion + z_value**2 / (2 * total)
+    ) / denominator
+    half_width = (
+        z_value
+        * np.sqrt(
+            proportion * (1 - proportion) / total
+            + z_value**2 / (4 * total**2)
+        )
+        / denominator
+    )
+    return {
+        'count': successes,
+        'total': total,
+        'fraction': float(proportion),
+        'wilson95': [
+            float(center - half_width),
+            float(center + half_width),
+        ],
+    }
+
+
+def _ofes_population_summary(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """汇总 OFES 深层事件总体的比例、分布和秩相关。"""
+    passed = diagnostics.loc[
+        diagnostics['population_diagnostic_passed']
+    ].copy()
+    rotation = passed.loc[passed['rotation_dominated']]
+    polarity_matched_rotation = rotation.loc[
+        rotation['surface_core_rotation_polarity_match']
+    ]
+    proportions = {
+        'water_mass_dominated': _ofes_population_boolean_summary(
+            passed['water_mass_dominated']
+        ),
+        'heave_important': _ofes_population_boolean_summary(
+            passed['heave_important']
+        ),
+        'low_salinity_fingerprint': _ofes_population_boolean_summary(
+            passed['low_salinity_fingerprint']
+        ),
+        'low_aou_fingerprint': _ofes_population_boolean_summary(
+            passed['low_aou_fingerprint']
+        ),
+        'weak_n2_fingerprint': _ofes_population_boolean_summary(
+            passed['weak_n2_fingerprint']
+        ),
+        'joint_water_mass_fingerprint': (
+            _ofes_population_boolean_summary(
+                passed['joint_water_mass_fingerprint']
+            )
+        ),
+        'rotation_dominated': _ofes_population_boolean_summary(
+            passed['rotation_dominated']
+        ),
+        'anticyclonic_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['negative_subsurface_rossby_number']
+            )
+        ),
+        'surface_polarity_matched_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['surface_core_rotation_polarity_match']
+            )
+        ),
+        'surface_attenuated_among_polarity_matched_rotation': (
+            _ofes_population_boolean_summary(
+                polarity_matched_rotation[
+                    'surface_attenuated_rotation'
+                ]
+            )
+        ),
+        'surface_weak_or_reversed_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['surface_weak_or_reversed_rotation']
+            )
+        ),
+    }
+    quantile_columns = (
+        'water_mass_absolute_fraction',
+        'heave_absolute_fraction',
+        'same_sigma_salinity_contrast',
+        'same_sigma_aou_contrast',
+        'n2_ratio_core_to_background',
+        'absolute_subsurface_rossby_number',
+        'normalized_strain',
+        'surface_to_subsurface_colocated_rotation_ratio',
+        'surface_to_subsurface_core_weighted_rotation_ratio',
+        'surface_to_subsurface_nearby_rotation_ratio',
+        'surface_eta_contrast_m',
+    )
+    distributions: dict[str, dict] = {}
+    for column in quantile_columns:
+        values = pd.to_numeric(
+            passed[column], errors='coerce'
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        if values.empty:
+            distributions[column] = {
+                'count': 0,
+                'q25': None,
+                'median': None,
+                'q75': None,
+            }
+        else:
+            distributions[column] = {
+                'count': int(len(values)),
+                'q25': float(values.quantile(0.25)),
+                'median': float(values.median()),
+                'q75': float(values.quantile(0.75)),
+            }
+
+    correlation_pairs = {
+        'delta_do_vs_subsurface_abs_rossby': (
+            'delta_do_max',
+            'absolute_subsurface_rossby_number',
+        ),
+        'delta_do_vs_normalized_strain': (
+            'delta_do_max',
+            'normalized_strain',
+        ),
+        'delta_do_vs_surface_abs_rossby': (
+            'delta_do_max',
+            'absolute_surface_rossby_number',
+        ),
+        'delta_do_vs_nearby_surface_abs_rossby': (
+            'delta_do_max',
+            'surface_same_sign_abs_rossby_max',
+        ),
+        'delta_do_vs_core_weighted_surface_abs_rossby': (
+            'delta_do_max',
+            'absolute_surface_core_weighted_rossby_number',
+        ),
+        'subsurface_vs_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'absolute_surface_rossby_number',
+        ),
+        'subsurface_vs_nearby_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'surface_same_sign_abs_rossby_max',
+        ),
+        'subsurface_vs_core_weighted_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'absolute_surface_core_weighted_rossby_number',
+        ),
+    }
+    correlations: dict[str, dict] = {}
+    for label, (x_name, y_name) in correlation_pairs.items():
+        pair = passed[[x_name, y_name]].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if (
+            len(pair) < 3
+            or pair[x_name].nunique() < 2
+            or pair[y_name].nunique() < 2
+        ):
+            correlations[label] = {
+                'count': int(len(pair)),
+                'spearman_rho': None,
+                'p_value': None,
+            }
+            continue
+        rho, p_value = spearmanr(
+            pair[x_name].to_numpy(dtype=float),
+            pair[y_name].to_numpy(dtype=float),
+        )
+        correlations[label] = {
+            'count': int(len(pair)),
+            'spearman_rho': float(rho),
+            'p_value': float(p_value),
+        }
+    return {
+        'event_count': int(len(diagnostics)),
+        'passed_event_count': int(len(passed)),
+        'failed_event_count': int(
+            len(diagnostics) - len(passed)
+        ),
+        'diagnostic_status_counts': {
+            str(key): int(value)
+            for key, value in diagnostics[
+                'population_diagnostic_status'
+            ].value_counts(dropna=False).items()
+        },
+        'candidate_threshold': float(
+            settings['candidate_threshold']
+        ),
+        'surface_attenuation_ratio_max': float(
+            settings['surface_attenuation_ratio_max']
+        ),
+        'surface_search_radius_km': float(
+            settings['surface_search_radius_km']
+        ),
+        'surface_weight_scale_factor': float(
+            settings['surface_weight_scale_factor']
+        ),
+        'surface_weight_support_factor': float(
+            settings['surface_weight_support_factor']
+        ),
+        'heave_important_absolute_fraction_min': float(
+            settings['heave_important_absolute_fraction_min']
+        ),
+        'operational_definitions': {
+            'water_mass_dominated': (
+                '|water-mass contribution| > |heave contribution|'
+            ),
+            'heave_important': (
+                '|heave| / (|water mass| + |heave|) >= '
+                f'{settings["heave_important_absolute_fraction_min"]:g}'
+            ),
+            'rotation_dominated': (
+                '|subsurface Rossby number| > normalized strain'
+            ),
+            'surface_attenuated_rotation': (
+                'rotation dominated, core-weighted surface and '
+                'subsurface Ro have the same sign, and their absolute '
+                'ratio <= '
+                f'{settings["surface_attenuation_ratio_max"]:g}'
+            ),
+            'surface_core_weighting': (
+                'Gaussian scale = peak anomaly area-equivalent radius '
+                f'x {settings["surface_weight_scale_factor"]:g}; '
+                'support = scale '
+                f'x {settings["surface_weight_support_factor"]:g}'
+            ),
+            'nearby_maximum_caveat': (
+                f'maximum same-sign surface Ro within '
+                f'{settings["surface_search_radius_km"]:g} km is retained '
+                'only as a permissive upper-envelope sensitivity'
+            ),
+            'joint_water_mass_fingerprint': (
+                'same-sigma salinity < 0, AOU < 0, and N2 ratio < 1'
+            ),
+            'aou_independence_caveat': (
+                'AOU contains observed DO and is not independent of the '
+                'positive-DO event detector'
+            ),
+            'wilson_interval_caveat': (
+                'Wilson intervals are descriptive because independence '
+                'among linked or recurrent events has not been established'
+            ),
+        },
+        'proportions': proportions,
+        'distributions': distributions,
+        'correlations': correlations,
+    }
+
+
+def _plot_ofes_event_population(
+    diagnostics: pd.DataFrame,
+    summary: dict,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制水团、动力、表层衰减和 tracer fingerprint 总体图。"""
+    passed = diagnostics.loc[
+        diagnostics['population_diagnostic_passed']
+    ].copy()
+    if passed.empty:
+        raise RuntimeError(
+            'No passed OFES population diagnostics are available to plot.'
+        )
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 10.5))
+
+    ax = axes[0, 0]
+    scatter = ax.scatter(
+        passed['water_mass_do_contrast'],
+        passed['heave_do_contribution'],
+        c=passed['peak_depth_m'],
+        cmap='viridis',
+        s=42,
+        alpha=0.82,
+    )
+    limit = float(
+        np.nanmax(
+            np.abs(
+                passed[
+                    [
+                        'water_mass_do_contrast',
+                        'heave_do_contribution',
+                    ]
+                ].to_numpy(dtype=float)
+            )
+        )
+    )
+    line = np.linspace(-limit, limit, 200)
+    ax.plot(line, line, '--', color='0.55', linewidth=1)
+    ax.plot(line, -line, '--', color='0.55', linewidth=1)
+    ax.axhline(0, color='0.8', linewidth=0.8)
+    ax.axvline(0, color='0.8', linewidth=0.8)
+    ax.set_xlabel('Water-mass DO contribution (µmol kg⁻¹)')
+    ax.set_ylabel('Heave DO contribution (µmol kg⁻¹)')
+    water = summary['proportions']['water_mass_dominated']
+    ax.set_title(
+        'A  Peak decomposition  '
+        f'({water["count"]}/{water["total"]} water-mass dominated)'
+    )
+    fig.colorbar(scatter, ax=ax, label='Peak depth (m)')
+
+    ax = axes[0, 1]
+    colors = np.where(
+        passed['rossby_number'] < 0,
+        '#2563eb',
+        '#dc2626',
+    )
+    ax.scatter(
+        passed['absolute_subsurface_rossby_number'],
+        passed['normalized_strain'],
+        c=colors,
+        s=42,
+        alpha=0.82,
+    )
+    maximum = float(
+        np.nanmax(
+            passed[
+                [
+                    'absolute_subsurface_rossby_number',
+                    'normalized_strain',
+                ]
+            ].to_numpy(dtype=float)
+        )
+    )
+    ax.plot([0, maximum], [0, maximum], '--', color='0.4')
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Subsurface |Rossby number|')
+    ax.set_ylabel('Subsurface normalized strain')
+    rotation = summary['proportions']['rotation_dominated']
+    ax.set_title(
+        'B  Subsurface kinematics  '
+        f'({rotation["count"]}/{rotation["total"]} rotation dominated)'
+    )
+    ax.legend(
+        handles=[
+            Line2D(
+                [], [], marker='o', linestyle='', color='#2563eb',
+                label='anticyclonic'
+            ),
+            Line2D(
+                [], [], marker='o', linestyle='', color='#dc2626',
+                label='cyclonic'
+            ),
+        ],
+        frameon=False,
+    )
+
+    ax = axes[1, 0]
+    eta_cm = 100.0 * passed['surface_eta_contrast_m']
+    eta_norm = Normalize(
+        vmin=float(eta_cm.min()),
+        vmax=float(eta_cm.max()),
+    )
+    rotation_rows = passed['rotation_dominated']
+    polarity_match_rows = (
+        rotation_rows
+        & passed['surface_core_rotation_polarity_match']
+    )
+    reversed_rows = rotation_rows & ~polarity_match_rows
+    surface_scatter = ax.scatter(
+        passed.loc[
+            polarity_match_rows,
+            'absolute_subsurface_rossby_number',
+        ],
+        passed.loc[
+            polarity_match_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[polarity_match_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=42,
+        alpha=0.82,
+        edgecolors='black',
+        linewidths=0.5,
+        label='rotation; polarity matched',
+    )
+    ax.scatter(
+        passed.loc[
+            reversed_rows, 'absolute_subsurface_rossby_number'
+        ],
+        passed.loc[
+            reversed_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[reversed_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=48,
+        alpha=0.9,
+        marker='s',
+        edgecolors='#7e22ce',
+        linewidths=1.2,
+        label='rotation; polarity reversed',
+    )
+    ax.scatter(
+        passed.loc[
+            ~rotation_rows, 'absolute_subsurface_rossby_number'
+        ],
+        passed.loc[
+            ~rotation_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[~rotation_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=42,
+        alpha=0.82,
+        marker='x',
+        label='strain dominated',
+    )
+    maximum = float(
+        np.nanmax(
+            passed[
+                [
+                    'absolute_subsurface_rossby_number',
+                    'absolute_surface_core_weighted_rossby_number',
+                ]
+            ].to_numpy(dtype=float)
+        )
+    )
+    ratio = float(summary['surface_attenuation_ratio_max'])
+    ax.plot([0, maximum], [0, maximum], '--', color='0.4')
+    ax.plot(
+        [0, maximum],
+        [0, ratio * maximum],
+        ':',
+        color='0.4',
+    )
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Subsurface |Rossby number|')
+    ax.set_ylabel('Core-weighted surface |Rossby number|')
+    decoupled = summary['proportions'][
+        'surface_weak_or_reversed_among_rotation_dominated'
+    ]
+    ax.set_title(
+        'C  Core-centered surface expression  '
+        f'({decoupled["count"]}/{decoupled["total"]} weak/reversed)'
+    )
+    ax.legend(frameon=False)
+    fig.colorbar(
+        surface_scatter,
+        ax=ax,
+        label='Core-minus-annulus SSH (cm)',
+    )
+
+    ax = axes[1, 1]
+    fingerprint_scatter = ax.scatter(
+        passed['same_sigma_salinity_contrast'],
+        passed['same_sigma_aou_contrast'],
+        c=passed['n2_ratio_core_to_background'],
+        cmap='cividis',
+        s=42,
+        alpha=0.82,
+    )
+    ax.axhline(0, color='0.5', linewidth=1)
+    ax.axvline(0, color='0.5', linewidth=1)
+    ax.set_xlabel('Same-σ salinity contrast')
+    ax.set_ylabel('Same-σ AOU contrast (µmol kg⁻¹)')
+    fingerprint = summary['proportions'][
+        'joint_water_mass_fingerprint'
+    ]
+    ax.set_title(
+        'D  Joint water-mass fingerprint  '
+        f'({fingerprint["count"]}/{fingerprint["total"]} joint)'
+    )
+    fig.colorbar(
+        fingerprint_scatter,
+        ax=ax,
+        label='Core/background N² ratio',
+    )
+    fig.suptitle(
+        'OFES DO50 deep-event population at objective peak dates',
+        fontsize=16,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(target, dpi=int(dpi), bbox_inches='tight')
+    plt.close(fig)
+    return target
+
+
+def _ofes_event_population_run_identity(
+    diagnostic_run_dir: str | Path,
+    catalog_run_dir: str | Path,
+    settings: dict,
+    diagnostic_settings: dict,
+    requests: pd.DataFrame,
+) -> tuple[dict, pd.DataFrame]:
+    """构建 OFES 事件总体诊断的输入 inventory 与稳定签名。"""
+    diagnostic_root = Path(diagnostic_run_dir)
+    catalog_root = Path(catalog_run_dir)
+    dates = sorted(
+        pd.to_datetime(requests['peak_date']).dt.normalize().unique()
+    )
+    inventory_records: list[dict] = []
+    for date_value in dates:
+        date = pd.Timestamp(date_value)
+        for variable in (
+            'do2', 'temp', 'salinity', 'u', 'v', 'eta'
+        ):
+            path = _ofes_file_path(variable, date)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f'OFES population source file not found: {path}'
+                )
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': date,
+                    'variable': variable,
+                    'roles': 'deep_event_peak_population',
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    inventory = pd.DataFrame(inventory_records)
+    inventory_payload = inventory.assign(
+        date=inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_file_path,
+            _ofes_contiguous_slice,
+            _ofes_assert_coordinate_match,
+            _ofes_subset_to_float32,
+            load_ofes_snapshot,
+            _ofes_tracer_coordinates,
+            approximate_degree_length,
+            great_circle_distance_m,
+            adaptive_distance_m,
+            _minimal_lon_diff_deg,
+            _ofes_event_diagnostic_settings,
+            _ofes_event_population_settings,
+            _ofes_profile_value_at_depth,
+            _ofes_sigma0_profile,
+            _ofes_point_thermodynamics,
+            _ofes_n2_at_depth,
+            _ofes_density_crossing_near_depth,
+            _ofes_masked_median_profiles,
+            _ofes_nan_gaussian,
+            _ofes_fixed_depth_kinematic_fields,
+            _ofes_kinematics_at_point,
+            _ofes_delivery_edge_distance_km,
+            _ofes_diagnose_water_mass_day,
+            _ofes_surface_expression_day,
+            _ofes_add_population_metrics,
+            _ofes_population_boolean_summary,
+            _ofes_population_summary,
+            _plot_ofes_event_population,
+            _ofes_event_population_run_identity,
+            generalize_ofes_deep_events,
+        )
+    )
+    code_sha256 = hashlib.sha256(
+        code_sources.encode('utf-8')
+    ).hexdigest()
+    input_sha256 = {
+        'diagnostic_manifest.json': _file_sha256(
+            diagnostic_root / 'manifest.json'
+        ),
+        'deep_sensitivity_ranking.parquet': _file_sha256(
+            diagnostic_root / 'deep_sensitivity_ranking.parquet'
+        ),
+        'catalog_manifest.json': _file_sha256(
+            catalog_root / 'manifest.json'
+        ),
+        'daily_objects.parquet': _file_sha256(
+            catalog_root / 'daily_objects.parquet'
+        ),
+    }
+    repo_root = Path(__file__).resolve().parent
+    signature_payload = {
+        'schema_version': 2,
+        'diagnostic_run_dir': str(diagnostic_root),
+        'catalog_run_dir': str(catalog_root),
+        'input_sha256': input_sha256,
+        'settings': settings,
+        'diagnostic_settings': diagnostic_settings,
+        'event_ids': requests['event_id'].astype(str).tolist(),
+        'peak_daily_object_keys': requests[
+            'peak_daily_object_key'
+        ].astype(str).tolist(),
+        'source_inventory_sha256': inventory_sha256,
+        'population_code_sha256': code_sha256,
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+    }
+    canonical = json.dumps(
+        signature_payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    return (
+        {
+            **signature_payload,
+            'run_signature': run_signature,
+            'run_tag': f'ofes_population_{run_signature[:12]}',
+            'source_identity_basis': (
+                'peak-date OFES path, size_bytes, and mtime_ns; '
+                'catalog and diagnostic inputs are content-hashed'
+            ),
+        },
+        inventory,
+    )
+
+
+def generalize_ofes_deep_events(
+    diagnostic_run_dir: str | Path,
+    *,
+    population_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """OFES DO50 深层事件的峰值水团、动力与表层表达总体诊断。
+
+    入口只消费已完成的 schema-v2 前五诊断运行及其年度 catalog，
+    客观固定其中 DO50、500–900 m 的 59 个事件。每个事件仅在
+    catalog peak 日诊断一次，并将深层水团/heave 分解与同日 SSH
+    环带异常、最上层涡度/应变及 50 km 内同极性涡度峰值合并成
+    event-level scalars。
+
+    参数:
+        - diagnostic_run_dir (str | Path): 已完成的 schema-v2 OFES event diagnostics 运行目录。
+        - population_overrides (dict | None): 临时覆盖已声明的 event_population 配置。
+        - output_dir (str | Path | None): 总体诊断根目录；None 时写到诊断运行下的配置子目录。
+        - resume (bool): 是否复用签名一致的单事件峰值 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、59-event 输入表、峰值诊断表、总结和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>.parquet`。
+        - `<run_dir>/population_events.parquet`、`population_peak_diagnostics.parquet`、`population_summary.json`、`source_inventory.parquet`、`population_phase_space.png` 和 `manifest.json`。
+
+    说明:
+        - water-mass dominated 只指峰值日分解中水团项绝对值大于 heave 项，不是因果归因。
+        - rotation/strain 以同量纲的 |Ro| 与 strain/|f| 直接比较；表层衰减使用半径内同极性最大 |Ro|，仍只是运算标签，不同于已证实的 surface-blind SCV。
+        - AOU 包含 DO，与正 DO 事件检测器不独立；联合 fingerprint 只作水团描述，不当作额外独立证据。
+        - 该节点不启动轨迹、聚类、frontogenesis 或混合层诊断；后续方法由总体结果选择。
+    """
+    diagnostic_root = Path(diagnostic_run_dir)
+    settings = _ofes_event_population_settings(
+        population_overrides
+    )
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    diagnostic_manifest = json.loads(
+        (diagnostic_root / 'manifest.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if (
+        diagnostic_manifest.get('status') != 'complete'
+        or int(diagnostic_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES population diagnostics require a complete '
+            'schema-v2 diagnostic run.'
+        )
+    catalog_root = Path(
+        diagnostic_manifest['catalog_run_dir']
+    )
+    if not catalog_root.exists():
+        catalog_root = diagnostic_root.parent.parent
+    catalog_manifest = json.loads(
+        (catalog_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        catalog_manifest.get('status') != 'complete'
+        or int(catalog_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES population diagnostics require a complete '
+            'schema-v2 catalog.'
+        )
+
+    deep_events = pd.read_parquet(
+        diagnostic_root / 'deep_sensitivity_ranking.parquet'
+    )
+    deep_events = deep_events.loc[
+        np.isclose(
+            deep_events['threshold'].to_numpy(dtype=float),
+            float(settings['candidate_threshold']),
+        )
+        & deep_events['deep_sensitivity_eligible']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    if len(deep_events) != int(settings['expected_event_count']):
+        raise RuntimeError(
+            'OFES deep population count changed: expected '
+            f'{settings["expected_event_count"]}, found '
+            f'{len(deep_events)}.'
+        )
+    if deep_events['event_id'].duplicated().any():
+        raise RuntimeError('OFES deep population contains duplicate events.')
+    linked_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    peak_objects = linked_objects.loc[
+        linked_objects['daily_object_key'].isin(
+            deep_events['peak_daily_object_key']
+        )
+    ].copy()
+    if (
+        len(peak_objects) != len(deep_events)
+        or peak_objects['daily_object_key'].duplicated().any()
+    ):
+        raise RuntimeError(
+            'OFES deep events do not map one-to-one to peak daily objects.'
+        )
+    peak_objects = peak_objects.rename(
+        columns={
+            'date': 'diagnostic_date',
+            'peak_lon': 'daily_peak_lon',
+            'peak_lat': 'daily_peak_lat',
+            'peak_depth_at_max': 'daily_peak_depth_m',
+            'delta_do_max': 'daily_peak_delta_do',
+            'area_km2': 'daily_peak_area_km2',
+            'equivalent_radius_km': (
+                'daily_peak_equivalent_radius_km'
+            ),
+            'pixel_count': 'daily_peak_pixel_count',
+        }
+    )
+    requests = deep_events.merge(
+        peak_objects[
+            [
+                'event_id',
+                'daily_object_key',
+                'diagnostic_date',
+                'daily_peak_lon',
+                'daily_peak_lat',
+                'daily_peak_depth_m',
+                'daily_peak_delta_do',
+                'daily_peak_area_km2',
+                'daily_peak_equivalent_radius_km',
+                'daily_peak_pixel_count',
+            ]
+        ],
+        left_on=['event_id', 'peak_daily_object_key'],
+        right_on=['event_id', 'daily_object_key'],
+        how='left',
+        validate='one_to_one',
+    )
+    if requests['diagnostic_date'].isna().any():
+        raise RuntimeError(
+            'At least one OFES population event lacks a peak object.'
+        )
+    if not np.array_equal(
+        pd.to_datetime(requests['diagnostic_date'])
+        .dt.normalize()
+        .to_numpy(),
+        pd.to_datetime(requests['peak_date'])
+        .dt.normalize()
+        .to_numpy(),
+    ):
+        raise RuntimeError(
+            'OFES event peak dates do not match peak-object dates.'
+        )
+    requests['population_event_index'] = np.arange(
+        1, len(requests) + 1, dtype=np.int16
+    )
+    identity, source_inventory = (
+        _ofes_event_population_run_identity(
+            diagnostic_root,
+            catalog_root,
+            settings,
+            diagnostic_settings,
+            requests,
+        )
+    )
+    population_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else diagnostic_root / settings['output_subdir']
+    )
+    run_dir = population_root / identity['run_tag']
+    if run_dir.exists() and not resume and any(run_dir.iterdir()):
+        raise FileExistsError(
+            f'OFES population run directory is not empty: {run_dir}'
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    previous_manifest = {}
+    if manifest_path.exists():
+        previous_manifest = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        previous_signature = previous_manifest.get('run_signature')
+        if (
+            previous_signature
+            and previous_signature != identity['run_signature']
+        ):
+            raise RuntimeError(
+                'Existing OFES population manifest signature does '
+                'not match the requested run.'
+            )
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': previous_manifest.get(
+            'created_at_utc',
+            pd.Timestamp.now(tz='UTC').isoformat(),
+        ),
+        'updated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'completed_fragments': 0,
+        'total_fragments': int(len(requests)),
+        'resume_enabled': bool(resume),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        requests, run_dir / 'population_events.parquet'
+    )
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+
+    frames: list[pd.DataFrame] = []
+    completed_fragments = 0
+    try:
+        for event in requests.itertuples(index=False):
+            fragment_path = events_dir / f'{event.event_id}.parquet'
+            reused = False
+            if resume and fragment_path.exists():
+                frame = pd.read_parquet(fragment_path)
+                if (
+                    len(frame) == 1
+                    and frame.iloc[0]['population_run_signature']
+                    == identity['run_signature']
+                    and frame.iloc[0]['peak_daily_object_key']
+                    == event.peak_daily_object_key
+                ):
+                    reused = True
+            if not reused:
+                diagnosis = _ofes_diagnose_water_mass_day(
+                    event.diagnostic_date,
+                    float(event.daily_peak_lon),
+                    float(event.daily_peak_lat),
+                    float(event.peak_depth_m),
+                    diagnostic_settings,
+                )
+                surface = _ofes_surface_expression_day(
+                    event.diagnostic_date,
+                    float(event.daily_peak_lon),
+                    float(event.daily_peak_lat),
+                    float(diagnosis['rossby_number']),
+                    float(event.daily_peak_equivalent_radius_km),
+                    diagnostic_settings,
+                    settings,
+                )
+                record = event._asdict()
+                record.update(diagnosis)
+                record.update(surface)
+                record['population_run_signature'] = identity[
+                    'run_signature'
+                ]
+                frame = pd.DataFrame([record])
+                _atomic_write_parquet(frame, fragment_path)
+            frames.append(frame)
+            completed_fragments += 1
+            if (
+                completed_fragments == 1
+                or completed_fragments == len(requests)
+                or completed_fragments % 10 == 0
+            ):
+                print(
+                    '[OFES population] '
+                    f'{completed_fragments:02d}/{len(requests):02d} '
+                    f'{event.event_id} '
+                    f'({"reused" if reused else "diagnosed"})'
+                )
+                manifest['completed_fragments'] = int(
+                    completed_fragments
+                )
+                manifest['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(manifest, manifest_path)
+
+        diagnostics = pd.concat(frames, ignore_index=True)
+        diagnostics = diagnostics.sort_values(
+            'population_event_index', kind='mergesort'
+        ).reset_index(drop=True)
+        diagnostics = _ofes_add_population_metrics(
+            diagnostics, settings
+        )
+        summary = _ofes_population_summary(diagnostics, settings)
+        diagnostic_path = (
+            run_dir / 'population_peak_diagnostics.parquet'
+        )
+        summary_path = run_dir / 'population_summary.json'
+        figure_path = run_dir / 'population_phase_space.png'
+        _atomic_write_parquet(diagnostics, diagnostic_path)
+        _ofes_atomic_write_json(summary, summary_path)
+        _plot_ofes_event_population(
+            diagnostics,
+            summary,
+            figure_path,
+            int(settings['figure_dpi']),
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_fragments': int(completed_fragments),
+                'event_count': int(len(diagnostics)),
+                'passed_event_count': int(
+                    diagnostics[
+                        'population_diagnostic_passed'
+                    ].sum()
+                ),
+                'failed_event_count': int(
+                    (~diagnostics[
+                        'population_diagnostic_passed'
+                    ]).sum()
+                ),
+                'outputs': {
+                    'population_events': str(
+                        run_dir / 'population_events.parquet'
+                    ),
+                    'population_peak_diagnostics': str(
+                        diagnostic_path
+                    ),
+                    'population_summary': str(summary_path),
+                    'population_phase_space': str(figure_path),
+                    'source_inventory': str(
+                        run_dir / 'source_inventory.parquet'
+                    ),
+                    'event_fragments': str(events_dir),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_fragments': int(completed_fragments),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'population_events': requests,
+        'population_peak_diagnostics': diagnostics,
+        'summary': summary,
+        'figure_path': figure_path,
+    }
+
+
 def _ofes_event_evolution_settings(
     overrides: dict | None = None,
 ) -> dict:

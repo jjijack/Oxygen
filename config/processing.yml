@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.28 变更：
+#   - 新增 59 个 OFES DO50 深层事件的峰值水团/heave、动力与同点/核心加权/50 km 上界表层表达诊断。
 # version 1.27 变更：
 #   - 澄清 OFES DODS 垂向坐标的 mbar 是 JAMSTEC 对公开产品的通用错误 metadata 警告，
 #     不是本次交付的专项确认；数值处理不变。
@@ -292,6 +294,16 @@ ofes:
     control_match_strain_scale: 0.20
     context_days: 10
     output_subdir: event_diagnostics
+  event_population:
+    candidate_threshold: 50.0
+    expected_event_count: 59
+    heave_important_absolute_fraction_min: 0.3333333333333333
+    surface_search_radius_km: 50.0
+    surface_weight_scale_factor: 1.0
+    surface_weight_support_factor: 2.0
+    surface_attenuation_ratio_max: 0.5
+    figure_dpi: 180
+    output_subdir: event_population
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12
