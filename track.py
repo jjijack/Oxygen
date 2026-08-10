@@ -34837,3 +34837,2399 @@ def diagnose_ofes_ranked_events(
             control_diagnostic_frame
         ),
     }
+
+
+def _ofes_event_evolution_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES event 演化与 Hosoda benchmark 配置。"""
+    raw = dict(_OFES_CFG.get('event_evolution', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_evolution override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    settings = {
+        'map_radius_km': float(
+            raw.get('map_radius_km', 350.0)
+        ),
+        'map_quiver_stride': int(
+            raw.get('map_quiver_stride', 12)
+        ),
+        'map_min_finite_fraction': float(
+            raw.get('map_min_finite_fraction', 0.50)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'hosoda_dates': tuple(
+            str(value)
+            for value in raw.get(
+                'hosoda_dates',
+                ('2003-04-05', '2003-05-10', '2003-05-15'),
+            )
+        ),
+        'hosoda_lon_bounds': tuple(
+            float(value)
+            for value in raw.get(
+                'hosoda_lon_bounds', (142.0, 150.0)
+            )
+        ),
+        'hosoda_lat_bounds': tuple(
+            float(value)
+            for value in raw.get(
+                'hosoda_lat_bounds', (32.0, 39.0)
+            )
+        ),
+        'hosoda_do_sigma0': float(
+            raw.get('hosoda_do_sigma0', 26.5)
+        ),
+        'hosoda_do_reference_pressure_dbar': float(
+            raw.get(
+                'hosoda_do_reference_pressure_dbar', 500.0
+            )
+        ),
+        'hosoda_salinity_sigma0': float(
+            raw.get('hosoda_salinity_sigma0', 26.7)
+        ),
+        'hosoda_salinity_reference_pressure_dbar': float(
+            raw.get(
+                'hosoda_salinity_reference_pressure_dbar',
+                600.0,
+            )
+        ),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_evolution')
+        ),
+    }
+    positive_keys = (
+        'map_radius_km',
+        'map_quiver_stride',
+        'figure_dpi',
+        'hosoda_do_sigma0',
+        'hosoda_do_reference_pressure_dbar',
+        'hosoda_salinity_sigma0',
+        'hosoda_salinity_reference_pressure_dbar',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES evolution radii, strides, pressures, densities, '
+            'and figure DPI must be finite and positive.'
+        )
+    if not (
+        0 < settings['map_min_finite_fraction'] <= 1
+    ):
+        raise ValueError(
+            'OFES map_min_finite_fraction must lie in (0, 1].'
+        )
+    if len(settings['hosoda_dates']) != 3:
+        raise ValueError(
+            'OFES Hosoda benchmark requires exactly three dates.'
+        )
+    for key in ('hosoda_lon_bounds', 'hosoda_lat_bounds'):
+        bounds = settings[key]
+        if (
+            len(bounds) != 2
+            or not np.all(np.isfinite(bounds))
+            or bounds[0] >= bounds[1]
+        ):
+            raise ValueError(
+                f'OFES {key} must contain two ordered finite values.'
+            )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES event evolution output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_fields_on_sigma0(
+    pressure: np.ndarray,
+    sigma0: np.ndarray,
+    target_sigma0: float,
+    reference_pressure: float | np.ndarray,
+    fields: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """把三维 OFES 场线性映射到最接近参考压力的指定 sigma0 交点。"""
+    pressure_arr = np.asarray(pressure, dtype=float)
+    sigma0_arr = np.asarray(sigma0, dtype=float)
+    if (
+        pressure_arr.ndim != 1
+        or sigma0_arr.ndim != 3
+        or sigma0_arr.shape[0] != pressure_arr.size
+    ):
+        raise ValueError(
+            'sigma0 must have shape (pressure, lat, lon) on a '
+            'one-dimensional pressure coordinate.'
+        )
+    if pressure_arr.size < 2 or not np.all(
+        np.diff(pressure_arr) > 0
+    ):
+        raise ValueError(
+            'OFES pressure must contain at least two increasing levels.'
+        )
+
+    lower = sigma0_arr[:-1] - float(target_sigma0)
+    upper = sigma0_arr[1:] - float(target_sigma0)
+    denominator = sigma0_arr[1:] - sigma0_arr[:-1]
+    crossing = (
+        np.isfinite(lower)
+        & np.isfinite(upper)
+        & (lower * upper <= 0)
+        & (denominator != 0)
+    )
+    fraction = np.full(lower.shape, np.nan, dtype=float)
+    np.divide(
+        -lower,
+        denominator,
+        out=fraction,
+        where=crossing,
+    )
+    pair_pressure = (
+        pressure_arr[:-1, None, None]
+        + fraction * np.diff(pressure_arr)[:, None, None]
+    )
+    reference = np.broadcast_to(
+        np.asarray(reference_pressure, dtype=float),
+        sigma0_arr.shape[1:],
+    )
+    score = np.where(
+        crossing,
+        np.abs(pair_pressure - reference[None, :, :]),
+        np.inf,
+    )
+    best = np.argmin(score, axis=0)
+    available = np.any(crossing, axis=0)
+    gather = best[None, :, :]
+    chosen_fraction = np.take_along_axis(
+        fraction, gather, axis=0
+    )[0]
+    chosen_pressure = np.take_along_axis(
+        pair_pressure, gather, axis=0
+    )[0]
+    result = {
+        'pressure': np.where(
+            available, chosen_pressure, np.nan
+        ),
+        'crossing_count': np.count_nonzero(
+            crossing, axis=0
+        ).astype(np.int16),
+    }
+    for key, field in fields.items():
+        values = np.asarray(field, dtype=float)
+        if values.shape != sigma0_arr.shape:
+            raise ValueError(
+                f'OFES field {key!r} does not match sigma0 shape '
+                f'{sigma0_arr.shape}.'
+            )
+        lower_values = np.take_along_axis(
+            values[:-1], gather, axis=0
+        )[0]
+        upper_values = np.take_along_axis(
+            values[1:], gather, axis=0
+        )[0]
+        interpolated = lower_values + chosen_fraction * (
+            upper_values - lower_values
+        )
+        result[key] = np.where(
+            available
+            & np.isfinite(lower_values)
+            & np.isfinite(upper_values),
+            interpolated,
+            np.nan,
+        )
+    return result
+
+
+def _ofes_sigma0_volume(snapshot: dict) -> np.ndarray:
+    """由 OFES 位温与实用盐度计算完整三维 TEOS-10 sigma0。"""
+    pressure = np.asarray(snapshot['pressure'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(
+        np.asarray(snapshot['lon'], dtype=float),
+        np.asarray(snapshot['lat'], dtype=float),
+    )
+    salinity = np.asarray(snapshot['salinity'], dtype=float)
+    theta = np.asarray(snapshot['temp'], dtype=float)
+    expected_shape = (
+        pressure.size, lat_grid.shape[0], lon_grid.shape[1]
+    )
+    if (
+        salinity.shape != expected_shape
+        or theta.shape != expected_shape
+    ):
+        raise ValueError(
+            'OFES temperature and salinity must share the '
+            '(pressure, lat, lon) tracer grid.'
+        )
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        pressure[:, None, None],
+        lon_grid[None, :, :],
+        lat_grid[None, :, :],
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    return np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+
+
+def _ofes_event_context_requests(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    context_days: int,
+    catalog_start: str | pd.Timestamp,
+    catalog_end: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """为每个固定候选建立 before/start/peak/end/after 请求表。"""
+    lower_date = pd.Timestamp(catalog_start).normalize()
+    upper_date = pd.Timestamp(catalog_end).normalize()
+    role_specs = (
+        ('context_before', -int(context_days), 'start'),
+        ('start', 0, 'start'),
+        ('peak', 0, 'peak'),
+        ('end', 0, 'end'),
+        ('context_after', int(context_days), 'end'),
+    )
+    records: list[dict] = []
+    ordered_events = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    )
+    for event in ordered_events.itertuples(index=False):
+        group = daily_diagnostics.loc[
+            daily_diagnostics['event_id'] == event.event_id
+        ].sort_values('date', kind='mergesort')
+        if group.empty:
+            raise RuntimeError(
+                f'No daily diagnostics found for {event.event_id}.'
+            )
+        peak_rows = group.loc[
+            group['daily_object_key']
+            == event.peak_daily_object_key
+        ]
+        if len(peak_rows) != 1:
+            raise RuntimeError(
+                f'Expected one peak row for {event.event_id}.'
+            )
+        position_rows = {
+            'start': group.iloc[0],
+            'peak': peak_rows.iloc[0],
+            'end': group.iloc[-1],
+        }
+        event_dates = {
+            'start': pd.Timestamp(event.start_date).normalize(),
+            'peak': pd.Timestamp(event.peak_date).normalize(),
+            'end': pd.Timestamp(event.end_date).normalize(),
+        }
+        target_sigma0 = float(
+            peak_rows.iloc[0]['target_sigma0']
+        )
+        if not np.isfinite(target_sigma0):
+            raise RuntimeError(
+                f'Peak target sigma0 is missing for {event.event_id}.'
+            )
+        for order, (role, offset, position_role) in enumerate(
+            role_specs
+        ):
+            if role == 'context_before':
+                requested_date = (
+                    event_dates['start']
+                    + pd.Timedelta(days=offset)
+                )
+            elif role == 'context_after':
+                requested_date = (
+                    event_dates['end']
+                    + pd.Timedelta(days=offset)
+                )
+            else:
+                requested_date = event_dates[role]
+            actual_date = min(
+                max(requested_date, lower_date), upper_date
+            )
+            position = position_rows[position_role]
+            records.append(
+                {
+                    'event_id': str(event.event_id),
+                    'quality_rank_within_threshold': int(
+                        event.quality_rank_within_threshold
+                    ),
+                    'context_order': int(order),
+                    'context_role': role,
+                    'requested_date': requested_date,
+                    'actual_date': actual_date,
+                    'date_was_clipped': bool(
+                        actual_date != requested_date
+                    ),
+                    'position_basis': (
+                        f'{position_role}_daily_max_delta_do_column'
+                    ),
+                    'requested_core_lon': float(
+                        position['requested_core_lon']
+                    ),
+                    'requested_core_lat': float(
+                        position['requested_core_lat']
+                    ),
+                    'reference_pressure_dbar': float(
+                        event.peak_pressure_dbar
+                    ),
+                    'target_sigma0': target_sigma0,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_event_evolution_inventory(
+    context_requests: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总事件演化与 Hosoda benchmark 所需 OFES 文件身份。"""
+    inventory_roles: dict[
+        tuple[str, pd.Timestamp], set[str]
+    ] = {}
+    for row in context_requests.itertuples(index=False):
+        date = pd.Timestamp(row.actual_date).normalize()
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+            inventory_roles.setdefault(
+                (variable, date), set()
+            ).add(
+                f'event_context:{row.event_id}:{row.context_role}'
+            )
+    for date_text in settings['hosoda_dates']:
+        date = pd.Timestamp(date_text).normalize()
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+            inventory_roles.setdefault(
+                (variable, date), set()
+            ).add('hosoda_benchmark')
+
+    records: list[dict] = []
+    for (variable, date), roles in sorted(
+        inventory_roles.items(),
+        key=lambda item: (item[0][1], item[0][0]),
+    ):
+        path = _ofes_file_path(variable, date)
+        if not path.exists():
+            raise FileNotFoundError(
+                f'OFES evolution source file not found: {path}'
+            )
+        stat = path.stat()
+        records.append(
+            {
+                'date': date,
+                'variable': variable,
+                'roles': ','.join(sorted(roles)),
+                'source_file': str(path),
+                'size_bytes': int(stat.st_size),
+                'mtime_ns': int(stat.st_mtime_ns),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_atomic_write_npz(
+    path: str | Path,
+    **arrays,
+) -> Path:
+    """在目标目录内原子写入压缩 OFES 场缓存。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        with temporary.open('wb') as handle:
+            np.savez_compressed(handle, **arrays)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _ofes_event_evolution_run_identity(
+    diagnostic_run_dir: str | Path,
+    settings: dict,
+    context_requests: pd.DataFrame,
+) -> tuple[dict, pd.DataFrame]:
+    """构建 OFES event 演化的稳定签名与源文件 inventory。"""
+    diagnostic_root = Path(diagnostic_run_dir)
+    diagnostic_manifest = json.loads(
+        (diagnostic_root / 'manifest.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    inventory = _ofes_event_evolution_inventory(
+        context_requests, settings
+    )
+    inventory_payload = inventory.assign(
+        date=inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    diagnostic_inputs = {
+        name: _file_sha256(diagnostic_root / name)
+        for name in (
+            'manifest.json',
+            'selected_events.parquet',
+            'quality_event_catalog.parquet',
+            'daily_diagnostics.parquet',
+            'event_diagnostic_summary.parquet',
+            'negative_control.parquet',
+            'negative_control_diagnostic.parquet',
+        )
+    }
+    catalog_root = Path(
+        diagnostic_manifest['catalog_run_dir']
+    )
+    catalog_inputs = {
+        name: _file_sha256(catalog_root / name)
+        for name in (
+            'manifest.json',
+            'scan_summary.parquet',
+            'event_catalog.parquet',
+        )
+    }
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_event_evolution_settings,
+            _ofes_fields_on_sigma0,
+            _ofes_sigma0_volume,
+            _ofes_event_context_requests,
+            _ofes_event_evolution_inventory,
+            _ofes_atomic_write_npz,
+            _ofes_event_evolution_run_identity,
+            _ofes_build_context_field,
+            _ofes_build_hosoda_field,
+            _ofes_plot_annual_catalog_overview,
+            _ofes_plot_event_time_series,
+            _ofes_plot_event_context_maps,
+            _ofes_plot_negative_control_comparison,
+            _ofes_plot_hosoda_benchmark,
+            build_ofes_event_evolution_diagnostics,
+        )
+    )
+    code_sha256 = hashlib.sha256(
+        code_sources.encode('utf-8')
+    ).hexdigest()
+    repo_root = Path(__file__).resolve().parent
+    signature_payload = {
+        'schema_version': 1,
+        'diagnostic_run_dir': str(diagnostic_root),
+        'diagnostic_run_signature': diagnostic_manifest[
+            'run_signature'
+        ],
+        'diagnostic_input_sha256': diagnostic_inputs,
+        'catalog_run_dir': str(catalog_root),
+        'catalog_run_signature': diagnostic_manifest[
+            'catalog_run_signature'
+        ],
+        'catalog_input_sha256': catalog_inputs,
+        'settings': settings,
+        'context_request_records': (
+            context_requests.assign(
+                requested_date=context_requests[
+                    'requested_date'
+                ].dt.strftime('%Y-%m-%d'),
+                actual_date=context_requests[
+                    'actual_date'
+                ].dt.strftime('%Y-%m-%d'),
+            ).to_dict(orient='records')
+        ),
+        'source_inventory_sha256': inventory_sha256,
+        'evolution_code_sha256': code_sha256,
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'gsw_version': str(
+            getattr(gsw, '__version__', 'unknown')
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'matplotlib_version': str(
+            getattr(plt.matplotlib, '__version__', 'unknown')
+        ),
+    }
+    canonical = json.dumps(
+        signature_payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    return (
+        {
+            **signature_payload,
+            'run_signature': run_signature,
+            'run_tag': f'ofes_evolution_{run_signature[:12]}',
+            'source_identity_basis': (
+                'selected-date OFES path, size_bytes, and mtime_ns; '
+                'diagnostic and catalog tables are content-hashed'
+            ),
+        },
+        inventory,
+    )
+
+
+def _ofes_build_context_field(
+    request: dict,
+    settings: dict,
+    run_signature: str,
+    cache_path: str | Path,
+    *,
+    resume: bool,
+) -> dict:
+    """构建或复用一个候选事件角色的等密度面场缓存。"""
+    target = Path(cache_path)
+    expected = {
+        'run_signature': str(run_signature),
+        'event_id': str(request['event_id']),
+        'context_role': str(request['context_role']),
+        'actual_date': pd.Timestamp(
+            request['actual_date']
+        ).strftime('%Y-%m-%d'),
+    }
+    if resume and target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            matches = all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            )
+            if matches:
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['field_cache_reused'] = True
+                metadata['field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+
+    date = pd.Timestamp(request['actual_date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            core_lon - lon_half_width,
+            core_lon + lon_half_width,
+        ),
+        lat_bounds=(
+            core_lat - lat_half_width,
+            core_lat + lat_half_width,
+        ),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['pressure'],
+        sigma0,
+        float(request['target_sigma0']),
+        float(request['reference_pressure_dbar']),
+        {
+            'do': snapshot['do2'],
+            'salinity': snapshot['salinity'],
+            'theta': snapshot['temp'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                core_lon,
+                core_lat,
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    circle_mask = distance_km <= radius_km
+    finite_mask = circle_mask & np.isfinite(mapped['do'])
+    circle_columns = int(np.count_nonzero(circle_mask))
+    finite_columns = int(np.count_nonzero(finite_mask))
+    finite_fraction = (
+        float(finite_columns / circle_columns)
+        if circle_columns
+        else 0.0
+    )
+    row = int(np.argmin(np.abs(lat - core_lat)))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, core_lon))
+        )
+    )
+    annulus_mask = (
+        distance_km
+        >= float(settings['background_inner_radius_km'])
+    ) & (
+        distance_km
+        <= float(settings['background_outer_radius_km'])
+    )
+    annulus_valid = annulus_mask & np.isfinite(mapped['do'])
+    annulus_valid_columns = int(
+        np.count_nonzero(annulus_valid)
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        date
+    )
+    edge_distance_km = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(core_lon),
+            np.asarray(core_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    mapped_core = {
+        key: float(np.asarray(values)[row, column])
+        for key, values in mapped.items()
+        if key != 'crossing_count'
+    }
+    required_core = (
+        mapped_core['pressure'],
+        mapped_core['do'],
+        mapped_core['salinity'],
+        mapped_core['theta'],
+        mapped_core['u'],
+        mapped_core['v'],
+    )
+    failure_reasons: list[str] = []
+    if (
+        finite_fraction
+        < float(settings['map_min_finite_fraction'])
+    ):
+        failure_reasons.append('insufficient_map_finite_fraction')
+    if (
+        annulus_valid_columns
+        < int(settings['background_min_valid_columns'])
+    ):
+        failure_reasons.append(
+            'insufficient_isopycnal_annulus_columns'
+        )
+    if not all(np.isfinite(value) for value in required_core):
+        failure_reasons.append('nonfinite_core_isopycnal_field')
+
+    masked_fields = {
+        key: np.where(
+            circle_mask, np.asarray(values, dtype=float), np.nan
+        ).astype(np.float32)
+        for key, values in mapped.items()
+        if key != 'crossing_count'
+    }
+    metadata = {
+        'actual_core_lon': float(lon[column]),
+        'actual_core_lat': float(lat[row]),
+        'core_grid_distance_m': float(
+            great_circle_distance_m(
+                float(lon[column]),
+                float(lat[row]),
+                core_lon,
+                core_lat,
+            )
+        ),
+        'map_radius_km': radius_km,
+        'map_circle_column_count': circle_columns,
+        'map_finite_column_count': finite_columns,
+        'map_finite_fraction': finite_fraction,
+        'isopycnal_annulus_valid_columns': (
+            annulus_valid_columns
+        ),
+        'delivery_edge_distance_km': edge_distance_km,
+        'requested_circle_within_delivery_window': bool(
+            edge_distance_km >= radius_km
+        ),
+        'core_isopycnal_pressure_dbar': (
+            mapped_core['pressure']
+        ),
+        'core_isopycnal_do_umol_kg': mapped_core['do'],
+        'core_isopycnal_salinity': mapped_core['salinity'],
+        'core_isopycnal_theta_deg_c': mapped_core['theta'],
+        'core_isopycnal_u_m_s': mapped_core['u'],
+        'core_isopycnal_v_m_s': mapped_core['v'],
+        'core_isopycnal_speed_m_s': float(
+            np.hypot(mapped_core['u'], mapped_core['v'])
+        ),
+        'annulus_isopycnal_do_median_umol_kg': float(
+            np.nanmedian(
+                np.asarray(mapped['do'])[annulus_valid]
+            )
+        ),
+        'annulus_isopycnal_salinity_median': float(
+            np.nanmedian(
+                np.asarray(mapped['salinity'])[
+                    annulus_valid
+                ]
+            )
+        ),
+        'field_diagnostic_passed': bool(
+            not failure_reasons
+        ),
+        'field_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'field_cache_reused': False,
+        'field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        distance_km=distance_km.astype(np.float32),
+        crossing_count=np.where(
+            circle_mask,
+            mapped['crossing_count'],
+            0,
+        ).astype(np.int16),
+        **masked_fields,
+    )
+    return metadata
+
+
+def _ofes_build_hosoda_field(
+    date: str | pd.Timestamp,
+    settings: dict,
+    run_signature: str,
+    cache_path: str | Path,
+    *,
+    resume: bool,
+) -> dict:
+    """构建或复用一个 Hosoda benchmark 日期的双等密度面场。"""
+    date_ts = pd.Timestamp(date).normalize()
+    target = Path(cache_path)
+    expected = {
+        'run_signature': str(run_signature),
+        'date': date_ts.strftime('%Y-%m-%d'),
+    }
+    if resume and target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            matches = all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            )
+            if matches:
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['field_cache_reused'] = True
+                metadata['field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=settings['hosoda_lon_bounds'],
+        lat_bounds=settings['hosoda_lat_bounds'],
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    fields = {
+        'do': snapshot['do2'],
+        'salinity': snapshot['salinity'],
+        'theta': snapshot['temp'],
+        'u': snapshot['u'],
+        'v': snapshot['v'],
+    }
+    mapped_do = _ofes_fields_on_sigma0(
+        snapshot['pressure'],
+        sigma0,
+        float(settings['hosoda_do_sigma0']),
+        float(
+            settings['hosoda_do_reference_pressure_dbar']
+        ),
+        fields,
+    )
+    mapped_salinity = _ofes_fields_on_sigma0(
+        snapshot['pressure'],
+        sigma0,
+        float(settings['hosoda_salinity_sigma0']),
+        float(
+            settings[
+                'hosoda_salinity_reference_pressure_dbar'
+            ]
+        ),
+        fields,
+    )
+    do_values = np.asarray(mapped_do['do'], dtype=float)
+    salinity_values = np.asarray(
+        mapped_salinity['salinity'], dtype=float
+    )
+    do_finite = np.isfinite(do_values)
+    salinity_finite = np.isfinite(salinity_values)
+    do_fraction = float(np.mean(do_finite))
+    salinity_fraction = float(np.mean(salinity_finite))
+    do_q05, do_q95 = np.nanpercentile(
+        do_values, (5.0, 95.0)
+    )
+    salinity_q05, salinity_q95 = np.nanpercentile(
+        salinity_values, (5.0, 95.0)
+    )
+    failure_reasons: list[str] = []
+    if (
+        min(do_fraction, salinity_fraction)
+        < float(settings['map_min_finite_fraction'])
+    ):
+        failure_reasons.append('insufficient_map_finite_fraction')
+    required = (
+        do_q05,
+        do_q95,
+        np.nanmax(do_values),
+        salinity_q05,
+        salinity_q95,
+        np.nanmin(salinity_values),
+    )
+    if not all(np.isfinite(value) for value in required):
+        failure_reasons.append('nonfinite_benchmark_metric')
+    if (
+        np.isfinite(do_q05)
+        and np.isfinite(do_q95)
+        and do_q95 <= do_q05
+    ):
+        failure_reasons.append('unresolved_do_spatial_structure')
+    if (
+        np.isfinite(salinity_q05)
+        and np.isfinite(salinity_q95)
+        and salinity_q95 <= salinity_q05
+    ):
+        failure_reasons.append(
+            'unresolved_salinity_spatial_structure'
+        )
+    metadata = {
+        'date': date_ts,
+        'do_target_sigma0': float(
+            settings['hosoda_do_sigma0']
+        ),
+        'do_reference_pressure_dbar': float(
+            settings['hosoda_do_reference_pressure_dbar']
+        ),
+        'salinity_target_sigma0': float(
+            settings['hosoda_salinity_sigma0']
+        ),
+        'salinity_reference_pressure_dbar': float(
+            settings[
+                'hosoda_salinity_reference_pressure_dbar'
+            ]
+        ),
+        'do_finite_fraction': do_fraction,
+        'salinity_finite_fraction': salinity_fraction,
+        'do_q05_umol_kg': float(do_q05),
+        'do_q95_umol_kg': float(do_q95),
+        'do_max_umol_kg': float(np.nanmax(do_values)),
+        'salinity_q05': float(salinity_q05),
+        'salinity_q95': float(salinity_q95),
+        'salinity_min': float(
+            np.nanmin(salinity_values)
+        ),
+        'diagnostic_passed': bool(not failure_reasons),
+        'diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'field_cache_reused': False,
+        'field_cache_path': str(target.resolve()),
+    }
+    cache_arrays = {
+        'lon': np.asarray(
+            snapshot['lon'], dtype=np.float32
+        ),
+        'lat': np.asarray(
+            snapshot['lat'], dtype=np.float32
+        ),
+    }
+    for prefix, mapped in (
+        ('do_surface', mapped_do),
+        ('salinity_surface', mapped_salinity),
+    ):
+        for key in (
+            'pressure',
+            'do',
+            'salinity',
+            'theta',
+            'u',
+            'v',
+        ):
+            cache_arrays[f'{prefix}_{key}'] = np.asarray(
+                mapped[key], dtype=np.float32
+            )
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        **cache_arrays,
+    )
+    return metadata
+
+
+def _ofes_save_figure(
+    fig: plt.Figure,
+    path: str | Path,
+    dpi: int,
+) -> Path:
+    """原子保存 OFES 诊断图并关闭 Figure。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        fig.savefig(
+            temporary,
+            format=target.suffix.lstrip('.') or 'png',
+            dpi=int(dpi),
+            bbox_inches='tight',
+        )
+        os.replace(temporary, target)
+    finally:
+        plt.close(fig)
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _ofes_plot_annual_catalog_overview(
+    catalog_run_dir: str | Path,
+    quality_events: pd.DataFrame,
+    selected_events: pd.DataFrame,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制年度扫描强度、空间分布、压力与固定候选排名总览。"""
+    catalog_root = Path(catalog_run_dir)
+    scan = pd.read_parquet(
+        catalog_root / 'scan_summary.parquet'
+    )
+    do50 = quality_events.loc[
+        quality_events['threshold'] == 50.0
+    ].copy()
+    selected = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    )
+    fig, axes = plt.subplots(
+        2, 2, figsize=(15.5, 10.5), constrained_layout=True
+    )
+    ax = axes[0, 0]
+    for threshold, group in scan.groupby(
+        'threshold', sort=True
+    ):
+        key = _ofes_threshold_tag(float(threshold)).upper()
+        ax.plot(
+            group['date'],
+            group['peak_pixel_count'],
+            color=_THRESHOLD_COLORS.get(key, '#6b7280'),
+            linewidth=1.0,
+            label=key,
+        )
+    ax.set_yscale('symlog', linthresh=1)
+    ax.set_ylabel('Daily peak pixels')
+    ax.set_title('(a) Annual ΔDO occurrence')
+    ax.legend(frameon=False, ncol=3)
+    ax.grid(alpha=0.2)
+
+    ax = axes[0, 1]
+    eligible = do50.loc[do50['quality_eligible']]
+    truncated = do50.loc[do50['touches_delivery_edge']]
+    ax.scatter(
+        eligible['peak_lon'],
+        eligible['peak_lat'],
+        s=np.clip(eligible['rank_score'] ** 2, 5, 50),
+        c='#9ca3af',
+        alpha=0.45,
+        linewidths=0,
+        label='Quality-eligible DO50',
+    )
+    if not truncated.empty:
+        ax.scatter(
+            truncated['peak_lon'],
+            truncated['peak_lat'],
+            s=18,
+            marker='x',
+            c='#d97706',
+            alpha=0.8,
+            label='Delivery-edge truncated',
+        )
+    label_offsets = {
+        1: (7, 5),
+        2: (7, 5),
+        3: (9, -13),
+        4: (-15, 8),
+        5: (6, 5),
+    }
+    for row in selected.itertuples(index=False):
+        rank = int(row.quality_rank_within_threshold)
+        ax.scatter(
+            row.peak_lon,
+            row.peak_lat,
+            s=70,
+            c='#b91c1c',
+            edgecolors='white',
+            linewidths=0.8,
+            zorder=3,
+        )
+        ax.annotate(
+            str(rank),
+            (row.peak_lon, row.peak_lat),
+            xytext=label_offsets[rank],
+            textcoords='offset points',
+            ha='right' if rank == 4 else 'left',
+            fontsize=9,
+            fontweight='bold',
+            bbox={
+                'boxstyle': 'round,pad=0.12',
+                'facecolor': 'white',
+                'edgecolor': 'none',
+                'alpha': 0.72,
+            },
+        )
+    ax.set_xlim(140, 170)
+    ax.set_ylim(25, 45)
+    ax.set_xlabel('Longitude (°E)')
+    ax.set_ylabel('Latitude (°N)')
+    ax.set_title('(b) DO50 event peaks')
+    ax.grid(alpha=0.2)
+    ax.legend(frameon=False, fontsize=8, loc='lower right')
+
+    ax = axes[1, 0]
+    bins = np.linspace(300, 1000, 29)
+    ax.hist(
+        eligible['peak_pressure_dbar'],
+        bins=bins,
+        color='#6b7280',
+        alpha=0.75,
+        label='Quality-eligible DO50',
+    )
+    deep = eligible.loc[
+        eligible['deep_sensitivity_eligible']
+    ]
+    ax.hist(
+        deep['peak_pressure_dbar'],
+        bins=bins,
+        histtype='step',
+        linewidth=1.8,
+        color='#2563eb',
+        label='500–900 dbar sensitivity',
+    )
+    lower_count = int(
+        np.count_nonzero(
+            eligible['peak_on_lower_search_level']
+        )
+    )
+    ax.text(
+        0.98,
+        0.67,
+        (
+            f'Lower-bound peaks: {lower_count}/{len(eligible)}'
+            f' ({100 * lower_count / max(len(eligible), 1):.1f}%)'
+        ),
+        transform=ax.transAxes,
+        ha='right',
+        va='top',
+        fontsize=9,
+    )
+    ax.set_xlabel('Event peak pressure (dbar-like)')
+    ax.set_ylabel('Events')
+    ax.set_title('(c) Native-pressure distribution')
+    ax.legend(frameon=False, fontsize=8, loc='upper right')
+
+    ax = axes[1, 1]
+    components = (
+        ('rank_amplitude_component', 'Amplitude', '#991b1b'),
+        ('rank_area_component', 'Area', '#c2410c'),
+        ('rank_thickness_component', 'Thickness', '#ca8a04'),
+        ('rank_duration_component', 'Duration', '#2563eb'),
+    )
+    x = np.arange(len(selected))
+    bottom = np.zeros(len(selected), dtype=float)
+    for column, label, color in components:
+        values = selected[column].to_numpy(dtype=float)
+        ax.bar(
+            x,
+            values,
+            bottom=bottom,
+            label=label,
+            color=color,
+            width=0.72,
+        )
+        bottom += values
+    ax.set_xticks(
+        x,
+        [
+            f'Rank {int(value)}'
+            for value in selected[
+                'quality_rank_within_threshold'
+            ]
+        ],
+    )
+    ax.set_ylabel('Predeclared rank score')
+    ax.set_title('(d) Locked formal top five')
+    ax.legend(frameon=False, ncol=2, fontsize=8)
+    fig.suptitle(
+        'OFES 2003 objective ΔDO event catalog',
+        fontsize=16,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_event_time_series(
+    event: pd.Series,
+    daily_diagnostics: pd.DataFrame,
+    context_days: int,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制单个固定候选的水团分解、层结与动力演化。"""
+    group = daily_diagnostics.loc[
+        daily_diagnostics['event_id'] == event['event_id']
+    ].sort_values('date', kind='mergesort')
+    dates = pd.to_datetime(group['date'])
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11.5, 9.5), sharex=True,
+        constrained_layout=True,
+    )
+    axes[0].plot(
+        dates,
+        group['fixed_pressure_do_contrast'],
+        '-o',
+        markersize=3.5,
+        linewidth=1.4,
+        color='#111827',
+        label='Fixed-pressure contrast',
+    )
+    axes[0].plot(
+        dates,
+        group['water_mass_do_contrast'],
+        '-o',
+        markersize=3.0,
+        linewidth=1.2,
+        color='#b91c1c',
+        label='Same-isopycnal water mass',
+    )
+    axes[0].plot(
+        dates,
+        group['heave_do_contribution'],
+        '-o',
+        markersize=3.0,
+        linewidth=1.2,
+        color='#2563eb',
+        label='Background-profile heave',
+    )
+    axes[0].axhline(0, color='#6b7280', linewidth=0.7)
+    axes[0].set_ylabel('DO contrast\n(μmol kg⁻¹)')
+    axes[0].legend(frameon=False, ncol=3, fontsize=8)
+    axes[0].grid(alpha=0.2)
+
+    axes[1].plot(
+        dates,
+        group['n2_ratio_core_to_background'],
+        '-o',
+        markersize=3.5,
+        color='#7c3aed',
+        label='N² core/background',
+    )
+    axes[1].axhline(
+        1.0, color='#6b7280', linewidth=0.8, linestyle='--'
+    )
+    axes[1].set_ylabel('N² ratio')
+    axes[1].grid(alpha=0.2)
+    pressure_axis = axes[1].twinx()
+    pressure_axis.plot(
+        dates,
+        group['daily_peak_pressure_dbar'],
+        color='#0891b2',
+        linewidth=1.0,
+        alpha=0.75,
+        label='Daily peak pressure',
+    )
+    pressure_axis.invert_yaxis()
+    pressure_axis.set_ylabel(
+        'Daily peak pressure (dbar-like)',
+        color='#0891b2',
+    )
+
+    axes[2].plot(
+        dates,
+        group['rossby_number'],
+        '-o',
+        markersize=3.0,
+        color='#b91c1c',
+        label='ζ/f',
+    )
+    axes[2].plot(
+        dates,
+        group['normalized_strain'],
+        '-o',
+        markersize=3.0,
+        color='#d97706',
+        label='strain/|f|',
+    )
+    axes[2].plot(
+        dates,
+        group['normalized_okubo_weiss'],
+        '-o',
+        markersize=3.0,
+        color='#2563eb',
+        label='OW/f²',
+    )
+    axes[2].axhline(0, color='#6b7280', linewidth=0.7)
+    axes[2].set_ylabel('Normalized kinematics')
+    axes[2].legend(frameon=False, ncol=3, fontsize=8)
+    axes[2].grid(alpha=0.2)
+    for ax in axes:
+        for role, date, style in (
+            ('start', event['start_date'], ':'),
+            ('peak', event['peak_date'], '-'),
+            ('end', event['end_date'], ':'),
+        ):
+            ax.axvline(
+                pd.Timestamp(date),
+                color=(
+                    '#b91c1c' if role == 'peak' else '#6b7280'
+                ),
+                linewidth=0.9,
+                linestyle=style,
+                alpha=0.8,
+            )
+    axes[-1].set_xlim(
+        pd.Timestamp(event['start_date'])
+        - pd.Timedelta(days=int(context_days)),
+        pd.Timestamp(event['end_date'])
+        + pd.Timedelta(days=int(context_days)),
+    )
+    axes[-1].xaxis.set_major_formatter(
+        mdates.DateFormatter('%b %d')
+    )
+    rank = int(event['quality_rank_within_threshold'])
+    fig.suptitle(
+        (
+            f'OFES DO50 rank {rank}: {event["event_id"]}  '
+            f'(reference {float(event["peak_pressure_dbar"]):.1f} dbar)'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_event_context_maps(
+    event: pd.Series,
+    context: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    quiver_stride: int,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制单个固定候选五角色的等密度面 DO 与几何演化。"""
+    event_context = context.loc[
+        context['event_id'] == event['event_id']
+    ].sort_values('context_order', kind='mergesort')
+    if len(event_context) != 5:
+        raise RuntimeError(
+            f'Expected five context roles for {event["event_id"]}.'
+        )
+    fields: list[dict] = []
+    for row in event_context.itertuples(index=False):
+        with np.load(
+            row.field_cache_path, allow_pickle=False
+        ) as cached:
+            fields.append(
+                {
+                    key: np.asarray(cached[key]).copy()
+                    for key in (
+                        'lon',
+                        'lat',
+                        'do',
+                        'salinity',
+                        'pressure',
+                        'u',
+                        'v',
+                    )
+                }
+            )
+    do_values = np.concatenate(
+        [
+            field['do'][np.isfinite(field['do'])]
+            for field in fields
+        ]
+    )
+    pressure_anomalies = np.concatenate(
+        [
+            (
+                field['pressure']
+                - float(event['peak_pressure_dbar'])
+            )[np.isfinite(field['pressure'])]
+            for field in fields
+        ]
+    )
+    do_vmin, do_vmax = np.nanpercentile(
+        do_values, (2.0, 98.0)
+    )
+    pressure_limit = float(
+        np.nanpercentile(np.abs(pressure_anomalies), 98.0)
+    )
+    pressure_limit = max(25.0, pressure_limit)
+    fig, axes = plt.subplots(
+        2,
+        5,
+        figsize=(23.5, 9.2),
+        constrained_layout=True,
+    )
+    top_mappable = None
+    bottom_mappable = None
+    track = daily_diagnostics.loc[
+        daily_diagnostics['event_id'] == event['event_id']
+    ].sort_values('date', kind='mergesort')
+    for column, (row, field) in enumerate(
+        zip(event_context.itertuples(index=False), fields)
+    ):
+        lon = field['lon']
+        lat = field['lat']
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        top = axes[0, column]
+        bottom = axes[1, column]
+        top_mappable = top.pcolormesh(
+            lon,
+            lat,
+            field['do'],
+            cmap='viridis',
+            shading='auto',
+            vmin=float(do_vmin),
+            vmax=float(do_vmax),
+        )
+        bottom_mappable = bottom.pcolormesh(
+            lon,
+            lat,
+            field['pressure']
+            - float(event['peak_pressure_dbar']),
+            cmap='RdBu_r',
+            shading='auto',
+            vmin=-pressure_limit,
+            vmax=pressure_limit,
+        )
+        salinity = field['salinity']
+        finite_salinity = salinity[np.isfinite(salinity)]
+        if (
+            finite_salinity.size
+            and np.nanmax(finite_salinity)
+            > np.nanmin(finite_salinity)
+        ):
+            levels = np.unique(
+                np.nanpercentile(
+                    finite_salinity, (20.0, 50.0, 80.0)
+                )
+            )
+            if len(levels) > 1:
+                bottom.contour(
+                    lon,
+                    lat,
+                    salinity,
+                    levels=levels,
+                    colors='#374151',
+                    linewidths=0.55,
+                    alpha=0.75,
+                )
+        stride = int(quiver_stride)
+        top.quiver(
+            lon_grid[::stride, ::stride],
+            lat_grid[::stride, ::stride],
+            field['u'][::stride, ::stride],
+            field['v'][::stride, ::stride],
+            color='white',
+            alpha=0.75,
+            scale=4.5,
+            width=0.003,
+        )
+        for ax in (top, bottom):
+            ax.plot(
+                track['requested_core_lon'],
+                track['requested_core_lat'],
+                color='#111827',
+                linewidth=0.8,
+                alpha=0.65,
+            )
+            ax.scatter(
+                row.requested_core_lon,
+                row.requested_core_lat,
+                s=45,
+                marker='x',
+                linewidths=1.5,
+                c='#ef4444',
+                zorder=5,
+            )
+            ax.set_xlim(float(lon[0]), float(lon[-1]))
+            ax.set_ylim(float(lat[0]), float(lat[-1]))
+            ax.grid(alpha=0.16)
+            mean_latitude = float(np.nanmean(lat))
+            ax.set_aspect(
+                1.0 / max(
+                    np.cos(np.deg2rad(mean_latitude)), 0.2
+                )
+            )
+        clipped = ' (clipped)' if row.date_was_clipped else ''
+        top.set_title(
+            (
+                f'{row.context_role.replace("_", " ")}\n'
+                f'{pd.Timestamp(row.actual_date):%Y-%m-%d}{clipped}'
+            ),
+            fontsize=10,
+        )
+        bottom.set_xlabel('Longitude (°E)')
+        if column == 0:
+            top.set_ylabel('Latitude (°N)')
+            bottom.set_ylabel('Latitude (°N)')
+    if top_mappable is None or bottom_mappable is None:
+        raise RuntimeError('No OFES event context field was plotted.')
+    fig.colorbar(
+        top_mappable,
+        ax=axes[0, :].tolist(),
+        shrink=0.88,
+        pad=0.01,
+        label='DO on peak sigma0 (μmol kg⁻¹)',
+    )
+    fig.colorbar(
+        bottom_mappable,
+        ax=axes[1, :].tolist(),
+        shrink=0.88,
+        pad=0.01,
+        label='Isopycnal pressure − reference (dbar)',
+    )
+    rank = int(event['quality_rank_within_threshold'])
+    target_sigma0 = float(event_context.iloc[0]['target_sigma0'])
+    fig.suptitle(
+        (
+            f'OFES DO50 rank {rank}: fixed σ0={target_sigma0:.3f} '
+            'event evolution'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_negative_control_comparison(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    negative_control: pd.DataFrame,
+    control_diagnostic: pd.DataFrame,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制头条事件峰值与预声明匹配负对照的对比。"""
+    headline = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).iloc[0]
+    peak_rows = daily_diagnostics.loc[
+        daily_diagnostics['daily_object_key']
+        == headline['peak_daily_object_key']
+    ]
+    if len(peak_rows) != 1 or len(control_diagnostic) != 1:
+        raise RuntimeError(
+            'Negative-control figure requires one event peak and '
+            'one control diagnosis.'
+        )
+    peak = peak_rows.iloc[0]
+    control = control_diagnostic.iloc[0]
+    match = negative_control.iloc[0]
+    fig, axes = plt.subplots(
+        1, 3, figsize=(14.5, 4.8), constrained_layout=True
+    )
+    labels = ('Fixed pressure', 'Water mass', 'Heave')
+    event_values = (
+        peak['fixed_pressure_do_contrast'],
+        peak['water_mass_do_contrast'],
+        peak['heave_do_contribution'],
+    )
+    control_values = (
+        control['fixed_pressure_do_contrast'],
+        control['water_mass_do_contrast'],
+        control['heave_do_contribution'],
+    )
+    x = np.arange(len(labels))
+    axes[0].bar(
+        x - 0.18,
+        event_values,
+        width=0.36,
+        color='#b91c1c',
+        label='Rank-1 peak',
+    )
+    axes[0].bar(
+        x + 0.18,
+        control_values,
+        width=0.36,
+        color='#6b7280',
+        label='Matched control',
+    )
+    axes[0].axhline(0, color='#111827', linewidth=0.7)
+    axes[0].set_xticks(x, labels, rotation=18, ha='right')
+    axes[0].set_ylabel('DO contrast (μmol kg⁻¹)')
+    axes[0].set_title('(a) Exact decomposition')
+    axes[0].legend(frameon=False, fontsize=8)
+
+    dynamics = ('ζ/f', 'strain/|f|', 'OW/f²', 'N² ratio')
+    axes[1].plot(
+        dynamics,
+        [
+            peak['rossby_number'],
+            peak['normalized_strain'],
+            peak['normalized_okubo_weiss'],
+            peak['n2_ratio_core_to_background'],
+        ],
+        '-o',
+        color='#b91c1c',
+        label='Rank-1 peak',
+    )
+    axes[1].plot(
+        dynamics,
+        [
+            control['rossby_number'],
+            control['normalized_strain'],
+            control['normalized_okubo_weiss'],
+            control['n2_ratio_core_to_background'],
+        ],
+        '-o',
+        color='#6b7280',
+        label='Matched control',
+    )
+    axes[1].axhline(0, color='#111827', linewidth=0.7)
+    axes[1].tick_params(axis='x', rotation=18)
+    axes[1].set_title('(b) Dynamics and stratification')
+    axes[1].legend(frameon=False, fontsize=8)
+
+    mismatch_columns = (
+        'match_sigma0_normalized',
+        'match_theta_normalized',
+        'match_salinity_normalized',
+        'match_do_normalized',
+        'match_vorticity_normalized',
+        'match_strain_normalized',
+    )
+    mismatch_labels = (
+        'σ0', 'θ', 'S', 'DO', 'ζ/f', 'strain/f'
+    )
+    mismatch_values = [
+        abs(float(match[column]))
+        for column in mismatch_columns
+    ]
+    axes[2].bar(
+        mismatch_labels,
+        mismatch_values,
+        color='#2563eb',
+    )
+    axes[2].axhline(
+        1.0,
+        color='#6b7280',
+        linestyle='--',
+        linewidth=0.8,
+    )
+    axes[2].set_ylabel('|Normalized mismatch|')
+    axes[2].set_title(
+        f'(c) Match score = {float(match["match_score"]):.2f}'
+    )
+    axes[2].tick_params(axis='x', rotation=18)
+    fig.suptitle(
+        (
+            f'{headline["event_id"]} peak versus same-day '
+            'predeclared negative control'
+        ),
+        fontsize=14,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_hosoda_benchmark(
+    benchmark: pd.DataFrame,
+    settings: dict,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制 Hosoda 日期的高 DO 与低盐双等密度面集成检验。"""
+    benchmark_sorted = benchmark.sort_values(
+        'date', kind='mergesort'
+    )
+    fields: list[dict] = []
+    for row in benchmark_sorted.itertuples(index=False):
+        with np.load(
+            row.field_cache_path, allow_pickle=False
+        ) as cached:
+            fields.append(
+                {
+                    key: np.asarray(cached[key]).copy()
+                    for key in (
+                        'lon',
+                        'lat',
+                        'do_surface_do',
+                        'do_surface_pressure',
+                        'do_surface_u',
+                        'do_surface_v',
+                        'salinity_surface_salinity',
+                        'salinity_surface_pressure',
+                    )
+                }
+            )
+    all_do = np.concatenate(
+        [
+            field['do_surface_do'][
+                np.isfinite(field['do_surface_do'])
+            ]
+            for field in fields
+        ]
+    )
+    all_salinity = np.concatenate(
+        [
+            field['salinity_surface_salinity'][
+                np.isfinite(field['salinity_surface_salinity'])
+            ]
+            for field in fields
+        ]
+    )
+    do_vmin, do_vmax = np.nanpercentile(
+        all_do, (2.0, 98.0)
+    )
+    salinity_vmin, salinity_vmax = np.nanpercentile(
+        all_salinity, (2.0, 98.0)
+    )
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(15.8, 9.0),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    do_mappable = None
+    salinity_mappable = None
+    for column, (row, field) in enumerate(
+        zip(benchmark_sorted.itertuples(index=False), fields)
+    ):
+        lon = field['lon']
+        lat = field['lat']
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        do_mappable = axes[0, column].pcolormesh(
+            lon,
+            lat,
+            field['do_surface_do'],
+            cmap='viridis',
+            shading='auto',
+            vmin=float(do_vmin),
+            vmax=float(do_vmax),
+        )
+        pressure = field['do_surface_pressure']
+        finite_pressure = pressure[np.isfinite(pressure)]
+        if (
+            finite_pressure.size
+            and np.nanmax(finite_pressure)
+            > np.nanmin(finite_pressure)
+        ):
+            axes[0, column].contour(
+                lon,
+                lat,
+                pressure,
+                levels=np.unique(
+                    np.nanpercentile(
+                        finite_pressure, (20.0, 50.0, 80.0)
+                    )
+                ),
+                colors='white',
+                linewidths=0.55,
+                alpha=0.8,
+            )
+        stride = int(settings['map_quiver_stride'])
+        axes[0, column].quiver(
+            lon_grid[::stride, ::stride],
+            lat_grid[::stride, ::stride],
+            field['do_surface_u'][::stride, ::stride],
+            field['do_surface_v'][::stride, ::stride],
+            color='white',
+            scale=4.0,
+            width=0.003,
+            alpha=0.75,
+        )
+        salinity_mappable = axes[1, column].pcolormesh(
+            lon,
+            lat,
+            field['salinity_surface_salinity'],
+            cmap='cividis_r',
+            shading='auto',
+            vmin=float(salinity_vmin),
+            vmax=float(salinity_vmax),
+        )
+        salinity_pressure = field[
+            'salinity_surface_pressure'
+        ]
+        finite_salinity_pressure = salinity_pressure[
+            np.isfinite(salinity_pressure)
+        ]
+        if (
+            finite_salinity_pressure.size
+            and np.nanmax(finite_salinity_pressure)
+            > np.nanmin(finite_salinity_pressure)
+        ):
+            axes[1, column].contour(
+                lon,
+                lat,
+                salinity_pressure,
+                levels=np.unique(
+                    np.nanpercentile(
+                        finite_salinity_pressure,
+                        (20.0, 50.0, 80.0),
+                    )
+                ),
+                colors='white',
+                linewidths=0.55,
+                alpha=0.8,
+            )
+        axes[0, column].set_title(
+            pd.Timestamp(row.date).strftime('%Y-%m-%d')
+        )
+        axes[1, column].set_xlabel('Longitude (°E)')
+        for ax in axes[:, column]:
+            ax.grid(alpha=0.16)
+            ax.set_aspect(
+                1.0
+                / max(
+                    np.cos(np.deg2rad(float(np.mean(lat)))),
+                    0.2,
+                )
+            )
+    axes[0, 0].set_ylabel('Latitude (°N)')
+    axes[1, 0].set_ylabel('Latitude (°N)')
+    if do_mappable is None or salinity_mappable is None:
+        raise RuntimeError('No Hosoda benchmark field was plotted.')
+    fig.colorbar(
+        do_mappable,
+        ax=axes[0, :].tolist(),
+        shrink=0.86,
+        pad=0.01,
+        label=(
+            f'DO on σ0={settings["hosoda_do_sigma0"]:.1f} '
+            '(μmol kg⁻¹)'
+        ),
+    )
+    fig.colorbar(
+        salinity_mappable,
+        ax=axes[1, :].tolist(),
+        shrink=0.86,
+        pad=0.01,
+        label=(
+            f'Salinity on σ0='
+            f'{settings["hosoda_salinity_sigma0"]:.1f}'
+        ),
+    )
+    fig.suptitle(
+        (
+            'Hosoda et al. (2021) April–May 2003 '
+            'qualitative integration benchmark'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def build_ofes_event_evolution_diagnostics(
+    diagnostic_run_dir: str | Path,
+    *,
+    evolution_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """构建固定 OFES 候选的等密度面演化、基准图与轨迹门控。
+
+    本入口只消费已完成的年度 catalog 和排名候选水团诊断。它为每个预锁定
+    候选建立起始前、起始、峰值、结束和结束后五个场景，在事件峰值 sigma0
+    与固定峰值 pressure 参考下绘制演化；另以三天双等密度面图复核 Hosoda
+    benchmark，并依据尚未解决的时空插值与垂向坐标问题写出显式轨迹门槛。
+
+    参数:
+        - diagnostic_run_dir (str | Path): 已完成且通过 gate 的 OFES 排名候选水团诊断目录。
+        - evolution_overrides (dict | None): 临时覆盖已声明的 event_evolution 配置。
+        - output_dir (str | Path | None): 演化输出根目录；None 时写到诊断目录下配置的子目录。
+        - resume (bool): 是否复用签名一致的等密度面场缓存或完整运行，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、五角色 context 表、Hosoda benchmark 表、轨迹门槛和图件路径。
+
+    输出:
+        - `<run_dir>/fields/*.npz`、`event_context_snapshots.parquet`、`hosoda_benchmark_summary.parquet`、`source_inventory.parquet`。
+        - `<run_dir>/figures/*.png`、`trajectory_gate.json` 与 `manifest.json`。
+
+    说明:
+        - 五角色位置来自事件 start/peak/end 的逐日最大 ΔDO 网格列；before/after 沿用对应端点位置。
+        - 每个事件始终使用其 peak-day sigma0 与 catalog peak pressure，不随日期重新选择参考面。
+        - Hosoda 图只作 loader、坐标、TEOS-10 映射与中尺度场的正向集成检验，不参与正式候选替换或排名。
+        - 轨迹关闭是验证门控结论，不否定二维等密度面演化；当前结果不把 Eulerian 对象解释成物质粒子。
+    """
+    diagnostic_root = Path(diagnostic_run_dir)
+    diagnostic_manifest_path = (
+        diagnostic_root / 'manifest.json'
+    )
+    if not diagnostic_manifest_path.exists():
+        raise FileNotFoundError(
+            'OFES diagnostic manifest not found: '
+            f'{diagnostic_manifest_path}'
+        )
+    diagnostic_manifest = json.loads(
+        diagnostic_manifest_path.read_text(encoding='utf-8')
+    )
+    if diagnostic_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES event evolution requires a complete diagnostic run.'
+        )
+    if not bool(
+        diagnostic_manifest.get('diagnostic_gate_passed')
+    ):
+        raise RuntimeError(
+            'OFES event evolution requires the water-mass and '
+            'negative-control diagnostic gate to pass.'
+        )
+    required_inputs = (
+        'selected_events.parquet',
+        'quality_event_catalog.parquet',
+        'daily_diagnostics.parquet',
+        'event_diagnostic_summary.parquet',
+        'negative_control.parquet',
+        'negative_control_diagnostic.parquet',
+    )
+    missing = [
+        name
+        for name in required_inputs
+        if not (diagnostic_root / name).exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'OFES diagnostic inputs are missing: {missing}.'
+        )
+
+    selected_events = pd.read_parquet(
+        diagnostic_root / 'selected_events.parquet'
+    ).sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    quality_events = pd.read_parquet(
+        diagnostic_root / 'quality_event_catalog.parquet'
+    )
+    daily_diagnostics = pd.read_parquet(
+        diagnostic_root / 'daily_diagnostics.parquet'
+    )
+    event_summary = pd.read_parquet(
+        diagnostic_root / 'event_diagnostic_summary.parquet'
+    )
+    negative_control = pd.read_parquet(
+        diagnostic_root / 'negative_control.parquet'
+    )
+    control_diagnostic = pd.read_parquet(
+        diagnostic_root
+        / 'negative_control_diagnostic.parquet'
+    )
+    if len(selected_events) != 5:
+        raise RuntimeError(
+            'OFES event evolution expects the locked top five '
+            f'candidates; found {len(selected_events)}.'
+        )
+
+    settings = _ofes_event_evolution_settings(
+        evolution_overrides
+    )
+    diagnostic_settings = diagnostic_manifest['settings']
+    settings.update(
+        {
+            'context_days': int(
+                diagnostic_settings['context_days']
+            ),
+            'background_inner_radius_km': float(
+                diagnostic_settings[
+                    'background_inner_radius_km'
+                ]
+            ),
+            'background_outer_radius_km': float(
+                diagnostic_settings[
+                    'background_outer_radius_km'
+                ]
+            ),
+            'background_min_valid_columns': int(
+                diagnostic_settings[
+                    'background_min_valid_columns'
+                ]
+            ),
+        }
+    )
+    catalog_root = Path(
+        diagnostic_manifest['catalog_run_dir']
+    )
+    catalog_manifest = json.loads(
+        (catalog_root / 'manifest.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if catalog_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES event evolution requires a complete source catalog.'
+        )
+    context_requests = _ofes_event_context_requests(
+        selected_events,
+        daily_diagnostics,
+        settings['context_days'],
+        catalog_manifest['start_date'],
+        catalog_manifest['end_date'],
+    )
+    identity, source_inventory = (
+        _ofes_event_evolution_run_identity(
+            diagnostic_root,
+            settings,
+            context_requests,
+        )
+    )
+    evolution_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else diagnostic_root / settings['output_subdir']
+    )
+    run_dir = evolution_root / identity['run_tag']
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists() and resume:
+        previous_manifest = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if (
+            previous_manifest.get('status') == 'complete'
+            and previous_manifest.get('run_signature')
+            == identity['run_signature']
+        ):
+            outputs = previous_manifest['outputs']
+            required_output_paths = (
+                outputs['event_context_snapshots'],
+                outputs['hosoda_benchmark_summary'],
+                outputs['source_inventory'],
+                outputs['trajectory_gate'],
+                *outputs['figures'],
+            )
+            if all(
+                Path(path).exists()
+                for path in required_output_paths
+            ):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous_manifest,
+                    'event_context_snapshots': (
+                        pd.read_parquet(
+                            outputs['event_context_snapshots']
+                        )
+                    ),
+                    'hosoda_benchmark_summary': (
+                        pd.read_parquet(
+                            outputs['hosoda_benchmark_summary']
+                        )
+                    ),
+                    'trajectory_gate': json.loads(
+                        Path(outputs['trajectory_gate']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_paths': [
+                        Path(path) for path in outputs['figures']
+                    ],
+                    'reused_complete_run': True,
+                }
+    if (
+        run_dir.exists()
+        and not resume
+        and any(run_dir.iterdir())
+    ):
+        raise FileExistsError(
+            f'OFES evolution run directory is not empty: {run_dir}'
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fields_dir = run_dir / 'fields'
+    figures_dir = run_dir / 'figures'
+    fields_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    previous_manifest = {}
+    if manifest_path.exists():
+        previous_manifest = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        previous_signature = previous_manifest.get(
+            'run_signature'
+        )
+        if (
+            previous_signature
+            and previous_signature != identity['run_signature']
+        ):
+            raise RuntimeError(
+                'Existing OFES evolution manifest signature '
+                'does not match the requested run.'
+            )
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': previous_manifest.get(
+            'created_at_utc',
+            pd.Timestamp.now(tz='UTC').isoformat(),
+        ),
+        'updated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'completed_context_fields': 0,
+        'total_context_fields': int(len(context_requests)),
+        'completed_hosoda_fields': 0,
+        'total_hosoda_fields': int(
+            len(settings['hosoda_dates'])
+        ),
+        'resume_enabled': bool(resume),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+
+    try:
+        context_records: list[dict] = []
+        for index, row in enumerate(
+            context_requests.itertuples(index=False),
+            start=1,
+        ):
+            cache_path = (
+                fields_dir
+                / (
+                    f'{row.event_id}_'
+                    f'{row.context_order}_{row.context_role}.npz'
+                )
+            )
+            request = row._asdict()
+            metadata = _ofes_build_context_field(
+                request,
+                settings,
+                identity['run_signature'],
+                cache_path,
+                resume=resume,
+            )
+            context_records.append({**request, **metadata})
+            manifest['completed_context_fields'] = int(index)
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+            print(
+                '[OFES evolution] '
+                f'context {index:02d}/{len(context_requests):02d} '
+                f'{row.event_id} {row.context_role} '
+                f'({"reused" if metadata["field_cache_reused"] else "mapped"})'
+            )
+        context = pd.DataFrame(context_records).sort_values(
+            [
+                'quality_rank_within_threshold',
+                'context_order',
+            ],
+            kind='mergesort',
+        ).reset_index(drop=True)
+        _atomic_write_parquet(
+            context,
+            run_dir / 'event_context_snapshots.parquet',
+        )
+        if not bool(context['field_diagnostic_passed'].all()):
+            failed = context.loc[
+                ~context['field_diagnostic_passed'],
+                ['event_id', 'context_role', 'field_diagnostic_status'],
+            ]
+            raise RuntimeError(
+                'OFES event context field gate failed: '
+                f'{failed.to_dict(orient="records")}'
+            )
+
+        benchmark_records: list[dict] = []
+        for index, date_text in enumerate(
+            settings['hosoda_dates'], start=1
+        ):
+            date = pd.Timestamp(date_text).normalize()
+            cache_path = (
+                fields_dir
+                / f'hosoda_{date:%Y%m%d}.npz'
+            )
+            metadata = _ofes_build_hosoda_field(
+                date,
+                settings,
+                identity['run_signature'],
+                cache_path,
+                resume=resume,
+            )
+            benchmark_records.append(metadata)
+            manifest['completed_hosoda_fields'] = int(index)
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+            print(
+                '[OFES evolution] '
+                f'Hosoda {index}/{len(settings["hosoda_dates"])} '
+                f'{date:%Y-%m-%d} '
+                f'({"reused" if metadata["field_cache_reused"] else "mapped"})'
+            )
+        benchmark = pd.DataFrame(benchmark_records)
+        benchmark['date'] = pd.to_datetime(benchmark['date'])
+        benchmark = benchmark.sort_values(
+            'date', kind='mergesort'
+        ).reset_index(drop=True)
+        _atomic_write_parquet(
+            benchmark,
+            run_dir / 'hosoda_benchmark_summary.parquet',
+        )
+        if not bool(benchmark['diagnostic_passed'].all()):
+            raise RuntimeError(
+                'OFES Hosoda benchmark field gate failed: '
+                f'{benchmark.loc[~benchmark["diagnostic_passed"]].to_dict(orient="records")}'
+            )
+
+        figure_paths: list[Path] = []
+        figure_paths.append(
+            _ofes_plot_annual_catalog_overview(
+                catalog_root,
+                quality_events,
+                selected_events,
+                figures_dir / 'annual_catalog_overview.png',
+                settings['figure_dpi'],
+            )
+        )
+        for event in selected_events.to_dict(orient='records'):
+            event_series = pd.Series(event)
+            event_id = str(event['event_id'])
+            figure_paths.append(
+                _ofes_plot_event_time_series(
+                    event_series,
+                    daily_diagnostics,
+                    settings['context_days'],
+                    (
+                        figures_dir
+                        / f'{event_id}_diagnostic_evolution.png'
+                    ),
+                    settings['figure_dpi'],
+                )
+            )
+            figure_paths.append(
+                _ofes_plot_event_context_maps(
+                    event_series,
+                    context,
+                    daily_diagnostics,
+                    settings['map_quiver_stride'],
+                    (
+                        figures_dir
+                        / f'{event_id}_isopycnal_context.png'
+                    ),
+                    settings['figure_dpi'],
+                )
+            )
+        figure_paths.append(
+            _ofes_plot_negative_control_comparison(
+                selected_events,
+                daily_diagnostics,
+                negative_control,
+                control_diagnostic,
+                figures_dir / 'negative_control_comparison.png',
+                settings['figure_dpi'],
+            )
+        )
+        figure_paths.append(
+            _ofes_plot_hosoda_benchmark(
+                benchmark,
+                settings,
+                figures_dir / 'hosoda_benchmark.png',
+                settings['figure_dpi'],
+            )
+        )
+        figure_paths = [
+            path.resolve() for path in figure_paths
+        ]
+
+        clipped_context = context.loc[
+            context['date_was_clipped'],
+            [
+                'event_id',
+                'context_role',
+                'requested_date',
+                'actual_date',
+            ],
+        ].copy()
+        clipped_records = clipped_context.assign(
+            requested_date=clipped_context[
+                'requested_date'
+            ].dt.strftime('%Y-%m-%d'),
+            actual_date=clipped_context[
+                'actual_date'
+            ].dt.strftime('%Y-%m-%d'),
+        ).to_dict(orient='records')
+        trajectory_gate = {
+            'enabled': False,
+            'three_dimensional_enabled': False,
+            'pressure_surface_enabled': False,
+            'status': 'disabled_after_diagnostic_review',
+            'decision': (
+                'Retain the fixed candidates and stop before '
+                'trajectory integration.'
+            ),
+            'candidate_event_ids': selected_events[
+                'event_id'
+            ].astype(str).tolist(),
+            'passed_prerequisites': {
+                'water_mass_and_kinematic_diagnostics': bool(
+                    diagnostic_manifest[
+                        'diagnostic_gate_passed'
+                    ]
+                ),
+                'negative_control': bool(
+                    diagnostic_manifest[
+                        'negative_control_passed'
+                    ]
+                ),
+                'event_context_fields': bool(
+                    context['field_diagnostic_passed'].all()
+                ),
+                'hosoda_integration_benchmark': bool(
+                    benchmark['diagnostic_passed'].all()
+                ),
+            },
+            'unresolved_items': [
+                'daily_velocity_temporal_interpolation',
+                'pressure_to_geometric_depth_conversion',
+                'three_dimensional_vertical_velocity_coupling',
+                'material-parcel_identity_of_eulerian_delta_do_objects',
+            ],
+            'scientific_rationale': (
+                'The isopycnal maps, exact water-mass/heave '
+                'decomposition, kinematics, and matched negative '
+                'control test a plausible pathway without treating '
+                'an Eulerian pressure-varying object as a parcel. '
+                'A trajectory would currently add assumptions that '
+                'have not passed dataset-specific validation.'
+            ),
+            'context_date_clipping': clipped_records,
+        }
+        trajectory_gate_path = run_dir / 'trajectory_gate.json'
+        _ofes_atomic_write_json(
+            trajectory_gate, trajectory_gate_path
+        )
+
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_context_fields': int(len(context)),
+                'completed_hosoda_fields': int(len(benchmark)),
+                'selected_event_count': int(
+                    len(selected_events)
+                ),
+                'event_context_rows': int(len(context)),
+                'context_field_gate_passed': bool(
+                    context['field_diagnostic_passed'].all()
+                ),
+                'hosoda_benchmark_gate_passed': bool(
+                    benchmark['diagnostic_passed'].all()
+                ),
+                'trajectory_enabled': False,
+                'figure_count': int(len(figure_paths)),
+                'outputs': {
+                    'event_context_snapshots': str(
+                        (
+                            run_dir
+                            / 'event_context_snapshots.parquet'
+                        ).resolve()
+                    ),
+                    'hosoda_benchmark_summary': str(
+                        (
+                            run_dir
+                            / 'hosoda_benchmark_summary.parquet'
+                        ).resolve()
+                    ),
+                    'source_inventory': str(
+                        (
+                            run_dir / 'source_inventory.parquet'
+                        ).resolve()
+                    ),
+                    'trajectory_gate': str(
+                        trajectory_gate_path.resolve()
+                    ),
+                    'field_cache_directory': str(
+                        fields_dir.resolve()
+                    ),
+                    'figures': [
+                        str(path) for path in figure_paths
+                    ],
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'event_context_snapshots': context,
+        'hosoda_benchmark_summary': benchmark,
+        'event_diagnostic_summary': event_summary,
+        'trajectory_gate': trajectory_gate,
+        'figure_paths': figure_paths,
+        'reused_complete_run': False,
+    }

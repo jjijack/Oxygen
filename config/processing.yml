@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.25 变更：
+#   - 新增 OFES 客观事件的 ±10 天等密度面演化图、年度总览、Hosoda benchmark 与轨迹门槛配置。
 # version 1.24 变更：
 #   - 新增 OFES 客观候选的等密度水团/heave 分解、动力量、深层敏感性排名与匹配负对照配置。
 # version 1.23 变更：
@@ -79,7 +81,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.24
+version: 1.25
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -280,6 +282,19 @@ ofes:
     control_match_strain_scale: 0.20
     context_days: 10
     output_subdir: event_diagnostics
+  event_evolution:
+    map_radius_km: 350.0
+    map_quiver_stride: 12
+    map_min_finite_fraction: 0.50
+    figure_dpi: 180
+    hosoda_dates: ["2003-04-05", "2003-05-10", "2003-05-15"]
+    hosoda_lon_bounds: [142.0, 150.0]
+    hosoda_lat_bounds: [32.0, 39.0]
+    hosoda_do_sigma0: 26.5
+    hosoda_do_reference_pressure_dbar: 500.0
+    hosoda_salinity_sigma0: 26.7
+    hosoda_salinity_reference_pressure_dbar: 600.0
+    output_subdir: event_evolution
 
 plot:
   basemap_colors:
