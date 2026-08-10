@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.26 变更：
+#   - 更正 OFES `lev` 的错误 millibar attribute：统一按交付 z-level 深度（m）解释，
+#     仅在 TEOS-10 入口按纬度转换为海水压力；事件目录、诊断与图表字段同步改为 depth/m。
 # version 1.25 变更：
 #   - 新增 OFES 客观事件的 ±10 天等密度面演化图、年度总览、Hosoda benchmark 与轨迹门槛配置。
 # version 1.24 变更：
@@ -8,7 +11,7 @@
 #     catalog 与客观排序配置；固定 parity、掩码审计、缓存 provenance 和事件链接门槛。
 # version 1.22 变更：
 #   - 修正 OFES 为 MOM3 Arakawa B-grid：u/v 均从四个角点共置到示踪物中心；集中记录原生/输出单位、
-#     pressure 坐标与 w 向上为正约定，并将轨迹限制为未验证日场上的定压二维诊断。
+#     交付垂向坐标与 w 向上为正约定，并将轨迹限制为未验证日场上的定深二维诊断。
 # version 1.21 变更：
 #   - plot typography 整体提升 2 pt，固化会议投影与后续正式图的可读性标准：
 #     figure/panel/axis/tick/annotation 分别为 24/20/17/17/16 pt。
@@ -81,7 +84,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.25
+version: 1.26
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -192,9 +195,10 @@ processing:
 
 ofes:
   horizontal_grid: arakawa_b      # MOM3 B-grid：u/v 同处角点，均需四角平均到示踪物中心
-  pressure_scale: 1.0             # lev attribute 写作 millibar；数值保留为 OFES 的 dbar-like pressure 坐标
-  pressure_units: dbar
-  native_pressure_units: millibar
+  depth_scale: 1.0                # JAMSTEC 已注明 lev 的 millibar attribute 错误；交付数值为 z-level 深度（m）
+  depth_units: m
+  source_vertical_units_attribute: millibar
+  source_vertical_units_note: "incorrect provider attribute; delivered coordinate is depth in metres"
   variable_scale:                 # 原生值 → 对外值
     do2: 1.0
     temp: 1.0
@@ -222,8 +226,8 @@ ofes:
     w: "m s-1"
     eta: "m"
     pressur: "hPa"
-  vertical_velocity_positive: up  # MOM3 z/w 向上为正；本数据另经局地连续性符号检验
-  vertical_velocity_sign_basis: "MOM3 convention and 2003-04-05 KE discrete-continuity check"
+  vertical_velocity_positive: up  # MOM3 约定；正式启用 w 前仍需保留可复现的数据集专项验证
+  vertical_velocity_sign_basis: "MOM3 convention; dataset-specific validation artifact required"
   temporal_interpolation: piecewise_constant_unvalidated
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
@@ -233,11 +237,14 @@ ofes:
   tracer_vars: [do2, temp, salinity]
   velocity_vars: [u, v, w]
   surface_vars: [eta, pressur]
+  variable_semantics:
+    eta: sea_surface_height
+    pressur: surface_air_pressure
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
   delta_do_catalog:
     thresholds: [20.0, 35.0, 50.0]
-    candidate_pressure_min_dbar: 300.0
-    candidate_pressure_max_dbar: 1000.0
+    candidate_depth_min_m: 300.0
+    candidate_depth_max_m: 1000.0
     latitude_chunk_size: 100
     parity_dates: ["2003-01-01", "2003-04-05", "2003-07-01", "2003-10-01"]
     parity_lon_bounds: [142.0, 150.0]
@@ -246,24 +253,24 @@ ofes:
     parity_top_profiles: 200
     parity_seed: 20260730
     object_connectivity: 8
-    object_pressure_tolerance_dbar: 100.0
+    object_depth_tolerance_m: 100.0
     min_object_pixels: 12
     event_max_missing_days: 1
     event_max_centroid_distance_km: 80.0
-    event_max_pressure_difference_dbar: 100.0
+    event_max_depth_difference_m: 100.0
     event_bbox_padding_pixels: 6
     event_gap_cost_per_missing_day: 0.25
     min_ranked_event_days: 3
     rank_area_reference_km2: 500.0
-    rank_thickness_reference_dbar: 100.0
+    rank_thickness_reference_m: 100.0
     rank_duration_reference_days: 5.0
     output_region_slug: ofes_np30_ke
   event_diagnostics:
     candidate_threshold: 50.0
     candidate_count: 5
     maximum_sampled_event_days: 31
-    deep_pressure_min_dbar: 500.0
-    deep_pressure_max_dbar: 900.0
+    deep_depth_min_m: 500.0
+    deep_depth_max_m: 900.0
     background_inner_radius_km: 120.0
     background_outer_radius_km: 240.0
     background_load_margin_km: 50.0
@@ -291,9 +298,9 @@ ofes:
     hosoda_lon_bounds: [142.0, 150.0]
     hosoda_lat_bounds: [32.0, 39.0]
     hosoda_do_sigma0: 26.5
-    hosoda_do_reference_pressure_dbar: 500.0
+    hosoda_do_reference_depth_m: 500.0
     hosoda_salinity_sigma0: 26.7
-    hosoda_salinity_reference_pressure_dbar: 600.0
+    hosoda_salinity_reference_depth_m: 600.0
     output_subdir: event_evolution
 
 plot:

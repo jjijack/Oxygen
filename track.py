@@ -29105,12 +29105,12 @@ def _ofes_tracer_coordinates(
     with Dataset(str(reference_path), 'r') as nc:
         lon = np.asarray(nc.variables['lon'][:], dtype=float)
         lat = np.asarray(nc.variables['lat'][:], dtype=float)
-        pressure_native = np.asarray(nc.variables['lev'][:], dtype=float)
-        pressure_attr_units = str(getattr(nc.variables['lev'], 'units', 'unknown'))
+        depth_native = np.asarray(nc.variables['lev'][:], dtype=float)
+        depth_attr_units = str(getattr(nc.variables['lev'], 'units', 'unknown'))
 
-    pressure_scale = float(_OFES_CFG.get('pressure_scale', 1.0))
-    pressure = pressure_native * pressure_scale
-    return lon, lat, pressure, pressure_attr_units, reference_path
+    depth_scale = float(_OFES_CFG.get('depth_scale', 1.0))
+    depth = depth_native * depth_scale
+    return lon, lat, depth, depth_attr_units, reference_path
 
 
 def _ofes_subset_to_float32(variable, indexer: tuple) -> np.ndarray:
@@ -29124,13 +29124,13 @@ def load_ofes_snapshot(
     variables: list[str] | None = None,
     lon_bounds: tuple[float, float] | None = None,
     lat_bounds: tuple[float, float] | None = None,
-    pressure_bounds: tuple[float, float] | None = None,
+    depth_bounds: tuple[float, float] | None = None,
 ) -> dict:
     """按日期和区域加载 OFES NP30 快照，并校正 MOM3 B-grid 坐标。
 
     函数先读取一维坐标并构造 netCDF slice，再物化所请求的变量子集。`u` 和 `v`
-    同处 B-grid 角点，均由四个角点平均到示踪物中心；`w` 保留原生层界面压力
-    `pressure_w`，不再静默插值到示踪物层中心。变量单位按 `processing.yml`
+    同处 B-grid 角点，均由四个角点平均到示踪物中心；`w` 保留交付层界深度
+    `depth_w`，不再静默插值到示踪物层中心。变量单位按 `processing.yml`
     集中转换，原生与输出单位均记录在 `metadata`。
 
     参数:
@@ -29138,14 +29138,14 @@ def load_ofes_snapshot(
         - variables (list[str] | None): 需要加载的变量名列表；None 时加载 do2/temp/salinity/u/v/w。
         - lon_bounds (tuple[float, float] | None): 经度窗口；None 时读取全部已交付经度。
         - lat_bounds (tuple[float, float] | None): 纬度窗口；None 时读取全部已交付纬度。
-        - pressure_bounds (tuple[float, float] | None): 压力窗口（dbar-like OFES pressure coordinate）；None 时读取全部层。
+        - depth_bounds (tuple[float, float] | None): 深度窗口（m）；None 时读取全部层。
 
     返回:
-        - dict: 含 date/lon/lat/pressure、请求变量和 metadata；u/v 与示踪物数组维度为 (pressure, lat, lon)，w 为 (pressure_w, lat, lon)。
+        - dict: 含 date/lon/lat/depth、请求变量和 metadata；u/v 与示踪物数组维度为 (depth, lat, lon)，w 为 (depth_w, lat, lon)。
 
     说明:
-        - 文件中的 `lev.units` 写作 millibar；这里保留其数值为约等于 dbar 的原生压力坐标，不把它宣称为精确几何深度。
-        - `w` 按 MOM3 约定向上为正，已通过局地连续性符号检验；本函数只负责读取，不据此授权三维轨迹解释。
+        - JAMSTEC 已注明文件中的 `lev.units=millibar` 是错误 metadata；本入口按交付 z-level 深度（m）解释其数值。
+        - `w` 按 MOM3 约定记录为向上为正，但尚缺可复现的数据集专项验证；本函数只负责读取，不据此授权三维轨迹解释。
         - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
     date_ts = pd.Timestamp(date).normalize()
@@ -29156,32 +29156,36 @@ def load_ofes_snapshot(
     if not variables:
         raise ValueError('variables must contain at least one OFES variable name.')
 
-    lon_all, lat_all, pressure_all, pressure_attr_units, reference_path = (
+    lon_all, lat_all, depth_all, depth_attr_units, reference_path = (
         _ofes_tracer_coordinates(date_ts)
     )
     lon_slice = _ofes_contiguous_slice(
         lon_all, lon_bounds, 'longitude', longitude=True
     )
     lat_slice = _ofes_contiguous_slice(lat_all, lat_bounds, 'latitude')
-    pressure_slice = _ofes_contiguous_slice(
-        pressure_all, pressure_bounds, 'pressure'
+    depth_slice = _ofes_contiguous_slice(
+        depth_all, depth_bounds, 'depth'
     )
     lon = lon_all[lon_slice]
     lat = lat_all[lat_slice]
-    pressure = pressure_all[pressure_slice]
+    depth = depth_all[depth_slice]
 
     variable_scale = _OFES_CFG.get('variable_scale', {})
     native_units_cfg = _OFES_CFG.get('native_units', {})
     output_units_cfg = _OFES_CFG.get('output_units', {})
+    variable_semantics_cfg = _OFES_CFG.get('variable_semantics', {})
     metadata: dict = {
         'horizontal_grid': str(_OFES_CFG.get('horizontal_grid', 'arakawa_b')),
         'horizontal_location': 'tracer_center',
-        'pressure_units': str(_OFES_CFG.get('pressure_units', 'dbar')),
-        'native_pressure_units': str(
-            _OFES_CFG.get('native_pressure_units', pressure_attr_units)
+        'depth_units': str(_OFES_CFG.get('depth_units', 'm')),
+        'source_vertical_units_attribute': depth_attr_units,
+        'source_vertical_units_note': str(
+            _OFES_CFG.get(
+                'source_vertical_units_note',
+                'incorrect provider attribute; delivered coordinate is depth in metres',
+            )
         ),
-        'file_pressure_units': pressure_attr_units,
-        'pressure_semantics': 'native OFES pressure coordinate; not exact geometric depth',
+        'depth_semantics': 'delivered OFES z-level depth below sea surface',
         'vertical_velocity_positive': str(
             _OFES_CFG.get('vertical_velocity_positive', 'up')
         ),
@@ -29196,6 +29200,7 @@ def load_ofes_snapshot(
         'variable_dims': {},
         'native_units': {},
         'output_units': {},
+        'variable_semantics': {},
         'unit_scales': {},
         'source_shapes': {},
         'loaded_shapes': {},
@@ -29206,7 +29211,7 @@ def load_ofes_snapshot(
         'date': date_ts,
         'lon': lon,
         'lat': lat,
-        'pressure': pressure,
+        'depth': depth,
     }
 
     for var in variables:
@@ -29228,12 +29233,12 @@ def load_ofes_snapshot(
                     )
 
             if var in ('u', 'v'):
-                pressure_var = (
-                    np.asarray(nc.variables['lev'][pressure_slice], dtype=float)
-                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                depth_var = (
+                    np.asarray(nc.variables['lev'][depth_slice], dtype=float)
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
                 )
                 _ofes_assert_coordinate_match(
-                    pressure_var, pressure, f'{var} pressure'
+                    depth_var, depth, f'{var} depth'
                 )
                 corner_lat_slice = slice(lat_slice.start, lat_slice.stop + 1)
                 corner_lon_slice = slice(lon_slice.start, lon_slice.stop + 1)
@@ -29245,10 +29250,10 @@ def load_ofes_snapshot(
                 )
                 raw = _ofes_subset_to_float32(
                     nc_var,
-                    (0, pressure_slice, corner_lat_slice, corner_lon_slice),
+                    (0, depth_slice, corner_lat_slice, corner_lon_slice),
                 )
                 expected_corner_shape = (
-                    pressure.size, lat.size + 1, lon.size + 1
+                    depth.size, lat.size + 1, lon.size + 1
                 )
                 if raw.shape != expected_corner_shape:
                     raise ValueError(
@@ -29277,11 +29282,11 @@ def load_ofes_snapshot(
                 )
                 raw = collocated
                 metadata['variable_dims'][var] = (
-                    'pressure', 'lat', 'lon'
+                    'depth', 'lat', 'lon'
                 )
                 metadata['read_slices'][var] = {
                     'time': 0,
-                    'pressure': (pressure_slice.start, pressure_slice.stop),
+                    'depth': (depth_slice.start, depth_slice.stop),
                     'lat_corner': (
                         corner_lat_slice.start, corner_lat_slice.stop
                     ),
@@ -29290,20 +29295,20 @@ def load_ofes_snapshot(
                     ),
                 }
             elif var == 'w':
-                pressure_w_all = (
+                depth_w_all = (
                     np.asarray(nc.variables['lev'][:], dtype=float)
-                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
                 )
-                pressure_w_slice = _ofes_contiguous_slice(
-                    pressure_w_all, pressure_bounds, 'w pressure'
+                depth_w_slice = _ofes_contiguous_slice(
+                    depth_w_all, depth_bounds, 'w depth'
                 )
-                pressure_w = pressure_w_all[pressure_w_slice]
-                if 'pressure_w' in result:
+                depth_w = depth_w_all[depth_w_slice]
+                if 'depth_w' in result:
                     _ofes_assert_coordinate_match(
-                        result['pressure_w'], pressure_w, 'w pressure'
+                        result['depth_w'], depth_w, 'w depth'
                     )
                 else:
-                    result['pressure_w'] = pressure_w
+                    result['depth_w'] = depth_w
                 _ofes_assert_coordinate_match(
                     np.asarray(nc.variables['lat'][lat_slice], dtype=float),
                     lat,
@@ -29315,26 +29320,26 @@ def load_ofes_snapshot(
                     'w longitude',
                 )
                 raw = _ofes_subset_to_float32(
-                    nc_var, (0, pressure_w_slice, lat_slice, lon_slice)
+                    nc_var, (0, depth_w_slice, lat_slice, lon_slice)
                 )
                 metadata['variable_dims'][var] = (
-                    'pressure_w', 'lat', 'lon'
+                    'depth_w', 'lat', 'lon'
                 )
                 metadata['read_slices'][var] = {
                     'time': 0,
-                    'pressure_w': (
-                        pressure_w_slice.start, pressure_w_slice.stop
+                    'depth_w': (
+                        depth_w_slice.start, depth_w_slice.stop
                     ),
                     'lat': (lat_slice.start, lat_slice.stop),
                     'lon': (lon_slice.start, lon_slice.stop),
                 }
             elif nc_var.ndim == 4:
-                pressure_var = (
-                    np.asarray(nc.variables['lev'][pressure_slice], dtype=float)
-                    * float(_OFES_CFG.get('pressure_scale', 1.0))
+                depth_var = (
+                    np.asarray(nc.variables['lev'][depth_slice], dtype=float)
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
                 )
                 _ofes_assert_coordinate_match(
-                    pressure_var, pressure, f'{var} pressure'
+                    depth_var, depth, f'{var} depth'
                 )
                 _ofes_assert_coordinate_match(
                     np.asarray(nc.variables['lat'][lat_slice], dtype=float),
@@ -29347,14 +29352,14 @@ def load_ofes_snapshot(
                     f'{var} longitude',
                 )
                 raw = _ofes_subset_to_float32(
-                    nc_var, (0, pressure_slice, lat_slice, lon_slice)
+                    nc_var, (0, depth_slice, lat_slice, lon_slice)
                 )
                 metadata['variable_dims'][var] = (
-                    'pressure', 'lat', 'lon'
+                    'depth', 'lat', 'lon'
                 )
                 metadata['read_slices'][var] = {
                     'time': 0,
-                    'pressure': (pressure_slice.start, pressure_slice.stop),
+                    'depth': (depth_slice.start, depth_slice.stop),
                     'lat': (lat_slice.start, lat_slice.stop),
                     'lon': (lon_slice.start, lon_slice.stop),
                 }
@@ -29395,6 +29400,10 @@ def load_ofes_snapshot(
         metadata['output_units'][var] = str(
             output_units_cfg.get(var, file_units or 'unknown')
         )
+        if var in variable_semantics_cfg:
+            metadata['variable_semantics'][var] = str(
+                variable_semantics_cfg[var]
+            )
         metadata['loaded_shapes'][var] = tuple(
             int(v) for v in result[var].shape
         )
@@ -29408,13 +29417,13 @@ def _ofes_profile_variables(
     snapshot: dict,
     variables: list[str] | None,
 ) -> list[str]:
-    """解析与示踪物 pressure 网格同位、可合并成单张剖面表的变量。"""
+    """解析与示踪物 depth 网格同位、可合并成单张剖面表的变量。"""
     variable_dims = snapshot.get('metadata', {}).get('variable_dims', {})
     if variables is None:
         return [
             var
             for var, dims in variable_dims.items()
-            if tuple(dims) == ('pressure', 'lat', 'lon')
+            if tuple(dims) == ('depth', 'lat', 'lon')
         ]
 
     selected = list(dict.fromkeys(variables))
@@ -29422,10 +29431,10 @@ def _ofes_profile_variables(
         if var not in snapshot:
             raise KeyError(f'Variable {var!r} is absent from the OFES snapshot.')
         dims = tuple(variable_dims.get(var, ()))
-        if dims != ('pressure', 'lat', 'lon'):
+        if dims != ('depth', 'lat', 'lon'):
             raise ValueError(
                 f'Variable {var!r} uses coordinates {dims}; only variables on '
-                '(pressure, lat, lon) can share this profile table.'
+                '(depth, lat, lon) can share this profile table.'
             )
     return selected
 
@@ -29451,10 +29460,10 @@ def extract_ofes_profile(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """从 OFES 快照中提取指定经纬度的定压剖面（最近邻）。
+    """从 OFES 快照中提取指定经纬度的定深剖面（最近邻）。
 
-    仅合并已经位于 `(pressure, lat, lon)` 示踪物网格的变量。`w` 保留在
-    `pressure_w` 层界面上，不能由本入口静默混入中心层剖面。
+    仅合并已经位于 `(depth, lat, lon)` 示踪物网格的变量。`w` 保留在
+    `depth_w` 层界面上，不能由本入口静默混入中心层剖面。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
@@ -29463,18 +29472,18 @@ def extract_ofes_profile(
         - variables (list[str] | None): 变量名列表；None 时提取所有中心层 3-D 变量。
 
     返回:
-        - pd.DataFrame: 含 Pressure 列及各变量列的剖面表，Pressure 单位见 snapshot metadata。
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
     """
     _ofes_validate_profile_point(snapshot, lon, lat)
     lat_arr = np.asarray(snapshot['lat'], dtype=float)
     lon_arr = np.asarray(snapshot['lon'], dtype=float)
-    pressure_arr = np.asarray(snapshot['pressure'], dtype=float)
+    depth_arr = np.asarray(snapshot['depth'], dtype=float)
 
     j = int(np.argmin(np.abs(lat_arr - lat)))
     i = int(np.argmin(np.abs(lon_arr - lon)))
     selected = _ofes_profile_variables(snapshot, variables)
 
-    records = {'Pressure': pressure_arr.copy()}
+    records = {'Depth': depth_arr.copy()}
     for var in selected:
         arr = snapshot[var]
         records[var] = arr[:, j, i].copy()
@@ -29488,24 +29497,24 @@ def extract_ofes_profile_interp(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """从 OFES 快照中提取指定经纬度的定压剖面（水平双线性插值）。
+    """从 OFES 快照中提取指定经纬度的定深剖面（水平双线性插值）。
 
-    垂向保留原生示踪物 pressure 层；若任一请求变量的四角整列均为陆地 NaN，
-    整张表回退到最近邻剖面。`w` 的层界面 pressure 不在此处插值。
+    垂向保留交付示踪物 depth 层；若任一请求变量的四角整列均为陆地 NaN，
+    整张表回退到最近邻剖面。`w` 的层界面 depth 不在此处插值。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - lon (float): 经度。
         - lat (float): 纬度。
-        - variables (list[str] | None): 位于示踪物 pressure 网格的变量名列表；None 时自动选择。
+        - variables (list[str] | None): 位于示踪物 depth 网格的变量名列表；None 时自动选择。
 
     返回:
-        - pd.DataFrame: 含 Pressure 列及各变量列的剖面表，Pressure 单位见 snapshot metadata。
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
     """
     _ofes_validate_profile_point(snapshot, lon, lat)
     lat_arr = np.asarray(snapshot['lat'], dtype=float)
     lon_arr = np.asarray(snapshot['lon'], dtype=float)
-    pressure_arr = np.asarray(snapshot['pressure'], dtype=float)
+    depth_arr = np.asarray(snapshot['depth'], dtype=float)
     selected = _ofes_profile_variables(snapshot, variables)
     if lat_arr.size < 2 or lon_arr.size < 2:
         return extract_ofes_profile(snapshot, lon, lat, selected)
@@ -29525,7 +29534,7 @@ def extract_ofes_profile_interp(
     w10 = dy * (1 - dx)
     w11 = dy * dx
 
-    records = {'Pressure': pressure_arr.copy()}
+    records = {'Depth': depth_arr.copy()}
     any_all_nan = False
     for var in selected:
         arr = snapshot[var]
@@ -29552,11 +29561,11 @@ def detect_ofes_delta_do(
     detection_config: DetectionConfig | None = None,
     interp: bool = True,
 ) -> pd.DataFrame:
-    """在 OFES 定压虚拟剖面上运行 ΔDO 检测。
+    """在 OFES 定深虚拟剖面上运行 ΔDO 检测。
 
     本入口直接复用 `calculate_delta_do` 作为单剖面真值实现，并显式把
-    `Pressure` 传为剖面坐标。OFES 的 `temp` 是位温，送入通用 detector 前
-    先用 TEOS-10 转为原位温度；返回结果中的候选坐标命名为 `pressure`。
+    `Depth` 传为剖面坐标。OFES 的 `temp` 是位温，送入通用 detector 前
+    先按纬度把深度转换为海水压力，再用 TEOS-10 转为原位温度；返回候选坐标命名为 `depth`。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典（需含 do2/temp/salinity）。
@@ -29566,10 +29575,10 @@ def detect_ofes_delta_do(
         - interp (bool): True 时用双线性插值取剖面，False 时用最近邻。
 
     返回:
-        - pd.DataFrame: 每个剖面最多一个最强候选，含 pressure 和 ΔDO 指标；空表表示无异常。
+        - pd.DataFrame: 每个剖面最多一个最强候选，含 depth 和 ΔDO 指标；空表表示无异常。
 
     说明:
-        - DetectionConfig 中沿用通用入口的 `anomaly_*_depth` 字段名，但本入口按 dbar-like pressure 数值解释这些阈值。
+        - DetectionConfig 的 `anomaly_*_depth` 字段在本入口直接按深度米解释。
         - 返回的 delta_temperature 基于转换后的原位温度；快照中的 `temp` 本身仍保留 OFES 原生位温。
     """
     extract_fn = extract_ofes_profile_interp if interp else extract_ofes_profile
@@ -29581,14 +29590,18 @@ def detect_ofes_delta_do(
         'salinity': 'Salinity',
     }
     prof = prof.rename(columns=col_map)
-    pressure_values = prof['Pressure'].to_numpy(dtype=float)
+    depth_values = prof['Depth'].to_numpy(dtype=float)
+    seawater_pressure = gsw.p_from_z(
+        -depth_values,
+        np.full_like(depth_values, float(lat)),
+    )
     salinity_values = prof['Salinity'].to_numpy(dtype=float)
     potential_temperature = prof['Potential_temperature'].to_numpy(dtype=float)
     absolute_salinity = gsw.SA_from_SP(
         salinity_values,
-        pressure_values,
-        np.full_like(pressure_values, float(lon)),
-        np.full_like(pressure_values, float(lat)),
+        seawater_pressure,
+        np.full_like(depth_values, float(lon)),
+        np.full_like(depth_values, float(lat)),
     )
     conservative_temperature = gsw.CT_from_pt(
         absolute_salinity,
@@ -29597,7 +29610,7 @@ def detect_ofes_delta_do(
     prof['Temperature'] = gsw.t_from_CT(
         absolute_salinity,
         conservative_temperature,
-        pressure_values,
+        seawater_pressure,
     )
 
     prof['Profile_number'] = 0
@@ -29611,14 +29624,14 @@ def detect_ofes_delta_do(
     result = calculate_delta_do(
         prof,
         detection_config=cfg,
-        depth_col='Pressure',
+        depth_col='Depth',
         verbose=False,
     )
     result = _keep_best_anomaly_per_profile(result, cfg).rename(
-        columns={'depth': 'pressure'}
+        columns={'depth': 'depth'}
     )
-    result.attrs['pressure_units'] = snapshot.get('metadata', {}).get(
-        'pressure_units', 'dbar'
+    result.attrs['depth_units'] = snapshot.get('metadata', {}).get(
+        'depth_units', 'm'
     )
     result.attrs['temperature_basis'] = (
         'in_situ_from_ofes_potential_temperature'
@@ -29628,60 +29641,60 @@ def detect_ofes_delta_do(
 
 def _ofes_interp3d(
     field: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     pts: np.ndarray,
 ) -> np.ndarray:
-    """对 (N,3) 点阵 [pressure, lat, lon] 做三线性插值。"""
+    """对 (N,3) 点阵 [depth, lat, lon] 做三线性插值。"""
     interp_fn = RegularGridInterpolator(
-        (pressure, lat, lon), field,
+        (depth, lat, lon), field,
         method='linear', bounds_error=False, fill_value=np.nan,
     )
     return interp_fn(pts)
 
 
-def _ofes_fixed_pressure_tendency(
+def _ofes_fixed_depth_tendency(
     pos: np.ndarray,
     u_field: np.ndarray,
     v_field: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
 ) -> np.ndarray:
-    """返回固定 pressure 粒子的 [0, dlat/dt, dlon/dt]。"""
-    u = _ofes_interp3d(u_field, pressure, lat, lon, pos)
-    v = _ofes_interp3d(v_field, pressure, lat, lon, pos)
+    """返回固定深度粒子的 [0, dlat/dt, dlon/dt]。"""
+    u = _ofes_interp3d(u_field, depth, lat, lon, pos)
+    v = _ofes_interp3d(v_field, depth, lat, lon, pos)
     geo = approximate_degree_length(pos[:, 1])
     dlat = v / geo['meters_per_degree_lat']
     dlon = u / geo['meters_per_degree_lon']
     return np.column_stack([np.zeros_like(u), dlat, dlon])
 
 
-def _ofes_rk4_fixed_pressure_step(
+def _ofes_rk4_fixed_depth_step(
     pos: np.ndarray,
     u_field: np.ndarray,
     v_field: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     dt: float,
 ) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
-    """执行一步固定 pressure RK4，并返回用于越界判定的中间位置。"""
-    k1 = _ofes_fixed_pressure_tendency(
-        pos, u_field, v_field, pressure, lat, lon
+    """执行一步固定深度 RK4，并返回用于越界判定的中间位置。"""
+    k1 = _ofes_fixed_depth_tendency(
+        pos, u_field, v_field, depth, lat, lon
     )
     pos2 = pos + 0.5 * dt * k1
-    k2 = _ofes_fixed_pressure_tendency(
-        pos2, u_field, v_field, pressure, lat, lon
+    k2 = _ofes_fixed_depth_tendency(
+        pos2, u_field, v_field, depth, lat, lon
     )
     pos3 = pos + 0.5 * dt * k2
-    k3 = _ofes_fixed_pressure_tendency(
-        pos3, u_field, v_field, pressure, lat, lon
+    k3 = _ofes_fixed_depth_tendency(
+        pos3, u_field, v_field, depth, lat, lon
     )
     pos4 = pos + dt * k3
-    k4 = _ofes_fixed_pressure_tendency(
-        pos4, u_field, v_field, pressure, lat, lon
+    k4 = _ofes_fixed_depth_tendency(
+        pos4, u_field, v_field, depth, lat, lon
     )
     new_pos = pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
     return new_pos, (pos2, pos3, pos4, new_pos)
@@ -29689,7 +29702,7 @@ def _ofes_rk4_fixed_pressure_step(
 
 def _ofes_positions_in_bounds(
     pos: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
 ) -> np.ndarray:
@@ -29697,8 +29710,8 @@ def _ofes_positions_in_bounds(
     finite = np.all(np.isfinite(pos), axis=1)
     return (
         finite
-        & (pos[:, 0] >= pressure[0])
-        & (pos[:, 0] <= pressure[-1])
+        & (pos[:, 0] >= depth[0])
+        & (pos[:, 0] <= depth[-1])
         & (pos[:, 1] >= lat[0])
         & (pos[:, 1] <= lat[-1])
         & (pos[:, 2] >= lon[0])
@@ -29711,34 +29724,34 @@ def advect_ofes_particles(
     particles: np.ndarray,
     backward: bool = False,
     dt_seconds: float | None = None,
-    vertical_mode: str = 'fixed_pressure',
+    vertical_mode: str = 'fixed_depth',
 ) -> dict:
-    """用 OFES 日均水平速度做固定 pressure 的二维 RK4 粒子诊断。
+    """用 OFES 日均水平速度做固定深度的二维 RK4 粒子诊断。
 
     该入口严格保留各个积分时刻，并为每个粒子记录 active、invalid 或 escaped
     状态。失败粒子从失败时刻起位置记为 NaN，不再伪装成静止粒子。当前只允许
-    `fixed_pressure`；三维 pressure/depth 与 `w` 耦合尚未通过验证门槛。
+    `fixed_depth`；三维 z/w 耦合尚未通过验证门槛。
 
     参数:
         - snapshots (dict[str, dict] | list[dict]): 按日期排序的 OFES 快照集合。
-        - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [pressure, lat, lon]。
+        - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [depth, lat, lon]。
         - backward (bool): True 时从最后一个快照向前积分，默认 False。
         - dt_seconds (float | None): 最大积分步长（秒）；None 时从 processing.yml 读取，末步自动缩短以精确落在下个快照时刻。
-        - vertical_mode (str): 垂向处理；当前仅支持 'fixed_pressure'。
+        - vertical_mode (str): 垂向处理；当前仅支持 'fixed_depth'。
 
     返回:
         - dict: 含 times、positions、status、final_status、failure_time、coordinate_columns 和 metadata；positions 形状为 (time, particle, 3)。
 
     说明:
         - 每个相邻日场之间仍使用积分方向起点的速度场，属于未验证的分段恒定时间近似；metadata 会显式记录。
-        - `w` 虽已确认向上为正，但 pressure-depth 转换和日均三维速度时间插值尚未验证，因此本入口不使用 `w`。
-        - 该结果适合作为 pressure-surface 水平输运诊断，不构成三维水团来源证明。
+        - `w` 的数据集专项符号验证和日均三维速度时间插值尚未完成，因此本入口不使用 `w`。
+        - 该结果适合作为固定深度水平输运诊断，不构成三维水团来源证明。
     """
-    if vertical_mode != 'fixed_pressure':
+    if vertical_mode != 'fixed_depth':
         raise NotImplementedError(
-            'Only vertical_mode="fixed_pressure" is enabled. Three-dimensional '
-            'OFES trajectories remain disabled until pressure-depth conversion '
-            'and daily u/v/w interpolation are validated.'
+            'Only vertical_mode="fixed_depth" is enabled. Three-dimensional '
+            'OFES trajectories remain disabled until w sign/coupling and daily '
+            'u/v/w interpolation are validated.'
         )
     if dt_seconds is None:
         dt_seconds = float(_OFES_CFG.get('rk4_dt_seconds', 3600))
@@ -29768,11 +29781,11 @@ def advect_ofes_particles(
     if pos.ndim != 2 or pos.shape[1] != 3:
         raise ValueError(
             'particles must have shape (N, 3) with columns '
-            '[pressure, lat, lon].'
+            '[depth, lat, lon].'
         )
 
     first = snap_list[0]
-    first_pressure = np.asarray(first['pressure'], dtype=float)
+    first_depth = np.asarray(first['depth'], dtype=float)
     first_lat = np.asarray(first['lat'], dtype=float)
     first_lon = np.asarray(first['lon'], dtype=float)
     status = np.full(pos.shape[0], 'active', dtype='<U8')
@@ -29781,7 +29794,7 @@ def advect_ofes_particles(
     status[
         finite_initial
         & ~_ofes_positions_in_bounds(
-            pos, first_pressure, first_lat, first_lon
+            pos, first_depth, first_lat, first_lon
         )
     ] = 'escaped'
 
@@ -29797,13 +29810,13 @@ def advect_ofes_particles(
         snap = snap_list[idx]
         u_field = np.asarray(snap['u'], dtype=float)
         v_field = np.asarray(snap['v'], dtype=float)
-        pressure = np.asarray(snap['pressure'], dtype=float)
+        depth = np.asarray(snap['depth'], dtype=float)
         lat = np.asarray(snap['lat'], dtype=float)
         lon = np.asarray(snap['lon'], dtype=float)
-        expected_shape = (pressure.size, lat.size, lon.size)
+        expected_shape = (depth.size, lat.size, lon.size)
         if u_field.shape != expected_shape or v_field.shape != expected_shape:
             raise ValueError(
-                f'OFES u/v shape must equal pressure/lat/lon shape '
+                f'OFES u/v shape must equal depth/lat/lon shape '
                 f'{expected_shape}; got u={u_field.shape}, v={v_field.shape}.'
             )
 
@@ -29819,17 +29832,17 @@ def advect_ofes_particles(
             active_idx = np.flatnonzero(status == 'active')
             if active_idx.size:
                 active_pos = pos[active_idx]
-                new_pos, stages = _ofes_rk4_fixed_pressure_step(
+                new_pos, stages = _ofes_rk4_fixed_depth_step(
                     active_pos,
                     u_field,
                     v_field,
-                    pressure,
+                    depth,
                     lat,
                     lon,
                     step_seconds,
                 )
                 new_inside = _ofes_positions_in_bounds(
-                    new_pos, pressure, lat, lon
+                    new_pos, depth, lat, lon
                 )
                 stage_escaped = np.zeros(active_idx.size, dtype=bool)
                 for stage in stages:
@@ -29837,7 +29850,7 @@ def advect_ofes_particles(
                     stage_escaped |= (
                         stage_finite
                         & ~_ofes_positions_in_bounds(
-                            stage, pressure, lat, lon
+                            stage, depth, lat, lon
                         )
                     )
 
@@ -29872,11 +29885,11 @@ def advect_ofes_particles(
         'status': np.stack(statuses),
         'final_status': status.copy(),
         'failure_time': failure_time,
-        'coordinate_columns': ('pressure', 'lat', 'lon'),
+        'coordinate_columns': ('depth', 'lat', 'lon'),
         'metadata': {
             'vertical_mode': vertical_mode,
-            'pressure_units': str(
-                first.get('metadata', {}).get('pressure_units', 'dbar')
+            'depth_units': str(
+                first.get('metadata', {}).get('depth_units', 'm')
             ),
             'temporal_interpolation': str(
                 _OFES_CFG.get(
@@ -29887,7 +29900,7 @@ def advect_ofes_particles(
             'w_used': False,
             'unresolved_validation': (
                 'daily_velocity_interpolation',
-                'pressure_depth_conversion',
+                'vertical_velocity_sign_and_coupling',
                 'three_dimensional_vertical_motion',
             ),
         },
@@ -29897,19 +29910,19 @@ def advect_ofes_particles(
 def plot_ofes_snapshot_quick(
     snapshot: dict,
     variable: str = 'do2',
-    pressure: float = 200.0,
+    depth: float = 200.0,
     ax=None,
     show_fig: bool = True,
 ) -> plt.Figure | None:
-    """快速绘制 OFES 定压或表面变量的水平切片。
+    """快速绘制 OFES 定深或表面变量的水平切片。
 
-    三维变量按其 metadata 选择 `pressure` 或 `pressure_w` 最近层；二维表面变量
+    三维变量按其 metadata 选择 `depth` 或 `depth_w` 最近层；二维表面变量
     直接绘制。色标使用 loader 记录的输出单位。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - variable (str): 绘制的变量名。
-        - pressure (float): 三维变量的目标压力（dbar-like），取最近层，默认 200.0。
+        - depth (float): 三维变量的目标深度（m），取最近层，默认 200.0。
         - ax (matplotlib.axes.Axes | None): 可选 GeoAxes。
         - show_fig (bool): 是否显示图形。
 
@@ -29923,16 +29936,16 @@ def plot_ofes_snapshot_quick(
         .get('variable_dims', {})
         .get(variable, ())
     )
-    if variable_dims == ('pressure', 'lat', 'lon'):
-        vertical_coord = np.asarray(snapshot['pressure'], dtype=float)
-        k = int(np.argmin(np.abs(vertical_coord - pressure)))
+    if variable_dims == ('depth', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['depth'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - depth)))
         data = snapshot[variable][k]
-        vertical_title = f'pressure={vertical_coord[k]:.1f} dbar'
-    elif variable_dims == ('pressure_w', 'lat', 'lon'):
-        vertical_coord = np.asarray(snapshot['pressure_w'], dtype=float)
-        k = int(np.argmin(np.abs(vertical_coord - pressure)))
+        vertical_title = f'depth={vertical_coord[k]:.1f} m'
+    elif variable_dims == ('depth_w', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['depth_w'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - depth)))
         data = snapshot[variable][k]
-        vertical_title = f'interface pressure={vertical_coord[k]:.1f} dbar'
+        vertical_title = f'interface depth={vertical_coord[k]:.1f} m'
     elif variable_dims == ('lat', 'lon'):
         data = snapshot[variable]
         vertical_title = 'surface'
@@ -30001,11 +30014,11 @@ def _ofes_delta_do_catalog_settings(
 
     settings = {
         'thresholds': thresholds,
-        'candidate_pressure_min_dbar': float(
-            raw.get('candidate_pressure_min_dbar', 300.0)
+        'candidate_depth_min_m': float(
+            raw.get('candidate_depth_min_m', 300.0)
         ),
-        'candidate_pressure_max_dbar': float(
-            raw.get('candidate_pressure_max_dbar', 1000.0)
+        'candidate_depth_max_m': float(
+            raw.get('candidate_depth_max_m', 1000.0)
         ),
         'latitude_chunk_size': int(raw.get('latitude_chunk_size', 100)),
         'parity_dates': tuple(str(value) for value in raw.get(
@@ -30024,8 +30037,8 @@ def _ofes_delta_do_catalog_settings(
         'parity_top_profiles': int(raw.get('parity_top_profiles', 200)),
         'parity_seed': int(raw.get('parity_seed', 20260730)),
         'object_connectivity': int(raw.get('object_connectivity', 8)),
-        'object_pressure_tolerance_dbar': float(
-            raw.get('object_pressure_tolerance_dbar', 100.0)
+        'object_depth_tolerance_m': float(
+            raw.get('object_depth_tolerance_m', 100.0)
         ),
         'min_object_pixels': int(raw.get('min_object_pixels', 12)),
         'event_max_missing_days': int(
@@ -30034,8 +30047,8 @@ def _ofes_delta_do_catalog_settings(
         'event_max_centroid_distance_km': float(
             raw.get('event_max_centroid_distance_km', 80.0)
         ),
-        'event_max_pressure_difference_dbar': float(
-            raw.get('event_max_pressure_difference_dbar', 100.0)
+        'event_max_depth_difference_m': float(
+            raw.get('event_max_depth_difference_m', 100.0)
         ),
         'event_bbox_padding_pixels': int(
             raw.get('event_bbox_padding_pixels', 6)
@@ -30049,8 +30062,8 @@ def _ofes_delta_do_catalog_settings(
         'rank_area_reference_km2': float(
             raw.get('rank_area_reference_km2', 500.0)
         ),
-        'rank_thickness_reference_dbar': float(
-            raw.get('rank_thickness_reference_dbar', 100.0)
+        'rank_thickness_reference_m': float(
+            raw.get('rank_thickness_reference_m', 100.0)
         ),
         'rank_duration_reference_days': float(
             raw.get('rank_duration_reference_days', 5.0)
@@ -30060,12 +30073,12 @@ def _ofes_delta_do_catalog_settings(
         ),
     }
     if (
-        settings['candidate_pressure_min_dbar'] < 0
-        or settings['candidate_pressure_max_dbar']
-        <= settings['candidate_pressure_min_dbar']
+        settings['candidate_depth_min_m'] < 0
+        or settings['candidate_depth_max_m']
+        <= settings['candidate_depth_min_m']
     ):
         raise ValueError(
-            'OFES catalog candidate pressure bounds must be ordered and '
+            'OFES catalog candidate depth bounds must be ordered and '
             'non-negative.'
         )
     if settings['latitude_chunk_size'] <= 0:
@@ -30073,13 +30086,13 @@ def _ofes_delta_do_catalog_settings(
     if settings['object_connectivity'] not in (4, 8):
         raise ValueError('OFES object_connectivity must be 4 or 8.')
     positive_keys = (
-        'object_pressure_tolerance_dbar',
+        'object_depth_tolerance_m',
         'min_object_pixels',
         'event_max_centroid_distance_km',
-        'event_max_pressure_difference_dbar',
+        'event_max_depth_difference_m',
         'min_ranked_event_days',
         'rank_area_reference_km2',
-        'rank_thickness_reference_dbar',
+        'rank_thickness_reference_m',
         'rank_duration_reference_days',
     )
     if any(settings[key] <= 0 for key in positive_keys):
@@ -30100,7 +30113,7 @@ def _ofes_delta_do_catalog_settings(
 
 def _ofes_vectorized_do_peaks(
     do_values: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     detection_config: DetectionConfig,
     *,
     valid_mask: np.ndarray | None = None,
@@ -30119,19 +30132,19 @@ def _ofes_vectorized_do_peaks(
         )
 
     values = np.asarray(do_values, dtype=np.float64)
-    pressure_arr = np.asarray(pressure, dtype=np.float64)
-    if values.ndim != 3 or pressure_arr.ndim != 1:
+    depth_arr = np.asarray(depth, dtype=np.float64)
+    if values.ndim != 3 or depth_arr.ndim != 1:
         raise ValueError(
-            'do_values must have shape (pressure, lat, lon) and pressure '
+            'do_values must have shape (depth, lat, lon) and depth '
             'must be one-dimensional.'
         )
-    if values.shape[0] != pressure_arr.size:
+    if values.shape[0] != depth_arr.size:
         raise ValueError(
-            f'OFES DO pressure axis mismatch: {values.shape[0]} != '
-            f'{pressure_arr.size}.'
+            f'OFES DO depth axis mismatch: {values.shape[0]} != '
+            f'{depth_arr.size}.'
         )
-    if not np.all(np.diff(pressure_arr) > 0):
-        raise ValueError('OFES pressure coordinate must be strictly increasing.')
+    if not np.all(np.diff(depth_arr) > 0):
+        raise ValueError('OFES depth coordinate must be strictly increasing.')
 
     horizontal_shape = values.shape[1:]
     flat = values.reshape(values.shape[0], -1)
@@ -30159,14 +30172,14 @@ def _ofes_vectorized_do_peaks(
     packed = np.packbits(valid.T, axis=1)
     _, inverse = np.unique(packed, axis=0, return_inverse=True)
     best_delta = np.full(flat.shape[1], np.nan, dtype=np.float64)
-    best_pressure = np.full(flat.shape[1], np.nan, dtype=np.float64)
+    best_depth = np.full(flat.shape[1], np.nan, dtype=np.float64)
     best_level = np.full(flat.shape[1], -1, dtype=np.int16)
     candidate_count = np.zeros(flat.shape[1], dtype=np.int16)
     valid_level_count = np.count_nonzero(valid, axis=0).astype(np.int16)
     thickness = np.full(flat.shape[1], np.nan, dtype=np.float64)
 
-    pressure_min = float(detection_config.anomaly_min_depth)
-    pressure_max = float(detection_config.anomaly_max_depth)
+    depth_min = float(detection_config.anomaly_min_depth)
+    depth_max = float(detection_config.anomaly_max_depth)
     half_window = float(detection_config.depth_interval)
 
     for pattern_id in range(int(inverse.max()) + 1):
@@ -30177,44 +30190,44 @@ def _ofes_vectorized_do_peaks(
         if levels.size < 5:
             continue
 
-        pattern_pressure = pressure_arr[levels]
+        pattern_depth = depth_arr[levels]
         pattern_values = flat[np.ix_(levels, columns)]
         slopes = np.gradient(
-            pattern_values, pattern_pressure, axis=0
+            pattern_values, pattern_depth, axis=0
         )
         candidates = np.zeros(pattern_values.shape, dtype=bool)
         candidates[1:-1] = (
             (slopes[:-2] > 0)
             & (slopes[2:] < 0)
         )
-        if pressure_min > 0:
-            candidates &= pattern_pressure[:, None] >= pressure_min
-        if pressure_max > 0:
-            candidates &= pattern_pressure[:, None] <= pressure_max
+        if depth_min > 0:
+            candidates &= pattern_depth[:, None] >= depth_min
+        if depth_max > 0:
+            candidates &= pattern_depth[:, None] <= depth_max
 
         deltas = np.full(pattern_values.shape, np.nan, dtype=np.float64)
         endpoint_indices: dict[int, tuple[int, int]] = {}
-        for local_index, target_pressure in enumerate(pattern_pressure):
-            if pressure_min > 0 and target_pressure < pressure_min:
+        for local_index, target_depth in enumerate(pattern_depth):
+            if depth_min > 0 and target_depth < depth_min:
                 continue
-            if pressure_max > 0 and target_pressure > pressure_max:
+            if depth_max > 0 and target_depth > depth_max:
                 continue
             lower = int(np.searchsorted(
-                pattern_pressure,
-                max(0.0, target_pressure - half_window),
+                pattern_depth,
+                max(0.0, target_depth - half_window),
                 side='left',
             ))
             upper = int(np.searchsorted(
-                pattern_pressure,
-                target_pressure + half_window,
+                pattern_depth,
+                target_depth + half_window,
                 side='right',
             ) - 1)
             if lower >= upper:
                 continue
             endpoint_indices[local_index] = (lower, upper)
             fraction = (
-                (target_pressure - pattern_pressure[lower])
-                / (pattern_pressure[upper] - pattern_pressure[lower])
+                (target_depth - pattern_depth[lower])
+                / (pattern_depth[upper] - pattern_depth[lower])
             )
             reference = (
                 pattern_values[lower]
@@ -30242,7 +30255,7 @@ def _ofes_vectorized_do_peaks(
             selected_local, selected_positions
         ]
         best_delta[selected_columns] = selected_delta
-        best_pressure[selected_columns] = pattern_pressure[selected_local]
+        best_depth[selected_columns] = pattern_depth[selected_local]
         best_level[selected_columns] = levels[selected_local]
 
         qualifying_positions = np.flatnonzero(
@@ -30259,13 +30272,13 @@ def _ofes_vectorized_do_peaks(
                 continue
             lower, upper = endpoint
             peak_delta = float(deltas[local_index, position])
-            segment_pressure = pattern_pressure[lower:upper + 1]
+            segment_depth = pattern_depth[lower:upper + 1]
             segment_values = pattern_values[
                 lower:upper + 1, position
             ]
             fraction = (
-                (segment_pressure - pattern_pressure[lower])
-                / (pattern_pressure[upper] - pattern_pressure[lower])
+                (segment_depth - pattern_depth[lower])
+                / (pattern_depth[upper] - pattern_depth[lower])
             )
             reference = (
                 pattern_values[lower, position]
@@ -30290,29 +30303,29 @@ def _ofes_vectorized_do_peaks(
 
             if start > 0:
                 upper_edge = 0.5 * (
-                    segment_pressure[start - 1]
-                    + segment_pressure[start]
+                    segment_depth[start - 1]
+                    + segment_depth[start]
                 )
             else:
-                upper_edge = segment_pressure[start]
-            if stop + 1 < segment_pressure.size:
+                upper_edge = segment_depth[start]
+            if stop + 1 < segment_depth.size:
                 lower_edge = 0.5 * (
-                    segment_pressure[stop]
-                    + segment_pressure[stop + 1]
+                    segment_depth[stop]
+                    + segment_depth[stop + 1]
                 )
             else:
-                lower_edge = segment_pressure[stop]
+                lower_edge = segment_depth[stop]
             thickness[columns[position]] = max(
                 0.0, float(lower_edge - upper_edge)
             )
 
     result = {
         'delta_do': best_delta.reshape(horizontal_shape).astype(np.float32),
-        'peak_pressure': best_pressure.reshape(
+        'peak_depth': best_depth.reshape(
             horizontal_shape
         ).astype(np.float32),
         'peak_level_index': best_level.reshape(horizontal_shape),
-        'half_amplitude_thickness_dbar': thickness.reshape(
+        'half_amplitude_thickness_m': thickness.reshape(
             horizontal_shape
         ).astype(np.float32),
         'candidate_count': candidate_count.reshape(horizontal_shape),
@@ -30330,21 +30343,21 @@ def _ofes_threshold_tag(threshold: float) -> str:
 def _ofes_depth_aware_components(
     rows: np.ndarray,
     columns: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
     grid_shape: tuple[int, int],
     *,
-    pressure_tolerance: float,
+    depth_tolerance: float,
     connectivity: int,
 ) -> tuple[int, np.ndarray]:
-    """连接水平相邻且峰值 pressure 足够接近的稀疏异常像元。"""
+    """连接水平相邻且峰值 depth 足够接近的稀疏异常像元。"""
     rows_arr = np.asarray(rows, dtype=np.int32)
     columns_arr = np.asarray(columns, dtype=np.int32)
-    pressure_arr = np.asarray(pressure, dtype=float)
+    depth_arr = np.asarray(depth, dtype=float)
     if not (
-        rows_arr.shape == columns_arr.shape == pressure_arr.shape
+        rows_arr.shape == columns_arr.shape == depth_arr.shape
     ):
         raise ValueError(
-            'OFES object rows, columns, and pressure must share one shape.'
+            'OFES object rows, columns, and depth must share one shape.'
         )
     node_count = rows_arr.size
     if node_count == 0:
@@ -30358,11 +30371,11 @@ def _ofes_depth_aware_components(
         raise ValueError('OFES object pixel indices lie outside the scan grid.')
 
     node_grid = np.full(grid_shape, -1, dtype=np.int32)
-    pressure_grid = np.full(grid_shape, np.nan, dtype=np.float32)
+    depth_grid = np.full(grid_shape, np.nan, dtype=np.float32)
     node_grid[rows_arr, columns_arr] = np.arange(
         node_count, dtype=np.int32
     )
-    pressure_grid[rows_arr, columns_arr] = pressure_arr
+    depth_grid[rows_arr, columns_arr] = depth_arr
 
     offsets = [(0, 1), (1, 0)]
     if connectivity == 8:
@@ -30389,16 +30402,16 @@ def _ofes_depth_aware_components(
         )
         left = node_grid[source_rows, source_columns]
         right = node_grid[target_rows, target_columns]
-        left_pressure = pressure_grid[source_rows, source_columns]
-        right_pressure = pressure_grid[target_rows, target_columns]
+        left_depth = depth_grid[source_rows, source_columns]
+        right_depth = depth_grid[target_rows, target_columns]
         connected = (
             (left >= 0)
             & (right >= 0)
-            & np.isfinite(left_pressure)
-            & np.isfinite(right_pressure)
+            & np.isfinite(left_depth)
+            & np.isfinite(right_depth)
             & (
-                np.abs(left_pressure - right_pressure)
-                <= float(pressure_tolerance)
+                np.abs(left_depth - right_depth)
+                <= float(depth_tolerance)
             )
         )
         if np.any(connected):
@@ -30458,9 +30471,9 @@ def _ofes_empty_peak_pixels() -> pd.DataFrame:
             'lat': pd.Series(dtype='float32'),
             'lon': pd.Series(dtype='float32'),
             'delta_do': pd.Series(dtype='float32'),
-            'peak_pressure': pd.Series(dtype='float32'),
+            'peak_depth': pd.Series(dtype='float32'),
             'peak_level_index': pd.Series(dtype='int16'),
-            'half_amplitude_thickness_dbar': pd.Series(dtype='float32'),
+            'half_amplitude_thickness_m': pd.Series(dtype='float32'),
             'candidate_count': pd.Series(dtype='int16'),
             'valid_level_count': pd.Series(dtype='int16'),
         }
@@ -30494,13 +30507,13 @@ def _ofes_empty_daily_objects() -> pd.DataFrame:
             'delta_do_p90': pd.Series(dtype='float64'),
             'peak_lon': pd.Series(dtype='float64'),
             'peak_lat': pd.Series(dtype='float64'),
-            'peak_pressure_at_max': pd.Series(dtype='float64'),
-            'pressure_mean': pd.Series(dtype='float64'),
-            'pressure_min': pd.Series(dtype='float64'),
-            'pressure_max': pd.Series(dtype='float64'),
-            'pressure_span_dbar': pd.Series(dtype='float64'),
-            'thickness_median_dbar': pd.Series(dtype='float64'),
-            'thickness_max_dbar': pd.Series(dtype='float64'),
+            'peak_depth_at_max': pd.Series(dtype='float64'),
+            'depth_mean': pd.Series(dtype='float64'),
+            'depth_min': pd.Series(dtype='float64'),
+            'depth_max': pd.Series(dtype='float64'),
+            'depth_span_m': pd.Series(dtype='float64'),
+            'thickness_median_m': pd.Series(dtype='float64'),
+            'thickness_max_m': pd.Series(dtype='float64'),
         }
     )
 
@@ -30525,9 +30538,9 @@ def _ofes_build_daily_objects(
     rows = working['lat_index'].to_numpy(dtype=np.int32)
     columns = working['lon_index'].to_numpy(dtype=np.int32)
     delta = working['delta_do'].to_numpy(dtype=float)
-    peak_pressure = working['peak_pressure'].to_numpy(dtype=float)
+    peak_depth = working['peak_depth'].to_numpy(dtype=float)
     thickness = working[
-        'half_amplitude_thickness_dbar'
+        'half_amplitude_thickness_m'
     ].to_numpy(dtype=float)
     lon_arr = np.asarray(lon, dtype=float)
     lat_arr = np.asarray(lat, dtype=float)
@@ -30547,10 +30560,10 @@ def _ofes_build_daily_objects(
         _, raw_labels = _ofes_depth_aware_components(
             rows[active_positions],
             columns[active_positions],
-            peak_pressure[active_positions],
+            peak_depth[active_positions],
             (lat_arr.size, lon_arr.size),
-            pressure_tolerance=settings[
-                'object_pressure_tolerance_dbar'
+            depth_tolerance=settings[
+                'object_depth_tolerance_m'
             ],
             connectivity=settings['object_connectivity'],
         )
@@ -30568,7 +30581,7 @@ def _ofes_build_daily_objects(
             member_lon = lon_arr[member_columns]
             member_lat = lat_arr[member_rows]
             member_delta = delta[member_positions]
-            member_pressure = peak_pressure[member_positions]
+            member_depth = peak_depth[member_positions]
             member_thickness = thickness[member_positions]
             total_area = float(np.sum(member_area))
             max_position = member_positions[
@@ -30620,26 +30633,26 @@ def _ofes_build_daily_objects(
                     'peak_lat': float(
                         lat_arr[rows[max_position]]
                     ),
-                    'peak_pressure_at_max': float(
-                        peak_pressure[max_position]
+                    'peak_depth_at_max': float(
+                        peak_depth[max_position]
                     ),
-                    'pressure_mean': float(
-                        np.nanmean(member_pressure)
+                    'depth_mean': float(
+                        np.nanmean(member_depth)
                     ),
-                    'pressure_min': float(
-                        np.nanmin(member_pressure)
+                    'depth_min': float(
+                        np.nanmin(member_depth)
                     ),
-                    'pressure_max': float(
-                        np.nanmax(member_pressure)
+                    'depth_max': float(
+                        np.nanmax(member_depth)
                     ),
-                    'pressure_span_dbar': float(
-                        np.nanmax(member_pressure)
-                        - np.nanmin(member_pressure)
+                    'depth_span_m': float(
+                        np.nanmax(member_depth)
+                        - np.nanmin(member_depth)
                     ),
-                    'thickness_median_dbar': float(
+                    'thickness_median_m': float(
                         np.nanmedian(member_thickness)
                     ),
-                    'thickness_max_dbar': float(
+                    'thickness_max_m': float(
                         np.nanmax(member_thickness)
                     ),
                 }
@@ -30671,22 +30684,22 @@ def scan_ofes_delta_do_day(
 
     参数:
         - date (str | pd.Timestamp): 待扫描日期。
-        - detection_config (DetectionConfig | None): DO 检测配置；None 时使用 processing.yml 默认，并由 catalog 固定候选 pressure 范围。
+        - detection_config (DetectionConfig | None): DO 检测配置；None 时使用 processing.yml 默认，并由 catalog 固定候选 depth 范围。
         - thresholds (tuple[float, ...] | list[float] | None): 同时保留的 ΔDO 阈值；None 时使用 `ofes.delta_do_catalog.thresholds`。
         - lon_bounds (tuple[float, float] | None): 可选连续经度窗口；None 读取交付区域全部经度。
         - lat_bounds (tuple[float, float] | None): 可选纬度窗口；None 读取交付区域全部纬度。
         - catalog_overrides (dict | None): 临时覆盖 catalog 配置，仅接受 processing.yml 已声明键。
 
     返回:
-        - dict: 含稀疏 peak `pixels`、`objects`、扫描 `metadata` 以及 lon/lat/pressure 坐标。
+        - dict: 含稀疏 peak `pixels`、`objects`、扫描 `metadata` 以及 lon/lat/depth 坐标。
 
     输出:
         - 不写文件；年度 catalog 驱动负责将返回表原子写入带签名的逐日 fragments。
 
     说明:
         - 每个水平列只保留 observation detector 定义下 ΔDO 最大的候选。
-        - daily object 使用水平 4/8 邻接，并要求相邻像元 peak pressure 差不超过配置容差。
-        - half-amplitude thickness 是局地端点参考线之上、峰值半振幅连续核的 pressure 宽度。
+        - daily object 使用水平 4/8 邻接，并要求相邻像元 peak depth 差不超过配置容差。
+        - half-amplitude thickness 是局地端点参考线之上、峰值半振幅连续核的 depth 宽度。
     """
     settings = _ofes_delta_do_catalog_settings(catalog_overrides)
     if thresholds is not None:
@@ -30705,10 +30718,10 @@ def scan_ofes_delta_do_day(
         base_config,
         do_threshold=min(settings['thresholds']),
         anomaly_min_depth=settings[
-            'candidate_pressure_min_dbar'
+            'candidate_depth_min_m'
         ],
         anomaly_max_depth=settings[
-            'candidate_pressure_max_dbar'
+            'candidate_depth_max_m'
         ],
     )
     if cfg.salinity_threshold > 0 or cfg.temperature_threshold > 0:
@@ -30721,8 +30734,8 @@ def scan_ofes_delta_do_day(
     (
         lon_all,
         lat_all,
-        pressure,
-        pressure_attr_units,
+        depth,
+        depth_attr_units,
         reference_path,
     ) = _ofes_tracer_coordinates(date_ts)
     lon_slice = _ofes_contiguous_slice(
@@ -30753,12 +30766,12 @@ def scan_ofes_delta_do_day(
             )
             raw = _ofes_subset_to_float32(
                 variable,
-                (0, slice(0, pressure.size), source_lat_slice, lon_slice),
+                (0, slice(0, depth.size), source_lat_slice, lon_slice),
             )
             values = np.asarray(raw * scale, dtype=np.float32)
             peaks = _ofes_vectorized_do_peaks(
                 values,
-                pressure,
+                depth,
                 cfg,
                 minimum_delta=min(settings['thresholds']),
             )
@@ -30786,12 +30799,12 @@ def scan_ofes_delta_do_day(
                         'lat': lat[local_rows].astype(np.float32),
                         'lon': lon[chunk_columns].astype(np.float32),
                         'delta_do': peaks['delta_do'][active],
-                        'peak_pressure': peaks['peak_pressure'][active],
+                        'peak_depth': peaks['peak_depth'][active],
                         'peak_level_index': peaks[
                             'peak_level_index'
                         ][active],
-                        'half_amplitude_thickness_dbar': peaks[
-                            'half_amplitude_thickness_dbar'
+                        'half_amplitude_thickness_m': peaks[
+                            'half_amplitude_thickness_m'
                         ][active],
                         'candidate_count': peaks[
                             'candidate_count'
@@ -30826,18 +30839,24 @@ def scan_ofes_delta_do_day(
         'reference_file': str(reference_path),
         'source_shape': source_shape,
         'loaded_shape': (
-            int(pressure.size), int(lat.size), int(lon.size)
+            int(depth.size), int(lat.size), int(lon.size)
         ),
         'read_slices': {
             'time': 0,
-            'pressure': (0, int(pressure.size)),
+            'depth': (0, int(depth.size)),
             'lat': (int(lat_slice.start), int(lat_slice.stop)),
             'lon': (int(lon_slice.start), int(lon_slice.stop)),
         },
-        'pressure_units': str(
-            _OFES_CFG.get('pressure_units', 'dbar')
+        'depth_units': str(
+            _OFES_CFG.get('depth_units', 'm')
         ),
-        'file_pressure_units': pressure_attr_units,
+        'source_vertical_units_attribute': depth_attr_units,
+        'source_vertical_units_note': str(
+            _OFES_CFG.get(
+                'source_vertical_units_note',
+                'incorrect provider attribute; delivered coordinate is depth in metres',
+            )
+        ),
         'native_units': str(
             _OFES_CFG.get('native_units', {}).get(
                 'do2', 'umol kg-1'
@@ -30879,7 +30898,7 @@ def scan_ofes_delta_do_day(
         'date': date_ts,
         'lon': lon,
         'lat': lat,
-        'pressure': pressure,
+        'depth': depth,
         'pixels': pixels,
         'objects': objects,
         'metadata': metadata,
@@ -30957,7 +30976,7 @@ def _ofes_common_mask_audit_day(
         reference_lat = np.asarray(
             reference.variables['lat'][:], dtype=float
         )
-        reference_pressure = np.asarray(
+        reference_depth = np.asarray(
             reference.variables['lev'][:], dtype=float
         )
         coordinate_errors: dict[str, dict[str, float]] = {}
@@ -30991,22 +31010,22 @@ def _ofes_common_mask_audit_day(
                     reference_lat,
                     f'{variable} latitude',
                 ),
-                'pressure_max_abs_error': (
+                'depth_max_abs_error': (
                     _ofes_assert_coordinate_match(
                         np.asarray(
                             dataset.variables['lev'][:],
                             dtype=float,
                         ),
-                        reference_pressure,
-                        f'{variable} pressure',
+                        reference_depth,
+                        f'{variable} depth',
                     )
                 ),
             }
 
-        npressure = reference_pressure.size
+        ndepth = reference_depth.size
         nlat = reference_lat.size
         nlon = reference_lon.size
-        level_index = np.arange(npressure)[:, None, None]
+        level_index = np.arange(ndepth)[:, None, None]
         mask_mismatch = {'temp': 0, 'salinity': 0}
         checked_values = 0
         near_zero_values = 0
@@ -31145,7 +31164,7 @@ def _ofes_detector_parity_day(
     minimum_threshold = min(settings['thresholds'])
     vector = _ofes_vectorized_do_peaks(
         snapshot['do2'],
-        snapshot['pressure'],
+        snapshot['depth'],
         detection_config,
         valid_mask=common_valid,
         minimum_delta=minimum_threshold,
@@ -31194,14 +31213,14 @@ def _ofes_detector_parity_day(
     )
 
     profile_count = int(sample.size)
-    pressure_count = int(snapshot['pressure'].size)
+    depth_count = int(snapshot['depth'].size)
     profile_table = pd.DataFrame(
         {
             'Profile_number': np.repeat(
-                np.arange(profile_count), pressure_count
+                np.arange(profile_count), depth_count
             ),
-            'Pressure': np.tile(
-                snapshot['pressure'], profile_count
+            'Depth': np.tile(
+                snapshot['depth'], profile_count
             ),
             'DO': (
                 snapshot['do2'][:, rows, columns]
@@ -31220,7 +31239,7 @@ def _ofes_detector_parity_day(
     golden = calculate_delta_do(
         profile_table,
         detection_config=detection_config,
-        depth_col='Pressure',
+        depth_col='Depth',
         include_aou=False,
         verbose=False,
     )
@@ -31239,7 +31258,7 @@ def _ofes_detector_parity_day(
         golden_by_profile = pd.DataFrame()
 
     sampled_delta = vector['delta_do'][rows, columns]
-    sampled_pressure = vector['peak_pressure'][rows, columns]
+    sampled_depth = vector['peak_depth'][rows, columns]
     threshold_results: dict[str, dict] = {}
     failure_examples: list[dict] = []
     total_failure_count = 0
@@ -31270,9 +31289,9 @@ def _ofes_detector_parity_day(
             vector_hit != golden_hit
         )
         delta_mismatch: list[int] = []
-        pressure_mismatch: list[int] = []
+        depth_mismatch: list[int] = []
         delta_errors: list[float] = []
-        pressure_errors: list[float] = []
+        depth_errors: list[float] = []
         for profile_number in np.flatnonzero(
             vector_hit & golden_hit
         ):
@@ -31283,21 +31302,21 @@ def _ofes_detector_parity_day(
                 float(sampled_delta[profile_number])
                 - float(golden_row['delta_do'])
             )
-            pressure_error = abs(
-                float(sampled_pressure[profile_number])
+            depth_error = abs(
+                float(sampled_depth[profile_number])
                 - float(golden_row['depth'])
             )
             delta_errors.append(delta_error)
-            pressure_errors.append(pressure_error)
+            depth_errors.append(depth_error)
             if delta_error > 2e-5:
                 delta_mismatch.append(int(profile_number))
-            if pressure_error > 1e-6:
-                pressure_mismatch.append(int(profile_number))
+            if depth_error > 1e-6:
+                depth_mismatch.append(int(profile_number))
 
         failure_count = (
             int(membership_mismatch.size)
             + len(delta_mismatch)
-            + len(pressure_mismatch)
+            + len(depth_mismatch)
         )
         total_failure_count += failure_count
         threshold_results[tag] = {
@@ -31308,15 +31327,15 @@ def _ofes_detector_parity_day(
                 membership_mismatch.size
             ),
             'delta_mismatch_count': int(len(delta_mismatch)),
-            'pressure_mismatch_count': int(
-                len(pressure_mismatch)
+            'depth_mismatch_count': int(
+                len(depth_mismatch)
             ),
             'max_abs_delta_error': (
                 float(max(delta_errors)) if delta_errors else 0.0
             ),
-            'max_abs_pressure_error_dbar': (
-                float(max(pressure_errors))
-                if pressure_errors
+            'max_abs_depth_error_m': (
+                float(max(depth_errors))
+                if depth_errors
                 else 0.0
             ),
             'passed': bool(failure_count == 0),
@@ -31324,8 +31343,8 @@ def _ofes_detector_parity_day(
         for kind, indices in (
             ('membership', membership_mismatch),
             ('delta', np.asarray(delta_mismatch, dtype=int)),
-            ('pressure', np.asarray(
-                pressure_mismatch, dtype=int
+            ('depth', np.asarray(
+                depth_mismatch, dtype=int
             )),
         ):
             for profile_number in indices:
@@ -31353,12 +31372,12 @@ def _ofes_detector_parity_day(
                             )
                             else None
                         ),
-                        'vector_peak_pressure': (
+                        'vector_peak_depth': (
                             float(
-                                sampled_pressure[profile_number]
+                                sampled_depth[profile_number]
                             )
                             if np.isfinite(
-                                sampled_pressure[profile_number]
+                                sampled_depth[profile_number]
                             )
                             else None
                         ),
@@ -31370,7 +31389,7 @@ def _ofes_detector_parity_day(
         'lon_bounds': list(settings['parity_lon_bounds']),
         'lat_bounds': list(settings['parity_lat_bounds']),
         'regional_shape': [
-            int(snapshot['pressure'].size),
+            int(snapshot['depth'].size),
             int(snapshot['lat'].size),
             int(snapshot['lon'].size),
         ],
@@ -31403,7 +31422,7 @@ def validate_ofes_delta_do_vectorization(
 
     对配置中的四个季节日期先分块审计全域 DO/T/S 坐标与有效值掩码，再在固定
     黑潮延伸体窗口抽取随机海洋列和最强候选列，与 `calculate_delta_do`
-    逐廓线比较 DO20/35/50 的成员、振幅及 peak pressure。
+    逐廓线比较 DO20/35/50 的成员、振幅及 peak depth。
 
     参数:
         - catalog_overrides (dict | None): 临时覆盖已声明的 OFES catalog 配置。
@@ -31418,7 +31437,7 @@ def validate_ofes_delta_do_vectorization(
 
     说明:
         - 全年扫描只读 DO 的前提是四季全域 DO/T/S 掩码逐值相同；内部缺层不判失败，因为向量化实现按唯一有效层模式分组处理。
-        - parity 固定绝对容差为 ΔDO 2e-5 μmol kg⁻¹、pressure 1e-6 dbar。
+        - parity 固定绝对容差为 ΔDO 2e-5 μmol kg⁻¹、depth 1e-6 m。
     """
     settings = _ofes_delta_do_catalog_settings(
         catalog_overrides
@@ -31427,10 +31446,10 @@ def validate_ofes_delta_do_vectorization(
         'do',
         do_threshold=min(settings['thresholds']),
         anomaly_min_depth=settings[
-            'candidate_pressure_min_dbar'
+            'candidate_depth_min_m'
         ],
         anomaly_max_depth=settings[
-            'candidate_pressure_max_dbar'
+            'candidate_depth_max_m'
         ],
     )
     mask_audits: list[dict] = []
@@ -31455,7 +31474,7 @@ def validate_ofes_delta_do_vectorization(
         result['passed'] for result in detector_parity
     )
     report = {
-        'schema_version': 1,
+        'schema_version': 2,
         'generated_at_utc': pd.Timestamp.now(
             tz='UTC'
         ).isoformat(),
@@ -31469,13 +31488,13 @@ def validate_ofes_delta_do_vectorization(
             'do_threshold': float(
                 detection_config.do_threshold
             ),
-            'depth_interval_dbar': float(
+            'depth_interval_m': float(
                 detection_config.depth_interval
             ),
-            'candidate_pressure_min_dbar': float(
+            'candidate_depth_min_m': float(
                 detection_config.anomaly_min_depth
             ),
-            'candidate_pressure_max_dbar': float(
+            'candidate_depth_max_m': float(
                 detection_config.anomaly_max_depth
             ),
             'do_near_zero_threshold': float(
@@ -31487,7 +31506,7 @@ def validate_ofes_delta_do_vectorization(
         },
         'tolerances': {
             'delta_do_abs': 2e-5,
-            'pressure_dbar_abs': 1e-6,
+            'depth_m_abs': 1e-6,
         },
         'mask_audits': mask_audits,
         'detector_parity': detector_parity,
@@ -31521,10 +31540,10 @@ def _ofes_link_daily_objects(
         'row_max',
         'column_min',
         'column_max',
-        'pressure_mean',
+        'depth_mean',
         'delta_do_max',
         'area_km2',
-        'thickness_max_dbar',
+        'thickness_max_m',
     }
     missing = sorted(required.difference(working.columns))
     if missing:
@@ -31549,7 +31568,7 @@ def _ofes_link_daily_objects(
         [pd.NA] * len(working), dtype='Int16'
     )
     working['link_distance_km'] = np.nan
-    working['link_pressure_difference_dbar'] = np.nan
+    working['link_depth_difference_m'] = np.nan
     working['link_cost'] = np.nan
     working['link_status'] = pd.Series(
         [None] * len(working), dtype='object'
@@ -31563,8 +31582,8 @@ def _ofes_link_daily_objects(
     maximum_distance_km = float(
         settings['event_max_centroid_distance_km']
     )
-    maximum_pressure_difference = float(
-        settings['event_max_pressure_difference_dbar']
+    maximum_depth_difference = float(
+        settings['event_max_depth_difference_m']
     )
     padding_pixels = int(settings['event_bbox_padding_pixels'])
     gap_cost = float(
@@ -31621,15 +31640,15 @@ def _ofes_link_daily_objects(
                     dtype=float,
                 )
                 distance_matrix = np.full_like(cost, np.nan)
-                pressure_matrix = np.full_like(cost, np.nan)
+                depth_matrix = np.full_like(cost, np.nan)
                 current_lon = working.loc[
                     current_positions, 'centroid_lon'
                 ].to_numpy(dtype=float)
                 current_lat = working.loc[
                     current_positions, 'centroid_lat'
                 ].to_numpy(dtype=float)
-                current_pressure = working.loc[
-                    current_positions, 'pressure_mean'
+                current_depth = working.loc[
+                    current_positions, 'depth_mean'
                 ].to_numpy(dtype=float)
                 current_row_min = working.loc[
                     current_positions, 'row_min'
@@ -31663,9 +31682,9 @@ def _ofes_link_daily_objects(
                         ),
                         dtype=float,
                     ) / 1000.0
-                    pressure_difference = np.abs(
-                        current_pressure
-                        - float(previous['pressure_mean'])
+                    depth_difference = np.abs(
+                        current_depth
+                        - float(previous['depth_mean'])
                     )
                     padding = float(padding_pixels * day_gap)
                     bbox_overlap = (
@@ -31697,22 +31716,22 @@ def _ofes_link_daily_objects(
                     )
                     accepted = (
                         np.isfinite(distance)
-                        & np.isfinite(pressure_difference)
+                        & np.isfinite(depth_difference)
                         & (distance <= distance_limit)
                         & (
-                            pressure_difference
-                            <= maximum_pressure_difference
+                            depth_difference
+                            <= maximum_depth_difference
                         )
                         & bbox_overlap
                     )
                     distance_matrix[track_index] = distance
-                    pressure_matrix[
+                    depth_matrix[
                         track_index
-                    ] = pressure_difference
+                    ] = depth_difference
                     cost[track_index, accepted] = (
                         distance[accepted] / distance_limit
-                        + pressure_difference[accepted]
-                        / maximum_pressure_difference
+                        + depth_difference[accepted]
+                        / maximum_depth_difference
                         + gap_cost * (day_gap - 1)
                     )
 
@@ -31762,9 +31781,9 @@ def _ofes_link_daily_objects(
                         )
                         working.at[
                             position,
-                            'link_pressure_difference_dbar',
+                            'link_depth_difference_m',
                         ] = float(
-                            pressure_matrix[
+                            depth_matrix[
                                 track_index, current_index
                             ]
                         )
@@ -31851,7 +31870,7 @@ def _ofes_link_daily_objects(
             / 1000.0
         )
         thickness = group[
-            'thickness_max_dbar'
+            'thickness_max_m'
         ].to_numpy(dtype=float)
         finite_thickness = thickness[np.isfinite(thickness)]
         maximum_thickness = (
@@ -31903,18 +31922,18 @@ def _ofes_link_daily_objects(
                 'equivalent_radius_km_max': float(
                     group['equivalent_radius_km'].max()
                 ),
-                'thickness_max_dbar': maximum_thickness,
-                'thickness_median_of_daily_max_dbar': (
+                'thickness_max_m': maximum_thickness,
+                'thickness_median_of_daily_max_m': (
                     median_thickness
                 ),
-                'pressure_mean_dbar': float(
-                    group['pressure_mean'].mean()
+                'depth_mean_m': float(
+                    group['depth_mean'].mean()
                 ),
-                'pressure_min_dbar': float(
-                    group['pressure_min'].min()
+                'depth_min_m': float(
+                    group['depth_min'].min()
                 ),
-                'pressure_max_dbar': float(
-                    group['pressure_max'].max()
+                'depth_max_m': float(
+                    group['depth_max'].max()
                 ),
                 'mean_centroid_lon': mean_centroid_lon,
                 'mean_centroid_lat': mean_centroid_lat,
@@ -31932,8 +31951,8 @@ def _ofes_link_daily_objects(
                 ),
                 'peak_lon': float(peak['peak_lon']),
                 'peak_lat': float(peak['peak_lat']),
-                'peak_pressure_dbar': float(
-                    peak['peak_pressure_at_max']
+                'peak_depth_m': float(
+                    peak['peak_depth_at_max']
                 ),
                 'track_length_km': track_length,
                 'net_displacement_km': displacement,
@@ -31963,8 +31982,8 @@ def _ofes_link_daily_objects(
         / float(settings['rank_area_reference_km2'])
     )
     events['rank_thickness_component'] = np.log1p(
-        events['thickness_max_dbar']
-        / float(settings['rank_thickness_reference_dbar'])
+        events['thickness_max_m']
+        / float(settings['rank_thickness_reference_m'])
     )
     events['rank_duration_component'] = np.log1p(
         events['observed_days']
@@ -32014,14 +32033,14 @@ def _ofes_link_daily_objects(
 def _ofes_coordinate_sha256(
     lon: np.ndarray,
     lat: np.ndarray,
-    pressure: np.ndarray,
+    depth: np.ndarray,
 ) -> str:
     """返回带 dtype/shape 边界的 OFES 三坐标 SHA-256。"""
     digest = hashlib.sha256()
     for name, values in (
         ('lon', lon),
         ('lat', lat),
-        ('pressure', pressure),
+        ('depth', depth),
     ):
         array = np.ascontiguousarray(
             np.asarray(values, dtype=np.float64)
@@ -32086,11 +32105,11 @@ def _ofes_catalog_run_identity(
         ).encode('utf-8')
     ).hexdigest()
 
-    lon, lat, pressure, _, _ = _ofes_tracer_coordinates(
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(
         pd.Timestamp(dates[0])
     )
     coordinate_sha256 = _ofes_coordinate_sha256(
-        lon, lat, pressure
+        lon, lat, depth
     )
     code_sources = '\n\n'.join(
         inspect.getsource(function)
@@ -32110,7 +32129,7 @@ def _ofes_catalog_run_identity(
     ).hexdigest()
     repo_root = Path(__file__).resolve().parent
     signature_payload = {
-        'schema_version': 1,
+        'schema_version': 2,
         'start_date': pd.Timestamp(dates[0]).strftime(
             '%Y-%m-%d'
         ),
@@ -32168,7 +32187,7 @@ def build_ofes_delta_do_event_catalog(
 
     运行先以固定四季日期执行掩码和 observation-detector parity gate；通过后
     才逐日读取 DO、写入稀疏 peak pixels 与 depth-aware objects。跨日对象按
-    距离、peak pressure、bbox 门槛进行一对一全局最小代价匹配，最后用预先
+    距离、peak depth、bbox 门槛进行一对一全局最小代价匹配，最后用预先
     固定的振幅、面积、厚度和持续时间公式分阈值排名。
 
     参数:
@@ -32203,10 +32222,10 @@ def build_ofes_delta_do_event_catalog(
         'do',
         do_threshold=min(settings['thresholds']),
         anomaly_min_depth=settings[
-            'candidate_pressure_min_dbar'
+            'candidate_depth_min_m'
         ],
         anomaly_max_depth=settings[
-            'candidate_pressure_max_dbar'
+            'candidate_depth_max_m'
         ],
     )
     identity, source_inventory = _ofes_catalog_run_identity(
@@ -32269,7 +32288,7 @@ def build_ofes_delta_do_event_catalog(
         'rank_formula': (
             'log1p(max_delta_do/threshold) + '
             'log1p(max_area_km2/area_reference_km2) + '
-            'log1p(max_thickness_dbar/thickness_reference_dbar) '
+            'log1p(max_thickness_m/thickness_reference_m) '
             '+ log1p(observed_days/duration_reference_days)'
         ),
     }
@@ -32295,11 +32314,11 @@ def build_ofes_delta_do_event_catalog(
         }
         _ofes_atomic_write_json(preflight, preflight_path)
 
-    reference_lon, reference_lat, reference_pressure, _, _ = (
+    reference_lon, reference_lat, reference_depth, _, _ = (
         _ofes_tracer_coordinates(start)
     )
     reference_coordinate_sha256 = _ofes_coordinate_sha256(
-        reference_lon, reference_lat, reference_pressure
+        reference_lon, reference_lat, reference_depth
     )
     object_frames: list[pd.DataFrame] = []
     summary_records: list[dict] = []
@@ -32345,7 +32364,7 @@ def build_ofes_delta_do_event_catalog(
                 coordinate_sha256 = _ofes_coordinate_sha256(
                     result['lon'],
                     result['lat'],
-                    result['pressure'],
+                    result['depth'],
                 )
                 if (
                     coordinate_sha256
@@ -32526,11 +32545,11 @@ def _ofes_event_diagnostic_settings(
         'maximum_sampled_event_days': int(
             raw.get('maximum_sampled_event_days', 31)
         ),
-        'deep_pressure_min_dbar': float(
-            raw.get('deep_pressure_min_dbar', 500.0)
+        'deep_depth_min_m': float(
+            raw.get('deep_depth_min_m', 500.0)
         ),
-        'deep_pressure_max_dbar': float(
-            raw.get('deep_pressure_max_dbar', 900.0)
+        'deep_depth_max_m': float(
+            raw.get('deep_depth_max_m', 900.0)
         ),
         'background_inner_radius_km': float(
             raw.get('background_inner_radius_km', 120.0)
@@ -32595,8 +32614,8 @@ def _ofes_event_diagnostic_settings(
         'candidate_threshold',
         'candidate_count',
         'maximum_sampled_event_days',
-        'deep_pressure_min_dbar',
-        'deep_pressure_max_dbar',
+        'deep_depth_min_m',
+        'deep_depth_max_m',
         'background_inner_radius_km',
         'background_outer_radius_km',
         'background_load_margin_km',
@@ -32623,11 +32642,11 @@ def _ofes_event_diagnostic_settings(
             'must be finite and positive.'
         )
     if (
-        settings['deep_pressure_max_dbar']
-        <= settings['deep_pressure_min_dbar']
+        settings['deep_depth_max_m']
+        <= settings['deep_depth_min_m']
     ):
         raise ValueError(
-            'OFES deep diagnostic pressure bounds must be ordered.'
+            'OFES deep diagnostic depth bounds must be ordered.'
         )
     if (
         settings['background_outer_radius_km']
@@ -32659,41 +32678,42 @@ def _ofes_event_diagnostic_settings(
     return settings
 
 
-def _ofes_profile_value_at_pressure(
-    pressure: np.ndarray,
+def _ofes_profile_value_at_depth(
+    depth: np.ndarray,
     values: np.ndarray,
-    target_pressure: float,
+    target_depth: float,
 ) -> float:
-    """在有效且递增的 pressure 剖面上线性插值单个值。"""
-    pressure_arr = np.asarray(pressure, dtype=float)
+    """在有效且递增的深度剖面上线性插值单个值。"""
+    depth_arr = np.asarray(depth, dtype=float)
     values_arr = np.asarray(values, dtype=float)
-    valid = np.isfinite(pressure_arr) & np.isfinite(values_arr)
+    valid = np.isfinite(depth_arr) & np.isfinite(values_arr)
     if np.count_nonzero(valid) < 2:
         return np.nan
-    x = pressure_arr[valid]
+    x = depth_arr[valid]
     y = values_arr[valid]
     if (
-        float(target_pressure) < float(x[0])
-        or float(target_pressure) > float(x[-1])
+        float(target_depth) < float(x[0])
+        or float(target_depth) > float(x[-1])
     ):
         return np.nan
-    return float(np.interp(float(target_pressure), x, y))
+    return float(np.interp(float(target_depth), x, y))
 
 
 def _ofes_sigma0_profile(
-    pressure: np.ndarray,
+    depth: np.ndarray,
     salinity: np.ndarray,
     potential_temperature: np.ndarray,
     lon: float,
     lat: float,
 ) -> np.ndarray:
     """从 OFES PSS-78 盐度和位温计算 TEOS-10 sigma0 剖面。"""
-    pressure_arr = np.asarray(pressure, dtype=float)
+    depth_arr = np.asarray(depth, dtype=float)
+    seawater_pressure = gsw.p_from_z(-depth_arr, float(lat))
     salinity_arr = np.asarray(salinity, dtype=float)
     theta_arr = np.asarray(potential_temperature, dtype=float)
     absolute_salinity = gsw.SA_from_SP(
         salinity_arr,
-        pressure_arr,
+        seawater_pressure,
         float(lon),
         float(lat),
     )
@@ -32709,7 +32729,7 @@ def _ofes_sigma0_profile(
 
 
 def _ofes_point_thermodynamics(
-    pressure: float,
+    depth: float,
     salinity: float,
     potential_temperature: float,
     oxygen: float,
@@ -32718,7 +32738,7 @@ def _ofes_point_thermodynamics(
 ) -> dict:
     """计算单点 TEOS-10 密度、spiciness 与 AOU 诊断。"""
     values = (
-        pressure,
+        depth,
         salinity,
         potential_temperature,
         oxygen,
@@ -32735,10 +32755,13 @@ def _ofes_point_thermodynamics(
     )
     if not all(np.isfinite(value) for value in values):
         return {key: np.nan for key in keys}
+    seawater_pressure = float(
+        gsw.p_from_z(-float(depth), float(lat))
+    )
     absolute_salinity = float(
         gsw.SA_from_SP(
             float(salinity),
-            float(pressure),
+            seawater_pressure,
             float(lon),
             float(lat),
         )
@@ -32762,7 +32785,7 @@ def _ofes_point_thermodynamics(
         gsw.O2sol(
             absolute_salinity,
             conservative_temperature,
-            float(pressure),
+            seawater_pressure,
             float(lon),
             float(lat),
         )
@@ -32777,29 +32800,30 @@ def _ofes_point_thermodynamics(
     }
 
 
-def _ofes_n2_at_pressure(
-    pressure: np.ndarray,
+def _ofes_n2_at_depth(
+    depth: np.ndarray,
     salinity: np.ndarray,
     potential_temperature: np.ndarray,
     lon: float,
     lat: float,
-    target_pressure: float,
+    target_depth: float,
 ) -> float:
-    """在目标 pressure 插值 TEOS-10 浮力频率平方。"""
-    pressure_arr = np.asarray(pressure, dtype=float)
+    """在目标深度插值 TEOS-10 浮力频率平方。"""
+    depth_arr = np.asarray(depth, dtype=float)
     salinity_arr = np.asarray(salinity, dtype=float)
     theta_arr = np.asarray(potential_temperature, dtype=float)
     valid = (
-        np.isfinite(pressure_arr)
+        np.isfinite(depth_arr)
         & np.isfinite(salinity_arr)
         & np.isfinite(theta_arr)
     )
     if np.count_nonzero(valid) < 3:
         return np.nan
-    pressure_valid = pressure_arr[valid]
+    depth_valid = depth_arr[valid]
+    seawater_pressure = gsw.p_from_z(-depth_valid, float(lat))
     absolute_salinity = gsw.SA_from_SP(
         salinity_arr[valid],
-        pressure_valid,
+        seawater_pressure,
         float(lon),
         float(lat),
     )
@@ -32809,43 +32833,44 @@ def _ofes_n2_at_pressure(
     n2, pressure_mid = gsw.Nsquared(
         absolute_salinity,
         conservative_temperature,
-        pressure_valid,
+        seawater_pressure,
         lat=float(lat),
     )
-    finite = np.isfinite(n2) & np.isfinite(pressure_mid)
-    return _ofes_profile_value_at_pressure(
-        pressure_mid[finite],
+    depth_mid = -gsw.z_from_p(pressure_mid, float(lat))
+    finite = np.isfinite(n2) & np.isfinite(depth_mid)
+    return _ofes_profile_value_at_depth(
+        depth_mid[finite],
         n2[finite],
-        float(target_pressure),
+        float(target_depth),
     )
 
 
-def _ofes_density_crossing_near_pressure(
-    pressure: np.ndarray,
+def _ofes_density_crossing_near_depth(
+    depth: np.ndarray,
     sigma0: np.ndarray,
     target_sigma0: float,
-    reference_pressure: float,
+    reference_depth: float,
     fields: dict[str, np.ndarray],
 ) -> dict:
-    """返回离参考 pressure 最近的 target-sigma0 线性交点。"""
-    pressure_arr = np.asarray(pressure, dtype=float)
+    """返回离参考深度最近的 target-sigma0 线性交点。"""
+    depth_arr = np.asarray(depth, dtype=float)
     sigma_arr = np.asarray(sigma0, dtype=float)
     result = {
-        'pressure': np.nan,
+        'depth': np.nan,
         'crossing_count': 0,
         **{key: np.nan for key in fields},
     }
     if (
-        pressure_arr.ndim != 1
-        or sigma_arr.shape != pressure_arr.shape
+        depth_arr.ndim != 1
+        or sigma_arr.shape != depth_arr.shape
         or not np.isfinite(target_sigma0)
     ):
         return result
     lower = sigma_arr[:-1] - float(target_sigma0)
     upper = sigma_arr[1:] - float(target_sigma0)
     valid = (
-        np.isfinite(pressure_arr[:-1])
-        & np.isfinite(pressure_arr[1:])
+        np.isfinite(depth_arr[:-1])
+        & np.isfinite(depth_arr[1:])
         & np.isfinite(lower)
         & np.isfinite(upper)
         & (lower * upper <= 0)
@@ -32861,28 +32886,28 @@ def _ofes_density_crossing_near_pressure(
         sigma_arr[candidates + 1]
         - sigma_arr[candidates]
     )
-    crossing_pressure = (
-        pressure_arr[candidates]
+    crossing_depth = (
+        depth_arr[candidates]
         + fraction
         * (
-            pressure_arr[candidates + 1]
-            - pressure_arr[candidates]
+            depth_arr[candidates + 1]
+            - depth_arr[candidates]
         )
     )
     choice = int(
         np.argmin(
             np.abs(
-                crossing_pressure - float(reference_pressure)
+                crossing_depth - float(reference_depth)
             )
         )
     )
     index = int(candidates[choice])
     fraction_value = float(fraction[choice])
-    result['pressure'] = float(crossing_pressure[choice])
+    result['depth'] = float(crossing_depth[choice])
     for key, values in fields.items():
         values_arr = np.asarray(values, dtype=float)
         if (
-            values_arr.shape == pressure_arr.shape
+            values_arr.shape == depth_arr.shape
             and np.isfinite(values_arr[index])
             and np.isfinite(values_arr[index + 1])
         ):
@@ -32945,17 +32970,17 @@ def _ofes_nan_gaussian(
     return smoothed
 
 
-def _ofes_fixed_pressure_kinematic_fields(
+def _ofes_fixed_depth_kinematic_fields(
     snapshot: dict,
-    target_pressure: float,
+    target_depth: float,
     smoothing_sigma_pixels: float,
 ) -> dict:
-    """计算最近原生 pressure 层的平滑速度梯度与无量纲动力量。"""
-    pressure = np.asarray(snapshot['pressure'], dtype=float)
-    if pressure.size == 0:
-        raise ValueError('OFES snapshot contains no pressure level.')
+    """计算最近交付深度层的平滑速度梯度与无量纲动力量。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    if depth.size == 0:
+        raise ValueError('OFES snapshot contains no depth level.')
     level_index = int(
-        np.argmin(np.abs(pressure - float(target_pressure)))
+        np.argmin(np.abs(depth - float(target_depth)))
     )
     lon = np.asarray(snapshot['lon'], dtype=float)
     lat = np.asarray(snapshot['lat'], dtype=float)
@@ -33008,7 +33033,7 @@ def _ofes_fixed_pressure_kinematic_fields(
         where=np.abs(coriolis) > 0,
     )
     return {
-        'pressure_dbar': float(pressure[level_index]),
+        'depth_m': float(depth[level_index]),
         'level_index': int(level_index),
         'u': u,
         'v': v,
@@ -33049,8 +33074,8 @@ def _ofes_kinematics_at_point(
     u = float(fields['u'][row, column])
     v = float(fields['v'][row, column])
     return {
-        'kinematic_pressure_dbar': float(
-            fields['pressure_dbar']
+        'kinematic_depth_m': float(
+            fields['depth_m']
         ),
         'u_m_s': u,
         'v_m_s': v,
@@ -33119,9 +33144,14 @@ def _ofes_quality_event_catalog(
         raise RuntimeError(
             'OFES event diagnostics require a complete catalog.'
         )
+    if int(manifest.get('schema_version', 0)) != 2:
+        raise RuntimeError(
+            'OFES event diagnostics require a depth/m schema-v2 '
+            'catalog; regenerate the catalog with the current code.'
+        )
     events = pd.read_parquet(root / 'event_catalog.parquet')
     objects = pd.read_parquet(root / 'daily_objects.parquet')
-    lon, lat, pressure, _, _ = _ofes_tracer_coordinates(
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(
         pd.Timestamp(manifest['start_date'])
     )
     edge_by_event = objects.assign(
@@ -33164,47 +33194,47 @@ def _ofes_quality_event_catalog(
         ] = np.arange(1, len(ranked) + 1)
 
     catalog_settings = manifest['catalog_settings']
-    candidate_pressure = pressure[
+    candidate_depth = depth[
         (
-            pressure
+            depth
             >= float(
                 catalog_settings[
-                    'candidate_pressure_min_dbar'
+                    'candidate_depth_min_m'
                 ]
             )
         )
         & (
-            pressure
+            depth
             <= float(
                 catalog_settings[
-                    'candidate_pressure_max_dbar'
+                    'candidate_depth_max_m'
                 ]
             )
         )
     ]
-    if candidate_pressure.size == 0:
+    if candidate_depth.size == 0:
         raise RuntimeError(
-            'The catalog pressure window contains no native level.'
+            'The catalog depth window contains no delivered level.'
         )
-    lower_search_level = float(candidate_pressure[0])
-    upper_search_level = float(candidate_pressure[-1])
+    lower_search_level = float(candidate_depth[0])
+    upper_search_level = float(candidate_depth[-1])
     events['peak_on_lower_search_level'] = np.isclose(
-        events['peak_pressure_dbar'],
+        events['peak_depth_m'],
         lower_search_level,
         rtol=0.0,
         atol=1e-6,
     )
     events['peak_on_upper_search_level'] = np.isclose(
-        events['peak_pressure_dbar'],
+        events['peak_depth_m'],
         upper_search_level,
         rtol=0.0,
         atol=1e-6,
     )
     events['deep_sensitivity_eligible'] = (
         events['quality_eligible']
-        & events['peak_pressure_dbar'].between(
-            float(settings['deep_pressure_min_dbar']),
-            float(settings['deep_pressure_max_dbar']),
+        & events['peak_depth_m'].between(
+            float(settings['deep_depth_min_m']),
+            float(settings['deep_depth_max_m']),
         )
     )
     events[
@@ -33252,8 +33282,8 @@ def _ofes_quality_event_catalog(
         threshold_events['rank_eligible']
     ]
     audit = {
-        'lower_search_level_dbar': lower_search_level,
-        'upper_search_level_dbar': upper_search_level,
+        'lower_search_level_m': lower_search_level,
+        'upper_search_level_m': upper_search_level,
         'candidate_threshold': float(
             settings['candidate_threshold']
         ),
@@ -33406,7 +33436,7 @@ def _ofes_diagnose_water_mass_day(
     date: str | pd.Timestamp,
     core_lon: float,
     core_lat: float,
-    reference_pressure: float,
+    reference_depth: float,
     settings: dict,
 ) -> dict:
     """诊断单日 OFES 核心相对环带背景的水团与 heave 分量。"""
@@ -33443,7 +33473,7 @@ def _ofes_diagnose_water_mass_day(
     )
     lon = np.asarray(snapshot['lon'], dtype=float)
     lat = np.asarray(snapshot['lat'], dtype=float)
-    pressure = np.asarray(snapshot['pressure'], dtype=float)
+    depth = np.asarray(snapshot['depth'], dtype=float)
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     distance_km = (
         np.asarray(
@@ -33473,11 +33503,11 @@ def _ofes_diagnose_water_mass_day(
     actual_lat = float(lat[row])
     reference_level = int(
         np.argmin(
-            np.abs(pressure - float(reference_pressure))
+            np.abs(depth - float(reference_depth))
         )
     )
-    native_reference_pressure = float(
-        pressure[reference_level]
+    delivered_reference_depth = float(
+        depth[reference_level]
     )
     valid_reference = (
         background_mask
@@ -33511,45 +33541,45 @@ def _ofes_diagnose_water_mass_day(
         ),
     }
     core_sigma0 = _ofes_sigma0_profile(
-        pressure,
+        depth,
         core_profiles['salinity'],
         core_profiles['theta'],
         actual_lon,
         actual_lat,
     )
     background_sigma0 = _ofes_sigma0_profile(
-        pressure,
+        depth,
         background_profiles['salinity'],
         background_profiles['theta'],
         actual_lon,
         actual_lat,
     )
     core_fixed = {
-        key: _ofes_profile_value_at_pressure(
-            pressure, values, float(reference_pressure)
+        key: _ofes_profile_value_at_depth(
+            depth, values, float(reference_depth)
         )
         for key, values in core_profiles.items()
     }
     background_fixed = {
-        key: _ofes_profile_value_at_pressure(
-            pressure, values, float(reference_pressure)
+        key: _ofes_profile_value_at_depth(
+            depth, values, float(reference_depth)
         )
         for key, values in background_profiles.items()
     }
-    target_sigma0 = _ofes_profile_value_at_pressure(
-        pressure, core_sigma0, float(reference_pressure)
+    target_sigma0 = _ofes_profile_value_at_depth(
+        depth, core_sigma0, float(reference_depth)
     )
     background_on_sigma = (
-        _ofes_density_crossing_near_pressure(
-            pressure,
+        _ofes_density_crossing_near_depth(
+            depth,
             background_sigma0,
             target_sigma0,
-            float(reference_pressure),
+            float(reference_depth),
             background_profiles,
         )
     )
     core_thermodynamics = _ofes_point_thermodynamics(
-        float(reference_pressure),
+        float(reference_depth),
         core_fixed['salinity'],
         core_fixed['theta'],
         core_fixed['do'],
@@ -33558,7 +33588,7 @@ def _ofes_diagnose_water_mass_day(
     )
     background_fixed_thermodynamics = (
         _ofes_point_thermodynamics(
-            float(reference_pressure),
+            float(reference_depth),
             background_fixed['salinity'],
             background_fixed['theta'],
             background_fixed['do'],
@@ -33568,7 +33598,7 @@ def _ofes_diagnose_water_mass_day(
     )
     background_sigma_thermodynamics = (
         _ofes_point_thermodynamics(
-            float(background_on_sigma['pressure']),
+            float(background_on_sigma['depth']),
             float(background_on_sigma['salinity']),
             float(background_on_sigma['theta']),
             float(background_on_sigma['do']),
@@ -33576,23 +33606,23 @@ def _ofes_diagnose_water_mass_day(
             actual_lat,
         )
     )
-    core_n2 = _ofes_n2_at_pressure(
-        pressure,
+    core_n2 = _ofes_n2_at_depth(
+        depth,
         core_profiles['salinity'],
         core_profiles['theta'],
         actual_lon,
         actual_lat,
-        float(reference_pressure),
+        float(reference_depth),
     )
-    background_n2 = _ofes_n2_at_pressure(
-        pressure,
+    background_n2 = _ofes_n2_at_depth(
+        depth,
         background_profiles['salinity'],
         background_profiles['theta'],
         actual_lon,
         actual_lat,
-        float(background_on_sigma['pressure']),
+        float(background_on_sigma['depth']),
     )
-    fixed_pressure_do_contrast = (
+    fixed_depth_do_contrast = (
         core_fixed['do'] - background_fixed['do']
     )
     water_mass_do_contrast = (
@@ -33602,7 +33632,7 @@ def _ofes_diagnose_water_mass_day(
         background_on_sigma['do'] - background_fixed['do']
     )
     closure_error = (
-        fixed_pressure_do_contrast
+        fixed_depth_do_contrast
         - water_mass_do_contrast
         - heave_do_contribution
     )
@@ -33616,9 +33646,9 @@ def _ofes_diagnose_water_mass_day(
         else np.nan
     )
     kinematic_fields = (
-        _ofes_fixed_pressure_kinematic_fields(
+        _ofes_fixed_depth_kinematic_fields(
             snapshot,
-            float(reference_pressure),
+            float(reference_depth),
             float(
                 settings[
                     'velocity_smoothing_sigma_pixels'
@@ -33663,10 +33693,10 @@ def _ofes_diagnose_water_mass_day(
         failure_reasons.append('insufficient_background_columns')
     if not np.isfinite(target_sigma0):
         failure_reasons.append('missing_core_sigma0')
-    if not np.isfinite(background_on_sigma['pressure']):
+    if not np.isfinite(background_on_sigma['depth']):
         failure_reasons.append('missing_background_sigma_crossing')
     required_metrics = (
-        fixed_pressure_do_contrast,
+        fixed_depth_do_contrast,
         water_mass_do_contrast,
         heave_do_contribution,
         closure_error,
@@ -33695,12 +33725,12 @@ def _ofes_diagnose_water_mass_day(
         'core_lon': actual_lon,
         'core_lat': actual_lat,
         'core_grid_distance_m': core_grid_distance_m,
-        'reference_pressure_dbar': float(reference_pressure),
-        'native_reference_pressure_dbar': (
-            native_reference_pressure
+        'reference_depth_m': float(reference_depth),
+        'delivered_reference_depth_m': (
+            delivered_reference_depth
         ),
-        'reference_pressure_native_offset_dbar': float(
-            native_reference_pressure - float(reference_pressure)
+        'reference_depth_delivered_offset_m': float(
+            delivered_reference_depth - float(reference_depth)
         ),
         'background_inner_radius_km': float(
             settings['background_inner_radius_km']
@@ -33718,15 +33748,15 @@ def _ofes_diagnose_water_mass_day(
         'background_sigma0_fixed': float(
             background_fixed_thermodynamics['sigma0']
         ),
-        'background_sigma_pressure_dbar': float(
-            background_on_sigma['pressure']
+        'background_sigma_depth_m': float(
+            background_on_sigma['depth']
         ),
         'background_sigma_crossing_count': int(
             background_on_sigma['crossing_count']
         ),
-        'core_minus_background_isopycnal_pressure_dbar': float(
-            float(reference_pressure)
-            - float(background_on_sigma['pressure'])
+        'core_minus_background_isopycnal_depth_m': float(
+            float(reference_depth)
+            - float(background_on_sigma['depth'])
         ),
         'core_do_fixed': float(core_fixed['do']),
         'background_do_fixed': float(
@@ -33735,8 +33765,8 @@ def _ofes_diagnose_water_mass_day(
         'background_do_same_sigma': float(
             background_on_sigma['do']
         ),
-        'fixed_pressure_do_contrast': float(
-            fixed_pressure_do_contrast
+        'fixed_depth_do_contrast': float(
+            fixed_depth_do_contrast
         ),
         'water_mass_do_contrast': float(
             water_mass_do_contrast
@@ -33814,26 +33844,26 @@ def _ofes_select_negative_control(
     peak_date: str | pd.Timestamp,
     event_lon: float,
     event_lat: float,
-    reference_pressure: float,
+    reference_depth: float,
     event_peak_diagnostic: dict,
     settings: dict,
 ) -> dict:
     """按预先声明的水团和动力距离选择同日无 DO20 负对照。"""
     date_ts = pd.Timestamp(peak_date).normalize()
-    pressure = _ofes_tracer_coordinates(date_ts)[2]
-    pressure_level = int(
+    depth = _ofes_tracer_coordinates(date_ts)[2]
+    depth_level = int(
         np.argmin(
             np.abs(
-                np.asarray(pressure, dtype=float)
-                - float(reference_pressure)
+                np.asarray(depth, dtype=float)
+                - float(reference_depth)
             )
         )
     )
-    native_pressure = float(pressure[pressure_level])
+    delivered_depth = float(depth[depth_level])
     snapshot = load_ofes_snapshot(
         date_ts,
         variables=['do2', 'temp', 'salinity', 'u', 'v'],
-        pressure_bounds=(native_pressure, native_pressure),
+        depth_bounds=(delivered_depth, delivered_depth),
     )
     lon = np.asarray(snapshot['lon'], dtype=float)
     lat = np.asarray(snapshot['lat'], dtype=float)
@@ -33903,7 +33933,7 @@ def _ofes_select_negative_control(
     oxygen = np.asarray(snapshot['do2'][0], dtype=float)
     absolute_salinity = gsw.SA_from_SP(
         salinity,
-        native_pressure,
+        delivered_depth,
         lon_grid,
         lat_grid,
     )
@@ -33917,9 +33947,9 @@ def _ofes_select_negative_control(
         dtype=float,
     )
     kinematic_fields = (
-        _ofes_fixed_pressure_kinematic_fields(
+        _ofes_fixed_depth_kinematic_fields(
             snapshot,
-            native_pressure,
+            delivered_depth,
             float(
                 settings[
                     'velocity_smoothing_sigma_pixels'
@@ -34059,7 +34089,7 @@ def _ofes_select_negative_control(
         'date': date_ts,
         'lon': float(lon[column]),
         'lat': float(lat[row]),
-        'reference_pressure_dbar': native_pressure,
+        'reference_depth_m': delivered_depth,
         'event_lon': float(event_lon),
         'event_lat': float(event_lat),
         'event_distance_km': float(
@@ -34132,8 +34162,8 @@ def _ofes_event_diagnostic_summary(
                 'peak_target_sigma0': float(
                     peak['target_sigma0']
                 ),
-                'peak_fixed_pressure_do_contrast': float(
-                    peak['fixed_pressure_do_contrast']
+                'peak_fixed_depth_do_contrast': float(
+                    peak['fixed_depth_do_contrast']
                 ),
                 'peak_water_mass_do_contrast': float(
                     peak['water_mass_do_contrast']
@@ -34165,9 +34195,9 @@ def _ofes_event_diagnostic_summary(
                 'peak_normalized_okubo_weiss': float(
                     peak['normalized_okubo_weiss']
                 ),
-                'median_fixed_pressure_do_contrast': float(
+                'median_fixed_depth_do_contrast': float(
                     passed[
-                        'fixed_pressure_do_contrast'
+                        'fixed_depth_do_contrast'
                     ].median()
                 ),
                 'median_water_mass_do_contrast': float(
@@ -34270,14 +34300,14 @@ def _ofes_event_diagnostic_run_identity(
             adaptive_distance_m,
             _minimal_lon_diff_deg,
             _ofes_event_diagnostic_settings,
-            _ofes_profile_value_at_pressure,
+            _ofes_profile_value_at_depth,
             _ofes_sigma0_profile,
             _ofes_point_thermodynamics,
-            _ofes_n2_at_pressure,
-            _ofes_density_crossing_near_pressure,
+            _ofes_n2_at_depth,
+            _ofes_density_crossing_near_depth,
             _ofes_masked_median_profiles,
             _ofes_nan_gaussian,
-            _ofes_fixed_pressure_kinematic_fields,
+            _ofes_fixed_depth_kinematic_fields,
             _ofes_kinematics_at_point,
             _ofes_unit_sphere_xyz,
             _ofes_quality_event_catalog,
@@ -34305,7 +34335,7 @@ def _ofes_event_diagnostic_run_identity(
         )
     repo_root = Path(__file__).resolve().parent
     signature_payload = {
-        'schema_version': 1,
+        'schema_version': 2,
         'catalog_run_dir': str(catalog_root),
         'catalog_run_signature': catalog_manifest[
             'run_signature'
@@ -34361,8 +34391,8 @@ def diagnose_ofes_ranked_events(
 
     入口先从完整年度 catalog 排除触及 900 x 600 交付边界的截断事件，再按
     原定 score 重排并固定 DO50 前五名。每个事件最多诊断 31 个观测日，核心
-    取逐日对象最大 ΔDO 列，参考层固定为事件峰值 pressure；同日 120–240 km
-    环带给出精确的固定 pressure DO = 同密度水团项 + heave 项分解。第一名
+    取逐日对象最大 ΔDO 列，参考层固定为事件峰值 depth；同日 120–240 km
+    环带给出精确的固定 depth DO = 同密度水团项 + heave 项分解。第一名
     事件另按预声明的六维水团/动力距离选择一个无 DO20 的空间负对照。
 
     参数:
@@ -34379,9 +34409,9 @@ def diagnose_ofes_ranked_events(
         - `<run_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet`、`source_inventory.parquet` 与 `manifest.json`。
 
     说明:
-        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–900 dbar 仅是另表敏感性排名。
-        - sigma0、spiciness0、氧饱和度与 N2 使用 TEOS-10；OFES temp 按原生位温解释。
-        - u/v 先在原生网格上以 1.5 像元 Gaussian 平滑，再计算相对涡度、总应变与 Okubo-Weiss。
+        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–900 m 仅是另表敏感性排名。
+        - sigma0、spiciness0、氧饱和度与 N2 使用 TEOS-10；OFES temp 按交付位温解释。
+        - u/v 先在交付网格上以 1.5 像元 Gaussian 平滑，再计算相对涡度、总应变与 Okubo-Weiss。
         - 负对照必须距事件 300–700 km、纬差不超过 3°、距任一 DO20 像元至少 100 km，且完整 240 km 环带留在交付窗口内。
     """
     catalog_root = Path(catalog_run_dir)
@@ -34396,6 +34426,11 @@ def diagnose_ofes_ranked_events(
     if catalog_manifest.get('status') != 'complete':
         raise RuntimeError(
             'diagnose_ofes_ranked_events requires a complete catalog.'
+        )
+    if int(catalog_manifest.get('schema_version', 0)) != 2:
+        raise RuntimeError(
+            'diagnose_ofes_ranked_events requires a depth/m schema-v2 '
+            'catalog; regenerate the catalog with the current code.'
         )
     catalog_thresholds = {
         float(value)
@@ -34444,8 +34479,8 @@ def diagnose_ofes_ranked_events(
         sampled['raw_rank_within_threshold'] = int(
             event.rank_within_threshold
         )
-        sampled['event_peak_pressure_dbar'] = float(
-            event.peak_pressure_dbar
+        sampled['event_peak_depth_m'] = float(
+            event.peak_depth_m
         )
         sampled['event_peak_daily_object_key'] = str(
             event.peak_daily_object_key
@@ -34569,7 +34604,7 @@ def diagnose_ofes_ranked_events(
                     date,
                     float(row.peak_lon),
                     float(row.peak_lat),
-                    float(row.event_peak_pressure_dbar),
+                    float(row.event_peak_depth_m),
                     settings,
                 )
                 diagnosis.update(
@@ -34600,8 +34635,8 @@ def diagnose_ofes_ranked_events(
                         'catalog_delta_do': float(
                             row.delta_do_max
                         ),
-                        'daily_peak_pressure_dbar': float(
-                            row.peak_pressure_at_max
+                        'daily_peak_depth_m': float(
+                            row.peak_depth_at_max
                         ),
                         'daily_object_area_km2': float(
                             row.area_km2
@@ -34683,7 +34718,7 @@ def diagnose_ofes_ranked_events(
             headline_event['peak_date'],
             float(headline_event['peak_lon']),
             float(headline_event['peak_lat']),
-            float(headline_event['peak_pressure_dbar']),
+            float(headline_event['peak_depth_m']),
             headline_peak.to_dict(),
             settings,
         )
@@ -34709,7 +34744,7 @@ def diagnose_ofes_ranked_events(
             float(negative_control['lat']),
             float(
                 negative_control[
-                    'reference_pressure_dbar'
+                    'reference_depth_m'
                 ]
             ),
             settings,
@@ -34885,17 +34920,17 @@ def _ofes_event_evolution_settings(
         'hosoda_do_sigma0': float(
             raw.get('hosoda_do_sigma0', 26.5)
         ),
-        'hosoda_do_reference_pressure_dbar': float(
+        'hosoda_do_reference_depth_m': float(
             raw.get(
-                'hosoda_do_reference_pressure_dbar', 500.0
+                'hosoda_do_reference_depth_m', 500.0
             )
         ),
         'hosoda_salinity_sigma0': float(
             raw.get('hosoda_salinity_sigma0', 26.7)
         ),
-        'hosoda_salinity_reference_pressure_dbar': float(
+        'hosoda_salinity_reference_depth_m': float(
             raw.get(
-                'hosoda_salinity_reference_pressure_dbar',
+                'hosoda_salinity_reference_depth_m',
                 600.0,
             )
         ),
@@ -34908,16 +34943,16 @@ def _ofes_event_evolution_settings(
         'map_quiver_stride',
         'figure_dpi',
         'hosoda_do_sigma0',
-        'hosoda_do_reference_pressure_dbar',
+        'hosoda_do_reference_depth_m',
         'hosoda_salinity_sigma0',
-        'hosoda_salinity_reference_pressure_dbar',
+        'hosoda_salinity_reference_depth_m',
     )
     if any(
         not np.isfinite(settings[key]) or settings[key] <= 0
         for key in positive_keys
     ):
         raise ValueError(
-            'OFES evolution radii, strides, pressures, densities, '
+            'OFES evolution radii, strides, depths, densities, '
             'and figure DPI must be finite and positive.'
         )
     if not (
@@ -34948,29 +34983,29 @@ def _ofes_event_evolution_settings(
 
 
 def _ofes_fields_on_sigma0(
-    pressure: np.ndarray,
+    depth: np.ndarray,
     sigma0: np.ndarray,
     target_sigma0: float,
-    reference_pressure: float | np.ndarray,
+    reference_depth: float | np.ndarray,
     fields: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """把三维 OFES 场线性映射到最接近参考压力的指定 sigma0 交点。"""
-    pressure_arr = np.asarray(pressure, dtype=float)
+    """把三维 OFES 场线性映射到最接近参考深度的指定 sigma0 交点。"""
+    depth_arr = np.asarray(depth, dtype=float)
     sigma0_arr = np.asarray(sigma0, dtype=float)
     if (
-        pressure_arr.ndim != 1
+        depth_arr.ndim != 1
         or sigma0_arr.ndim != 3
-        or sigma0_arr.shape[0] != pressure_arr.size
+        or sigma0_arr.shape[0] != depth_arr.size
     ):
         raise ValueError(
-            'sigma0 must have shape (pressure, lat, lon) on a '
-            'one-dimensional pressure coordinate.'
+            'sigma0 must have shape (depth, lat, lon) on a '
+            'one-dimensional depth coordinate.'
         )
-    if pressure_arr.size < 2 or not np.all(
-        np.diff(pressure_arr) > 0
+    if depth_arr.size < 2 or not np.all(
+        np.diff(depth_arr) > 0
     ):
         raise ValueError(
-            'OFES pressure must contain at least two increasing levels.'
+            'OFES depth must contain at least two increasing levels.'
         )
 
     lower = sigma0_arr[:-1] - float(target_sigma0)
@@ -34989,17 +35024,17 @@ def _ofes_fields_on_sigma0(
         out=fraction,
         where=crossing,
     )
-    pair_pressure = (
-        pressure_arr[:-1, None, None]
-        + fraction * np.diff(pressure_arr)[:, None, None]
+    pair_depth = (
+        depth_arr[:-1, None, None]
+        + fraction * np.diff(depth_arr)[:, None, None]
     )
     reference = np.broadcast_to(
-        np.asarray(reference_pressure, dtype=float),
+        np.asarray(reference_depth, dtype=float),
         sigma0_arr.shape[1:],
     )
     score = np.where(
         crossing,
-        np.abs(pair_pressure - reference[None, :, :]),
+        np.abs(pair_depth - reference[None, :, :]),
         np.inf,
     )
     best = np.argmin(score, axis=0)
@@ -35008,12 +35043,12 @@ def _ofes_fields_on_sigma0(
     chosen_fraction = np.take_along_axis(
         fraction, gather, axis=0
     )[0]
-    chosen_pressure = np.take_along_axis(
-        pair_pressure, gather, axis=0
+    chosen_depth = np.take_along_axis(
+        pair_depth, gather, axis=0
     )[0]
     result = {
-        'pressure': np.where(
-            available, chosen_pressure, np.nan
+        'depth': np.where(
+            available, chosen_depth, np.nan
         ),
         'crossing_count': np.count_nonzero(
             crossing, axis=0
@@ -35047,15 +35082,14 @@ def _ofes_fields_on_sigma0(
 
 def _ofes_sigma0_volume(snapshot: dict) -> np.ndarray:
     """由 OFES 位温与实用盐度计算完整三维 TEOS-10 sigma0。"""
-    pressure = np.asarray(snapshot['pressure'], dtype=float)
-    lon_grid, lat_grid = np.meshgrid(
-        np.asarray(snapshot['lon'], dtype=float),
-        np.asarray(snapshot['lat'], dtype=float),
-    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
     salinity = np.asarray(snapshot['salinity'], dtype=float)
     theta = np.asarray(snapshot['temp'], dtype=float)
     expected_shape = (
-        pressure.size, lat_grid.shape[0], lon_grid.shape[1]
+        depth.size, lat_grid.shape[0], lon_grid.shape[1]
     )
     if (
         salinity.shape != expected_shape
@@ -35063,11 +35097,14 @@ def _ofes_sigma0_volume(snapshot: dict) -> np.ndarray:
     ):
         raise ValueError(
             'OFES temperature and salinity must share the '
-            '(pressure, lat, lon) tracer grid.'
+            '(depth, lat, lon) tracer grid.'
         )
+    seawater_pressure = gsw.p_from_z(
+        -depth[:, None], lat[None, :]
+    )[:, :, None]
     absolute_salinity = gsw.SA_from_SP(
         salinity,
-        pressure[:, None, None],
+        seawater_pressure,
         lon_grid[None, :, :],
         lat_grid[None, :, :],
     )
@@ -35178,8 +35215,8 @@ def _ofes_event_context_requests(
                     'requested_core_lat': float(
                         position['requested_core_lat']
                     ),
-                    'reference_pressure_dbar': float(
-                        event.peak_pressure_dbar
+                    'reference_depth_m': float(
+                        event.peak_depth_m
                     ),
                     'target_sigma0': target_sigma0,
                 }
@@ -35327,7 +35364,7 @@ def _ofes_event_evolution_run_identity(
     ).hexdigest()
     repo_root = Path(__file__).resolve().parent
     signature_payload = {
-        'schema_version': 1,
+        'schema_version': 2,
         'diagnostic_run_dir': str(diagnostic_root),
         'diagnostic_run_signature': diagnostic_manifest[
             'run_signature'
@@ -35449,10 +35486,10 @@ def _ofes_build_context_field(
     )
     sigma0 = _ofes_sigma0_volume(snapshot)
     mapped = _ofes_fields_on_sigma0(
-        snapshot['pressure'],
+        snapshot['depth'],
         sigma0,
         float(request['target_sigma0']),
-        float(request['reference_pressure_dbar']),
+        float(request['reference_depth_m']),
         {
             'do': snapshot['do2'],
             'salinity': snapshot['salinity'],
@@ -35521,7 +35558,7 @@ def _ofes_build_context_field(
         if key != 'crossing_count'
     }
     required_core = (
-        mapped_core['pressure'],
+        mapped_core['depth'],
         mapped_core['do'],
         mapped_core['salinity'],
         mapped_core['theta'],
@@ -35573,8 +35610,8 @@ def _ofes_build_context_field(
         'requested_circle_within_delivery_window': bool(
             edge_distance_km >= radius_km
         ),
-        'core_isopycnal_pressure_dbar': (
-            mapped_core['pressure']
+        'core_isopycnal_depth_m': (
+            mapped_core['depth']
         ),
         'core_isopycnal_do_umol_kg': mapped_core['do'],
         'core_isopycnal_salinity': mapped_core['salinity'],
@@ -35674,21 +35711,21 @@ def _ofes_build_hosoda_field(
         'v': snapshot['v'],
     }
     mapped_do = _ofes_fields_on_sigma0(
-        snapshot['pressure'],
+        snapshot['depth'],
         sigma0,
         float(settings['hosoda_do_sigma0']),
         float(
-            settings['hosoda_do_reference_pressure_dbar']
+            settings['hosoda_do_reference_depth_m']
         ),
         fields,
     )
     mapped_salinity = _ofes_fields_on_sigma0(
-        snapshot['pressure'],
+        snapshot['depth'],
         sigma0,
         float(settings['hosoda_salinity_sigma0']),
         float(
             settings[
-                'hosoda_salinity_reference_pressure_dbar'
+                'hosoda_salinity_reference_depth_m'
             ]
         ),
         fields,
@@ -35742,15 +35779,15 @@ def _ofes_build_hosoda_field(
         'do_target_sigma0': float(
             settings['hosoda_do_sigma0']
         ),
-        'do_reference_pressure_dbar': float(
-            settings['hosoda_do_reference_pressure_dbar']
+        'do_reference_depth_m': float(
+            settings['hosoda_do_reference_depth_m']
         ),
         'salinity_target_sigma0': float(
             settings['hosoda_salinity_sigma0']
         ),
-        'salinity_reference_pressure_dbar': float(
+        'salinity_reference_depth_m': float(
             settings[
-                'hosoda_salinity_reference_pressure_dbar'
+                'hosoda_salinity_reference_depth_m'
             ]
         ),
         'do_finite_fraction': do_fraction,
@@ -35785,7 +35822,7 @@ def _ofes_build_hosoda_field(
         ('salinity_surface', mapped_salinity),
     ):
         for key in (
-            'pressure',
+            'depth',
             'do',
             'salinity',
             'theta',
@@ -35841,7 +35878,7 @@ def _ofes_plot_annual_catalog_overview(
     output_path: str | Path,
     dpi: int,
 ) -> Path:
-    """绘制年度扫描强度、空间分布、压力与固定候选排名总览。"""
+    """绘制年度扫描强度、空间分布、深度与固定候选排名总览。"""
     catalog_root = Path(catalog_run_dir)
     scan = pd.read_parquet(
         catalog_root / 'scan_summary.parquet'
@@ -35940,7 +35977,7 @@ def _ofes_plot_annual_catalog_overview(
     ax = axes[1, 0]
     bins = np.linspace(300, 1000, 29)
     ax.hist(
-        eligible['peak_pressure_dbar'],
+        eligible['peak_depth_m'],
         bins=bins,
         color='#6b7280',
         alpha=0.75,
@@ -35950,12 +35987,12 @@ def _ofes_plot_annual_catalog_overview(
         eligible['deep_sensitivity_eligible']
     ]
     ax.hist(
-        deep['peak_pressure_dbar'],
+        deep['peak_depth_m'],
         bins=bins,
         histtype='step',
         linewidth=1.8,
         color='#2563eb',
-        label='500–900 dbar sensitivity',
+        label='500–900 m sensitivity',
     )
     lower_count = int(
         np.count_nonzero(
@@ -35974,9 +36011,9 @@ def _ofes_plot_annual_catalog_overview(
         va='top',
         fontsize=9,
     )
-    ax.set_xlabel('Event peak pressure (dbar-like)')
+    ax.set_xlabel('Event peak depth (m)')
     ax.set_ylabel('Events')
-    ax.set_title('(c) Native-pressure distribution')
+    ax.set_title('(c) Delivered-depth distribution')
     ax.legend(frameon=False, fontsize=8, loc='upper right')
 
     ax = axes[1, 1]
@@ -36037,12 +36074,12 @@ def _ofes_plot_event_time_series(
     )
     axes[0].plot(
         dates,
-        group['fixed_pressure_do_contrast'],
+        group['fixed_depth_do_contrast'],
         '-o',
         markersize=3.5,
         linewidth=1.4,
         color='#111827',
-        label='Fixed-pressure contrast',
+        label='Fixed-depth contrast',
     )
     axes[0].plot(
         dates,
@@ -36080,18 +36117,18 @@ def _ofes_plot_event_time_series(
     )
     axes[1].set_ylabel('N² ratio')
     axes[1].grid(alpha=0.2)
-    pressure_axis = axes[1].twinx()
-    pressure_axis.plot(
+    depth_axis = axes[1].twinx()
+    depth_axis.plot(
         dates,
-        group['daily_peak_pressure_dbar'],
+        group['daily_peak_depth_m'],
         color='#0891b2',
         linewidth=1.0,
         alpha=0.75,
-        label='Daily peak pressure',
+        label='Daily peak depth',
     )
-    pressure_axis.invert_yaxis()
-    pressure_axis.set_ylabel(
-        'Daily peak pressure (dbar-like)',
+    depth_axis.invert_yaxis()
+    depth_axis.set_ylabel(
+        'Daily peak depth (m)',
         color='#0891b2',
     )
 
@@ -36151,7 +36188,7 @@ def _ofes_plot_event_time_series(
     fig.suptitle(
         (
             f'OFES DO50 rank {rank}: {event["event_id"]}  '
-            f'(reference {float(event["peak_pressure_dbar"]):.1f} dbar)'
+            f'(reference {float(event["peak_depth_m"]):.1f} m)'
         ),
         fontsize=15,
         fontweight='bold',
@@ -36188,7 +36225,7 @@ def _ofes_plot_event_context_maps(
                         'lat',
                         'do',
                         'salinity',
-                        'pressure',
+                        'depth',
                         'u',
                         'v',
                     )
@@ -36200,22 +36237,22 @@ def _ofes_plot_event_context_maps(
             for field in fields
         ]
     )
-    pressure_anomalies = np.concatenate(
+    depth_anomalies = np.concatenate(
         [
             (
-                field['pressure']
-                - float(event['peak_pressure_dbar'])
-            )[np.isfinite(field['pressure'])]
+                field['depth']
+                - float(event['peak_depth_m'])
+            )[np.isfinite(field['depth'])]
             for field in fields
         ]
     )
     do_vmin, do_vmax = np.nanpercentile(
         do_values, (2.0, 98.0)
     )
-    pressure_limit = float(
-        np.nanpercentile(np.abs(pressure_anomalies), 98.0)
+    depth_limit = float(
+        np.nanpercentile(np.abs(depth_anomalies), 98.0)
     )
-    pressure_limit = max(25.0, pressure_limit)
+    depth_limit = max(25.0, depth_limit)
     fig, axes = plt.subplots(
         2,
         5,
@@ -36247,12 +36284,12 @@ def _ofes_plot_event_context_maps(
         bottom_mappable = bottom.pcolormesh(
             lon,
             lat,
-            field['pressure']
-            - float(event['peak_pressure_dbar']),
+            field['depth']
+            - float(event['peak_depth_m']),
             cmap='RdBu_r',
             shading='auto',
-            vmin=-pressure_limit,
-            vmax=pressure_limit,
+            vmin=-depth_limit,
+            vmax=depth_limit,
         )
         salinity = field['salinity']
         finite_salinity = salinity[np.isfinite(salinity)]
@@ -36339,7 +36376,7 @@ def _ofes_plot_event_context_maps(
         ax=axes[1, :].tolist(),
         shrink=0.88,
         pad=0.01,
-        label='Isopycnal pressure − reference (dbar)',
+        label='Isopycnal depth − reference (m)',
     )
     rank = int(event['quality_rank_within_threshold'])
     target_sigma0 = float(event_context.iloc[0]['target_sigma0'])
@@ -36382,14 +36419,14 @@ def _ofes_plot_negative_control_comparison(
     fig, axes = plt.subplots(
         1, 3, figsize=(14.5, 4.8), constrained_layout=True
     )
-    labels = ('Fixed pressure', 'Water mass', 'Heave')
+    labels = ('Fixed depth', 'Water mass', 'Heave')
     event_values = (
-        peak['fixed_pressure_do_contrast'],
+        peak['fixed_depth_do_contrast'],
         peak['water_mass_do_contrast'],
         peak['heave_do_contribution'],
     )
     control_values = (
-        control['fixed_pressure_do_contrast'],
+        control['fixed_depth_do_contrast'],
         control['water_mass_do_contrast'],
         control['heave_do_contribution'],
     )
@@ -36508,11 +36545,11 @@ def _ofes_plot_hosoda_benchmark(
                         'lon',
                         'lat',
                         'do_surface_do',
-                        'do_surface_pressure',
+                        'do_surface_depth',
                         'do_surface_u',
                         'do_surface_v',
                         'salinity_surface_salinity',
-                        'salinity_surface_pressure',
+                        'salinity_surface_depth',
                     )
                 }
             )
@@ -36563,20 +36600,20 @@ def _ofes_plot_hosoda_benchmark(
             vmin=float(do_vmin),
             vmax=float(do_vmax),
         )
-        pressure = field['do_surface_pressure']
-        finite_pressure = pressure[np.isfinite(pressure)]
+        depth = field['do_surface_depth']
+        finite_depth = depth[np.isfinite(depth)]
         if (
-            finite_pressure.size
-            and np.nanmax(finite_pressure)
-            > np.nanmin(finite_pressure)
+            finite_depth.size
+            and np.nanmax(finite_depth)
+            > np.nanmin(finite_depth)
         ):
             axes[0, column].contour(
                 lon,
                 lat,
-                pressure,
+                depth,
                 levels=np.unique(
                     np.nanpercentile(
-                        finite_pressure, (20.0, 50.0, 80.0)
+                        finite_depth, (20.0, 50.0, 80.0)
                     )
                 ),
                 colors='white',
@@ -36603,24 +36640,24 @@ def _ofes_plot_hosoda_benchmark(
             vmin=float(salinity_vmin),
             vmax=float(salinity_vmax),
         )
-        salinity_pressure = field[
-            'salinity_surface_pressure'
+        salinity_depth = field[
+            'salinity_surface_depth'
         ]
-        finite_salinity_pressure = salinity_pressure[
-            np.isfinite(salinity_pressure)
+        finite_salinity_depth = salinity_depth[
+            np.isfinite(salinity_depth)
         ]
         if (
-            finite_salinity_pressure.size
-            and np.nanmax(finite_salinity_pressure)
-            > np.nanmin(finite_salinity_pressure)
+            finite_salinity_depth.size
+            and np.nanmax(finite_salinity_depth)
+            > np.nanmin(finite_salinity_depth)
         ):
             axes[1, column].contour(
                 lon,
                 lat,
-                salinity_pressure,
+                salinity_depth,
                 levels=np.unique(
                     np.nanpercentile(
-                        finite_salinity_pressure,
+                        finite_salinity_depth,
                         (20.0, 50.0, 80.0),
                     )
                 ),
@@ -36687,7 +36724,7 @@ def build_ofes_event_evolution_diagnostics(
 
     本入口只消费已完成的年度 catalog 和排名候选水团诊断。它为每个预锁定
     候选建立起始前、起始、峰值、结束和结束后五个场景，在事件峰值 sigma0
-    与固定峰值 pressure 参考下绘制演化；另以三天双等密度面图复核 Hosoda
+    与固定峰值 depth 参考下绘制演化；另以三天双等密度面图复核 Hosoda
     benchmark，并依据尚未解决的时空插值与垂向坐标问题写出显式轨迹门槛。
 
     参数:
@@ -36705,7 +36742,7 @@ def build_ofes_event_evolution_diagnostics(
 
     说明:
         - 五角色位置来自事件 start/peak/end 的逐日最大 ΔDO 网格列；before/after 沿用对应端点位置。
-        - 每个事件始终使用其 peak-day sigma0 与 catalog peak pressure，不随日期重新选择参考面。
+        - 每个事件始终使用其 peak-day sigma0 与 catalog peak depth，不随日期重新选择参考面。
         - Hosoda 图只作 loader、坐标、TEOS-10 映射与中尺度场的正向集成检验，不参与正式候选替换或排名。
         - 轨迹关闭是验证门控结论，不否定二维等密度面演化；当前结果不把 Eulerian 对象解释成物质粒子。
     """
@@ -36724,6 +36761,12 @@ def build_ofes_event_evolution_diagnostics(
     if diagnostic_manifest.get('status') != 'complete':
         raise RuntimeError(
             'OFES event evolution requires a complete diagnostic run.'
+        )
+    if int(diagnostic_manifest.get('schema_version', 0)) != 2:
+        raise RuntimeError(
+            'OFES event evolution requires a depth/m schema-v2 '
+            'diagnostic run; regenerate the catalog and diagnostics '
+            'with the current code.'
         )
     if not bool(
         diagnostic_manifest.get('diagnostic_gate_passed')
@@ -37110,7 +37153,7 @@ def build_ofes_event_evolution_diagnostics(
         trajectory_gate = {
             'enabled': False,
             'three_dimensional_enabled': False,
-            'pressure_surface_enabled': False,
+            'fixed_depth_enabled': False,
             'status': 'disabled_after_diagnostic_review',
             'decision': (
                 'Retain the fixed candidates and stop before '
@@ -37139,15 +37182,15 @@ def build_ofes_event_evolution_diagnostics(
             },
             'unresolved_items': [
                 'daily_velocity_temporal_interpolation',
-                'pressure_to_geometric_depth_conversion',
-                'three_dimensional_vertical_velocity_coupling',
+                'fixed_depth_trajectory_reversibility',
+                'vertical_velocity_sign_and_interface_coupling',
                 'material-parcel_identity_of_eulerian_delta_do_objects',
             ],
             'scientific_rationale': (
                 'The isopycnal maps, exact water-mass/heave '
                 'decomposition, kinematics, and matched negative '
                 'control test a plausible pathway without treating '
-                'an Eulerian pressure-varying object as a parcel. '
+                'an Eulerian depth-varying object as a parcel. '
                 'A trajectory would currently add assumptions that '
                 'have not passed dataset-specific validation.'
             ),
