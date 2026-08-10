@@ -1,6 +1,9 @@
 # 处理与算法参数配置
+# version 1.27 变更：
+#   - 澄清 OFES DODS 垂向坐标的 mbar 是 JAMSTEC 对公开产品的通用错误 metadata 警告，
+#     不是本次交付的专项确认；数值处理不变。
 # version 1.26 变更：
-#   - 更正 OFES `lev` 的错误 millibar attribute：统一按交付 z-level 深度（m）解释，
+#   - 参照公开 OFES DODS 的通用错误 mbar 警告，将交付 `lev` 统一按 z-level 深度（m）解释，
 #     仅在 TEOS-10 入口按纬度转换为海水压力；事件目录、诊断与图表字段同步改为 depth/m。
 # version 1.25 变更：
 #   - 新增 OFES 客观事件的 ±10 天等密度面演化图、年度总览、Hosoda benchmark 与轨迹门槛配置。
@@ -195,10 +198,10 @@ processing:
 
 ofes:
   horizontal_grid: arakawa_b      # MOM3 B-grid：u/v 同处角点，均需四角平均到示踪物中心
-  depth_scale: 1.0                # JAMSTEC 已注明 lev 的 millibar attribute 错误；交付数值为 z-level 深度（m）
+  depth_scale: 1.0                # JAMSTEC 公开页说明 DODS 的 mbar 为通用错误 attribute；结合交付层位按 z-level 深度（m）解释
   depth_units: m
   source_vertical_units_attribute: millibar
-  source_vertical_units_note: "incorrect provider attribute; delivered coordinate is depth in metres"
+  source_vertical_units_note: "general false-unit warning for public OFES DODS output; delivered z-level coordinate interpreted as depth in metres"
   variable_scale:                 # 原生值 → 对外值
     do2: 1.0
     temp: 1.0

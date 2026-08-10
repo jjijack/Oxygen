@@ -29144,7 +29144,7 @@ def load_ofes_snapshot(
         - dict: 含 date/lon/lat/depth、请求变量和 metadata；u/v 与示踪物数组维度为 (depth, lat, lon)，w 为 (depth_w, lat, lon)。
 
     说明:
-        - JAMSTEC 已注明文件中的 `lev.units=millibar` 是错误 metadata；本入口按交付 z-level 深度（m）解释其数值。
+        - JAMSTEC OFES 公开数据页将 DODS 垂向坐标的 mbar 说明为通用错误 metadata，并非本次交付的专项确认；结合交付层位，本入口按 z-level 深度（m）解释其数值。
         - `w` 按 MOM3 约定记录为向上为正，但尚缺可复现的数据集专项验证；本函数只负责读取，不据此授权三维轨迹解释。
         - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
@@ -29182,7 +29182,8 @@ def load_ofes_snapshot(
         'source_vertical_units_note': str(
             _OFES_CFG.get(
                 'source_vertical_units_note',
-                'incorrect provider attribute; delivered coordinate is depth in metres',
+                'general false-unit warning for public OFES DODS output; '
+                'delivered z-level coordinate interpreted as depth in metres',
             )
         ),
         'depth_semantics': 'delivered OFES z-level depth below sea surface',
@@ -30854,7 +30855,8 @@ def scan_ofes_delta_do_day(
         'source_vertical_units_note': str(
             _OFES_CFG.get(
                 'source_vertical_units_note',
-                'incorrect provider attribute; delivered coordinate is depth in metres',
+                'general false-unit warning for public OFES DODS output; '
+                'delivered z-level coordinate interpreted as depth in metres',
             )
         ),
         'native_units': str(
