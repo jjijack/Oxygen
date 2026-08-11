@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.29 变更：
+#   - 新增 OFES 深层事件的客观机制分层与 onset/formation 诊断；固定比较事件出现前、首次进入
+#     500 m 以下和峰值阶段的水团/heave、旋转/应变、水平密度梯度、收敛与解析水平锋生率；
+#     代表事件另需满足 start-to-peak 时间展开和全程 240 km 背景环带完整性门槛。
 # version 1.28 变更：
 #   - 新增 59 个 OFES DO50 深层事件的峰值水团/heave、动力与同点/核心加权/50 km 上界表层表达诊断。
 # version 1.27 变更：
@@ -304,6 +308,21 @@ ofes:
     surface_attenuation_ratio_max: 0.5
     figure_dpi: 180
     output_subdir: event_population
+  event_onset:
+    pre_start_days: 5
+    minimum_start_to_peak_observed_days: 2
+    require_full_background_annulus: true
+    deep_entry_depth_min_m: 500.0
+    frontogenesis_load_radius_km: 100.0
+    core_summary_radius_km: 30.0
+    core_min_valid_columns: 100
+    density_smoothing_sigma_pixels: 1.5
+    minimum_density_gradient_kg_m4: 1.0e-8
+    map_radius_km: 180.0
+    map_min_finite_fraction: 0.50
+    map_quiver_stride: 12
+    figure_dpi: 180
+    output_subdir: event_onset
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12

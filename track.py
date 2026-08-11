@@ -36354,6 +36354,1773 @@ def generalize_ofes_deep_events(
     }
 
 
+# -------------------- OFES 深层事件 onset/formation 诊断 --------------------
+def _ofes_event_onset_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 事件机制分层与 onset 诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_onset', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_onset override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'pre_start_days': int(raw.get('pre_start_days', 5)),
+        'minimum_start_to_peak_observed_days': int(
+            raw.get('minimum_start_to_peak_observed_days', 2)
+        ),
+        'require_full_background_annulus': bool(
+            raw.get('require_full_background_annulus', True)
+        ),
+        'deep_entry_depth_min_m': float(
+            raw.get('deep_entry_depth_min_m', 500.0)
+        ),
+        'frontogenesis_load_radius_km': float(
+            raw.get('frontogenesis_load_radius_km', 100.0)
+        ),
+        'core_summary_radius_km': float(
+            raw.get('core_summary_radius_km', 30.0)
+        ),
+        'core_min_valid_columns': int(
+            raw.get('core_min_valid_columns', 100)
+        ),
+        'density_smoothing_sigma_pixels': float(
+            raw.get('density_smoothing_sigma_pixels', 1.5)
+        ),
+        'minimum_density_gradient_kg_m4': float(
+            raw.get('minimum_density_gradient_kg_m4', 1e-8)
+        ),
+        'map_radius_km': float(
+            raw.get('map_radius_km', 180.0)
+        ),
+        'map_min_finite_fraction': float(
+            raw.get('map_min_finite_fraction', 0.50)
+        ),
+        'map_quiver_stride': int(
+            raw.get('map_quiver_stride', 12)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_onset')
+        ),
+    }
+    positive = (
+        'pre_start_days',
+        'minimum_start_to_peak_observed_days',
+        'deep_entry_depth_min_m',
+        'frontogenesis_load_radius_km',
+        'core_summary_radius_km',
+        'core_min_valid_columns',
+        'density_smoothing_sigma_pixels',
+        'minimum_density_gradient_kg_m4',
+        'map_radius_km',
+        'map_quiver_stride',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES onset counts, scales, radii, depths, and figure '
+            'DPI must be finite and positive.'
+        )
+    if (
+        settings['core_summary_radius_km']
+        >= settings['frontogenesis_load_radius_km']
+    ):
+        raise ValueError(
+            'OFES onset core radius must be smaller than the '
+            'frontogenesis load radius.'
+        )
+    if settings['map_radius_km'] <= settings['core_summary_radius_km']:
+        raise ValueError(
+            'OFES onset map radius must exceed the core radius.'
+        )
+    if not 0 < settings['map_min_finite_fraction'] <= 1:
+        raise ValueError(
+            'OFES onset map_min_finite_fraction must lie in (0, 1].'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES onset output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_select_onset_regimes(
+    population_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+    settings: dict,
+    catalog_start: str | pd.Timestamp,
+    background_outer_radius_km: float,
+) -> pd.DataFrame:
+    """按排序与 onset 可诊断性选取总体、应变和表层弱旋转代表。"""
+    passed = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold',
+        kind='mergesort',
+    ).copy()
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(catalog_start).normalize()
+    )
+    feasibility: list[dict] = []
+    for event in passed.itertuples(index=False):
+        start = pd.Timestamp(event.start_date).normalize()
+        peak = pd.Timestamp(event.peak_date).normalize()
+        group = daily_objects.loc[
+            (daily_objects['event_id'].astype(str) == str(event.event_id))
+            & (pd.to_datetime(daily_objects['date']) >= start)
+            & (pd.to_datetime(daily_objects['date']) <= peak)
+        ]
+        edge_distance = _ofes_delivery_edge_distance_km(
+            group['peak_lon'].to_numpy(dtype=float),
+            group['peak_lat'].to_numpy(dtype=float),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+        minimum_edge = (
+            float(np.min(edge_distance))
+            if edge_distance.size
+            else np.nan
+        )
+        enough_days = len(group) >= int(
+            settings['minimum_start_to_peak_observed_days']
+        )
+        full_annulus = bool(
+            np.isfinite(minimum_edge)
+            and minimum_edge >= float(background_outer_radius_km)
+        )
+        eligible = bool(
+            peak > start
+            and enough_days
+            and (
+                full_annulus
+                or not settings['require_full_background_annulus']
+            )
+        )
+        feasibility.append(
+            {
+                'event_id': str(event.event_id),
+                'onset_start_to_peak_observed_days': int(len(group)),
+                'onset_min_delivery_edge_distance_km': minimum_edge,
+                'onset_full_background_annulus': full_annulus,
+                'onset_selection_eligible': eligible,
+            }
+        )
+    passed = passed.merge(
+        pd.DataFrame(feasibility),
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    eligible = passed['onset_selection_eligible'].to_numpy(dtype=bool)
+    selectors = (
+        (
+            'headline',
+            'best_overall_deep_rank_with_onset_feasibility',
+            eligible,
+        ),
+        (
+            'strain_dominated',
+            'best_deep_rank_among_onset_feasible_strain_dominated',
+            (
+                eligible
+                & ~passed['rotation_dominated'].to_numpy(dtype=bool)
+            ),
+        ),
+        (
+            'surface_weak_rotation',
+            'best_deep_rank_among_onset_feasible_surface_weak_or_reversed_rotation',
+            (
+                eligible
+                & passed['rotation_dominated'].to_numpy(dtype=bool)
+                & passed[
+                    'surface_weak_or_reversed_rotation'
+                ].to_numpy(dtype=bool)
+            ),
+        ),
+    )
+    records: list[dict] = []
+    for order, (label, criterion, mask) in enumerate(
+        selectors, start=1
+    ):
+        candidates = passed.loc[mask]
+        if candidates.empty:
+            raise RuntimeError(
+                f'No OFES population event satisfies {criterion}.'
+            )
+        record = candidates.iloc[0].to_dict()
+        record.update(
+            {
+                'regime_order': int(order),
+                'regime_label': label,
+                'selection_criterion': criterion,
+            }
+        )
+        records.append(record)
+    selected = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    if selected['event_id'].duplicated().any():
+        raise RuntimeError(
+            'OFES onset selectors did not produce three distinct events.'
+        )
+    return selected
+
+
+def _ofes_onset_daily_requests(
+    selected: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+    settings: dict,
+    catalog_start: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """建立出现前逐日背景与 start-to-peak 已观测对象请求。"""
+    lower_date = pd.Timestamp(catalog_start).normalize()
+    records: list[dict] = []
+    for event in selected.itertuples(index=False):
+        event_id = str(event.event_id)
+        start = pd.Timestamp(event.start_date).normalize()
+        peak = pd.Timestamp(event.peak_date).normalize()
+        group = daily_objects.loc[
+            (daily_objects['event_id'].astype(str) == event_id)
+            & (pd.to_datetime(daily_objects['date']) >= start)
+            & (pd.to_datetime(daily_objects['date']) <= peak)
+        ].sort_values('date', kind='mergesort')
+        if group.empty:
+            raise RuntimeError(
+                f'No start-to-peak daily objects found for {event_id}.'
+            )
+        if group['date'].duplicated().any():
+            raise RuntimeError(
+                f'Multiple daily objects occur on one day for {event_id}.'
+            )
+        start_rows = group.loc[
+            pd.to_datetime(group['date']).dt.normalize() == start
+        ]
+        peak_rows = group.loc[
+            group['daily_object_key'].astype(str)
+            == str(event.peak_daily_object_key)
+        ]
+        deep_rows = group.loc[
+            group['peak_depth_at_max']
+            >= float(settings['deep_entry_depth_min_m'])
+        ]
+        if len(start_rows) != 1 or len(peak_rows) != 1 or deep_rows.empty:
+            raise RuntimeError(
+                f'OFES onset anchors are incomplete for {event_id}.'
+            )
+        start_row = start_rows.iloc[0]
+        deep_row = deep_rows.iloc[0]
+        deep_date = pd.Timestamp(deep_row['date']).normalize()
+        pre_start = max(
+            lower_date,
+            start - pd.Timedelta(days=int(settings['pre_start_days'])),
+        )
+        for date in pd.date_range(
+            pre_start,
+            start - pd.Timedelta(days=1),
+            freq='D',
+        ):
+            records.append(
+                {
+                    'regime_order': int(event.regime_order),
+                    'regime_label': str(event.regime_label),
+                    'selection_criterion': str(
+                        event.selection_criterion
+                    ),
+                    'event_id': event_id,
+                    'date': date.normalize(),
+                    'phase': 'pre_start',
+                    'day_relative_to_start': int((date - start).days),
+                    'daily_object_key': None,
+                    'position_basis': 'held_start_daily_peak_column',
+                    'requested_core_lon': float(start_row['peak_lon']),
+                    'requested_core_lat': float(start_row['peak_lat']),
+                    'reference_depth_m': float(event.peak_depth_m),
+                    'map_target_sigma0': float(event.target_sigma0),
+                    'catalog_delta_do_max': np.nan,
+                    'catalog_peak_depth_m': np.nan,
+                    'catalog_equivalent_radius_km': np.nan,
+                    'is_start': False,
+                    'is_deep_entry': False,
+                    'is_peak': False,
+                    'is_map_anchor': bool(
+                        date.normalize()
+                        == start - pd.Timedelta(days=1)
+                    ),
+                    'anchor_roles': (
+                        'pre_start'
+                        if date.normalize()
+                        == start - pd.Timedelta(days=1)
+                        else ''
+                    ),
+                }
+            )
+        for row in group.itertuples(index=False):
+            date = pd.Timestamp(row.date).normalize()
+            roles: list[str] = []
+            if date == start:
+                roles.append('start')
+            if date == deep_date:
+                roles.append('deep_entry')
+            if str(row.daily_object_key) == str(
+                event.peak_daily_object_key
+            ):
+                roles.append('peak')
+            records.append(
+                {
+                    'regime_order': int(event.regime_order),
+                    'regime_label': str(event.regime_label),
+                    'selection_criterion': str(
+                        event.selection_criterion
+                    ),
+                    'event_id': event_id,
+                    'date': date,
+                    'phase': 'detected',
+                    'day_relative_to_start': int((date - start).days),
+                    'daily_object_key': str(row.daily_object_key),
+                    'position_basis': 'daily_max_delta_do_column',
+                    'requested_core_lon': float(row.peak_lon),
+                    'requested_core_lat': float(row.peak_lat),
+                    'reference_depth_m': float(event.peak_depth_m),
+                    'map_target_sigma0': float(event.target_sigma0),
+                    'catalog_delta_do_max': float(row.delta_do_max),
+                    'catalog_peak_depth_m': float(
+                        row.peak_depth_at_max
+                    ),
+                    'catalog_equivalent_radius_km': float(
+                        row.equivalent_radius_km
+                    ),
+                    'is_start': bool(date == start),
+                    'is_deep_entry': bool(date == deep_date),
+                    'is_peak': bool(
+                        str(row.daily_object_key)
+                        == str(event.peak_daily_object_key)
+                    ),
+                    'is_map_anchor': bool(roles),
+                    'anchor_roles': '|'.join(roles),
+                }
+            )
+    requests = pd.DataFrame(records).sort_values(
+        ['regime_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    if requests.empty or requests.duplicated(
+        ['event_id', 'date']
+    ).any():
+        raise RuntimeError(
+            'OFES onset requests are empty or contain duplicate dates.'
+        )
+    requests.insert(
+        0,
+        'daily_request_key',
+        requests.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    requests.insert(
+        1,
+        'daily_request_index',
+        np.arange(1, len(requests) + 1, dtype=np.int16),
+    )
+    return requests
+
+
+def _ofes_fixed_depth_frontogenesis_fields(
+    snapshot: dict,
+    target_depth: float,
+    smoothing_sigma_pixels: float,
+    minimum_density_gradient_kg_m4: float,
+) -> dict:
+    """计算解析水平速度梯度造成的固定深度锋生率。
+
+    使用 F_h = -grad(sigma0)^T grad(u_h)^T grad(sigma0)，并以
+    |grad(sigma0)|^2 归一化为水平运动学造成的局地梯度增长率。
+    """
+    kinematics = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        float(target_depth),
+        float(smoothing_sigma_pixels),
+    )
+    level = int(kinematics['level_index'])
+    depth = float(kinematics['depth_m'])
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    pressure = np.asarray(
+        gsw.p_from_z(-depth, lat), dtype=float
+    )[:, None]
+    absolute_salinity = gsw.SA_from_SP(
+        np.asarray(snapshot['salinity'][level], dtype=float),
+        pressure,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity,
+        np.asarray(snapshot['temp'][level], dtype=float),
+    )
+    sigma0 = _ofes_nan_gaussian(
+        np.asarray(
+            gsw.sigma0(
+                absolute_salinity, conservative_temperature
+            ),
+            dtype=float,
+        ),
+        float(smoothing_sigma_pixels),
+    )
+    scale = approximate_degree_length(lat)
+    meters_per_degree_lon = np.asarray(
+        scale['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    meters_per_degree_lat = np.asarray(
+        scale['meters_per_degree_lat'], dtype=float
+    )[:, None]
+    u = np.asarray(kinematics['u'], dtype=float)
+    v = np.asarray(kinematics['v'], dtype=float)
+    du_dx = np.gradient(u, lon, axis=1) / meters_per_degree_lon
+    dv_dx = np.gradient(v, lon, axis=1) / meters_per_degree_lon
+    du_dy = np.gradient(u, lat, axis=0) / meters_per_degree_lat
+    dv_dy = np.gradient(v, lat, axis=0) / meters_per_degree_lat
+    density_gradient_x = (
+        np.gradient(sigma0, lon, axis=1) / meters_per_degree_lon
+    )
+    density_gradient_y = (
+        np.gradient(sigma0, lat, axis=0) / meters_per_degree_lat
+    )
+    density_gradient = np.hypot(
+        density_gradient_x, density_gradient_y
+    )
+    frontogenesis = -(
+        density_gradient_x**2 * du_dx
+        + density_gradient_x
+        * density_gradient_y
+        * (du_dy + dv_dx)
+        + density_gradient_y**2 * dv_dy
+    )
+    normalized = np.full(frontogenesis.shape, np.nan, dtype=float)
+    np.divide(
+        frontogenesis,
+        density_gradient**2,
+        out=normalized,
+        where=(
+            np.isfinite(frontogenesis)
+            & np.isfinite(density_gradient)
+            & (
+                density_gradient
+                >= float(minimum_density_gradient_kg_m4)
+            )
+        ),
+    )
+    divergence = du_dx + dv_dy
+    return {
+        **kinematics,
+        'sigma0': sigma0,
+        'density_gradient_x_kg_m4': density_gradient_x,
+        'density_gradient_y_kg_m4': density_gradient_y,
+        'density_gradient_kg_m4': density_gradient,
+        'horizontal_frontogenesis_kg2_m8_s': frontogenesis,
+        'normalized_frontogenesis_rate_s_1': normalized,
+        'horizontal_divergence_s_1': divergence,
+        'horizontal_convergence_s_1': -divergence,
+    }
+
+
+def _ofes_frontogenesis_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth: float,
+    settings: dict,
+) -> dict:
+    """提取核心点与 30 km 核心盘的水平锋生诊断。"""
+    date_ts = pd.Timestamp(date).normalize()
+    radius_km = float(settings['frontogenesis_load_radius_km'])
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    available_depth = np.asarray(
+        _ofes_tracer_coordinates(date_ts)[2], dtype=float
+    )
+    delivered_depth = float(
+        available_depth[
+            np.argmin(np.abs(available_depth - float(reference_depth)))
+        ]
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+        depth_bounds=(delivered_depth, delivered_depth),
+    )
+    fields = _ofes_fixed_depth_frontogenesis_fields(
+        snapshot,
+        float(reference_depth),
+        float(settings['density_smoothing_sigma_pixels']),
+        float(settings['minimum_density_gradient_kg_m4']),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(core_lon),
+            float(core_lat),
+        ),
+        dtype=float,
+    ) / 1000.0
+    core_mask = (
+        distance_km <= float(settings['core_summary_radius_km'])
+    )
+    valid = (
+        core_mask
+        & np.isfinite(fields['density_gradient_kg_m4'])
+        & np.isfinite(fields['normalized_frontogenesis_rate_s_1'])
+        & np.isfinite(fields['horizontal_convergence_s_1'])
+    )
+    valid_count = int(np.count_nonzero(valid))
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, float(core_lon)))
+        )
+    )
+    failure_reasons: list[str] = []
+    if valid_count < int(settings['core_min_valid_columns']):
+        failure_reasons.append('insufficient_frontogenesis_core_columns')
+    point_values = (
+        fields['density_gradient_kg_m4'][row, column],
+        fields['normalized_frontogenesis_rate_s_1'][row, column],
+        fields['horizontal_convergence_s_1'][row, column],
+    )
+    if not all(np.isfinite(value) for value in point_values):
+        failure_reasons.append('nonfinite_frontogenesis_core_point')
+    return {
+        'frontogenesis_depth_m': float(fields['depth_m']),
+        'frontogenesis_core_radius_km': float(
+            settings['core_summary_radius_km']
+        ),
+        'frontogenesis_core_valid_columns': valid_count,
+        'core_density_gradient_kg_m4': float(
+            fields['density_gradient_kg_m4'][row, column]
+        ),
+        'core_normalized_frontogenesis_rate_s_1': float(
+            fields['normalized_frontogenesis_rate_s_1'][row, column]
+        ),
+        'core_horizontal_convergence_s_1': float(
+            fields['horizontal_convergence_s_1'][row, column]
+        ),
+        'disk_median_density_gradient_kg_m4': float(
+            np.nanmedian(fields['density_gradient_kg_m4'][valid])
+        ),
+        'disk_median_normalized_frontogenesis_rate_s_1': float(
+            np.nanmedian(
+                fields['normalized_frontogenesis_rate_s_1'][valid]
+            )
+        ),
+        'disk_frontogenetic_fraction': float(
+            np.mean(
+                fields['normalized_frontogenesis_rate_s_1'][valid] > 0
+            )
+        ),
+        'disk_median_horizontal_convergence_s_1': float(
+            np.nanmedian(fields['horizontal_convergence_s_1'][valid])
+        ),
+        'frontogenesis_diagnostic_passed': bool(not failure_reasons),
+        'frontogenesis_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+    }
+
+
+def _ofes_event_onset_inventory(
+    requests: pd.DataFrame,
+) -> pd.DataFrame:
+    """汇总 onset 标量与 anchor 地图所需 OFES 文件身份。"""
+    roles: dict[tuple[str, pd.Timestamp], set[str]] = {}
+    for row in requests.itertuples(index=False):
+        date = pd.Timestamp(row.date).normalize()
+        role = (
+            f'onset:{row.event_id}:'
+            f'{row.phase}:{row.anchor_roles or "daily"}'
+        )
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+            roles.setdefault((variable, date), set()).add(role)
+    records: list[dict] = []
+    for (variable, date), source_roles in sorted(
+        roles.items(), key=lambda item: (item[0][1], item[0][0])
+    ):
+        path = _ofes_file_path(variable, date)
+        if not path.exists():
+            raise FileNotFoundError(
+                f'OFES onset source file not found: {path}'
+            )
+        stat = path.stat()
+        records.append(
+            {
+                'date': date,
+                'variable': variable,
+                'roles': ','.join(sorted(source_roles)),
+                'source_file': str(path),
+                'size_bytes': int(stat.st_size),
+                'mtime_ns': int(stat.st_mtime_ns),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_event_onset_run_identity(
+    population_run_dir: str | Path,
+    catalog_run_dir: str | Path,
+    settings: dict,
+    diagnostic_settings: dict,
+    requests: pd.DataFrame,
+) -> tuple[dict, pd.DataFrame]:
+    """构建 OFES onset 运行签名及源文件 inventory。"""
+    population_root = Path(population_run_dir)
+    catalog_root = Path(catalog_run_dir)
+    inventory = _ofes_event_onset_inventory(requests)
+    inventory_payload = inventory.assign(
+        date=inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_event_onset_settings,
+            _ofes_select_onset_regimes,
+            _ofes_onset_daily_requests,
+            _ofes_fixed_depth_frontogenesis_fields,
+            _ofes_frontogenesis_day,
+            _ofes_event_onset_inventory,
+            _ofes_event_onset_run_identity,
+            _ofes_build_onset_map_field,
+            _ofes_summarize_event_onset,
+            _plot_ofes_event_onset_timeseries,
+            _plot_ofes_event_onset_maps,
+            diagnose_ofes_event_onset_regimes,
+            _ofes_diagnose_water_mass_day,
+            _ofes_fixed_depth_kinematic_fields,
+            _ofes_fields_on_sigma0,
+            _ofes_sigma0_volume,
+        )
+    )
+    code_sha256 = hashlib.sha256(
+        code_sources.encode('utf-8')
+    ).hexdigest()
+    repo_root = Path(__file__).resolve().parent
+    request_records = requests.assign(
+        date=requests['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    payload = {
+        'schema_version': 2,
+        'population_run_dir': str(population_root),
+        'population_input_sha256': {
+            name: _file_sha256(population_root / name)
+            for name in (
+                'manifest.json',
+                'population_peak_diagnostics.parquet',
+                'population_summary.json',
+            )
+        },
+        'catalog_run_dir': str(catalog_root),
+        'catalog_input_sha256': {
+            name: _file_sha256(catalog_root / name)
+            for name in ('manifest.json', 'daily_objects.parquet')
+        },
+        'settings': settings,
+        'diagnostic_settings': diagnostic_settings,
+        'request_records': request_records,
+        'source_inventory_sha256': inventory_sha256,
+        'onset_code_sha256': code_sha256,
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'matplotlib_version': str(
+            getattr(plt.matplotlib, '__version__', 'unknown')
+        ),
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    return (
+        {
+            **payload,
+            'run_signature': signature,
+            'run_tag': f'ofes_onset_{signature[:12]}',
+            'source_identity_basis': (
+                'requested-date OFES path, size_bytes, and mtime_ns; '
+                'population and catalog inputs are content-hashed'
+            ),
+        },
+        inventory,
+    )
+
+
+def _ofes_build_onset_map_field(
+    request: dict,
+    settings: dict,
+    run_signature: str,
+    cache_path: str | Path,
+    *,
+    resume: bool,
+) -> dict:
+    """构建或复用一个 onset anchor 的等密度面与固定深度场。"""
+    target = Path(cache_path)
+    expected = {
+        'run_signature': str(run_signature),
+        'daily_request_key': str(request['daily_request_key']),
+        'anchor_roles': str(request['anchor_roles']),
+    }
+    if resume and target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            if all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            ):
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['map_field_cache_reused'] = True
+                metadata['map_field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half_width, core_lon + lon_half_width),
+        lat_bounds=(core_lat - lat_half_width, core_lat + lat_half_width),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(request['map_target_sigma0']),
+        float(request['reference_depth_m']),
+        {
+            'do': snapshot['do2'],
+            'salinity': snapshot['salinity'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    front = _ofes_fixed_depth_frontogenesis_fields(
+        snapshot,
+        float(request['reference_depth_m']),
+        float(settings['density_smoothing_sigma_pixels']),
+        float(settings['minimum_density_gradient_kg_m4']),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid, lat_grid, core_lon, core_lat
+        ),
+        dtype=float,
+    ) / 1000.0
+    circle = distance_km <= radius_km
+    finite = circle & np.isfinite(mapped['do'])
+    circle_count = int(np.count_nonzero(circle))
+    finite_count = int(np.count_nonzero(finite))
+    finite_fraction = (
+        float(finite_count / circle_count) if circle_count else 0.0
+    )
+    failure_reasons: list[str] = []
+    if finite_fraction < float(settings['map_min_finite_fraction']):
+        failure_reasons.append('insufficient_onset_map_finite_fraction')
+    masked = {
+        'isopycnal_do': mapped['do'],
+        'isopycnal_salinity': mapped['salinity'],
+        'isopycnal_depth': mapped['depth'],
+        'isopycnal_u': mapped['u'],
+        'isopycnal_v': mapped['v'],
+        'density_gradient': front['density_gradient_kg_m4'],
+        'frontogenesis_rate': (
+            front['normalized_frontogenesis_rate_s_1']
+        ),
+        'horizontal_convergence': (
+            front['horizontal_convergence_s_1']
+        ),
+        'rossby_number': front['rossby_number'],
+        'normalized_strain': front['normalized_strain'],
+    }
+    arrays = {
+        key: np.where(circle, value, np.nan).astype(np.float32)
+        for key, value in masked.items()
+    }
+    metadata = {
+        'map_date': date,
+        'map_radius_km': radius_km,
+        'map_circle_column_count': circle_count,
+        'map_finite_column_count': finite_count,
+        'map_finite_fraction': finite_fraction,
+        'map_target_sigma0': float(request['map_target_sigma0']),
+        'map_reference_depth_m': float(request['reference_depth_m']),
+        'map_frontogenesis_depth_m': float(front['depth_m']),
+        'map_diagnostic_passed': bool(not failure_reasons),
+        'map_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'map_field_cache_reused': False,
+        'map_field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        distance_km=distance_km.astype(np.float32),
+        crossing_count=np.where(
+            circle, mapped['crossing_count'], 0
+        ).astype(np.int16),
+        **arrays,
+    )
+    return metadata
+
+
+def _ofes_summarize_event_onset(
+    diagnostics: pd.DataFrame,
+    selected: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总三个客观代表的出现前、深层进入与峰值变化。"""
+    metric_names = (
+        'fixed_depth_do_contrast',
+        'water_mass_do_contrast',
+        'heave_do_contribution',
+        'rossby_number',
+        'normalized_strain',
+        'disk_median_density_gradient_kg_m4',
+        'disk_median_normalized_frontogenesis_rate_s_1',
+        'disk_frontogenetic_fraction',
+        'disk_median_horizontal_convergence_s_1',
+    )
+    records: list[dict] = []
+    for event in selected.itertuples(index=False):
+        group = diagnostics.loc[
+            diagnostics['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('date', kind='mergesort')
+        pre = group.loc[group['phase'] == 'pre_start']
+        start = group.loc[group['is_start']]
+        deep = group.loc[group['is_deep_entry']]
+        peak = group.loc[group['is_peak']]
+        if pre.empty or len(start) != 1 or len(deep) != 1 or len(peak) != 1:
+            raise RuntimeError(
+                f'OFES onset summary anchors are incomplete for '
+                f'{event.event_id}.'
+            )
+        record = {
+            'regime_order': int(event.regime_order),
+            'regime_label': str(event.regime_label),
+            'selection_criterion': str(event.selection_criterion),
+            'event_id': str(event.event_id),
+            'deep_sensitivity_rank_within_threshold': int(
+                event.deep_sensitivity_rank_within_threshold
+            ),
+            'start_date': pd.Timestamp(start.iloc[0]['date']),
+            'deep_entry_date': pd.Timestamp(deep.iloc[0]['date']),
+            'peak_date': pd.Timestamp(peak.iloc[0]['date']),
+            'start_to_deep_entry_days': int(
+                deep.iloc[0]['day_relative_to_start']
+            ),
+            'start_to_peak_days': int(
+                peak.iloc[0]['day_relative_to_start']
+            ),
+            'pre_start_day_count': int(len(pre)),
+            'diagnostic_day_count': int(len(group)),
+            'clipped_background_day_count': int(
+                (~group['background_annulus_within_delivery_window']).sum()
+            ),
+            'frontogenetic_detected_day_fraction': float(
+                np.mean(
+                    group.loc[
+                        group['phase'] == 'detected',
+                        'disk_median_normalized_frontogenesis_rate_s_1',
+                    ]
+                    > 0
+                )
+            ),
+        }
+        for metric in metric_names:
+            record[f'pre_start_median_{metric}'] = float(
+                np.nanmedian(pre[metric].to_numpy(dtype=float))
+            )
+            record[f'start_{metric}'] = float(start.iloc[0][metric])
+            record[f'deep_entry_{metric}'] = float(deep.iloc[0][metric])
+            record[f'peak_{metric}'] = float(peak.iloc[0][metric])
+        pre_gradient = record[
+            'pre_start_median_disk_median_density_gradient_kg_m4'
+        ]
+        record['deep_entry_density_gradient_ratio_to_pre_start'] = (
+            float(
+                record[
+                    'deep_entry_disk_median_density_gradient_kg_m4'
+                ]
+                / pre_gradient
+            )
+            if np.isfinite(pre_gradient) and pre_gradient > 0
+            else np.nan
+        )
+        record['deep_entry_water_mass_increase_from_pre_start'] = float(
+            record['deep_entry_water_mass_do_contrast']
+            - record['pre_start_median_water_mass_do_contrast']
+        )
+        records.append(record)
+    summary = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    payload = {
+        'selected_event_count': int(len(summary)),
+        'selection_records': summary[
+            [
+                'regime_label',
+                'selection_criterion',
+                'event_id',
+                'deep_sensitivity_rank_within_threshold',
+            ]
+        ].to_dict(orient='records'),
+        'event_records': summary.assign(
+            start_date=summary['start_date'].dt.strftime('%Y-%m-%d'),
+            deep_entry_date=summary[
+                'deep_entry_date'
+            ].dt.strftime('%Y-%m-%d'),
+            peak_date=summary['peak_date'].dt.strftime('%Y-%m-%d'),
+        ).to_dict(orient='records'),
+        'diagnostic_scope': (
+            'Fixed-depth horizontal density-gradient, convergence, '
+            'and resolved horizontal-advection frontogenesis are '
+            'compared with same-day water-mass/heave diagnostics.'
+        ),
+        'causal_limits': [
+            'Positive horizontal frontogenesis is not direct evidence '
+            'of vertical subduction.',
+            'Vertical-advection, diabatic, mixing, and unresolved '
+            'submesoscale terms are omitted.',
+            'Pre-start positions are held at the detector-defined '
+            'start column and are Eulerian context, not trajectories.',
+            'A clipped 120-240 km background annulus is retained only '
+            'when the minimum valid-column gate passes and is flagged.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_onset_timeseries(
+    diagnostics: pd.DataFrame,
+    selected: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制三个客观机制代表的 pre-start 至 peak 标量演化。"""
+    ordered = selected.sort_values(
+        'regime_order', kind='mergesort'
+    )
+    figure, axes = plt.subplots(
+        len(ordered),
+        3,
+        figsize=(16, 4.2 * len(ordered)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row_index, event in enumerate(
+        ordered.itertuples(index=False)
+    ):
+        group = diagnostics.loc[
+            diagnostics['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('day_relative_to_start', kind='mergesort')
+        x = group['day_relative_to_start'].to_numpy(dtype=float)
+        anchors = {
+            'start': 0.0,
+            'deep entry': float(
+                group.loc[
+                    group['is_deep_entry'], 'day_relative_to_start'
+                ].iloc[0]
+            ),
+            'peak': float(
+                group.loc[
+                    group['is_peak'], 'day_relative_to_start'
+                ].iloc[0]
+            ),
+        }
+        axis = axes[row_index, 0]
+        axis.plot(
+            x,
+            group['fixed_depth_do_contrast'],
+            color='#6b7280',
+            linewidth=1.6,
+            label='Fixed-depth contrast',
+        )
+        axis.plot(
+            x,
+            group['water_mass_do_contrast'],
+            color='#2563eb',
+            linewidth=2.0,
+            label='Same-isopycnal water mass',
+        )
+        axis.plot(
+            x,
+            group['heave_do_contribution'],
+            color='#d97706',
+            linewidth=1.6,
+            linestyle='--',
+            label='Heave',
+        )
+        axis.axhline(0, color='black', linewidth=0.6)
+        axis.set_ylabel(r'DO contrast ($\mu$mol kg$^{-1}$)')
+        axis.legend(loc='best', fontsize=8)
+        axis.set_title(
+            f'{event.regime_label}: {event.event_id}', loc='left'
+        )
+
+        axis = axes[row_index, 1]
+        axis.plot(
+            x,
+            group['rossby_number'].abs(),
+            color='#7c3aed',
+            linewidth=1.8,
+            label=r'$|Ro|$',
+        )
+        axis.plot(
+            x,
+            group['normalized_strain'],
+            color='#059669',
+            linewidth=1.8,
+            label=r'strain/$|f|$',
+        )
+        axis.set_ylabel('Normalized kinematics')
+        axis.legend(loc='best', fontsize=8)
+
+        axis = axes[row_index, 2]
+        axis.plot(
+            x,
+            group['disk_median_density_gradient_kg_m4'] * 1e6,
+            color='#111827',
+            linewidth=1.8,
+            label=r'$|\nabla_h\sigma_0|$',
+        )
+        axis.set_ylabel(
+            r'Density gradient ($10^{-6}$ kg m$^{-4}$)'
+        )
+        rate_axis = axis.twinx()
+        rate_axis.plot(
+            x,
+            group[
+                'disk_median_normalized_frontogenesis_rate_s_1'
+            ]
+            * 86400.0,
+            color='#dc2626',
+            linewidth=1.8,
+            label='Horizontal frontogenesis',
+        )
+        rate_axis.axhline(0, color='#dc2626', linewidth=0.5)
+        rate_axis.set_ylabel('Frontogenesis rate (day$^{-1}$)')
+        handles_a, labels_a = axis.get_legend_handles_labels()
+        handles_b, labels_b = rate_axis.get_legend_handles_labels()
+        axis.legend(
+            handles_a + handles_b,
+            labels_a + labels_b,
+            loc='best',
+            fontsize=8,
+        )
+        for column_axis in axes[row_index]:
+            column_axis.axvspan(
+                float(x.min()), 0.0, color='#e5e7eb', alpha=0.35
+            )
+            column_axis.axvline(0, color='black', linewidth=0.8)
+            if anchors['deep entry'] not in (0.0, anchors['peak']):
+                column_axis.axvline(
+                    anchors['deep entry'],
+                    color='#0ea5e9',
+                    linewidth=0.9,
+                    linestyle='--',
+                )
+            column_axis.axvline(
+                anchors['peak'],
+                color='#b91c1c',
+                linewidth=0.9,
+                linestyle=':',
+            )
+            column_axis.grid(alpha=0.2)
+            column_axis.set_xlabel('Days relative to event start')
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def _plot_ofes_event_onset_maps(
+    event: pd.Series,
+    map_table: pd.DataFrame,
+    output_path: str | Path,
+    quiver_stride: int,
+    figure_dpi: int,
+) -> Path:
+    """绘制单个代表事件 anchor 日的等密度面水团与锋生场。"""
+    rows = map_table.loc[
+        map_table['event_id'].astype(str) == str(event['event_id'])
+    ].sort_values('date', kind='mergesort')
+    if rows.empty:
+        raise RuntimeError(
+            f'No OFES onset maps found for {event["event_id"]}.'
+        )
+    caches: list[dict] = []
+    for row in rows.itertuples(index=False):
+        with np.load(row.map_field_cache_path, allow_pickle=False) as data:
+            caches.append(
+                {
+                    'row': row,
+                    **{
+                        key: np.asarray(data[key])
+                        for key in (
+                            'lon',
+                            'lat',
+                            'isopycnal_do',
+                            'isopycnal_salinity',
+                            'isopycnal_u',
+                            'isopycnal_v',
+                            'density_gradient',
+                            'frontogenesis_rate',
+                        )
+                    },
+                }
+            )
+    do_values = np.concatenate(
+        [item['isopycnal_do'][np.isfinite(item['isopycnal_do'])]
+         for item in caches]
+    )
+    salinity_values = np.concatenate(
+        [item['isopycnal_salinity'][
+            np.isfinite(item['isopycnal_salinity'])
+        ] for item in caches]
+    )
+    rate_values = np.concatenate(
+        [item['frontogenesis_rate'][
+            np.isfinite(item['frontogenesis_rate'])
+        ] * 86400.0 for item in caches]
+    )
+    gradient_values = np.concatenate(
+        [item['density_gradient'][
+            np.isfinite(item['density_gradient'])
+        ] * 1e6 for item in caches]
+    )
+    do_limits = np.nanpercentile(do_values, [2, 98])
+    salinity_levels = np.unique(
+        np.nanpercentile(salinity_values, [15, 35, 55, 75, 90])
+    )
+    rate_limit = float(np.nanpercentile(np.abs(rate_values), 98))
+    rate_limit = max(rate_limit, np.finfo(float).eps)
+    gradient_levels = np.unique(
+        np.nanpercentile(gradient_values, [60, 80, 92])
+    )
+    figure, axes = plt.subplots(
+        2,
+        len(caches),
+        figsize=(4.3 * len(caches), 8.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    do_artist = None
+    rate_artist = None
+    for column, item in enumerate(caches):
+        row = item['row']
+        lon = item['lon']
+        lat = item['lat']
+        top = axes[0, column]
+        do_artist = top.pcolormesh(
+            lon,
+            lat,
+            item['isopycnal_do'],
+            shading='auto',
+            cmap='viridis',
+            vmin=float(do_limits[0]),
+            vmax=float(do_limits[1]),
+        )
+        if salinity_levels.size >= 2:
+            contours = top.contour(
+                lon,
+                lat,
+                item['isopycnal_salinity'],
+                levels=salinity_levels,
+                colors='white',
+                linewidths=0.7,
+                alpha=0.8,
+            )
+            top.clabel(contours, fontsize=6, fmt='%.2f')
+        stride = int(quiver_stride)
+        top.quiver(
+            lon[::stride],
+            lat[::stride],
+            item['isopycnal_u'][::stride, ::stride],
+            item['isopycnal_v'][::stride, ::stride],
+            color='black',
+            alpha=0.65,
+            scale=10,
+            width=0.0025,
+        )
+        top.scatter(
+            row.requested_core_lon,
+            row.requested_core_lat,
+            marker='x',
+            s=45,
+            linewidths=1.5,
+            color='#ef4444',
+        )
+        top.set_title(
+            f'{row.anchor_roles.replace("|", "+")}\n'
+            f'{pd.Timestamp(row.date):%Y-%m-%d}'
+        )
+        bottom = axes[1, column]
+        rate_artist = bottom.pcolormesh(
+            lon,
+            lat,
+            item['frontogenesis_rate'] * 86400.0,
+            shading='auto',
+            cmap='RdBu_r',
+            vmin=-rate_limit,
+            vmax=rate_limit,
+        )
+        if gradient_levels.size >= 2:
+            bottom.contour(
+                lon,
+                lat,
+                item['density_gradient'] * 1e6,
+                levels=gradient_levels,
+                colors='black',
+                linewidths=0.7,
+            )
+        bottom.scatter(
+            row.requested_core_lon,
+            row.requested_core_lat,
+            marker='x',
+            s=45,
+            linewidths=1.5,
+            color='#111827',
+        )
+        for axis in (top, bottom):
+            axis.set_aspect('equal', adjustable='box')
+            axis.set_xlabel('Longitude')
+            if column == 0:
+                axis.set_ylabel('Latitude')
+            axis.grid(alpha=0.15)
+    if do_artist is not None:
+        figure.colorbar(
+            do_artist,
+            ax=axes[0, :].tolist(),
+            shrink=0.82,
+            label=r'Isopycnal DO ($\mu$mol kg$^{-1}$)',
+        )
+    if rate_artist is not None:
+        figure.colorbar(
+            rate_artist,
+            ax=axes[1, :].tolist(),
+            shrink=0.82,
+            label='Resolved horizontal frontogenesis (day$^{-1}$)',
+        )
+    figure.suptitle(
+        f'{event["regime_label"]}: {event["event_id"]} '
+        f'on $\\sigma_0={event["target_sigma0"]:.3f}$',
+        fontsize=15,
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_event_onset_regimes(
+    population_run_dir: str | Path,
+    *,
+    onset_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """诊断 OFES 深层事件客观机制代表的 onset/formation 演化。
+
+    函数只消费已完成的 schema-v2 59-event population 运行，先要求
+    start-to-peak 可展开且完整背景环带不越过交付边界，再按固定规则选择
+    可诊断事件中的总体深层排名第一、应变主导中排名第一，以及表层核心
+    弱或反号的旋转主导中排名第一。对每例诊断 detector start 前五天和
+    start-to-peak 的所有已观测事件日，并固定比较 peak depth 上的水团/
+    heave、旋转、应变、水平密度梯度、收敛和解析水平速度梯度锋生率。
+
+    参数:
+        - population_run_dir (str | Path): 已完成的 schema-v2 59-event population 目录。
+        - onset_overrides (dict | None): 临时覆盖已声明的 event_onset 配置。
+        - output_dir (str | Path | None): 输出根目录；None 时写到 population 运行下。
+        - resume (bool): 是否复用签名一致的逐日 parquet 与 anchor 场缓存，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、三例选择表、逐日诊断、事件总结、JSON 总结和图件路径。
+
+    输出:
+        - `<run_dir>/days/*.parquet`、`<run_dir>/fields/*.npz`。
+        - `<run_dir>/selected_regimes.parquet`、`daily_requests.parquet`、`daily_diagnostics.parquet`、`event_onset_summary.parquet`、`analysis_summary.json`、图件及 `manifest.json`。
+
+    说明:
+        - 事件 start 是 catalog detector 首次识别日；首次进入深层定义为逐日最大 ΔDO 深度首次达到配置的 500 m 门槛。
+        - pre-start 位置固定在 start 日最大 ΔDO 网格列，仅提供 Eulerian 上下文，不是回溯轨迹。
+        - 逐日标量分解使用当日核心参考深度的 sigma0；anchor 地图固定使用事件 peak-day 核心 sigma0，以比较同一密度面结构。
+        - 锋生率只含解析水平速度梯度对固定深度 sigma0 水平梯度的运动学作用；正值不等同于已证明下沉或 subduction。
+        - 本节点不读取 `w`，不计算完整 PV，也不启动轨迹。
+    """
+    population_root = Path(population_run_dir)
+    population_manifest = json.loads(
+        (population_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        population_manifest.get('status') != 'complete'
+        or int(population_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES onset diagnostics require a complete schema-v2 '
+            'population run.'
+        )
+    population = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    catalog_root = Path(population_manifest['catalog_run_dir'])
+    catalog_manifest = json.loads(
+        (catalog_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        catalog_manifest.get('status') != 'complete'
+        or int(catalog_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES onset diagnostics require a complete schema-v2 catalog.'
+        )
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    settings = _ofes_event_onset_settings(onset_overrides)
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    selected = _ofes_select_onset_regimes(
+        population,
+        daily_objects,
+        settings,
+        catalog_manifest['start_date'],
+        float(diagnostic_settings['background_outer_radius_km']),
+    )
+    requests = _ofes_onset_daily_requests(
+        selected,
+        daily_objects,
+        settings,
+        catalog_manifest['start_date'],
+    )
+    identity, inventory = _ofes_event_onset_run_identity(
+        population_root,
+        catalog_root,
+        settings,
+        diagnostic_settings,
+        requests,
+    )
+    onset_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else population_root / settings['output_subdir']
+    )
+    run_dir = onset_root / identity['run_tag']
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists() and resume:
+        previous = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if (
+            previous.get('status') == 'complete'
+            and previous.get('run_signature')
+            == identity['run_signature']
+        ):
+            outputs = previous['outputs']
+            required = [
+                outputs['selected_regimes'],
+                outputs['daily_requests'],
+                outputs['daily_diagnostics'],
+                outputs['map_diagnostics'],
+                outputs['event_onset_summary'],
+                outputs['analysis_summary'],
+                outputs['source_inventory'],
+                *outputs['figures'],
+            ]
+            if all(Path(path).exists() for path in required):
+                map_diagnostics = pd.read_parquet(
+                    outputs['map_diagnostics']
+                )
+                if not all(
+                    Path(path).exists()
+                    for path in map_diagnostics[
+                        'map_field_cache_path'
+                    ]
+                ):
+                    raise FileNotFoundError(
+                        'A completed OFES onset run is missing map '
+                        'field caches.'
+                    )
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'selected_regimes': pd.read_parquet(
+                        outputs['selected_regimes']
+                    ),
+                    'daily_diagnostics': pd.read_parquet(
+                        outputs['daily_diagnostics']
+                    ),
+                    'map_diagnostics': map_diagnostics,
+                    'event_onset_summary': pd.read_parquet(
+                        outputs['event_onset_summary']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_paths': [
+                        Path(path) for path in outputs['figures']
+                    ],
+                    'reused_complete_run': True,
+                }
+    if run_dir.exists() and not resume and any(run_dir.iterdir()):
+        raise FileExistsError(
+            f'OFES onset run directory is not empty: {run_dir}'
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    days_dir = run_dir / 'days'
+    fields_dir = run_dir / 'fields'
+    figures_dir = run_dir / 'figures'
+    for directory in (days_dir, fields_dir, figures_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    previous = {}
+    if manifest_path.exists():
+        previous = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if (
+            previous.get('run_signature')
+            and previous['run_signature'] != identity['run_signature']
+        ):
+            raise RuntimeError(
+                'Existing OFES onset manifest signature does not match.'
+            )
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': previous.get(
+            'created_at_utc', pd.Timestamp.now(tz='UTC').isoformat()
+        ),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_daily_fragments': 0,
+        'total_daily_fragments': int(len(requests)),
+        'completed_map_fields': 0,
+        'total_map_fields': int(requests['is_map_anchor'].sum()),
+        'resume_enabled': bool(resume),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        selected, run_dir / 'selected_regimes.parquet'
+    )
+    _atomic_write_parquet(
+        requests, run_dir / 'daily_requests.parquet'
+    )
+    _atomic_write_parquet(
+        inventory, run_dir / 'source_inventory.parquet'
+    )
+    completed_days = 0
+    completed_maps = 0
+    try:
+        day_frames: list[pd.DataFrame] = []
+        for row in requests.itertuples(index=False):
+            fragment = days_dir / f'{row.daily_request_key}.parquet'
+            reused = False
+            if resume and fragment.exists():
+                frame = pd.read_parquet(fragment)
+                if (
+                    len(frame) == 1
+                    and frame.iloc[0]['onset_run_signature']
+                    == identity['run_signature']
+                    and frame.iloc[0]['daily_request_key']
+                    == row.daily_request_key
+                ):
+                    reused = True
+            if not reused:
+                water_mass = _ofes_diagnose_water_mass_day(
+                    row.date,
+                    float(row.requested_core_lon),
+                    float(row.requested_core_lat),
+                    float(row.reference_depth_m),
+                    diagnostic_settings,
+                )
+                frontogenesis = _ofes_frontogenesis_day(
+                    row.date,
+                    float(row.requested_core_lon),
+                    float(row.requested_core_lat),
+                    float(row.reference_depth_m),
+                    settings,
+                )
+                record = row._asdict()
+                record.update(water_mass)
+                record.update(frontogenesis)
+                record['onset_diagnostic_passed'] = bool(
+                    water_mass['diagnostic_passed']
+                    and frontogenesis[
+                        'frontogenesis_diagnostic_passed'
+                    ]
+                )
+                record['onset_diagnostic_status'] = ';'.join(
+                    status
+                    for status in (
+                        water_mass['diagnostic_status'],
+                        frontogenesis[
+                            'frontogenesis_diagnostic_status'
+                        ],
+                    )
+                    if status != 'passed'
+                ) or 'passed'
+                record['onset_run_signature'] = identity[
+                    'run_signature'
+                ]
+                frame = pd.DataFrame([record])
+                _atomic_write_parquet(frame, fragment)
+            day_frames.append(frame)
+            completed_days += 1
+            if (
+                completed_days == 1
+                or completed_days == len(requests)
+                or completed_days % 10 == 0
+            ):
+                print(
+                    '[OFES onset] '
+                    f'day {completed_days:02d}/{len(requests):02d} '
+                    f'{row.event_id} {pd.Timestamp(row.date):%Y-%m-%d} '
+                    f'({"reused" if reused else "diagnosed"})'
+                )
+                manifest['completed_daily_fragments'] = int(
+                    completed_days
+                )
+                manifest['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(manifest, manifest_path)
+        diagnostics = pd.concat(day_frames, ignore_index=True).sort_values(
+            ['regime_order', 'date'], kind='mergesort'
+        ).reset_index(drop=True)
+        _atomic_write_parquet(
+            diagnostics, run_dir / 'daily_diagnostics.parquet'
+        )
+        if not bool(diagnostics['onset_diagnostic_passed'].all()):
+            failed = diagnostics.loc[
+                ~diagnostics['onset_diagnostic_passed'],
+                ['daily_request_key', 'onset_diagnostic_status'],
+            ]
+            raise RuntimeError(
+                'OFES onset daily diagnostic gate failed: '
+                f'{failed.to_dict(orient="records")}'
+            )
+
+        map_records: list[dict] = []
+        anchors = requests.loc[requests['is_map_anchor']]
+        for row in anchors.itertuples(index=False):
+            safe_roles = str(row.anchor_roles).replace('|', '_')
+            cache_path = fields_dir / (
+                f'{row.daily_request_key}_{safe_roles}.npz'
+            )
+            metadata = _ofes_build_onset_map_field(
+                row._asdict(),
+                settings,
+                identity['run_signature'],
+                cache_path,
+                resume=resume,
+            )
+            map_records.append({**row._asdict(), **metadata})
+            completed_maps += 1
+            manifest['completed_map_fields'] = int(completed_maps)
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+            print(
+                '[OFES onset] '
+                f'map {completed_maps:02d}/{len(anchors):02d} '
+                f'{row.event_id} {row.anchor_roles} '
+                f'({"reused" if metadata["map_field_cache_reused"] else "mapped"})'
+            )
+        map_table = pd.DataFrame(map_records).sort_values(
+            ['regime_order', 'date'], kind='mergesort'
+        ).reset_index(drop=True)
+        _atomic_write_parquet(
+            map_table, run_dir / 'map_diagnostics.parquet'
+        )
+        if not bool(map_table['map_diagnostic_passed'].all()):
+            raise RuntimeError(
+                'OFES onset anchor map finite-field gate failed.'
+            )
+        event_summary, analysis_summary = _ofes_summarize_event_onset(
+            diagnostics, selected
+        )
+        _atomic_write_parquet(
+            event_summary, run_dir / 'event_onset_summary.parquet'
+        )
+        _ofes_atomic_write_json(
+            analysis_summary, run_dir / 'analysis_summary.json'
+        )
+        figure_paths = [
+            _plot_ofes_event_onset_timeseries(
+                diagnostics,
+                selected,
+                figures_dir / 'onset_regime_evolution.png',
+                int(settings['figure_dpi']),
+            )
+        ]
+        for event in selected.to_dict(orient='records'):
+            event_series = pd.Series(event)
+            figure_paths.append(
+                _plot_ofes_event_onset_maps(
+                    event_series,
+                    map_table,
+                    figures_dir
+                    / f'{event["event_id"]}_onset_maps.png',
+                    int(settings['map_quiver_stride']),
+                    int(settings['figure_dpi']),
+                )
+            )
+        figure_paths = [path.resolve() for path in figure_paths]
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_daily_fragments': int(completed_days),
+                'completed_map_fields': int(completed_maps),
+                'selected_event_ids': selected[
+                    'event_id'
+                ].astype(str).tolist(),
+                'daily_diagnostic_gate_passed': True,
+                'map_diagnostic_gate_passed': True,
+                'trajectory_enabled': False,
+                'outputs': {
+                    'selected_regimes': str(
+                        (run_dir / 'selected_regimes.parquet').resolve()
+                    ),
+                    'daily_requests': str(
+                        (run_dir / 'daily_requests.parquet').resolve()
+                    ),
+                    'daily_diagnostics': str(
+                        (run_dir / 'daily_diagnostics.parquet').resolve()
+                    ),
+                    'map_diagnostics': str(
+                        (run_dir / 'map_diagnostics.parquet').resolve()
+                    ),
+                    'event_onset_summary': str(
+                        (run_dir / 'event_onset_summary.parquet').resolve()
+                    ),
+                    'analysis_summary': str(
+                        (run_dir / 'analysis_summary.json').resolve()
+                    ),
+                    'source_inventory': str(
+                        (run_dir / 'source_inventory.parquet').resolve()
+                    ),
+                    'day_fragments': str(days_dir.resolve()),
+                    'map_field_directory': str(fields_dir.resolve()),
+                    'figures': [str(path) for path in figure_paths],
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_daily_fragments': int(completed_days),
+                'completed_map_fields': int(completed_maps),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'selected_regimes': selected,
+        'daily_diagnostics': diagnostics,
+        'map_diagnostics': map_table,
+        'event_onset_summary': event_summary,
+        'analysis_summary': analysis_summary,
+        'figure_paths': figure_paths,
+        'reused_complete_run': False,
+    }
+
+
 def _ofes_event_evolution_settings(
     overrides: dict | None = None,
 ) -> dict:
