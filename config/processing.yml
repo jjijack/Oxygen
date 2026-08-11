@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.32 变更：
+#   - 固化 OFES 二维固定深度 trajectory 的线性日场时间插值、解析场误差、积分域边界和有效粒子门槛。
 # version 1.31 变更：
 #   - 新增 OFES 全生命周期表层核心加权 Ro 与垂向剖面首层的一致性容差审计。
 # version 1.30 变更：
@@ -98,7 +100,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.31"
+version: "1.32"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -242,7 +244,7 @@ ofes:
     pressur: "hPa"
   vertical_velocity_positive: up  # MOM3 约定；正式启用 w 前仍需保留可复现的数据集专项验证
   vertical_velocity_sign_basis: "MOM3 convention; dataset-specific validation artifact required"
-  temporal_interpolation: piecewise_constant_unvalidated
+  temporal_interpolation: linear_fixed_depth_validated  # 仅 u/v 二维固定深度已过解析场、步长与可逆性验证；三维 w 仍关闭
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
     u: u_vel
@@ -368,6 +370,10 @@ ofes:
     reversibility_median_error_max_km: 5.0
     reversibility_q90_error_max_km: 10.0
     timestep_endpoint_median_spread_max_km: 10.0
+    analytic_translation_error_max_km: 0.01
+    analytic_rotation_error_max_km: 0.01
+    domain_margin_km: 700.0
+    minimum_active_fraction: 0.75
     ensemble_ring_fractions: [0.0, 0.35, 0.70]
     ensemble_azimuth_count: 8
     adjacent_depth_levels: 1
