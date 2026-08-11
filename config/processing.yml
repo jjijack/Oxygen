@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.30 变更：
+#   - 新增 OFES 同密度面 water-mass patch 连续性、质心流速敏感性、全生命周期表层/深层表达和
+#     固定深度二维 ensemble trajectory 的预注册门槛；轨迹运行与论文来源解释分离，三维 w 继续关闭。
 # version 1.29 变更：
 #   - 新增 OFES 深层事件的客观机制分层与 onset/formation 诊断；固定比较事件出现前、首次进入
 #     500 m 以下和峰值阶段的水团/heave、旋转/应变、水平密度梯度、收敛与解析水平锋生率；
@@ -93,7 +96,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.26
+version: "1.30"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -323,6 +326,50 @@ ofes:
     map_quiver_stride: 12
     figure_dpi: 180
     output_subdir: event_onset
+  event_patch:
+    representative_event_ids: ["OFES_DO50_E000002", "OFES_DO50_E000239", "OFES_DO50_E000176"]
+    map_radius_km: 180.0
+    do_contrast_min_umol_kg: 50.0
+    spiciness_peak_fraction_min: 0.5
+    minimum_consecutive_days: 5
+    centroid_transition_pass_fraction_min: 0.75
+    centroid_error_floor_km: 30.0
+    translated_mask_median_iou_min: 0.20
+    median_direction_cosine_min: 0.80
+    positive_direction_fraction_min: 0.75
+    median_speed_ratio_min: 0.5
+    median_speed_ratio_max: 2.0
+    figure_dpi: 180
+    output_subdir: event_patch
+  event_lifecycle:
+    persistent_day_fraction_min: 0.75
+    intermittent_day_fraction_min: 0.25
+    minimum_lag_pairs: 7
+    maximum_lag_days: 5
+    maximum_lag_duration_fraction: 0.3333333333333333
+    lag_correlation_min: 0.5
+    lag_improvement_over_zero_min: 0.1
+    minimum_classified_lag_days: 2
+    scv_rotation_day_fraction_min: 0.5
+    scv_anticyclonic_rotation_fraction_min: 0.75
+    scv_subsurface_max_depth_min_m: 200.0
+    scv_minimum_consecutive_days: 5
+    figure_dpi: 180
+    output_subdir: event_lifecycle
+  trajectory_2d:
+    event_ids: ["OFES_DO50_E000002", "OFES_DO50_E000239", "OFES_DO50_E000176"]
+    temporal_interpolation: linear
+    rk4_dt_seconds: 3600
+    sensitivity_dt_seconds: [1800, 3600, 7200]
+    reversibility_days: [1, 3, 5]
+    reversibility_median_error_max_km: 5.0
+    reversibility_q90_error_max_km: 10.0
+    timestep_endpoint_median_spread_max_km: 10.0
+    ensemble_ring_fractions: [0.0, 0.35, 0.70]
+    ensemble_azimuth_count: 8
+    adjacent_depth_levels: 1
+    figure_dpi: 180
+    output_subdir: trajectory_2d
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12

@@ -15,7 +15,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as ndimage_label
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -38121,11 +38121,86 @@ def diagnose_ofes_event_onset_regimes(
     }
 
 
+def _ofes_centroid_velocity_day(
+    date: str | pd.Timestamp,
+    centroid_lon: float,
+    centroid_lat: float,
+    reference_depth_m: float,
+    smoothing_sigma_pixels: float,
+) -> dict:
+    """在 detected object 质心双线性采样平滑固定深度 u/v。"""
+    date_ts = pd.Timestamp(date).normalize()
+    available_depth = np.asarray(
+        _ofes_tracer_coordinates(date_ts)[2], dtype=float
+    )
+    delivered_depth = float(
+        available_depth[
+            np.argmin(
+                np.abs(available_depth - float(reference_depth_m))
+            )
+        ]
+    )
+    radius_km = 40.0
+    scale = approximate_degree_length(float(centroid_lat))
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['u', 'v'],
+        lon_bounds=(
+            float(centroid_lon) - lon_half_width,
+            float(centroid_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(centroid_lat) - lat_half_width,
+            float(centroid_lat) + lat_half_width,
+        ),
+        depth_bounds=(delivered_depth, delivered_depth),
+    )
+    fields = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        delivered_depth,
+        float(smoothing_sigma_pixels),
+    )
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    point = np.asarray(
+        [[float(centroid_lat), float(centroid_lon)]], dtype=float
+    )
+    values = {}
+    for name in ('u', 'v'):
+        interpolator = RegularGridInterpolator(
+            (lat, lon),
+            np.asarray(fields[name], dtype=float),
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        values[name] = float(interpolator(point)[0])
+    return {
+        'centroid_flow_depth_m': delivered_depth,
+        'centroid_u_m_s': values['u'],
+        'centroid_v_m_s': values['v'],
+        'centroid_flow_speed_m_s': float(
+            np.hypot(values['u'], values['v'])
+        ),
+    }
+
+
 def _ofes_event_flow_segments(
     onset_diagnostics: pd.DataFrame,
     daily_objects: pd.DataFrame,
+    diagnostic_settings: dict,
 ) -> pd.DataFrame:
-    """比较 detected 对象质心逐段位移与端点核心流速。"""
+    """比较 detected 对象质心逐段位移与核心/质心端点流速。"""
     detected = onset_diagnostics.loc[
         onset_diagnostics['phase'] == 'detected'
     ].merge(
@@ -38141,11 +38216,37 @@ def _ofes_event_flow_segments(
         how='left',
         validate='one_to_one',
     )
+    centroid_records = []
+    for row in detected.itertuples(index=False):
+        centroid_records.append(
+            {
+                'daily_object_key': str(row.daily_object_key),
+                **_ofes_centroid_velocity_day(
+                    row.date,
+                    float(row.centroid_lon),
+                    float(row.centroid_lat),
+                    float(row.reference_depth_m),
+                    float(
+                        diagnostic_settings[
+                            'velocity_smoothing_sigma_pixels'
+                        ]
+                    ),
+                ),
+            }
+        )
+    detected = detected.merge(
+        pd.DataFrame(centroid_records),
+        on='daily_object_key',
+        how='left',
+        validate='one_to_one',
+    )
     required = (
         'centroid_lon',
         'centroid_lat',
         'u_m_s',
         'v_m_s',
+        'centroid_u_m_s',
+        'centroid_v_m_s',
     )
     if detected[list(required)].isna().any().any():
         raise RuntimeError(
@@ -38195,13 +38296,29 @@ def _ofes_event_flow_segments(
             mean_v = 0.5 * (
                 float(start['v_m_s']) + float(end['v_m_s'])
             )
+            mean_centroid_u = 0.5 * (
+                float(start['centroid_u_m_s'])
+                + float(end['centroid_u_m_s'])
+            )
+            mean_centroid_v = 0.5 * (
+                float(start['centroid_v_m_s'])
+                + float(end['centroid_v_m_s'])
+            )
             predicted_dx = mean_u * elapsed_seconds
             predicted_dy = mean_v * elapsed_seconds
+            centroid_predicted_dx = mean_centroid_u * elapsed_seconds
+            centroid_predicted_dy = mean_centroid_v * elapsed_seconds
             observed_distance = float(
                 np.hypot(observed_dx, observed_dy)
             )
             predicted_distance = float(
                 np.hypot(predicted_dx, predicted_dy)
+            )
+            centroid_predicted_distance = float(
+                np.hypot(
+                    centroid_predicted_dx,
+                    centroid_predicted_dy,
+                )
             )
             dot_product = (
                 observed_dx * predicted_dx
@@ -38215,10 +38332,40 @@ def _ofes_event_flow_segments(
                 if observed_distance > 0 and predicted_distance > 0
                 else np.nan
             )
+            centroid_dot_product = (
+                observed_dx * centroid_predicted_dx
+                + observed_dy * centroid_predicted_dy
+            )
+            centroid_direction_cosine = (
+                float(
+                    centroid_dot_product
+                    / (
+                        observed_distance
+                        * centroid_predicted_distance
+                    )
+                )
+                if (
+                    observed_distance > 0
+                    and centroid_predicted_distance > 0
+                )
+                else np.nan
+            )
             residual_dx = observed_dx - predicted_dx
             residual_dy = observed_dy - predicted_dy
             residual_distance = float(
                 np.hypot(residual_dx, residual_dy)
+            )
+            centroid_residual_dx = (
+                observed_dx - centroid_predicted_dx
+            )
+            centroid_residual_dy = (
+                observed_dy - centroid_predicted_dy
+            )
+            centroid_residual_distance = float(
+                np.hypot(
+                    centroid_residual_dx,
+                    centroid_residual_dy,
+                )
             )
             start_offset = float(
                 great_circle_distance_m(
@@ -38238,9 +38385,12 @@ def _ofes_event_flow_segments(
             )
             finite = (
                 np.isfinite(direction_cosine)
+                and np.isfinite(centroid_direction_cosine)
                 and np.isfinite(residual_distance)
+                and np.isfinite(centroid_residual_distance)
                 and observed_distance > 0
                 and predicted_distance > 0
+                and centroid_predicted_distance > 0
             )
             records.append(
                 {
@@ -38274,18 +38424,47 @@ def _ofes_event_flow_segments(
                     'core_flow_speed_m_s': (
                         predicted_distance / elapsed_seconds
                     ),
+                    'mean_centroid_u_m_s': mean_centroid_u,
+                    'mean_centroid_v_m_s': mean_centroid_v,
+                    'centroid_flow_speed_m_s': (
+                        centroid_predicted_distance / elapsed_seconds
+                    ),
                     'predicted_dx_m': predicted_dx,
                     'predicted_dy_m': predicted_dy,
                     'predicted_distance_m': predicted_distance,
                     'direction_cosine': direction_cosine,
+                    'centroid_direction_cosine': (
+                        centroid_direction_cosine
+                    ),
                     'vector_residual_dx_m': residual_dx,
                     'vector_residual_dy_m': residual_dy,
                     'vector_residual_distance_m': residual_distance,
+                    'centroid_predicted_dx_m': centroid_predicted_dx,
+                    'centroid_predicted_dy_m': centroid_predicted_dy,
+                    'centroid_predicted_distance_m': (
+                        centroid_predicted_distance
+                    ),
+                    'centroid_vector_residual_dx_m': (
+                        centroid_residual_dx
+                    ),
+                    'centroid_vector_residual_dy_m': (
+                        centroid_residual_dy
+                    ),
+                    'centroid_vector_residual_distance_m': (
+                        centroid_residual_distance
+                    ),
                     'observed_to_core_flow_speed_ratio': float(
                         observed_distance / predicted_distance
                     ),
                     'residual_to_observed_distance_ratio': float(
                         residual_distance / observed_distance
+                    ),
+                    'observed_to_centroid_flow_speed_ratio': float(
+                        observed_distance
+                        / centroid_predicted_distance
+                    ),
+                    'centroid_residual_to_observed_distance_ratio': float(
+                        centroid_residual_distance / observed_distance
                     ),
                     'start_peak_to_centroid_offset_km': (
                         start_offset / 1000.0
@@ -38311,7 +38490,7 @@ def _ofes_event_flow_segments(
 def _ofes_event_flow_summary(
     segments: pd.DataFrame,
 ) -> tuple[pd.DataFrame, dict]:
-    """汇总事件质心平移与核心流速的一致性而不设通过阈值。"""
+    """并列汇总事件质心平移与核心/质心流速的一致性。"""
     records: list[dict] = []
     for event_id, group in segments.groupby(
         'event_id', sort=False
@@ -38334,11 +38513,26 @@ def _ofes_event_flow_summary(
                 'same_half_plane_fraction': float(
                     np.mean(group['direction_cosine'] > 0)
                 ),
+                'median_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].median()
+                ),
+                'q25_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].quantile(0.25)
+                ),
+                'q75_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].quantile(0.75)
+                ),
+                'centroid_same_half_plane_fraction': float(
+                    np.mean(group['centroid_direction_cosine'] > 0)
+                ),
                 'median_observed_speed_m_s': float(
                     group['observed_speed_m_s'].median()
                 ),
                 'median_core_flow_speed_m_s': float(
                     group['core_flow_speed_m_s'].median()
+                ),
+                'median_centroid_flow_speed_m_s': float(
+                    group['centroid_flow_speed_m_s'].median()
                 ),
                 'median_observed_to_core_flow_speed_ratio': float(
                     group[
@@ -38349,6 +38543,22 @@ def _ofes_event_flow_summary(
                     group[
                         'residual_to_observed_distance_ratio'
                     ].median()
+                ),
+                'median_observed_to_centroid_flow_speed_ratio': float(
+                    group[
+                        'observed_to_centroid_flow_speed_ratio'
+                    ].median()
+                ),
+                'median_centroid_residual_to_observed_distance_ratio': (
+                    float(
+                        group[
+                            'centroid_residual_to_observed_distance_ratio'
+                        ].median()
+                    )
+                ),
+                'centroid_minus_core_median_direction_cosine': float(
+                    group['centroid_direction_cosine'].median()
+                    - group['direction_cosine'].median()
                 ),
                 'maximum_observed_segment_distance_km': float(
                     group['observed_distance_m'].max() / 1000.0
@@ -38373,15 +38583,15 @@ def _ofes_event_flow_summary(
         'event_records': summary.to_dict(orient='records'),
         'interpretation': (
             'Directional agreement indicates that linked object-centroid '
-            'translation is kinematically compatible with the resolved '
-            'flow sampled at each daily maximum-DeltaDO core.'
+            'translation is kinematically compared with the resolved flow '
+            'at both the maximum-DeltaDO core and the object centroid.'
         ),
         'causal_limits': [
             'Daily connected objects and their centroids are Eulerian '
             'features, not material parcels.',
-            'Velocity is sampled at the daily maximum-DeltaDO core rather '
-            'than the object centroid; the reported offset quantifies this '
-            'proxy mismatch.',
+            'Core and centroid sampling are retained side by side; a weaker '
+            'centroid result is sensitivity information rather than a '
+            'failed or discardable result.',
             'Trapezoidal endpoint velocity is not a trajectory integration '
             'and does not test deformation, diffusion, or vertical motion.',
             'No alignment threshold is used as a gate or causal label.',
@@ -38420,6 +38630,14 @@ def _plot_ofes_event_flow_consistency(
         predicted_dy = (
             group['predicted_dy_m'].to_numpy(dtype=float) / 1000.0
         )
+        centroid_predicted_dx = (
+            group['centroid_predicted_dx_m'].to_numpy(dtype=float)
+            / 1000.0
+        )
+        centroid_predicted_dy = (
+            group['centroid_predicted_dy_m'].to_numpy(dtype=float)
+            / 1000.0
+        )
         axis.plot(path_x, path_y, color='#111827', linewidth=1.0)
         axis.quiver(
             path_x[:-1],
@@ -38446,6 +38664,19 @@ def _plot_ofes_event_flow_consistency(
             width=0.005,
             label='Endpoint core-flow step',
         )
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            centroid_predicted_dx,
+            centroid_predicted_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#2563eb',
+            alpha=0.70,
+            width=0.004,
+            label='Endpoint centroid-flow step',
+        )
         axis.scatter(
             path_x[0], path_y[0], color='#2563eb', s=45, zorder=3
         )
@@ -38454,8 +38685,8 @@ def _plot_ofes_event_flow_consistency(
         )
         axis.set_title(
             f'{event.regime_label}\n{event.event_id}\n'
-            f'median cos={event.median_direction_cosine:.2f}, '
-            f'same half-plane={event.same_half_plane_fraction:.0%}'
+            f'core/centroid cos={event.median_direction_cosine:.2f}/'
+            f'{event.median_centroid_direction_cosine:.2f}'
         )
         axis.set_xlabel('Cumulative eastward displacement (km)')
         axis.set_ylabel('Cumulative northward displacement (km)')
@@ -38464,13 +38695,18 @@ def _plot_ofes_event_flow_consistency(
     handles = [
         Line2D([0], [0], color='#111827', linewidth=2),
         Line2D([0], [0], color='#dc2626', linewidth=2),
+        Line2D([0], [0], color='#2563eb', linewidth=2),
     ]
     figure.legend(
         handles,
-        ['Observed centroid step', 'Endpoint core-flow step'],
+        [
+            'Observed centroid step',
+            'Endpoint core-flow step',
+            'Endpoint centroid-flow step',
+        ],
         loc='upper center',
         bbox_to_anchor=(0.5, 1.08),
-        ncol=2,
+        ncol=3,
     )
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -38486,10 +38722,10 @@ def quantify_ofes_event_flow_consistency(
 ) -> dict:
     """量化 OFES onset 代表事件质心平移与解析核心流的一致性。
 
-    函数消费完成的 schema-v2 onset 运行及其源 catalog，不再读取 OFES
-    日场。对每个 detected event 的相邻对象，以对象质心定义观测位移，
-    以两端最大 ΔDO 核心处固定参考深度 u/v 的梯形平均定义平流代理，
-    报告方向余弦、速度比和矢量残差。
+    函数消费完成的 schema-v2 onset 运行及其源 catalog。对每个 detected
+    event 的相邻对象，以对象质心定义观测位移，并列比较两端最大 ΔDO
+    核心与对象质心处固定参考深度 u/v 的梯形平均，报告方向余弦、速度比
+    和矢量残差；质心结果变弱时仍作为正式敏感性结果保留。
 
     参数:
         - onset_run_dir (str | Path): 已完成的 schema-v2 onset 运行目录。
@@ -38503,7 +38739,7 @@ def quantify_ofes_event_flow_consistency(
 
     说明:
         - 这是 linked Eulerian object 的准拉格朗日运动学审计，不是粒子轨迹或物质水团证明。
-        - 核心流速与对象质心并非严格同位，输出显式报告二者距离；不据此设置通过阈值。
+        - 核心与质心流速并列输出，不因质心结果削弱原结论而选择性丢弃。
         - 本节点不读取 `w`，不重建中间时刻速度，也不计算扩散或形变后的 patch overlap。
     """
     onset_root = Path(onset_run_dir)
@@ -38525,13 +38761,49 @@ def quantify_ofes_event_flow_consistency(
     daily_objects = pd.read_parquet(
         catalog_root / 'daily_objects.parquet'
     )
+    diagnostic_settings = _ofes_event_diagnostic_settings()
     segments = _ofes_event_flow_segments(
-        onset_diagnostics, daily_objects
+        onset_diagnostics,
+        daily_objects,
+        diagnostic_settings,
     )
     summary, analysis_summary = _ofes_event_flow_summary(segments)
+    detected_dates = sorted(
+        pd.to_datetime(
+            onset_diagnostics.loc[
+                onset_diagnostics['phase'] == 'detected', 'date'
+            ]
+        ).dt.normalize().unique()
+    )
+    inventory_records = []
+    for date in detected_dates:
+        for variable in ('u', 'v'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    source_inventory = pd.DataFrame(inventory_records)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha256 = hashlib.sha256(
+        json.dumps(
+            inventory_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
     code_sources = '\n\n'.join(
         inspect.getsource(item)
         for item in (
+            _ofes_centroid_velocity_day,
             _ofes_event_flow_segments,
             _ofes_event_flow_summary,
             _plot_ofes_event_flow_consistency,
@@ -38556,12 +38828,14 @@ def quantify_ofes_event_flow_consistency(
                 catalog_root / 'daily_objects.parquet'
             ),
         },
+        'diagnostic_settings': diagnostic_settings,
+        'source_inventory_sha256': inventory_sha256,
         'flow_audit_code_sha256': hashlib.sha256(
             code_sources.encode('utf-8')
         ).hexdigest(),
         'algorithm': (
             'object-centroid displacement versus trapezoidal endpoint '
-            'maximum-DeltaDO-core velocity'
+            'maximum-DeltaDO-core and direct object-centroid velocity'
         ),
         'numpy_version': str(np.__version__),
         'pandas_version': str(pd.__version__),
@@ -38627,8 +38901,10 @@ def quantify_ofes_event_flow_consistency(
         summary_path = run_dir / 'event_flow_summary.parquet'
         analysis_path = run_dir / 'analysis_summary.json'
         figure_path = run_dir / 'event_flow_consistency.png'
+        inventory_path = run_dir / 'source_inventory.parquet'
         _atomic_write_parquet(segments, segments_path)
         _atomic_write_parquet(summary, summary_path)
+        _atomic_write_parquet(source_inventory, inventory_path)
         _ofes_atomic_write_json(analysis_summary, analysis_path)
         _plot_ofes_event_flow_consistency(
             segments, summary, figure_path
@@ -38647,6 +38923,7 @@ def quantify_ofes_event_flow_consistency(
                     'summary': str(summary_path.resolve()),
                     'analysis_summary': str(analysis_path.resolve()),
                     'figure': str(figure_path.resolve()),
+                    'source_inventory': str(inventory_path.resolve()),
                 },
             }
         )
@@ -38670,6 +38947,1100 @@ def quantify_ofes_event_flow_consistency(
         'segments': segments,
         'summary': summary,
         'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_event_patch_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES water-mass patch 连续性配置。"""
+    raw = dict(_OFES_CFG.get('event_patch', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_patch override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'representative_event_ids': tuple(
+            str(value) for value in raw.get(
+                'representative_event_ids',
+                (
+                    'OFES_DO50_E000002',
+                    'OFES_DO50_E000239',
+                    'OFES_DO50_E000176',
+                ),
+            )
+        ),
+        'map_radius_km': float(raw.get('map_radius_km', 180.0)),
+        'do_contrast_min_umol_kg': float(
+            raw.get('do_contrast_min_umol_kg', 50.0)
+        ),
+        'spiciness_peak_fraction_min': float(
+            raw.get('spiciness_peak_fraction_min', 0.5)
+        ),
+        'minimum_consecutive_days': int(
+            raw.get('minimum_consecutive_days', 5)
+        ),
+        'centroid_transition_pass_fraction_min': float(
+            raw.get('centroid_transition_pass_fraction_min', 0.75)
+        ),
+        'centroid_error_floor_km': float(
+            raw.get('centroid_error_floor_km', 30.0)
+        ),
+        'translated_mask_median_iou_min': float(
+            raw.get('translated_mask_median_iou_min', 0.20)
+        ),
+        'median_direction_cosine_min': float(
+            raw.get('median_direction_cosine_min', 0.80)
+        ),
+        'positive_direction_fraction_min': float(
+            raw.get('positive_direction_fraction_min', 0.75)
+        ),
+        'median_speed_ratio_min': float(
+            raw.get('median_speed_ratio_min', 0.5)
+        ),
+        'median_speed_ratio_max': float(
+            raw.get('median_speed_ratio_max', 2.0)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(raw.get('output_subdir', 'event_patch')),
+    }
+    if len(settings['representative_event_ids']) != 3:
+        raise ValueError(
+            'OFES event_patch requires exactly three representative events.'
+        )
+    positive = (
+        'map_radius_km',
+        'do_contrast_min_umol_kg',
+        'spiciness_peak_fraction_min',
+        'centroid_error_floor_km',
+        'translated_mask_median_iou_min',
+        'median_direction_cosine_min',
+        'median_speed_ratio_min',
+        'median_speed_ratio_max',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES event_patch numeric thresholds must be finite and positive.'
+        )
+    fractions = (
+        'spiciness_peak_fraction_min',
+        'centroid_transition_pass_fraction_min',
+        'translated_mask_median_iou_min',
+        'median_direction_cosine_min',
+        'positive_direction_fraction_min',
+    )
+    if any(not 0 < settings[key] <= 1 for key in fractions):
+        raise ValueError(
+            'OFES event_patch fraction thresholds must lie in (0, 1].'
+        )
+    if settings['minimum_consecutive_days'] < 2:
+        raise ValueError(
+            'OFES patch minimum_consecutive_days must be at least two.'
+        )
+    if (
+        settings['median_speed_ratio_max']
+        <= settings['median_speed_ratio_min']
+    ):
+        raise ValueError('OFES patch speed-ratio bounds are not ordered.')
+    return settings
+
+
+def _ofes_patch_requests(
+    onset_diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """固定三个 onset 事件的逐日 patch fingerprint 请求。"""
+    requested_ids = settings['representative_event_ids']
+    available_ids = set(onset_diagnostics['event_id'].astype(str))
+    missing = [value for value in requested_ids if value not in available_ids]
+    if missing:
+        raise RuntimeError(
+            f'OFES patch representative events are absent: {missing}.'
+        )
+    records = []
+    for event_order, event_id in enumerate(requested_ids, start=1):
+        group = onset_diagnostics.loc[
+            onset_diagnostics['event_id'].astype(str) == str(event_id)
+        ].sort_values('date', kind='mergesort')
+        peak = group.loc[group['is_peak']]
+        if len(peak) != 1:
+            raise RuntimeError(
+                f'OFES patch peak fingerprint is ambiguous for {event_id}.'
+            )
+        peak_row = peak.iloc[0]
+        peak_spice = float(
+            peak_row['same_sigma_spiciness0_contrast']
+        )
+        if not np.isfinite(peak_spice) or np.isclose(peak_spice, 0.0):
+            raise RuntimeError(
+                f'OFES patch peak spiciness is invalid for {event_id}.'
+            )
+        finite_radii = group[
+            'catalog_equivalent_radius_km'
+        ].dropna().to_numpy(dtype=float)
+        event_radius = (
+            float(np.nanmedian(finite_radii))
+            if finite_radii.size
+            else float(settings['centroid_error_floor_km'])
+        )
+        for row in group.itertuples(index=False):
+            records.append(
+                {
+                    'event_order': int(event_order),
+                    'event_id': str(event_id),
+                    'regime_label': str(row.regime_label),
+                    'date': pd.Timestamp(row.date).normalize(),
+                    'day_relative_to_start': int(
+                        row.day_relative_to_start
+                    ),
+                    'phase': str(row.phase),
+                    'daily_object_key': (
+                        str(row.daily_object_key)
+                        if pd.notna(row.daily_object_key)
+                        else ''
+                    ),
+                    'requested_core_lon': float(row.requested_core_lon),
+                    'requested_core_lat': float(row.requested_core_lat),
+                    'reference_depth_m': float(row.reference_depth_m),
+                    'target_sigma0': float(row.map_target_sigma0),
+                    'background_do_same_sigma': float(
+                        row.background_do_same_sigma
+                    ),
+                    'background_spiciness0_same_sigma': float(
+                        row.background_spiciness0_same_sigma
+                    ),
+                    'peak_spiciness0_contrast': peak_spice,
+                    'spiciness0_contrast_sign': int(np.sign(peak_spice)),
+                    'spiciness0_contrast_magnitude_min': float(
+                        abs(peak_spice)
+                        * settings['spiciness_peak_fraction_min']
+                    ),
+                    'event_equivalent_radius_km': event_radius,
+                    'is_start': bool(row.is_start),
+                    'is_deep_entry': bool(row.is_deep_entry),
+                    'is_peak': bool(row.is_peak),
+                }
+            )
+    requests = pd.DataFrame(records).sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    requests.insert(
+        0,
+        'patch_request_key',
+        requests.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    return requests
+
+
+def _ofes_nearest_coordinate_indices(
+    coordinate: np.ndarray,
+    values: np.ndarray,
+) -> np.ndarray:
+    """返回单调坐标中各值的最近索引，越界值为 -1。"""
+    axis = np.asarray(coordinate, dtype=float)
+    targets = np.asarray(values, dtype=float)
+    result = np.full(targets.shape, -1, dtype=np.int32)
+    finite = (
+        np.isfinite(targets)
+        & (targets >= axis[0])
+        & (targets <= axis[-1])
+    )
+    if not np.any(finite):
+        return result
+    insertion = np.searchsorted(axis, targets[finite], side='left')
+    insertion = np.clip(insertion, 0, len(axis) - 1)
+    left = np.clip(insertion - 1, 0, len(axis) - 1)
+    choose_left = (
+        np.abs(targets[finite] - axis[left])
+        <= np.abs(targets[finite] - axis[insertion])
+    )
+    result[finite] = np.where(choose_left, left, insertion)
+    return result
+
+
+def _ofes_build_patch_day(
+    request: dict,
+    settings: dict,
+    run_signature: str,
+    cache_path: str | Path,
+    *,
+    resume: bool,
+) -> dict:
+    """构建一个代表事件日的等密度面 DO/spice patch。"""
+    target = Path(cache_path)
+    expected = {
+        'run_signature': str(run_signature),
+        'patch_request_key': str(request['patch_request_key']),
+    }
+    if resume and target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            if all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            ):
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['patch_field_cache_reused'] = True
+                metadata['patch_field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half_width, core_lon + lon_half_width),
+        lat_bounds=(core_lat - lat_half_width, core_lat + lat_half_width),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(request['target_sigma0']),
+        float(request['reference_depth_m']),
+        {
+            'do': snapshot['do2'],
+            'theta': snapshot['temp'],
+            'salinity': snapshot['salinity'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    mapped_pressure = np.asarray(
+        gsw.p_from_z(-mapped['depth'], lat_grid), dtype=float
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        mapped['salinity'],
+        mapped_pressure,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, mapped['theta']
+    )
+    spiciness0 = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    do_contrast = (
+        np.asarray(mapped['do'], dtype=float)
+        - float(request['background_do_same_sigma'])
+    )
+    spice_contrast = (
+        spiciness0
+        - float(request['background_spiciness0_same_sigma'])
+    )
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid, lat_grid, core_lon, core_lat
+        ),
+        dtype=float,
+    ) / 1000.0
+    circle = distance_km <= radius_km
+    fingerprint = (
+        circle
+        & np.isfinite(do_contrast)
+        & np.isfinite(spice_contrast)
+        & (
+            do_contrast
+            >= float(settings['do_contrast_min_umol_kg'])
+        )
+        & (
+            spice_contrast
+            * int(request['spiciness0_contrast_sign'])
+            > 0
+        )
+        & (
+            np.abs(spice_contrast)
+            >= float(request['spiciness0_contrast_magnitude_min'])
+        )
+    )
+    labels, component_count = ndimage_label(
+        fingerprint,
+        structure=np.ones((3, 3), dtype=np.int8),
+    )
+    chosen_label = 0
+    chosen_min_distance = np.nan
+    candidate_limit = max(
+        float(settings['centroid_error_floor_km']),
+        float(request['event_equivalent_radius_km']),
+    )
+    candidates = []
+    for label_id in range(1, int(component_count) + 1):
+        component = labels == label_id
+        minimum_distance = float(np.nanmin(distance_km[component]))
+        if minimum_distance <= candidate_limit:
+            candidates.append(
+                (
+                    minimum_distance,
+                    -int(np.count_nonzero(component)),
+                    label_id,
+                )
+            )
+    if candidates:
+        chosen_min_distance, _, chosen_label = min(candidates)
+    patch_mask = labels == int(chosen_label) if chosen_label else np.zeros_like(
+        fingerprint, dtype=bool
+    )
+    patch_identified = bool(np.any(patch_mask))
+    if patch_identified:
+        area_weights = np.cos(np.deg2rad(lat_grid[patch_mask]))
+        patch_lon = float(
+            np.average(lon_grid[patch_mask], weights=area_weights)
+        )
+        patch_lat = float(
+            np.average(lat_grid[patch_mask], weights=area_weights)
+        )
+        patch_u = float(
+            np.average(mapped['u'][patch_mask], weights=area_weights)
+        )
+        patch_v = float(
+            np.average(mapped['v'][patch_mask], weights=area_weights)
+        )
+        patch_do = float(np.nanmedian(do_contrast[patch_mask]))
+        patch_spice = float(np.nanmedian(spice_contrast[patch_mask]))
+        scale = approximate_degree_length(patch_lat)
+        dx = float(np.nanmedian(np.diff(lon))) * float(
+            scale['meters_per_degree_lon']
+        )
+        dy = float(np.nanmedian(np.diff(lat))) * float(
+            scale['meters_per_degree_lat']
+        )
+        area_km2 = float(
+            np.count_nonzero(patch_mask) * abs(dx * dy) / 1e6
+        )
+        equivalent_radius = float(np.sqrt(area_km2 / np.pi))
+    else:
+        patch_lon = patch_lat = patch_u = patch_v = np.nan
+        patch_do = patch_spice = area_km2 = equivalent_radius = np.nan
+    metadata = {
+        **{key: request[key] for key in request},
+        'patch_date': date,
+        'patch_identified': patch_identified,
+        'fingerprint_component_count': int(component_count),
+        'chosen_component_label': int(chosen_label),
+        'chosen_component_minimum_core_distance_km': float(
+            chosen_min_distance
+        ),
+        'patch_pixel_count': int(np.count_nonzero(patch_mask)),
+        'patch_centroid_lon': patch_lon,
+        'patch_centroid_lat': patch_lat,
+        'patch_mean_u_m_s': patch_u,
+        'patch_mean_v_m_s': patch_v,
+        'patch_median_do_contrast': patch_do,
+        'patch_median_spiciness0_contrast': patch_spice,
+        'patch_area_km2': area_km2,
+        'patch_equivalent_radius_km': equivalent_radius,
+        'patch_field_cache_reused': False,
+        'patch_field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        do_contrast=do_contrast.astype(np.float32),
+        spiciness0_contrast=spice_contrast.astype(np.float32),
+        isopycnal_depth=np.asarray(mapped['depth'], dtype=np.float32),
+        isopycnal_u=np.asarray(mapped['u'], dtype=np.float32),
+        isopycnal_v=np.asarray(mapped['v'], dtype=np.float32),
+        fingerprint_mask=fingerprint.astype(np.uint8),
+        patch_mask=patch_mask.astype(np.uint8),
+    )
+    return metadata
+
+
+def _ofes_patch_transition_metrics(
+    daily: pd.DataFrame,
+) -> pd.DataFrame:
+    """量化相邻日 fingerprint patch 的平移、流向和形状重叠。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        ordered = group.sort_values('date', kind='mergesort').reset_index(
+            drop=True
+        )
+        for index in range(len(ordered) - 1):
+            start = ordered.iloc[index]
+            end = ordered.iloc[index + 1]
+            start_date = pd.Timestamp(start['date']).normalize()
+            end_date = pd.Timestamp(end['date']).normalize()
+            elapsed_seconds = float(
+                (end_date - start_date).total_seconds()
+            )
+            if (
+                elapsed_seconds != 86400.0
+                or not bool(start['patch_identified'])
+                or not bool(end['patch_identified'])
+            ):
+                continue
+            midpoint_lat = 0.5 * (
+                float(start['patch_centroid_lat'])
+                + float(end['patch_centroid_lat'])
+            )
+            scale = approximate_degree_length(midpoint_lat)
+            observed_dx = float(
+                _minimal_lon_diff_deg(
+                    float(end['patch_centroid_lon']),
+                    float(start['patch_centroid_lon']),
+                )
+                * float(scale['meters_per_degree_lon'])
+            )
+            observed_dy = float(
+                (
+                    float(end['patch_centroid_lat'])
+                    - float(start['patch_centroid_lat'])
+                )
+                * float(scale['meters_per_degree_lat'])
+            )
+            mean_u = 0.5 * (
+                float(start['patch_mean_u_m_s'])
+                + float(end['patch_mean_u_m_s'])
+            )
+            mean_v = 0.5 * (
+                float(start['patch_mean_v_m_s'])
+                + float(end['patch_mean_v_m_s'])
+            )
+            predicted_dx = mean_u * elapsed_seconds
+            predicted_dy = mean_v * elapsed_seconds
+            observed_distance = float(np.hypot(observed_dx, observed_dy))
+            predicted_distance = float(
+                np.hypot(predicted_dx, predicted_dy)
+            )
+            direction_cosine = (
+                float(
+                    (
+                        observed_dx * predicted_dx
+                        + observed_dy * predicted_dy
+                    )
+                    / (observed_distance * predicted_distance)
+                )
+                if observed_distance > 0 and predicted_distance > 0
+                else np.nan
+            )
+            centroid_error = float(
+                np.hypot(
+                    observed_dx - predicted_dx,
+                    observed_dy - predicted_dy,
+                )
+                / 1000.0
+            )
+            with np.load(
+                start['patch_field_cache_path'], allow_pickle=False
+            ) as first, np.load(
+                end['patch_field_cache_path'], allow_pickle=False
+            ) as second:
+                first_mask = np.asarray(first['patch_mask'], dtype=bool)
+                first_u = np.asarray(first['isopycnal_u'], dtype=float)
+                first_v = np.asarray(first['isopycnal_v'], dtype=float)
+                first_lon = np.asarray(first['lon'], dtype=float)
+                first_lat = np.asarray(first['lat'], dtype=float)
+                second_mask = np.asarray(second['patch_mask'], dtype=bool)
+                second_lon = np.asarray(second['lon'], dtype=float)
+                second_lat = np.asarray(second['lat'], dtype=float)
+                first_lon_grid, first_lat_grid = np.meshgrid(
+                    first_lon, first_lat
+                )
+                pixel_scale = approximate_degree_length(
+                    first_lat_grid[first_mask]
+                )
+                predicted_lon = (
+                    first_lon_grid[first_mask]
+                    + first_u[first_mask]
+                    * elapsed_seconds
+                    / np.asarray(
+                        pixel_scale['meters_per_degree_lon'], dtype=float
+                    )
+                )
+                predicted_lat = (
+                    first_lat_grid[first_mask]
+                    + first_v[first_mask]
+                    * elapsed_seconds
+                    / np.asarray(
+                        pixel_scale['meters_per_degree_lat'], dtype=float
+                    )
+                )
+                rows = _ofes_nearest_coordinate_indices(
+                    second_lat, predicted_lat
+                )
+                columns = _ofes_nearest_coordinate_indices(
+                    second_lon, predicted_lon
+                )
+                valid = (rows >= 0) & (columns >= 0)
+                predicted_mask = np.zeros(second_mask.shape, dtype=bool)
+                predicted_mask[rows[valid], columns[valid]] = True
+                intersection = int(
+                    np.count_nonzero(predicted_mask & second_mask)
+                )
+                union = int(
+                    np.count_nonzero(predicted_mask | second_mask)
+                )
+                translated_iou = (
+                    float(intersection / union) if union else np.nan
+                )
+            error_limit = max(
+                float(start['centroid_error_floor_km']),
+                0.5
+                * (
+                    float(start['patch_equivalent_radius_km'])
+                    + float(end['patch_equivalent_radius_km'])
+                ),
+            )
+            records.append(
+                {
+                    'event_order': int(start['event_order']),
+                    'event_id': str(event_id),
+                    'regime_label': str(start['regime_label']),
+                    'transition_index': int(index + 1),
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'observed_distance_km': observed_distance / 1000.0,
+                    'predicted_distance_km': predicted_distance / 1000.0,
+                    'direction_cosine': direction_cosine,
+                    'observed_to_flow_speed_ratio': (
+                        float(observed_distance / predicted_distance)
+                        if predicted_distance > 0
+                        else np.nan
+                    ),
+                    'centroid_prediction_error_km': centroid_error,
+                    'centroid_error_limit_km': error_limit,
+                    'centroid_transition_passed': bool(
+                        centroid_error <= error_limit
+                    ),
+                    'translated_mask_iou': translated_iou,
+                }
+            )
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                'event_order',
+                'event_id',
+                'regime_label',
+                'transition_index',
+                'start_date',
+                'end_date',
+                'observed_distance_km',
+                'predicted_distance_km',
+                'direction_cosine',
+                'observed_to_flow_speed_ratio',
+                'centroid_prediction_error_km',
+                'centroid_error_limit_km',
+                'centroid_transition_passed',
+                'translated_mask_iou',
+            ]
+        )
+    return pd.DataFrame(records).sort_values(
+        ['event_order', 'start_date'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_maximum_consecutive_patch_days(group: pd.DataFrame) -> int:
+    """返回事件中连续可识别 patch 的最长日数。"""
+    dates = sorted(
+        pd.to_datetime(
+            group.loc[group['patch_identified'], 'date']
+        ).dt.normalize().unique()
+    )
+    if not dates:
+        return 0
+    maximum = current = 1
+    for earlier, later in zip(dates[:-1], dates[1:]):
+        if pd.Timestamp(later) - pd.Timestamp(earlier) == pd.Timedelta(days=1):
+            current += 1
+        else:
+            maximum = max(maximum, current)
+            current = 1
+    return int(max(maximum, current))
+
+
+def _ofes_patch_summary(
+    daily: pd.DataFrame,
+    transitions: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总三事件 patch 连续性并预注册判定 E000002 轨迹解释门。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        event_transitions = transitions.loc[
+            transitions['event_id'].astype(str) == str(event_id)
+        ]
+        speed_ratio = event_transitions[
+            'observed_to_flow_speed_ratio'
+        ].to_numpy(dtype=float)
+        maximum_run = _ofes_maximum_consecutive_patch_days(group)
+        record = {
+            'event_order': int(group['event_order'].iloc[0]),
+            'event_id': str(event_id),
+            'regime_label': str(group['regime_label'].iloc[0]),
+            'diagnostic_day_count': int(len(group)),
+            'identified_day_count': int(group['patch_identified'].sum()),
+            'maximum_consecutive_identified_days': maximum_run,
+            'transition_count': int(len(event_transitions)),
+            'centroid_transition_pass_fraction': (
+                float(
+                    event_transitions[
+                        'centroid_transition_passed'
+                    ].mean()
+                )
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_translated_mask_iou': (
+                float(event_transitions['translated_mask_iou'].median())
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_direction_cosine': (
+                float(event_transitions['direction_cosine'].median())
+                if len(event_transitions)
+                else np.nan
+            ),
+            'positive_direction_fraction': (
+                float(np.mean(event_transitions['direction_cosine'] > 0))
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_observed_to_flow_speed_ratio': (
+                float(np.nanmedian(speed_ratio))
+                if speed_ratio.size
+                else np.nan
+            ),
+        }
+        record['consecutive_day_gate_passed'] = bool(
+            maximum_run >= settings['minimum_consecutive_days']
+        )
+        record['centroid_transition_gate_passed'] = bool(
+            np.isfinite(record['centroid_transition_pass_fraction'])
+            and record['centroid_transition_pass_fraction']
+            >= settings['centroid_transition_pass_fraction_min']
+        )
+        record['translated_mask_gate_passed'] = bool(
+            np.isfinite(record['median_translated_mask_iou'])
+            and record['median_translated_mask_iou']
+            >= settings['translated_mask_median_iou_min']
+        )
+        record['direction_gate_passed'] = bool(
+            np.isfinite(record['median_direction_cosine'])
+            and record['median_direction_cosine']
+            >= settings['median_direction_cosine_min']
+            and record['positive_direction_fraction']
+            >= settings['positive_direction_fraction_min']
+        )
+        record['speed_gate_passed'] = bool(
+            np.isfinite(record['median_observed_to_flow_speed_ratio'])
+            and settings['median_speed_ratio_min']
+            <= record['median_observed_to_flow_speed_ratio']
+            <= settings['median_speed_ratio_max']
+        )
+        record['candidate_pathway_gate_passed'] = bool(
+            record['consecutive_day_gate_passed']
+            and record['centroid_transition_gate_passed']
+            and record['translated_mask_gate_passed']
+            and record['direction_gate_passed']
+            and record['speed_gate_passed']
+        )
+        records.append(record)
+    summary = pd.DataFrame(records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    headline_id = settings['representative_event_ids'][0]
+    headline = summary.loc[
+        summary['event_id'].astype(str) == str(headline_id)
+    ]
+    if len(headline) != 1:
+        raise RuntimeError('OFES patch headline gate row is missing.')
+    headline_record = headline.iloc[0].to_dict()
+    payload = {
+        'headline_event_id': str(headline_id),
+        'headline_candidate_pathway_gate_passed': bool(
+            headline_record['candidate_pathway_gate_passed']
+        ),
+        'trajectory_execution_policy': (
+            'Validated fixed-depth ensembles are run regardless of this '
+            'gate; the gate controls promotion into source-pathway claims.'
+        ),
+        'predeclared_thresholds': settings,
+        'event_records': summary.to_dict(orient='records'),
+        'causal_limits': [
+            'A connected Eulerian fingerprint patch is not a material parcel.',
+            'Resolved horizontal flow omits diffusion, mixing, vertical '
+            'motion, and unresolved submesoscale tendencies.',
+            'E000176 and E000239 remain controls and cannot replace the '
+            'blind headline event as the trajectory-interpretation trigger.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_patch_continuity(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制三类代表事件的 fingerprint patch 质心演化。"""
+    figure, axes = plt.subplots(
+        1,
+        len(summary),
+        figsize=(5.4 * len(summary), 5.2),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, event in zip(axes[0], summary.itertuples(index=False)):
+        group = daily.loc[
+            daily['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('date', kind='mergesort')
+        identified = group.loc[group['patch_identified']]
+        axis.plot(
+            identified['patch_centroid_lon'],
+            identified['patch_centroid_lat'],
+            color='#111827',
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        scatter = axis.scatter(
+            identified['patch_centroid_lon'],
+            identified['patch_centroid_lat'],
+            c=identified['day_relative_to_start'],
+            cmap='viridis',
+            s=np.clip(
+                identified['patch_area_km2'].to_numpy(dtype=float) / 8.0,
+                20.0,
+                180.0,
+            ),
+            edgecolor='#111827',
+            linewidth=0.4,
+        )
+        axis.scatter(
+            group['requested_core_lon'],
+            group['requested_core_lat'],
+            marker='x',
+            color='#dc2626',
+            s=28,
+            alpha=0.65,
+            label='ΔDO core',
+        )
+        axis.set_title(
+            f'{event.regime_label}\n{event.event_id}\n'
+            f'{event.maximum_consecutive_identified_days} consecutive days; '
+            f'gate={bool(event.candidate_pathway_gate_passed)}'
+        )
+        axis.set_xlabel('Longitude')
+        axis.set_ylabel('Latitude')
+        axis.grid(alpha=0.2)
+        axis.legend(loc='best')
+        if not identified.empty:
+            figure.colorbar(
+                scatter,
+                ax=axis,
+                shrink=0.72,
+                label='Days relative to event start',
+            )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_water_mass_patch_continuity(
+    onset_run_dir: str | Path,
+    *,
+    patch_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """追踪三个 OFES onset 代表的同密度面 DO/spice fingerprint patch。
+
+    函数沿用 onset 固定代表事件和 peak σ₀，在每个逐日窗口中识别同时满足
+    DO50 与 peak-spice 指纹的连通 patch，并量化连续日数、流场平移后的 mask
+    IoU、质心误差、方向余弦和速度比。E000002 的预注册门只控制轨迹能否
+    支持来源表述，不控制二维 ensemble trajectory 是否实际运行。
+
+    参数:
+        - onset_run_dir (str | Path): 已完成的 schema-v2 onset 运行目录。
+        - patch_overrides (dict | None): 临时覆盖 `ofes.event_patch` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入 onset 目录的 `event_patch`。
+        - resume (bool): 是否复用签名一致的逐日 patch field，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、逐日 patch、相邻日 transition、事件总结、解释 gate 和图件路径。
+
+    输出:
+        - `<run_dir>/fields/*.npz`、`daily_patch_diagnostics.parquet`、`patch_transitions.parquet`、`patch_summary.parquet`、`trajectory_interpretation_gate.json`、`patch_continuity.png` 与 `manifest.json`。
+
+    说明:
+        - fingerprint continuity 是 Eulerian/quasi-Lagrangian 候选路径，不是物质水团证明。
+        - E000176 与 E000239 只作机制对照，不得替换 blind headline E000002 触发来源表述。
+    """
+    onset_root = Path(onset_run_dir)
+    onset_manifest = json.loads(
+        (onset_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        onset_manifest.get('status') != 'complete'
+        or int(onset_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES patch continuity requires a complete schema-v2 onset run.'
+        )
+    settings = _ofes_event_patch_settings(patch_overrides)
+    onset_diagnostics = pd.read_parquet(
+        onset_root / 'daily_diagnostics.parquet'
+    )
+    requests = _ofes_patch_requests(onset_diagnostics, settings)
+    inventory_records = []
+    for date in sorted(requests['date'].unique()):
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    source_inventory = pd.DataFrame(inventory_records)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_event_patch_settings,
+            _ofes_patch_requests,
+            _ofes_nearest_coordinate_indices,
+            _ofes_build_patch_day,
+            _ofes_patch_transition_metrics,
+            _ofes_maximum_consecutive_patch_days,
+            _ofes_patch_summary,
+            _plot_ofes_patch_continuity,
+            diagnose_ofes_water_mass_patch_continuity,
+            _ofes_fields_on_sigma0,
+            _ofes_sigma0_volume,
+        )
+    )
+    repo_root = Path(__file__).resolve().parent
+    payload = {
+        'schema_version': 2,
+        'onset_run_dir': str(onset_root),
+        'onset_run_signature': onset_manifest['run_signature'],
+        'input_sha256': {
+            'onset_manifest.json': _file_sha256(
+                onset_root / 'manifest.json'
+            ),
+            'daily_diagnostics.parquet': _file_sha256(
+                onset_root / 'daily_diagnostics.parquet'
+            ),
+        },
+        'settings': settings,
+        'request_records': requests.assign(
+            date=requests['date'].dt.strftime('%Y-%m-%d')
+        ).to_dict(orient='records'),
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'patch_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'ofes_patch_{signature[:12]}',
+    }
+    patch_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else onset_root / settings['output_subdir']
+    )
+    run_dir = patch_root / identity['run_tag']
+    fields_dir = run_dir / 'fields'
+    fields_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES patch manifest signature does not match.'
+            )
+        if previous.get('status') == 'complete':
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'daily_patch_diagnostics': pd.read_parquet(
+                        outputs['daily_patch_diagnostics']
+                    ),
+                    'patch_transitions': pd.read_parquet(
+                        outputs['patch_transitions']
+                    ),
+                    'patch_summary': pd.read_parquet(
+                        outputs['patch_summary']
+                    ),
+                    'trajectory_interpretation_gate': json.loads(
+                        Path(
+                            outputs['trajectory_interpretation_gate']
+                        ).read_text(encoding='utf-8')
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_daily_fields': 0,
+        'total_daily_fields': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(source_inventory, run_dir / 'source_inventory.parquet')
+    completed = 0
+    try:
+        daily_records = []
+        for row in requests.itertuples(index=False):
+            cache_path = fields_dir / f'{row.patch_request_key}.npz'
+            metadata = _ofes_build_patch_day(
+                row._asdict(),
+                settings,
+                signature,
+                cache_path,
+                resume=resume,
+            )
+            metadata['centroid_error_floor_km'] = float(
+                settings['centroid_error_floor_km']
+            )
+            daily_records.append(metadata)
+            completed += 1
+            manifest['completed_daily_fields'] = completed
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+        daily = pd.DataFrame(daily_records).sort_values(
+            ['event_order', 'date'], kind='mergesort'
+        ).reset_index(drop=True)
+        transitions = _ofes_patch_transition_metrics(daily)
+        summary, gate = _ofes_patch_summary(
+            daily, transitions, settings
+        )
+        daily_path = run_dir / 'daily_patch_diagnostics.parquet'
+        transition_path = run_dir / 'patch_transitions.parquet'
+        summary_path = run_dir / 'patch_summary.parquet'
+        gate_path = run_dir / 'trajectory_interpretation_gate.json'
+        figure_path = run_dir / 'patch_continuity.png'
+        _atomic_write_parquet(daily, daily_path)
+        _atomic_write_parquet(transitions, transition_path)
+        _atomic_write_parquet(summary, summary_path)
+        _ofes_atomic_write_json(gate, gate_path)
+        _plot_ofes_patch_continuity(
+            daily, summary, figure_path, settings['figure_dpi']
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'headline_candidate_pathway_gate_passed': bool(
+                    gate['headline_candidate_pathway_gate_passed']
+                ),
+                'outputs': {
+                    'daily_patch_diagnostics': str(daily_path.resolve()),
+                    'patch_transitions': str(transition_path.resolve()),
+                    'patch_summary': str(summary_path.resolve()),
+                    'trajectory_interpretation_gate': str(
+                        gate_path.resolve()
+                    ),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(
+                        (run_dir / 'source_inventory.parquet').resolve()
+                    ),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_daily_fields': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_patch_diagnostics': daily,
+        'patch_transitions': transitions,
+        'patch_summary': summary,
+        'trajectory_interpretation_gate': gate,
         'figure_path': figure_path,
         'reused_complete_run': False,
     }
