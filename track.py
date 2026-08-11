@@ -35032,6 +35032,7 @@ def _ofes_surface_expression_day(
                 lat_grid,
                 float(core_lon),
                 float(core_lat),
+                force_great_circle=True,
             ),
             dtype=float,
         )
@@ -35194,52 +35195,12 @@ def _ofes_surface_expression_day(
     }
 
 
-def _ofes_add_population_metrics(
+def _ofes_add_surface_rotation_metrics(
     diagnostics: pd.DataFrame,
     settings: dict,
 ) -> pd.DataFrame:
-    """为峰值诊断表添加连续比率和透明的运算分类。"""
+    """以 population 原口径添加深浅层旋转与表层表达分类。"""
     result = diagnostics.copy()
-    water_mass_abs = result['water_mass_do_contrast'].abs()
-    heave_abs = result['heave_do_contribution'].abs()
-    contribution_total = water_mass_abs + heave_abs
-    result['water_mass_absolute_fraction'] = np.divide(
-        water_mass_abs,
-        contribution_total,
-        out=np.full(len(result), np.nan, dtype=float),
-        where=contribution_total.to_numpy(dtype=float) > 0,
-    )
-    result['heave_absolute_fraction'] = (
-        1.0 - result['water_mass_absolute_fraction']
-    )
-    result['water_mass_dominated'] = (
-        water_mass_abs > heave_abs
-    )
-    result['heave_important'] = (
-        result['heave_absolute_fraction']
-        >= float(
-            settings['heave_important_absolute_fraction_min']
-        )
-    )
-    result['contribution_regime'] = np.select(
-        [water_mass_abs > heave_abs, heave_abs > water_mass_abs],
-        ['water_mass_dominated', 'heave_dominated'],
-        default='balanced',
-    )
-    result['low_salinity_fingerprint'] = (
-        result['same_sigma_salinity_contrast'] < 0
-    )
-    result['low_aou_fingerprint'] = (
-        result['same_sigma_aou_contrast'] < 0
-    )
-    result['weak_n2_fingerprint'] = (
-        result['n2_ratio_core_to_background'] < 1
-    )
-    result['joint_water_mass_fingerprint'] = (
-        result['low_salinity_fingerprint']
-        & result['low_aou_fingerprint']
-        & result['weak_n2_fingerprint']
-    )
     result['absolute_subsurface_rossby_number'] = (
         result['rossby_number'].abs()
     )
@@ -35329,6 +35290,81 @@ def _ofes_add_population_metrics(
             )
         )
     )
+    colocated_polarity_match = (
+        result['surface_rossby_number'] * result['rossby_number'] > 0
+    )
+    colocated_weak_or_reversed = (
+        result['rotation_dominated']
+        & (
+            ~colocated_polarity_match
+            | (
+                result[
+                    'surface_to_subsurface_colocated_rotation_ratio'
+                ]
+                <= float(settings['surface_attenuation_ratio_max'])
+            )
+        )
+    )
+    result['surface_colocated_rotation_polarity_match'] = (
+        colocated_polarity_match
+    )
+    result['surface_colocated_weak_or_reversed_rotation'] = (
+        colocated_weak_or_reversed
+    )
+    result['surface_spatial_offset_rotation'] = (
+        colocated_weak_or_reversed
+        & ~result['surface_weak_or_reversed_rotation']
+    )
+    return result
+
+
+def _ofes_add_population_metrics(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """为峰值诊断表添加连续比率和透明的运算分类。"""
+    result = diagnostics.copy()
+    water_mass_abs = result['water_mass_do_contrast'].abs()
+    heave_abs = result['heave_do_contribution'].abs()
+    contribution_total = water_mass_abs + heave_abs
+    result['water_mass_absolute_fraction'] = np.divide(
+        water_mass_abs,
+        contribution_total,
+        out=np.full(len(result), np.nan, dtype=float),
+        where=contribution_total.to_numpy(dtype=float) > 0,
+    )
+    result['heave_absolute_fraction'] = (
+        1.0 - result['water_mass_absolute_fraction']
+    )
+    result['water_mass_dominated'] = (
+        water_mass_abs > heave_abs
+    )
+    result['heave_important'] = (
+        result['heave_absolute_fraction']
+        >= float(
+            settings['heave_important_absolute_fraction_min']
+        )
+    )
+    result['contribution_regime'] = np.select(
+        [water_mass_abs > heave_abs, heave_abs > water_mass_abs],
+        ['water_mass_dominated', 'heave_dominated'],
+        default='balanced',
+    )
+    result['low_salinity_fingerprint'] = (
+        result['same_sigma_salinity_contrast'] < 0
+    )
+    result['low_aou_fingerprint'] = (
+        result['same_sigma_aou_contrast'] < 0
+    )
+    result['weak_n2_fingerprint'] = (
+        result['n2_ratio_core_to_background'] < 1
+    )
+    result['joint_water_mass_fingerprint'] = (
+        result['low_salinity_fingerprint']
+        & result['low_aou_fingerprint']
+        & result['weak_n2_fingerprint']
+    )
+    result = _ofes_add_surface_rotation_metrics(result, settings)
     result['absolute_surface_eta_contrast_m'] = (
         result['surface_eta_contrast_m'].abs()
     )
@@ -40041,6 +40077,1209 @@ def diagnose_ofes_water_mass_patch_continuity(
         'patch_transitions': transitions,
         'patch_summary': summary,
         'trajectory_interpretation_gate': gate,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_event_lifecycle_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 事件生命周期与 SCV-compatible 配置。"""
+    raw = dict(_OFES_CFG.get('event_lifecycle', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_lifecycle override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'persistent_day_fraction_min': float(
+            raw.get('persistent_day_fraction_min', 0.75)
+        ),
+        'intermittent_day_fraction_min': float(
+            raw.get('intermittent_day_fraction_min', 0.25)
+        ),
+        'minimum_lag_pairs': int(raw.get('minimum_lag_pairs', 7)),
+        'maximum_lag_days': int(raw.get('maximum_lag_days', 5)),
+        'maximum_lag_duration_fraction': float(
+            raw.get('maximum_lag_duration_fraction', 1 / 3)
+        ),
+        'lag_correlation_min': float(
+            raw.get('lag_correlation_min', 0.5)
+        ),
+        'lag_improvement_over_zero_min': float(
+            raw.get('lag_improvement_over_zero_min', 0.1)
+        ),
+        'minimum_classified_lag_days': int(
+            raw.get('minimum_classified_lag_days', 2)
+        ),
+        'scv_rotation_day_fraction_min': float(
+            raw.get('scv_rotation_day_fraction_min', 0.5)
+        ),
+        'scv_anticyclonic_rotation_fraction_min': float(
+            raw.get('scv_anticyclonic_rotation_fraction_min', 0.75)
+        ),
+        'scv_subsurface_max_depth_min_m': float(
+            raw.get('scv_subsurface_max_depth_min_m', 200.0)
+        ),
+        'scv_minimum_consecutive_days': int(
+            raw.get('scv_minimum_consecutive_days', 5)
+        ),
+        'surface_profile_rossby_tolerance': float(
+            raw.get('surface_profile_rossby_tolerance', 0.001)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_lifecycle')
+        ),
+    }
+    fraction_keys = (
+        'persistent_day_fraction_min',
+        'intermittent_day_fraction_min',
+        'maximum_lag_duration_fraction',
+        'lag_correlation_min',
+        'lag_improvement_over_zero_min',
+        'scv_rotation_day_fraction_min',
+        'scv_anticyclonic_rotation_fraction_min',
+    )
+    if any(
+        not np.isfinite(settings[key]) or not 0 < settings[key] <= 1
+        for key in fraction_keys
+    ):
+        raise ValueError(
+            'OFES lifecycle fraction thresholds must lie in (0, 1].'
+        )
+    if (
+        settings['intermittent_day_fraction_min']
+        >= settings['persistent_day_fraction_min']
+    ):
+        raise ValueError(
+            'OFES lifecycle intermittent threshold must be below persistent.'
+        )
+    integer_keys = (
+        'minimum_lag_pairs',
+        'maximum_lag_days',
+        'minimum_classified_lag_days',
+        'scv_minimum_consecutive_days',
+        'figure_dpi',
+    )
+    if any(settings[key] <= 0 for key in integer_keys):
+        raise ValueError(
+            'OFES lifecycle integer thresholds must be positive.'
+        )
+    if (
+        not np.isfinite(settings['surface_profile_rossby_tolerance'])
+        or settings['surface_profile_rossby_tolerance'] <= 0
+    ):
+        raise ValueError(
+            'OFES lifecycle surface/profile Ro tolerance must be positive.'
+        )
+    return settings
+
+
+def _ofes_lifecycle_requests(
+    population_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+) -> pd.DataFrame:
+    """构建 56 个严格事件的完整 observed-day 请求。"""
+    strict = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold', kind='mergesort'
+    )
+    if len(strict) != 56:
+        raise RuntimeError(
+            f'OFES lifecycle expected 56 strict events, found {len(strict)}.'
+        )
+    event_columns = [
+        'event_id',
+        'deep_sensitivity_rank_within_threshold',
+        'start_date',
+        'peak_date',
+        'peak_daily_object_key',
+        'reference_depth_m',
+        'daily_peak_equivalent_radius_km',
+        'rotation_dominated',
+        'rossby_number',
+        'surface_core_rotation_polarity_match',
+        'surface_weak_or_reversed_rotation',
+        'surface_core_weighted_rossby_number',
+    ]
+    event_meta = strict[event_columns].rename(
+        columns={
+            'rotation_dominated': 'population_peak_rotation_dominated',
+            'rossby_number': 'population_peak_rossby_number',
+            'surface_core_rotation_polarity_match': (
+                'population_peak_surface_polarity_matched'
+            ),
+            'surface_weak_or_reversed_rotation': (
+                'population_peak_surface_weak_or_reversed'
+            ),
+            'surface_core_weighted_rossby_number': (
+                'population_peak_surface_core_weighted_rossby_number'
+            ),
+            'daily_peak_equivalent_radius_km': (
+                'event_peak_equivalent_radius_km'
+            ),
+        }
+    ).copy()
+    event_meta.insert(
+        0,
+        'event_order',
+        np.arange(1, len(event_meta) + 1, dtype=np.int16),
+    )
+    selected = daily_objects.loc[
+        (daily_objects['threshold'] == 50.0)
+        & daily_objects['event_id'].astype(str).isin(
+            event_meta['event_id'].astype(str)
+        )
+    ].merge(
+        event_meta,
+        on='event_id',
+        how='inner',
+        validate='many_to_one',
+    )
+    selected['date'] = pd.to_datetime(selected['date']).dt.normalize()
+    selected['start_date'] = pd.to_datetime(
+        selected['start_date']
+    ).dt.normalize()
+    selected['peak_date'] = pd.to_datetime(
+        selected['peak_date']
+    ).dt.normalize()
+    selected['day_relative_to_start'] = (
+        selected['date'] - selected['start_date']
+    ).dt.days.astype(np.int16)
+    start_to_peak = (
+        selected['peak_date'] - selected['start_date']
+    ).dt.days.to_numpy(dtype=float)
+    selected['normalized_event_time'] = np.divide(
+        selected['day_relative_to_start'].to_numpy(dtype=float),
+        start_to_peak,
+        out=np.full(len(selected), np.nan, dtype=float),
+        where=start_to_peak > 0,
+    )
+    selected['event_peak_polarity_sign'] = np.sign(
+        selected['population_peak_rossby_number'].to_numpy(dtype=float)
+    ).astype(np.int8)
+    selected['is_event_peak_day'] = (
+        selected['daily_object_key'].astype(str)
+        == selected['peak_daily_object_key'].astype(str)
+    )
+    selected = selected.sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    selected.insert(
+        0,
+        'lifecycle_request_key',
+        selected.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    if selected['lifecycle_request_key'].duplicated().any():
+        raise RuntimeError('OFES lifecycle requests contain duplicate days.')
+    return selected
+
+
+def _ofes_vertical_core_rossby_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth_m: float,
+    weight_scale_km: float,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> tuple[dict, pd.DataFrame]:
+    """提取逐层核心加权 Ro 与固定参考深度点动力量。"""
+    support_km = (
+        float(weight_scale_km)
+        * float(population_settings['surface_weight_support_factor'])
+    )
+    if support_km >= float(
+        diagnostic_settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES lifecycle core weight overlaps the background annulus.'
+        )
+    load_radius_km = max(60.0, support_km + 20.0)
+    scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        pd.Timestamp(date).normalize(),
+        variables=['u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(core_lon),
+            float(core_lat),
+            force_great_circle=True,
+        ),
+        dtype=float,
+    ) / 1000.0
+    weight_mask = distance_km <= support_km
+    weights = np.exp(
+        -0.5 * (distance_km[weight_mask] / float(weight_scale_km)) ** 2
+    )
+    if not weights.size or float(np.sum(weights)) <= 0:
+        raise RuntimeError('OFES lifecycle core weight has no support.')
+    profile_records = []
+    reference_fields = None
+    reference_index = int(
+        np.argmin(np.abs(depth - float(reference_depth_m)))
+    )
+    for level_index, level_depth in enumerate(depth):
+        fields = _ofes_fixed_depth_kinematic_fields(
+            snapshot,
+            float(level_depth),
+            float(
+                diagnostic_settings['velocity_smoothing_sigma_pixels']
+            ),
+        )
+        core_weighted_rossby = float(
+            np.sum(weights * fields['rossby_number'][weight_mask])
+            / np.sum(weights)
+        )
+        profile_records.append(
+            {
+                'depth_m': float(level_depth),
+                'core_weighted_rossby_number': core_weighted_rossby,
+            }
+        )
+        if level_index == reference_index:
+            reference_fields = fields
+    if reference_fields is None:
+        raise RuntimeError('OFES lifecycle reference depth was not sampled.')
+    kinematics = _ofes_kinematics_at_point(
+        reference_fields,
+        lon,
+        lat,
+        float(core_lon),
+        float(core_lat),
+    )
+    profile = pd.DataFrame(profile_records)
+    finite = profile['core_weighted_rossby_number'].notna()
+    if not bool(finite.any()):
+        raise RuntimeError('OFES lifecycle vertical Ro profile is empty.')
+    valid_profile = profile.loc[finite]
+    maximum_index = valid_profile[
+        'core_weighted_rossby_number'
+    ].abs().idxmax()
+    maximum = profile.loc[maximum_index]
+    summary = {
+        **kinematics,
+        'vertical_max_abs_rossby_number': float(
+            abs(maximum['core_weighted_rossby_number'])
+        ),
+        'vertical_max_rossby_number': float(
+            maximum['core_weighted_rossby_number']
+        ),
+        'vertical_max_rossby_depth_m': float(maximum['depth_m']),
+        'vertical_surface_core_weighted_rossby_number': float(
+            profile.iloc[0]['core_weighted_rossby_number']
+        ),
+        'vertical_profile_level_count': int(len(profile)),
+    }
+    return summary, profile
+
+
+def _ofes_lifecycle_day(
+    request: dict,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> tuple[dict, pd.DataFrame]:
+    """计算一个严格事件日的深层、表层和垂向旋转诊断。"""
+    core_lon = float(request['peak_lon'])
+    core_lat = float(request['peak_lat'])
+    weight_scale = (
+        float(request['event_peak_equivalent_radius_km'])
+        * float(population_settings['surface_weight_scale_factor'])
+    )
+    vertical, profile = _ofes_vertical_core_rossby_day(
+        request['date'],
+        core_lon,
+        core_lat,
+        float(request['reference_depth_m']),
+        weight_scale,
+        diagnostic_settings,
+        population_settings,
+    )
+    surface = _ofes_surface_expression_day(
+        request['date'],
+        core_lon,
+        core_lat,
+        float(vertical['rossby_number']),
+        float(request['event_peak_equivalent_radius_km']),
+        diagnostic_settings,
+        population_settings,
+    )
+    record = {
+        **request,
+        **vertical,
+        **surface,
+        'lifecycle_diagnostic_passed': bool(
+            surface['surface_diagnostic_passed']
+            and np.isfinite(vertical['rossby_number'])
+            and np.isfinite(vertical['normalized_strain'])
+            and np.isfinite(vertical['vertical_max_rossby_number'])
+        ),
+    }
+    classified = _ofes_add_surface_rotation_metrics(
+        pd.DataFrame([record]), population_settings
+    ).iloc[0].to_dict()
+    classified['surface_core_weighted_profile_agreement'] = float(
+        classified['vertical_surface_core_weighted_rossby_number']
+        - classified['surface_core_weighted_rossby_number']
+    )
+    profile.insert(0, 'date', pd.Timestamp(request['date']).normalize())
+    profile.insert(0, 'event_id', str(request['event_id']))
+    profile.insert(
+        0, 'lifecycle_request_key', str(request['lifecycle_request_key'])
+    )
+    return classified, profile
+
+
+def _ofes_fraction_class(value: float, settings: dict) -> str:
+    """按预注册 75%/25% 门槛返回 persistent/intermittent/rare。"""
+    if not np.isfinite(value):
+        return 'unresolved'
+    if value >= settings['persistent_day_fraction_min']:
+        return 'persistent'
+    if value >= settings['intermittent_day_fraction_min']:
+        return 'intermittent'
+    return 'rare'
+
+
+def _ofes_maximum_consecutive_true(
+    dates: pd.Series,
+    values: pd.Series,
+) -> int:
+    """返回按日排序布尔序列中连续 True 的最长天数。"""
+    frame = pd.DataFrame(
+        {
+            'date': pd.to_datetime(dates).dt.normalize(),
+            'value': values.astype(bool).to_numpy(),
+        }
+    ).sort_values('date', kind='mergesort')
+    maximum = current = 0
+    previous_date = None
+    for row in frame.itertuples(index=False):
+        if row.value and (
+            previous_date is None
+            or row.date - previous_date == pd.Timedelta(days=1)
+        ):
+            current += 1
+        elif row.value:
+            current = 1
+        else:
+            current = 0
+        maximum = max(maximum, current)
+        previous_date = row.date
+    return int(maximum)
+
+
+def _ofes_lifecycle_lag_diagnostic(
+    group: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """用旋转强度交叉相关描述表层相对深层的 lead/lag。"""
+    ordered = group.sort_values('date', kind='mergesort')
+    peak_sign = int(ordered['event_peak_polarity_sign'].iloc[0])
+    surface = (
+        ordered['surface_core_weighted_rossby_number'].to_numpy(dtype=float)
+        * peak_sign
+    )
+    deep = ordered['rossby_number'].to_numpy(dtype=float) * peak_sign
+    n_pairs = len(ordered)
+    if n_pairs < settings['minimum_lag_pairs']:
+        return {
+            'lag_pair_count': int(n_pairs),
+            'lag_search_max_days': 0,
+            'zero_lag_correlation': np.nan,
+            'maximum_lag_correlation': np.nan,
+            'best_surface_lead_days': np.nan,
+            'lead_lag_class': 'unresolved_too_short',
+        }
+    duration_days = int(
+        (ordered['date'].max() - ordered['date'].min()).days
+    )
+    lag_max = min(
+        int(settings['maximum_lag_days']),
+        max(
+            1,
+            int(
+                np.floor(
+                    duration_days
+                    * settings['maximum_lag_duration_fraction']
+                )
+            ),
+        ),
+    )
+    correlations = {}
+    for lag in range(-lag_max, lag_max + 1):
+        if lag > 0:
+            surface_values = surface[:-lag]
+            deep_values = deep[lag:]
+        elif lag < 0:
+            surface_values = surface[-lag:]
+            deep_values = deep[:lag]
+        else:
+            surface_values = surface
+            deep_values = deep
+        finite = np.isfinite(surface_values) & np.isfinite(deep_values)
+        if (
+            int(np.count_nonzero(finite))
+            < settings['minimum_lag_pairs']
+            or np.nanstd(surface_values[finite]) == 0
+            or np.nanstd(deep_values[finite]) == 0
+        ):
+            correlations[lag] = np.nan
+        else:
+            correlations[lag] = float(
+                np.corrcoef(
+                    surface_values[finite], deep_values[finite]
+                )[0, 1]
+            )
+    finite_items = [
+        (lag, value)
+        for lag, value in correlations.items()
+        if np.isfinite(value)
+    ]
+    zero = correlations.get(0, np.nan)
+    if not finite_items:
+        best_lag, best = 0, np.nan
+        label = 'unresolved_nonfinite'
+    else:
+        best_lag, best = max(finite_items, key=lambda item: item[1])
+        improvement = best - zero if np.isfinite(zero) else np.nan
+        classified = (
+            best >= settings['lag_correlation_min']
+            and np.isfinite(improvement)
+            and improvement
+            >= settings['lag_improvement_over_zero_min']
+            and abs(best_lag)
+            >= settings['minimum_classified_lag_days']
+        )
+        if classified:
+            label = (
+                'surface_leads'
+                if best_lag > 0
+                else 'surface_lags'
+            )
+        elif np.isfinite(zero) and zero >= settings['lag_correlation_min']:
+            label = 'synchronous_or_unresolved'
+        else:
+            label = 'unresolved'
+    return {
+        'lag_pair_count': int(n_pairs),
+        'lag_search_max_days': int(lag_max),
+        'zero_lag_correlation': float(zero),
+        'maximum_lag_correlation': float(best),
+        'best_surface_lead_days': float(best_lag),
+        'lead_lag_class': label,
+    }
+
+
+def _ofes_lifecycle_peak_parity(
+    daily: pd.DataFrame,
+    population_diagnostics: pd.DataFrame,
+) -> dict:
+    """要求生命周期 peak 日逐值继承 population 26/29 与 7/29。"""
+    rotation_population = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+        & population_diagnostics['rotation_dominated']
+    ]
+    peak = daily.loc[daily['is_event_peak_day']].merge(
+        rotation_population[
+            [
+                'event_id',
+                'rossby_number',
+                'surface_core_weighted_rossby_number',
+                'surface_core_rotation_polarity_match',
+                'surface_weak_or_reversed_rotation',
+            ]
+        ],
+        on='event_id',
+        how='inner',
+        validate='one_to_one',
+        suffixes=('_lifecycle', '_population'),
+    )
+    if len(peak) != 29:
+        raise RuntimeError(
+            f'OFES lifecycle peak parity expected 29 rotation events, '
+            f'found {len(peak)}.'
+        )
+    numeric_columns = (
+        'rossby_number',
+        'surface_core_weighted_rossby_number',
+    )
+    maximum_differences = {}
+    for column in numeric_columns:
+        difference = np.abs(
+            peak[f'{column}_lifecycle'].to_numpy(dtype=float)
+            - peak[f'{column}_population'].to_numpy(dtype=float)
+        )
+        maximum_differences[column] = float(np.nanmax(difference))
+    lifecycle_matched = int(
+        peak['surface_core_rotation_polarity_match_lifecycle'].sum()
+    )
+    lifecycle_weak = int(
+        peak['surface_weak_or_reversed_rotation_lifecycle'].sum()
+    )
+    boolean_exact = bool(
+        np.array_equal(
+            peak[
+                'surface_core_rotation_polarity_match_lifecycle'
+            ].to_numpy(dtype=bool),
+            peak[
+                'surface_core_rotation_polarity_match_population'
+            ].to_numpy(dtype=bool),
+        )
+        and np.array_equal(
+            peak[
+                'surface_weak_or_reversed_rotation_lifecycle'
+            ].to_numpy(dtype=bool),
+            peak[
+                'surface_weak_or_reversed_rotation_population'
+            ].to_numpy(dtype=bool),
+        )
+    )
+    passed = bool(
+        boolean_exact
+        and lifecycle_matched == 26
+        and lifecycle_weak == 7
+        and all(value <= 1e-10 for value in maximum_differences.values())
+    )
+    payload = {
+        'passed': passed,
+        'rotation_event_count': int(len(peak)),
+        'surface_polarity_matched_count': lifecycle_matched,
+        'surface_weak_or_reversed_count': lifecycle_weak,
+        'boolean_columns_exact': boolean_exact,
+        'maximum_numeric_differences': maximum_differences,
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES lifecycle peak-day population parity failed: {payload}'
+        )
+    return payload
+
+
+def _ofes_lifecycle_summary(
+    daily: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总 56 个事件的时间口径表层表达与 SCV-compatible 分类。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        eligible = group.loc[group['lifecycle_diagnostic_passed']].copy()
+        rotation = eligible.loc[eligible['rotation_dominated']]
+        rotation_fraction = float(
+            eligible['rotation_dominated'].mean()
+        ) if len(eligible) else np.nan
+        anticyclonic_fraction = (
+            float(rotation['negative_subsurface_rossby_number'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        scv_day = (
+            eligible['rotation_dominated']
+            & eligible['negative_subsurface_rossby_number']
+            & (
+                eligible['vertical_max_rossby_depth_m']
+                >= settings['scv_subsurface_max_depth_min_m']
+            )
+            & (eligible['vertical_max_rossby_number'] < 0)
+        )
+        maximum_scv_days = _ofes_maximum_consecutive_true(
+            eligible['date'], scv_day
+        ) if len(eligible) else 0
+        polarity_fraction = (
+            float(rotation['surface_core_rotation_polarity_match'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        weak_fraction = (
+            float(rotation['surface_weak_or_reversed_rotation'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        offset_fraction = (
+            float(rotation['surface_spatial_offset_rotation'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        persistent_anticyclonic = bool(
+            np.isfinite(rotation_fraction)
+            and rotation_fraction
+            >= settings['scv_rotation_day_fraction_min']
+            and np.isfinite(anticyclonic_fraction)
+            and anticyclonic_fraction
+            >= settings['scv_anticyclonic_rotation_fraction_min']
+        )
+        scv_compatible = bool(
+            persistent_anticyclonic
+            and maximum_scv_days
+            >= settings['scv_minimum_consecutive_days']
+        )
+        surface_obscured = bool(
+            scv_compatible
+            and np.isfinite(weak_fraction)
+            and weak_fraction
+            >= settings['persistent_day_fraction_min']
+        )
+        records.append(
+            {
+                'event_order': int(group['event_order'].iloc[0]),
+                'event_id': str(event_id),
+                'deep_sensitivity_rank_within_threshold': int(
+                    group[
+                        'deep_sensitivity_rank_within_threshold'
+                    ].iloc[0]
+                ),
+                'population_peak_rotation_dominated': bool(
+                    group['population_peak_rotation_dominated'].iloc[0]
+                ),
+                'observed_day_count': int(len(group)),
+                'eligible_day_count': int(len(eligible)),
+                'rotation_day_count': int(len(rotation)),
+                'rotation_day_fraction': rotation_fraction,
+                'anticyclonic_fraction_among_rotation_days': (
+                    anticyclonic_fraction
+                ),
+                'surface_polarity_match_fraction_among_rotation_days': (
+                    polarity_fraction
+                ),
+                'surface_weak_or_reversed_fraction_among_rotation_days': (
+                    weak_fraction
+                ),
+                'surface_spatial_offset_fraction_among_rotation_days': (
+                    offset_fraction
+                ),
+                'surface_polarity_match_lifecycle_class': (
+                    _ofes_fraction_class(polarity_fraction, settings)
+                ),
+                'surface_weak_or_reversed_lifecycle_class': (
+                    _ofes_fraction_class(weak_fraction, settings)
+                ),
+                'surface_spatial_offset_lifecycle_class': (
+                    _ofes_fraction_class(offset_fraction, settings)
+                ),
+                'maximum_consecutive_scv_compatible_days': (
+                    maximum_scv_days
+                ),
+                'persistent_anticyclonic_rotational_carrier': (
+                    persistent_anticyclonic
+                ),
+                'scv_compatible': scv_compatible,
+                'surface_obscured_scv_compatible': surface_obscured,
+                **_ofes_lifecycle_lag_diagnostic(eligible, settings),
+            }
+        )
+    summary = pd.DataFrame(records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    strict_count = int(len(summary))
+    anticyclonic_count = int(
+        summary['persistent_anticyclonic_rotational_carrier'].sum()
+    )
+    scv_count = int(summary['scv_compatible'].sum())
+    obscured_count = int(
+        summary['surface_obscured_scv_compatible'].sum()
+    )
+    def dominance_label(count: int) -> str:
+        return 'dominant' if count / strict_count > 0.5 else 'subset'
+    payload = {
+        'strict_event_count': strict_count,
+        'peak_rotation_event_count': int(
+            summary['population_peak_rotation_dominated'].sum()
+        ),
+        'persistent_anticyclonic_rotational_carrier_count': (
+            anticyclonic_count
+        ),
+        'persistent_anticyclonic_rotational_carrier_fraction': (
+            anticyclonic_count / strict_count
+        ),
+        'persistent_anticyclonic_rotational_carrier_label': (
+            dominance_label(anticyclonic_count)
+        ),
+        'scv_compatible_count': scv_count,
+        'scv_compatible_fraction': scv_count / strict_count,
+        'scv_compatible_label': dominance_label(scv_count),
+        'surface_obscured_scv_compatible_count': obscured_count,
+        'surface_obscured_scv_compatible_fraction': (
+            obscured_count / strict_count
+        ),
+        'surface_obscured_scv_compatible_label': (
+            dominance_label(obscured_count)
+        ),
+        'lead_lag_counts': summary['lead_lag_class'].value_counts(
+            dropna=False
+        ).to_dict(),
+        'wording_rule': (
+            'Dominant is reserved for more than half of all 56 strict '
+            'events; conditional majorities are explicitly labeled.'
+        ),
+        'lead_lag_limit': (
+            'Lag uses rotation-strength cross-correlation rather than DO '
+            'threshold onset, but remains descriptive and cannot prove '
+            'vertical propagation.'
+        ),
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_lifecycle(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制 56-event 生命周期的 carrier 和表层表达摘要。"""
+    figure, axes = plt.subplots(
+        1, 3, figsize=(17, 5.2), constrained_layout=True
+    )
+    counts = [
+        int(summary['persistent_anticyclonic_rotational_carrier'].sum()),
+        int(summary['scv_compatible'].sum()),
+        int(summary['surface_obscured_scv_compatible'].sum()),
+    ]
+    labels = [
+        'Persistent\nanticyclonic carrier',
+        'SCV-compatible',
+        'Surface-obscured\nSCV-compatible',
+    ]
+    axes[0].bar(labels, counts, color=['#4c78a8', '#7b61a8', '#d95f59'])
+    axes[0].axhline(28, color='#111827', linestyle='--', linewidth=1)
+    axes[0].set_ylabel('Events (strict denominator = 56)')
+    axes[0].set_title('Predeclared carrier hierarchy')
+    rotation = summary.loc[
+        summary['population_peak_rotation_dominated']
+    ]
+    axes[1].scatter(
+        rotation['rotation_day_fraction'],
+        rotation[
+            'surface_weak_or_reversed_fraction_among_rotation_days'
+        ],
+        c=rotation['scv_compatible'].map(
+            {True: '#7b61a8', False: '#9ca3af'}
+        ),
+        s=45,
+        alpha=0.85,
+    )
+    axes[1].axhline(0.75, color='#d95f59', linestyle='--', linewidth=1)
+    axes[1].set_xlabel('Rotation-dominated day fraction')
+    axes[1].set_ylabel('Weak/reversed fraction on rotation days')
+    axes[1].set_title('Peak-rotation events through time')
+    lifecycle = daily.loc[
+        daily['population_peak_rotation_dominated']
+        & np.isfinite(daily['normalized_event_time'])
+    ].copy()
+    lifecycle['time_bin'] = pd.cut(
+        lifecycle['normalized_event_time'],
+        bins=np.linspace(0, 1, 9),
+        include_lowest=True,
+    )
+    binned = lifecycle.groupby(
+        'time_bin', observed=True
+    ).agg(
+        normalized_event_time=('normalized_event_time', 'median'),
+        deep_rotation=('absolute_subsurface_rossby_number', 'median'),
+        surface_rotation=(
+            'absolute_surface_core_weighted_rossby_number', 'median'
+        ),
+    ).reset_index(drop=True)
+    axes[2].plot(
+        binned['normalized_event_time'],
+        binned['deep_rotation'],
+        marker='o',
+        label='Subsurface |Ro|',
+    )
+    axes[2].plot(
+        binned['normalized_event_time'],
+        binned['surface_rotation'],
+        marker='o',
+        label='Surface core-weighted |Ro|',
+    )
+    axes[2].set_xlabel('Normalized start-to-peak time')
+    axes[2].set_ylabel('|Ro|')
+    axes[2].set_title('Population lifecycle composite')
+    axes[2].legend()
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_event_lifecycle(
+    population_run_dir: str | Path,
+    *,
+    lifecycle_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """推广 OFES 深层事件的动力载体和表层表达至完整生命周期。
+
+    函数对 56 个背景环带完整事件的全部 650 个 observed days 复用 population
+    的深层 rotation/strain 与三套表层表达口径，同时构建核心加权垂向 Ro
+    剖面。peak 日必须精确复现既有 26/29 polarity-matched 和 7/29
+    weak-or-reversed，再按预注册日数与比例定义 persistent anticyclonic、
+    SCV-compatible 和 surface-obscured 子集。
+
+    参数:
+        - population_run_dir (str | Path): 已完成的 schema-v2 population 运行目录。
+        - lifecycle_overrides (dict | None): 临时覆盖 `ofes.event_lifecycle` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入 population 目录的 `event_lifecycle`。
+        - resume (bool): 是否复用签名一致的逐日和垂向 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、daily lifecycle、vertical profiles、event summary、peak parity、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/days/*.parquet`、`profiles/*.parquet`、`lifecycle_daily_diagnostics.parquet`、`lifecycle_vertical_profiles.parquet`、`lifecycle_event_summary.parquet`、`peak_population_parity.json`、`analysis_summary.json`、`event_lifecycle.png` 与 `manifest.json`。
+
+    说明:
+        - lead/lag 使用旋转强度交叉相关，不使用 DO 首次过阈值时间；仍只作描述，不能证明垂向传播。
+        - SCV-compatible 是 OFES 动力代理，未与 McCoy 目录的观测判据完全等同，论文中不得省略 compatible 限定。
+    """
+    population_root = Path(population_run_dir)
+    population_manifest = json.loads(
+        (population_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        population_manifest.get('status') != 'complete'
+        or int(population_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES lifecycle requires a complete schema-v2 population run.'
+        )
+    settings = _ofes_event_lifecycle_settings(lifecycle_overrides)
+    population_settings = _ofes_event_population_settings()
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    population_diagnostics = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    diagnostic_root = Path(population_manifest['diagnostic_run_dir'])
+    diagnostic_manifest = json.loads(
+        (diagnostic_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    catalog_root = Path(diagnostic_manifest['catalog_run_dir'])
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    requests = _ofes_lifecycle_requests(
+        population_diagnostics, daily_objects
+    )
+    inventory_records = []
+    for date in sorted(requests['date'].unique()):
+        for variable in ('u', 'v', 'eta'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    source_inventory = pd.DataFrame(inventory_records)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_add_surface_rotation_metrics,
+            _ofes_event_lifecycle_settings,
+            _ofes_lifecycle_requests,
+            _ofes_vertical_core_rossby_day,
+            _ofes_lifecycle_day,
+            _ofes_fraction_class,
+            _ofes_maximum_consecutive_true,
+            _ofes_lifecycle_lag_diagnostic,
+            _ofes_lifecycle_peak_parity,
+            _ofes_lifecycle_summary,
+            _plot_ofes_event_lifecycle,
+            diagnose_ofes_event_lifecycle,
+            _ofes_surface_expression_day,
+            _ofes_fixed_depth_kinematic_fields,
+        )
+    )
+    repo_root = Path(__file__).resolve().parent
+    payload = {
+        'schema_version': 2,
+        'population_run_dir': str(population_root),
+        'population_run_signature': population_manifest['run_signature'],
+        'input_sha256': {
+            'population_manifest.json': _file_sha256(
+                population_root / 'manifest.json'
+            ),
+            'population_peak_diagnostics.parquet': _file_sha256(
+                population_root / 'population_peak_diagnostics.parquet'
+            ),
+            'catalog_manifest.json': _file_sha256(
+                catalog_root / 'manifest.json'
+            ),
+            'daily_objects.parquet': _file_sha256(
+                catalog_root / 'daily_objects.parquet'
+            ),
+        },
+        'settings': settings,
+        'population_settings': population_settings,
+        'diagnostic_settings': diagnostic_settings,
+        'request_count': int(len(requests)),
+        'request_sha256': hashlib.sha256(
+            requests.to_json(
+                orient='records', date_format='iso'
+            ).encode('utf-8')
+        ).hexdigest(),
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'lifecycle_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'ofes_lifecycle_{signature[:12]}',
+    }
+    lifecycle_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else population_root / settings['output_subdir']
+    )
+    run_dir = lifecycle_root / identity['run_tag']
+    days_dir = run_dir / 'days'
+    profiles_dir = run_dir / 'profiles'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES lifecycle manifest signature does not match.'
+            )
+        if previous.get('status') == 'complete':
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'daily_diagnostics': pd.read_parquet(
+                        outputs['daily_diagnostics']
+                    ),
+                    'vertical_profiles': pd.read_parquet(
+                        outputs['vertical_profiles']
+                    ),
+                    'event_summary': pd.read_parquet(
+                        outputs['event_summary']
+                    ),
+                    'peak_population_parity': json.loads(
+                        Path(outputs['peak_population_parity']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_days': 0,
+        'total_days': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(source_inventory, run_dir / 'source_inventory.parquet')
+    completed = 0
+    try:
+        daily_frames = []
+        profile_frames = []
+        for row in requests.itertuples(index=False):
+            day_path = days_dir / f'{row.lifecycle_request_key}.parquet'
+            profile_path = (
+                profiles_dir / f'{row.lifecycle_request_key}.parquet'
+            )
+            reused = False
+            if resume and day_path.exists() and profile_path.exists():
+                day_frame = pd.read_parquet(day_path)
+                profile = pd.read_parquet(profile_path)
+                reused = bool(
+                    len(day_frame) == 1
+                    and str(day_frame.iloc[0]['lifecycle_run_signature'])
+                    == signature
+                    and profile['lifecycle_run_signature'].astype(str)
+                    .eq(signature).all()
+                )
+            if not reused:
+                record, profile = _ofes_lifecycle_day(
+                    row._asdict(),
+                    diagnostic_settings,
+                    population_settings,
+                )
+                record['lifecycle_run_signature'] = signature
+                profile['lifecycle_run_signature'] = signature
+                day_frame = pd.DataFrame([record])
+                _atomic_write_parquet(day_frame, day_path)
+                _atomic_write_parquet(profile, profile_path)
+            daily_frames.append(day_frame)
+            profile_frames.append(profile)
+            completed += 1
+            if completed % 10 == 0 or completed == len(requests):
+                print(
+                    f'[OFES lifecycle] {completed}/{len(requests)}',
+                    flush=True,
+                )
+                manifest['completed_days'] = completed
+                manifest['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(manifest, manifest_path)
+        daily = pd.concat(daily_frames, ignore_index=True).sort_values(
+            ['event_order', 'date'], kind='mergesort'
+        ).reset_index(drop=True)
+        profiles = pd.concat(profile_frames, ignore_index=True)
+        maximum_profile_disagreement = float(
+            daily['surface_core_weighted_profile_agreement'].abs().max()
+        )
+        if (
+            maximum_profile_disagreement
+            > settings['surface_profile_rossby_tolerance']
+        ):
+            raise RuntimeError(
+                'OFES lifecycle surface/profile weighted Ro mismatch: '
+                f'{maximum_profile_disagreement}.'
+            )
+        peak_parity = _ofes_lifecycle_peak_parity(
+            daily, population_diagnostics
+        )
+        event_summary, analysis_summary = _ofes_lifecycle_summary(
+            daily, settings
+        )
+        analysis_summary['peak_population_parity'] = peak_parity
+        analysis_summary[
+            'maximum_surface_profile_rossby_disagreement'
+        ] = maximum_profile_disagreement
+        daily_path = run_dir / 'lifecycle_daily_diagnostics.parquet'
+        profiles_path = run_dir / 'lifecycle_vertical_profiles.parquet'
+        event_path = run_dir / 'lifecycle_event_summary.parquet'
+        parity_path = run_dir / 'peak_population_parity.json'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'event_lifecycle.png'
+        _atomic_write_parquet(daily, daily_path)
+        _atomic_write_parquet(profiles, profiles_path)
+        _atomic_write_parquet(event_summary, event_path)
+        _ofes_atomic_write_json(peak_parity, parity_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_event_lifecycle(
+            daily, event_summary, figure_path, settings['figure_dpi']
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_days': int(len(daily)),
+                'strict_event_count': int(len(event_summary)),
+                'peak_population_parity_passed': bool(
+                    peak_parity['passed']
+                ),
+                'outputs': {
+                    'daily_diagnostics': str(daily_path.resolve()),
+                    'vertical_profiles': str(profiles_path.resolve()),
+                    'event_summary': str(event_path.resolve()),
+                    'peak_population_parity': str(parity_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(
+                        (run_dir / 'source_inventory.parquet').resolve()
+                    ),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_days': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_diagnostics': daily,
+        'vertical_profiles': profiles,
+        'event_summary': event_summary,
+        'peak_population_parity': peak_parity,
+        'analysis_summary': analysis_summary,
         'figure_path': figure_path,
         'reused_complete_run': False,
     }

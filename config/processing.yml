@@ -1,4 +1,6 @@
 # 处理与算法参数配置
+# version 1.31 变更：
+#   - 新增 OFES 全生命周期表层核心加权 Ro 与垂向剖面首层的一致性容差审计。
 # version 1.30 变更：
 #   - 新增 OFES 同密度面 water-mass patch 连续性、质心流速敏感性、全生命周期表层/深层表达和
 #     固定深度二维 ensemble trajectory 的预注册门槛；轨迹运行与论文来源解释分离，三维 w 继续关闭。
@@ -96,7 +98,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.30"
+version: "1.31"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -354,6 +356,7 @@ ofes:
     scv_anticyclonic_rotation_fraction_min: 0.75
     scv_subsurface_max_depth_min_m: 200.0
     scv_minimum_consecutive_days: 5
+    surface_profile_rossby_tolerance: 0.001
     figure_dpi: 180
     output_subdir: event_lifecycle
   trajectory_2d:
