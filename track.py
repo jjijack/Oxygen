@@ -38121,6 +38121,560 @@ def diagnose_ofes_event_onset_regimes(
     }
 
 
+def _ofes_event_flow_segments(
+    onset_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+) -> pd.DataFrame:
+    """比较 detected 对象质心逐段位移与端点核心流速。"""
+    detected = onset_diagnostics.loc[
+        onset_diagnostics['phase'] == 'detected'
+    ].merge(
+        daily_objects[
+            [
+                'daily_object_key',
+                'centroid_lon',
+                'centroid_lat',
+                'link_gap_days',
+            ]
+        ],
+        on='daily_object_key',
+        how='left',
+        validate='one_to_one',
+    )
+    required = (
+        'centroid_lon',
+        'centroid_lat',
+        'u_m_s',
+        'v_m_s',
+    )
+    if detected[list(required)].isna().any().any():
+        raise RuntimeError(
+            'OFES event-flow audit is missing centroid or core-flow data.'
+        )
+    records: list[dict] = []
+    for event_id, group in detected.groupby(
+        'event_id', sort=False
+    ):
+        ordered = group.sort_values('date', kind='mergesort').reset_index(
+            drop=True
+        )
+        for segment_index in range(len(ordered) - 1):
+            start = ordered.iloc[segment_index]
+            end = ordered.iloc[segment_index + 1]
+            start_date = pd.Timestamp(start['date']).normalize()
+            end_date = pd.Timestamp(end['date']).normalize()
+            elapsed_seconds = float(
+                (end_date - start_date).total_seconds()
+            )
+            if elapsed_seconds <= 0:
+                raise RuntimeError(
+                    f'Non-positive OFES event-flow interval for {event_id}.'
+                )
+            midpoint_lat = 0.5 * (
+                float(start['centroid_lat'])
+                + float(end['centroid_lat'])
+            )
+            scale = approximate_degree_length(midpoint_lat)
+            observed_dx = float(
+                _minimal_lon_diff_deg(
+                    float(end['centroid_lon']),
+                    float(start['centroid_lon']),
+                )
+                * float(scale['meters_per_degree_lon'])
+            )
+            observed_dy = float(
+                (
+                    float(end['centroid_lat'])
+                    - float(start['centroid_lat'])
+                )
+                * float(scale['meters_per_degree_lat'])
+            )
+            mean_u = 0.5 * (
+                float(start['u_m_s']) + float(end['u_m_s'])
+            )
+            mean_v = 0.5 * (
+                float(start['v_m_s']) + float(end['v_m_s'])
+            )
+            predicted_dx = mean_u * elapsed_seconds
+            predicted_dy = mean_v * elapsed_seconds
+            observed_distance = float(
+                np.hypot(observed_dx, observed_dy)
+            )
+            predicted_distance = float(
+                np.hypot(predicted_dx, predicted_dy)
+            )
+            dot_product = (
+                observed_dx * predicted_dx
+                + observed_dy * predicted_dy
+            )
+            direction_cosine = (
+                float(
+                    dot_product
+                    / (observed_distance * predicted_distance)
+                )
+                if observed_distance > 0 and predicted_distance > 0
+                else np.nan
+            )
+            residual_dx = observed_dx - predicted_dx
+            residual_dy = observed_dy - predicted_dy
+            residual_distance = float(
+                np.hypot(residual_dx, residual_dy)
+            )
+            start_offset = float(
+                great_circle_distance_m(
+                    float(start['requested_core_lon']),
+                    float(start['requested_core_lat']),
+                    float(start['centroid_lon']),
+                    float(start['centroid_lat']),
+                )
+            )
+            end_offset = float(
+                great_circle_distance_m(
+                    float(end['requested_core_lon']),
+                    float(end['requested_core_lat']),
+                    float(end['centroid_lon']),
+                    float(end['centroid_lat']),
+                )
+            )
+            finite = (
+                np.isfinite(direction_cosine)
+                and np.isfinite(residual_distance)
+                and observed_distance > 0
+                and predicted_distance > 0
+            )
+            records.append(
+                {
+                    'regime_order': int(start['regime_order']),
+                    'regime_label': str(start['regime_label']),
+                    'event_id': str(event_id),
+                    'segment_index': int(segment_index + 1),
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'elapsed_days': elapsed_seconds / 86400.0,
+                    'start_daily_object_key': str(
+                        start['daily_object_key']
+                    ),
+                    'end_daily_object_key': str(end['daily_object_key']),
+                    'catalog_link_gap_days': int(end['link_gap_days']),
+                    'reference_depth_m': float(
+                        start['reference_depth_m']
+                    ),
+                    'start_centroid_lon': float(start['centroid_lon']),
+                    'start_centroid_lat': float(start['centroid_lat']),
+                    'end_centroid_lon': float(end['centroid_lon']),
+                    'end_centroid_lat': float(end['centroid_lat']),
+                    'observed_dx_m': observed_dx,
+                    'observed_dy_m': observed_dy,
+                    'observed_distance_m': observed_distance,
+                    'observed_speed_m_s': (
+                        observed_distance / elapsed_seconds
+                    ),
+                    'mean_core_u_m_s': mean_u,
+                    'mean_core_v_m_s': mean_v,
+                    'core_flow_speed_m_s': (
+                        predicted_distance / elapsed_seconds
+                    ),
+                    'predicted_dx_m': predicted_dx,
+                    'predicted_dy_m': predicted_dy,
+                    'predicted_distance_m': predicted_distance,
+                    'direction_cosine': direction_cosine,
+                    'vector_residual_dx_m': residual_dx,
+                    'vector_residual_dy_m': residual_dy,
+                    'vector_residual_distance_m': residual_distance,
+                    'observed_to_core_flow_speed_ratio': float(
+                        observed_distance / predicted_distance
+                    ),
+                    'residual_to_observed_distance_ratio': float(
+                        residual_distance / observed_distance
+                    ),
+                    'start_peak_to_centroid_offset_km': (
+                        start_offset / 1000.0
+                    ),
+                    'end_peak_to_centroid_offset_km': (
+                        end_offset / 1000.0
+                    ),
+                    'segment_diagnostic_passed': bool(finite),
+                }
+            )
+    segments = pd.DataFrame(records).sort_values(
+        ['regime_order', 'segment_index'], kind='mergesort'
+    ).reset_index(drop=True)
+    if segments.empty or not bool(
+        segments['segment_diagnostic_passed'].all()
+    ):
+        raise RuntimeError(
+            'OFES event-flow audit produced no complete segments.'
+        )
+    return segments
+
+
+def _ofes_event_flow_summary(
+    segments: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总事件质心平移与核心流速的一致性而不设通过阈值。"""
+    records: list[dict] = []
+    for event_id, group in segments.groupby(
+        'event_id', sort=False
+    ):
+        records.append(
+            {
+                'regime_order': int(group['regime_order'].iloc[0]),
+                'regime_label': str(group['regime_label'].iloc[0]),
+                'event_id': str(event_id),
+                'segment_count': int(len(group)),
+                'median_direction_cosine': float(
+                    group['direction_cosine'].median()
+                ),
+                'q25_direction_cosine': float(
+                    group['direction_cosine'].quantile(0.25)
+                ),
+                'q75_direction_cosine': float(
+                    group['direction_cosine'].quantile(0.75)
+                ),
+                'same_half_plane_fraction': float(
+                    np.mean(group['direction_cosine'] > 0)
+                ),
+                'median_observed_speed_m_s': float(
+                    group['observed_speed_m_s'].median()
+                ),
+                'median_core_flow_speed_m_s': float(
+                    group['core_flow_speed_m_s'].median()
+                ),
+                'median_observed_to_core_flow_speed_ratio': float(
+                    group[
+                        'observed_to_core_flow_speed_ratio'
+                    ].median()
+                ),
+                'median_residual_to_observed_distance_ratio': float(
+                    group[
+                        'residual_to_observed_distance_ratio'
+                    ].median()
+                ),
+                'maximum_observed_segment_distance_km': float(
+                    group['observed_distance_m'].max() / 1000.0
+                ),
+                'median_peak_to_centroid_offset_km': float(
+                    pd.concat(
+                        (
+                            group['start_peak_to_centroid_offset_km'],
+                            group['end_peak_to_centroid_offset_km'],
+                        ),
+                        ignore_index=True,
+                    ).median()
+                ),
+            }
+        )
+    summary = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    payload = {
+        'event_count': int(len(summary)),
+        'segment_count': int(len(segments)),
+        'event_records': summary.to_dict(orient='records'),
+        'interpretation': (
+            'Directional agreement indicates that linked object-centroid '
+            'translation is kinematically compatible with the resolved '
+            'flow sampled at each daily maximum-DeltaDO core.'
+        ),
+        'causal_limits': [
+            'Daily connected objects and their centroids are Eulerian '
+            'features, not material parcels.',
+            'Velocity is sampled at the daily maximum-DeltaDO core rather '
+            'than the object centroid; the reported offset quantifies this '
+            'proxy mismatch.',
+            'Trapezoidal endpoint velocity is not a trajectory integration '
+            'and does not test deformation, diffusion, or vertical motion.',
+            'No alignment threshold is used as a gate or causal label.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_flow_consistency(
+    segments: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int = 180,
+) -> Path:
+    """绘制对象质心逐段位移与核心流预测位移。"""
+    figure, axes = plt.subplots(
+        1,
+        len(summary),
+        figsize=(5.2 * len(summary), 5.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, event in zip(
+        axes[0], summary.itertuples(index=False)
+    ):
+        group = segments.loc[
+            segments['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('segment_index', kind='mergesort')
+        observed_dx = group['observed_dx_m'].to_numpy(dtype=float) / 1000.0
+        observed_dy = group['observed_dy_m'].to_numpy(dtype=float) / 1000.0
+        path_x = np.r_[0.0, np.cumsum(observed_dx)]
+        path_y = np.r_[0.0, np.cumsum(observed_dy)]
+        predicted_dx = (
+            group['predicted_dx_m'].to_numpy(dtype=float) / 1000.0
+        )
+        predicted_dy = (
+            group['predicted_dy_m'].to_numpy(dtype=float) / 1000.0
+        )
+        axis.plot(path_x, path_y, color='#111827', linewidth=1.0)
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            observed_dx,
+            observed_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#111827',
+            width=0.006,
+            label='Observed centroid step',
+        )
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            predicted_dx,
+            predicted_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#dc2626',
+            alpha=0.75,
+            width=0.005,
+            label='Endpoint core-flow step',
+        )
+        axis.scatter(
+            path_x[0], path_y[0], color='#2563eb', s=45, zorder=3
+        )
+        axis.scatter(
+            path_x[-1], path_y[-1], color='#b91c1c', s=45, zorder=3
+        )
+        axis.set_title(
+            f'{event.regime_label}\n{event.event_id}\n'
+            f'median cos={event.median_direction_cosine:.2f}, '
+            f'same half-plane={event.same_half_plane_fraction:.0%}'
+        )
+        axis.set_xlabel('Cumulative eastward displacement (km)')
+        axis.set_ylabel('Cumulative northward displacement (km)')
+        axis.set_aspect('equal', adjustable='datalim')
+        axis.grid(alpha=0.2)
+    handles = [
+        Line2D([0], [0], color='#111827', linewidth=2),
+        Line2D([0], [0], color='#dc2626', linewidth=2),
+    ]
+    figure.legend(
+        handles,
+        ['Observed centroid step', 'Endpoint core-flow step'],
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.08),
+        ncol=2,
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def quantify_ofes_event_flow_consistency(
+    onset_run_dir: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """量化 OFES onset 代表事件质心平移与解析核心流的一致性。
+
+    函数消费完成的 schema-v2 onset 运行及其源 catalog，不再读取 OFES
+    日场。对每个 detected event 的相邻对象，以对象质心定义观测位移，
+    以两端最大 ΔDO 核心处固定参考深度 u/v 的梯形平均定义平流代理，
+    报告方向余弦、速度比和矢量残差。
+
+    参数:
+        - onset_run_dir (str | Path): 已完成的 schema-v2 onset 运行目录。
+        - output_dir (str | Path | None): 输出根目录；None 时写到 onset 目录的 `event_flow` 下。
+
+    返回:
+        - dict: 含 run_dir、manifest、逐段表、事件总结、JSON 总结和图件路径。
+
+    输出:
+        - `<run_dir>/event_flow_segments.parquet`、`event_flow_summary.parquet`、`analysis_summary.json`、`event_flow_consistency.png` 与 `manifest.json`。
+
+    说明:
+        - 这是 linked Eulerian object 的准拉格朗日运动学审计，不是粒子轨迹或物质水团证明。
+        - 核心流速与对象质心并非严格同位，输出显式报告二者距离；不据此设置通过阈值。
+        - 本节点不读取 `w`，不重建中间时刻速度，也不计算扩散或形变后的 patch overlap。
+    """
+    onset_root = Path(onset_run_dir)
+    onset_manifest = json.loads(
+        (onset_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        onset_manifest.get('status') != 'complete'
+        or int(onset_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES event-flow audit requires a complete schema-v2 '
+            'onset run.'
+        )
+    onset_diagnostics = pd.read_parquet(
+        onset_root / 'daily_diagnostics.parquet'
+    )
+    catalog_root = Path(onset_manifest['catalog_run_dir'])
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    segments = _ofes_event_flow_segments(
+        onset_diagnostics, daily_objects
+    )
+    summary, analysis_summary = _ofes_event_flow_summary(segments)
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_event_flow_segments,
+            _ofes_event_flow_summary,
+            _plot_ofes_event_flow_consistency,
+            quantify_ofes_event_flow_consistency,
+        )
+    )
+    payload = {
+        'schema_version': 2,
+        'onset_run_dir': str(onset_root),
+        'onset_run_signature': onset_manifest['run_signature'],
+        'input_sha256': {
+            'onset_manifest.json': _file_sha256(
+                onset_root / 'manifest.json'
+            ),
+            'daily_diagnostics.parquet': _file_sha256(
+                onset_root / 'daily_diagnostics.parquet'
+            ),
+            'catalog_manifest.json': _file_sha256(
+                catalog_root / 'manifest.json'
+            ),
+            'daily_objects.parquet': _file_sha256(
+                catalog_root / 'daily_objects.parquet'
+            ),
+        },
+        'flow_audit_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'algorithm': (
+            'object-centroid displacement versus trapezoidal endpoint '
+            'maximum-DeltaDO-core velocity'
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'matplotlib_version': str(
+            getattr(plt.matplotlib, '__version__', 'unknown')
+        ),
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    signature = hashlib.sha256(
+        canonical.encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'ofes_flow_{signature[:12]}',
+    }
+    flow_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else onset_root / 'event_flow'
+    )
+    run_dir = flow_root / identity['run_tag']
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(
+            manifest_path.read_text(encoding='utf-8')
+        )
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES event-flow manifest signature does not match.'
+            )
+        if previous.get('status') == 'complete':
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'segments': pd.read_parquet(outputs['segments']),
+                    'summary': pd.read_parquet(outputs['summary']),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    try:
+        segments_path = run_dir / 'event_flow_segments.parquet'
+        summary_path = run_dir / 'event_flow_summary.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'event_flow_consistency.png'
+        _atomic_write_parquet(segments, segments_path)
+        _atomic_write_parquet(summary, summary_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_event_flow_consistency(
+            segments, summary, figure_path
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'event_count': int(len(summary)),
+                'segment_count': int(len(segments)),
+                'trajectory_enabled': False,
+                'outputs': {
+                    'segments': str(segments_path.resolve()),
+                    'summary': str(summary_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'segments': segments,
+        'summary': summary,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
 def _ofes_event_evolution_settings(
     overrides: dict | None = None,
 ) -> dict:
