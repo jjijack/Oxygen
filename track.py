@@ -28661,6 +28661,496 @@ def plot_meta_association_sensitivity(
     return result
 
 
+def summarize_detector_meta_association_sensitivity(
+    detection_configs: tuple[DetectionConfig, ...]
+    | list[DetectionConfig]
+    | None = None,
+    *,
+    radius_factors: tuple[float, ...] | list[float] = (
+        1.0, 1.2, 1.5, 2.0,
+    ),
+    start_year: int = 2002,
+    end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    meta_distance: pd.DataFrame | None = None,
+    meta_distance_path: str | Path | None = None,
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    force_distance_cache: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """按统一分母与 META 覆盖期比较 ΔDO、AOU 和 TRIM 的表层涡关联。
+
+    每个 detector 使用自身可评估 profile 集合，并把分析限制在 META 日目录实际覆盖期。对每个半径倍数，
+    函数比较互斥的 anomaly 与 non-anomaly profiles 的 META membership，而不是把 anomaly 子集与包含
+    它的总体 baseline 直接做 Fisher 检验。默认同时评估 ΔDO20/35/50、AOU 和 TRIM。
+
+    参数:
+        - detection_configs (tuple[DetectionConfig, ...] | list[DetectionConfig] | None): detector 配置；None 使用 ΔDO20/35/50、AOU、TRIM 的 300 m 正式配置。
+        - radius_factors (tuple[float, ...] | list[float]): META 有效半径倍数，默认 (1.0, 1.2, 1.5, 2.0)。
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): 默认 detector 的异常峰最浅深度（m），默认 300。
+        - meta_distance (pd.DataFrame | None): 已加载的 META 距离比表；None 时读取或构建缓存。
+        - meta_distance_path (str | Path | None): META 距离比 parquet；None 使用默认路径。
+        - profile_eligibility (pd.DataFrame | None): 对应深度的 Argo eligibility；None 时读取或构建。
+        - profile_eligibility_path (str | Path | None): eligibility parquet；None 使用默认路径。
+        - output_dir (str | Path | None): 输出目录；None 使用 shared/global 默认目录。
+        - force_distance_cache (bool): 是否强制重建 META 距离缓存，默认 False。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 detector 和 radius factor 一行的可评估数、membership、exact OR/CI 与来源。
+
+    输出:
+        - `plot_outputs/shared/<region>/detector_meta_association_sensitivity/detector_meta_association_sensitivity_<y0>_<y1>_depth<z>m_radius<...>x.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - OR 的参照组是同一 detector-evaluable 分母内的 non-anomaly profiles。
+        - 1.0–1.5× 是主要几何敏感性；2.0× 是较宽松边界，不应单独据此定义关联强弱。
+    """
+    radius_values = sorted({float(value) for value in radius_factors})
+    if not radius_values or any(value <= 0 for value in radius_values):
+        raise ValueError('radius_factors must contain positive values.')
+    if int(end_year) < int(start_year):
+        raise ValueError('end_year must be >= start_year.')
+
+    if detection_configs is None:
+        configs = [
+            make_detection_config(
+                'do', do_threshold=threshold,
+                anomaly_min_depth=float(anomaly_min_depth),
+            )
+            for threshold in (20.0, 35.0, 50.0)
+        ] + [
+            make_detection_config(
+                method, anomaly_min_depth=float(anomaly_min_depth)
+            )
+            for method in ('aou', 'trim')
+        ]
+    else:
+        configs = [
+            _resolve_detection_config(config) for config in detection_configs
+        ]
+    if not configs:
+        raise ValueError('detection_configs must not be empty.')
+    detector_stems = [config.file_stem() for config in configs]
+    if len(detector_stems) != len(set(detector_stems)):
+        raise ValueError(
+            f'detection_configs contain duplicate stems: {detector_stems}'
+        )
+    configured_depths = {
+        float(config.anomaly_min_depth or 0.0) for config in configs
+    }
+    if configured_depths != {float(anomaly_min_depth)}:
+        raise ValueError(
+            f'All detector depths must equal anomaly_min_depth; got '
+            f'{sorted(configured_depths)}.'
+        )
+
+    region_slug = _current_region_key()
+    max_factor = max(radius_values)
+    statistics_dir = _shared_output_dir('statistics', region_slug)
+    if meta_distance is None:
+        if meta_distance_path is None:
+            meta_distance_path = statistics_dir / (
+                f'argo_meta_radius_distance_{int(start_year)}_'
+                f'{int(end_year)}_max'
+                f'{_format_detection_value(max_factor)}x.parquet'
+            )
+        distance_source = Path(meta_distance_path)
+        if distance_source.exists() and not force_distance_cache:
+            meta_distance = pd.read_parquet(distance_source)
+        else:
+            meta_distance = build_argo_meta_radius_distance_table(
+                start_year=int(start_year),
+                end_year=int(end_year),
+                search_max_radius_factor=max_factor,
+                output_dir=distance_source.parent,
+                force=bool(force_distance_cache),
+                save_data=True,
+            )
+    else:
+        meta_distance = meta_distance.copy()
+        distance_source = (
+            Path(meta_distance_path)
+            if meta_distance_path is not None else Path('<memory>')
+        )
+    required_distance = {
+        'Profile_number', 'nearest_meta_radius_ratio',
+        'meta_catalog_covered', 'search_max_radius_factor',
+        'meta_catalog_start', 'meta_catalog_end',
+    }
+    missing_distance = required_distance.difference(meta_distance.columns)
+    if missing_distance:
+        raise ValueError(
+            f'META distance table missing columns: '
+            f'{sorted(missing_distance)}'
+        )
+    supported_factors = pd.to_numeric(
+        meta_distance['search_max_radius_factor'], errors='coerce'
+    ).dropna().unique()
+    if (
+        len(supported_factors) != 1
+        or float(supported_factors[0]) + 1e-12 < max_factor
+    ):
+        raise ValueError(
+            f'META distance cache supports {supported_factors}, '
+            f'but radius factors require {max_factor:g}.'
+        )
+    profile_ids = pd.to_numeric(
+        meta_distance['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    if profile_ids.isna().any() or profile_ids.duplicated().any():
+        raise ValueError(
+            'META distance table requires unique, non-null Profile_number.'
+        )
+    meta_distance['Profile_number'] = profile_ids.astype(int)
+    meta_distance = meta_distance.set_index('Profile_number', drop=False)
+    all_ids = set(meta_distance.index.astype(int))
+    covered_ids = set(
+        meta_distance.loc[
+            meta_distance['meta_catalog_covered'].fillna(False).astype(bool)
+        ].index.astype(int)
+    )
+
+    match_cfg = _scv_matched_control_config()
+    eligibility_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                eligibility_dir,
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
+            )
+        eligibility_source = Path(profile_eligibility_path)
+        if eligibility_source.exists():
+            profile_eligibility = pd.read_parquet(eligibility_source)
+        else:
+            profile_eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                output_dir=eligibility_dir,
+                save_data=True,
+            )
+    else:
+        profile_eligibility = profile_eligibility.copy()
+        eligibility_source = (
+            Path(profile_eligibility_path)
+            if profile_eligibility_path is not None else Path('<memory>')
+        )
+
+    ratio = pd.to_numeric(
+        meta_distance['nearest_meta_radius_ratio'], errors='coerce'
+    )
+    catalog_start = pd.Timestamp(
+        meta_distance['meta_catalog_start'].dropna().iloc[0]
+    )
+    catalog_end = pd.Timestamp(
+        meta_distance['meta_catalog_end'].dropna().iloc[0]
+    )
+    rows: list[dict] = []
+    for detector_order, cfg in enumerate(configs):
+        evaluable_ids = _detector_evaluable_profile_ids(
+            cfg,
+            int(start_year),
+            int(end_year),
+            profile_eligibility=profile_eligibility,
+            profile_eligibility_path=eligibility_source,
+        ) & all_ids & covered_ids
+        anomaly_ids, anomaly_source = _load_detector_anomaly_ids(
+            cfg, int(start_year), int(end_year), region_slug
+        )
+        anomaly_ids &= evaluable_ids
+        non_anomaly_ids = evaluable_ids.difference(anomaly_ids)
+        if not evaluable_ids or not anomaly_ids or not non_anomaly_ids:
+            raise ValueError(
+                f'Insufficient detector groups for {cfg.file_stem()}: '
+                f'evaluable={len(evaluable_ids)}, anomaly={len(anomaly_ids)}, '
+                f'non_anomaly={len(non_anomaly_ids)}.'
+            )
+        detector_label = (
+            f'ΔDO{_format_detection_value(float(cfg.do_threshold))}'
+            if cfg.method == 'do' else cfg.method.upper()
+        )
+        for radius_factor in radius_values:
+            member_ids = set(
+                meta_distance.loc[
+                    ratio.le(float(radius_factor))
+                ].index.astype(int)
+            )
+            baseline_member_n = len(evaluable_ids & member_ids)
+            anomaly_member_n = len(anomaly_ids & member_ids)
+            non_anomaly_member_n = len(non_anomaly_ids & member_ids)
+            odds_ratio, ci_low, ci_high, fisher_p = (
+                _conditional_exact_odds_ratio_ci(
+                    anomaly_member_n,
+                    len(anomaly_ids),
+                    non_anomaly_member_n,
+                    len(non_anomaly_ids),
+                )
+            )
+            rows.append({
+                'detector_order': int(detector_order),
+                'detection_method': cfg.method,
+                'detector_label': detector_label,
+                'detector_stem': cfg.file_stem(),
+                'criteria': cfg.threshold_label(),
+                'radius_factor': float(radius_factor),
+                'evaluable_n': int(len(evaluable_ids)),
+                'baseline_meta_n': int(baseline_member_n),
+                'baseline_membership_rate': float(
+                    baseline_member_n / len(evaluable_ids)
+                ),
+                'anomaly_n': int(len(anomaly_ids)),
+                'anomaly_meta_n': int(anomaly_member_n),
+                'anomaly_membership_rate': float(
+                    anomaly_member_n / len(anomaly_ids)
+                ),
+                'non_anomaly_n': int(len(non_anomaly_ids)),
+                'non_anomaly_meta_n': int(non_anomaly_member_n),
+                'non_anomaly_membership_rate': float(
+                    non_anomaly_member_n / len(non_anomaly_ids)
+                ),
+                'anomaly_vs_non_anomaly_or': odds_ratio,
+                'or_ci_low': ci_low,
+                'or_ci_high': ci_high,
+                'fisher_p': fisher_p,
+                'minimum_depth_m': float(anomaly_min_depth),
+                'period_start': int(start_year),
+                'period_end': int(end_year),
+                'meta_catalog_start': catalog_start,
+                'meta_catalog_end': catalog_end,
+                'anomaly_source': str(anomaly_source),
+                'meta_distance_source': str(distance_source),
+                'profile_eligibility_source': str(eligibility_source),
+                'denominator_definition': (
+                    'detector-evaluable profiles during META catalog coverage'
+                ),
+            })
+    summary = pd.DataFrame(rows).sort_values(
+        ['detector_order', 'radius_factor']
+    ).reset_index(drop=True)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else _shared_output_dir(
+                'detector_meta_association_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        depth_tag = _format_detection_value(float(anomaly_min_depth))
+        radius_tag = '-'.join(
+            _format_detection_value(value) for value in radius_values
+        )
+        stem = (
+            f'detector_meta_association_sensitivity_{int(start_year)}_'
+            f'{int(end_year)}_depth{depth_tag}m_radius{radius_tag}x'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] Detector META sensitivity saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return summary
+
+
+def plot_detector_meta_association_sensitivity(
+    summary: pd.DataFrame,
+    *,
+    default_radius_factor: float = 1.2,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 ΔDO、AOU 与 TRIM 的 META 半径敏感性和默认半径 membership。
+
+    左图展示 anomaly 相对同 detector non-anomaly profiles 的 exact OR 随有效半径变化；右图在默认
+    半径下并列 anomaly 与 non-anomaly membership。ΔDO20/35/50 使用主线阈值颜色，AOU/TRIM
+    使用独立的蓝/绿色，避免遮蔽 ΔDO 阈值的视觉层级。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_detector_meta_association_sensitivity` 输出。
+        - default_radius_factor (float): 右图使用的 META 半径倍数，默认 1.2。
+        - output_dir (str | Path | None): 图输出目录；None 使用 shared/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含绘图数据、默认半径和 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/shared/<region>/detector_meta_association_sensitivity/detector_meta_association_sensitivity.png`（save_fig 时）。
+
+    说明:
+        - OR=1 表示 anomaly 与 non-anomaly 的 META membership 无差异；多个半径结果不是独立检验。
+    """
+    required = {
+        'detector_order', 'detector_label', 'radius_factor',
+        'anomaly_membership_rate', 'non_anomaly_membership_rate',
+        'anomaly_vs_non_anomaly_or', 'or_ci_low', 'or_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Detector META summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary.copy().sort_values(
+        ['detector_order', 'radius_factor']
+    )
+    detector_rows = plotted.drop_duplicates(
+        'detector_label'
+    ).sort_values('detector_order')
+    labels = list(detector_rows['detector_label'].astype(str))
+    style_map = {
+        'AOU': ('#2563eb', '^'),
+        'TRIM': ('#0f766e', 'P'),
+    }
+    for label in labels:
+        if label.startswith('ΔDO'):
+            threshold_tag = label.replace('ΔDO', '')
+            key = f'DO{threshold_tag}'
+            style_map[label] = (
+                _THRESHOLD_COLORS.get(key, _GROUP_COLORS['scv']),
+                _THRESHOLD_MARKERS.get(key, 'o'),
+            )
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.8))
+    finite_bounds: list[float] = []
+    for label in labels:
+        rows = plotted[
+            plotted['detector_label'].astype(str).eq(label)
+        ].sort_values('radius_factor')
+        estimate = pd.to_numeric(
+            rows['anomaly_vs_non_anomaly_or'], errors='coerce'
+        ).to_numpy(dtype=float)
+        low = pd.to_numeric(
+            rows['or_ci_low'], errors='coerce'
+        ).to_numpy(dtype=float)
+        high = pd.to_numeric(
+            rows['or_ci_high'], errors='coerce'
+        ).to_numpy(dtype=float)
+        finite_bounds.extend(low[np.isfinite(low)].tolist())
+        finite_bounds.extend(high[np.isfinite(high)].tolist())
+        color, marker = style_map[label]
+        axes[0].errorbar(
+            rows['radius_factor'],
+            estimate,
+            yerr=np.vstack([estimate - low, high - estimate]),
+            color=color,
+            marker=marker,
+            linewidth=2.0,
+            capsize=3,
+            label=label,
+        )
+    axes[0].axhline(1.0, color='#4b5563', linestyle='--', linewidth=1.2)
+    axes[0].set_xlabel('META effective-radius factor')
+    axes[0].set_ylabel('Anomaly membership odds ratio')
+    axes[0].set_title('Association sensitivity to geometry')
+    axes[0].legend(frameon=False, loc='best')
+    axes[0].grid(axis='y', alpha=0.22)
+    if finite_bounds:
+        axes[0].set_ylim(
+            max(0.0, min(finite_bounds) * 0.96),
+            max(finite_bounds) * 1.04,
+        )
+
+    default_rows = plotted[np.isclose(
+        pd.to_numeric(
+            plotted['radius_factor'], errors='coerce'
+        ).to_numpy(dtype=float),
+        float(default_radius_factor),
+    )].sort_values('detector_order')
+    if len(default_rows) != len(labels):
+        raise ValueError(
+            f'Expected one row per detector at radius '
+            f'{default_radius_factor:g}.'
+        )
+    y = np.arange(len(default_rows), dtype=float)
+    non_anomaly_rate = pd.to_numeric(
+        default_rows['non_anomaly_membership_rate'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    anomaly_rate = pd.to_numeric(
+        default_rows['anomaly_membership_rate'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    for index, (_, row) in enumerate(default_rows.iterrows()):
+        label = str(row['detector_label'])
+        color, marker = style_map[label]
+        axes[1].plot(
+            [non_anomaly_rate[index], anomaly_rate[index]],
+            [index, index],
+            color='#9ca3af',
+            linewidth=1.5,
+            zorder=1,
+        )
+        axes[1].scatter(
+            non_anomaly_rate[index], index,
+            facecolors='white', edgecolors='#4b5563', marker='o',
+            s=85, linewidths=1.5, zorder=2,
+        )
+        axes[1].scatter(
+            anomaly_rate[index], index,
+            color=color, marker=marker, s=90, zorder=3,
+        )
+    axes[1].set_yticks(y)
+    axes[1].set_yticklabels(list(default_rows['detector_label']))
+    axes[1].invert_yaxis()
+    axes[1].set_xlabel('META membership (%)')
+    axes[1].set_title(f'Membership at {default_radius_factor:g}× radius')
+    axes[1].grid(axis='x', alpha=0.22)
+    axes[1].scatter(
+        [], [], facecolors='white', edgecolors='#4b5563',
+        marker='o', s=85, label='Non-anomaly (open)',
+    )
+    axes[1].scatter(
+        [], [], color='#4b5563', marker='o', s=85,
+        label='Anomaly (colored)',
+    )
+    axes[1].legend(frameon=False, loc='best')
+
+    for axis in axes:
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    result = {
+        'rows': plotted,
+        'default_radius_factor': float(default_radius_factor),
+    }
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else _shared_output_dir(
+                'detector_meta_association_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / 'detector_meta_association_sensitivity.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] Detector META sensitivity figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
+
+
 def _default_mccoy_resolution_path(region_slug: str) -> Path:
     """返回 DO 主线中已生成的 McCoy 全目录 parquet。"""
     do_cfg = make_detection_config('do')
