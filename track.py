@@ -27308,6 +27308,795 @@ def plot_do_threshold_meta_association(
     return out
 
 
+def _load_argo_profiles_for_density_sensitivity(
+    year: int,
+    profile_ids: set[int],
+    argo_data_dir: str | Path | None,
+) -> tuple[pd.DataFrame, Path]:
+    """按 profile id 读取密度坐标验证所需的年度 Argo 列。"""
+    source = (
+        Path(argo_data_dir) if argo_data_dir is not None else Path(argo_path)
+    ) / f'Argo{int(year)}.parquet'
+    if not source.exists():
+        raise FileNotFoundError(f'Missing annual Argo parquet: {source}')
+    schema_names = set(pq.ParquetFile(source).schema_arrow.names)
+    source_map = {
+        'Depth': _first_available_column(
+            schema_names, ('Depth', 'Depth_m')
+        ),
+        'DO': _first_available_column(
+            schema_names, ('DOXY_Adjusted', 'DOXY', 'DO_mol_kg')
+        ),
+        'Temperature': _first_available_column(
+            schema_names,
+            ('Temp_Adjusted', 'Temp', 'Temperature_degC'),
+        ),
+        'Salinity': _first_available_column(
+            schema_names, ('PSAL_Adjusted', 'PSAL', 'Salinity_psu')
+        ),
+    }
+    missing = [name for name, column in source_map.items() if column is None]
+    if missing:
+        raise ValueError(
+            f'Argo{int(year)}.parquet lacks variables: {missing}'
+        )
+    base_columns = {
+        'Year', 'Month', 'Day', 'Longitude', 'Latitude',
+        'Profile_number', 'Platform_number',
+    }
+    missing_base = sorted(base_columns.difference(schema_names))
+    if missing_base:
+        raise ValueError(
+            f'Argo{int(year)}.parquet lacks columns: {missing_base}'
+        )
+    selected = set(base_columns) | set(source_map.values())
+    flag_map = {}
+    for standard_name, source_name in source_map.items():
+        if standard_name == 'Depth':
+            continue
+        candidates = (
+            f'{source_name}_Flag',
+            {
+                'DO': 'DOXY_Flag',
+                'Temperature': 'Temp_Flag',
+                'Salinity': 'PSAL_Flag',
+            }[standard_name],
+        )
+        flag_source = _first_available_column(schema_names, candidates)
+        if flag_source is not None:
+            selected.add(flag_source)
+            flag_map[f'{standard_name}_Flag'] = flag_source
+    frame = pd.read_parquet(
+        source,
+        columns=sorted(selected),
+        filters=[('Profile_number', 'in', sorted(profile_ids))],
+    )
+    rename_map = {
+        source_name: standard_name
+        for standard_name, source_name in source_map.items()
+    }
+    rename_map.update({
+        source_name: standard_name
+        for standard_name, source_name in flag_map.items()
+    })
+    frame = frame.rename(columns=rename_map)
+    return frame, source
+
+
+def _prepare_do_density_profile(
+    profile: pd.DataFrame,
+    cfg: DetectionConfig,
+) -> tuple[pd.DataFrame, str]:
+    """复刻 DO detector 的 profile QC 与重复深度处理。"""
+    work = profile.copy()
+    value_columns = ['Depth', 'DO', 'Salinity', 'Temperature']
+    for column in value_columns:
+        work[column] = pd.to_numeric(work[column], errors='coerce')
+    if work.empty:
+        return work, 'empty_profile'
+
+    good_flags = {'1', '2', '5', '8', 1, 2, 5, 8}
+    for variable in ('DO', 'Salinity', 'Temperature'):
+        flag_column = f'{variable}_Flag'
+        if flag_column in work.columns:
+            bad = ~work[flag_column].isin(good_flags)
+            work.loc[bad, variable] = np.nan
+    bad_do = work['DO'].le(float(cfg.do_near_zero_threshold))
+    max_bad = cfg.do_near_zero_max_count
+    if max_bad is not None and int(bad_do.sum()) > int(max_bad):
+        return work.iloc[0:0].copy(), 'too_many_near_zero_do_values'
+    work.loc[bad_do, 'DO'] = np.nan
+    work = work.dropna(subset=value_columns).copy()
+    if len(work) < 5:
+        return work, 'fewer_than_five_valid_levels'
+
+    if work['Depth'].duplicated().any():
+        strategy = str(cfg.duplicate_depth_strategy or 'best_qc').lower()
+        if strategy not in {'best_qc', 'first', 'mean', 'max', 'min'}:
+            strategy = 'best_qc'
+        priority = {1: 0, 2: 1, 5: 2, 8: 3}
+        picked_rows = []
+        for _, group in work.groupby('Depth', sort=False):
+            if len(group) == 1 or strategy == 'first':
+                picked_rows.append(group.iloc[0])
+            elif strategy == 'mean':
+                row = group.iloc[0].copy()
+                for column in ('DO', 'Salinity', 'Temperature'):
+                    row[column] = pd.to_numeric(
+                        group[column], errors='coerce'
+                    ).mean()
+                picked_rows.append(row)
+            elif strategy in {'max', 'min'}:
+                values = pd.to_numeric(group['DO'], errors='coerce')
+                index = values.idxmax() if strategy == 'max' else values.idxmin()
+                picked_rows.append(group.loc[index])
+            else:
+                if 'DO_Flag' not in group.columns:
+                    picked_rows.append(group.iloc[0])
+                    continue
+                ranks = group['DO_Flag'].map(
+                    lambda value: priority.get(
+                        int(value) if pd.notna(value) else -1, 999
+                    )
+                )
+                picked_rows.append(group.loc[ranks.idxmin()])
+        work = pd.DataFrame(picked_rows)
+
+    work = work.sort_values('Depth').reset_index(drop=True)
+    depth = work['Depth'].to_numpy(dtype=float)
+    if len(depth) < 5 or np.any(np.diff(depth) <= 0):
+        keep = np.r_[True, np.diff(depth) > 0]
+        work = work.loc[keep].reset_index(drop=True)
+    if len(work) < 5:
+        return work, 'fewer_than_five_unique_levels'
+    return work, 'ok'
+
+
+def calculate_do_density_coordinate_sensitivity(
+    *,
+    detection_config: DetectionConfig | None = None,
+    start_year: int = 2002,
+    end_year: int = 2023,
+    anomalies_path: str | Path | None = None,
+    argo_data_dir: str | Path | None = None,
+    reproduction_tolerance: float = 1e-4,
+    output_dir: str | Path | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> dict:
+    """将已识别 ΔDO prominence 重投影到 σ₀ 坐标并量化异常存活率。
+
+    对每个已落盘 DO anomaly，函数从年度 Argo parquet 读取原始剖面，复刻 detector 的 QC、重复深度
+    和端点参考线，在相同上下端点间分别按深度与 σ₀ 线性构造背景 DO。深度坐标重算值必须先复现
+    已保存 `delta_do`，之后才把 `delta_sigma0` 用作 heave sensitivity，而不是重新搜索另一个峰。
+
+    参数:
+        - detection_config (DetectionConfig | None): DO detector 配置；None 使用默认 ΔDO50、300 m 配置。
+        - start_year (int): 分析起始年份，默认 2002。
+        - end_year (int): 分析结束年份，默认 2023。
+        - anomalies_path (str | Path | None): anomalies parquet；None 按 detector 配置定位。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 使用 paths.yml 默认值。
+        - reproduction_tolerance (float): 深度坐标重算值与落盘 ΔDO 的最大允许绝对误差，默认 1e-4 μmol kg⁻¹。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - force (bool): 是否忽略并覆盖同参数缓存，默认 False。
+        - save_data (bool): 是否保存 details 与 summary parquet/CSV，默认 True。
+
+    返回:
+        - dict: 含逐异常 `details`、单行 `summary` 和相应输出路径（save_data 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/do_density_coordinate_sensitivity/do_density_coordinate_sensitivity_<y0>_<y1>_<stem>_tol<tolerance>_details.parquet`（save_data 时）。
+        - 同参数的 summary parquet 及 CSV（save_data 时）。
+
+    说明:
+        - `delta_sigma0` 只在目标 σ₀ 被窗口上下端点 σ₀ 夹住时计算；无法夹住的水团侵入不会被静默外推。
+        - 该检验排查局地 prominence 是否主要由一致性等密度面升降造成，不证明水团来源、年龄或形成机制。
+    """
+    cfg = _resolve_detection_config(detection_config)
+    if cfg.method != 'do':
+        raise ValueError('Density-coordinate sensitivity requires method=do.')
+    if int(end_year) < int(start_year):
+        raise ValueError('end_year must be >= start_year.')
+    if float(reproduction_tolerance) < 0:
+        raise ValueError('reproduction_tolerance must be non-negative.')
+
+    region_slug = _current_region_key()
+    run_tag = cfg.file_stem()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else cfg.output_dir('do_density_coordinate_sensitivity', region_slug)
+    )
+    stem = (
+        f'do_density_coordinate_sensitivity_{int(start_year)}_'
+        f'{int(end_year)}_{run_tag}_tol'
+        f'{_format_detection_value(float(reproduction_tolerance))}'
+    )
+    details_path = out_dir / f'{stem}_details.parquet'
+    summary_path = out_dir / f'{stem}_summary.parquet'
+    if details_path.exists() and summary_path.exists() and not force:
+        return {
+            'details': pd.read_parquet(details_path),
+            'summary': pd.read_parquet(summary_path),
+            'details_path': str(details_path),
+            'summary_path': str(summary_path),
+        }
+
+    if anomalies_path is None:
+        anomalies_path = (
+            cfg.output_dir('plot_argo_hotspots', region_slug)
+            / f'anomalies_{int(start_year)}_{int(end_year)}_{run_tag}.parquet'
+        )
+    anomaly_source = Path(anomalies_path)
+    if not anomaly_source.exists():
+        raise FileNotFoundError(
+            f'Missing DO anomalies parquet: {anomaly_source}'
+        )
+    anomalies = pd.read_parquet(anomaly_source)
+    required_anomaly = {
+        'Profile_number', 'Year', 'depth', 'delta_do',
+    }
+    missing_anomaly = required_anomaly.difference(anomalies.columns)
+    if missing_anomaly:
+        raise ValueError(
+            f'DO anomalies parquet missing columns: {sorted(missing_anomaly)}'
+        )
+    if 'detection_method' in anomalies.columns:
+        anomalies = anomalies[
+            anomalies['detection_method'].astype(str).str.lower().eq('do')
+        ].copy()
+    anomalies['Profile_number'] = pd.to_numeric(
+        anomalies['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    anomalies['Year'] = pd.to_numeric(
+        anomalies['Year'], errors='coerce'
+    ).astype('Int64')
+    anomalies = anomalies[
+        anomalies['Profile_number'].notna()
+        & anomalies['Year'].between(int(start_year), int(end_year))
+    ].copy()
+    if anomalies['Profile_number'].duplicated().any():
+        anomalies = _keep_best_anomaly_per_profile(anomalies, cfg)
+    if anomalies.empty:
+        raise ValueError('No DO anomalies remain for density sensitivity.')
+
+    rows: list[dict] = []
+    argo_sources: list[str] = []
+    for year, year_anomalies in anomalies.groupby('Year', sort=True):
+        profile_ids = set(year_anomalies['Profile_number'].astype(int))
+        profiles, source = _load_argo_profiles_for_density_sensitivity(
+            int(year), profile_ids, argo_data_dir
+        )
+        argo_sources.append(str(source))
+        grouped_profiles = {
+            int(profile_number): group
+            for profile_number, group in profiles.groupby(
+                'Profile_number', sort=False
+            )
+        }
+        for anomaly in year_anomalies.itertuples(index=False):
+            profile_number = int(anomaly.Profile_number)
+            target_depth = float(anomaly.depth)
+            stored_delta = float(anomaly.delta_do)
+            base_record = {
+                'Profile_number': profile_number,
+                'Platform_number': getattr(anomaly, 'Platform_number', np.nan),
+                'Year': int(year),
+                'Month': getattr(anomaly, 'Month', np.nan),
+                'Day': getattr(anomaly, 'Day', np.nan),
+                'Longitude': getattr(anomaly, 'Longitude', np.nan),
+                'Latitude': getattr(anomaly, 'Latitude', np.nan),
+                'target_depth_m': target_depth,
+                'stored_delta_do': stored_delta,
+                'status': 'ok',
+                'skip_reason': '',
+            }
+            raw_profile = grouped_profiles.get(profile_number)
+            if raw_profile is None:
+                rows.append({
+                    **base_record,
+                    'status': 'skipped',
+                    'skip_reason': 'profile_absent_from_annual_parquet',
+                })
+                continue
+            profile, preparation_status = _prepare_do_density_profile(
+                raw_profile, cfg
+            )
+            if preparation_status != 'ok':
+                rows.append({
+                    **base_record,
+                    'status': 'skipped',
+                    'skip_reason': preparation_status,
+                })
+                continue
+            depth = profile['Depth'].to_numpy(dtype=float)
+            oxygen = profile['DO'].to_numpy(dtype=float)
+            salinity = profile['Salinity'].to_numpy(dtype=float)
+            temperature = profile['Temperature'].to_numpy(dtype=float)
+            lon = pd.to_numeric(
+                profile['Longitude'], errors='coerce'
+            ).to_numpy(dtype=float)
+            lat = pd.to_numeric(
+                profile['Latitude'], errors='coerce'
+            ).to_numpy(dtype=float)
+            try:
+                pressure = gsw.p_from_z(-depth, lat)
+                absolute_salinity = gsw.SA_from_SP(
+                    salinity, pressure, lon, lat
+                )
+                conservative_temperature = gsw.CT_from_t(
+                    absolute_salinity, temperature, pressure
+                )
+                sigma0 = np.asarray(
+                    gsw.sigma0(
+                        absolute_salinity, conservative_temperature
+                    ),
+                    dtype=float,
+                )
+            except Exception as exc:
+                rows.append({
+                    **base_record,
+                    'status': 'skipped',
+                    'skip_reason': f'sigma0_error:{type(exc).__name__}',
+                })
+                continue
+            window = (
+                np.isfinite(depth)
+                & np.isfinite(oxygen)
+                & np.isfinite(sigma0)
+                & (depth >= target_depth - float(cfg.depth_interval))
+                & (depth <= target_depth + float(cfg.depth_interval))
+            )
+            if int(np.count_nonzero(window)) < 2:
+                rows.append({
+                    **base_record,
+                    'status': 'skipped',
+                    'skip_reason': 'insufficient_endpoint_window',
+                })
+                continue
+            window_depth = depth[window]
+            window_oxygen = oxygen[window]
+            window_sigma0 = sigma0[window]
+            order = np.argsort(window_depth)
+            window_depth = window_depth[order]
+            window_oxygen = window_oxygen[order]
+            window_sigma0 = window_sigma0[order]
+            if np.isclose(window_depth[0], window_depth[-1]):
+                rows.append({
+                    **base_record,
+                    'status': 'skipped',
+                    'skip_reason': 'coincident_depth_endpoints',
+                })
+                continue
+            observed_do = float(np.interp(
+                target_depth, window_depth, window_oxygen
+            ))
+            target_sigma0 = float(np.interp(
+                target_depth, window_depth, window_sigma0
+            ))
+            depth_reference = float(np.interp(
+                target_depth,
+                [window_depth[0], window_depth[-1]],
+                [window_oxygen[0], window_oxygen[-1]],
+            ))
+            recomputed_delta = observed_do - depth_reference
+            sigma_endpoints = np.asarray([
+                window_sigma0[0], window_sigma0[-1]
+            ], dtype=float)
+            oxygen_endpoints = np.asarray([
+                window_oxygen[0], window_oxygen[-1]
+            ], dtype=float)
+            sigma_order = np.argsort(sigma_endpoints)
+            sigma_endpoints = sigma_endpoints[sigma_order]
+            oxygen_endpoints = oxygen_endpoints[sigma_order]
+            sigma_bracketed = bool(
+                np.isfinite(target_sigma0)
+                and not np.isclose(sigma_endpoints[0], sigma_endpoints[1])
+                and target_sigma0 >= sigma_endpoints[0] - 1e-10
+                and target_sigma0 <= sigma_endpoints[1] + 1e-10
+            )
+            density_reference = (
+                float(np.interp(
+                    target_sigma0, sigma_endpoints, oxygen_endpoints
+                ))
+                if sigma_bracketed else np.nan
+            )
+            density_delta = (
+                observed_do - density_reference
+                if sigma_bracketed else np.nan
+            )
+            reproduction_error = recomputed_delta - stored_delta
+            reproduced = bool(
+                np.isfinite(reproduction_error)
+                and abs(reproduction_error) <= float(reproduction_tolerance)
+            )
+            status = 'ok' if sigma_bracketed and reproduced else 'invalid'
+            skip_reason = ''
+            if not reproduced:
+                skip_reason = 'depth_prominence_not_reproduced'
+            elif not sigma_bracketed:
+                skip_reason = 'target_sigma0_not_bracketed'
+            rows.append({
+                **base_record,
+                'status': status,
+                'skip_reason': skip_reason,
+                'window_lower_depth_m': float(window_depth[0]),
+                'window_upper_depth_m': float(window_depth[-1]),
+                'window_lower_sigma0': float(window_sigma0[0]),
+                'window_upper_sigma0': float(window_sigma0[-1]),
+                'target_sigma0': target_sigma0,
+                'observed_do': observed_do,
+                'depth_reference_do': depth_reference,
+                'density_reference_do': density_reference,
+                'recomputed_delta_do_depth': recomputed_delta,
+                'delta_do_sigma0': density_delta,
+                'heave_component': recomputed_delta - density_delta,
+                'density_survival_ratio': (
+                    float(density_delta / recomputed_delta)
+                    if np.isfinite(density_delta)
+                    and np.isfinite(recomputed_delta)
+                    and recomputed_delta != 0
+                    else np.nan
+                ),
+                'survives_original_threshold': bool(
+                    np.isfinite(density_delta)
+                    and density_delta >= float(cfg.do_threshold)
+                ),
+                'retains_positive_prominence': bool(
+                    np.isfinite(density_delta) and density_delta > 0
+                ),
+                'depth_reproduction_error': reproduction_error,
+                'depth_prominence_reproduced': reproduced,
+                'sigma0_target_bracketed': sigma_bracketed,
+                'sigma0_monotonic_in_window': bool(
+                    np.all(np.diff(window_sigma0) >= 0)
+                ),
+                'n_window_levels': int(len(window_depth)),
+            })
+
+    details = pd.DataFrame(rows).sort_values(
+        ['Year', 'Profile_number']
+    ).reset_index(drop=True)
+    valid = details[
+        details['status'].astype(str).eq('ok')
+    ].copy()
+    ratios = pd.to_numeric(
+        valid.get('density_survival_ratio'), errors='coerce'
+    ).dropna()
+    heave = pd.to_numeric(
+        valid.get('heave_component'), errors='coerce'
+    ).dropna()
+    monotonic = valid[
+        valid.get(
+            'sigma0_monotonic_in_window',
+            pd.Series(False, index=valid.index),
+        ).fillna(False).astype(bool)
+    ].copy()
+    monotonic_ratios = pd.to_numeric(
+        monotonic.get('density_survival_ratio'), errors='coerce'
+    ).dropna()
+    monotonic_heave = pd.to_numeric(
+        monotonic.get('heave_component'), errors='coerce'
+    ).dropna()
+    summary = pd.DataFrame([{
+        'detection_method': cfg.method,
+        'detector_stem': run_tag,
+        'threshold_umol_kg': float(cfg.do_threshold),
+        'minimum_depth_m': float(cfg.anomaly_min_depth),
+        'depth_interval_m': float(cfg.depth_interval),
+        'n_anomalies': int(len(details)),
+        'n_valid_density_projection': int(len(valid)),
+        'n_depth_prominence_reproduced': int(
+            details.get(
+                'depth_prominence_reproduced',
+                pd.Series(False, index=details.index),
+            ).fillna(False).astype(bool).sum()
+        ),
+        'n_sigma0_target_bracketed': int(
+            details.get(
+                'sigma0_target_bracketed',
+                pd.Series(False, index=details.index),
+            ).fillna(False).astype(bool).sum()
+        ),
+        'n_survives_original_threshold': int(
+            valid.get(
+                'survives_original_threshold',
+                pd.Series(False, index=valid.index),
+            ).fillna(False).astype(bool).sum()
+        ),
+        'survival_rate': (
+            float(valid['survives_original_threshold'].astype(bool).mean())
+            if len(valid) else np.nan
+        ),
+        'n_retains_positive_prominence': int(
+            valid.get(
+                'retains_positive_prominence',
+                pd.Series(False, index=valid.index),
+            ).fillna(False).astype(bool).sum()
+        ),
+        'positive_prominence_retention_rate': (
+            float(valid['retains_positive_prominence'].astype(bool).mean())
+            if len(valid) else np.nan
+        ),
+        'n_sigma0_monotonic_windows': int(len(monotonic)),
+        'sigma0_monotonic_window_fraction': (
+            float(len(monotonic) / len(valid)) if len(valid) else np.nan
+        ),
+        'monotonic_n_survives_original_threshold': int(
+            monotonic.get(
+                'survives_original_threshold',
+                pd.Series(False, index=monotonic.index),
+            ).fillna(False).astype(bool).sum()
+        ),
+        'monotonic_threshold_survival_rate': (
+            float(
+                monotonic['survives_original_threshold'].astype(bool).mean()
+            ) if len(monotonic) else np.nan
+        ),
+        'monotonic_positive_prominence_retention_rate': (
+            float(
+                monotonic['retains_positive_prominence'].astype(bool).mean()
+            ) if len(monotonic) else np.nan
+        ),
+        'monotonic_median_density_survival_ratio': (
+            float(monotonic_ratios.median())
+            if len(monotonic_ratios) else np.nan
+        ),
+        'monotonic_density_survival_ratio_q025': (
+            float(monotonic_ratios.quantile(0.025))
+            if len(monotonic_ratios) else np.nan
+        ),
+        'monotonic_density_survival_ratio_q975': (
+            float(monotonic_ratios.quantile(0.975))
+            if len(monotonic_ratios) else np.nan
+        ),
+        'monotonic_median_heave_component': (
+            float(monotonic_heave.median())
+            if len(monotonic_heave) else np.nan
+        ),
+        'median_density_survival_ratio': (
+            float(ratios.median()) if len(ratios) else np.nan
+        ),
+        'density_survival_ratio_q025': (
+            float(ratios.quantile(0.025)) if len(ratios) else np.nan
+        ),
+        'density_survival_ratio_q975': (
+            float(ratios.quantile(0.975)) if len(ratios) else np.nan
+        ),
+        'median_heave_component': (
+            float(heave.median()) if len(heave) else np.nan
+        ),
+        'max_abs_depth_reproduction_error': float(
+            pd.to_numeric(
+                details.get('depth_reproduction_error'), errors='coerce'
+            ).abs().max()
+        ),
+        'reproduction_tolerance': float(reproduction_tolerance),
+        'anomalies_source': str(anomaly_source),
+        'argo_sources': json.dumps(sorted(set(argo_sources))),
+        'interpretation': (
+            'Density-coordinate persistence tests coherent-isopycnal-heave '
+            'sensitivity; it does not identify formation mechanism.'
+        ),
+    }])
+    result = {'details': details, 'summary': summary}
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_parquet(details, details_path)
+        _atomic_write_parquet(summary, summary_path)
+        details.to_csv(out_dir / f'{stem}_details.csv', index=False)
+        summary.to_csv(out_dir / f'{stem}_summary.csv', index=False)
+        result['details_path'] = str(details_path)
+        result['summary_path'] = str(summary_path)
+        print(f'[*] DO density sensitivity saved: {details_path}')
+        print(f'[*] DO density sensitivity saved: {summary_path}')
+    return result
+
+
+def plot_do_density_coordinate_sensitivity(
+    details: pd.DataFrame,
+    summary: pd.DataFrame | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 ΔDO prominence 的深度坐标复现与 σ₀ 坐标存活诊断。
+
+    三个面板依次比较落盘与重算的深度坐标 prominence、深度与密度坐标 prominence，以及
+    `ΔDOσ₀ / ΔDOz` 分布。第二图区分窗口内密度是否严格单调，存活率直方图与标题阈值比例使用
+    更保守的密度单调子集；全部端点可投影剖面仍保留在散点图中。
+
+    参数:
+        - details (pd.DataFrame): `calculate_do_density_coordinate_sensitivity` 返回的逐异常表。
+        - summary (pd.DataFrame | None): 同函数返回的单行摘要；None 时从 details 现场汇总标题数字。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含有效绘图数据与 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/do_density_coordinate_sensitivity/do_density_coordinate_sensitivity_<stem>.png`（save_fig 时）。
+
+    说明:
+        - 1:1 线附近的密度坐标 prominence 表示局地峰值不会因坐标重投影而消失；它不是水团来源诊断。
+    """
+    required = {
+        'status', 'stored_delta_do', 'recomputed_delta_do_depth',
+        'delta_do_sigma0', 'density_survival_ratio',
+        'survives_original_threshold',
+    }
+    missing = required.difference(details.columns)
+    if missing:
+        raise ValueError(
+            f'Density sensitivity details missing columns: {sorted(missing)}'
+        )
+    valid = details[details['status'].astype(str).eq('ok')].copy()
+    if valid.empty:
+        raise ValueError('No valid density-coordinate profiles to plot.')
+    monotonic_mask = valid.get(
+        'sigma0_monotonic_in_window',
+        pd.Series(False, index=valid.index),
+    ).fillna(False).astype(bool)
+    monotonic = valid[monotonic_mask].copy()
+    nonmonotonic = valid[~monotonic_mask].copy()
+    if monotonic.empty:
+        raise ValueError(
+            'No density-monotonic windows are available to plot.'
+        )
+    if summary is not None and not summary.empty:
+        record = summary.iloc[0]
+        threshold = float(record.get('threshold_umol_kg', np.nan))
+        detector_stem = str(record.get('detector_stem', 'do'))
+        median_ratio = float(
+            record.get(
+                'monotonic_median_density_survival_ratio', np.nan
+            )
+        )
+        survival_rate = float(
+            record.get('monotonic_threshold_survival_rate', np.nan)
+        )
+        positive_retention_rate = float(
+            record.get(
+                'positive_prominence_retention_rate', np.nan
+            )
+        )
+    else:
+        threshold = np.nan
+        detector_stem = 'do'
+        median_ratio = float(pd.to_numeric(
+            monotonic['density_survival_ratio'], errors='coerce'
+        ).median())
+        survival_rate = float(
+            monotonic['survives_original_threshold'].astype(bool).mean()
+        )
+        positive_retention_rate = float(
+            valid.get(
+                'retains_positive_prominence',
+                pd.Series(False, index=valid.index),
+            ).fillna(False).astype(bool).mean()
+        )
+
+    stored = pd.to_numeric(
+        valid['stored_delta_do'], errors='coerce'
+    ).to_numpy(dtype=float)
+    depth_delta = pd.to_numeric(
+        valid['recomputed_delta_do_depth'], errors='coerce'
+    ).to_numpy(dtype=float)
+    density_delta = pd.to_numeric(
+        valid['delta_do_sigma0'], errors='coerce'
+    ).to_numpy(dtype=float)
+    ratios = pd.to_numeric(
+        monotonic['density_survival_ratio'], errors='coerce'
+    ).dropna().to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.6))
+    finite_stored = np.isfinite(stored) & np.isfinite(depth_delta)
+    stored_limits = [
+        float(np.nanmin(np.r_[stored[finite_stored], depth_delta[finite_stored]])),
+        float(np.nanmax(np.r_[stored[finite_stored], depth_delta[finite_stored]])),
+    ]
+    axes[0].scatter(
+        stored[finite_stored], depth_delta[finite_stored],
+        s=22, color=_THRESHOLD_COLORS.get('DO50', '#b91c1c'),
+        alpha=0.55, edgecolors='none',
+    )
+    axes[0].plot(stored_limits, stored_limits, color='0.3', linestyle='--')
+    axes[0].set_xlabel('Stored ΔDO (μmol kg⁻¹)')
+    axes[0].set_ylabel('Recomputed ΔDOz (μmol kg⁻¹)')
+    axes[0].set_title('Depth-coordinate reproduction')
+
+    finite_density = np.isfinite(depth_delta) & np.isfinite(density_delta)
+    density_limits = [
+        float(np.nanmin(np.r_[
+            depth_delta[finite_density], density_delta[finite_density]
+        ])),
+        float(np.nanmax(np.r_[
+            depth_delta[finite_density], density_delta[finite_density]
+        ])),
+    ]
+    nonmonotonic_depth = pd.to_numeric(
+        nonmonotonic['recomputed_delta_do_depth'], errors='coerce'
+    ).to_numpy(dtype=float)
+    nonmonotonic_density = pd.to_numeric(
+        nonmonotonic['delta_do_sigma0'], errors='coerce'
+    ).to_numpy(dtype=float)
+    monotonic_depth = pd.to_numeric(
+        monotonic['recomputed_delta_do_depth'], errors='coerce'
+    ).to_numpy(dtype=float)
+    monotonic_density = pd.to_numeric(
+        monotonic['delta_do_sigma0'], errors='coerce'
+    ).to_numpy(dtype=float)
+    axes[1].scatter(
+        nonmonotonic_depth, nonmonotonic_density,
+        s=18, color='#9ca3af', alpha=0.35, edgecolors='none',
+        label=f'Non-monotonic (n={len(nonmonotonic)})',
+    )
+    axes[1].scatter(
+        monotonic_depth, monotonic_density,
+        s=22, color='#3478a8', alpha=0.6, edgecolors='none',
+        label=f'Monotonic (n={len(monotonic)})',
+    )
+    axes[1].plot(density_limits, density_limits, color='0.3', linestyle='--')
+    axes[1].set_xlabel('ΔDOz (μmol kg⁻¹)')
+    axes[1].set_ylabel('ΔDOσ₀ (μmol kg⁻¹)')
+    axes[1].set_title('Density-coordinate persistence')
+    axes[1].legend(frameon=False, loc='lower right')
+
+    axes[2].hist(
+        ratios, bins=30, color='#3478a8', alpha=0.82,
+        edgecolor='white', linewidth=0.5,
+    )
+    axes[2].axvline(1.0, color='0.3', linestyle='--', linewidth=1.3)
+    axes[2].axvline(
+        median_ratio, color=_THRESHOLD_COLORS.get('DO50', '#b91c1c'),
+        linewidth=2.0, label=f'median {median_ratio:.3f}',
+    )
+    axes[2].set_xlabel('ΔDOσ₀ / ΔDOz')
+    axes[2].set_ylabel('Anomaly profiles')
+    axes[2].set_title('Prominence survival ratio')
+    axes[2].legend(frameon=False, loc='best')
+
+    threshold_label = (
+        f'ΔDO{_format_detection_value(threshold)}'
+        if np.isfinite(threshold) else 'ΔDO'
+    )
+    fig.suptitle(
+        f'{threshold_label} density-coordinate sensitivity '
+        f'(all n={len(valid)}, positive={100.0 * positive_retention_rate:.1f}%; '
+        f'monotonic n={len(monotonic)}, ≥ threshold={100.0 * survival_rate:.1f}%)'
+    )
+    for axis in axes:
+        axis.grid(alpha=0.18)
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    result = {'rows': valid, 'median_survival_ratio': median_ratio}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'do_density_coordinate_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            f'do_density_coordinate_sensitivity_{detector_stem}.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] DO density sensitivity figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
+
+
 def summarize_meta_association_sensitivity(
     *,
     thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
