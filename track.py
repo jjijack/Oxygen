@@ -29146,7 +29146,7 @@ def load_ofes_snapshot(
 
     说明:
         - JAMSTEC OFES 公开数据页将 DODS 垂向坐标的 mbar 说明为通用错误 metadata，并非本次交付的专项确认；结合交付层位，本入口按 z-level 深度（m）解释其数值。
-        - `w` 按 MOM3 约定记录为向上为正，但尚缺可复现的数据集专项验证；本函数只负责读取，不据此授权三维轨迹解释。
+        - `w` 按 MOM3 约定记录为向上为正；本函数只负责读取，三维轨迹另需消费 `validate_ofes_vertical_velocity` 通过后的完整 manifest。
         - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
     date_ts = pd.Timestamp(date).normalize()
@@ -41368,6 +41368,664 @@ def diagnose_ofes_event_lifecycle(
         'vertical_profiles': profiles,
         'event_summary': event_summary,
         'peak_population_parity': peak_parity,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_vertical_velocity_validation_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 垂向速度数据集专项验证配置。"""
+    raw = dict(
+        _OFES_CFG.get('vertical_velocity_validation', {}) or {}
+    )
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                'Unknown OFES vertical_velocity_validation override '
+                f'keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'dates': tuple(
+            pd.Timestamp(value).normalize()
+            for value in raw.get(
+                'dates',
+                (
+                    '2003-01-04',
+                    '2003-01-22',
+                    '2003-01-26',
+                    '2003-04-14',
+                    '2003-06-04',
+                ),
+            )
+        ),
+        'lon_bounds': tuple(
+            float(value)
+            for value in raw.get('lon_bounds', (142.0, 153.0))
+        ),
+        'lat_bounds': tuple(
+            float(value)
+            for value in raw.get('lat_bounds', (32.0, 39.0))
+        ),
+        'depth_bounds_m': tuple(
+            float(value)
+            for value in raw.get('depth_bounds_m', (250.0, 900.0))
+        ),
+        'minimum_finite_fraction': float(
+            raw.get('minimum_finite_fraction', 0.99)
+        ),
+        'correlation_min': float(raw.get('correlation_min', 0.99)),
+        'regression_slope_min': float(
+            raw.get('regression_slope_min', 0.95)
+        ),
+        'regression_slope_max': float(
+            raw.get('regression_slope_max', 1.05)
+        ),
+        'normalized_rmse_max': float(
+            raw.get('normalized_rmse_max', 0.12)
+        ),
+        'opposite_sign_normalized_rmse_min': float(
+            raw.get('opposite_sign_normalized_rmse_min', 1.50)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get(
+                'output_subdir', 'vertical_velocity_validation'
+            )
+        ),
+    }
+    if not settings['dates'] or len(set(settings['dates'])) != len(
+        settings['dates']
+    ):
+        raise ValueError(
+            'OFES vertical-velocity validation dates must be unique.'
+        )
+    for key in ('lon_bounds', 'lat_bounds', 'depth_bounds_m'):
+        values = settings[key]
+        if (
+            len(values) != 2
+            or not np.all(np.isfinite(values))
+            or values[0] >= values[1]
+        ):
+            raise ValueError(
+                f'OFES vertical-velocity {key} must be increasing.'
+            )
+    fractions = (
+        settings['minimum_finite_fraction'],
+        settings['correlation_min'],
+    )
+    if any(
+        not np.isfinite(value) or not 0 < value <= 1
+        for value in fractions
+    ):
+        raise ValueError(
+            'OFES vertical-velocity fraction/correlation gates must lie '
+            'in (0, 1].'
+        )
+    positive = (
+        settings['regression_slope_min'],
+        settings['regression_slope_max'],
+        settings['normalized_rmse_max'],
+        settings['opposite_sign_normalized_rmse_min'],
+        settings['figure_dpi'],
+    )
+    if any(not np.isfinite(value) or value <= 0 for value in positive):
+        raise ValueError(
+            'OFES vertical-velocity validation gates must be positive.'
+        )
+    if (
+        settings['regression_slope_min']
+        >= settings['regression_slope_max']
+    ):
+        raise ValueError(
+            'OFES vertical-velocity slope bounds must be increasing.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES vertical-velocity output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_vertical_velocity_source_inventory(
+    settings: dict,
+) -> pd.DataFrame:
+    """记录垂向速度专项验证的逐日 u/v/w 文件身份。"""
+    records = []
+    for date in settings['dates']:
+        for variable in ('u', 'v', 'w'):
+            path = _ofes_file_path(variable, date)
+            stat = path.stat()
+            records.append(
+                {
+                    'date': pd.Timestamp(date).normalize(),
+                    'variable': variable,
+                    'source_file': str(path.resolve()),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_vertical_velocity_continuity_day(
+    date: pd.Timestamp,
+    settings: dict,
+) -> dict:
+    """在原生 B-grid 面速度上审计单日水平散度与 w 层界差分。"""
+    date_ts = pd.Timestamp(date).normalize()
+    tracer_lon, tracer_lat, tracer_depth, _, _ = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    lon_slice = _ofes_contiguous_slice(
+        tracer_lon,
+        settings['lon_bounds'],
+        'longitude',
+        longitude=True,
+    )
+    lat_slice = _ofes_contiguous_slice(
+        tracer_lat, settings['lat_bounds'], 'latitude'
+    )
+    depth_slice = _ofes_contiguous_slice(
+        tracer_depth, settings['depth_bounds_m'], 'depth'
+    )
+    if depth_slice.start == 0:
+        raise ValueError(
+            'OFES continuity validation requires a w interface above the '
+            'shallowest audited tracer layer.'
+        )
+    corner_lon_slice = slice(lon_slice.start, lon_slice.stop + 1)
+    corner_lat_slice = slice(lat_slice.start, lat_slice.stop + 1)
+    scale = float(_OFES_CFG.get('variable_scale', {}).get('w', 0.01))
+    velocity_scale = float(
+        _OFES_CFG.get('variable_scale', {}).get('u', 0.01)
+    )
+    if not np.isclose(
+        velocity_scale,
+        float(_OFES_CFG.get('variable_scale', {}).get('v', 0.01)),
+    ):
+        raise ValueError('OFES u/v unit scales differ unexpectedly.')
+
+    with Dataset(str(_ofes_file_path('u', date_ts)), 'r') as dataset:
+        corner_lon = np.asarray(
+            dataset.variables['lon'][corner_lon_slice], dtype=float
+        )
+        corner_lat = np.asarray(
+            dataset.variables['lat'][corner_lat_slice], dtype=float
+        )
+        u = _ofes_subset_to_float32(
+            dataset.variables['u'],
+            (0, depth_slice, corner_lat_slice, corner_lon_slice),
+        ).astype(float) * velocity_scale
+    with Dataset(str(_ofes_file_path('v', date_ts)), 'r') as dataset:
+        v_corner_lon = np.asarray(
+            dataset.variables['lon'][corner_lon_slice], dtype=float
+        )
+        v_corner_lat = np.asarray(
+            dataset.variables['lat'][corner_lat_slice], dtype=float
+        )
+        _ofes_assert_coordinate_match(
+            v_corner_lon, corner_lon, 'u/v corner longitude'
+        )
+        _ofes_assert_coordinate_match(
+            v_corner_lat, corner_lat, 'u/v corner latitude'
+        )
+        v = _ofes_subset_to_float32(
+            dataset.variables['v'],
+            (0, depth_slice, corner_lat_slice, corner_lon_slice),
+        ).astype(float) * velocity_scale
+    with Dataset(str(_ofes_file_path('w', date_ts)), 'r') as dataset:
+        w_lon = np.asarray(
+            dataset.variables['lon'][lon_slice], dtype=float
+        )
+        w_lat = np.asarray(
+            dataset.variables['lat'][lat_slice], dtype=float
+        )
+        depth_w = np.asarray(dataset.variables['lev'][:], dtype=float) * float(
+            _OFES_CFG.get('depth_scale', 1.0)
+        )
+        w_lower = _ofes_subset_to_float32(
+            dataset.variables['w'],
+            (0, depth_slice, lat_slice, lon_slice),
+        ).astype(float) * scale
+        upper_slice = slice(depth_slice.start - 1, depth_slice.stop - 1)
+        w_upper = _ofes_subset_to_float32(
+            dataset.variables['w'],
+            (0, upper_slice, lat_slice, lon_slice),
+        ).astype(float) * scale
+
+    lon = tracer_lon[lon_slice]
+    lat = tracer_lat[lat_slice]
+    depth = tracer_depth[depth_slice]
+    lower_interface = depth_w[depth_slice]
+    upper_interface = depth_w[upper_slice]
+    coordinate_errors = {
+        'w_lon_max_abs_error_deg': _ofes_assert_coordinate_match(
+            w_lon, lon, 'w/tracer longitude'
+        ),
+        'w_lat_max_abs_error_deg': _ofes_assert_coordinate_match(
+            w_lat, lat, 'w/tracer latitude'
+        ),
+        'u_v_lon_midpoint_max_abs_error_deg': (
+            _ofes_assert_coordinate_match(
+                0.5 * (corner_lon[:-1] + corner_lon[1:]),
+                lon,
+                'B-grid longitude midpoint',
+            )
+        ),
+        'u_v_lat_midpoint_max_abs_error_deg': (
+            _ofes_assert_coordinate_match(
+                0.5 * (corner_lat[:-1] + corner_lat[1:]),
+                lat,
+                'B-grid latitude midpoint',
+            )
+        ),
+    }
+    if not np.all(
+        (upper_interface < depth) & (depth < lower_interface)
+    ):
+        raise RuntimeError(
+            'OFES tracer depths are not bracketed by adjacent w interfaces.'
+        )
+    layer_thickness = lower_interface - upper_interface
+    if np.any(layer_thickness <= 0):
+        raise RuntimeError('OFES w interface depths are not increasing.')
+
+    eastward_east = 0.5 * (u[:, :-1, 1:] + u[:, 1:, 1:])
+    eastward_west = 0.5 * (u[:, :-1, :-1] + u[:, 1:, :-1])
+    northward_north = 0.5 * (v[:, 1:, :-1] + v[:, 1:, 1:])
+    northward_south = 0.5 * (v[:, :-1, :-1] + v[:, :-1, 1:])
+    earth_radius_m = 6371000.0
+    lon_width_rad = np.diff(np.deg2rad(corner_lon))[None, None, :]
+    corner_lat_rad = np.deg2rad(corner_lat)
+    lat_width_rad = np.diff(corner_lat_rad)[None, :, None]
+    center_cosine = np.cos(np.deg2rad(lat))[None, :, None]
+    horizontal_divergence = (
+        (eastward_east - eastward_west)
+        / (earth_radius_m * center_cosine * lon_width_rad)
+        + (
+            northward_north
+            * np.cos(corner_lat_rad[1:])[None, :, None]
+            - northward_south
+            * np.cos(corner_lat_rad[:-1])[None, :, None]
+        )
+        / (earth_radius_m * center_cosine * lat_width_rad)
+    )
+    vertical_shear = (w_lower - w_upper) / layer_thickness[:, None, None]
+    finite = np.isfinite(horizontal_divergence) & np.isfinite(vertical_shear)
+    horizontal = horizontal_divergence[finite]
+    vertical = vertical_shear[finite]
+    if horizontal.size < 2:
+        raise RuntimeError(
+            f'OFES continuity validation has too few finite cells on '
+            f'{date_ts:%Y-%m-%d}.'
+        )
+    horizontal_rms = float(np.sqrt(np.mean(horizontal ** 2)))
+    if not np.isfinite(horizontal_rms) or horizontal_rms <= 0:
+        raise RuntimeError('OFES horizontal-divergence RMS is not positive.')
+    correlation = float(np.corrcoef(horizontal, vertical)[0, 1])
+    regression_slope = float(
+        np.dot(horizontal, vertical) / np.dot(horizontal, horizontal)
+    )
+    normalized_rmse = float(
+        np.sqrt(np.mean((horizontal - vertical) ** 2)) / horizontal_rms
+    )
+    opposite_sign_normalized_rmse = float(
+        np.sqrt(np.mean((horizontal + vertical) ** 2)) / horizontal_rms
+    )
+    finite_fraction = float(horizontal.size / horizontal_divergence.size)
+    passed = bool(
+        finite_fraction >= settings['minimum_finite_fraction']
+        and correlation >= settings['correlation_min']
+        and settings['regression_slope_min']
+        <= regression_slope
+        <= settings['regression_slope_max']
+        and normalized_rmse <= settings['normalized_rmse_max']
+        and opposite_sign_normalized_rmse
+        >= settings['opposite_sign_normalized_rmse_min']
+    )
+    return {
+        'date': date_ts,
+        'finite_cell_count': int(horizontal.size),
+        'total_cell_count': int(horizontal_divergence.size),
+        'finite_fraction': finite_fraction,
+        'correlation': correlation,
+        'regression_slope_through_origin': regression_slope,
+        'normalized_rmse': normalized_rmse,
+        'opposite_sign_normalized_rmse': (
+            opposite_sign_normalized_rmse
+        ),
+        'horizontal_divergence_rms_s_1': horizontal_rms,
+        'maximum_abs_horizontal_divergence_s_1': float(
+            np.max(np.abs(horizontal))
+        ),
+        'maximum_abs_vertical_difference_s_1': float(
+            np.max(np.abs(vertical))
+        ),
+        'audited_depth_level_count': int(depth.size),
+        'minimum_audited_depth_m': float(depth.min()),
+        'maximum_audited_depth_m': float(depth.max()),
+        'minimum_layer_thickness_m': float(layer_thickness.min()),
+        'maximum_layer_thickness_m': float(layer_thickness.max()),
+        **coordinate_errors,
+        'continuity_equation': (
+            'div_h(u,v) = d(w_up)/d(depth_down)'
+        ),
+        'native_velocity_units': 'cm s-1',
+        'validated_velocity_units': 'm s-1',
+        'validated_w_positive_direction': 'up',
+        'particle_depth_tendency': 'd(depth_down)/dt = -w_up',
+        'passed': passed,
+    }
+
+
+def _plot_ofes_vertical_velocity_validation(
+    daily: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+) -> Path:
+    """绘制逐日连续方程与反号对照验证指标。"""
+    labels = pd.to_datetime(daily['date']).dt.strftime('%m-%d')
+    x = np.arange(len(daily))
+    figure, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
+    panels = (
+        (
+            'correlation',
+            settings['correlation_min'],
+            'Correlation',
+            'minimum',
+        ),
+        (
+            'regression_slope_through_origin',
+            1.0,
+            'Through-origin slope',
+            'reference',
+        ),
+        (
+            'normalized_rmse',
+            settings['normalized_rmse_max'],
+            'Normalized RMSE',
+            'maximum',
+        ),
+        (
+            'opposite_sign_normalized_rmse',
+            settings['opposite_sign_normalized_rmse_min'],
+            'Opposite-sign normalized RMSE',
+            'minimum',
+        ),
+    )
+    for axis, (column, threshold, title, label) in zip(
+        axes.flat, panels
+    ):
+        axis.plot(x, daily[column], marker='o', color='#2563eb')
+        axis.axhline(
+            threshold,
+            color='#dc2626',
+            linestyle='--',
+            linewidth=1.2,
+            label=f'{label}: {threshold:g}',
+        )
+        if column == 'regression_slope_through_origin':
+            axis.axhspan(
+                settings['regression_slope_min'],
+                settings['regression_slope_max'],
+                color='#16a34a',
+                alpha=0.08,
+                label=(
+                    'accepted: '
+                    f"{settings['regression_slope_min']:g}–"
+                    f"{settings['regression_slope_max']:g}"
+                ),
+            )
+        axis.set_xticks(x, labels, rotation=30)
+        axis.set_title(title)
+        axis.grid(alpha=0.2)
+        axis.legend(frameon=False, fontsize=9)
+    figure.suptitle(
+        'OFES vertical velocity: B-grid continuity validation',
+        fontsize=15,
+    )
+    figure.tight_layout()
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(settings['figure_dpi']), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def validate_ofes_vertical_velocity(
+    *,
+    validation_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """验证 OFES `w` 的单位、正方向、层界位置与 B-grid 连续方程。
+
+    workflow 直接在原生 MOM3 B-grid 上将 u/v 平均到网格单元东西/
+    南北边界，以球面通量形式求水平散度，再与相邻下层界 `w`
+    差分比较。在向下为正的深度坐标中，向上为正的 `w` 应满足
+    `div_h(u,v) = d(w_up)/d(depth_down)`；反号误差是预注册负对照。
+
+    参数:
+        - validation_overrides (dict | None): 临时覆盖 `ofes.vertical_velocity_validation` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 时写入 OFES 共享输出树。
+        - resume (bool): 是否复用签名一致的完整运行，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、daily_metrics、analysis_summary、figure_path 和 reused_complete_run。
+
+    输出:
+        - `<run_dir>/daily_metrics.parquet`、`analysis_summary.json`、`source_inventory.parquet`、`vertical_velocity_validation.png` 和 `manifest.json`。
+
+    说明:
+        - 只有 complete 且 `validation_passed=true` 的运行可授权三维轨迹消费 `w`。
+        - 本审计同时检查 tracer center 是否位于相邻 `w` 层界之间，不把层界速度静默冒充为层中心速度。
+    """
+    settings = _ofes_vertical_velocity_validation_settings(
+        validation_overrides
+    )
+    source_inventory = _ofes_vertical_velocity_source_inventory(settings)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_file_path,
+            _ofes_contiguous_slice,
+            _ofes_assert_coordinate_match,
+            _ofes_tracer_coordinates,
+            _ofes_subset_to_float32,
+            _ofes_vertical_velocity_validation_settings,
+            _ofes_vertical_velocity_source_inventory,
+            _ofes_vertical_velocity_continuity_day,
+            _plot_ofes_vertical_velocity_validation,
+            validate_ofes_vertical_velocity,
+        )
+    )
+    repo_root = Path(__file__).resolve().parent
+    payload = {
+        'schema_version': 1,
+        'settings': settings,
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'validation_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'ofes_w_validation_{signature[:12]}',
+    }
+    validation_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else Path(plots_output_root)
+        / 'do'
+        / str(
+            _OFES_CFG.get('delta_do_catalog', {}).get(
+                'output_region_slug', 'ofes_np30_ke'
+            )
+        )
+        / settings['output_subdir']
+    )
+    run_dir = validation_root / identity['run_tag']
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES w validation manifest signature differs.'
+            )
+        if previous.get('status') == 'complete' and resume:
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'daily_metrics': pd.read_parquet(
+                        outputs['daily_metrics']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'validation_passed': False,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_dates': 0,
+        'total_dates': int(len(settings['dates'])),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    inventory_path = run_dir / 'source_inventory.parquet'
+    _atomic_write_parquet(source_inventory, inventory_path)
+    completed = 0
+    try:
+        daily = pd.DataFrame(
+            [
+                _ofes_vertical_velocity_continuity_day(date, settings)
+                for date in settings['dates']
+            ]
+        ).sort_values('date', kind='mergesort').reset_index(drop=True)
+        completed = int(len(daily))
+        validation_passed = bool(daily['passed'].all())
+        analysis_summary = {
+            'validation_passed': validation_passed,
+            'validated_date_count': completed,
+            'total_finite_cell_count': int(
+                daily['finite_cell_count'].sum()
+            ),
+            'minimum_finite_fraction': float(
+                daily['finite_fraction'].min()
+            ),
+            'minimum_correlation': float(daily['correlation'].min()),
+            'regression_slope_range': [
+                float(
+                    daily['regression_slope_through_origin'].min()
+                ),
+                float(
+                    daily['regression_slope_through_origin'].max()
+                ),
+            ],
+            'maximum_normalized_rmse': float(
+                daily['normalized_rmse'].max()
+            ),
+            'minimum_opposite_sign_normalized_rmse': float(
+                daily['opposite_sign_normalized_rmse'].min()
+            ),
+            'validated_native_units': 'cm s-1',
+            'validated_output_units': 'm s-1',
+            'validated_w_positive_direction': 'up',
+            'particle_depth_coordinate_positive': 'down',
+            'particle_vertical_tendency': 'd(depth)/dt = -w',
+            'w_vertical_location': 'lower_interface',
+            'continuity_equation': (
+                'div_h(u,v) = d(w_up)/d(depth_down)'
+            ),
+            'opposite_sign_control': (
+                'div_h(u,v) = -d(w_up)/d(depth_down)'
+            ),
+        }
+        if not validation_passed:
+            raise RuntimeError(
+                'OFES vertical velocity failed one or more pre-registered '
+                'continuity gates.'
+            )
+        daily_path = run_dir / 'daily_metrics.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'vertical_velocity_validation.png'
+        _atomic_write_parquet(daily, daily_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_vertical_velocity_validation(
+            daily, figure_path, settings
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'validation_passed': True,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_dates': completed,
+                'outputs': {
+                    'daily_metrics': str(daily_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(inventory_path.resolve()),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'validation_passed': False,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_dates': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_metrics': daily,
         'analysis_summary': analysis_summary,
         'figure_path': figure_path,
         'reused_complete_run': False,

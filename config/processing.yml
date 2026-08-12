@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.33 变更：
+#   - 新增 OFES w 的 B-grid 连续方程、层界位置、单位与正方向数据集专项验证；
+#     三维轨迹只能消费通过预注册门槛的完整 validation manifest。
 # version 1.32 变更：
 #   - 固化 OFES 二维固定深度 trajectory 的线性日场时间插值、解析场误差、积分域边界和有效粒子门槛。
 # version 1.31 变更：
@@ -242,8 +245,8 @@ ofes:
     w: "m s-1"
     eta: "m"
     pressur: "hPa"
-  vertical_velocity_positive: up  # MOM3 约定；正式启用 w 前仍需保留可复现的数据集专项验证
-  vertical_velocity_sign_basis: "MOM3 convention; dataset-specific validation artifact required"
+  vertical_velocity_positive: up  # MOM3 约定；三维轨迹另强制校验本数据集的连续方程 validation manifest
+  vertical_velocity_sign_basis: "MOM3 convention plus required dataset-specific B-grid continuity validation"
   temporal_interpolation: linear_fixed_depth_validated  # 仅 u/v 二维固定深度已过解析场、步长与可逆性验证；三维 w 仍关闭
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
@@ -361,6 +364,19 @@ ofes:
     surface_profile_rossby_tolerance: 0.001
     figure_dpi: 180
     output_subdir: event_lifecycle
+  vertical_velocity_validation:
+    dates: ["2003-01-04", "2003-01-22", "2003-01-26", "2003-04-14", "2003-06-04"]
+    lon_bounds: [142.0, 153.0]
+    lat_bounds: [32.0, 39.0]
+    depth_bounds_m: [250.0, 900.0]
+    minimum_finite_fraction: 0.99
+    correlation_min: 0.99
+    regression_slope_min: 0.95
+    regression_slope_max: 1.05
+    normalized_rmse_max: 0.12
+    opposite_sign_normalized_rmse_min: 1.50
+    figure_dpi: 180
+    output_subdir: vertical_velocity_validation
   trajectory_2d:
     event_ids: ["OFES_DO50_E000002", "OFES_DO50_E000239", "OFES_DO50_E000176"]
     temporal_interpolation: linear
