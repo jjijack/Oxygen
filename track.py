@@ -50289,6 +50289,2036 @@ def run_ofes_3d_trajectory_population(
     }
 
 
+# -------------------- OFES 回溯通风与配对背景粒子 --------------------
+def _ofes_trajectory_ventilation_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES MLD/outcrop 回溯与配对对照配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_ventilation', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_ventilation override keys: '
+                f'{unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'maximum_backtrack_days': int(
+            raw.get('maximum_backtrack_days', 90)
+        ),
+        'reporting_horizons_days': tuple(
+            int(value)
+            for value in raw.get(
+                'reporting_horizons_days', (30, 60, 90)
+            )
+        ),
+        'integration_dt_seconds': float(
+            raw.get('integration_dt_seconds', 3600)
+        ),
+        'domain_margin_km': float(raw.get('domain_margin_km', 700.0)),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'mld_reference_depth_m': float(
+            raw.get('mld_reference_depth_m', 10.0)
+        ),
+        'mld_density_threshold_kg_m3': float(
+            raw.get('mld_density_threshold_kg_m3', 0.03)
+        ),
+        'near_mld_tolerance_m': float(
+            raw.get('near_mld_tolerance_m', 25.0)
+        ),
+        'outcrop_density_tolerance_kg_m3': float(
+            raw.get('outcrop_density_tolerance_kg_m3', 0.03)
+        ),
+        'control_inner_radius_km': float(
+            raw.get('control_inner_radius_km', 120.0)
+        ),
+        'control_outer_radius_km': float(
+            raw.get('control_outer_radius_km', 240.0)
+        ),
+        'control_radius_step_km': float(
+            raw.get('control_radius_step_km', 25.0)
+        ),
+        'control_azimuth_count': int(
+            raw.get('control_azimuth_count', 32)
+        ),
+        'control_depth_scale_m': float(
+            raw.get('control_depth_scale_m', 50.0)
+        ),
+        'control_depth_max_difference_m': float(
+            raw.get('control_depth_max_difference_m', 150.0)
+        ),
+        'control_sigma0_scale_kg_m3': float(
+            raw.get('control_sigma0_scale_kg_m3', 0.05)
+        ),
+        'control_sigma0_max_difference_kg_m3': float(
+            raw.get('control_sigma0_max_difference_kg_m3', 0.15)
+        ),
+        'control_same_sign_do_max_umol_kg': float(
+            raw.get('control_same_sign_do_max_umol_kg', 10.0)
+        ),
+        'control_same_sign_spiciness0_max': float(
+            raw.get('control_same_sign_spiciness0_max', 0.05)
+        ),
+        'kinematic_smoothing_sigma_pixels': float(
+            raw.get('kinematic_smoothing_sigma_pixels', 1.0)
+        ),
+        'kinematic_ro_scale': float(
+            raw.get('kinematic_ro_scale', 0.10)
+        ),
+        'kinematic_strain_scale_s_1': float(
+            raw.get('kinematic_strain_scale_s_1', 1.0e-5)
+        ),
+        'bootstrap_replicates': int(
+            raw.get('bootstrap_replicates', 10000)
+        ),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_ventilation')
+        ),
+    }
+    positive = (
+        'maximum_backtrack_days',
+        'integration_dt_seconds',
+        'domain_margin_km',
+        'mld_reference_depth_m',
+        'mld_density_threshold_kg_m3',
+        'control_inner_radius_km',
+        'control_outer_radius_km',
+        'control_radius_step_km',
+        'control_azimuth_count',
+        'control_depth_scale_m',
+        'control_depth_max_difference_m',
+        'control_sigma0_scale_kg_m3',
+        'control_sigma0_max_difference_kg_m3',
+        'control_same_sign_do_max_umol_kg',
+        'control_same_sign_spiciness0_max',
+        'kinematic_ro_scale',
+        'kinematic_strain_scale_s_1',
+        'bootstrap_replicates',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation positive settings are invalid.'
+        )
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or not 0 < settings['minimum_active_fraction'] <= 1
+        or settings['near_mld_tolerance_m'] < 0
+        or settings['outcrop_density_tolerance_kg_m3'] < 0
+        or settings['kinematic_smoothing_sigma_pixels'] < 0
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation worker/fraction/tolerance '
+            'settings are invalid.'
+        )
+    horizons = settings['reporting_horizons_days']
+    if (
+        not horizons
+        or tuple(sorted(set(horizons))) != horizons
+        or horizons[-1] > settings['maximum_backtrack_days']
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation horizons must be unique, ordered, '
+            'and no longer than maximum_backtrack_days.'
+        )
+    if (
+        settings['control_outer_radius_km']
+        <= settings['control_inner_radius_km']
+        or settings['control_azimuth_count'] < 8
+        or not settings['output_subdir'].strip()
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation control geometry/output is invalid.'
+        )
+    return settings
+
+
+def _ofes_trajectory_ventilation_science_settings(
+    settings: dict,
+) -> dict:
+    """返回不含并发执行度的通风回溯科学参数。"""
+    return {
+        key: value for key, value in settings.items()
+        if key != 'worker_count'
+    }
+
+
+def _ofes_trajectory_ventilation_processing_config_sha256() -> str:
+    """返回剔除通风回溯并发度后的处理配置哈希。"""
+    processing_config = copy.deepcopy(_PROC_CFG)
+    ventilation = processing_config.get('ofes', {}).get(
+        'trajectory_ventilation', {}
+    )
+    ventilation.pop('worker_count', None)
+    return hashlib.sha256(
+        json.dumps(
+            processing_config,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+
+
+def _ofes_trajectory_fixed_bounds(
+    positions: np.ndarray,
+    margin_km: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """从释放位置与固定距离留白构建事件积分域。"""
+    finite = np.all(np.isfinite(positions), axis=1)
+    if not np.any(finite):
+        raise ValueError('OFES trajectory bounds require finite positions.')
+    subset = np.asarray(positions[finite], dtype=float)
+    center_lat = float(np.median(subset[:, 1]))
+    scale = approximate_degree_length(center_lat)
+    margin_m = float(margin_km) * 1000.0
+    lon_margin = margin_m / float(scale['meters_per_degree_lon'])
+    lat_margin = margin_m / float(scale['meters_per_degree_lat'])
+    return (
+        (
+            float(np.min(subset[:, 2]) - lon_margin),
+            float(np.max(subset[:, 2]) + lon_margin),
+        ),
+        (
+            float(np.min(subset[:, 1]) - lat_margin),
+            float(np.max(subset[:, 1]) + lat_margin),
+        ),
+    )
+
+
+def _ofes_ventilation_profile_samples(
+    snapshot: dict,
+    lon_points: np.ndarray,
+    lat_points: np.ndarray,
+) -> dict:
+    """在任意水平点插值完整 T/S/DO 剖面并派生 sigma0/spice。"""
+    lon_points = np.asarray(lon_points, dtype=float)
+    lat_points = np.asarray(lat_points, dtype=float)
+    if lon_points.shape != lat_points.shape or lon_points.ndim != 1:
+        raise ValueError('OFES profile sample lon/lat must be matching 1-D.')
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    count = int(lon_points.size)
+    points = np.column_stack(
+        [
+            np.tile(depth, count),
+            np.repeat(lat_points, depth.size),
+            np.repeat(lon_points, depth.size),
+        ]
+    )
+    values = {}
+    for source, target in (
+        ('temp', 'theta'),
+        ('salinity', 'salinity'),
+        ('do2', 'do2'),
+    ):
+        if source in snapshot:
+            values[target] = _ofes_interp3d(
+                snapshot[source],
+                depth,
+                np.asarray(snapshot['lat'], dtype=float),
+                np.asarray(snapshot['lon'], dtype=float),
+                points,
+            ).reshape(count, depth.size)
+    if 'theta' not in values or 'salinity' not in values:
+        raise ValueError('OFES ventilation profiles require temp and salinity.')
+    pressure = gsw.p_from_z(
+        -np.broadcast_to(depth, (count, depth.size)),
+        np.broadcast_to(lat_points[:, None], (count, depth.size)),
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        values['salinity'],
+        pressure,
+        np.broadcast_to(lon_points[:, None], (count, depth.size)),
+        np.broadcast_to(lat_points[:, None], (count, depth.size)),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, values['theta']
+    )
+    values['sigma0'] = np.asarray(
+        gsw.sigma0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    values['spiciness0'] = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    values['depth'] = depth
+    return values
+
+
+def _ofes_mld_contact_from_profile(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    particle_depth_m: float,
+    target_sigma0: float,
+    settings: dict,
+) -> dict:
+    """从单剖面分别判定实际 MLD 接触与等密度面出露机会。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    sigma_arr = np.asarray(sigma0, dtype=float)
+    finite = np.isfinite(depth_arr) & np.isfinite(sigma_arr)
+    if np.count_nonzero(finite) < 3:
+        return {
+            'mld_diagnostic_valid': False,
+            'mld_m': np.nan,
+            'mld_capped_at_delivery_bottom': False,
+            'particle_sigma0': np.nan,
+            'depth_minus_mld_m': np.nan,
+            'direct_mld_contact': False,
+            'near_mld_contact': False,
+            'isopycnal_outcrop_opportunity': False,
+        }
+    d = depth_arr[finite]
+    sigma = sigma_arr[finite]
+    reference_index = int(
+        np.argmin(
+            np.abs(d - settings['mld_reference_depth_m'])
+        )
+    )
+    threshold_reached = bool(
+        np.any(
+            (d > d[reference_index])
+            & (
+                sigma - sigma[reference_index]
+                >= settings['mld_density_threshold_kg_m3']
+            )
+        )
+    )
+    mld = _mld_from_sigma(
+        d,
+        sigma,
+        settings['mld_density_threshold_kg_m3'],
+        settings['mld_reference_depth_m'],
+    )
+    particle_sigma0 = _ofes_profile_value_at_depth(
+        d, sigma, float(particle_depth_m)
+    )
+    mixed = np.isfinite(sigma) & (d <= float(mld))
+    tolerance = settings['outcrop_density_tolerance_kg_m3']
+    outcrop = bool(
+        np.isfinite(target_sigma0)
+        and np.any(mixed)
+        and float(target_sigma0)
+        >= float(np.nanmin(sigma[mixed]) - tolerance)
+        and float(target_sigma0)
+        <= float(np.nanmax(sigma[mixed]) + tolerance)
+    )
+    clearance = float(particle_depth_m) - float(mld)
+    return {
+        'mld_diagnostic_valid': bool(
+            np.isfinite(mld) and np.isfinite(particle_sigma0)
+        ),
+        'mld_m': float(mld),
+        'mld_capped_at_delivery_bottom': bool(not threshold_reached),
+        'particle_sigma0': float(particle_sigma0),
+        'depth_minus_mld_m': clearance,
+        'direct_mld_contact': bool(clearance <= 0),
+        'near_mld_contact': bool(
+            clearance <= settings['near_mld_tolerance_m']
+        ),
+        'isopycnal_outcrop_opportunity': outcrop,
+    }
+
+
+def _ofes_ventilation_candidate_geometry(
+    core_lon: float,
+    core_lat: float,
+    settings: dict,
+) -> pd.DataFrame:
+    """在预注册环带构造确定性配对对照候选位置。"""
+    radii = np.arange(
+        settings['control_inner_radius_km'],
+        settings['control_outer_radius_km'] + 1e-9,
+        settings['control_radius_step_km'],
+    )
+    if radii[-1] < settings['control_outer_radius_km'] - 1e-9:
+        radii = np.append(radii, settings['control_outer_radius_km'])
+    azimuths = np.linspace(
+        0.0,
+        360.0,
+        int(settings['control_azimuth_count']),
+        endpoint=False,
+    )
+    scale = approximate_degree_length(float(core_lat))
+    records = []
+    candidate_index = 0
+    for radius in radii:
+        for azimuth in azimuths:
+            angle = np.deg2rad(float(azimuth))
+            records.append(
+                {
+                    'candidate_index': candidate_index,
+                    'radius_km': float(radius),
+                    'azimuth_deg': float(azimuth),
+                    'lon': float(
+                        core_lon
+                        + radius * 1000.0 * np.cos(angle)
+                        / float(scale['meters_per_degree_lon'])
+                    ),
+                    'lat': float(
+                        core_lat
+                        + radius * 1000.0 * np.sin(angle)
+                        / float(scale['meters_per_degree_lat'])
+                    ),
+                }
+            )
+            candidate_index += 1
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_interp2d(
+    snapshot: dict,
+    field: np.ndarray,
+    lon_points: np.ndarray,
+    lat_points: np.ndarray,
+) -> np.ndarray:
+    """从规则 OFES 水平网格线性插值二维场。"""
+    interpolator = RegularGridInterpolator(
+        (
+            np.asarray(snapshot['lat'], dtype=float),
+            np.asarray(snapshot['lon'], dtype=float),
+        ),
+        np.asarray(field, dtype=float),
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    values = np.asarray(
+        interpolator(
+            np.column_stack(
+                [
+                    np.asarray(lat_points, dtype=float),
+                    np.asarray(lon_points, dtype=float),
+                ]
+            )
+        ),
+        dtype=float,
+    )
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        grid_lon = np.asarray(snapshot['lon'], dtype=float)
+        grid_lat = np.asarray(snapshot['lat'], dtype=float)
+        field_arr = np.asarray(field, dtype=float)
+        missing_indices = np.flatnonzero(missing)
+        for index in missing_indices:
+            column = int(
+                np.argmin(
+                    np.abs(
+                        _minimal_lon_diff_deg(
+                            grid_lon, float(lon_points[index])
+                        )
+                    )
+                )
+            )
+            row = int(
+                np.argmin(np.abs(grid_lat - float(lat_points[index])))
+            )
+            values[index] = float(field_arr[row, column])
+    return values
+
+
+def _ofes_ventilation_controls(
+    event: dict,
+    anomaly_positions: np.ndarray,
+    anomaly_metadata: pd.DataFrame,
+    settings: dict,
+) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """为异常粒子选择水文匹配与动力也匹配的两组对照。"""
+    peak_date = pd.Timestamp(event['peak_date']).normalize()
+    core_lon = float(event['daily_peak_lon'])
+    core_lat = float(event['daily_peak_lat'])
+    load_radius = settings['control_outer_radius_km'] + 50.0
+    scale = approximate_degree_length(core_lat)
+    lon_margin = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lon'])
+    )
+    lat_margin = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        peak_date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_margin, core_lon + lon_margin),
+        lat_bounds=(core_lat - lat_margin, core_lat + lat_margin),
+        depth_bounds=None,
+    )
+    candidates = _ofes_ventilation_candidate_geometry(
+        core_lon, core_lat, settings
+    )
+    candidate_profiles = _ofes_ventilation_profile_samples(
+        snapshot,
+        candidates['lon'].to_numpy(dtype=float),
+        candidates['lat'].to_numpy(dtype=float),
+    )
+    anomaly_profiles = _ofes_ventilation_profile_samples(
+        snapshot,
+        anomaly_positions[:, 2],
+        anomaly_positions[:, 1],
+    )
+    background = _ofes_trajectory_tracer_background(
+        snapshot,
+        core_lon,
+        core_lat,
+        {
+            'background_inner_radius_km': settings[
+                'control_inner_radius_km'
+            ],
+            'background_outer_radius_km': settings[
+                'control_outer_radius_km'
+            ],
+        },
+    )
+    output_positions = []
+    output_records = []
+    audit_records = []
+    next_index = int(len(anomaly_metadata))
+    peak_do_sign = int(np.sign(float(event['water_mass_do_contrast'])))
+    peak_spice_sign = int(
+        np.sign(float(event['same_sigma_spiciness0_contrast']))
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    kinematics_by_level: dict[int, dict] = {}
+    for depth_m, anomaly_group in anomaly_metadata.groupby(
+        'depth_m', sort=True
+    ):
+        anomaly_indices = anomaly_group.index.to_numpy(dtype=int)
+        candidate_count = len(candidates)
+        anomaly_sigma = np.asarray(
+            [
+                _ofes_profile_value_at_depth(
+                    depth,
+                    anomaly_profiles['sigma0'][index],
+                    float(depth_m),
+                )
+                for index in anomaly_indices
+            ],
+            dtype=float,
+        )
+        row_count = len(anomaly_indices)
+        candidate_depth = np.full(
+            (row_count, candidate_count), np.nan
+        )
+        candidate_sigma = np.full_like(candidate_depth, np.nan)
+        do_contrast = np.full_like(candidate_depth, np.nan)
+        spice_contrast = np.full_like(candidate_depth, np.nan)
+        for local_row, target_sigma in enumerate(anomaly_sigma):
+            background_crossing = _ofes_density_crossing_near_depth(
+                background['depth'],
+                background['sigma0'],
+                float(target_sigma),
+                float(depth_m),
+                background['profiles'],
+            )
+            background_thermo = _ofes_point_thermodynamics(
+                float(background_crossing['depth']),
+                float(background_crossing['salinity']),
+                float(background_crossing['theta']),
+                float(background_crossing['do2']),
+                core_lon,
+                core_lat,
+            )
+            for candidate_index in range(candidate_count):
+                crossing = _ofes_density_crossing_near_depth(
+                    depth,
+                    candidate_profiles['sigma0'][candidate_index],
+                    float(target_sigma),
+                    float(depth_m),
+                    {
+                        'do2': candidate_profiles['do2'][candidate_index],
+                        'theta': candidate_profiles['theta'][candidate_index],
+                        'salinity': candidate_profiles['salinity'][
+                            candidate_index
+                        ],
+                    },
+                )
+                candidate_depth[local_row, candidate_index] = float(
+                    crossing['depth']
+                )
+                candidate_thermo = _ofes_point_thermodynamics(
+                    float(crossing['depth']),
+                    float(crossing['salinity']),
+                    float(crossing['theta']),
+                    float(crossing['do2']),
+                    float(candidates.iloc[candidate_index]['lon']),
+                    float(candidates.iloc[candidate_index]['lat']),
+                )
+                candidate_sigma[local_row, candidate_index] = float(
+                    candidate_thermo['sigma0']
+                )
+                do_contrast[local_row, candidate_index] = float(
+                    crossing['do2'] - background_crossing['do2']
+                )
+                spice_contrast[local_row, candidate_index] = float(
+                    candidate_thermo['spiciness0']
+                    - background_thermo['spiciness0']
+                )
+        strong_same_do = (
+            np.sign(do_contrast) == peak_do_sign
+        ) & (
+            np.abs(do_contrast)
+            >= settings['control_same_sign_do_max_umol_kg']
+        )
+        strong_same_spice = (
+            np.sign(spice_contrast) == peak_spice_sign
+        ) & (
+            np.abs(spice_contrast)
+            >= settings['control_same_sign_spiciness0_max']
+        )
+        depth_difference = np.abs(candidate_depth - float(depth_m))
+        ordinary = (
+            np.isfinite(candidate_sigma)
+            & np.isfinite(do_contrast)
+            & np.isfinite(spice_contrast)
+            & (depth_difference <= settings['control_depth_max_difference_m'])
+            & ~(strong_same_do & strong_same_spice)
+        )
+        anomaly_level_index = int(
+            np.argmin(np.abs(depth - float(depth_m)))
+        )
+        if anomaly_level_index not in kinematics_by_level:
+            kinematics_by_level[anomaly_level_index] = (
+                _ofes_fixed_depth_kinematic_fields(
+                    snapshot,
+                    float(depth[anomaly_level_index]),
+                    settings['kinematic_smoothing_sigma_pixels'],
+                )
+            )
+        kinematics = kinematics_by_level[anomaly_level_index]
+        anomaly_ro = _ofes_ventilation_interp2d(
+            snapshot,
+            kinematics['rossby_number'],
+            anomaly_positions[anomaly_indices, 2],
+            anomaly_positions[anomaly_indices, 1],
+        )
+        anomaly_strain = _ofes_ventilation_interp2d(
+            snapshot,
+            kinematics['total_strain'],
+            anomaly_positions[anomaly_indices, 2],
+            anomaly_positions[anomaly_indices, 1],
+        )
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_sigma0'
+        ] = anomaly_sigma
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_rossby_number'
+        ] = anomaly_ro
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_total_strain_s_1'
+        ] = anomaly_strain
+        candidate_ro = np.full_like(candidate_depth, np.nan)
+        candidate_strain = np.full_like(candidate_depth, np.nan)
+        nearest_level = np.full(candidate_depth.shape, -1, dtype=int)
+        finite_depth = np.isfinite(candidate_depth)
+        nearest_level[finite_depth] = np.argmin(
+            np.abs(
+                depth[:, None]
+                - candidate_depth[finite_depth][None, :]
+            ),
+            axis=0,
+        )
+        for level_index in np.unique(nearest_level[nearest_level >= 0]):
+            if int(level_index) not in kinematics_by_level:
+                kinematics_by_level[int(level_index)] = (
+                    _ofes_fixed_depth_kinematic_fields(
+                        snapshot,
+                        float(depth[level_index]),
+                        settings['kinematic_smoothing_sigma_pixels'],
+                    )
+                )
+            level_kinematics = kinematics_by_level[int(level_index)]
+            level_ro = _ofes_ventilation_interp2d(
+                snapshot,
+                level_kinematics['rossby_number'],
+                candidates['lon'].to_numpy(dtype=float),
+                candidates['lat'].to_numpy(dtype=float),
+            )
+            level_strain = _ofes_ventilation_interp2d(
+                snapshot,
+                level_kinematics['total_strain'],
+                candidates['lon'].to_numpy(dtype=float),
+                candidates['lat'].to_numpy(dtype=float),
+            )
+            matching = nearest_level == int(level_index)
+            candidate_ro[matching] = np.broadcast_to(
+                level_ro, candidate_ro.shape
+            )[matching]
+            candidate_strain[matching] = np.broadcast_to(
+                level_strain, candidate_strain.shape
+            )[matching]
+        hydro_cost = np.sqrt(
+            (
+                (anomaly_sigma[:, None] - candidate_sigma)
+                / settings['control_sigma0_scale_kg_m3']
+            )**2
+            + (
+                depth_difference / settings['control_depth_scale_m']
+            )**2
+        )
+        hydro_cost[~ordinary] = np.inf
+        kinematic_cost = np.sqrt(
+            hydro_cost**2
+            + (
+                (anomaly_ro[:, None] - candidate_ro)
+                / settings['kinematic_ro_scale']
+            )**2
+            + (
+                (
+                    anomaly_strain[:, None]
+                    - candidate_strain
+                )
+                / settings['kinematic_strain_scale_s_1']
+            )**2
+        )
+        kinematic_cost[~np.isfinite(kinematic_cost)] = np.inf
+        for control_group, cost in (
+            ('hydrographic_control', hydro_cost),
+            ('kinematic_control', kinematic_cost),
+        ):
+            if (
+                np.count_nonzero(np.any(np.isfinite(cost), axis=0))
+                < len(anomaly_indices)
+                or np.any(~np.any(np.isfinite(cost), axis=1))
+            ):
+                raise RuntimeError(
+                    f'Insufficient ordinary matched controls for '
+                    f'{event["event_id"]} at {depth_m:g} m.'
+                )
+            try:
+                rows, columns = linear_sum_assignment(cost)
+            except ValueError as error:
+                raise RuntimeError(
+                    f'OFES matched-control cost matrix failed for '
+                    f'{event["event_id"]} {control_group}: {error}'
+                ) from error
+            if len(rows) != len(anomaly_indices) or not np.all(
+                np.isfinite(cost[rows, columns])
+            ):
+                raise RuntimeError(
+                    f'OFES matched-control assignment failed for '
+                    f'{event["event_id"]} {control_group}.'
+                )
+            if np.any(
+                np.abs(
+                    anomaly_sigma[rows] - candidate_sigma[rows, columns]
+                )
+                > settings['control_sigma0_max_difference_kg_m3']
+            ):
+                raise RuntimeError(
+                    f'OFES matched-control sigma0 tolerance failed for '
+                    f'{event["event_id"]} {control_group}.'
+                )
+            for local_row, candidate_index in zip(rows, columns):
+                anomaly_index = int(anomaly_indices[local_row])
+                anomaly = anomaly_metadata.loc[anomaly_index]
+                candidate = candidates.iloc[int(candidate_index)]
+                matched_depth = float(
+                    candidate_depth[local_row, candidate_index]
+                )
+                output_positions.append(
+                    (
+                        matched_depth,
+                        float(candidate['lat']),
+                        float(candidate['lon']),
+                    )
+                )
+                output_records.append(
+                    {
+                        'particle_index': next_index,
+                        'particle_id': (
+                            f'{control_group}_{anomaly.particle_id}'
+                        ),
+                        'particle_group': control_group,
+                        'pair_id': str(anomaly.particle_id),
+                        'depth_m': matched_depth,
+                        'depth_offset_index': int(
+                            anomaly.depth_offset_index
+                        ),
+                        'ring_fraction': float(anomaly.ring_fraction),
+                        'seed_lon': float(candidate['lon']),
+                        'seed_lat': float(candidate['lat']),
+                        'seed_sigma0': float(
+                            candidate_sigma[local_row, candidate_index]
+                        ),
+                        'seed_rossby_number': float(
+                            candidate_ro[local_row, candidate_index]
+                        ),
+                        'seed_total_strain_s_1': float(
+                            candidate_strain[local_row, candidate_index]
+                        ),
+                    }
+                )
+                audit_records.append(
+                    {
+                        'event_id': str(event['event_id']),
+                        'particle_group': control_group,
+                        'pair_id': str(anomaly.particle_id),
+                        'depth_m': float(depth_m),
+                        'control_seed_depth_m': matched_depth,
+                        'absolute_depth_difference_m': float(
+                            abs(matched_depth - float(depth_m))
+                        ),
+                        'candidate_index': int(candidate.candidate_index),
+                        'candidate_radius_km': float(candidate.radius_km),
+                        'candidate_azimuth_deg': float(
+                            candidate.azimuth_deg
+                        ),
+                        'absolute_sigma0_difference': float(
+                            abs(
+                                anomaly_sigma[local_row]
+                                - candidate_sigma[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'absolute_rossby_difference': float(
+                            abs(
+                                anomaly_ro[local_row]
+                                - candidate_ro[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'absolute_strain_difference_s_1': float(
+                            abs(
+                                anomaly_strain[local_row]
+                                - candidate_strain[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'candidate_same_sigma_do_contrast': float(
+                            do_contrast[local_row, candidate_index]
+                        ),
+                        'candidate_same_sigma_spiciness0_contrast': float(
+                            spice_contrast[local_row, candidate_index]
+                        ),
+                        'match_cost': float(cost[local_row, candidate_index]),
+                        'ordinary_fingerprint_gate_passed': bool(
+                            ordinary[local_row, candidate_index]
+                        ),
+                    }
+                )
+                next_index += 1
+    control_positions = np.asarray(output_positions, dtype=float)
+    control_metadata = pd.DataFrame(output_records)
+    if control_metadata.duplicated(
+        ['particle_group', 'pair_id']
+    ).any():
+        raise RuntimeError('OFES matched controls are not one-to-one.')
+    return (
+        control_positions,
+        control_metadata,
+        pd.DataFrame(audit_records),
+        anomaly_metadata,
+    )
+
+
+def _ofes_ventilation_sample_day(
+    event_id: str,
+    date: pd.Timestamp,
+    positions: np.ndarray,
+    status: np.ndarray,
+    particle_metadata: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """在一个回溯日诊断每粒子 MLD 接触与出露机会。"""
+    active = np.asarray(status).astype(str) == 'active'
+    records = []
+    diagnostics: dict[int, dict] = {}
+    if np.any(active):
+        active_position = np.asarray(positions[active], dtype=float)
+        center_lat = float(np.nanmedian(active_position[:, 1]))
+        scale = approximate_degree_length(center_lat)
+        lon_margin = 20_000.0 / float(scale['meters_per_degree_lon'])
+        lat_margin = 20_000.0 / float(scale['meters_per_degree_lat'])
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['temp', 'salinity'],
+            lon_bounds=(
+                float(np.nanmin(active_position[:, 2]) - lon_margin),
+                float(np.nanmax(active_position[:, 2]) + lon_margin),
+            ),
+            lat_bounds=(
+                float(np.nanmin(active_position[:, 1]) - lat_margin),
+                float(np.nanmax(active_position[:, 1]) + lat_margin),
+            ),
+            depth_bounds=None,
+        )
+        profiles = _ofes_ventilation_profile_samples(
+            snapshot,
+            active_position[:, 2],
+            active_position[:, 1],
+        )
+        for local_index, particle_index in enumerate(np.flatnonzero(active)):
+            metadata = particle_metadata.iloc[int(particle_index)]
+            diagnostics[int(particle_index)] = (
+                _ofes_mld_contact_from_profile(
+                    profiles['depth'],
+                    profiles['sigma0'][local_index],
+                    float(active_position[local_index, 0]),
+                    float(metadata['seed_sigma0']),
+                    settings,
+                )
+            )
+    for particle_index, metadata in particle_metadata.iterrows():
+        diagnostic = diagnostics.get(
+            int(particle_index),
+            {
+                'mld_diagnostic_valid': False,
+                'mld_m': np.nan,
+                'mld_capped_at_delivery_bottom': False,
+                'particle_sigma0': np.nan,
+                'depth_minus_mld_m': np.nan,
+                'direct_mld_contact': False,
+                'near_mld_contact': False,
+                'isopycnal_outcrop_opportunity': False,
+            },
+        )
+        records.append(
+            {
+                'event_id': str(event_id),
+                'date': pd.Timestamp(date).normalize(),
+                'particle_index': int(particle_index),
+                'particle_id': str(metadata['particle_id']),
+                'particle_group': str(metadata['particle_group']),
+                'pair_id': str(metadata['pair_id']),
+                'status': str(status[int(particle_index)]),
+                'depth_m': float(positions[int(particle_index), 0]),
+                'lat': float(positions[int(particle_index), 1]),
+                'lon': float(positions[int(particle_index), 2]),
+                'seed_sigma0': float(metadata['seed_sigma0']),
+                **diagnostic,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_velocity_snapshot(
+    date: pd.Timestamp,
+    lon_bounds: tuple[float, float],
+    lat_bounds: tuple[float, float],
+    validation_manifest: dict,
+) -> dict:
+    """加载一个已通过专项 w 门控的通风回溯速度快照。"""
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['u', 'v', 'w'],
+        lon_bounds=lon_bounds,
+        lat_bounds=lat_bounds,
+        depth_bounds=None,
+    )
+    snapshot['metadata']['w_validation_passed'] = True
+    snapshot['metadata']['w_validation_run_signature'] = str(
+        validation_manifest['run_signature']
+    )
+    return snapshot
+
+
+def _ofes_ventilation_horizon_summary(
+    daily: pd.DataFrame,
+    peak_date: pd.Timestamp,
+    available_backtrack_days: int,
+    settings: dict,
+) -> pd.DataFrame:
+    """按预注册 30/60/90 天窗口汇总事件等权通风指标。"""
+    frame = daily.copy()
+    frame['lookback_days'] = (
+        pd.Timestamp(peak_date).normalize()
+        - pd.to_datetime(frame['date']).dt.normalize()
+    ).dt.days.astype(int)
+    records = []
+    for horizon in settings['reporting_horizons_days']:
+        window = frame.loc[frame['lookback_days'] <= int(horizon)].copy()
+        for particle_group, group in window.groupby(
+            'particle_group', sort=True
+        ):
+            boundary_lookback = min(
+                int(horizon), int(available_backtrack_days)
+            )
+            boundary = group.loc[
+                group['lookback_days'] == boundary_lookback
+            ]
+            boundary_active_ids = boundary.loc[
+                boundary['status'].astype(str) == 'active',
+                'particle_id',
+            ].astype(str)
+            valid_day_count = group.groupby('particle_id')[
+                'mld_diagnostic_valid'
+            ].sum()
+            expected_day_count = int(boundary_lookback + 1)
+            valid_ids = valid_day_count.index[
+                valid_day_count == expected_day_count
+            ].astype(str)
+            complete_ids = pd.Index(boundary_active_ids).intersection(
+                pd.Index(valid_ids)
+            )
+            complete = group.loc[
+                group['particle_id'].astype(str).isin(complete_ids)
+            ].copy()
+            initial_count = int(group['particle_id'].nunique())
+            complete_count = int(len(complete_ids))
+            per_particle = complete.groupby('particle_id').agg(
+                ever_direct_mld_contact=('direct_mld_contact', 'max'),
+                ever_near_mld_contact=('near_mld_contact', 'max'),
+                ever_outcrop_opportunity=(
+                    'isopycnal_outcrop_opportunity', 'max'
+                ),
+                direct_contact_days=('direct_mld_contact', 'sum'),
+                near_contact_days=('near_mld_contact', 'sum'),
+                outcrop_opportunity_days=(
+                    'isopycnal_outcrop_opportunity', 'sum'
+                ),
+                minimum_depth_minus_mld_m=('depth_minus_mld_m', 'min'),
+            )
+            most_recent = (
+                complete.loc[complete['direct_mld_contact']]
+                .groupby('particle_id')['lookback_days']
+                .min()
+            )
+            records.append(
+                {
+                    'event_id': str(frame['event_id'].iloc[0]),
+                    'particle_group': str(particle_group),
+                    'horizon_days': int(horizon),
+                    'available_backtrack_days': int(
+                        available_backtrack_days
+                    ),
+                    'full_horizon_observed': bool(
+                        available_backtrack_days >= int(horizon)
+                    ),
+                    'initial_particle_count': initial_count,
+                    'complete_particle_count': complete_count,
+                    'complete_particle_fraction': float(
+                        complete_count / initial_count
+                    ) if initial_count else np.nan,
+                    'diagnostic_passed': bool(
+                        available_backtrack_days >= int(horizon)
+                        and initial_count > 0
+                        and complete_count / initial_count
+                        >= settings['minimum_active_fraction']
+                    ),
+                    'ever_direct_mld_contact_fraction': float(
+                        per_particle['ever_direct_mld_contact'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'ever_near_mld_contact_fraction': float(
+                        per_particle['ever_near_mld_contact'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'ever_outcrop_opportunity_fraction': float(
+                        per_particle['ever_outcrop_opportunity'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'median_direct_contact_days': float(
+                        per_particle['direct_contact_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_near_contact_days': float(
+                        per_particle['near_contact_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_outcrop_opportunity_days': float(
+                        per_particle['outcrop_opportunity_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_minimum_depth_minus_mld_m': float(
+                        per_particle['minimum_depth_minus_mld_m'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_most_recent_direct_contact_lookback_days': float(
+                        most_recent.median()
+                    ) if len(most_recent) else np.nan,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回单事件通风回溯 fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'particle_metadata': event_dir / 'particle_metadata.parquet',
+        'control_audit': event_dir / 'control_audit.parquet',
+        'daily_diagnostics': event_dir / 'daily_diagnostics.parquet',
+        'horizon_summary': event_dir / 'horizon_summary.parquet',
+    }
+
+
+def _ofes_ventilation_fragment_reusable(
+    paths: dict[str, Path],
+    run_signature: str,
+) -> bool:
+    """判定通风回溯 fragment 是否完整且签名一致。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    return bool(
+        stored.get('ventilation_run_signature') == str(run_signature)
+    )
+
+
+def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
+    """流式回溯一个事件的异常/对照粒子并原子落盘。"""
+    event = dict(payload['event'])
+    event_id = str(event['event_id'])
+    settings = payload['settings']
+    validation_manifest = payload['validation_manifest']
+    paths = _ofes_ventilation_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    trajectory_settings = payload['trajectory_settings']
+    anomaly_positions, anomaly_metadata, _ = (
+        _ofes_trajectory_seed_ensemble(
+            event['peak_date'],
+            float(event['daily_peak_lon']),
+            float(event['daily_peak_lat']),
+            float(event['reference_depth_m']),
+            float(event['daily_peak_equivalent_radius_km']),
+            trajectory_settings,
+        )
+    )
+    anomaly_metadata['particle_group'] = 'anomaly'
+    anomaly_metadata['pair_id'] = anomaly_metadata['particle_id'].astype(str)
+    (
+        control_positions,
+        control_metadata,
+        control_audit,
+        anomaly_metadata,
+    ) = _ofes_ventilation_controls(
+        event,
+        anomaly_positions,
+        anomaly_metadata,
+        settings,
+    )
+    particle_metadata = pd.concat(
+        [
+            anomaly_metadata,
+            control_metadata,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    particle_metadata['particle_index'] = np.arange(
+        len(particle_metadata), dtype=int
+    )
+    positions = np.vstack([anomaly_positions, control_positions])
+    if len(positions) != len(particle_metadata):
+        raise RuntimeError('OFES ventilation particle metadata mismatch.')
+    status = np.full(len(positions), 'active', dtype='<U8')
+    lon_bounds, lat_bounds = _ofes_trajectory_fixed_bounds(
+        positions, settings['domain_margin_km']
+    )
+    peak_date = pd.Timestamp(event['peak_date']).normalize()
+    data_start = pd.Timestamp(payload['data_start_date']).normalize()
+    requested_start = peak_date - pd.Timedelta(
+        days=settings['maximum_backtrack_days']
+    )
+    start_date = max(data_start, requested_start)
+    available_days = int((peak_date - start_date).days)
+    daily_frames = [
+        _ofes_ventilation_sample_day(
+            event_id,
+            peak_date,
+            positions,
+            status,
+            particle_metadata,
+            settings,
+        )
+    ]
+    current_snapshot = _ofes_ventilation_velocity_snapshot(
+        peak_date,
+        lon_bounds,
+        lat_bounds,
+        validation_manifest,
+    )
+    current_date = peak_date
+    while current_date > start_date:
+        previous_date = current_date - pd.Timedelta(days=1)
+        previous_snapshot = _ofes_ventilation_velocity_snapshot(
+            previous_date,
+            lon_bounds,
+            lat_bounds,
+            validation_manifest,
+        )
+        active_index = np.flatnonzero(status == 'active')
+        if active_index.size:
+            result = advect_ofes_particles(
+                [previous_snapshot, current_snapshot],
+                positions[active_index],
+                backward=True,
+                dt_seconds=settings['integration_dt_seconds'],
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            positions[active_index] = np.asarray(
+                result['positions'][-1], dtype=float
+            )
+            status[active_index] = np.asarray(
+                result['final_status']
+            ).astype(str)
+        daily_frames.append(
+            _ofes_ventilation_sample_day(
+                event_id,
+                previous_date,
+                positions,
+                status,
+                particle_metadata,
+                settings,
+            )
+        )
+        current_snapshot = previous_snapshot
+        current_date = previous_date
+    daily = pd.concat(daily_frames, ignore_index=True)
+    horizon = _ofes_ventilation_horizon_summary(
+        daily,
+        peak_date,
+        available_days,
+        settings,
+    )
+    summary = {
+        'event_id': event_id,
+        'peak_date': peak_date,
+        'backtrack_start_date': start_date,
+        'available_backtrack_days': available_days,
+        'left_censored_at_data_start': bool(
+            requested_start < data_start
+        ),
+        'particle_count': int(len(particle_metadata)),
+        'particle_count_by_group': {
+            str(key): int(value)
+            for key, value in particle_metadata.groupby(
+                'particle_group'
+            ).size().items()
+        },
+        'minimum_final_active_fraction': float(
+            horizon.loc[
+                horizon['horizon_days']
+                == min(
+                    available_days,
+                    settings['reporting_horizons_days'][-1],
+                ),
+                'complete_particle_fraction',
+            ].min()
+        ) if available_days in settings['reporting_horizons_days'] else float(
+            daily.loc[daily['date'] == start_date]
+            .groupby('particle_group')['status']
+            .apply(lambda values: (values == 'active').mean())
+            .min()
+        ),
+        'ventilation_run_signature': str(payload['run_signature']),
+    }
+    _ofes_atomic_write_json(summary, paths['summary'])
+    _atomic_write_parquet(particle_metadata, paths['particle_metadata'])
+    _atomic_write_parquet(control_audit, paths['control_audit'])
+    _atomic_write_parquet(daily, paths['daily_diagnostics'])
+    _atomic_write_parquet(horizon, paths['horizon_summary'])
+    return {
+        'event_id': event_id,
+        'available_backtrack_days': available_days,
+    }
+
+
+def _ofes_load_ventilation_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的通风回溯 fragment。"""
+    paths = _ofes_ventilation_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        **{
+            key: pd.read_parquet(paths[key])
+            for key in (
+                'particle_metadata',
+                'control_audit',
+                'daily_diagnostics',
+                'horizon_summary',
+            )
+        },
+    }
+
+
+def _ofes_ventilation_group_comparison(
+    horizon_summary: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """以事件为统计单位比较异常与两组配对对照。"""
+    metrics = (
+        'ever_direct_mld_contact_fraction',
+        'ever_near_mld_contact_fraction',
+        'ever_outcrop_opportunity_fraction',
+    )
+    records = []
+    summary = {}
+    rng = np.random.default_rng(settings['random_seed'])
+    for horizon in settings['reporting_horizons_days']:
+        subset = horizon_summary.loc[
+            (horizon_summary['horizon_days'] == int(horizon))
+            & horizon_summary['diagnostic_passed']
+        ].copy()
+        wide = subset.pivot(
+            index='event_id',
+            columns='particle_group',
+            values=list(metrics),
+        )
+        horizon_payload = {}
+        for control_group in (
+            'hydrographic_control', 'kinematic_control'
+        ):
+            group_payload = {}
+            for metric in metrics:
+                if (
+                    (metric, 'anomaly') not in wide
+                    or (metric, control_group) not in wide
+                ):
+                    difference = np.asarray([], dtype=float)
+                else:
+                    pair = wide[
+                        [(metric, 'anomaly'), (metric, control_group)]
+                    ].dropna()
+                    difference = (
+                        pair[(metric, 'anomaly')]
+                        - pair[(metric, control_group)]
+                    ).to_numpy(dtype=float)
+                if difference.size:
+                    bootstrap = difference[
+                        rng.integers(
+                            0,
+                            difference.size,
+                            size=(
+                                settings['bootstrap_replicates'],
+                                difference.size,
+                            ),
+                        )
+                    ].mean(axis=1)
+                    interval = np.quantile(bootstrap, (0.025, 0.975))
+                    if np.allclose(difference, 0):
+                        statistic = 0.0
+                        p_value = 1.0
+                    else:
+                        test = scipy.stats.wilcoxon(
+                            difference,
+                            alternative='two-sided',
+                            zero_method='pratt',
+                        )
+                        statistic = float(test.statistic)
+                        p_value = float(test.pvalue)
+                else:
+                    interval = (np.nan, np.nan)
+                    statistic = np.nan
+                    p_value = np.nan
+                record = {
+                    'horizon_days': int(horizon),
+                    'control_group': control_group,
+                    'metric': metric,
+                    'event_count': int(difference.size),
+                    'event_equal_mean_difference': float(
+                        np.mean(difference)
+                    ) if difference.size else np.nan,
+                    'event_equal_median_difference': float(
+                        np.median(difference)
+                    ) if difference.size else np.nan,
+                    'bootstrap95_low': float(interval[0]),
+                    'bootstrap95_high': float(interval[1]),
+                    'paired_wilcoxon_statistic': statistic,
+                    'paired_wilcoxon_p': p_value,
+                }
+                records.append(record)
+                group_payload[metric] = record
+            horizon_payload[control_group] = group_payload
+        summary[str(horizon)] = horizon_payload
+    return pd.DataFrame(records), summary
+
+
+def _plot_ofes_trajectory_ventilation(
+    horizon_summary: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+) -> Path:
+    """绘制异常与配对对照的事件等权通风历史图。"""
+    metrics = (
+        ('ever_direct_mld_contact_fraction', 'Direct MLD contact'),
+        ('ever_near_mld_contact_fraction', 'Within 25 m of MLD'),
+        ('ever_outcrop_opportunity_fraction', 'Isopycnal outcrop opportunity'),
+    )
+    groups = (
+        ('anomaly', '#d62728'),
+        ('hydrographic_control', '#4c78a8'),
+        ('kinematic_control', '#72b7b2'),
+    )
+    figure, axes = plt.subplots(
+        1, 3, figsize=(15, 4.8), constrained_layout=True
+    )
+    for axis, (metric, title) in zip(axes, metrics):
+        for group, color in groups:
+            rows = horizon_summary.loc[
+                (horizon_summary['particle_group'] == group)
+                & horizon_summary['diagnostic_passed']
+            ]
+            values = rows.groupby('horizon_days')[metric]
+            x = np.asarray(sorted(values.groups), dtype=float)
+            median = values.median().reindex(x).to_numpy(dtype=float)
+            q25 = values.quantile(0.25).reindex(x).to_numpy(dtype=float)
+            q75 = values.quantile(0.75).reindex(x).to_numpy(dtype=float)
+            axis.plot(
+                x,
+                median,
+                marker='o',
+                linewidth=2.0,
+                color=color,
+                label=group.replace('_', ' '),
+            )
+            axis.fill_between(x, q25, q75, color=color, alpha=0.16)
+        axis.set_title(title)
+        axis.set_xlabel('Backtrack horizon (days)')
+        axis.set_ylabel('Fraction of complete particles')
+        axis.set_ylim(-0.03, 1.03)
+        axis.grid(alpha=0.2)
+    axes[0].legend(frameon=False, fontsize=9)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        output, dpi=int(settings['figure_dpi']), bbox_inches='tight'
+    )
+    plt.close(figure)
+    return output
+
+
+def _validate_ofes_ventilation_diagnostics(settings: dict) -> dict:
+    """用解析密度剖面验证 MLD 插值与两类接触语义。"""
+    depth = np.asarray([2.5, 10.0, 20.0, 40.0, 80.0])
+    sigma0 = np.asarray([25.0, 25.0, 25.01, 25.03, 25.10])
+    direct = _ofes_mld_contact_from_profile(
+        depth, sigma0, 30.0, 25.02, settings
+    )
+    deep = _ofes_mld_contact_from_profile(
+        depth, sigma0, 60.0, 25.08, settings
+    )
+    passed = bool(
+        abs(direct['mld_m'] - 40.0) <= 1.0e-10
+        and direct['direct_mld_contact']
+        and direct['isopycnal_outcrop_opportunity']
+        and not deep['direct_mld_contact']
+        and not deep['isopycnal_outcrop_opportunity']
+    )
+    payload = {
+        'passed': passed,
+        'expected_mld_m': 40.0,
+        'actual_mld_m': float(direct['mld_m']),
+        'direct_contact_case_passed': bool(
+            direct['direct_mld_contact']
+        ),
+        'outcrop_opportunity_case_passed': bool(
+            direct['isopycnal_outcrop_opportunity']
+        ),
+        'deep_noncontact_case_passed': bool(
+            not deep['direct_mld_contact']
+        ),
+        'dense_nonoutcrop_case_passed': bool(
+            not deep['isopycnal_outcrop_opportunity']
+        ),
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES ventilation analytic validation failed: {payload}'
+        )
+    return payload
+
+
+def run_ofes_3d_trajectory_ventilation(
+    population_run_dir: str | Path,
+    w_validation_run_dir: str | Path,
+    trajectory_population_run_dir: str | Path,
+    *,
+    ventilation_overrides: dict | None = None,
+    trajectory_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """回溯 OFES 异常与配对背景粒子的 MLD 接触史和出露机会。
+
+    workflow 在每个严格 DO50 事件的峰值日释放 51 个异常 ensemble 粒子，并在
+    120–240 km 环带为每个粒子分别选择同深度/近 sigma0 的普通水团对照和进一步
+    匹配 Ro/strain 的敏感性对照。三组粒子使用已门控的逐日 u/v/w 向后积分最多
+    90 天；逐日密度阈值 MLD 的实际接触和释放 sigma0 在当前位置的出露机会分开统计。
+
+    参数:
+        - population_run_dir (str | Path): 已完成的严格59-event峰值总体目录。
+        - w_validation_run_dir (str | Path): 已完成且通过的OFES垂向速度专项验证目录。
+        - trajectory_population_run_dir (str | Path): 已完成的三维轨迹总体目录，用于resolved-pathway分层而非复用短轨迹。
+        - ventilation_overrides (dict | None): 临时覆盖 `ofes.trajectory_ventilation` 配置。
+        - trajectory_overrides (dict | None): 临时覆盖已验证的粒子释放几何配置。
+        - output_dir (str | Path | None): 输出根目录；None写入三维轨迹总体目录下配置子目录。
+        - resume (bool): 是否复用签名一致的逐事件 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、逐日诊断、事件×窗口摘要、配对审计、总体比较、analysis summary和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`daily_ventilation_diagnostics.parquet`、`event_horizon_summary.parquet`、`control_match_audit.parquet`、`group_comparison.parquet`、`analysis_summary.json`、`trajectory_ventilation.png` 与 `manifest.json`。
+
+    说明:
+        - direct MLD contact 要求粒子深度不深于同日同点 MLD；25 m near-contact 仅作敏感性。
+        - outcrop opportunity 只表示粒子峰值 sigma0 落入当前位置混合层密度范围，不等同于粒子实际通风。
+        - 对照不匹配异常水团指纹；主对照故意不匹配旋转，Ro/strain匹配只作次级敏感性。
+        - 30/60/90 天比例只纳入窗口完整且组内存活率达门槛的事件，年初事件显式左删失。
+    """
+    population_root = Path(population_run_dir)
+    validation_root = Path(w_validation_run_dir)
+    trajectory_root = Path(trajectory_population_run_dir)
+    settings = _ofes_trajectory_ventilation_settings(
+        ventilation_overrides
+    )
+    trajectory_settings = _ofes_trajectory_3d_settings(
+        trajectory_overrides
+    )
+    population_manifest = json.loads(
+        (population_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    validation_manifest = json.loads(
+        (validation_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    trajectory_manifest = json.loads(
+        (trajectory_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if population_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES ventilation requires a complete peak population.'
+        )
+    if (
+        validation_manifest.get('status') != 'complete'
+        or validation_manifest.get('validation_passed') is not True
+    ):
+        raise RuntimeError(
+            'OFES ventilation requires a complete passed w validation.'
+        )
+    if trajectory_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES ventilation requires a complete 3-D population run.'
+        )
+    population = pd.read_parquet(
+        population_manifest['outputs']['population_peak_diagnostics']
+    )
+    events = population.loc[
+        population['population_diagnostic_passed']
+    ].copy()
+    events['peak_date'] = pd.to_datetime(events['peak_date']).dt.normalize()
+    events = events.sort_values(
+        ['peak_date', 'event_id'], kind='mergesort'
+    ).reset_index(drop=True)
+    if events.empty:
+        raise RuntimeError('OFES ventilation found no strict events.')
+    catalog_manifest_path = Path(
+        population_manifest['catalog_run_dir']
+    ) / 'manifest.json'
+    catalog_manifest = json.loads(
+        catalog_manifest_path.read_text(encoding='utf-8')
+    )
+    data_start_date = pd.Timestamp(
+        catalog_manifest['start_date']
+    ).normalize()
+    classification = pd.read_parquet(
+        trajectory_manifest['outputs']['population_classification']
+    )
+    classification_columns = (
+        'event_id',
+        'resolved_vertical_pathway_supported',
+        'resolved_downward_pathway_supported',
+        'resolved_upward_pathway_supported',
+        'vertical_direction_matched',
+    )
+    event_context = events[
+        [
+            'event_id',
+            'peak_date',
+            'kinematic_regime',
+            'rotation_dominated',
+            'negative_subsurface_rossby_number',
+            'water_mass_dominated',
+        ]
+    ].merge(
+        classification[list(classification_columns)],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    source_records = []
+    for event in events.itertuples(index=False):
+        start = max(
+            data_start_date,
+            pd.Timestamp(event.peak_date)
+            - pd.Timedelta(days=settings['maximum_backtrack_days']),
+        )
+        for date in pd.date_range(start, event.peak_date):
+            variables = ['u', 'v', 'w', 'temp', 'salinity']
+            if date == pd.Timestamp(event.peak_date):
+                variables.append('do2')
+            for variable in variables:
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                source_records.append(
+                    {
+                        'event_id': str(event.event_id),
+                        'date': pd.Timestamp(date).normalize(),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    source_inventory = pd.DataFrame(source_records)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_trajectory_ventilation_settings,
+            _ofes_trajectory_ventilation_science_settings,
+            _ofes_trajectory_ventilation_processing_config_sha256,
+            _ofes_trajectory_fixed_bounds,
+            _ofes_ventilation_profile_samples,
+            _ofes_mld_contact_from_profile,
+            _ofes_ventilation_candidate_geometry,
+            _ofes_ventilation_interp2d,
+            _ofes_ventilation_controls,
+            _ofes_ventilation_sample_day,
+            _ofes_ventilation_velocity_snapshot,
+            _ofes_ventilation_horizon_summary,
+            _ofes_ventilation_fragment_paths,
+            _ofes_ventilation_fragment_reusable,
+            _ofes_run_ventilation_event_worker,
+            _ofes_load_ventilation_fragment,
+            _ofes_ventilation_group_comparison,
+            _plot_ofes_trajectory_ventilation,
+            _validate_ofes_ventilation_diagnostics,
+            run_ofes_3d_trajectory_ventilation,
+            advect_ofes_particles,
+            load_ofes_snapshot,
+        )
+    )
+    payload = {
+        'schema_version': 1,
+        'population_run_dir': str(population_root.resolve()),
+        'population_run_signature': population_manifest['run_signature'],
+        'w_validation_run_dir': str(validation_root.resolve()),
+        'w_validation_run_signature': validation_manifest['run_signature'],
+        'trajectory_population_run_dir': str(trajectory_root.resolve()),
+        'trajectory_population_run_signature': trajectory_manifest[
+            'run_signature'
+        ],
+        'input_sha256': {
+            'population_manifest.json': _file_sha256(
+                population_root / 'manifest.json'
+            ),
+            'population_peak_diagnostics.parquet': _file_sha256(
+                population_manifest['outputs'][
+                    'population_peak_diagnostics'
+                ]
+            ),
+            'w_validation_manifest.json': _file_sha256(
+                validation_root / 'manifest.json'
+            ),
+            'trajectory_population_manifest.json': _file_sha256(
+                trajectory_root / 'manifest.json'
+            ),
+            'population_classification.parquet': _file_sha256(
+                trajectory_manifest['outputs'][
+                    'population_classification'
+                ]
+            ),
+            'catalog_manifest.json': _file_sha256(catalog_manifest_path),
+        },
+        'settings': _ofes_trajectory_ventilation_science_settings(
+            settings
+        ),
+        'trajectory_release_settings': {
+            key: trajectory_settings[key]
+            for key in (
+                'ensemble_ring_fractions',
+                'ensemble_azimuth_count',
+                'adjacent_depth_levels',
+            )
+        },
+        'event_ids': events['event_id'].astype(str).tolist(),
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_science_config_sha256': (
+            _ofes_trajectory_ventilation_processing_config_sha256()
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'scipy_version': str(scipy.__version__),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'execution_settings': {
+            'worker_count': int(settings['worker_count'])
+        },
+        'processing_config_sha256': _file_sha256(
+            Path(__file__).resolve().parent / 'config' / 'processing.yml'
+        ),
+        'run_signature': signature,
+        'run_tag': f'ofes_trajectory_ventilation_{signature[:12]}',
+    }
+    output_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else trajectory_root / settings['output_subdir']
+    )
+    run_dir = output_root / identity['run_tag']
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES ventilation manifest signature differs.'
+            )
+        if previous.get('status') == 'complete' and resume:
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'daily_diagnostics': pd.read_parquet(
+                        outputs['daily_diagnostics']
+                    ),
+                    'horizon_summary': pd.read_parquet(
+                        outputs['horizon_summary']
+                    ),
+                    'control_audit': pd.read_parquet(
+                        outputs['control_audit']
+                    ),
+                    'particle_metadata': pd.read_parquet(
+                        outputs['particle_metadata']
+                    ),
+                    'group_comparison': pd.read_parquet(
+                        outputs['group_comparison']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_events': 0,
+        'total_events': int(len(events)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(event_context, run_dir / 'event_context.parquet')
+    analytic_validation = _validate_ofes_ventilation_diagnostics(settings)
+    analytic_path = run_dir / 'analytic_validation.json'
+    _ofes_atomic_write_json(analytic_validation, analytic_path)
+    completed = 0
+    try:
+        pending = []
+        for event in events.to_dict(orient='records'):
+            paths = _ofes_ventilation_fragment_paths(
+                events_dir, str(event['event_id'])
+            )
+            if resume and _ofes_ventilation_fragment_reusable(
+                paths, signature
+            ):
+                completed += 1
+            else:
+                pending.append(
+                    {
+                        'event': event,
+                        'settings': settings,
+                        'trajectory_settings': trajectory_settings,
+                        'validation_manifest': validation_manifest,
+                        'data_start_date': data_start_date,
+                        'events_dir': str(events_dir.resolve()),
+                        'run_signature': signature,
+                    }
+                )
+        pending.sort(
+            key=lambda item: pd.Timestamp(item['event']['peak_date']),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory ventilation] '
+            f'events={len(events)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={settings["worker_count"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=int(settings['worker_count']),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_ventilation_event_worker, task
+                    ): str(task['event']['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory ventilation] '
+                        f'{completed}/{len(events)} complete: '
+                        f'{result["event_id"]} '
+                        f'({result["available_backtrack_days"]} d)',
+                        flush=True,
+                    )
+        fragments = [
+            _ofes_load_ventilation_fragment(events_dir, event_id)
+            for event_id in events['event_id'].astype(str)
+        ]
+        daily = pd.concat(
+            [item['daily_diagnostics'] for item in fragments],
+            ignore_index=True,
+        )
+        horizon = pd.concat(
+            [item['horizon_summary'] for item in fragments],
+            ignore_index=True,
+        ).merge(
+            event_context.drop(columns='peak_date'),
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        control_audit = pd.concat(
+            [item['control_audit'] for item in fragments],
+            ignore_index=True,
+        )
+        particle_metadata = pd.concat(
+            [
+                item['particle_metadata'].assign(
+                    event_id=str(event_id)
+                )
+                for event_id, item in zip(
+                    events['event_id'].astype(str), fragments
+                )
+            ],
+            ignore_index=True,
+        )
+        event_summary = pd.DataFrame(
+            [item['summary'] for item in fragments]
+        )
+        comparison_frames = []
+        comparison_payload = {}
+        comparison_subsets = {
+            'all_events': horizon,
+            **{
+                f'kinematic_{regime}': group
+                for regime, group in horizon.groupby(
+                    'kinematic_regime', dropna=True, sort=True
+                )
+            },
+            'resolved_vertical_pathway': horizon.loc[
+                horizon['resolved_vertical_pathway_supported'].eq(True)
+            ],
+        }
+        for subset_name, subset in comparison_subsets.items():
+            frame, subset_payload = _ofes_ventilation_group_comparison(
+                subset, settings
+            )
+            frame.insert(0, 'analysis_subset', subset_name)
+            comparison_frames.append(frame)
+            comparison_payload[subset_name] = subset_payload
+        comparison = pd.concat(comparison_frames, ignore_index=True)
+        full_window_counts = {}
+        for horizon_days in settings['reporting_horizons_days']:
+            window = horizon.loc[
+                horizon['horizon_days'] == horizon_days
+            ]
+            passed_by_event = window.groupby('event_id').agg(
+                group_count=('particle_group', 'nunique'),
+                all_groups_passed=('diagnostic_passed', 'all'),
+            )
+            full_window_counts[str(horizon_days)] = int(
+                (
+                    (passed_by_event['group_count'] == 3)
+                    & passed_by_event['all_groups_passed']
+                ).sum()
+            )
+        analysis_summary = {
+            'strict_population_event_count': int(len(events)),
+            'particle_count_per_event': int(
+                event_summary['particle_count'].iloc[0]
+            ),
+            'full_window_event_counts': full_window_counts,
+            'left_censored_event_count': int(
+                event_summary['left_censored_at_data_start'].sum()
+            ),
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'all_events_and_subsets': comparison_payload,
+            'control_match_quality': {
+                str(group): {
+                    'pair_count': int(len(values)),
+                    'median_absolute_sigma0_difference': float(
+                        values['absolute_sigma0_difference'].median()
+                    ),
+                    'q90_absolute_sigma0_difference': float(
+                        values['absolute_sigma0_difference'].quantile(0.9)
+                    ),
+                    'median_absolute_rossby_difference': float(
+                        values['absolute_rossby_difference'].median()
+                    ),
+                    'median_absolute_strain_difference_s_1': float(
+                        values['absolute_strain_difference_s_1'].median()
+                    ),
+                    'all_ordinary_fingerprint_gate_passed': bool(
+                        values['ordinary_fingerprint_gate_passed'].all()
+                    ),
+                }
+                for group, values in control_audit.groupby(
+                    'particle_group', sort=True
+                )
+            },
+            'interpretation': (
+                'Anomaly-minus-control differences test whether deep DO '
+                'event trajectories encounter the diagnosed mixed layer '
+                'or local isopycnal-outcrop opportunities more often than '
+                'same-day matched background trajectories.'
+            ),
+            'limits': [
+                'An outcrop opportunity is a local hydrographic condition, '
+                'not direct proof that the deep particle was ventilated.',
+                'Resolved daily-mean advection omits submesoscale transport, '
+                'mixing, and diffusion.',
+                'Particles escaping the delivered domain reduce complete '
+                'ensemble fractions and are not treated as non-contact.',
+                'Early-year events are left-censored and excluded from '
+                'windows that predate the 2003 delivery.',
+                'E000002 remains an observed-core versus particle-path '
+                'mismatch counterexample and cannot identify a material '
+                'source even if its backward particles encounter the MLD.',
+            ],
+        }
+        output_paths = {
+            'daily_diagnostics': (
+                run_dir / 'daily_ventilation_diagnostics.parquet'
+            ),
+            'horizon_summary': run_dir / 'event_horizon_summary.parquet',
+            'control_audit': run_dir / 'control_match_audit.parquet',
+            'particle_metadata': run_dir / 'particle_metadata.parquet',
+            'event_summary': run_dir / 'event_summary.parquet',
+            'group_comparison': run_dir / 'group_comparison.parquet',
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_ventilation.png',
+            'source_inventory': run_dir / 'source_inventory.parquet',
+            'event_context': run_dir / 'event_context.parquet',
+            'analytic_validation': analytic_path,
+        }
+        for key, frame in (
+            ('daily_diagnostics', daily),
+            ('horizon_summary', horizon),
+            ('control_audit', control_audit),
+            ('particle_metadata', particle_metadata),
+            ('event_summary', event_summary),
+            ('group_comparison', comparison),
+        ):
+            _atomic_write_parquet(frame, output_paths[key])
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_trajectory_ventilation(
+            horizon,
+            output_paths['figure'],
+            settings,
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'completed_events': int(len(events)),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'outputs': {
+                    key: str(path.resolve())
+                    for key, path in output_paths.items()
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_events': completed,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_diagnostics': daily,
+        'horizon_summary': horizon,
+        'control_audit': control_audit,
+        'particle_metadata': particle_metadata,
+        'group_comparison': comparison,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
 def _ofes_event_evolution_settings(
     overrides: dict | None = None,
 ) -> dict:

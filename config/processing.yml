@@ -1,4 +1,9 @@
 # 处理与算法参数配置
+# version 1.38 变更：
+#   - 新增 OFES 峰值日粒子最长 90 天回溯的 MLD 接触史与等密度面出露机会诊断；
+#     异常 ensemble 与同日、近深度/同密度的 120–240 km 普通背景粒子配对，
+#     另保留 Ro/strain 也匹配的次级敏感性对照；实际 MLD 接触与水平位置上的
+#     出露机会严格分开，30/60/90 天窗口按数据起点显式标记左删失。
 # version 1.37 变更：
 #   - 参照 McCoy et al. (2020) 公开 MATLAB 源码新增 OFES 虚拟 Argo 剖面链：在事件核心与
 #     0.35R/0.70R 两圈采样，以目标剖面加 120–240 km、25 km 径向间隔的稀疏环带估计等密度面局地 IQR，
@@ -122,7 +127,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.37"
+version: "1.38"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -505,6 +510,34 @@ ofes:
     normalized_time_bin_count: 11
     figure_dpi: 180
     output_subdir: trajectory_tracers
+  trajectory_ventilation:
+    worker_count: 16
+    maximum_backtrack_days: 90
+    reporting_horizons_days: [30, 60, 90]
+    integration_dt_seconds: 3600
+    domain_margin_km: 700.0
+    minimum_active_fraction: 0.75
+    mld_reference_depth_m: 10.0
+    mld_density_threshold_kg_m3: 0.03
+    near_mld_tolerance_m: 25.0
+    outcrop_density_tolerance_kg_m3: 0.03
+    control_inner_radius_km: 120.0
+    control_outer_radius_km: 240.0
+    control_radius_step_km: 25.0
+    control_azimuth_count: 32
+    control_depth_scale_m: 50.0
+    control_depth_max_difference_m: 150.0
+    control_sigma0_scale_kg_m3: 0.05
+    control_sigma0_max_difference_kg_m3: 0.15
+    control_same_sign_do_max_umol_kg: 10.0
+    control_same_sign_spiciness0_max: 0.05
+    kinematic_smoothing_sigma_pixels: 1.0
+    kinematic_ro_scale: 0.10
+    kinematic_strain_scale_s_1: 1.0e-5
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    figure_dpi: 180
+    output_subdir: trajectory_ventilation
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12
