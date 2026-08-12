@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.35 变更：
+#   - 将已验证的 OFES u/v/w 三维 ensemble trajectory 并行推广到 59-event 子集中
+#     背景环带完整且 start-to-peak 时间展开的事件；新增事件级进程并行、断点续跑、
+#     代表事件逐值复现和观测异常核垂向位移对照口径。
 # version 1.34 变更：
 #   - 新增 OFES u/v/w 三维 ensemble trajectory：完整交付深度域、层界 w 插值、
 #     解析场/步长/可逆性门槛，并预注册同起点固定深度对照、release 敏感性及
@@ -422,6 +426,15 @@ ofes:
     headline_downward_displacement_min_m: 100.0
     figure_dpi: 180
     output_subdir: trajectory_3d
+  trajectory_3d_population:
+    worker_count: 16
+    minimum_integration_days: 1
+    observed_depth_change_min_m: 25.0
+    particle_depth_change_min_m: 25.0
+    vertical_alignment_median_max_m: 150.0
+    representative_parity_atol: 1.0e-9
+    figure_dpi: 180
+    output_subdir: trajectory_3d_population
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12

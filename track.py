@@ -26,6 +26,10 @@ from scipy.optimize import least_squares, linear_sum_assignment
 import copy
 import gsw
 from collections import defaultdict
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    as_completed as futures_as_completed,
+)
 import multiprocessing
 import h5py
 import time as tm
@@ -44131,6 +44135,104 @@ def _ofes_trajectory_3d_settings(
     return settings
 
 
+def _ofes_trajectory_3d_population_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 三维 trajectory 总体推广配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_3d_population', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                'Unknown OFES trajectory_3d_population override keys: '
+                f'{unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'minimum_integration_days': int(
+            raw.get('minimum_integration_days', 1)
+        ),
+        'observed_depth_change_min_m': float(
+            raw.get('observed_depth_change_min_m', 25.0)
+        ),
+        'particle_depth_change_min_m': float(
+            raw.get('particle_depth_change_min_m', 25.0)
+        ),
+        'vertical_alignment_median_max_m': float(
+            raw.get('vertical_alignment_median_max_m', 150.0)
+        ),
+        'representative_parity_atol': float(
+            raw.get('representative_parity_atol', 1e-9)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_3d_population')
+        ),
+    }
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['minimum_integration_days'] <= 0
+    ):
+        raise ValueError(
+            'OFES trajectory population worker/day counts are invalid.'
+        )
+    for key in (
+        'observed_depth_change_min_m',
+        'particle_depth_change_min_m',
+        'vertical_alignment_median_max_m',
+        'figure_dpi',
+    ):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(
+                'OFES trajectory population thresholds must be finite '
+                'and positive.'
+            )
+    if (
+        not np.isfinite(settings['representative_parity_atol'])
+        or settings['representative_parity_atol'] < 0
+    ):
+        raise ValueError(
+            'OFES representative_parity_atol must be finite and nonnegative.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory population output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_3d_population_science_settings(
+    settings: dict,
+) -> dict:
+    """返回不含执行并发度的总体科学参数。"""
+    return {
+        key: value
+        for key, value in settings.items()
+        if key != 'worker_count'
+    }
+
+
+def _ofes_trajectory_3d_population_processing_config_sha256() -> str:
+    """返回剔除总体执行并发度后的处理配置哈希。"""
+    processing_config = copy.deepcopy(_PROC_CFG)
+    population_config = (
+        processing_config.get('ofes', {}).get(
+            'trajectory_3d_population', {}
+        )
+    )
+    population_config.pop('worker_count', None)
+    return hashlib.sha256(
+        json.dumps(
+            processing_config,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+
+
 def _ofes_trajectory_3d_synthetic_snapshot(
     date: str,
     lon: np.ndarray,
@@ -45634,6 +45736,1037 @@ def run_ofes_3d_trajectory_ensembles(
         'release_sensitivity': release_sensitivity,
         'analysis_summary': analysis_summary,
         'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_trajectory_3d_population_requests(
+    population_run_dir: str | Path,
+    population_settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """从 59-event 总体构建严格 start-to-peak 三维轨迹请求。"""
+    population_root = Path(population_run_dir)
+    manifest = json.loads(
+        (population_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES trajectory population requires a complete population run.'
+        )
+    diagnostics_path = Path(
+        manifest['outputs']['population_peak_diagnostics']
+    )
+    population = pd.read_parquet(diagnostics_path).sort_values(
+        'population_event_index', kind='mergesort'
+    ).reset_index(drop=True)
+    catalog_root = Path(manifest['catalog_run_dir'])
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    daily_objects['date'] = pd.to_datetime(
+        daily_objects['date']
+    ).dt.normalize()
+    eligibility_records = []
+    request_records = []
+    observed_tracks = []
+    minimum_days = int(population_settings['minimum_integration_days'])
+    for event in population.itertuples(index=False):
+        event_id = str(event.event_id)
+        start_date = pd.Timestamp(event.start_date).normalize()
+        peak_date = pd.Timestamp(event.peak_date).normalize()
+        integration_days = int((peak_date - start_date).days)
+        background_complete = bool(
+            event.background_annulus_within_delivery_window
+        )
+        population_passed = bool(event.population_diagnostic_passed)
+        if not population_passed or not background_complete:
+            eligibility_status = 'excluded_delivery_edge'
+        elif integration_days < minimum_days:
+            eligibility_status = 'excluded_no_time_expansion'
+        else:
+            eligibility_status = 'eligible'
+        eligibility_records.append(
+            {
+                'population_event_index': int(event.population_event_index),
+                'event_id': event_id,
+                'start_date': start_date,
+                'peak_date': peak_date,
+                'integration_days': integration_days,
+                'population_diagnostic_passed': population_passed,
+                'background_annulus_within_delivery_window': (
+                    background_complete
+                ),
+                'trajectory_population_eligible': bool(
+                    eligibility_status == 'eligible'
+                ),
+                'trajectory_population_status': eligibility_status,
+            }
+        )
+        if eligibility_status != 'eligible':
+            continue
+        event_track = daily_objects.loc[
+            (daily_objects['threshold'] == 50.0)
+            & (daily_objects['event_id'].astype(str) == event_id)
+            & (daily_objects['date'] >= start_date)
+            & (daily_objects['date'] <= peak_date)
+        ].sort_values('date', kind='mergesort').copy()
+        start_rows = event_track.loc[event_track['date'] == start_date]
+        peak_rows = event_track.loc[
+            event_track['daily_object_key'].astype(str)
+            == str(event.peak_daily_object_key)
+        ]
+        if len(start_rows) != 1 or len(peak_rows) != 1:
+            raise RuntimeError(
+                'OFES trajectory population start/peak object is ambiguous '
+                f'for {event_id}: start={len(start_rows)}, peak={len(peak_rows)}.'
+            )
+        start = start_rows.iloc[0]
+        peak = peak_rows.iloc[0]
+        request_records.append(
+            {
+                'event_order': int(event.population_event_index),
+                'event_id': event_id,
+                'regime_label': str(event.kinematic_regime),
+                'selection_criterion': (
+                    'population_background_complete_and_time_expanded'
+                ),
+                'start_date': start_date,
+                'peak_date': peak_date,
+                'integration_days': integration_days,
+                'observed_object_days': int(len(event_track)),
+                'start_core_lon': float(start['peak_lon']),
+                'start_core_lat': float(start['peak_lat']),
+                'peak_core_lon': float(peak['peak_lon']),
+                'peak_core_lat': float(peak['peak_lat']),
+                'reference_depth_m': float(event.reference_depth_m),
+                'start_reference_depth_m': float(
+                    start['peak_depth_at_max']
+                ),
+                'peak_reference_depth_m': float(
+                    peak['peak_depth_at_max']
+                ),
+                'start_equivalent_radius_km': float(
+                    start['equivalent_radius_km']
+                ),
+                'peak_equivalent_radius_km': float(
+                    event.daily_peak_equivalent_radius_km
+                ),
+                'observed_lon_min': float(event_track['peak_lon'].min()),
+                'observed_lon_max': float(event_track['peak_lon'].max()),
+                'observed_lat_min': float(event_track['peak_lat'].min()),
+                'observed_lat_max': float(event_track['peak_lat'].max()),
+            }
+        )
+        event_track.insert(
+            0, 'trajectory_event_order', int(event.population_event_index)
+        )
+        observed_tracks.append(event_track)
+    requests = pd.DataFrame(request_records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    eligibility = pd.DataFrame(eligibility_records).sort_values(
+        'population_event_index', kind='mergesort'
+    ).reset_index(drop=True)
+    if requests.empty or not observed_tracks:
+        raise RuntimeError('OFES trajectory population has no eligible events.')
+    if not requests['integration_days'].ge(minimum_days).all():
+        raise RuntimeError(
+            'OFES trajectory population contains a short integration request.'
+        )
+    return (
+        requests,
+        pd.concat(observed_tracks, ignore_index=True),
+        eligibility,
+        manifest,
+    )
+
+
+def _ofes_trajectory_3d_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回单事件三维 trajectory fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'trajectories': event_dir / 'trajectories.parquet',
+        'particle_metadata': event_dir / 'particle_metadata.parquet',
+        'reversibility': event_dir / 'reversibility.parquet',
+        'observed_alignment': event_dir / 'observed_alignment.parquet',
+        'release_sensitivity': event_dir / 'release_sensitivity.parquet',
+    }
+
+
+def _ofes_trajectory_3d_fragment_reusable(
+    paths: dict[str, Path],
+    run_signature: str,
+) -> bool:
+    """判定单事件 fragment 是否完整且签名一致。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    return bool(stored.get('trajectory_run_signature') == run_signature)
+
+
+def _ofes_run_trajectory_3d_population_worker(payload: dict) -> dict:
+    """在独立进程运行并原子写入一个事件 fragment。"""
+    request = dict(payload['request'])
+    event_id = str(request['event_id'])
+    paths = _ofes_trajectory_3d_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    result = _ofes_run_trajectory_3d_event(
+        request,
+        payload['observed_track'],
+        payload['trajectory_settings'],
+        payload['validation_manifest'],
+    )
+    result['summary']['trajectory_run_signature'] = str(
+        payload['run_signature']
+    )
+    _ofes_atomic_write_json(result['summary'], paths['summary'])
+    for key in (
+        'trajectories',
+        'particle_metadata',
+        'reversibility',
+        'observed_alignment',
+        'release_sensitivity',
+    ):
+        _atomic_write_parquet(result[key], paths[key])
+    return {
+        'event_id': event_id,
+        'event_order': int(request['event_order']),
+        'integration_days': int(request['integration_days']),
+    }
+
+
+def _ofes_load_trajectory_3d_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的三维 trajectory fragment。"""
+    paths = _ofes_trajectory_3d_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        **{
+            key: pd.read_parquet(paths[key])
+            for key in (
+                'trajectories',
+                'particle_metadata',
+                'reversibility',
+                'observed_alignment',
+                'release_sensitivity',
+            )
+        },
+    }
+
+
+def _ofes_trajectory_3d_representative_parity(
+    event_summary: pd.DataFrame,
+    representative_run_dir: str | Path,
+    absolute_tolerance: float,
+) -> tuple[pd.DataFrame, dict]:
+    """核对总体运行与已验证三事件运行的逐值一致性。"""
+    representative_root = Path(representative_run_dir)
+    representative_manifest = json.loads(
+        (representative_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if representative_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES population parity requires a complete representative run.'
+        )
+    representative = pd.read_parquet(
+        representative_manifest['outputs']['event_summary']
+    )
+    metrics = (
+        'backward_active_fraction',
+        'forward_observed_start_active_fraction',
+        'active_roundtrip_fraction',
+        'full_interval_roundtrip_median_error_km',
+        'full_interval_roundtrip_median_depth_error_m',
+        'backtracked_source_to_observed_start_median_km',
+        'backtracked_source_to_observed_start_median_depth_error_m',
+        'forward_start_to_observed_peak_median_km',
+        'forward_start_to_observed_peak_median_depth_error_m',
+        'backward_ensemble_to_observed_core_median_km',
+        'backward_ensemble_to_observed_core_median_depth_error_m',
+        'forward_ensemble_to_observed_core_median_km',
+        'forward_ensemble_to_observed_core_median_depth_error_m',
+        'forward_ensemble_centroid_depth_change_m',
+        'forward_particle_downward_displacement_fraction',
+        'observed_core_depth_change_m',
+        'matched_fixed_depth_forward_core_median_km',
+        'matched_fixed_depth_forward_core_median_depth_error_m',
+        'three_dimensional_minus_matched_fixed_depth_forward_core_km',
+        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m',
+        'median_endpoint_spread_km',
+        'median_endpoint_depth_spread_m',
+    )
+    merged = representative[['event_id', *metrics]].merge(
+        event_summary[['event_id', *metrics]],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+        suffixes=('_representative', '_population'),
+    )
+    records = []
+    for row in merged.itertuples(index=False):
+        for metric in metrics:
+            representative_value = float(
+                getattr(row, f'{metric}_representative')
+            )
+            population_value = float(
+                getattr(row, f'{metric}_population')
+            )
+            records.append(
+                {
+                    'event_id': str(row.event_id),
+                    'metric': metric,
+                    'representative_value': representative_value,
+                    'population_value': population_value,
+                    'absolute_difference': abs(
+                        representative_value - population_value
+                    ),
+                }
+            )
+    parity = pd.DataFrame(records)
+    passed = bool(
+        parity['absolute_difference'].notna().all()
+        and parity['absolute_difference'].le(absolute_tolerance).all()
+    )
+    summary = {
+        'passed': passed,
+        'representative_event_count': int(len(merged)),
+        'metric_count_per_event': int(len(metrics)),
+        'maximum_absolute_difference': float(
+            parity['absolute_difference'].max()
+        ),
+        'absolute_tolerance': float(absolute_tolerance),
+        'representative_run_signature': representative_manifest[
+            'run_signature'
+        ],
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES representative trajectory parity failed: {summary}'
+        )
+    return parity, summary
+
+
+def _ofes_trajectory_3d_population_classification(
+    event_summary: pd.DataFrame,
+    population: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """用预注册位移与对齐门槛对总体三维路径分类。"""
+    population_columns = (
+        'event_id',
+        'deep_sensitivity_rank_within_threshold',
+        'kinematic_regime',
+        'rotation_dominated',
+        'negative_subsurface_rossby_number',
+        'surface_weak_or_reversed_rotation',
+        'water_mass_dominated',
+    )
+    classified = event_summary.merge(
+        population[list(population_columns)],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+        suffixes=('', '_population'),
+    )
+    observed_threshold = float(settings['observed_depth_change_min_m'])
+    particle_threshold = float(settings['particle_depth_change_min_m'])
+    observed_change = classified['observed_core_depth_change_m'].to_numpy(
+        dtype=float
+    )
+    particle_change = classified[
+        'forward_ensemble_centroid_depth_change_m'
+    ].to_numpy(dtype=float)
+    classified['observed_vertical_motion'] = np.select(
+        [observed_change >= observed_threshold,
+         observed_change <= -observed_threshold],
+        ['downward', 'upward'],
+        default='weak_or_unresolved',
+    )
+    classified['particle_vertical_motion'] = np.select(
+        [particle_change >= particle_threshold,
+         particle_change <= -particle_threshold],
+        ['downward', 'upward'],
+        default='weak_or_unresolved',
+    )
+    classified['direction_evaluable'] = (
+        classified['observed_vertical_motion'] != 'weak_or_unresolved'
+    ) & (
+        classified['particle_vertical_motion'] != 'weak_or_unresolved'
+    )
+    classified['vertical_direction_matched'] = (
+        classified['direction_evaluable']
+        & (
+            classified['observed_vertical_motion']
+            == classified['particle_vertical_motion']
+        )
+    )
+    classified['vertical_alignment_passed'] = classified[
+        'forward_ensemble_to_observed_core_median_depth_error_m'
+    ].le(settings['vertical_alignment_median_max_m'])
+    classified['resolved_vertical_pathway_supported'] = (
+        classified['event_validation_passed'].astype(bool)
+        & classified['vertical_direction_matched']
+        & classified['vertical_alignment_passed']
+    )
+    classified['resolved_downward_pathway_supported'] = (
+        classified['resolved_vertical_pathway_supported']
+        & (classified['observed_vertical_motion'] == 'downward')
+    )
+    classified['resolved_upward_pathway_supported'] = (
+        classified['resolved_vertical_pathway_supported']
+        & (classified['observed_vertical_motion'] == 'upward')
+    )
+    classified['three_dimensional_vertical_alignment_improved'] = classified[
+        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m'
+    ].lt(0)
+    return classified.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_trajectory_3d_population_group_summary(
+    classified: pd.DataFrame,
+) -> dict:
+    """汇总一个总体或机制子集的三维路径比例。"""
+    count = int(len(classified))
+    evaluable = classified.loc[classified['direction_evaluable']]
+    return {
+        'event_count': count,
+        'event_validation_passed_count': int(
+            classified['event_validation_passed'].sum()
+        ),
+        'direction_evaluable_count': int(len(evaluable)),
+        'vertical_direction_matched_count': int(
+            evaluable['vertical_direction_matched'].sum()
+        ),
+        'vertical_direction_matched_fraction': (
+            float(evaluable['vertical_direction_matched'].mean())
+            if len(evaluable) else None
+        ),
+        'resolved_vertical_pathway_count': int(
+            classified['resolved_vertical_pathway_supported'].sum()
+        ),
+        'resolved_downward_pathway_count': int(
+            classified['resolved_downward_pathway_supported'].sum()
+        ),
+        'resolved_upward_pathway_count': int(
+            classified['resolved_upward_pathway_supported'].sum()
+        ),
+        'three_dimensional_vertical_alignment_improved_count': int(
+            classified[
+                'three_dimensional_vertical_alignment_improved'
+            ].sum()
+        ),
+        'three_dimensional_vertical_alignment_improved_fraction': (
+            float(
+                classified[
+                    'three_dimensional_vertical_alignment_improved'
+                ].mean()
+            )
+            if count else None
+        ),
+    }
+
+
+def _plot_ofes_3d_trajectory_population(
+    classified: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+) -> Path:
+    """绘制观测异常核与三维 ensemble 的总体垂向对照。"""
+    figure, axes = plt.subplots(
+        1, 2, figsize=(13, 5.5), constrained_layout=True
+    )
+    colors = {
+        'rotation_dominated': '#4c78a8',
+        'strain_dominated': '#e45756',
+    }
+    for regime, group in classified.groupby('kinematic_regime', sort=True):
+        label = str(regime).replace('_', ' ')
+        color = colors.get(str(regime), '#6b7280')
+        axes[0].scatter(
+            group['observed_core_depth_change_m'],
+            group['forward_ensemble_centroid_depth_change_m'],
+            s=42,
+            alpha=0.78,
+            color=color,
+            edgecolor='white',
+            linewidth=0.5,
+            label=f'{label} (n={len(group)})',
+        )
+        axes[1].scatter(
+            group['observed_core_depth_change_m'],
+            group[
+                'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m'
+            ],
+            s=42,
+            alpha=0.78,
+            color=color,
+            edgecolor='white',
+            linewidth=0.5,
+        )
+    finite_values = np.concatenate(
+        [
+            classified['observed_core_depth_change_m'].to_numpy(dtype=float),
+            classified[
+                'forward_ensemble_centroid_depth_change_m'
+            ].to_numpy(dtype=float),
+        ]
+    )
+    finite_values = finite_values[np.isfinite(finite_values)]
+    span = float(np.max(np.abs(finite_values))) if finite_values.size else 1.0
+    span = max(50.0, 1.08 * span)
+    axes[0].plot([-span, span], [-span, span], '--', color='#111827')
+    axes[0].axhline(0, color='#9ca3af', linewidth=0.8)
+    axes[0].axvline(0, color='#9ca3af', linewidth=0.8)
+    axes[0].set_xlim(-span, span)
+    axes[0].set_ylim(-span, span)
+    axes[0].set_aspect('equal', adjustable='box')
+    axes[0].set_xlabel('Observed ΔDO-core depth change (m)')
+    axes[0].set_ylabel('3-D ensemble centroid depth change (m)')
+    axes[0].set_title('Resolved vertical direction')
+    axes[0].legend(frameon=False)
+    axes[1].axhline(0, color='#111827', linestyle='--')
+    axes[1].axvline(0, color='#9ca3af', linewidth=0.8)
+    axes[1].set_xlabel('Observed ΔDO-core depth change (m)')
+    axes[1].set_ylabel('3-D minus fixed-depth error (m)')
+    axes[1].set_title('Value added by resolved w')
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    for event_id in (
+        'OFES_DO50_E000002',
+        'OFES_DO50_E000239',
+        'OFES_DO50_E000176',
+    ):
+        row = classified.loc[classified['event_id'] == event_id]
+        if row.empty:
+            continue
+        event = row.iloc[0]
+        short = event_id.replace('OFES_DO50_', '')
+        axes[0].annotate(
+            short,
+            (
+                event['observed_core_depth_change_m'],
+                event['forward_ensemble_centroid_depth_change_m'],
+            ),
+            xytext=(4, 4),
+            textcoords='offset points',
+            fontsize=8,
+        )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        output, dpi=int(settings['figure_dpi']), bbox_inches='tight'
+    )
+    plt.close(figure)
+    return output
+
+
+def run_ofes_3d_trajectory_population(
+    population_run_dir: str | Path,
+    w_validation_run_dir: str | Path,
+    representative_3d_run_dir: str | Path,
+    *,
+    trajectory_overrides: dict | None = None,
+    population_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """并行推广 OFES u/v/w 三维 ensemble trajectory 至严格事件总体。
+
+    workflow 沿用代表三事件的粒子几何、日场线性时间插值、
+    完整交付垂向域、步长/可逆性门槛及同起点固定深度对照。
+    事件之间使用 spawn 独立进程并行，事件内 51 粒子保持向量化；
+    每个事件单独落盘，以便签名一致的断点续跑。
+
+    参数:
+        - population_run_dir (str | Path): 已完成的 59-event peak 总体运行目录。
+        - w_validation_run_dir (str | Path): 已通过的 OFES `w` 数据集专项验证目录。
+        - representative_3d_run_dir (str | Path): 已完成的三事件三维运行，用于逐值复现审计。
+        - trajectory_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d` 配置。
+        - population_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d_population` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入 population 运行下的配置子目录。
+        - resume (bool): 是否复用签名一致的逐事件 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、eligibility、逐事件摘要、路径长表、总体分类、代表事件复现审计、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`event_eligibility.parquet`、`event_summary.parquet`、`trajectories.parquet`、`observed_alignment.parquet`、`release_sensitivity.parquet`、`population_classification.parquet`、`representative_parity.parquet`、`analysis_summary.json`、`trajectory_3d_population.png` 与 `manifest.json`。
+
+    说明:
+        - 严格比例只使用 population 背景环带完整且 start-to-peak 至少一天的事件。
+        - 观测异常核深度变化与粒子变化同号仍只是 resolved-pathway 一致性，不证明 material source 或严格 SCV 身份。
+    """
+    population_root = Path(population_run_dir)
+    validation_root = Path(w_validation_run_dir)
+    representative_root = Path(representative_3d_run_dir)
+    trajectory_settings = _ofes_trajectory_3d_settings(
+        trajectory_overrides
+    )
+    population_settings = _ofes_trajectory_3d_population_settings(
+        population_overrides
+    )
+    requests, observed_tracks, eligibility, population_manifest = (
+        _ofes_trajectory_3d_population_requests(
+            population_root, population_settings
+        )
+    )
+    validation_manifest = json.loads(
+        (validation_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        validation_manifest.get('status') != 'complete'
+        or validation_manifest.get('validation_passed') is not True
+    ):
+        raise RuntimeError(
+            'OFES trajectory population requires complete passed w validation.'
+        )
+    representative_manifest = json.loads(
+        (representative_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if representative_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES trajectory population requires a complete representative run.'
+        )
+    population = pd.read_parquet(
+        population_manifest['outputs']['population_peak_diagnostics']
+    )
+    source_inventory = _ofes_trajectory_3d_source_inventory(requests)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_3d_tendency_time_linear,
+            _ofes_rk4_3d_step,
+            advect_ofes_particles,
+            _ofes_trajectory_3d_settings,
+            _ofes_trajectory_3d_population_settings,
+            _ofes_trajectory_3d_population_science_settings,
+            _ofes_trajectory_3d_population_processing_config_sha256,
+            _validate_ofes_3d_trajectory_integrator,
+            _ofes_trajectory_seed_ensemble,
+            _ofes_trajectory_3d_population_requests,
+            _ofes_trajectory_3d_source_inventory,
+            _ofes_load_trajectory_3d_snapshots,
+            _ofes_trajectory_3d_timestep_spread,
+            _ofes_trajectory_3d_endpoint_metrics,
+            _ofes_trajectory_3d_release_sensitivity,
+            _ofes_trajectory_result_frame,
+            _ofes_trajectory_observed_alignment,
+            _ofes_run_trajectory_3d_event,
+            _ofes_trajectory_3d_fragment_paths,
+            _ofes_trajectory_3d_fragment_reusable,
+            _ofes_run_trajectory_3d_population_worker,
+            _ofes_load_trajectory_3d_fragment,
+            _ofes_trajectory_3d_representative_parity,
+            _ofes_trajectory_3d_population_classification,
+            _ofes_trajectory_3d_population_group_summary,
+            _plot_ofes_3d_trajectory_population,
+            run_ofes_3d_trajectory_population,
+            load_ofes_snapshot,
+        )
+    )
+    repo_root = Path(__file__).resolve().parent
+    payload = {
+        'schema_version': 1,
+        'population_run_dir': str(population_root.resolve()),
+        'population_run_signature': population_manifest['run_signature'],
+        'w_validation_run_dir': str(validation_root.resolve()),
+        'w_validation_run_signature': validation_manifest['run_signature'],
+        'representative_3d_run_dir': str(representative_root.resolve()),
+        'representative_3d_run_signature': representative_manifest[
+            'run_signature'
+        ],
+        'input_sha256': {
+            'population_manifest.json': _file_sha256(
+                population_root / 'manifest.json'
+            ),
+            'population_peak_diagnostics.parquet': _file_sha256(
+                population_manifest['outputs'][
+                    'population_peak_diagnostics'
+                ]
+            ),
+            'w_validation_manifest.json': _file_sha256(
+                validation_root / 'manifest.json'
+            ),
+            'representative_3d_manifest.json': _file_sha256(
+                representative_root / 'manifest.json'
+            ),
+        },
+        'trajectory_settings': trajectory_settings,
+        'population_settings': (
+            _ofes_trajectory_3d_population_science_settings(
+                population_settings
+            )
+        ),
+        'request_records': requests.to_dict(orient='records'),
+        'eligibility_records': eligibility.to_dict(orient='records'),
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload, sort_keys=True, separators=(',', ':')
+            ).encode('utf-8')
+        ).hexdigest(),
+        'trajectory_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_science_config_sha256': (
+            _ofes_trajectory_3d_population_processing_config_sha256()
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'scipy_version': str(scipy.__version__),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'execution_settings': {
+            'worker_count': int(population_settings['worker_count']),
+        },
+        'processing_config_sha256': _file_sha256(
+            repo_root / 'config' / 'processing.yml'
+        ),
+        'run_signature': signature,
+        'run_tag': f'ofes_trajectory3d_population_{signature[:12]}',
+    }
+    output_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else population_root / population_settings['output_subdir']
+    )
+    run_dir = output_root / identity['run_tag']
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES trajectory population signature differs.'
+            )
+        if previous.get('status') == 'complete' and resume:
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'event_eligibility': pd.read_parquet(
+                        outputs['event_eligibility']
+                    ),
+                    'event_summary': pd.read_parquet(
+                        outputs['event_summary']
+                    ),
+                    'trajectories': pd.read_parquet(
+                        outputs['trajectories']
+                    ),
+                    'observed_alignment': pd.read_parquet(
+                        outputs['observed_alignment']
+                    ),
+                    'release_sensitivity': pd.read_parquet(
+                        outputs['release_sensitivity']
+                    ),
+                    'population_classification': pd.read_parquet(
+                        outputs['population_classification']
+                    ),
+                    'representative_parity': pd.read_parquet(
+                        outputs['representative_parity']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(population_settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(eligibility, run_dir / 'event_eligibility.parquet')
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(
+        observed_tracks, run_dir / 'observed_object_tracks.parquet'
+    )
+    completed = 0
+    try:
+        analytic_validation = _validate_ofes_3d_trajectory_integrator(
+            trajectory_settings
+        )
+        analytic_path = run_dir / 'analytic_validation.json'
+        _ofes_atomic_write_json(analytic_validation, analytic_path)
+        pending = []
+        for request in requests.to_dict(orient='records'):
+            paths = _ofes_trajectory_3d_fragment_paths(
+                events_dir, str(request['event_id'])
+            )
+            reusable = resume and _ofes_trajectory_3d_fragment_reusable(
+                paths, signature
+            )
+            if reusable:
+                completed += 1
+            else:
+                observed_track = observed_tracks.loc[
+                    observed_tracks['event_id'].astype(str)
+                    == str(request['event_id'])
+                ].copy()
+                pending.append(
+                    {
+                        'request': request,
+                        'observed_track': observed_track,
+                        'trajectory_settings': trajectory_settings,
+                        'validation_manifest': validation_manifest,
+                        'events_dir': str(events_dir.resolve()),
+                        'run_signature': signature,
+                    }
+                )
+        pending.sort(
+            key=lambda task: int(task['request']['integration_days']),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory population] '
+            f'events={len(requests)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={population_settings["worker_count"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=int(population_settings['worker_count']),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_trajectory_3d_population_worker, task
+                    ): str(task['request']['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory population] '
+                        f'{completed}/{len(requests)} complete: '
+                        f'{result["event_id"]} '
+                        f'({result["integration_days"]} d)',
+                        flush=True,
+                    )
+        results = [
+            _ofes_load_trajectory_3d_fragment(
+                events_dir, str(event_id)
+            )
+            for event_id in requests['event_id']
+        ]
+        event_summary = pd.DataFrame(
+            [result['summary'] for result in results]
+        ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+        for column in ('start_date', 'peak_date'):
+            event_summary[column] = pd.to_datetime(
+                event_summary[column]
+            ).dt.normalize()
+        trajectories = pd.concat(
+            [result['trajectories'] for result in results],
+            ignore_index=True,
+        )
+        particle_metadata = pd.concat(
+            [result['particle_metadata'] for result in results],
+            ignore_index=True,
+        )
+        reversibility = pd.concat(
+            [result['reversibility'] for result in results],
+            ignore_index=True,
+        )
+        observed_alignment = pd.concat(
+            [result['observed_alignment'] for result in results],
+            ignore_index=True,
+        )
+        release_sensitivity = pd.concat(
+            [result['release_sensitivity'] for result in results],
+            ignore_index=True,
+        )
+        parity, parity_summary = (
+            _ofes_trajectory_3d_representative_parity(
+                event_summary,
+                representative_root,
+                population_settings['representative_parity_atol'],
+            )
+        )
+        classified = _ofes_trajectory_3d_population_classification(
+            event_summary, population, population_settings
+        )
+        groups = {
+            str(regime): _ofes_trajectory_3d_population_group_summary(group)
+            for regime, group in classified.groupby(
+                'kinematic_regime', sort=True
+            )
+        }
+        analysis_summary = {
+            'strict_population_event_count': int(
+                eligibility['population_diagnostic_passed'].sum()
+            ),
+            'trajectory_eligible_event_count': int(len(classified)),
+            'excluded_no_time_expansion_count': int(
+                (
+                    eligibility['trajectory_population_status']
+                    == 'excluded_no_time_expansion'
+                ).sum()
+            ),
+            'excluded_delivery_edge_count': int(
+                (
+                    eligibility['trajectory_population_status']
+                    == 'excluded_delivery_edge'
+                ).sum()
+            ),
+            'integration_day_sum': int(
+                classified['integration_days'].sum()
+            ),
+            'worker_count': int(population_settings['worker_count']),
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'representative_parity': parity_summary,
+            'all_events': _ofes_trajectory_3d_population_group_summary(
+                classified
+            ),
+            'by_kinematic_regime': groups,
+            'interpretation': (
+                'Population trajectories quantify how often resolved '
+                'daily-mean u/v/w reproduces the sign and magnitude class '
+                'of anomaly-core vertical evolution. Direction agreement '
+                'is pathway consistency, not material-source proof.'
+            ),
+            'limits': [
+                'Daily-mean resolved velocity omits unresolved mixing, '
+                'diffusion, and submesoscale transport.',
+                'The detector can shift between evolving anomaly maxima, so '
+                'core-depth change is not a material-particle observation.',
+                'Rotation-dominated association does not by itself establish '
+                'strict SCV identity or causation.',
+                'Delivery-edge and zero-duration events remain visible in '
+                'eligibility but are excluded from inference denominators.',
+            ],
+        }
+        output_paths = {
+            'event_eligibility': run_dir / 'event_eligibility.parquet',
+            'event_summary': run_dir / 'event_summary.parquet',
+            'trajectories': run_dir / 'trajectories.parquet',
+            'particle_metadata': run_dir / 'particle_metadata.parquet',
+            'reversibility': run_dir / 'reversibility.parquet',
+            'observed_alignment': run_dir / 'observed_alignment.parquet',
+            'release_sensitivity': run_dir / 'release_sensitivity.parquet',
+            'population_classification': (
+                run_dir / 'population_classification.parquet'
+            ),
+            'representative_parity': (
+                run_dir / 'representative_parity.parquet'
+            ),
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_3d_population.png',
+            'analytic_validation': analytic_path,
+            'source_inventory': run_dir / 'source_inventory.parquet',
+            'observed_object_tracks': (
+                run_dir / 'observed_object_tracks.parquet'
+            ),
+        }
+        for key, frame in (
+            ('event_summary', event_summary),
+            ('trajectories', trajectories),
+            ('particle_metadata', particle_metadata),
+            ('reversibility', reversibility),
+            ('observed_alignment', observed_alignment),
+            ('release_sensitivity', release_sensitivity),
+            ('population_classification', classified),
+            ('representative_parity', parity),
+        ):
+            _atomic_write_parquet(frame, output_paths[key])
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_3d_trajectory_population(
+            classified, output_paths['figure'], population_settings
+        )
+        outputs = {
+            key: str(path.resolve()) for key, path in output_paths.items()
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': int(len(classified)),
+                'representative_parity_passed': bool(
+                    parity_summary['passed']
+                ),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'event_eligibility': eligibility,
+        'event_summary': event_summary,
+        'trajectories': trajectories,
+        'observed_alignment': observed_alignment,
+        'release_sensitivity': release_sensitivity,
+        'population_classification': classified,
+        'representative_parity': parity,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
         'reused_complete_run': False,
     }
 
