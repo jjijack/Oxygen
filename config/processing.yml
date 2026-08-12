@@ -1,4 +1,10 @@
 # 处理与算法参数配置
+# version 1.37 变更：
+#   - 参照 McCoy et al. (2020) 公开 MATLAB 源码新增 OFES 虚拟 Argo 剖面链：在事件核心与
+#     0.35R/0.70R 两圈采样，以目标剖面加 120–240 km、25 km 径向间隔的稀疏环带估计等密度面局地 IQR，
+#     逐剖面复现联合有效层屏蔽、spice–N2 门槛、高斯垂向形态和去 BC1 动力高度内峰；明确不复刻
+#     get_IQR_data.m 的 no-op/错轴 bug，再用 OFES 原生 u/v 独立确认
+#     反气旋旋转。保留现有 5-day SCV-compatible 为更严的持续性子集，不后验放宽。
 # version 1.36 变更：
 #   - 在已完成的 OFES 三维 ensemble 轨迹上逐日采样 DO、位温、盐度、sigma0 与 spiciness0，
 #     并相对 120–240 km 局地背景同时计算固定深度及同密度面异常；复用既有轨迹而不重新积分，
@@ -116,7 +122,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.36"
+version: "1.37"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -377,6 +383,48 @@ ofes:
     surface_profile_rossby_tolerance: 0.001
     figure_dpi: 180
     output_subdir: event_lifecycle
+  mccoy_virtual_argo:
+    worker_count: 16
+    event_ids: []
+    sample_ring_fractions: [0.0, 0.35, 0.70]
+    sample_azimuth_count: 8
+    control_radii_km: [130.0, 155.0, 180.0, 205.0, 230.0]
+    control_azimuth_count: 16
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_spacing_km: 25.0
+    minimum_background_profiles: 61
+    pressure_min_dbar: 0.0
+    pressure_max_dbar: 1070.0
+    pressure_spacing_dbar: 10.0
+    smoothing_grid_spacing_dbar: 2.0
+    smoothing_bandwidth_dbar: 10.0
+    profile_min_unique_levels: 40
+    profile_min_pressure_max_dbar: 700.0
+    profile_max_pressure_min_dbar: 100.0
+    shallow_resolution_max_dbar: 65.0
+    deep_resolution_max_dbar: 105.0
+    iqr_multiplier: 1.5
+    initial_minimum_spice_exceedance_levels: 2
+    n2_density_tolerance_kg_m3: 0.2
+    minimum_peak_spiciness_kg_m3: 0.10
+    gaussian_r2_min: 0.5
+    gaussian_nrmse_max: 0.5
+    gaussian_h_min_dbar: 50.0
+    gaussian_h_max_dbar: 850.0
+    gaussian_h_step_dbar: 10.0
+    gaussian_amplitude_factors: [0.8, 1.2, 0.05]
+    gaussian_center_shift_factors: [-0.2, 0.2, 0.05]
+    lens_height_min_dbar: 150.0
+    lens_height_max_dbar: 1200.0
+    lens_shallow_limit_min_dbar: 100.0
+    equator_latitude_min_deg: 5.0
+    direct_velocity_smoothing_sigma_pixels: 1.5
+    source_archive_sha256: ee0abca349c4f090b3c99a695a88ee81df418fd3f756110d165f83b693b26406
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    figure_dpi: 180
+    output_subdir: mccoy_virtual_argo
   vertical_velocity_validation:
     dates: ["2003-01-04", "2003-01-22", "2003-01-26", "2003-04-14", "2003-06-04"]
     lon_bounds: [142.0, 153.0]

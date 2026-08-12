@@ -127,6 +127,12 @@ _ofes_root = Path(
 _mccoy_scv_csv = Path(
     _PATHS_CFG.get('paths', {}).get('mccoy_scv_csv', './data/mccoy2020_scv/SCVs.csv')
 )
+_mccoy_scv_source_archive = Path(
+    _PATHS_CFG.get('paths', {}).get(
+        'mccoy_scv_source_archive',
+        './data/mccoy2020_scv/ArgoSCVs-v1.3.zip',
+    )
+)
 _OFES_CFG = _PROC_CFG.get('ofes', {})
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
@@ -41539,6 +41545,2235 @@ def diagnose_ofes_event_lifecycle(
         'vertical_profiles': profiles,
         'event_summary': event_summary,
         'peak_population_parity': peak_parity,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_mccoy_virtual_argo_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 McCoy-source virtual-Argo 配置。"""
+    raw = dict(_OFES_CFG.get('mccoy_virtual_argo', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES mccoy_virtual_argo override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'event_ids': tuple(str(value) for value in raw.get('event_ids', ())),
+        'sample_ring_fractions': tuple(
+            float(value)
+            for value in raw.get('sample_ring_fractions', (0.0, 0.35, 0.70))
+        ),
+        'sample_azimuth_count': int(raw.get('sample_azimuth_count', 8)),
+        'control_radii_km': tuple(
+            float(value)
+            for value in raw.get(
+                'control_radii_km', (130.0, 155.0, 180.0, 205.0, 230.0)
+            )
+        ),
+        'control_azimuth_count': int(raw.get('control_azimuth_count', 16)),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_spacing_km': float(
+            raw.get('background_spacing_km', 25.0)
+        ),
+        'minimum_background_profiles': int(
+            raw.get('minimum_background_profiles', 61)
+        ),
+        'pressure_min_dbar': float(raw.get('pressure_min_dbar', 0.0)),
+        'pressure_max_dbar': float(raw.get('pressure_max_dbar', 1070.0)),
+        'pressure_spacing_dbar': float(
+            raw.get('pressure_spacing_dbar', 10.0)
+        ),
+        'smoothing_grid_spacing_dbar': float(
+            raw.get('smoothing_grid_spacing_dbar', 2.0)
+        ),
+        'smoothing_bandwidth_dbar': float(
+            raw.get('smoothing_bandwidth_dbar', 10.0)
+        ),
+        'profile_min_unique_levels': int(
+            raw.get('profile_min_unique_levels', 40)
+        ),
+        'profile_min_pressure_max_dbar': float(
+            raw.get('profile_min_pressure_max_dbar', 700.0)
+        ),
+        'profile_max_pressure_min_dbar': float(
+            raw.get('profile_max_pressure_min_dbar', 100.0)
+        ),
+        'shallow_resolution_max_dbar': float(
+            raw.get('shallow_resolution_max_dbar', 65.0)
+        ),
+        'deep_resolution_max_dbar': float(
+            raw.get('deep_resolution_max_dbar', 105.0)
+        ),
+        'iqr_multiplier': float(raw.get('iqr_multiplier', 1.5)),
+        'initial_minimum_spice_exceedance_levels': int(
+            raw.get('initial_minimum_spice_exceedance_levels', 2)
+        ),
+        'n2_density_tolerance_kg_m3': float(
+            raw.get('n2_density_tolerance_kg_m3', 0.2)
+        ),
+        'minimum_peak_spiciness_kg_m3': float(
+            raw.get('minimum_peak_spiciness_kg_m3', 0.10)
+        ),
+        'gaussian_r2_min': float(raw.get('gaussian_r2_min', 0.5)),
+        'gaussian_nrmse_max': float(raw.get('gaussian_nrmse_max', 0.5)),
+        'gaussian_h_min_dbar': float(
+            raw.get('gaussian_h_min_dbar', 50.0)
+        ),
+        'gaussian_h_max_dbar': float(
+            raw.get('gaussian_h_max_dbar', 850.0)
+        ),
+        'gaussian_h_step_dbar': float(
+            raw.get('gaussian_h_step_dbar', 10.0)
+        ),
+        'gaussian_amplitude_factors': tuple(
+            float(value)
+            for value in raw.get(
+                'gaussian_amplitude_factors', (0.8, 1.2, 0.05)
+            )
+        ),
+        'gaussian_center_shift_factors': tuple(
+            float(value)
+            for value in raw.get(
+                'gaussian_center_shift_factors', (-0.2, 0.2, 0.05)
+            )
+        ),
+        'lens_height_min_dbar': float(
+            raw.get('lens_height_min_dbar', 150.0)
+        ),
+        'lens_height_max_dbar': float(
+            raw.get('lens_height_max_dbar', 1200.0)
+        ),
+        'lens_shallow_limit_min_dbar': float(
+            raw.get('lens_shallow_limit_min_dbar', 100.0)
+        ),
+        'equator_latitude_min_deg': float(
+            raw.get('equator_latitude_min_deg', 5.0)
+        ),
+        'direct_velocity_smoothing_sigma_pixels': float(
+            raw.get('direct_velocity_smoothing_sigma_pixels', 1.5)
+        ),
+        'source_archive_sha256': str(raw.get('source_archive_sha256', '')),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'mccoy_virtual_argo')
+        ),
+    }
+    positive_keys = (
+        'worker_count', 'sample_azimuth_count', 'control_azimuth_count',
+        'background_inner_radius_km', 'background_outer_radius_km',
+        'background_spacing_km',
+        'minimum_background_profiles', 'pressure_spacing_dbar',
+        'smoothing_grid_spacing_dbar', 'smoothing_bandwidth_dbar',
+        'profile_min_unique_levels', 'profile_min_pressure_max_dbar',
+        'profile_max_pressure_min_dbar', 'shallow_resolution_max_dbar',
+        'deep_resolution_max_dbar', 'iqr_multiplier',
+        'initial_minimum_spice_exceedance_levels',
+        'n2_density_tolerance_kg_m3', 'minimum_peak_spiciness_kg_m3',
+        'gaussian_r2_min', 'gaussian_nrmse_max',
+        'gaussian_h_min_dbar', 'gaussian_h_max_dbar',
+        'gaussian_h_step_dbar', 'lens_height_min_dbar',
+        'lens_height_max_dbar', 'lens_shallow_limit_min_dbar',
+        'equator_latitude_min_deg',
+        'direct_velocity_smoothing_sigma_pixels', 'bootstrap_replicates',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError('OFES McCoy virtual-Argo settings must be positive.')
+    if (
+        not settings['sample_ring_fractions']
+        or settings['sample_ring_fractions'][0] != 0.0
+        or any(value < 0 for value in settings['sample_ring_fractions'])
+    ):
+        raise ValueError(
+            'OFES McCoy sample rings must begin at zero and be non-negative.'
+        )
+    if (
+        not settings['control_radii_km']
+        or min(settings['control_radii_km'])
+        < settings['background_inner_radius_km']
+        or max(settings['control_radii_km'])
+        > settings['background_outer_radius_km']
+    ):
+        raise ValueError(
+            'OFES McCoy control radii must remain inside the background annulus.'
+        )
+    if not np.allclose(
+        np.diff(settings['control_radii_km']),
+        settings['background_spacing_km'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            'OFES McCoy control radii must follow background_spacing_km.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+        or settings['pressure_max_dbar'] <= settings['pressure_min_dbar']
+        or settings['gaussian_h_max_dbar']
+        < settings['gaussian_h_min_dbar']
+        or settings['lens_height_max_dbar']
+        < settings['lens_height_min_dbar']
+    ):
+        raise ValueError('OFES McCoy ordered bounds are invalid.')
+    for key in ('gaussian_amplitude_factors', 'gaussian_center_shift_factors'):
+        start, stop, step = settings[key]
+        if step <= 0 or stop < start:
+            raise ValueError(f'OFES McCoy {key} range is invalid.')
+    if not re.fullmatch(r'[0-9a-f]{64}', settings['source_archive_sha256']):
+        raise ValueError('OFES McCoy source_archive_sha256 must be SHA-256.')
+    if not settings['output_subdir'].strip():
+        raise ValueError('OFES McCoy output_subdir must not be empty.')
+    return settings
+
+
+def _ofes_offset_lon_lat(
+    lon: float,
+    lat: float,
+    radius_km: float,
+    azimuth_deg: float,
+) -> tuple[float, float]:
+    """沿球面大圆从中心按方位角与距离生成采样点。"""
+    angular = float(radius_km) / 6371.0088
+    bearing = np.deg2rad(float(azimuth_deg))
+    lat0 = np.deg2rad(float(lat))
+    lon0 = np.deg2rad(float(lon))
+    lat1 = np.arcsin(
+        np.sin(lat0) * np.cos(angular)
+        + np.cos(lat0) * np.sin(angular) * np.cos(bearing)
+    )
+    lon1 = lon0 + np.arctan2(
+        np.sin(bearing) * np.sin(angular) * np.cos(lat0),
+        np.cos(angular) - np.sin(lat0) * np.sin(lat1),
+    )
+    return float(np.rad2deg(lon1)), float(np.rad2deg(lat1))
+
+
+def _ofes_mccoy_sampling_points(
+    core_lon: float,
+    core_lat: float,
+    event_radius_km: float,
+    settings: dict,
+) -> pd.DataFrame:
+    """构建 17 条事件剖面与稀疏环带 control 的确定性位置。"""
+    records = []
+    sample_index = 0
+    for ring_index, fraction in enumerate(settings['sample_ring_fractions']):
+        if ring_index == 0:
+            azimuths = (0.0,)
+        else:
+            azimuths = np.linspace(
+                0.0,
+                360.0,
+                int(settings['sample_azimuth_count']),
+                endpoint=False,
+            )
+        for azimuth in azimuths:
+            radius = float(event_radius_km) * float(fraction)
+            lon, lat = _ofes_offset_lon_lat(
+                core_lon, core_lat, radius, float(azimuth)
+            )
+            records.append(
+                {
+                    'sample_id': f'event_{sample_index:03d}',
+                    'sample_role': 'event',
+                    'ring_fraction': float(fraction),
+                    'radius_km': radius,
+                    'azimuth_deg': float(azimuth),
+                    'sample_lon': lon,
+                    'sample_lat': lat,
+                }
+            )
+            sample_index += 1
+    control_index = 0
+    control_azimuths = np.linspace(
+        0.0,
+        360.0,
+        int(settings['control_azimuth_count']),
+        endpoint=False,
+    )
+    for ring_index, radius in enumerate(settings['control_radii_km']):
+        offset = (
+            0.5 * 360.0 / int(settings['control_azimuth_count'])
+            if ring_index % 2
+            else 0.0
+        )
+        for azimuth in control_azimuths + offset:
+            lon, lat = _ofes_offset_lon_lat(
+                core_lon, core_lat, float(radius), float(azimuth)
+            )
+            records.append(
+                {
+                    'sample_id': f'control_{control_index:03d}',
+                    'sample_role': 'background_control',
+                    'ring_fraction': np.nan,
+                    'radius_km': float(radius),
+                    'azimuth_deg': float(azimuth % 360.0),
+                    'sample_lon': lon,
+                    'sample_lat': lat,
+                }
+            )
+            control_index += 1
+    return pd.DataFrame(records)
+
+
+def _ofes_mccoy_kernel_smooth(
+    values: np.ndarray,
+    sigma_pixels: float,
+) -> np.ndarray:
+    """在规则压强网格上复现 ksr.m 的归一化高斯核回归。"""
+    data = np.asarray(values, dtype=float)
+    numerator = gaussian_filter(
+        data,
+        sigma=float(sigma_pixels),
+        mode='constant',
+        cval=0.0,
+        truncate=8.0,
+    )
+    denominator = gaussian_filter(
+        np.ones(data.shape, dtype=float),
+        sigma=float(sigma_pixels),
+        mode='constant',
+        cval=0.0,
+        truncate=8.0,
+    )
+    return numerator / denominator
+
+
+def _ofes_mccoy_profile_properties(
+    depth_m: np.ndarray,
+    potential_temperature: np.ndarray,
+    salinity: np.ndarray,
+    lon: float,
+    lat: float,
+    settings: dict,
+) -> dict:
+    """按 McCoy 10-dbar 网格与 10-dbar 核平滑派生单条 OFES 剖面。"""
+    depth = np.asarray(depth_m, dtype=float)
+    theta = np.asarray(potential_temperature, dtype=float)
+    salt = np.asarray(salinity, dtype=float)
+    pressure = np.asarray(gsw.p_from_z(-depth, float(lat)), dtype=float)
+    valid = (
+        np.isfinite(pressure)
+        & np.isfinite(theta)
+        & np.isfinite(salt)
+    )
+    pressure = pressure[valid]
+    theta = theta[valid]
+    salt = salt[valid]
+    order = np.argsort(pressure)
+    pressure = pressure[order]
+    theta = theta[order]
+    salt = salt[order]
+    pressure, unique_index = np.unique(pressure, return_index=True)
+    theta = theta[unique_index]
+    salt = salt[unique_index]
+    shallow_indices = np.flatnonzero(
+        (pressure > 100.0) & (pressure < 700.0)
+    )
+    below_indices = np.flatnonzero(
+        (pressure > 100.0) & (pressure < 1000.0)
+    )
+    deep_indices = np.flatnonzero(pressure > 1000.0)
+    pressure_gaps = np.diff(pressure)
+    shallow_gap = (
+        float(np.max(pressure_gaps[shallow_indices[:-1]]))
+        if shallow_indices.size > 1
+        else np.inf
+    )
+    below_gap = (
+        float(np.max(pressure_gaps[below_indices[:-1]]))
+        if below_indices.size > 1
+        else np.inf
+    )
+    deep_gap = (
+        float(np.max(pressure_gaps[deep_indices[:-1]]))
+        if deep_indices.size > 1
+        else 0.0
+    )
+    qc_reasons = []
+    if pressure.size < settings['profile_min_unique_levels']:
+        qc_reasons.append('fewer_than_minimum_unique_levels')
+    if pressure.size == 0 or float(np.max(pressure)) < settings[
+        'profile_min_pressure_max_dbar'
+    ]:
+        qc_reasons.append('profile_too_shallow')
+    if pressure.size == 0 or float(np.min(pressure)) > settings[
+        'profile_max_pressure_min_dbar'
+    ]:
+        qc_reasons.append('profile_lacks_shallow_data')
+    if shallow_gap > settings['shallow_resolution_max_dbar']:
+        qc_reasons.append('insufficient_100_700dbar_resolution')
+    if np.any(
+        pressure_gaps[below_indices[:-1]]
+        > settings['shallow_resolution_max_dbar']
+    ):
+        first_bad = int(
+            below_indices[:-1][np.flatnonzero(
+                pressure_gaps[below_indices[:-1]]
+                > settings['shallow_resolution_max_dbar']
+            )[0]]
+        )
+        pressure = pressure[:first_bad + 1]
+        theta = theta[:first_bad + 1]
+        salt = salt[:first_bad + 1]
+        pressure_gaps = np.diff(pressure)
+        shallow_indices = np.flatnonzero(
+            (pressure > 100.0) & (pressure < 700.0)
+        )
+        below_indices = np.flatnonzero(
+            (pressure > 100.0) & (pressure < 1000.0)
+        )
+        deep_indices = np.flatnonzero(pressure > 1000.0)
+        shallow_gap = (
+            float(np.max(pressure_gaps[shallow_indices[:-1]]))
+            if shallow_indices.size > 1
+            else np.inf
+        )
+        below_gap = (
+            float(np.max(pressure_gaps[below_indices[:-1]]))
+            if below_indices.size > 1
+            else np.inf
+        )
+        deep_gap = (
+            float(np.max(pressure_gaps[deep_indices[:-1]]))
+            if deep_indices.size > 1
+            else 0.0
+        )
+        if float(np.max(pressure)) < settings[
+            'profile_min_pressure_max_dbar'
+        ]:
+            qc_reasons.append('profile_too_shallow_after_resolution_cut')
+    if np.any(
+        pressure_gaps[deep_indices[:-1]]
+        > settings['deep_resolution_max_dbar']
+    ):
+        first_bad = int(
+            deep_indices[:-1][np.flatnonzero(
+                pressure_gaps[deep_indices[:-1]]
+                > settings['deep_resolution_max_dbar']
+            )[0]]
+        )
+        pressure = pressure[:first_bad + 1]
+        theta = theta[:first_bad + 1]
+        salt = salt[:first_bad + 1]
+        pressure_gaps = np.diff(pressure)
+        deep_indices = np.flatnonzero(pressure > 1000.0)
+        deep_gap = (
+            float(np.max(pressure_gaps[deep_indices[:-1]]))
+            if deep_indices.size > 1
+            else 0.0
+        )
+    if (
+        pressure.size < settings['profile_min_unique_levels']
+        and 'fewer_than_minimum_unique_levels' not in qc_reasons
+    ):
+        qc_reasons.append('fewer_than_minimum_unique_levels_after_resolution_cut')
+    pgrid = np.arange(
+        settings['pressure_min_dbar'],
+        settings['pressure_max_dbar'] + 0.1,
+        settings['pressure_spacing_dbar'],
+        dtype=float,
+    )
+    empty = np.full(pgrid.size, np.nan, dtype=float)
+    result = {
+        'pressure': pgrid,
+        'potential_temperature': empty.copy(),
+        'in_situ_temperature': empty.copy(),
+        'salinity': empty.copy(),
+        'sigma0': empty.copy(),
+        'spiciness0': empty.copy(),
+        'n2': empty.copy(),
+        'absolute_salinity': empty.copy(),
+        'conservative_temperature': empty.copy(),
+        'profile_qc_passed': False,
+        'profile_qc_status': ';'.join(qc_reasons) if qc_reasons else 'passed',
+        'source_unique_level_count': int(pressure.size),
+        'source_pressure_min_dbar': (
+            float(np.min(pressure)) if pressure.size else np.nan
+        ),
+        'source_pressure_max_dbar': (
+            float(np.max(pressure)) if pressure.size else np.nan
+        ),
+        'source_shallow_max_gap_dbar': shallow_gap,
+        'source_below1000_max_gap_dbar': below_gap,
+        'source_deep_max_gap_dbar': deep_gap,
+        'source_longitude_deg': float(lon),
+        'source_latitude_deg': float(lat),
+    }
+    if qc_reasons:
+        return result
+    source_sa = gsw.SA_from_SP(salt, pressure, float(lon), float(lat))
+    source_ct = gsw.CT_from_pt(source_sa, theta)
+    temperature = gsw.t_from_CT(source_sa, source_ct, pressure)
+    theta_grid = np.interp(
+        pgrid, pressure, theta, left=np.nan, right=np.nan
+    )
+    temperature_grid = np.interp(
+        pgrid, pressure, temperature, left=np.nan, right=np.nan
+    )
+    salt_grid = np.interp(
+        pgrid, pressure, salt, left=np.nan, right=np.nan
+    )
+    p2 = np.arange(
+        settings['pressure_min_dbar'],
+        settings['pressure_max_dbar'] + 0.1,
+        settings['smoothing_grid_spacing_dbar'],
+        dtype=float,
+    )
+    inside_profile = (p2 >= pressure[0]) & (p2 <= pressure[-1])
+    p2_inside = p2[inside_profile]
+    temperature2 = np.interp(p2_inside, pressure, temperature)
+    salt2 = np.interp(p2_inside, pressure, salt)
+    sigma_pixels = (
+        settings['smoothing_bandwidth_dbar']
+        / settings['smoothing_grid_spacing_dbar']
+    )
+    temperature_smooth2 = _ofes_mccoy_kernel_smooth(
+        temperature2, sigma_pixels
+    )
+    salt_smooth2 = _ofes_mccoy_kernel_smooth(salt2, sigma_pixels)
+    temperature_smooth = np.interp(
+        pgrid, p2_inside, temperature_smooth2, left=np.nan, right=np.nan
+    )
+    salt_smooth = np.interp(
+        pgrid, p2_inside, salt_smooth2, left=np.nan, right=np.nan
+    )
+    SA = gsw.SA_from_SP(salt_grid, pgrid, float(lon), float(lat))
+    CT = gsw.CT_from_pt(SA, theta_grid)
+    SA_smooth = gsw.SA_from_SP(
+        salt_smooth, pgrid, float(lon), float(lat)
+    )
+    CT_smooth = gsw.CT_from_t(
+        SA_smooth, temperature_smooth, pgrid
+    )
+    n2_mid, p_mid = gsw.Nsquared(
+        SA_smooth, CT_smooth, pgrid, lat=float(lat)
+    )
+    n2 = np.interp(pgrid, p_mid, n2_mid, left=np.nan, right=np.nan)
+    sigma0 = np.asarray(gsw.sigma0(SA, CT), dtype=float)
+    spiciness0 = np.asarray(gsw.spiciness0(SA, CT), dtype=float)
+    finite_sigma = np.isfinite(sigma0)
+    if finite_sigma.any() and not np.all(np.diff(sigma0[finite_sigma]) >= 0):
+        original = sigma0[finite_sigma].copy()
+        sorted_sigma = np.sort(original)
+        if float(np.max(np.abs(original - sorted_sigma))) > 0.1:
+            result['profile_qc_status'] = 'density_inversion_gt_0.1kg_m3'
+            return result
+        sigma0[finite_sigma] = sorted_sigma
+    common = (
+        np.isfinite(theta_grid)
+        & np.isfinite(temperature_grid)
+        & np.isfinite(salt_grid)
+        & np.isfinite(sigma0)
+        & np.isfinite(spiciness0)
+        & np.isfinite(n2)
+        & np.isfinite(SA)
+        & np.isfinite(CT)
+    )
+    for values in (
+        theta_grid, temperature_grid, salt_grid, sigma0, spiciness0,
+        n2, SA, CT,
+    ):
+        values[~common] = np.nan
+    result.update(
+        {
+            'potential_temperature': theta_grid,
+            'in_situ_temperature': np.asarray(
+                temperature_grid, dtype=float
+            ),
+            'salinity': salt_grid,
+            'sigma0': sigma0,
+            'spiciness0': spiciness0,
+            'n2': n2,
+            'absolute_salinity': SA,
+            'conservative_temperature': CT,
+            'profile_qc_passed': True,
+            'profile_qc_status': 'passed',
+        }
+    )
+    return result
+
+
+def _ofes_mccoy_interp_density(
+    density: np.ndarray,
+    values: np.ndarray,
+    target_density: np.ndarray,
+) -> np.ndarray:
+    """在单调唯一的 sigma0 坐标上线性插值且禁止外推。"""
+    density_arr = np.asarray(density, dtype=float)
+    values_arr = np.asarray(values, dtype=float)
+    target = np.asarray(target_density, dtype=float)
+    valid = np.isfinite(density_arr) & np.isfinite(values_arr)
+    out = np.full(target.shape, np.nan, dtype=float)
+    if np.count_nonzero(valid) < 2:
+        return out
+    dens, index = np.unique(density_arr[valid], return_index=True)
+    vals = values_arr[valid][index]
+    finite_target = np.isfinite(target)
+    inside = finite_target & (target >= dens[0]) & (target <= dens[-1])
+    out[inside] = np.interp(target[inside], dens, vals)
+    return out
+
+
+def _ofes_mccoy_reference(
+    profiles: list[dict],
+    lon: float,
+    lat: float,
+) -> dict:
+    """以同日稀疏 control 的逐压中位构建 OFES-native 背景剖面。"""
+    good = [profile for profile in profiles if profile['profile_qc_passed']]
+    if not good:
+        raise RuntimeError('OFES McCoy controls contain no valid profiles.')
+    pressure = good[0]['pressure']
+    temperature_stack = np.stack(
+        [profile['in_situ_temperature'] for profile in good]
+    )
+    salt_stack = np.stack([profile['salinity'] for profile in good])
+    temperature = np.full(pressure.shape, np.nan, dtype=float)
+    salt = np.full(pressure.shape, np.nan, dtype=float)
+    temperature_valid = np.any(
+        np.isfinite(temperature_stack), axis=0
+    )
+    salt_valid = np.any(np.isfinite(salt_stack), axis=0)
+    temperature[temperature_valid] = np.nanmedian(
+        temperature_stack[:, temperature_valid], axis=0
+    )
+    salt[salt_valid] = np.nanmedian(salt_stack[:, salt_valid], axis=0)
+    for field in (temperature, salt):
+        finite = np.flatnonzero(np.isfinite(field))
+        if finite.size and finite[0] > 0 and pressure[0] == 0.0:
+            field[0] = field[finite[0]]
+    SA = gsw.SA_from_SP(salt, pressure, float(lon), float(lat))
+    CT = gsw.CT_from_t(SA, temperature, pressure)
+    theta = gsw.pt0_from_t(SA, temperature, pressure)
+    n2_mid, p_mid = gsw.Nsquared(SA, CT, pressure, lat=float(lat))
+    n2 = np.interp(pressure, p_mid, n2_mid, left=np.nan, right=np.nan)
+    return {
+        'pressure': pressure,
+        'potential_temperature': theta,
+        'in_situ_temperature': np.asarray(temperature, dtype=float),
+        'salinity': salt,
+        'sigma0': np.asarray(gsw.sigma0(SA, CT), dtype=float),
+        'spiciness0': np.asarray(gsw.spiciness0(SA, CT), dtype=float),
+        'n2': np.asarray(n2, dtype=float),
+        'absolute_salinity': np.asarray(SA, dtype=float),
+        'conservative_temperature': np.asarray(CT, dtype=float),
+    }
+
+
+def _ofes_mccoy_anomalies(
+    profile: dict,
+    reference: dict,
+) -> dict:
+    """复现 McCoy 沿目标剖面等密度面定义的 T/S/spice/N2 异常。"""
+    target_sigma = profile['sigma0']
+    reference_common = np.logical_and.reduce(
+        [
+            np.isfinite(reference[key])
+            for key in (
+                'sigma0', 'in_situ_temperature', 'salinity',
+                'spiciness0', 'n2',
+            )
+        ]
+    )
+    reference_sigma = np.where(
+        reference_common, reference['sigma0'], np.nan
+    )
+    anomalies = {}
+    for source_key, output_key in (
+        ('in_situ_temperature', 'temperature_anomaly'),
+        ('salinity', 'salinity_anomaly'),
+        ('spiciness0', 'spiciness_anomaly'),
+        ('n2', 'n2_anomaly'),
+    ):
+        reference_on_density = _ofes_mccoy_interp_density(
+            reference_sigma,
+            np.where(reference_common, reference[source_key], np.nan),
+            target_sigma,
+        )
+        anomalies[output_key] = (
+            np.asarray(profile[source_key], dtype=float)
+            - reference_on_density
+        )
+    return anomalies
+
+
+def _ofes_mccoy_iqr_on_profile(
+    target_profile: dict,
+    control_profiles: list[dict],
+    reference: dict,
+    settings: dict,
+) -> dict:
+    """沿目标 sigma0 从目标加 control 异常池估计 Q1/Q3/IQR。"""
+    target_sigma = target_profile['sigma0']
+    spice_columns = []
+    n2_columns = []
+    nearby_profiles = list(control_profiles)
+    if not any(
+        control is target_profile for control in nearby_profiles
+    ):
+        nearby_profiles.append(target_profile)
+    for control in nearby_profiles:
+        if not control['profile_qc_passed']:
+            continue
+        anomalies = _ofes_mccoy_anomalies(control, reference)
+        spice_columns.append(
+            _ofes_mccoy_interp_density(
+                control['sigma0'],
+                anomalies['spiciness_anomaly'],
+                target_sigma,
+            )
+        )
+        n2_columns.append(
+            _ofes_mccoy_interp_density(
+                control['sigma0'], anomalies['n2_anomaly'], target_sigma
+            )
+        )
+    if not spice_columns:
+        empty = np.full(target_sigma.shape, np.nan, dtype=float)
+        return {
+            'spice_q25': empty.copy(), 'spice_q75': empty.copy(),
+            'spice_iqr': empty.copy(), 'n2_q25': empty.copy(),
+            'n2_q75': empty.copy(), 'n2_iqr': empty.copy(),
+            'sample_count': np.zeros(target_sigma.shape, dtype=np.int16),
+        }
+    spice = np.stack(spice_columns, axis=1)
+    n2 = np.stack(n2_columns, axis=1)
+    spice_sample_count = np.count_nonzero(np.isfinite(spice), axis=1)
+    n2_sample_count = np.count_nonzero(np.isfinite(n2), axis=1)
+    spice_enough = spice_sample_count >= settings[
+        'minimum_background_profiles'
+    ]
+    n2_enough = n2_sample_count >= settings[
+        'minimum_background_profiles'
+    ]
+    spice_q25 = np.full(target_sigma.shape, np.nan, dtype=float)
+    spice_q75 = np.full(target_sigma.shape, np.nan, dtype=float)
+    n2_q25 = np.full(target_sigma.shape, np.nan, dtype=float)
+    n2_q75 = np.full(target_sigma.shape, np.nan, dtype=float)
+    for level in np.flatnonzero(spice_enough):
+        spice_values = spice[level, np.isfinite(spice[level])]
+        spice_q25[level], spice_q75[level] = np.percentile(
+            spice_values, (25, 75)
+        )
+    for level in np.flatnonzero(n2_enough):
+        n2_values = n2[level, np.isfinite(n2[level])]
+        n2_q25[level], n2_q75[level] = np.percentile(
+            n2_values, (25, 75)
+        )
+    return {
+        'spice_q25': spice_q25,
+        'spice_q75': spice_q75,
+        'spice_iqr': spice_q75 - spice_q25,
+        'n2_q25': n2_q25,
+        'n2_q75': n2_q75,
+        'n2_iqr': n2_q75 - n2_q25,
+        'sample_count': np.minimum(spice_sample_count, n2_sample_count),
+    }
+
+
+def _ofes_mccoy_matlab_range(values: tuple[float, float, float]) -> np.ndarray:
+    """按 MATLAB start:step:stop 语义构造包含终点的浮点范围。"""
+    start, stop, step = values
+    count = int(np.floor((stop - start) / step + 0.5))
+    return start + step * np.arange(count + 1, dtype=float)
+
+
+def _ofes_mccoy_round_10(value: float) -> float:
+    """复现 MATLAB 对正压强 round(p/10)*10 的 half-up 取整。"""
+    return float(np.floor(float(value) / 10.0 + 0.5) * 10.0)
+
+
+def _ofes_mccoy_gaussian_fit(
+    profile: dict,
+    anomalies: dict,
+    thresholds: dict,
+    pycnocline_density: float,
+    scv_type: str,
+    settings: dict,
+) -> dict:
+    """逐项移植 fit_gaussian.m 的离散搜索与六个拒绝门。"""
+    failed = {
+        'gaussian_passed': False,
+        'gaussian_failure': 'unresolved',
+        'gaussian_r2': np.nan,
+        'gaussian_nrmse': np.nan,
+        'gaussian_amplitude': np.nan,
+        'gaussian_h_parameter_dbar': np.nan,
+        'gaussian_peak_pressure_dbar': np.nan,
+        'gaussian_shallow_pressure_dbar': np.nan,
+        'gaussian_deep_pressure_dbar': np.nan,
+        'gaussian_core_shallow_pressure_dbar': np.nan,
+        'gaussian_core_deep_pressure_dbar': np.nan,
+        'gaussian_peak_density': np.nan,
+    }
+    pressure = profile['pressure']
+    density = profile['sigma0']
+    spice = np.asarray(anomalies['spiciness_anomaly'], dtype=float)
+    n2_anomaly = np.asarray(anomalies['n2_anomaly'], dtype=float)
+    sign = 1.0 if scv_type == 'spicy' else -1.0
+    transformed_spice = sign * spice
+    spice_threshold = (
+        thresholds['spice_q75']
+        if scv_type == 'spicy'
+        else -thresholds['spice_q25']
+    )
+    spice_exceed = transformed_spice - (
+        spice_threshold
+        + settings['iqr_multiplier'] * thresholds['spice_iqr']
+    )
+    n2_exceed = (
+        thresholds['n2_q25']
+        - settings['iqr_multiplier'] * thresholds['n2_iqr']
+        - n2_anomaly
+    )
+    below = (
+        np.isfinite(density)
+        & (density >= float(pycnocline_density))
+        & np.isfinite(transformed_spice)
+    )
+    indices = np.flatnonzero(below)
+    if indices.size < 3:
+        failed['gaussian_failure'] = 'no_data_below_pycnocline'
+        return failed
+    local = transformed_spice[indices]
+    peak_local = np.flatnonzero(
+        (local[1:-1] > local[:-2]) & (local[1:-1] > local[2:])
+    ) + 1
+    if peak_local.size == 0:
+        failed['gaussian_failure'] = 'no_spiciness_peak'
+        return failed
+    candidates = []
+    for local_index in peak_local:
+        index = int(indices[local_index])
+        density_near = (
+            below
+            & (np.abs(density - density[index])
+               <= settings['n2_density_tolerance_kg_m3'])
+        )
+        if (
+            np.isfinite(spice_exceed[index])
+            and spice_exceed[index] > 0
+            and transformed_spice[index]
+            > settings['minimum_peak_spiciness_kg_m3']
+            and np.any(n2_exceed[density_near] > 0)
+        ):
+            candidates.append(index)
+    if not candidates:
+        failed['gaussian_failure'] = 'no_matching_spice_n2_peak'
+        return failed
+    peak_index = max(candidates, key=lambda index: transformed_spice[index])
+    peak_pressure = float(pressure[peak_index])
+    base_amplitude = float(transformed_spice[peak_index])
+    h_values = np.arange(
+        settings['gaussian_h_min_dbar'],
+        settings['gaussian_h_max_dbar'] + 0.1,
+        settings['gaussian_h_step_dbar'],
+    )
+    amplitude_factors = _ofes_mccoy_matlab_range(
+        settings['gaussian_amplitude_factors']
+    )
+    center_factors = _ofes_mccoy_matlab_range(
+        settings['gaussian_center_shift_factors']
+    )
+    best = None
+    for h_value in h_values:
+        half_extent = 2.0 * np.sqrt(h_value**2 / 2.0)
+        full_height = 2.0 * half_extent
+        for amplitude_factor in amplitude_factors:
+            amplitude = base_amplitude * float(amplitude_factor)
+            for center_factor in center_factors:
+                center = peak_pressure + float(center_factor) * full_height
+                shallow = _ofes_mccoy_round_10(center - half_extent)
+                deep = _ofes_mccoy_round_10(center + half_extent)
+                fit_mask = (
+                    (pressure >= shallow)
+                    & (pressure <= deep)
+                    & np.isfinite(transformed_spice)
+                )
+                if np.count_nonzero(fit_mask) < 3:
+                    continue
+                model = amplitude * np.exp(
+                    -((pressure - center) ** 2) / (h_value**2)
+                )
+                observed = transformed_spice[fit_mask]
+                predicted = model[fit_mask]
+                observed_range = float(np.max(observed) - np.min(observed))
+                if observed_range <= 0:
+                    continue
+                correlation = np.corrcoef(observed, predicted)[0, 1]
+                r2 = float(correlation**2) if np.isfinite(correlation) else np.nan
+                rmse = float(np.sqrt(np.mean((observed - predicted) ** 2)))
+                nrmse = rmse / observed_range
+                if (
+                    not np.isfinite(r2)
+                    or r2 < settings['gaussian_r2_min']
+                    or nrmse > settings['gaussian_nrmse_max']
+                ):
+                    continue
+                loss = float(np.sum((observed - predicted) ** 2))
+                candidate = (
+                    loss, r2, nrmse, amplitude, h_value, center,
+                    shallow, deep,
+                )
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+    if best is None:
+        failed['gaussian_failure'] = 'fit_quality'
+        return failed
+    _, r2, nrmse, amplitude, h_value, center, shallow, deep = best
+    core_half_extent = np.sqrt(h_value**2 / 2.0)
+    core_shallow = _ofes_mccoy_round_10(center - core_half_extent)
+    core_deep = _ofes_mccoy_round_10(center + core_half_extent)
+    height = deep - shallow
+    if (
+        height < settings['lens_height_min_dbar']
+        or height > settings['lens_height_max_dbar']
+        or shallow < settings['lens_shallow_limit_min_dbar']
+    ):
+        failed['gaussian_failure'] = 'lens_extent'
+        return failed
+    finite_pressure = pressure[np.isfinite(spice)]
+    if (
+        finite_pressure.size == 0
+        or float(np.min(finite_pressure)) > shallow
+        or float(np.max(finite_pressure)) < deep
+    ):
+        failed['gaussian_failure'] = 'missing_lens_limits'
+        return failed
+    density_core_shallow = np.interp(core_shallow, pressure, density)
+    density_core_deep = np.interp(core_deep, pressure, density)
+    core_density_mask = (
+        np.isfinite(density)
+        & (density >= min(density_core_shallow, density_core_deep))
+        & (density <= max(density_core_shallow, density_core_deep))
+    )
+    if (
+        not np.any(n2_exceed[core_density_mask] > 0)
+        or float(np.nansum(n2_anomaly[core_density_mask])) > 0
+    ):
+        failed['gaussian_failure'] = 'no_weak_n2_core'
+        return failed
+    return {
+        'gaussian_passed': True,
+        'gaussian_failure': 'passed',
+        'gaussian_r2': r2,
+        'gaussian_nrmse': nrmse,
+        'gaussian_amplitude': sign * amplitude,
+        'gaussian_h_parameter_dbar': float(h_value),
+        'gaussian_peak_pressure_dbar': float(center),
+        'gaussian_shallow_pressure_dbar': float(shallow),
+        'gaussian_deep_pressure_dbar': float(deep),
+        'gaussian_core_shallow_pressure_dbar': float(core_shallow),
+        'gaussian_core_deep_pressure_dbar': float(core_deep),
+        'gaussian_peak_density': float(density[peak_index]),
+    }
+
+
+def _ofes_mccoy_dynamic_height_gate(
+    profile: dict,
+    reference: dict,
+    gaussian: dict,
+) -> dict:
+    """移植 get_*_scvs.m 的去 BC1 动力高度内峰判据。"""
+    result = {
+        'dynamic_height_passed': False,
+        'dynamic_height_failure': 'unresolved',
+        'dynamic_height_peak_m2_s2': np.nan,
+        'dynamic_height_bc1_alpha': np.nan,
+    }
+    try:
+        pressure = profile['pressure']
+        finite = (
+            np.isfinite(profile['absolute_salinity'])
+            & np.isfinite(profile['conservative_temperature'])
+            & np.isfinite(reference['absolute_salinity'])
+            & np.isfinite(reference['conservative_temperature'])
+        )
+        if np.count_nonzero(finite) < 10:
+            result['dynamic_height_failure'] = 'too_few_common_levels'
+            return result
+        pf = pressure[finite]
+        reference_pressure = float(np.max(pf))
+        dynamic_anomaly = (
+            gsw.geo_strf_dyn_height(
+                profile['absolute_salinity'][finite],
+                profile['conservative_temperature'][finite],
+                pf,
+                reference_pressure,
+            )
+            - gsw.geo_strf_dyn_height(
+                reference['absolute_salinity'][finite],
+                reference['conservative_temperature'][finite],
+                pf,
+                reference_pressure,
+            )
+        )
+        mode_mask = np.isfinite(reference['n2'])
+        if np.count_nonzero(mode_mask) < 5:
+            result['dynamic_height_failure'] = 'reference_n2_unavailable'
+            return result
+        _, pmodes, _, mode_pressure = _dynamic_modes(
+            reference['n2'][mode_mask], pressure[mode_mask]
+        )
+        bc1 = np.interp(
+            pf,
+            mode_pressure,
+            pmodes[:, 0],
+            left=np.nan,
+            right=np.nan,
+        )
+        common = np.isfinite(dynamic_anomaly) & np.isfinite(bc1)
+        if np.count_nonzero(common) < 10:
+            result['dynamic_height_failure'] = 'bc1_overlap_too_shallow'
+            return result
+        pf_common = pf[common]
+        dynamic_common = dynamic_anomaly[common]
+        bc1_common = bc1[common]
+        shallow = gaussian['gaussian_shallow_pressure_dbar']
+        deep = gaussian['gaussian_deep_pressure_dbar']
+        sigma = profile['sigma0']
+        finite_sigma = np.flatnonzero(np.isfinite(sigma))
+        mixed_layer_pressure = 0.0
+        if finite_sigma.size:
+            mixed = np.flatnonzero(
+                np.isfinite(sigma)
+                & (sigma > sigma[finite_sigma[0]] + 0.03)
+            )
+            if mixed.size:
+                mixed_layer_pressure = float(pressure[mixed[0]])
+        keep = (
+            ~((pf_common > shallow) & (pf_common < deep))
+            & (pf_common >= mixed_layer_pressure)
+        )
+        if np.count_nonzero(keep) < 3:
+            result['dynamic_height_failure'] = 'bc1_fit_too_few_levels'
+            return result
+        xo = bc1_common[keep]
+        xf = dynamic_common[keep]
+        design = xo - xo[-1]
+        target = xf - xf[-1]
+        denominator = float(np.dot(design, design))
+        alpha = (
+            float(np.clip(np.dot(design, target) / denominator, -1.0, 1.0))
+            if denominator > 0
+            else 0.0
+        )
+        residual = dynamic_common - (
+            alpha * bc1_common
+            + (dynamic_common[-1] - alpha * bc1_common[-1])
+        )
+        core = (pf_common >= shallow) & (pf_common <= deep)
+        if not np.any(core):
+            result['dynamic_height_failure'] = 'empty_lens_band'
+            return result
+        low = float(residual[np.argmin(np.abs(pf_common - shallow))])
+        high = float(residual[np.argmin(np.abs(pf_common - deep))])
+        peak = float(np.nanmax(residual[core]))
+        passed = bool(np.isfinite(peak) and peak > low and peak > high)
+        result.update(
+            {
+                'dynamic_height_passed': passed,
+                'dynamic_height_failure': (
+                    'passed' if passed else 'no_internal_maximum'
+                ),
+                'dynamic_height_peak_m2_s2': peak,
+                'dynamic_height_bc1_alpha': alpha,
+            }
+        )
+        return result
+    except Exception as error:
+        result['dynamic_height_failure'] = (
+            f'{type(error).__name__}:{error}'
+        )
+        return result
+
+
+def _ofes_mccoy_profile_classification(
+    profile: dict,
+    reference: dict,
+    control_profiles: list[dict],
+    settings: dict,
+) -> dict:
+    """对一条 OFES 虚拟剖面执行 McCoy individual-SCV 完整门链。"""
+    base = {
+        'profile_qc_passed': bool(profile['profile_qc_passed']),
+        'profile_qc_status': str(profile['profile_qc_status']),
+        'background_max_sample_count': 0,
+        'background_qualified_level_count': 0,
+        'background_iqr_passed': False,
+        'profile_offset_qc_passed': False,
+        'localized_spice_anomaly_passed': False,
+        'initial_candidate_passed': False,
+        'scv_type': None,
+        'pycnocline_density': np.nan,
+        'peak_spiciness_anomaly': np.nan,
+        'peak_n2_anomaly_s_2': np.nan,
+        'gaussian_passed': False,
+        'gaussian_failure': 'not_reached',
+        'gaussian_r2': np.nan,
+        'gaussian_nrmse': np.nan,
+        'gaussian_amplitude': np.nan,
+        'gaussian_h_parameter_dbar': np.nan,
+        'gaussian_peak_pressure_dbar': np.nan,
+        'gaussian_shallow_pressure_dbar': np.nan,
+        'gaussian_deep_pressure_dbar': np.nan,
+        'gaussian_core_shallow_pressure_dbar': np.nan,
+        'gaussian_core_deep_pressure_dbar': np.nan,
+        'gaussian_peak_density': np.nan,
+        'dynamic_height_passed': False,
+        'dynamic_height_failure': 'not_reached',
+        'dynamic_height_peak_m2_s2': np.nan,
+        'dynamic_height_bc1_alpha': np.nan,
+        'mccoy_profile_compatible': False,
+        'mccoy_failure_stage': 'profile_qc',
+    }
+    if not profile['profile_qc_passed']:
+        return base
+    if abs(float(profile['source_latitude_deg'])) < settings[
+        'equator_latitude_min_deg'
+    ]:
+        base['mccoy_failure_stage'] = 'equatorial'
+        return base
+    anomalies = _ofes_mccoy_anomalies(profile, reference)
+    thresholds = _ofes_mccoy_iqr_on_profile(
+        profile, control_profiles, reference, settings
+    )
+    finite_counts = thresholds['sample_count'][
+        np.isfinite(profile['sigma0'])
+    ]
+    base['background_max_sample_count'] = (
+        int(np.max(finite_counts)) if finite_counts.size else 0
+    )
+    enough = thresholds['sample_count'] >= settings[
+        'minimum_background_profiles'
+    ]
+    base['background_qualified_level_count'] = int(
+        np.count_nonzero(enough)
+    )
+    base['background_iqr_passed'] = bool(
+        np.count_nonzero(enough) >= 3
+    )
+    if not base['background_iqr_passed']:
+        base['mccoy_failure_stage'] = 'background_iqr'
+        return base
+    reference_n2 = reference['n2']
+    finite_n2 = np.flatnonzero(np.isfinite(reference_n2))
+    if finite_n2.size == 0:
+        base['mccoy_failure_stage'] = 'pycnocline'
+        return base
+    pycnocline_index = int(
+        finite_n2[np.nanargmax(reference_n2[finite_n2])]
+    )
+    pycnocline_index = min(pycnocline_index + 1, len(reference_n2) - 1)
+    pycnocline_density = float(reference['sigma0'][pycnocline_index])
+    base['pycnocline_density'] = pycnocline_density
+    below = (
+        np.isfinite(profile['sigma0'])
+        & (profile['sigma0'] >= pycnocline_density)
+    )
+    offset_passed = True
+    for anomaly_key in (
+        'temperature_anomaly', 'salinity_anomaly', 'spiciness_anomaly'
+    ):
+        values = anomalies[anomaly_key][below]
+        denominator = values.size
+        positive = np.count_nonzero(values > 0)
+        negative = np.count_nonzero(values < 0)
+        positive_fraction = (
+            float(positive / denominator) if denominator else 1.0
+        )
+        negative_fraction = (
+            float(negative / denominator) if denominator else 1.0
+        )
+        if (
+            denominator == 0
+            or positive == 0
+            or negative == 0
+            or positive_fraction > 0.9
+            or negative_fraction > 0.9
+        ):
+            offset_passed = False
+            break
+    base['profile_offset_qc_passed'] = offset_passed
+    if not offset_passed:
+        base['mccoy_failure_stage'] = 'profile_offset_qc'
+        return base
+    spice = anomalies['spiciness_anomaly']
+    n2_anomaly = anomalies['n2_anomaly']
+    multiplier = settings['iqr_multiplier']
+    localized_high = spice - (
+        thresholds['spice_q75'] + thresholds['spice_iqr']
+    )
+    localized_low = spice - (
+        thresholds['spice_q25'] - thresholds['spice_iqr']
+    )
+    localized_valid = np.isfinite(localized_high) & np.isfinite(localized_low)
+    localized_exceedance = (
+        (localized_high[localized_valid] > 0)
+        | (localized_low[localized_valid] < 0)
+    )
+    localized_indices = np.flatnonzero(localized_exceedance)
+    localized_passed = not (
+        localized_indices.size
+        and localized_indices[0] == 0
+        and not np.any(np.diff(localized_indices) > 1)
+    )
+    base['localized_spice_anomaly_passed'] = localized_passed
+    if not localized_passed:
+        base['mccoy_failure_stage'] = 'surface_connected_spice_anomaly'
+        return base
+    spicy_exceed = spice - (
+        thresholds['spice_q75'] + multiplier * thresholds['spice_iqr']
+    )
+    minty_exceed = (
+        thresholds['spice_q25'] - multiplier * thresholds['spice_iqr']
+        - spice
+    )
+    n2_exceed = (
+        thresholds['n2_q25'] - multiplier * thresholds['n2_iqr']
+        - n2_anomaly
+    )
+    candidate_types = []
+    for scv_type, spice_exceed in (
+        ('spicy', spicy_exceed), ('minty', minty_exceed)
+    ):
+        spice_indices = np.flatnonzero(below & (spice_exceed > 0))
+        n2_indices = np.flatnonzero(below & (n2_exceed > 0))
+        if (
+            spice_indices.size
+            < settings['initial_minimum_spice_exceedance_levels']
+            or n2_indices.size == 0
+        ):
+            continue
+        distance = np.abs(
+            profile['sigma0'][spice_indices, None]
+            - profile['sigma0'][n2_indices][None, :]
+        )
+        if np.any(distance <= settings['n2_density_tolerance_kg_m3']):
+            candidate_types.append(scv_type)
+    base['initial_candidate_passed'] = bool(candidate_types)
+    if not candidate_types:
+        base['mccoy_failure_stage'] = 'initial_spice_n2_candidate'
+        return base
+    fits = []
+    for scv_type in candidate_types:
+        fit = _ofes_mccoy_gaussian_fit(
+            profile,
+            anomalies,
+            thresholds,
+            pycnocline_density,
+            scv_type,
+            settings,
+        )
+        if fit['gaussian_passed']:
+            fits.append((scv_type, fit))
+    if not fits:
+        base['mccoy_failure_stage'] = 'gaussian'
+        return {**base, **_ofes_mccoy_gaussian_fit(
+            profile,
+            anomalies,
+            thresholds,
+            pycnocline_density,
+            candidate_types[0],
+            settings,
+        )}
+    scv_type, gaussian = min(
+        fits, key=lambda item: item[1]['gaussian_nrmse']
+    )
+    dynamic = _ofes_mccoy_dynamic_height_gate(
+        profile, reference, gaussian
+    )
+    pressure = profile['pressure']
+    core_index = int(
+        np.argmin(
+            np.abs(
+                pressure - gaussian['gaussian_peak_pressure_dbar']
+            )
+        )
+    )
+    base.update(
+        {
+            'scv_type': scv_type,
+            'peak_spiciness_anomaly': float(spice[core_index]),
+            'peak_n2_anomaly_s_2': float(n2_anomaly[core_index]),
+            'mccoy_profile_compatible': bool(
+                gaussian['gaussian_passed']
+                and dynamic['dynamic_height_passed']
+            ),
+            'mccoy_failure_stage': (
+                'passed'
+                if dynamic['dynamic_height_passed']
+                else 'dynamic_height'
+            ),
+        }
+    )
+    return {**base, **gaussian, **dynamic}
+
+
+def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
+    """处理一个峰值日事件的虚拟剖面、control 与直接速度确认。"""
+    request = dict(arguments['request'])
+    settings = dict(arguments['settings'])
+    event_id = str(request['event_id'])
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['peak_lon'])
+    core_lat = float(request['peak_lat'])
+    event_radius = float(request['event_peak_equivalent_radius_km'])
+    points = _ofes_mccoy_sampling_points(
+        core_lon, core_lat, event_radius, settings
+    )
+    load_radius = settings['background_outer_radius_km'] + 30.0
+    scale = approximate_degree_length(core_lat)
+    lon_half = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lon'])
+    )
+    lat_half = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half, core_lon + lon_half),
+        lat_bounds=(core_lat - lat_half, core_lat + lat_half),
+    )
+    profiles = []
+    for point in points.itertuples(index=False):
+        profile_table = extract_ofes_profile_interp(
+            snapshot,
+            float(point.sample_lon),
+            float(point.sample_lat),
+            variables=['temp', 'salinity'],
+        )
+        profiles.append(
+            _ofes_mccoy_profile_properties(
+                profile_table['Depth'].to_numpy(dtype=float),
+                profile_table['temp'].to_numpy(dtype=float),
+                profile_table['salinity'].to_numpy(dtype=float),
+                float(point.sample_lon),
+                float(point.sample_lat),
+                settings,
+            )
+        )
+    control_profiles = [
+        profile
+        for point, profile in zip(points.itertuples(index=False), profiles)
+        if point.sample_role == 'background_control'
+    ]
+    valid_control_count = sum(
+        profile['profile_qc_passed'] for profile in control_profiles
+    )
+    if valid_control_count < settings['minimum_background_profiles']:
+        raise RuntimeError(
+            f'{event_id} has only {valid_control_count} valid McCoy controls.'
+        )
+    reference = _ofes_mccoy_reference(
+        control_profiles, core_lon, core_lat
+    )
+    kinematic_cache = {}
+    records = []
+    for point, profile in zip(points.itertuples(index=False), profiles):
+        classification = _ofes_mccoy_profile_classification(
+            profile, reference, control_profiles, settings
+        )
+        peak_pressure = classification.get(
+            'gaussian_peak_pressure_dbar', np.nan
+        )
+        peak_depth = (
+            float(-gsw.z_from_p(peak_pressure, float(point.sample_lat)))
+            if np.isfinite(peak_pressure)
+            else np.nan
+        )
+        direct = {
+            'direct_velocity_depth_m': peak_depth,
+            'direct_rossby_number': np.nan,
+            'direct_normalized_strain': np.nan,
+            'direct_anticyclonic_rotation_confirmed': False,
+            'velocity_confirmed_mccoy_compatible': False,
+        }
+        if classification['mccoy_profile_compatible']:
+            depth_index = int(
+                np.argmin(
+                    np.abs(
+                        np.asarray(snapshot['depth'], dtype=float)
+                        - peak_depth
+                    )
+                )
+            )
+            if depth_index not in kinematic_cache:
+                kinematic_cache[depth_index] = (
+                    _ofes_fixed_depth_kinematic_fields(
+                        snapshot,
+                        float(snapshot['depth'][depth_index]),
+                        settings['direct_velocity_smoothing_sigma_pixels'],
+                    )
+                )
+            kinematics = _ofes_kinematics_at_point(
+                kinematic_cache[depth_index],
+                snapshot['lon'],
+                snapshot['lat'],
+                float(point.sample_lon),
+                float(point.sample_lat),
+            )
+            confirmed = bool(
+                np.isfinite(kinematics['rossby_number'])
+                and np.isfinite(kinematics['normalized_strain'])
+                and kinematics['rossby_number'] < 0
+                and abs(kinematics['rossby_number'])
+                > kinematics['normalized_strain']
+            )
+            direct.update(
+                {
+                    'direct_velocity_depth_m': float(
+                        kinematics['kinematic_depth_m']
+                    ),
+                    'direct_rossby_number': float(
+                        kinematics['rossby_number']
+                    ),
+                    'direct_normalized_strain': float(
+                        kinematics['normalized_strain']
+                    ),
+                    'direct_anticyclonic_rotation_confirmed': confirmed,
+                    'velocity_confirmed_mccoy_compatible': confirmed,
+                }
+            )
+        records.append(
+            {
+                'event_id': event_id,
+                'event_order': int(request['event_order']),
+                'date': date,
+                'event_peak_lon': core_lon,
+                'event_peak_lat': core_lat,
+                'event_peak_depth_m': float(request['peak_depth_at_max']),
+                'event_reference_depth_m': float(
+                    request['reference_depth_m']
+                ),
+                'event_equivalent_radius_km': event_radius,
+                'sample_id': str(point.sample_id),
+                'sample_role': str(point.sample_role),
+                'ring_fraction': float(point.ring_fraction),
+                'radius_km': float(point.radius_km),
+                'azimuth_deg': float(point.azimuth_deg),
+                'sample_lon': float(point.sample_lon),
+                'sample_lat': float(point.sample_lat),
+                'valid_control_profile_count': int(valid_control_count),
+                **classification,
+                **direct,
+            }
+        )
+    event_frame = pd.DataFrame(records)
+    audit = {
+        'event_id': event_id,
+        'date': date,
+        'event_profile_count': int(
+            (event_frame['sample_role'] == 'event').sum()
+        ),
+        'control_profile_count': int(
+            (event_frame['sample_role'] == 'background_control').sum()
+        ),
+        'valid_control_profile_count': int(valid_control_count),
+        'reference_pressure_max_dbar': float(
+            np.nanmax(reference['pressure'][
+                np.isfinite(reference['in_situ_temperature'])
+            ])
+        ),
+    }
+    return event_frame, audit
+
+
+def _ofes_mccoy_event_summary(
+    profiles: pd.DataFrame,
+    lifecycle_summary: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总 profile-compatible、velocity-confirmed 与既有持续性三层。"""
+    records = []
+    for event_id, group in profiles.groupby('event_id', sort=False):
+        event_profiles = group.loc[group['sample_role'] == 'event']
+        controls = group.loc[group['sample_role'] == 'background_control']
+        center = event_profiles.loc[
+            np.isclose(event_profiles['radius_km'], 0.0)
+        ]
+        if len(center) != 1:
+            raise RuntimeError(
+                f'OFES McCoy {event_id} does not have one center profile.'
+            )
+        records.append(
+            {
+                'event_order': int(group['event_order'].iloc[0]),
+                'event_id': str(event_id),
+                'event_profile_count': int(len(event_profiles)),
+                'control_profile_count': int(len(controls)),
+                'center_profile_mccoy_compatible': bool(
+                    center['mccoy_profile_compatible'].iloc[0]
+                ),
+                'any_event_profile_mccoy_compatible': bool(
+                    event_profiles['mccoy_profile_compatible'].any()
+                ),
+                'event_profile_mccoy_compatible_fraction': float(
+                    event_profiles['mccoy_profile_compatible'].mean()
+                ),
+                'center_profile_velocity_confirmed': bool(
+                    center['velocity_confirmed_mccoy_compatible'].iloc[0]
+                ),
+                'any_event_profile_velocity_confirmed': bool(
+                    event_profiles[
+                        'velocity_confirmed_mccoy_compatible'
+                    ].any()
+                ),
+                'event_profile_velocity_confirmed_fraction': float(
+                    event_profiles[
+                        'velocity_confirmed_mccoy_compatible'
+                    ].mean()
+                ),
+                'background_control_mccoy_compatible_fraction': float(
+                    controls['mccoy_profile_compatible'].mean()
+                ),
+                'center_scv_type': center['scv_type'].iloc[0],
+                'center_gaussian_peak_pressure_dbar': float(
+                    center['gaussian_peak_pressure_dbar'].iloc[0]
+                ),
+                'center_direct_rossby_number': float(
+                    center['direct_rossby_number'].iloc[0]
+                ),
+            }
+        )
+    summary = pd.DataFrame(records).merge(
+        lifecycle_summary,
+        on=['event_order', 'event_id'],
+        how='left',
+        validate='one_to_one',
+    ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+    if summary['scv_compatible'].isna().any():
+        raise RuntimeError('OFES McCoy summary failed to join lifecycle labels.')
+    event_profile_counts = summary['event_profile_count'].unique()
+    control_profile_counts = summary['control_profile_count'].unique()
+    if event_profile_counts.size != 1 or control_profile_counts.size != 1:
+        raise RuntimeError('OFES McCoy sampling counts vary across events.')
+    profiles_per_event = int(event_profile_counts[0])
+    controls_per_event = int(control_profile_counts[0])
+    from scipy.stats import fisher_exact
+    event_profiles = profiles.loc[profiles['sample_role'] == 'event']
+    controls = profiles.loc[profiles['sample_role'] == 'background_control']
+    event_pass = int(event_profiles['mccoy_profile_compatible'].sum())
+    control_pass = int(controls['mccoy_profile_compatible'].sum())
+    odds_ratio, p_value = fisher_exact(
+        [
+            [event_pass, len(event_profiles) - event_pass],
+            [control_pass, len(controls) - control_pass],
+        ]
+    )
+    paired = profiles.groupby(['event_id', 'sample_role'])[
+        'mccoy_profile_compatible'
+    ].mean().unstack('sample_role')
+    paired_difference = (
+        paired['event'] - paired['background_control']
+    ).to_numpy(dtype=float)
+    paired_wilcoxon = scipy.stats.wilcoxon(
+        paired_difference,
+        alternative='greater',
+        zero_method='wilcox',
+    )
+    rng = np.random.default_rng(int(settings['random_seed']))
+    bootstrap_index = rng.integers(
+        0,
+        len(paired_difference),
+        size=(int(settings['bootstrap_replicates']), len(paired_difference)),
+    )
+    bootstrap_mean = paired_difference[bootstrap_index].mean(axis=1)
+    bootstrap_ci = np.quantile(bootstrap_mean, (0.025, 0.975))
+    counts = {
+        'strict_event_count': int(len(summary)),
+        'persistent_anticyclonic_rotational_carrier_count': int(
+            summary[
+                'persistent_anticyclonic_rotational_carrier'
+            ].sum()
+        ),
+        'existing_persistent_ofes_scv_compatible_count': int(
+            summary['scv_compatible'].sum()
+        ),
+        'center_profile_mccoy_compatible_count': int(
+            summary['center_profile_mccoy_compatible'].sum()
+        ),
+        'any_event_profile_mccoy_compatible_count': int(
+            summary['any_event_profile_mccoy_compatible'].sum()
+        ),
+        'center_profile_velocity_confirmed_count': int(
+            summary['center_profile_velocity_confirmed'].sum()
+        ),
+        'any_event_profile_velocity_confirmed_count': int(
+            summary['any_event_profile_velocity_confirmed'].sum()
+        ),
+        'event_virtual_profile_count': int(len(event_profiles)),
+        'event_virtual_profile_mccoy_compatible_count': event_pass,
+        'background_control_profile_count': int(len(controls)),
+        'background_control_mccoy_compatible_count': control_pass,
+        'event_vs_control_profile_odds_ratio': float(odds_ratio),
+        'event_vs_control_profile_fisher_p': float(p_value),
+        'event_equal_mean_profile_pass_fraction': float(
+            paired['event'].mean()
+        ),
+        'event_equal_mean_control_pass_fraction': float(
+            paired['background_control'].mean()
+        ),
+        'event_equal_mean_pass_fraction_difference': float(
+            np.mean(paired_difference)
+        ),
+        'event_equal_mean_difference_bootstrap95': [
+            float(bootstrap_ci[0]), float(bootstrap_ci[1])
+        ],
+        'event_equal_paired_wilcoxon_statistic': float(
+            paired_wilcoxon.statistic
+        ),
+        'event_equal_paired_wilcoxon_p': float(paired_wilcoxon.pvalue),
+        'bootstrap_replicates': int(settings['bootstrap_replicates']),
+        'random_seed': int(settings['random_seed']),
+        'center_profile_failure_stage_counts': {
+            str(key): int(value)
+            for key, value in profiles.loc[
+                (profiles['sample_role'] == 'event')
+                & np.isclose(profiles['radius_km'], 0.0),
+                'mccoy_failure_stage',
+            ].value_counts().items()
+        },
+        'event_profile_failure_stage_counts': {
+            str(key): int(value)
+            for key, value in event_profiles[
+                'mccoy_failure_stage'
+            ].value_counts().items()
+        },
+        'center_profile_by_existing_scv_crosstab': {
+            f'existing_{int(existing)}_center_{int(center)}': int(count)
+            for (existing, center), count in summary.groupby(
+                ['scv_compatible', 'center_profile_mccoy_compatible']
+            ).size().items()
+        },
+        'center_profile_by_persistent_anticyclonic_crosstab': {
+            f'persistent_{int(persistent)}_center_{int(center)}': int(count)
+            for (persistent, center), count in summary.groupby(
+                [
+                    'persistent_anticyclonic_rotational_carrier',
+                    'center_profile_mccoy_compatible',
+                ]
+            ).size().items()
+        },
+        'center_profile_by_peak_rotation_crosstab': {
+            f'peak_rotation_{int(rotation)}_center_{int(center)}': int(count)
+            for (rotation, center), count in summary.groupby(
+                [
+                    'population_peak_rotation_dominated',
+                    'center_profile_mccoy_compatible',
+                ]
+            ).size().items()
+        },
+        'interpretation': (
+            'McCoy profile compatibility, direct OFES velocity confirmation, '
+            'and the existing five-day OFES persistence gate are reported as '
+            'separate evidence layers; neither is post-hoc relaxed.'
+        ),
+        'method_limit': (
+            'The public McCoy profile gates are ported, but the primary OFES '
+            'run uses a same-day sparse OFES annulus instead of the RG '
+            'climatology plus multi-year Argo IQR pool; results are therefore '
+            'McCoy-method-compatible rather than catalog-equivalent detections.'
+        ),
+        'source_parity': {
+            'ported_gates': (
+                'profile resolution QC; 2-dbar kernel smoothing and 10-dbar '
+                'property grid; along-isopycnal T/S/spiciness/N2 anomalies; '
+                'target-inclusive Tukey IQR pool; subsurface spice-N2 '
+                'coincidence; discrete Gaussian fit and weak-N2 core; '
+                '|latitude| >= 5 degrees; BC1-removed dynamic-height '
+                'internal maximum'
+            ),
+            'ofes_substitutions': (
+                'same-day OFES annulus median replaces monthly RG climatology; '
+                f'target plus {controls_per_event} deterministic OFES controls '
+                'replaces the '
+                'multi-year Argo pool within 2 degrees and +/-45 calendar '
+                f'days; delivered {settings["pressure_min_dbar"]:g}-'
+                f'{settings["pressure_max_dbar"]:g} dbar replaces the '
+                'original 0-2000 dbar grid'
+            ),
+            'intentional_extensions': (
+                f'{profiles_per_event} deterministic virtual-Argo intercepts '
+                'and direct OFES '
+                'u/v rotation confirmation are reported separately from the '
+                'ported single-profile gate'
+            ),
+            'not_ported': (
+                'Argo cycle/grey-list QC and consecutive-cast time-series '
+                'grouping do not apply to the OFES peak-day experiment'
+            ),
+            'source_bug_policy': (
+                'the intended greater-than-60 per-density IQR support rule is '
+                'enforced; the literal get_IQR_data.m equality-expression '
+                'no-op and column-loop indexing error are not reproduced'
+            ),
+        },
+        'scientific_summary': {
+            'center_profile_layer': (
+                f'{int(summary["center_profile_mccoy_compatible"].sum())}/'
+                f'{len(summary)} event centers pass the ported McCoy '
+                'individual-profile gate; '
+                f'{int(summary["center_profile_velocity_confirmed"].sum())}/'
+                f'{len(summary)} also have a direct OFES anticyclonic '
+                'rotation-dominated core at the diagnosed depth.'
+            ),
+            'intercept_layer': (
+                f'{int(summary["any_event_profile_mccoy_compatible"].sum())}/'
+                f'{len(summary)} events are intercepted by at least one of '
+                f'{profiles_per_event} deterministic virtual profiles; '
+                f'{int(summary["any_event_profile_velocity_confirmed"].sum())}/'
+                f'{len(summary)} also pass the direct OFES velocity '
+                'confirmation at an intercepted profile.'
+            ),
+            'relationship_to_existing_proxy': (
+                'The existing five-day OFES proxy remains '
+                f'{int(summary["scv_compatible"].sum())}/{len(summary)}. '
+                f'{int((summary["scv_compatible"] & summary["center_profile_mccoy_compatible"]).sum())} '
+                'of those pass the McCoy center-profile gate; the axes '
+                'measure peak-day hydrographic/dynamic-height shape versus '
+                'multi-day resolved rotational persistence and are not a '
+                'nested funnel.'
+            ),
+            'primary_enrichment_result': (
+                'Event-equal virtual-profile pass fractions exceed their '
+                'same-event annular controls by '
+                f'{float(np.mean(paired_difference)):.3f} on average '
+                f'(bootstrap 95% interval {float(bootstrap_ci[0]):.3f}-'
+                f'{float(bootstrap_ci[1]):.3f}; one-sided paired Wilcoxon '
+                f'p={float(paired_wilcoxon.pvalue):.3g}).'
+            ),
+            'claim_limit': (
+                'The result supports SCV-like thermohaline and '
+                'dynamic-height structure as a reproducible event-associated '
+                'subset, not SCV dominance, catalog-equivalent '
+                'detections, or causal formation by vortices.'
+            ),
+        },
+        'inference_limit': (
+            'Virtual profiles within one event are spatially dependent; the '
+            'event-equal paired contrast is primary, while the pooled-profile '
+            'Fisher test is retained only as a descriptive sensitivity.'
+        ),
+    }
+    return summary, counts
+
+
+def _plot_ofes_mccoy_virtual_argo(
+    profiles: pd.DataFrame,
+    summary: pd.DataFrame,
+    analysis: dict,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制 McCoy 虚拟剖面三层计数、采样概率与旧判据交叉表。"""
+    figure, axes = plt.subplots(2, 2, figsize=(14.0, 10.0))
+    labels = [
+        'Persistent anti-\ncyclonic carrier',
+        'McCoy center\nprofile',
+        'Center + direct\nOFES velocity',
+        'Existing 5-day\nOFES proxy',
+    ]
+    values = [
+        analysis['persistent_anticyclonic_rotational_carrier_count'],
+        analysis['center_profile_mccoy_compatible_count'],
+        analysis['center_profile_velocity_confirmed_count'],
+        analysis['existing_persistent_ofes_scv_compatible_count'],
+    ]
+    axes[0, 0].bar(
+        labels,
+        values,
+        color=['#64748b', '#2563eb', '#dc2626', '#7c3aed'],
+    )
+    axes[0, 0].set_ylabel(f'Events (out of {len(summary)})')
+    axes[0, 0].set_title('Separate evidence layers (not a nested funnel)')
+    for index, value in enumerate(values):
+        axes[0, 0].text(index, value + 0.5, str(value), ha='center')
+    event_profiles = profiles.loc[profiles['sample_role'] == 'event'].copy()
+    ring = event_profiles.groupby('ring_fraction').agg(
+        profile_fraction=('mccoy_profile_compatible', 'mean'),
+        velocity_fraction=('velocity_confirmed_mccoy_compatible', 'mean'),
+    ).reset_index()
+    axes[0, 1].plot(
+        ring['ring_fraction'], ring['profile_fraction'], marker='o',
+        label='McCoy profile gate',
+    )
+    axes[0, 1].plot(
+        ring['ring_fraction'], ring['velocity_fraction'], marker='s',
+        label='+ direct OFES velocity',
+    )
+    axes[0, 1].set_xlabel('Sampling radius / event equivalent radius')
+    axes[0, 1].set_ylabel('Virtual-profile pass fraction')
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].set_title('Virtual-Argo intercept sensitivity')
+    axes[0, 1].legend()
+    ordered = summary.sort_values(
+        'event_profile_mccoy_compatible_fraction', ascending=False
+    )
+    axes[1, 0].bar(
+        np.arange(len(ordered)),
+        ordered['event_profile_mccoy_compatible_fraction'],
+        color=np.where(ordered['scv_compatible'], '#7c3aed', '#94a3b8'),
+    )
+    axes[1, 0].set_xlabel('Events ordered by virtual-profile pass fraction')
+    axes[1, 0].set_ylabel('Pass fraction across 17 event profiles')
+    axes[1, 0].set_ylim(0, 1)
+    axes[1, 0].set_title('Purple marks the existing 5-day OFES subset')
+    cross = pd.crosstab(
+        summary['scv_compatible'],
+        summary['center_profile_mccoy_compatible'],
+    ).reindex(index=[False, True], columns=[False, True], fill_value=0)
+    image_handle = axes[1, 1].imshow(cross.to_numpy(), cmap='Blues')
+    for row in range(2):
+        for column in range(2):
+            axes[1, 1].text(
+                column, row, int(cross.iloc[row, column]),
+                ha='center', va='center', fontsize=15,
+            )
+    axes[1, 1].set_xticks([0, 1], ['No', 'Yes'])
+    axes[1, 1].set_yticks([0, 1], ['No', 'Yes'])
+    axes[1, 1].set_xlabel('McCoy center-profile compatible')
+    axes[1, 1].set_ylabel('Existing 5-day OFES proxy')
+    axes[1, 1].set_title('The two gates are deliberately not equated')
+    figure.colorbar(image_handle, ax=axes[1, 1], label='Events')
+    for axis in axes.flat:
+        axis.grid(alpha=0.2)
+    figure.suptitle(
+        'OFES virtual-Argo reproduction of McCoy et al. (2020) profile gates'
+    )
+    figure.tight_layout()
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def run_ofes_mccoy_virtual_argo(
+    lifecycle_run_dir: str | Path,
+    *,
+    mccoy_overrides: dict | None = None,
+    source_archive_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """在 56 个 OFES 深层事件上复现 McCoy individual-SCV 剖面门链。
+
+    入口只取每个事件的峰值日，在异常核心、0.35R 与 0.70R 放置 17 条虚拟
+    Argo 剖面，并以 120--240 km 稀疏 control 环带构建 OFES-native 背景；
+    IQR 邻域按源码口径包含目标剖面自身一次。
+    单剖面依次执行 McCoy 公开源码的 10-dbar 处理、等密度面异常、Tukey
+    IQR、spice--N2 共位、高斯形态、弱层结核心和去第一斜压模动力高度内峰；
+    通过后再用原生 OFES u/v 检验核深是否为反气旋 rotation-dominated。
+
+    参数:
+        - lifecycle_run_dir (str | Path): 已完成的 schema-v2 event-lifecycle 运行目录。
+        - mccoy_overrides (dict | None): 临时覆盖 `ofes.mccoy_virtual_argo` 配置。
+        - source_archive_path (str | Path | None): McCoy v1.3 源码 zip；None 使用 paths 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入 lifecycle 目录的 `mccoy_virtual_argo`。
+        - resume (bool): 是否复用签名一致的事件 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、profile/event/audit 表、analysis summary、图件路径及是否复用完成运行。
+
+    输出:
+        - `<run_dir>/events/*.parquet`、`virtual_profile_diagnostics.parquet`、`event_summary.parquet`、`event_audit.parquet`、`analysis_summary.json`、`mccoy_virtual_argo.png`、`source_inventory.parquet` 与 `manifest.json`。
+
+    说明:
+        - 源码数值门槛逐项绑定到 v1.3 zip SHA-256；`worker_count` 只作执行参数，不进入科学 run signature。
+        - OFES 仅交付至约 1077 m，且主运行用模式自身稀疏环带代替 RG 气候态与多年 Argo IQR 池，因此正式名称是 McCoy-method-compatible，而非 McCoy-catalog-equivalent。
+        - 现有 `scv_compatible` 五日连续动力代理不被修改；三层结果并列，不能因新方法命中更多事件而后验放宽旧判据。
+    """
+    lifecycle_root = Path(lifecycle_run_dir)
+    lifecycle_manifest = json.loads(
+        (lifecycle_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        lifecycle_manifest.get('status') != 'complete'
+        or int(lifecycle_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'OFES McCoy virtual Argo requires a complete schema-v2 '
+            'lifecycle run.'
+        )
+    settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
+    source_path = Path(
+        source_archive_path
+        if source_archive_path is not None
+        else _mccoy_scv_source_archive
+    )
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f'McCoy source archive not found: {source_path}'
+        )
+    source_sha256 = _file_sha256(source_path)
+    if source_sha256 != settings['source_archive_sha256']:
+        raise RuntimeError(
+            'McCoy source archive SHA-256 does not match the preregistered '
+            f'value: {source_sha256}.'
+        )
+    daily = pd.read_parquet(
+        lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+    )
+    lifecycle_summary = pd.read_parquet(
+        lifecycle_root / 'lifecycle_event_summary.parquet'
+    )
+    requests = daily.loc[daily['is_event_peak_day']].copy()
+    if settings['event_ids']:
+        requests = requests.loc[
+            requests['event_id'].astype(str).isin(settings['event_ids'])
+        ]
+        lifecycle_summary = lifecycle_summary.loc[
+            lifecycle_summary['event_id'].astype(str).isin(
+                settings['event_ids']
+            )
+        ]
+    requests = requests.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    lifecycle_summary = lifecycle_summary.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    if (
+        requests.empty
+        or len(requests) != len(lifecycle_summary)
+        or requests['event_id'].duplicated().any()
+    ):
+        raise RuntimeError('OFES McCoy peak-day event requests are invalid.')
+    inventory_records = []
+    for date in sorted(requests['date'].unique()):
+        for variable in ('temp', 'salinity', 'u', 'v'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path.resolve()),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    source_inventory = pd.DataFrame(inventory_records)
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_mccoy_virtual_argo_settings,
+            approximate_degree_length,
+            load_ofes_snapshot,
+            extract_ofes_profile_interp,
+            _dynamic_modes,
+            _ofes_fixed_depth_kinematic_fields,
+            _ofes_kinematics_at_point,
+            _ofes_offset_lon_lat,
+            _ofes_mccoy_sampling_points,
+            _ofes_mccoy_kernel_smooth,
+            _ofes_mccoy_profile_properties,
+            _ofes_mccoy_interp_density,
+            _ofes_mccoy_reference,
+            _ofes_mccoy_anomalies,
+            _ofes_mccoy_iqr_on_profile,
+            _ofes_mccoy_matlab_range,
+            _ofes_mccoy_round_10,
+            _ofes_mccoy_gaussian_fit,
+            _ofes_mccoy_dynamic_height_gate,
+            _ofes_mccoy_profile_classification,
+            _ofes_mccoy_event_worker,
+            _ofes_mccoy_event_summary,
+            _plot_ofes_mccoy_virtual_argo,
+            run_ofes_mccoy_virtual_argo,
+        )
+    )
+    science_settings = {
+        key: value
+        for key, value in settings.items()
+        if key != 'worker_count'
+    }
+    payload = {
+        'schema_version': 2,
+        'method': 'mccoy_2020_source_gates_ofes_native_background',
+        'lifecycle_run_dir': str(lifecycle_root.resolve()),
+        'lifecycle_run_signature': lifecycle_manifest['run_signature'],
+        'input_sha256': {
+            'lifecycle_manifest.json': _file_sha256(
+                lifecycle_root / 'manifest.json'
+            ),
+            'lifecycle_daily_diagnostics.parquet': _file_sha256(
+                lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+            ),
+            'lifecycle_event_summary.parquet': _file_sha256(
+                lifecycle_root / 'lifecycle_event_summary.parquet'
+            ),
+        },
+        'mccoy_source_archive': str(source_path.resolve()),
+        'mccoy_source_archive_sha256': source_sha256,
+        'settings': science_settings,
+        'request_count': int(len(requests)),
+        'request_sha256': hashlib.sha256(
+            requests.to_json(
+                orient='records', date_format='iso'
+            ).encode('utf-8')
+        ).hexdigest(),
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'mccoy_virtual_argo_code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'scipy_version': str(scipy.__version__),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'ofes_mccoy_virtual_argo_{signature[:12]}',
+    }
+    run_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else lifecycle_root / settings['output_subdir']
+    )
+    run_dir = run_root / identity['run_tag']
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES McCoy manifest signature does not match.'
+            )
+        if previous.get('status') == 'complete':
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'profile_diagnostics': pd.read_parquet(
+                        outputs['profile_diagnostics']
+                    ),
+                    'event_summary': pd.read_parquet(
+                        outputs['event_summary']
+                    ),
+                    'event_audit': pd.read_parquet(
+                        outputs['event_audit']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    profile_frames = []
+    audit_records = []
+    completed = 0
+    try:
+        pending = []
+        for row in requests.itertuples(index=False):
+            fragment_path = events_dir / f'{row.event_id}.parquet'
+            if resume and fragment_path.exists():
+                fragment = pd.read_parquet(fragment_path)
+                if (
+                    len(fragment)
+                    and fragment['mccoy_run_signature'].astype(str)
+                    .eq(signature).all()
+                ):
+                    profile_frames.append(fragment)
+                    audit_records.append(
+                        {
+                            'event_id': str(row.event_id),
+                            'date': pd.Timestamp(row.date).normalize(),
+                            'event_profile_count': int(
+                                (fragment['sample_role'] == 'event').sum()
+                            ),
+                            'control_profile_count': int(
+                                (fragment['sample_role']
+                                 == 'background_control').sum()
+                            ),
+                            'valid_control_profile_count': int(
+                                fragment['valid_control_profile_count'].iloc[0]
+                            ),
+                            'reference_pressure_max_dbar': settings[
+                                'pressure_max_dbar'
+                            ],
+                            'fragment_reused': True,
+                        }
+                    )
+                    completed += 1
+                    continue
+            pending.append(
+                {
+                    'request': row._asdict(),
+                    'settings': settings,
+                    'fragment_path': fragment_path,
+                }
+            )
+        if pending:
+            workers = min(int(settings['worker_count']), len(pending))
+            if workers == 1:
+                iterator = (
+                    (argument, _ofes_mccoy_event_worker(argument))
+                    for argument in pending
+                )
+                for argument, (fragment, audit) in iterator:
+                    fragment['mccoy_run_signature'] = signature
+                    _atomic_write_parquet(
+                        fragment, argument['fragment_path']
+                    )
+                    audit['fragment_reused'] = False
+                    profile_frames.append(fragment)
+                    audit_records.append(audit)
+                    completed += 1
+                    print(
+                        f'[OFES McCoy] {completed}/{len(requests)}',
+                        flush=True,
+                    )
+            else:
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _ofes_mccoy_event_worker, argument
+                        ): argument
+                        for argument in pending
+                    }
+                    for future in futures_as_completed(futures):
+                        argument = futures[future]
+                        fragment, audit = future.result()
+                        fragment['mccoy_run_signature'] = signature
+                        _atomic_write_parquet(
+                            fragment, argument['fragment_path']
+                        )
+                        audit['fragment_reused'] = False
+                        profile_frames.append(fragment)
+                        audit_records.append(audit)
+                        completed += 1
+                        print(
+                            f'[OFES McCoy] {completed}/{len(requests)}',
+                            flush=True,
+                        )
+                        manifest['completed_events'] = completed
+                        manifest['updated_at_utc'] = pd.Timestamp.now(
+                            tz='UTC'
+                        ).isoformat()
+                        _ofes_atomic_write_json(manifest, manifest_path)
+        profiles = pd.concat(profile_frames, ignore_index=True).sort_values(
+            ['event_order', 'sample_role', 'sample_id'], kind='mergesort'
+        ).reset_index(drop=True)
+        event_audit = pd.DataFrame(audit_records).sort_values(
+            'event_id', kind='mergesort'
+        ).reset_index(drop=True)
+        event_summary, analysis_summary = _ofes_mccoy_event_summary(
+            profiles, lifecycle_summary, settings
+        )
+        profile_path = run_dir / 'virtual_profile_diagnostics.parquet'
+        event_path = run_dir / 'event_summary.parquet'
+        audit_path = run_dir / 'event_audit.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'mccoy_virtual_argo.png'
+        _atomic_write_parquet(profiles, profile_path)
+        _atomic_write_parquet(event_summary, event_path)
+        _atomic_write_parquet(event_audit, audit_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_mccoy_virtual_argo(
+            profiles,
+            event_summary,
+            analysis_summary,
+            figure_path,
+            settings['figure_dpi'],
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': int(len(event_summary)),
+                'profile_row_count': int(len(profiles)),
+                'outputs': {
+                    'profile_diagnostics': str(profile_path.resolve()),
+                    'event_summary': str(event_path.resolve()),
+                    'event_audit': str(audit_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(
+                        (run_dir / 'source_inventory.parquet').resolve()
+                    ),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'profile_diagnostics': profiles,
+        'event_summary': event_summary,
+        'event_audit': event_audit,
         'analysis_summary': analysis_summary,
         'figure_path': figure_path,
         'reused_complete_run': False,
