@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.39 变更：
+#   - 通风回溯保留 16 事件进程并行，新增 4 路 NetCDF I/O 闸门并允许通过
+#     OXYGEN_OFES_ROOT 指向已验证的本地缓存；并发度不进入科学运行签名。
 # version 1.38 变更：
 #   - 新增 OFES 峰值日粒子最长 90 天回溯的 MLD 接触史与等密度面出露机会诊断；
 #     异常 ensemble 与同日、近深度/同密度的 120–240 km 普通背景粒子配对，
@@ -127,7 +130,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.38"
+version: "1.39"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -512,6 +515,7 @@ ofes:
     output_subdir: trajectory_tracers
   trajectory_ventilation:
     worker_count: 16
+    io_concurrency: 4
     maximum_backtrack_days: 90
     reporting_horizons_days: [30, 60, 90]
     integration_dt_seconds: 3600

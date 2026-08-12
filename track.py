@@ -26,6 +26,7 @@ from scipy.optimize import least_squares, linear_sum_assignment
 import copy
 import gsw
 from collections import defaultdict
+from contextlib import contextmanager
 from concurrent.futures import (
     ProcessPoolExecutor,
     as_completed as futures_as_completed,
@@ -122,7 +123,12 @@ _mld_clim_root = Path(
     _PATHS_CFG.get('paths', {}).get('mld_clim_root', './data/mld_clim')
 )
 _ofes_root = Path(
-    _PATHS_CFG.get('paths', {}).get('ofes_root', './data/OFES_NP30')
+    os.environ.get(
+        'OXYGEN_OFES_ROOT',
+        _PATHS_CFG.get('paths', {}).get(
+            'ofes_root', './data/OFES_NP30'
+        ),
+    )
 )
 _mccoy_scv_csv = Path(
     _PATHS_CFG.get('paths', {}).get('mccoy_scv_csv', './data/mccoy2020_scv/SCVs.csv')
@@ -50305,6 +50311,7 @@ def _ofes_trajectory_ventilation_settings(
         raw.update(overrides)
     settings = {
         'worker_count': int(raw.get('worker_count', 16)),
+        'io_concurrency': int(raw.get('io_concurrency', 4)),
         'maximum_backtrack_days': int(
             raw.get('maximum_backtrack_days', 90)
         ),
@@ -50412,6 +50419,8 @@ def _ofes_trajectory_ventilation_settings(
     if (
         settings['worker_count'] <= 0
         or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['io_concurrency'] <= 0
+        or settings['io_concurrency'] > settings['worker_count']
         or not 0 < settings['minimum_active_fraction'] <= 1
         or settings['near_mld_tolerance_m'] < 0
         or settings['outcrop_density_tolerance_kg_m3'] < 0
@@ -50449,7 +50458,7 @@ def _ofes_trajectory_ventilation_science_settings(
     """返回不含并发执行度的通风回溯科学参数。"""
     return {
         key: value for key, value in settings.items()
-        if key != 'worker_count'
+        if key not in {'worker_count', 'io_concurrency'}
     }
 
 
@@ -50460,6 +50469,7 @@ def _ofes_trajectory_ventilation_processing_config_sha256() -> str:
         'trajectory_ventilation', {}
     )
     ventilation.pop('worker_count', None)
+    ventilation.pop('io_concurrency', None)
     return hashlib.sha256(
         json.dumps(
             processing_config,
@@ -50494,6 +50504,28 @@ def _ofes_trajectory_fixed_bounds(
             float(np.max(subset[:, 1]) + lat_margin),
         ),
     )
+
+
+_OFES_VENTILATION_IO_GATE = None
+
+
+def _ofes_initialize_ventilation_worker(io_gate) -> None:
+    """在 spawn worker 内安装共享的 OFES NetCDF I/O 闸门。"""
+    global _OFES_VENTILATION_IO_GATE
+    _OFES_VENTILATION_IO_GATE = io_gate
+
+
+@contextmanager
+def _ofes_ventilation_io_gate(io_gate):
+    """限制并行事件同时进入 OFES NetCDF 读取区段的数量。"""
+    if io_gate is None:
+        yield
+        return
+    io_gate.acquire()
+    try:
+        yield
+    finally:
+        io_gate.release()
 
 
 def _ofes_ventilation_profile_samples(
@@ -50731,6 +50763,7 @@ def _ofes_ventilation_controls(
     anomaly_positions: np.ndarray,
     anomaly_metadata: pd.DataFrame,
     settings: dict,
+    io_gate=None,
 ) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """为异常粒子选择水文匹配与动力也匹配的两组对照。"""
     peak_date = pd.Timestamp(event['peak_date']).normalize()
@@ -50744,13 +50777,14 @@ def _ofes_ventilation_controls(
     lat_margin = (
         load_radius * 1000.0 / float(scale['meters_per_degree_lat'])
     )
-    snapshot = load_ofes_snapshot(
-        peak_date,
-        variables=['do2', 'temp', 'salinity', 'u', 'v'],
-        lon_bounds=(core_lon - lon_margin, core_lon + lon_margin),
-        lat_bounds=(core_lat - lat_margin, core_lat + lat_margin),
-        depth_bounds=None,
-    )
+    with _ofes_ventilation_io_gate(io_gate):
+        snapshot = load_ofes_snapshot(
+            peak_date,
+            variables=['do2', 'temp', 'salinity', 'u', 'v'],
+            lon_bounds=(core_lon - lon_margin, core_lon + lon_margin),
+            lat_bounds=(core_lat - lat_margin, core_lat + lat_margin),
+            depth_bounds=None,
+        )
     candidates = _ofes_ventilation_candidate_geometry(
         core_lon, core_lat, settings
     )
@@ -51129,6 +51163,7 @@ def _ofes_ventilation_sample_day(
     status: np.ndarray,
     particle_metadata: pd.DataFrame,
     settings: dict,
+    io_gate=None,
 ) -> pd.DataFrame:
     """在一个回溯日诊断每粒子 MLD 接触与出露机会。"""
     active = np.asarray(status).astype(str) == 'active'
@@ -51140,19 +51175,20 @@ def _ofes_ventilation_sample_day(
         scale = approximate_degree_length(center_lat)
         lon_margin = 20_000.0 / float(scale['meters_per_degree_lon'])
         lat_margin = 20_000.0 / float(scale['meters_per_degree_lat'])
-        snapshot = load_ofes_snapshot(
-            date,
-            variables=['temp', 'salinity'],
-            lon_bounds=(
-                float(np.nanmin(active_position[:, 2]) - lon_margin),
-                float(np.nanmax(active_position[:, 2]) + lon_margin),
-            ),
-            lat_bounds=(
-                float(np.nanmin(active_position[:, 1]) - lat_margin),
-                float(np.nanmax(active_position[:, 1]) + lat_margin),
-            ),
-            depth_bounds=None,
-        )
+        with _ofes_ventilation_io_gate(io_gate):
+            snapshot = load_ofes_snapshot(
+                date,
+                variables=['temp', 'salinity'],
+                lon_bounds=(
+                    float(np.nanmin(active_position[:, 2]) - lon_margin),
+                    float(np.nanmax(active_position[:, 2]) + lon_margin),
+                ),
+                lat_bounds=(
+                    float(np.nanmin(active_position[:, 1]) - lat_margin),
+                    float(np.nanmax(active_position[:, 1]) + lat_margin),
+                ),
+                depth_bounds=None,
+            )
         profiles = _ofes_ventilation_profile_samples(
             snapshot,
             active_position[:, 2],
@@ -51207,15 +51243,17 @@ def _ofes_ventilation_velocity_snapshot(
     lon_bounds: tuple[float, float],
     lat_bounds: tuple[float, float],
     validation_manifest: dict,
+    io_gate=None,
 ) -> dict:
     """加载一个已通过专项 w 门控的通风回溯速度快照。"""
-    snapshot = load_ofes_snapshot(
-        date,
-        variables=['u', 'v', 'w'],
-        lon_bounds=lon_bounds,
-        lat_bounds=lat_bounds,
-        depth_bounds=None,
-    )
+    with _ofes_ventilation_io_gate(io_gate):
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['u', 'v', 'w'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=None,
+        )
     snapshot['metadata']['w_validation_passed'] = True
     snapshot['metadata']['w_validation_run_signature'] = str(
         validation_manifest['run_signature']
@@ -51370,6 +51408,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
     event = dict(payload['event'])
     event_id = str(event['event_id'])
     settings = payload['settings']
+    io_gate = _OFES_VENTILATION_IO_GATE
     validation_manifest = payload['validation_manifest']
     paths = _ofes_ventilation_fragment_paths(
         payload['events_dir'], event_id
@@ -51398,6 +51437,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
         anomaly_positions,
         anomaly_metadata,
         settings,
+        io_gate,
     )
     particle_metadata = pd.concat(
         [
@@ -51432,6 +51472,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
             status,
             particle_metadata,
             settings,
+            io_gate,
         )
     ]
     current_snapshot = _ofes_ventilation_velocity_snapshot(
@@ -51439,6 +51480,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
         lon_bounds,
         lat_bounds,
         validation_manifest,
+        io_gate,
     )
     current_date = peak_date
     while current_date > start_date:
@@ -51448,6 +51490,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
             lon_bounds,
             lat_bounds,
             validation_manifest,
+            io_gate,
         )
         active_index = np.flatnonzero(status == 'active')
         if active_index.size:
@@ -51473,6 +51516,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
                 status,
                 particle_metadata,
                 settings,
+                io_gate,
             )
         )
         current_snapshot = previous_snapshot
@@ -51888,6 +51932,8 @@ def run_ofes_3d_trajectory_ventilation(
             _ofes_trajectory_ventilation_science_settings,
             _ofes_trajectory_ventilation_processing_config_sha256,
             _ofes_trajectory_fixed_bounds,
+            _ofes_initialize_ventilation_worker,
+            _ofes_ventilation_io_gate,
             _ofes_ventilation_profile_samples,
             _ofes_mld_contact_from_profile,
             _ofes_ventilation_candidate_geometry,
@@ -51981,7 +52027,8 @@ def run_ofes_3d_trajectory_ventilation(
     identity = {
         **payload,
         'execution_settings': {
-            'worker_count': int(settings['worker_count'])
+            'worker_count': int(settings['worker_count']),
+            'io_concurrency': int(settings['io_concurrency']),
         },
         'processing_config_sha256': _file_sha256(
             Path(__file__).resolve().parent / 'config' / 'processing.yml'
@@ -52081,14 +52128,20 @@ def run_ofes_3d_trajectory_ventilation(
         print(
             '[OFES trajectory ventilation] '
             f'events={len(events)}, reusable={completed}, '
-            f'pending={len(pending)}, workers={settings["worker_count"]}',
+            f'pending={len(pending)}, workers={settings["worker_count"]}, '
+            f'io_concurrency={settings["io_concurrency"]}',
             flush=True,
         )
         if pending:
             spawn_context = multiprocessing.get_context('spawn')
+            io_gate = spawn_context.BoundedSemaphore(
+                int(settings['io_concurrency'])
+            )
             with ProcessPoolExecutor(
                 max_workers=int(settings['worker_count']),
                 mp_context=spawn_context,
+                initializer=_ofes_initialize_ventilation_worker,
+                initargs=(io_gate,),
             ) as executor:
                 futures = {
                     executor.submit(
