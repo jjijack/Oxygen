@@ -30612,6 +30612,421 @@ def plot_scv_matched_control_enrichment(
     return out
 
 
+def summarize_scv_influence_diagnostics(
+    cohort: pd.DataFrame | None = None,
+    cohort_path: str | Path | None = None,
+    *,
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    outcome_mode: str = 'profile',
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """检验 SCV matched-control enrichment 是否由单条浮标或单一地理区域驱动。
+
+    函数复用已经构建的 outcome-blind matched cohort，依次删除一个 anchor SCV platform、一个海盆，
+    以及全部 KE matched sets，再以完全相同的 Mantel-Haenszel 口径重算 OR。该分析是确定性的
+    influence diagnostic，不替代主分析的 platform-cluster bootstrap uncertainty。
+
+    参数:
+        - cohort (pd.DataFrame | None): `build_scv_matched_control_cohort` 输出；None 时读取路径或默认缓存。
+        - cohort_path (str | Path | None): matched cohort parquet/CSV；None 定位默认参数缓存。
+        - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值列表，默认 (20, 35, 50)。
+        - outcome_mode (str): `profile` 或 `core_aligned`，默认 `profile`。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个阈值、留出类型和被留出单位一行的样本量、carrier counts 与 matched OR。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_influence_diagnostics/scv_influence_diagnostics_<outcome>_<y0>_<y1>_depth<z>m_<matching>.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - `leave_one_anchor_platform_out` 回答结果是否由某条重复采样浮标驱动。
+        - `leave_one_basin_out` 与 `leave_ke_out` 回答结果是否依赖单一地理热点；ΔDO50 留出后样本稀疏时应同时解读 carrier counts。
+    """
+    threshold_values = sorted({float(value) for value in thresholds})
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+    if outcome_mode not in {'profile', 'core_aligned'}:
+        raise ValueError("outcome_mode must be 'profile' or 'core_aligned'.")
+
+    region_slug = _current_region_key()
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    cohort_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    if cohort is None:
+        if cohort_path is None:
+            match_tag = _default_matched_control_run_tag(threshold_values)
+            cohort_path = cohort_dir / (
+                f'scv_matched_control_cohort_{int(baseline_start_year)}_'
+                f'{int(baseline_end_year)}_depth{depth_tag}m_{match_tag}.parquet'
+            )
+        cohort_source = Path(cohort_path)
+        cohort = (
+            pd.read_csv(cohort_source)
+            if cohort_source.suffix.lower() == '.csv'
+            else pd.read_parquet(cohort_source)
+        )
+    else:
+        cohort = cohort.copy()
+        cohort_source = (
+            Path(cohort_path) if cohort_path is not None else Path('<memory>')
+        )
+
+    required = {
+        'match_set_id', 'is_scv', 'anchor_platform_number',
+        'anchor_basin', 'anchor_is_ke',
+    }
+    missing = required.difference(cohort.columns)
+    if missing:
+        raise ValueError(
+            f'Matched cohort missing columns: {sorted(missing)}'
+        )
+    match_tags = pd.unique(
+        cohort.get('cohort_tag', pd.Series(['custom'])).astype(str)
+    )
+    if len(match_tags) != 1:
+        raise ValueError(
+            f'Cohort contains mixed matching configurations: '
+            f'{match_tags.tolist()}'
+        )
+    cohort_tag = str(match_tags[0])
+    outcome_columns = {}
+    for threshold in threshold_values:
+        tag = _format_detection_value(float(threshold))
+        outcome_col = (
+            f'has_delta_do_{tag}'
+            if outcome_mode == 'profile'
+            else f'has_core_aligned_delta_do_{tag}'
+        )
+        if outcome_col not in cohort.columns:
+            raise ValueError(
+                f'Matched cohort lacks outcome column: {outcome_col}'
+            )
+        outcome_columns[float(threshold)] = outcome_col
+    structural_cells = _matched_set_cells(
+        cohort, outcome_columns[float(threshold_values[0])]
+    )
+    valid_set_ids = set(structural_cells['match_set_id'])
+    anchor_rows = cohort[
+        cohort['is_scv'].fillna(False).astype(bool)
+        & cohort['match_set_id'].isin(valid_set_ids)
+    ].drop_duplicates('match_set_id')
+    if anchor_rows.empty:
+        raise ValueError('Matched cohort contains no SCV anchor rows.')
+
+    omission_specs: list[tuple[str, str, set]] = [
+        ('reference', 'None', set()),
+    ]
+    for platform in sorted(
+        pd.to_numeric(
+            anchor_rows['anchor_platform_number'], errors='coerce'
+        ).dropna().astype(int).unique()
+    ):
+        omitted_ids = set(
+            anchor_rows.loc[
+                pd.to_numeric(
+                    anchor_rows['anchor_platform_number'], errors='coerce'
+                ).eq(int(platform)),
+                'match_set_id',
+            ]
+        )
+        omission_specs.append((
+            'leave_one_anchor_platform_out', str(int(platform)), omitted_ids,
+        ))
+    basin_values = sorted(
+        value for value in anchor_rows['anchor_basin'].dropna().astype(str).unique()
+        if value and value.lower() != 'nan'
+    )
+    for basin in basin_values:
+        omitted_ids = set(
+            anchor_rows.loc[
+                anchor_rows['anchor_basin'].astype(str).eq(basin),
+                'match_set_id',
+            ]
+        )
+        omission_specs.append((
+            'leave_one_basin_out', basin, omitted_ids,
+        ))
+    ke_ids = set(
+        anchor_rows.loc[
+            anchor_rows['anchor_is_ke'].fillna(False).astype(bool),
+            'match_set_id',
+        ]
+    )
+    if ke_ids:
+        omission_specs.append(('leave_ke_out', 'KE', ke_ids))
+
+    rows: list[dict] = []
+    for threshold in threshold_values:
+        outcome_col = outcome_columns[float(threshold)]
+        reference_cells = _matched_set_cells(cohort, outcome_col)
+        reference_or = _mantel_haenszel_odds_ratio(reference_cells)
+        if reference_cells.empty:
+            raise ValueError(
+                f'No valid matched sets for threshold={threshold:g}.'
+            )
+        reference_carriers = int(reference_cells['a'].sum())
+        for omission_type, omitted_group, omitted_ids in omission_specs:
+            cells = reference_cells[
+                ~reference_cells['match_set_id'].isin(omitted_ids)
+            ].copy()
+            scv_carriers = int(cells['a'].sum())
+            control_carriers = int(cells['c'].sum())
+            estimate = _mantel_haenszel_odds_ratio(cells)
+            omitted_carriers = int(
+                reference_cells.loc[
+                    reference_cells['match_set_id'].isin(omitted_ids), 'a'
+                ].sum()
+            )
+            rows.append({
+                'threshold_umol_kg': float(threshold),
+                'outcome_mode': outcome_mode,
+                'omission_type': omission_type,
+                'omitted_group': omitted_group,
+                'n_omitted_matched_sets': int(len(omitted_ids)),
+                'n_omitted_scv_carriers': omitted_carriers,
+                'n_matched_sets': int(len(cells)),
+                'n_anchor_platforms': int(
+                    cells['anchor_platform_number'].nunique()
+                ) if not cells.empty else 0,
+                'scv_numerator': scv_carriers,
+                'scv_denominator': int(len(cells)),
+                'control_numerator': control_carriers,
+                'control_denominator': int(
+                    cells[['c', 'd']].sum(axis=1).sum()
+                ),
+                'matched_mantel_haenszel_or': estimate,
+                'reference_matched_or': reference_or,
+                'or_ratio_to_reference': (
+                    float(estimate / reference_or)
+                    if np.isfinite(estimate)
+                    and np.isfinite(reference_or)
+                    and reference_or != 0
+                    else np.nan
+                ),
+                'reference_scv_carriers': reference_carriers,
+                'period_start': int(baseline_start_year),
+                'period_end': int(baseline_end_year),
+                'minimum_depth_m': float(anomaly_min_depth),
+                'cohort_tag': cohort_tag,
+                'cohort_source': str(cohort_source),
+                'inference_note': (
+                    'Deterministic influence diagnostic; uncertainty remains '
+                    'the platform-cluster bootstrap from the primary analysis.'
+                ),
+            })
+
+    summary = pd.DataFrame(rows)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'scv_influence_diagnostics', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = (
+            f'scv_influence_diagnostics_{outcome_mode}_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_{cohort_tag}'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] SCV influence diagnostics saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return summary
+
+
+def plot_scv_influence_diagnostics(
+    summary: pd.DataFrame,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制单浮标与地理留出后的 SCV matched-control OR。
+
+    左图用区间表示逐条删除 anchor float 后的 OR 全范围，并叠加未留出的参考 OR；右图分别展示
+    leave-KE-out 和 leave-one-basin-out 结果。纵轴使用对数坐标，使 OR=1 的无富集基准可直接比较。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_influence_diagnostics` 输出。
+        - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含绘图数据与 `figure_path`（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_influence_diagnostics/scv_influence_diagnostics_<outcome>.png`（save_fig 时）。
+
+    说明:
+        - 留出结果是 influence range，不是 confidence interval。
+        - 地理留出后应结合剩余 matched sets 和 carrier counts 解读，尤其是 ΔDO50。
+    """
+    required = {
+        'threshold_umol_kg', 'outcome_mode', 'omission_type',
+        'omitted_group', 'matched_mantel_haenszel_or',
+        'n_matched_sets', 'scv_numerator',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'SCV influence summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary.copy()
+    outcome_modes = pd.unique(plotted['outcome_mode'].astype(str))
+    if len(outcome_modes) != 1:
+        raise ValueError(
+            f'Influence summary contains mixed outcome modes: '
+            f'{outcome_modes.tolist()}'
+        )
+    outcome_mode = str(outcome_modes[0])
+    thresholds = sorted(
+        pd.to_numeric(
+            plotted['threshold_umol_kg'], errors='coerce'
+        ).dropna().unique()
+    )
+    if not thresholds:
+        raise ValueError('SCV influence summary has no thresholds.')
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.8))
+    x = np.arange(len(thresholds), dtype=float)
+    reference = plotted[
+        plotted['omission_type'].astype(str).eq('reference')
+    ].set_index('threshold_umol_kg')
+    platform = plotted[
+        plotted['omission_type'].astype(str).eq(
+            'leave_one_anchor_platform_out'
+        )
+    ].copy()
+    for index, threshold in enumerate(thresholds):
+        key = f'DO{_format_detection_value(float(threshold))}'
+        color = _THRESHOLD_COLORS.get(key, _GROUP_COLORS['scv'])
+        marker = _THRESHOLD_MARKERS.get(key, 'o')
+        values = pd.to_numeric(
+            platform.loc[
+                pd.to_numeric(
+                    platform['threshold_umol_kg'], errors='coerce'
+                ).eq(float(threshold)),
+                'matched_mantel_haenszel_or',
+            ],
+            errors='coerce',
+        ).dropna()
+        reference_value = float(
+            reference.at[float(threshold), 'matched_mantel_haenszel_or']
+        )
+        if not values.empty:
+            low = float(values.min())
+            high = float(values.max())
+            axes[0].vlines(index, low, high, color=color, linewidth=3.0)
+            axes[0].hlines(
+                [low, high], index - 0.08, index + 0.08,
+                color=color, linewidth=2.0,
+            )
+        axes[0].scatter(
+            index, reference_value, color=color, marker=marker,
+            s=95, edgecolor='white', linewidth=0.8, zorder=3,
+        )
+    axes[0].axhline(1.0, color='#4b5563', linestyle='--', linewidth=1.2)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([
+        f'ΔDO{_format_detection_value(float(value))}'
+        for value in thresholds
+    ])
+    axes[0].set_ylabel('Matched odds ratio')
+    axes[0].set_title('Leave-one-float influence range')
+    axes[0].set_yscale('log')
+    axes[0].grid(axis='y', which='both', alpha=0.22)
+
+    geography = plotted[
+        plotted['omission_type'].isin([
+            'leave_ke_out', 'leave_one_basin_out',
+        ])
+    ].copy()
+    preferred_groups = ['KE', 'Pacific', 'Atlantic', 'Indian', 'SO']
+    present_groups = list(geography['omitted_group'].astype(str).unique())
+    group_order = [
+        group for group in preferred_groups if group in present_groups
+    ] + sorted(set(present_groups).difference(preferred_groups))
+    group_x = np.arange(len(group_order), dtype=float)
+    for threshold in thresholds:
+        key = f'DO{_format_detection_value(float(threshold))}'
+        rows = geography[
+            pd.to_numeric(
+                geography['threshold_umol_kg'], errors='coerce'
+            ).eq(float(threshold))
+        ].set_index('omitted_group')
+        values = [
+            float(rows.at[group, 'matched_mantel_haenszel_or'])
+            if group in rows.index else np.nan
+            for group in group_order
+        ]
+        axes[1].plot(
+            group_x,
+            values,
+            color=_THRESHOLD_COLORS.get(key, _GROUP_COLORS['scv']),
+            marker=_THRESHOLD_MARKERS.get(key, 'o'),
+            linestyle='none',
+            markersize=8,
+            label=f'ΔDO{_format_detection_value(float(threshold))}',
+        )
+    axes[1].axhline(1.0, color='#4b5563', linestyle='--', linewidth=1.2)
+    axes[1].set_xticks(group_x)
+    axes[1].set_xticklabels([
+        'Southern\nOcean' if group == 'SO' else group
+        for group in group_order
+    ])
+    axes[1].set_ylabel('Matched odds ratio after omission')
+    axes[1].set_title('Geographic influence')
+    axes[1].set_yscale('log')
+    axes[1].grid(axis='y', which='both', alpha=0.22)
+    axes[1].legend(
+        frameon=False,
+        loc='center left',
+        bbox_to_anchor=(1.01, 0.5),
+    )
+
+    for axis in axes:
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    result = {'rows': plotted, 'outcome_mode': outcome_mode}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'scv_influence_diagnostics', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f'scv_influence_diagnostics_{outcome_mode}.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] SCV influence figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
+
+
 def summarize_scv_matching_caliper_sensitivity(
     profile_eligibility: pd.DataFrame | None = None,
     profile_eligibility_path: str | Path | None = None,
