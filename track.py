@@ -46180,6 +46180,1289 @@ def _ofes_trajectory_3d_population_group_summary(
     }
 
 
+def _ofes_trajectory_tracer_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 三维轨迹多示踪剂配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_tracers', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_tracers override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'integration_labels': tuple(
+            str(value)
+            for value in raw.get(
+                'integration_labels',
+                (
+                    'forward_observed_start_to_peak',
+                    'backward_peak_to_start',
+                ),
+            )
+        ),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_load_margin_km': float(
+            raw.get('background_load_margin_km', 50.0)
+        ),
+        'background_min_valid_columns': int(
+            raw.get('background_min_valid_columns', 100)
+        ),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'minimum_valid_particle_fraction': float(
+            raw.get('minimum_valid_particle_fraction', 0.75)
+        ),
+        'same_sigma_do_abs_min_umol_kg': float(
+            raw.get('same_sigma_do_abs_min_umol_kg', 10.0)
+        ),
+        'same_sigma_theta_abs_min_deg_c': float(
+            raw.get('same_sigma_theta_abs_min_deg_c', 0.10)
+        ),
+        'same_sigma_salinity_abs_min': float(
+            raw.get('same_sigma_salinity_abs_min', 0.02)
+        ),
+        'same_sigma_spiciness0_abs_min': float(
+            raw.get('same_sigma_spiciness0_abs_min', 0.05)
+        ),
+        'fingerprint_persistence_fraction_min': float(
+            raw.get('fingerprint_persistence_fraction_min', 0.75)
+        ),
+        'normalized_time_bin_count': int(
+            raw.get('normalized_time_bin_count', 11)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_tracers')
+        ),
+    }
+    expected_labels = {
+        'forward_observed_start_to_peak',
+        'backward_peak_to_start',
+    }
+    if (
+        not settings['integration_labels']
+        or len(set(settings['integration_labels']))
+        != len(settings['integration_labels'])
+        or not set(settings['integration_labels']).issubset(expected_labels)
+    ):
+        raise ValueError(
+            'OFES trajectory tracer integration labels are invalid.'
+        )
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['background_min_valid_columns'] <= 0
+        or settings['normalized_time_bin_count'] < 3
+    ):
+        raise ValueError(
+            'OFES trajectory tracer worker/background counts are invalid.'
+        )
+    positive_keys = (
+        'background_inner_radius_km',
+        'background_outer_radius_km',
+        'background_load_margin_km',
+        'same_sigma_do_abs_min_umol_kg',
+        'same_sigma_theta_abs_min_deg_c',
+        'same_sigma_salinity_abs_min',
+        'same_sigma_spiciness0_abs_min',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES trajectory tracer radii, thresholds, and DPI must be '
+            'finite and positive.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES trajectory tracer background radii must be ordered.'
+        )
+    for key in (
+        'minimum_active_fraction',
+        'minimum_valid_particle_fraction',
+        'fingerprint_persistence_fraction_min',
+    ):
+        if not 0 < settings[key] <= 1:
+            raise ValueError(
+                f'OFES trajectory tracer {key} must lie in (0, 1].'
+            )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory tracer output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_tracer_science_settings(settings: dict) -> dict:
+    """返回不含执行并发度的轨迹示踪剂科学参数。"""
+    return {
+        key: value
+        for key, value in settings.items()
+        if key != 'worker_count'
+    }
+
+
+def _ofes_trajectory_tracer_processing_config_sha256() -> str:
+    """返回剔除轨迹示踪剂并发度后的处理配置哈希。"""
+    processing_config = copy.deepcopy(_PROC_CFG)
+    tracer_config = (
+        processing_config.get('ofes', {}).get(
+            'trajectory_tracers', {}
+        )
+    )
+    tracer_config.pop('worker_count', None)
+    return hashlib.sha256(
+        json.dumps(
+            processing_config,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+
+
+def _ofes_trajectory_tracer_daily_positions(
+    trajectories: pd.DataFrame,
+    integration_label: str,
+) -> pd.DataFrame:
+    """从逐小时轨迹中抽取每个模式日的粒子位置。"""
+    selected = trajectories.loc[
+        trajectories['integration_label'].astype(str)
+        == str(integration_label)
+    ].copy()
+    if selected.empty:
+        raise RuntimeError(
+            f'No OFES trajectory rows for {integration_label}.'
+        )
+    selected['time'] = pd.to_datetime(selected['time'])
+    selected['date'] = selected['time'].dt.normalize()
+    exact = selected.loc[selected['time'] == selected['date']].copy()
+    expected_dates = pd.date_range(
+        selected['date'].min(), selected['date'].max()
+    )
+    if (
+        len(exact) != len(expected_dates) * selected['particle_index'].nunique()
+        or exact.duplicated(['date', 'particle_index']).any()
+    ):
+        raise RuntimeError(
+            'OFES trajectory tracer sampling requires one midnight row per '
+            'particle and model day.'
+        )
+    columns = (
+        'event_id',
+        'integration_label',
+        'date',
+        'particle_index',
+        'particle_id',
+        'depth_m',
+        'lat',
+        'lon',
+        'status',
+        'ring_fraction',
+        'depth_offset_index',
+    )
+    return exact[list(columns)].sort_values(
+        ['date', 'particle_index'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_trajectory_tracer_source_inventory(
+    event_ids: list[str],
+    daily_positions: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录轨迹示踪剂分析消费的逐日 OFES 文件身份。"""
+    records = []
+    for event_id in event_ids:
+        dates = pd.to_datetime(
+            daily_positions.loc[
+                daily_positions['event_id'].astype(str) == str(event_id),
+                'date',
+            ]
+        ).dt.normalize().drop_duplicates()
+        for date in dates:
+            for variable in ('do2', 'temp', 'salinity'):
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                records.append(
+                    {
+                        'event_id': str(event_id),
+                        'date': pd.Timestamp(date),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    return pd.DataFrame(records)
+
+
+def _ofes_trajectory_tracer_background(
+    snapshot: dict,
+    center_lon: float,
+    center_lat: float,
+    settings: dict,
+) -> dict:
+    """计算一个事件日120–240 km背景环带的多示踪剂剖面。"""
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(center_lon),
+            float(center_lat),
+        ),
+        dtype=float,
+    ) / 1000.0
+    mask = (
+        distance_km >= settings['background_inner_radius_km']
+    ) & (
+        distance_km <= settings['background_outer_radius_km']
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    profiles = {
+        'do2': _ofes_masked_median_profiles(snapshot['do2'], mask),
+        'theta': _ofes_masked_median_profiles(snapshot['temp'], mask),
+        'salinity': _ofes_masked_median_profiles(
+            snapshot['salinity'], mask
+        ),
+    }
+    sigma0 = _ofes_sigma0_profile(
+        depth,
+        profiles['salinity'],
+        profiles['theta'],
+        float(center_lon),
+        float(center_lat),
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(snapshot['date'])
+    )
+    delivery_edge_distance_km = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(center_lon),
+            np.asarray(center_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    finite_columns = int(
+        np.count_nonzero(
+            mask
+            & np.isfinite(snapshot['do2'][0])
+            & np.isfinite(snapshot['temp'][0])
+            & np.isfinite(snapshot['salinity'][0])
+        )
+    )
+    return {
+        'depth': depth,
+        'profiles': profiles,
+        'sigma0': sigma0,
+        'annulus_grid_columns': int(np.count_nonzero(mask)),
+        'valid_columns': finite_columns,
+        'delivery_edge_distance_km': delivery_edge_distance_km,
+        'annulus_within_delivery_window': bool(
+            delivery_edge_distance_km
+            >= settings['background_outer_radius_km']
+        ),
+    }
+
+
+def _ofes_sample_trajectory_tracer_day(
+    day_positions: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """采样一个事件路径日的粒子多示踪剂及局地背景异常。"""
+    event_id = str(day_positions['event_id'].iloc[0])
+    integration_label = str(day_positions['integration_label'].iloc[0])
+    date = pd.Timestamp(day_positions['date'].iloc[0]).normalize()
+    active = day_positions.loc[
+        day_positions['status'].astype(str) == 'active'
+    ].copy()
+    particle_count = int(len(day_positions))
+    active_fraction = float(len(active) / particle_count)
+    if active.empty:
+        raise RuntimeError(
+            f'OFES trajectory tracer day has no active particles: '
+            f'{event_id} {date:%Y-%m-%d} {integration_label}.'
+        )
+    center_lon = float(active['lon'].median())
+    center_lat = float(active['lat'].median())
+    load_radius_km = (
+        settings['background_outer_radius_km']
+        + settings['background_load_margin_km']
+    )
+    scale = approximate_degree_length(center_lat)
+    lon_margin = (
+        load_radius_km * 1000.0 / scale['meters_per_degree_lon']
+    )
+    lat_margin = (
+        load_radius_km * 1000.0 / scale['meters_per_degree_lat']
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity'],
+        lon_bounds=(center_lon - lon_margin, center_lon + lon_margin),
+        lat_bounds=(center_lat - lat_margin, center_lat + lat_margin),
+        depth_bounds=None,
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    points = active[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+    do2 = _ofes_interp3d(snapshot['do2'], depth, lat, lon, points)
+    theta = _ofes_interp3d(snapshot['temp'], depth, lat, lon, points)
+    salinity = _ofes_interp3d(
+        snapshot['salinity'], depth, lat, lon, points
+    )
+    pressure = gsw.p_from_z(-points[:, 0], points[:, 1])
+    absolute_salinity = gsw.SA_from_SP(
+        salinity, pressure, points[:, 2], points[:, 1]
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    sigma0 = np.asarray(
+        gsw.sigma0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    spiciness0 = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    background = _ofes_trajectory_tracer_background(
+        snapshot, center_lon, center_lat, settings
+    )
+    records = []
+    for row_index, particle in enumerate(active.itertuples(index=False)):
+        background_fixed = {
+            key: _ofes_profile_value_at_depth(
+                background['depth'], values, float(particle.depth_m)
+            )
+            for key, values in background['profiles'].items()
+        }
+        background_same_sigma = _ofes_density_crossing_near_depth(
+            background['depth'],
+            background['sigma0'],
+            float(sigma0[row_index]),
+            float(particle.depth_m),
+            background['profiles'],
+        )
+        background_fixed_thermo = _ofes_point_thermodynamics(
+            float(particle.depth_m),
+            background_fixed['salinity'],
+            background_fixed['theta'],
+            background_fixed['do2'],
+            center_lon,
+            center_lat,
+        )
+        background_sigma_thermo = _ofes_point_thermodynamics(
+            float(background_same_sigma['depth']),
+            float(background_same_sigma['salinity']),
+            float(background_same_sigma['theta']),
+            float(background_same_sigma['do2']),
+            center_lon,
+            center_lat,
+        )
+        values = {
+            'do2': float(do2[row_index]),
+            'theta': float(theta[row_index]),
+            'salinity': float(salinity[row_index]),
+            'sigma0': float(sigma0[row_index]),
+            'spiciness0': float(spiciness0[row_index]),
+        }
+        records.append(
+            {
+                'event_id': event_id,
+                'integration_label': integration_label,
+                'date': date,
+                'particle_index': int(particle.particle_index),
+                'particle_id': str(particle.particle_id),
+                'depth_m': float(particle.depth_m),
+                'lat': float(particle.lat),
+                'lon': float(particle.lon),
+                'ring_fraction': float(particle.ring_fraction),
+                'depth_offset_index': int(particle.depth_offset_index),
+                **values,
+                'background_do2_fixed': float(background_fixed['do2']),
+                'background_theta_fixed': float(background_fixed['theta']),
+                'background_salinity_fixed': float(
+                    background_fixed['salinity']
+                ),
+                'background_sigma0_fixed': float(
+                    background_fixed_thermo['sigma0']
+                ),
+                'background_spiciness0_fixed': float(
+                    background_fixed_thermo['spiciness0']
+                ),
+                'background_same_sigma_depth_m': float(
+                    background_same_sigma['depth']
+                ),
+                'background_do2_same_sigma': float(
+                    background_same_sigma['do2']
+                ),
+                'background_theta_same_sigma': float(
+                    background_same_sigma['theta']
+                ),
+                'background_salinity_same_sigma': float(
+                    background_same_sigma['salinity']
+                ),
+                'background_spiciness0_same_sigma': float(
+                    background_sigma_thermo['spiciness0']
+                ),
+                'fixed_depth_do_contrast': float(
+                    values['do2'] - background_fixed['do2']
+                ),
+                'fixed_depth_theta_contrast': float(
+                    values['theta'] - background_fixed['theta']
+                ),
+                'fixed_depth_salinity_contrast': float(
+                    values['salinity'] - background_fixed['salinity']
+                ),
+                'fixed_depth_sigma0_contrast': float(
+                    values['sigma0'] - background_fixed_thermo['sigma0']
+                ),
+                'fixed_depth_spiciness0_contrast': float(
+                    values['spiciness0']
+                    - background_fixed_thermo['spiciness0']
+                ),
+                'same_sigma_do_contrast': float(
+                    values['do2'] - background_same_sigma['do2']
+                ),
+                'same_sigma_theta_contrast': float(
+                    values['theta'] - background_same_sigma['theta']
+                ),
+                'same_sigma_salinity_contrast': float(
+                    values['salinity']
+                    - background_same_sigma['salinity']
+                ),
+                'same_sigma_spiciness0_contrast': float(
+                    values['spiciness0']
+                    - background_sigma_thermo['spiciness0']
+                ),
+            }
+        )
+    samples = pd.DataFrame(records)
+    required = (
+        'do2',
+        'theta',
+        'salinity',
+        'sigma0',
+        'spiciness0',
+        'fixed_depth_do_contrast',
+        'fixed_depth_theta_contrast',
+        'fixed_depth_salinity_contrast',
+        'fixed_depth_sigma0_contrast',
+        'fixed_depth_spiciness0_contrast',
+        'same_sigma_do_contrast',
+        'same_sigma_theta_contrast',
+        'same_sigma_salinity_contrast',
+        'same_sigma_spiciness0_contrast',
+    )
+    valid = samples[list(required)].notna().all(axis=1)
+    day_summary = {
+        'event_id': event_id,
+        'integration_label': integration_label,
+        'date': date,
+        'particle_count': particle_count,
+        'active_particle_count': int(len(active)),
+        'active_fraction': active_fraction,
+        'valid_particle_count': int(valid.sum()),
+        'valid_particle_fraction': float(valid.sum() / particle_count),
+        'ensemble_centroid_lon': center_lon,
+        'ensemble_centroid_lat': center_lat,
+        'ensemble_centroid_depth_m': float(active['depth_m'].median()),
+        'background_annulus_grid_columns': int(
+            background['annulus_grid_columns']
+        ),
+        'background_valid_columns': int(background['valid_columns']),
+        'delivery_edge_distance_km': float(
+            background['delivery_edge_distance_km']
+        ),
+        'background_annulus_within_delivery_window': bool(
+            background['annulus_within_delivery_window']
+        ),
+        'daily_diagnostic_passed': bool(
+            active_fraction >= settings['minimum_active_fraction']
+            and valid.sum() / particle_count
+            >= settings['minimum_valid_particle_fraction']
+            and background['valid_columns']
+            >= settings['background_min_valid_columns']
+            and background['annulus_within_delivery_window']
+        ),
+    }
+    for column in required:
+        finite = samples.loc[valid, column].to_numpy(dtype=float)
+        day_summary[f'median_{column}'] = (
+            float(np.median(finite)) if finite.size else np.nan
+        )
+        day_summary[f'q25_{column}'] = (
+            float(np.quantile(finite, 0.25)) if finite.size else np.nan
+        )
+        day_summary[f'q75_{column}'] = (
+            float(np.quantile(finite, 0.75)) if finite.size else np.nan
+        )
+    return samples, day_summary
+
+
+def _ofes_trajectory_tracer_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回一个事件多示踪剂 fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'particle_samples': event_dir / 'particle_samples.parquet',
+        'daily_summary': event_dir / 'daily_summary.parquet',
+        'event_summary': event_dir / 'event_summary.parquet',
+    }
+
+
+def _ofes_trajectory_tracer_fragment_reusable(
+    paths: dict[str, Path],
+    run_signature: str,
+) -> bool:
+    """判定一个事件多示踪剂 fragment 是否完整且签名一致。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    return bool(stored.get('tracer_run_signature') == run_signature)
+
+
+def _ofes_trajectory_tracer_event_summary(
+    daily_summary: pd.DataFrame,
+    peak_fingerprint: dict,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总一个事件两向轨迹的多示踪剂指纹保持率。"""
+    metrics = {
+        'do': ('same_sigma_do_contrast', 'water_mass_do_contrast'),
+        'theta': ('same_sigma_theta_contrast', 'same_sigma_theta_contrast'),
+        'salinity': (
+            'same_sigma_salinity_contrast',
+            'same_sigma_salinity_contrast',
+        ),
+        'spiciness0': (
+            'same_sigma_spiciness0_contrast',
+            'same_sigma_spiciness0_contrast',
+        ),
+    }
+    thresholds = {
+        'do': settings['same_sigma_do_abs_min_umol_kg'],
+        'theta': settings['same_sigma_theta_abs_min_deg_c'],
+        'salinity': settings['same_sigma_salinity_abs_min'],
+        'spiciness0': settings['same_sigma_spiciness0_abs_min'],
+    }
+    records = []
+    for label, group in daily_summary.groupby(
+        'integration_label', sort=True
+    ):
+        ordered = group.sort_values('date', kind='mergesort')
+        record = {
+            'event_id': str(ordered['event_id'].iloc[0]),
+            'integration_label': str(label),
+            'day_count': int(len(ordered)),
+            'passed_day_count': int(
+                ordered['daily_diagnostic_passed'].sum()
+            ),
+            'all_days_passed': bool(
+                ordered['daily_diagnostic_passed'].all()
+            ),
+        }
+        for name, (daily_column, peak_column) in metrics.items():
+            peak_value = float(peak_fingerprint[peak_column])
+            peak_sign = int(np.sign(peak_value))
+            values = ordered[f'median_{daily_column}'].to_numpy(
+                dtype=float
+            )
+            value_sign = np.zeros(values.shape, dtype=int)
+            finite_values = np.isfinite(values)
+            value_sign[finite_values] = np.sign(
+                values[finite_values]
+            ).astype(int)
+            qualifying = (
+                finite_values
+                & ordered['daily_diagnostic_passed'].to_numpy(dtype=bool)
+                & (value_sign == peak_sign)
+                & (np.abs(values) >= thresholds[name])
+            )
+            fraction = float(np.mean(qualifying))
+            passed = bool(
+                peak_sign != 0
+                and abs(peak_value) >= thresholds[name]
+                and fraction
+                >= settings['fingerprint_persistence_fraction_min']
+            )
+            record[f'peak_{name}_contrast'] = peak_value
+            record[f'{name}_fingerprint_day_fraction'] = fraction
+            record[f'{name}_fingerprint_persistent'] = passed
+        record['thermohaline_fingerprint_persistent'] = bool(
+            record['theta_fingerprint_persistent']
+            and record['salinity_fingerprint_persistent']
+            and record['spiciness0_fingerprint_persistent']
+        )
+        record['joint_do_thermohaline_fingerprint_persistent'] = bool(
+            record['do_fingerprint_persistent']
+            and record['thermohaline_fingerprint_persistent']
+        )
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def _ofes_run_trajectory_tracer_event_worker(payload: dict) -> dict:
+    """在独立进程采样并原子写入一个事件的路径多示踪剂。"""
+    event_id = str(payload['event_id'])
+    paths = _ofes_trajectory_tracer_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    positions = payload['daily_positions'].copy()
+    settings = payload['settings']
+    sample_frames = []
+    daily_records = []
+    for (_, _), day in positions.groupby(
+        ['integration_label', 'date'], sort=True
+    ):
+        samples, summary = _ofes_sample_trajectory_tracer_day(
+            day, settings
+        )
+        sample_frames.append(samples)
+        daily_records.append(summary)
+    particle_samples = pd.concat(sample_frames, ignore_index=True)
+    daily_summary = pd.DataFrame(daily_records).sort_values(
+        ['integration_label', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    event_summary = _ofes_trajectory_tracer_event_summary(
+        daily_summary, payload['peak_fingerprint'], settings
+    )
+    summary = {
+        'event_id': event_id,
+        'tracer_run_signature': str(payload['run_signature']),
+        'integration_count': int(len(event_summary)),
+        'day_count': int(len(daily_summary)),
+        'particle_sample_count': int(len(particle_samples)),
+        'all_daily_diagnostics_passed': bool(
+            daily_summary['daily_diagnostic_passed'].all()
+        ),
+    }
+    _ofes_atomic_write_json(summary, paths['summary'])
+    _atomic_write_parquet(particle_samples, paths['particle_samples'])
+    _atomic_write_parquet(daily_summary, paths['daily_summary'])
+    _atomic_write_parquet(event_summary, paths['event_summary'])
+    return {
+        'event_id': event_id,
+        'day_count': int(len(daily_summary)),
+    }
+
+
+def _ofes_load_trajectory_tracer_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的路径多示踪剂 fragment。"""
+    paths = _ofes_trajectory_tracer_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        'particle_samples': pd.read_parquet(paths['particle_samples']),
+        'daily_summary': pd.read_parquet(paths['daily_summary']),
+        'event_summary': pd.read_parquet(paths['event_summary']),
+    }
+
+
+def _ofes_trajectory_tracer_group_summary(
+    event_summary: pd.DataFrame,
+) -> dict:
+    """汇总一个多示踪剂轨迹总体或机制子集。"""
+    forward = event_summary.loc[
+        event_summary['integration_label']
+        == 'forward_observed_start_to_peak'
+    ]
+    count = int(len(forward))
+    summary = {
+        'event_count': int(forward['event_id'].nunique()),
+        'all_days_passed_count': int(forward['all_days_passed'].sum()),
+        'do_fingerprint_persistent_count': int(
+            forward['do_fingerprint_persistent'].sum()
+        ),
+        'theta_fingerprint_persistent_count': int(
+            forward['theta_fingerprint_persistent'].sum()
+        ),
+        'salinity_fingerprint_persistent_count': int(
+            forward['salinity_fingerprint_persistent'].sum()
+        ),
+        'spiciness0_fingerprint_persistent_count': int(
+            forward['spiciness0_fingerprint_persistent'].sum()
+        ),
+        'thermohaline_fingerprint_persistent_count': int(
+            forward['thermohaline_fingerprint_persistent'].sum()
+        ),
+        'joint_do_thermohaline_fingerprint_persistent_count': int(
+            forward[
+                'joint_do_thermohaline_fingerprint_persistent'
+            ].sum()
+        ),
+    }
+    for key, value in tuple(summary.items()):
+        if key.endswith('_count') and key != 'event_count':
+            summary[key.removesuffix('_count') + '_fraction'] = (
+                float(value / count) if count else None
+            )
+    return summary
+
+
+def _plot_ofes_trajectory_tracers(
+    daily_summary: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+) -> Path:
+    """绘制正向路径的逐日多示踪剂中位异常与总体保持率。"""
+    forward = daily_summary.loc[
+        daily_summary['integration_label']
+        == 'forward_observed_start_to_peak'
+    ].copy()
+    if 'kinematic_regime' not in forward.columns:
+        forward = forward.merge(
+            event_summary[
+                ['event_id', 'integration_label', 'kinematic_regime']
+            ].drop_duplicates(),
+            on=['event_id', 'integration_label'],
+            how='left',
+            validate='many_to_one',
+        )
+    metrics = (
+        ('same_sigma_do_contrast', 'DO anomaly', r'$\mu$mol kg$^{-1}$'),
+        ('same_sigma_theta_contrast', 'Potential temperature anomaly', '°C'),
+        ('same_sigma_salinity_contrast', 'Salinity anomaly', 'psu'),
+        ('same_sigma_spiciness0_contrast', 'Spiciness anomaly', 'kg m$^{-3}$'),
+    )
+    figure, axes = plt.subplots(
+        2, 2, figsize=(13, 9), constrained_layout=True
+    )
+    colors = {
+        'rotation_dominated': '#4c78a8',
+        'strain_dominated': '#e45756',
+    }
+    for axis, (column, title, unit) in zip(axes.flat, metrics):
+        value_column = f'median_{column}'
+        bin_count = int(settings['normalized_time_bin_count'])
+        time_bin = np.rint(
+            forward['normalized_event_time'].to_numpy(dtype=float)
+            * (bin_count - 1)
+        ) / (bin_count - 1)
+        event_binned = (
+            forward.assign(normalized_time_bin=time_bin)
+            .groupby(
+                ['event_id', 'kinematic_regime', 'normalized_time_bin'],
+                as_index=False,
+            )[value_column]
+            .median()
+        )
+        for regime, group in event_binned.groupby(
+            'kinematic_regime', sort=True
+        ):
+            grouped = group.groupby('normalized_time_bin')[value_column]
+            x = np.asarray(sorted(grouped.groups), dtype=float)
+            median = grouped.median().reindex(x).to_numpy(dtype=float)
+            q25 = grouped.quantile(0.25).reindex(x).to_numpy(dtype=float)
+            q75 = grouped.quantile(0.75).reindex(x).to_numpy(dtype=float)
+            color = colors.get(str(regime), '#6b7280')
+            axis.plot(
+                x, median, color=color, linewidth=2.0,
+                label=str(regime).replace('_', ' '),
+            )
+            axis.fill_between(x, q25, q75, color=color, alpha=0.18)
+        axis.axhline(0, color='#111827', linewidth=0.8, linestyle='--')
+        axis.set_title(title)
+        axis.set_xlabel('Normalized start-to-peak time')
+        axis.set_ylabel(unit)
+        axis.grid(alpha=0.2)
+    axes[0, 0].legend(frameon=False)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        output, dpi=int(settings['figure_dpi']), bbox_inches='tight'
+    )
+    plt.close(figure)
+    return output
+
+
+def run_ofes_3d_trajectory_tracers(
+    trajectory_population_run_dir: str | Path,
+    population_run_dir: str | Path,
+    *,
+    tracer_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """在既有 OFES 三维轨迹上并行诊断 DO、温盐与 spiciness 水团指纹。
+
+    workflow 不重新积分 `u/v/w`，而是从已验证的三维 trajectory 长表抽取逐日粒子位置，
+    采样同日 `do2`、位温和盐度，派生 TEOS-10 sigma0 与 spiciness0。每个粒子同时相对
+    120–240 km 局地背景计算固定深度和同密度面异常，避免把单纯 heave 当成水团指纹。
+
+    参数:
+        - trajectory_population_run_dir (str | Path): 已完成的52事件三维轨迹总体目录。
+        - population_run_dir (str | Path): 已完成的59-event peak总体目录，用于峰值水团指纹和机制分组。
+        - tracer_overrides (dict | None): 临时覆盖 `ofes.trajectory_tracers` 配置。
+        - output_dir (str | Path | None): 输出根目录；None写入三维总体目录下配置子目录。
+        - resume (bool): 是否复用签名一致的逐事件 fragment，默认 True。
+
+    返回:
+        - dict: 含 run_dir、manifest、逐粒子示踪剂、逐日与逐事件摘要、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`particle_tracer_samples.parquet`、`daily_tracer_summary.parquet`、`event_tracer_summary.parquet`、`analysis_summary.json`、`trajectory_tracers.png` 与 `manifest.json`。
+
+    说明:
+        - 温度、盐度和spiciness来自同一T-S状态，属于相关的水团指纹，不作为三份独立证据计数。
+        - 沿粒子路径保持同号异常支持载体一致性，但仍不能单独证明通风地点或严格material source。
+    """
+    trajectory_root = Path(trajectory_population_run_dir)
+    population_root = Path(population_run_dir)
+    settings = _ofes_trajectory_tracer_settings(tracer_overrides)
+    trajectory_manifest = json.loads(
+        (trajectory_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    population_manifest = json.loads(
+        (population_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if trajectory_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES trajectory tracers require a complete trajectory population.'
+        )
+    if population_manifest.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES trajectory tracers require a complete peak population.'
+        )
+    trajectories = pd.read_parquet(
+        trajectory_manifest['outputs']['trajectories']
+    )
+    labels = set(settings['integration_labels'])
+    trajectories = trajectories.loc[
+        trajectories['integration_label'].astype(str).isin(labels)
+    ].copy()
+    daily_positions = pd.concat(
+        [
+            _ofes_trajectory_tracer_daily_positions(group, str(label))
+            for (_, label), group in trajectories.groupby(
+                ['event_id', 'integration_label'], sort=True
+            )
+        ],
+        ignore_index=True,
+    )
+    population = pd.read_parquet(
+        population_manifest['outputs']['population_peak_diagnostics']
+    )
+    peak_columns = (
+        'event_id',
+        'kinematic_regime',
+        'water_mass_do_contrast',
+        'same_sigma_theta_contrast',
+        'same_sigma_salinity_contrast',
+        'same_sigma_spiciness0_contrast',
+    )
+    peak_fingerprints = population[list(peak_columns)].copy()
+    event_ids = sorted(
+        daily_positions['event_id'].astype(str).unique().tolist()
+    )
+    missing = sorted(
+        set(event_ids) - set(peak_fingerprints['event_id'].astype(str))
+    )
+    if missing:
+        raise RuntimeError(
+            f'OFES trajectory tracers lack peak fingerprints: {missing}.'
+        )
+    source_inventory = _ofes_trajectory_tracer_source_inventory(
+        event_ids, daily_positions
+    )
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    code_sources = '\n\n'.join(
+        inspect.getsource(item)
+        for item in (
+            _ofes_trajectory_tracer_settings,
+            _ofes_trajectory_tracer_science_settings,
+            _ofes_trajectory_tracer_processing_config_sha256,
+            _ofes_trajectory_tracer_daily_positions,
+            _ofes_trajectory_tracer_source_inventory,
+            _ofes_trajectory_tracer_background,
+            _ofes_sample_trajectory_tracer_day,
+            _ofes_trajectory_tracer_fragment_paths,
+            _ofes_trajectory_tracer_fragment_reusable,
+            _ofes_trajectory_tracer_event_summary,
+            _ofes_run_trajectory_tracer_event_worker,
+            _ofes_load_trajectory_tracer_fragment,
+            _ofes_trajectory_tracer_group_summary,
+            _plot_ofes_trajectory_tracers,
+            run_ofes_3d_trajectory_tracers,
+            load_ofes_snapshot,
+        )
+    )
+    payload = {
+        'schema_version': 1,
+        'trajectory_population_run_dir': str(trajectory_root.resolve()),
+        'trajectory_population_run_signature': trajectory_manifest[
+            'run_signature'
+        ],
+        'population_run_dir': str(population_root.resolve()),
+        'population_run_signature': population_manifest['run_signature'],
+        'input_sha256': {
+            'trajectory_manifest.json': _file_sha256(
+                trajectory_root / 'manifest.json'
+            ),
+            'trajectories.parquet': _file_sha256(
+                trajectory_manifest['outputs']['trajectories']
+            ),
+            'population_manifest.json': _file_sha256(
+                population_root / 'manifest.json'
+            ),
+            'population_peak_diagnostics.parquet': _file_sha256(
+                population_manifest['outputs'][
+                    'population_peak_diagnostics'
+                ]
+            ),
+        },
+        'settings': _ofes_trajectory_tracer_science_settings(settings),
+        'event_ids': event_ids,
+        'source_inventory_sha256': hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'code_sha256': hashlib.sha256(
+            code_sources.encode('utf-8')
+        ).hexdigest(),
+        'processing_science_config_sha256': (
+            _ofes_trajectory_tracer_processing_config_sha256()
+        ),
+        'numpy_version': str(np.__version__),
+        'pandas_version': str(pd.__version__),
+        'gsw_version': str(getattr(gsw, '__version__', 'unknown')),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    identity = {
+        **payload,
+        'execution_settings': {
+            'worker_count': int(settings['worker_count'])
+        },
+        'processing_config_sha256': _file_sha256(
+            Path(__file__).resolve().parent / 'config' / 'processing.yml'
+        ),
+        'run_signature': signature,
+        'run_tag': f'ofes_trajectory_tracers_{signature[:12]}',
+    }
+    output_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else trajectory_root / settings['output_subdir']
+    )
+    run_dir = output_root / identity['run_tag']
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError(
+                'Existing OFES trajectory tracer manifest signature differs.'
+            )
+        if previous.get('status') == 'complete' and resume:
+            outputs = previous['outputs']
+            if all(Path(path).exists() for path in outputs.values()):
+                return {
+                    'run_dir': run_dir,
+                    'manifest': previous,
+                    'particle_tracer_samples': pd.read_parquet(
+                        outputs['particle_tracer_samples']
+                    ),
+                    'daily_tracer_summary': pd.read_parquet(
+                        outputs['daily_tracer_summary']
+                    ),
+                    'event_tracer_summary': pd.read_parquet(
+                        outputs['event_tracer_summary']
+                    ),
+                    'analysis_summary': json.loads(
+                        Path(outputs['analysis_summary']).read_text(
+                            encoding='utf-8'
+                        )
+                    ),
+                    'figure_path': Path(outputs['figure']),
+                    'reused_complete_run': True,
+                }
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(event_ids)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    completed = 0
+    try:
+        pending = []
+        for event_id in event_ids:
+            paths = _ofes_trajectory_tracer_fragment_paths(
+                events_dir, event_id
+            )
+            if resume and _ofes_trajectory_tracer_fragment_reusable(
+                paths, signature
+            ):
+                completed += 1
+                continue
+            fingerprint = peak_fingerprints.loc[
+                peak_fingerprints['event_id'].astype(str) == event_id
+            ]
+            pending.append(
+                {
+                    'event_id': event_id,
+                    'daily_positions': daily_positions.loc[
+                        daily_positions['event_id'].astype(str) == event_id
+                    ].copy(),
+                    'peak_fingerprint': fingerprint.iloc[0].to_dict(),
+                    'settings': settings,
+                    'events_dir': str(events_dir.resolve()),
+                    'run_signature': signature,
+                }
+            )
+        pending.sort(
+            key=lambda task: task['daily_positions']['date'].nunique(),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory tracers] '
+            f'events={len(event_ids)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={settings["worker_count"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=int(settings['worker_count']),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_trajectory_tracer_event_worker, task
+                    ): str(task['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory tracers] '
+                        f'{completed}/{len(event_ids)} complete: '
+                        f'{event_id} ({result["day_count"]} rows)',
+                        flush=True,
+                    )
+        fragments = [
+            _ofes_load_trajectory_tracer_fragment(events_dir, event_id)
+            for event_id in event_ids
+        ]
+        particle_samples = pd.concat(
+            [fragment['particle_samples'] for fragment in fragments],
+            ignore_index=True,
+        )
+        daily_summary = pd.concat(
+            [fragment['daily_summary'] for fragment in fragments],
+            ignore_index=True,
+        )
+        event_summary = pd.concat(
+            [fragment['event_summary'] for fragment in fragments],
+            ignore_index=True,
+        ).merge(
+            peak_fingerprints[['event_id', 'kinematic_regime']],
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        event_summary = event_summary.merge(
+            pd.read_parquet(
+                trajectory_manifest['outputs'][
+                    'population_classification'
+                ]
+            )[
+                [
+                    'event_id',
+                    'event_validation_passed',
+                    'resolved_vertical_pathway_supported',
+                    'resolved_downward_pathway_supported',
+                ]
+            ],
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        group_summary = {
+            str(regime): _ofes_trajectory_tracer_group_summary(group)
+            for regime, group in event_summary.groupby(
+                'kinematic_regime', sort=True
+            )
+        }
+        all_summary = _ofes_trajectory_tracer_group_summary(event_summary)
+        forward = event_summary.loc[
+            event_summary['integration_label']
+            == 'forward_observed_start_to_peak'
+        ]
+        resolved_down = forward.loc[
+            forward['resolved_downward_pathway_supported'].astype(bool)
+        ]
+        analysis_summary = {
+            'event_count': int(len(event_ids)),
+            'integration_count': int(len(event_summary)),
+            'sampled_event_day_count': int(len(daily_summary)),
+            'particle_sample_count': int(len(particle_samples)),
+            'worker_count': int(settings['worker_count']),
+            'all_events_forward': all_summary,
+            'by_kinematic_regime': group_summary,
+            'resolved_downward_forward': (
+                _ofes_trajectory_tracer_group_summary(resolved_down)
+            ),
+            'temperature_salinity_spiciness_independence_note': (
+                'Temperature, salinity, and spiciness0 describe one '
+                'thermohaline state and are not counted as independent '
+                'lines of evidence.'
+            ),
+            'interpretation': (
+                'Persistent same-isopycnal thermohaline anomalies along '
+                'validated trajectories support a coherent water-mass '
+                'carrier interpretation; failure indicates deformation, '
+                'mixing, background changes, or trajectory/core mismatch.'
+            ),
+            'limits': [
+                'The analysis samples daily model tracer snapshots along '
+                'resolved paths and does not close tracer tendency budgets.',
+                'A persistent fingerprint supports carrier consistency but '
+                'does not locate the original air-sea ventilation site.',
+                'DO is affected by solubility and biology, while temperature, '
+                'salinity, and spiciness are mutually dependent.',
+            ],
+        }
+        daily_summary = daily_summary.merge(
+            event_summary[
+                ['event_id', 'integration_label', 'kinematic_regime']
+            ],
+            on=['event_id', 'integration_label'],
+            how='left',
+            validate='many_to_one',
+        )
+        daily_summary['normalized_event_time'] = daily_summary.groupby(
+            ['event_id', 'integration_label'], sort=False
+        ).cumcount() / daily_summary.groupby(
+            ['event_id', 'integration_label'], sort=False
+        )['date'].transform(lambda values: max(1, len(values) - 1))
+        output_paths = {
+            'particle_tracer_samples': (
+                run_dir / 'particle_tracer_samples.parquet'
+            ),
+            'daily_tracer_summary': run_dir / 'daily_tracer_summary.parquet',
+            'event_tracer_summary': run_dir / 'event_tracer_summary.parquet',
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_tracers.png',
+            'source_inventory': run_dir / 'source_inventory.parquet',
+        }
+        _atomic_write_parquet(
+            particle_samples, output_paths['particle_tracer_samples']
+        )
+        _atomic_write_parquet(
+            daily_summary, output_paths['daily_tracer_summary']
+        )
+        _atomic_write_parquet(
+            event_summary, output_paths['event_tracer_summary']
+        )
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_trajectory_tracers(
+            daily_summary, event_summary, output_paths['figure'], settings
+        )
+        outputs = {
+            key: str(path.resolve()) for key, path in output_paths.items()
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': int(len(event_ids)),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'particle_tracer_samples': particle_samples,
+        'daily_tracer_summary': daily_summary,
+        'event_tracer_summary': event_summary,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
 def _plot_ofes_3d_trajectory_population(
     classified: pd.DataFrame,
     output_path: str | Path,

@@ -1,4 +1,9 @@
 # 处理与算法参数配置
+# version 1.36 变更：
+#   - 在已完成的 OFES 三维 ensemble 轨迹上逐日采样 DO、位温、盐度、sigma0 与 spiciness0，
+#     并相对 120–240 km 局地背景同时计算固定深度及同密度面异常；复用既有轨迹而不重新积分，
+#     事件间支持断点续跑和进程并行，绘图按归一化时间箱让事件等权；温盐/spice 只作同一
+#     水团指纹而不当作独立三份证据。
 # version 1.35 变更：
 #   - 将已验证的 OFES u/v/w 三维 ensemble trajectory 并行推广到 59-event 子集中
 #     背景环带完整且 start-to-peak 时间展开的事件；新增事件级进程并行、断点续跑、
@@ -111,7 +116,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.32"
+version: "1.36"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -435,6 +440,23 @@ ofes:
     representative_parity_atol: 1.0e-9
     figure_dpi: 180
     output_subdir: trajectory_3d_population
+  trajectory_tracers:
+    worker_count: 16
+    integration_labels: ["forward_observed_start_to_peak", "backward_peak_to_start"]
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_load_margin_km: 50.0
+    background_min_valid_columns: 100
+    minimum_active_fraction: 0.75
+    minimum_valid_particle_fraction: 0.75
+    same_sigma_do_abs_min_umol_kg: 10.0
+    same_sigma_theta_abs_min_deg_c: 0.10
+    same_sigma_salinity_abs_min: 0.02
+    same_sigma_spiciness0_abs_min: 0.05
+    fingerprint_persistence_fraction_min: 0.75
+    normalized_time_bin_count: 11
+    figure_dpi: 180
+    output_subdir: trajectory_tracers
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12
