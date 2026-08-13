@@ -26943,6 +26943,8 @@ def build_mccoy_scv_delta_do_threshold_table(
     baseline_end_year: int = 2023,
     anomaly_min_depth: float = 300.0,
     argo_anchored_path: str | Path | None = None,
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
     output_dir: str | Path | None = None,
     force: bool = False,
     save_data: bool = True,
@@ -26960,6 +26962,8 @@ def build_mccoy_scv_delta_do_threshold_table(
         - baseline_end_year (int): 分析结束年份（闭区间），默认 2023。
         - anomaly_min_depth (float): 异常峰最浅深度（m），默认 300。
         - argo_anchored_path (str | Path | None): McCoy Argo 锚定 representation 表；None 使用默认路径。
+        - profile_eligibility (pd.DataFrame | None): 对应深度的 Argo profile eligibility 表；None 沿用 anchored 表的兼容字段。
+        - profile_eligibility_path (str | Path | None): eligibility parquet 路径；与表同时提供时用于 provenance。
         - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
         - force (bool): True 时覆盖已存在的同参数结果；默认 False。
         - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
@@ -26968,11 +26972,11 @@ def build_mccoy_scv_delta_do_threshold_table(
         - pd.DataFrame: 每行含稳定 SCV/profile 标识、阈值、可评估状态、carrier 判定、来源与哈希。
 
     输出:
-        - `plot_outputs/do/<region>/mccoy_scv_delta_do_thresholds/mccoy_scv_delta_do_thresholds_<y0>_<y1>_depth<z>m.parquet`（save_data 时）。
+        - `plot_outputs/do/<region>/mccoy_scv_delta_do_thresholds/mccoy_scv_delta_do_thresholds_<y0>_<y1>_depth<z>m[_do<...>].parquet`（save_data 时）。
         - 同名 CSV（save_data 时）。
 
     说明:
-        - 当前迁移口径保留既有 244 个 DO-evaluable McCoy SCV 分母；新表生成后，绘图与统计不再读取裸 `has_delta_do`。
+        - 正式 depth sensitivity 应传入对应深度的 profile eligibility；兼容模式只用于复现既有 300 m 表。
         - anomalies parquet 是每个阈值的正式 detector 输出，carrier 集合不依赖本函数运行顺序。
     """
     threshold_values = sorted({float(value) for value in thresholds})
@@ -26992,27 +26996,98 @@ def build_mccoy_scv_delta_do_threshold_table(
     missing = required.difference(anchored.columns)
     if missing:
         raise ValueError(f'McCoy anchored table missing columns: {sorted(missing)}')
-    if 'do_evaluable' in anchored.columns:
-        evaluable = anchored['do_evaluable'].fillna(False).astype(bool)
-        eligibility_source = 'do_evaluable'
-    elif 'has_delta_do' in anchored.columns:
-        evaluable = anchored['has_delta_do'].notna()
-        eligibility_source = 'legacy_has_delta_do_notna_migration'
-    else:
-        raise ValueError(
-            'McCoy anchored table lacks a DO evaluability field; run the explicit SCV DO evaluability builder first.'
-        )
-
     profile_number = pd.to_numeric(anchored['profile_number'], errors='coerce').astype('Int64')
     year = pd.to_numeric(anchored['year'], errors='coerce').astype('Int64')
     in_period = year.between(int(baseline_start_year), int(baseline_end_year))
     anchored = anchored.loc[in_period & profile_number.notna()].copy()
     anchored['profile_number_int'] = profile_number.loc[anchored.index].astype(int)
     anchored['year_int'] = year.loc[anchored.index].astype(int)
-    anchored['do_evaluable_internal'] = evaluable.loc[anchored.index].astype(bool)
     if anchored['profile_number_int'].duplicated().any():
         duplicates = anchored.loc[anchored['profile_number_int'].duplicated(False), 'profile_number_int'].tolist()
         raise ValueError(f'Duplicate McCoy profile keys: {duplicates[:10]}')
+
+    eligibility_table_source = ''
+    eligibility_table_hash = ''
+    if profile_eligibility is not None or profile_eligibility_path is not None:
+        if profile_eligibility is None:
+            eligibility_path = Path(profile_eligibility_path)
+            profile_eligibility = pd.read_parquet(eligibility_path)
+        else:
+            profile_eligibility = profile_eligibility.copy()
+            eligibility_path = (
+                Path(profile_eligibility_path)
+                if profile_eligibility_path is not None
+                else None
+            )
+        required_eligibility = {'Profile_number', 'do_evaluable'}
+        missing_eligibility = required_eligibility.difference(
+            profile_eligibility.columns
+        )
+        if missing_eligibility:
+            raise ValueError(
+                'Profile eligibility table missing columns: '
+                f'{sorted(missing_eligibility)}'
+            )
+        if 'minimum_depth_m' in profile_eligibility.columns:
+            depth_values = pd.to_numeric(
+                profile_eligibility['minimum_depth_m'], errors='coerce'
+            ).dropna().unique()
+            if (
+                len(depth_values) != 1
+                or not np.isclose(
+                    float(depth_values[0]), float(anomaly_min_depth)
+                )
+            ):
+                raise ValueError(
+                    'Profile eligibility depth does not match '
+                    f'anomaly_min_depth={float(anomaly_min_depth):g}.'
+                )
+        eligibility_profile_ids = pd.to_numeric(
+            profile_eligibility['Profile_number'], errors='coerce'
+        ).astype('Int64')
+        eligibility_map = pd.Series(
+            profile_eligibility['do_evaluable'].fillna(False).astype(bool).to_numpy(),
+            index=eligibility_profile_ids,
+        )
+        eligibility_map = eligibility_map[
+            eligibility_map.index.notna()
+        ]
+        if eligibility_map.index.duplicated().any():
+            raise ValueError(
+                'Profile eligibility contains duplicate Profile_number rows.'
+            )
+        explicit_evaluable = anchored['profile_number_int'].map(
+            eligibility_map
+        )
+        if explicit_evaluable.isna().any():
+            missing_ids = anchored.loc[
+                explicit_evaluable.isna(), 'profile_number_int'
+            ].astype(int).tolist()
+            raise ValueError(
+                f'{len(missing_ids)} McCoy profiles are absent from explicit '
+                f'eligibility: {missing_ids[:10]}'
+            )
+        anchored['do_evaluable_internal'] = explicit_evaluable.astype(bool)
+        eligibility_source = 'profile_eligibility'
+        if eligibility_path is not None:
+            eligibility_table_source = str(eligibility_path)
+            if eligibility_path.exists():
+                eligibility_table_hash = _file_sha256(eligibility_path)
+    elif 'do_evaluable' in anchored.columns:
+        anchored['do_evaluable_internal'] = (
+            anchored['do_evaluable'].fillna(False).astype(bool)
+        )
+        eligibility_source = 'do_evaluable'
+    elif 'has_delta_do' in anchored.columns:
+        anchored['do_evaluable_internal'] = anchored[
+            'has_delta_do'
+        ].notna()
+        eligibility_source = 'legacy_has_delta_do_notna_migration'
+    else:
+        raise ValueError(
+            'McCoy anchored table lacks a DO evaluability field; '
+            'provide profile_eligibility for the requested depth.'
+        )
 
     depth_tag = _format_detection_value(float(anomaly_min_depth))
     out_dir = (
@@ -27024,13 +27099,44 @@ def build_mccoy_scv_delta_do_threshold_table(
         f'mccoy_scv_delta_do_thresholds_{int(baseline_start_year)}_'
         f'{int(baseline_end_year)}_depth{depth_tag}m'
     )
+    if threshold_values != [20.0, 35.0, 50.0]:
+        threshold_tag = '-'.join(
+            _format_detection_value(value) for value in threshold_values
+        )
+        stem = f'{stem}_do{threshold_tag}'
     parquet_path = out_dir / f'{stem}.parquet'
     csv_path = out_dir / f'{stem}.csv'
     if parquet_path.exists() and not force:
         cached = pd.read_parquet(parquet_path)
         cached_thresholds = sorted(pd.to_numeric(cached['threshold_umol_kg'], errors='coerce').dropna().unique())
-        if cached_thresholds == threshold_values:
+        cached_sources = set(
+            cached.get(
+                'eligibility_source', pd.Series(dtype=str)
+            ).dropna().astype(str)
+        )
+        source_matches = (
+            profile_eligibility is None
+            or cached_sources == {'profile_eligibility'}
+        )
+        hash_matches = (
+            not eligibility_table_hash
+            or set(
+                cached.get(
+                    'eligibility_table_sha256', pd.Series(dtype=str)
+                ).dropna().astype(str)
+            ) == {eligibility_table_hash}
+        )
+        if (
+            cached_thresholds == threshold_values
+            and source_matches
+            and hash_matches
+        ):
             return cached
+        if cached_thresholds == threshold_values:
+            raise FileExistsError(
+                'Existing threshold table has incompatible eligibility '
+                'provenance; pass force=True to replace it.'
+            )
         raise FileExistsError(
             f'Existing threshold table contains {cached_thresholds}, requested {threshold_values}; pass force=True to replace it.'
         )
@@ -27088,6 +27194,8 @@ def build_mccoy_scv_delta_do_threshold_table(
                 'period_end': int(baseline_end_year),
                 'detector_file_stem': cfg.file_stem(),
                 'eligibility_source': eligibility_source,
+                'eligibility_table_path': eligibility_table_source,
+                'eligibility_table_sha256': eligibility_table_hash,
                 'source_table_path': str(anchored_path),
                 'source_table_sha256': anchored_hash,
                 'anomalies_path': str(anomaly_path),
@@ -28262,6 +28370,20 @@ def build_scv_matched_control_cohort(
     ].copy()
     profile_eligibility['Profile_number'] = profile_eligibility['Profile_number'].astype(int)
     if use_eke:
+        sampled_source_col = 'mean_eke_source'
+        expected_eke_source = str(eke_source)
+        has_reusable_eke = (
+            'mean_eke' in profile_eligibility.columns
+            and sampled_source_col in profile_eligibility.columns
+            and profile_eligibility[sampled_source_col]
+            .fillna('')
+            .astype(str)
+            .eq(expected_eke_source)
+            .all()
+        )
+    else:
+        has_reusable_eke = False
+    if use_eke and not has_reusable_eke:
         profile_eligibility = sample_glorys_eke_at_profiles(
             profile_eligibility,
             eke_file_path=eke_source,
@@ -28940,6 +29062,13 @@ def _bootstrap_matched_or_by_cluster(
     )
 
 
+def _stable_analysis_seed(base_seed: int, *parts: object) -> int:
+    """由分析标签稳定派生 NumPy 可接受的随机种子。"""
+    payload = '|'.join([str(int(base_seed)), *(str(part) for part in parts)])
+    digest = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return int(digest[:8], 16)
+
+
 def _standardized_mean_difference(
     left: pd.Series | np.ndarray,
     right: pd.Series | np.ndarray,
@@ -29146,7 +29275,13 @@ def summarize_scv_matched_control_enrichment(
                     cells,
                     cluster_col=bootstrap_col,
                     iterations=iterations,
-                    random_seed=seed + int(round(float(threshold) * 10)) + len(rows),
+                    random_seed=_stable_analysis_seed(
+                        seed,
+                        str(scope),
+                        float(threshold),
+                        outcome_mode,
+                        cluster_unit,
+                    ),
                 )
             else:
                 exact_or = exact_low = exact_high = fisher_p = np.nan
@@ -29406,6 +29541,7 @@ def plot_scv_matched_control_enrichment(
                 np.isfinite(estimate) and estimate > 0
                 and np.isfinite(low) and low > 0
                 and np.isfinite(high) and high >= estimate
+                and low <= estimate
             ):
                 continue
             y = float(y_base[index] + offset)
@@ -29494,6 +29630,1011 @@ def plot_scv_matched_control_enrichment(
         plt.show()
     plt.close(fig)
     return out
+
+
+def summarize_scv_matching_caliper_sensitivity(
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
+    *,
+    spatial_calipers_km: tuple[float, ...] | list[float] = (
+        250.0, 500.0, 750.0,
+    ),
+    thresholds: tuple[float, ...] | list[float] = (20.0, 35.0, 50.0),
+    scopes: tuple[str, ...] | list[str] = (
+        'Global', 'KE', 'Global excluding KE',
+    ),
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    anomaly_min_depth: float = 300.0,
+    bootstrap_cluster_unit: str | None = None,
+    output_dir: str | Path | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """汇总 SCV matched-control 结论对空间 caliper 的敏感性。
+
+    函数在固定 ΔDO detector、深度门槛和其他 matching 条件下，仅改变 SCV-control 最大水平距离。
+    所有 caliper 共用一次 profile-level mean-EKE 采样，再分别构建 outcome-blind cohort 和
+    matched Mantel-Haenszel OR。输出同时记录匹配保留率和协变量平衡，避免只比较效应大小。
+
+    参数:
+        - profile_eligibility (pd.DataFrame | None): profile eligibility 表；None 时读取路径或默认缓存。
+        - profile_eligibility_path (str | Path | None): eligibility parquet；None 定位默认参数缓存。
+        - spatial_calipers_km (tuple[float, ...] | list[float]): 最大水平匹配距离列表（km），默认 (250, 500, 750)。
+        - thresholds (tuple[float, ...] | list[float]): 共同评估的 ΔDO 阈值，默认 (20, 35, 50)。
+        - scopes (tuple[str, ...] | list[str]): 要汇总的区域 scope，默认 global、KE 和 KE 留出。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - anomaly_min_depth (float): ΔDO detector 最浅深度（m），默认 300。
+        - bootstrap_cluster_unit (str | None): platform bootstrap 单位；None 读取配置。
+        - output_dir (str | Path | None): sensitivity 输出目录；None 使用 DO/global 默认目录。
+        - force (bool): 是否重建各 caliper 的 cohort，默认 False。
+        - save_data (bool): 是否保存 combined summary parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 caliper、scope 和 threshold 一行的匹配保留、平衡与 enrichment 统计。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control_sensitivity/scv_matching_caliper_sensitivity_<y0>_<y1>_depth<z>m_*.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - 该 sweep 只检验空间 caliper；年份、月份、EKE decile、垂向覆盖和 control 排除规则保持不变。
+        - 不应按 OR 最大值选择 caliper；默认 750 km 仍是主分析，较窄 caliper 用于检查结论与样本保留的权衡。
+    """
+    calipers = sorted({float(value) for value in spatial_calipers_km})
+    threshold_values = sorted({float(value) for value in thresholds})
+    if not calipers or any(value <= 0 for value in calipers):
+        raise ValueError('spatial_calipers_km must contain positive values.')
+    if not threshold_values or any(value <= 0 for value in threshold_values):
+        raise ValueError('thresholds must contain positive values.')
+
+    region_slug = _current_region_key()
+    match_cfg = _scv_matched_control_config()
+    cluster_unit = str(
+        match_cfg['bootstrap_cluster_unit']
+        if bootstrap_cluster_unit is None else bootstrap_cluster_unit
+    )
+    matched_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                matched_dir,
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
+            )
+        profile_source = Path(profile_eligibility_path)
+        if profile_source.exists():
+            profile_eligibility = pd.read_parquet(profile_source)
+        else:
+            profile_eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=float(anomaly_min_depth),
+                output_dir=matched_dir,
+                save_data=True,
+            )
+    else:
+        profile_eligibility = profile_eligibility.copy()
+
+    if bool(match_cfg['match_mean_eke']):
+        eke_source = glorys_processed_root / 'eke.zarr'
+        source_col = 'mean_eke_source'
+        if not (
+            'mean_eke' in profile_eligibility.columns
+            and source_col in profile_eligibility.columns
+            and profile_eligibility[source_col]
+            .fillna('')
+            .astype(str)
+            .eq(str(eke_source))
+            .all()
+        ):
+            profile_eligibility = sample_glorys_eke_at_profiles(
+                profile_eligibility,
+                eke_file_path=eke_source,
+                output_col='mean_eke',
+            )
+
+    summaries: list[pd.DataFrame] = []
+    for caliper in calipers:
+        cohort = build_scv_matched_control_cohort(
+            profile_eligibility=profile_eligibility,
+            thresholds=threshold_values,
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=float(anomaly_min_depth),
+            spatial_caliper_km=float(caliper),
+            force=bool(force),
+            save_data=bool(save_data),
+        )
+        summary = summarize_scv_matched_control_enrichment(
+            cohort=cohort,
+            thresholds=threshold_values,
+            scopes=scopes,
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=float(anomaly_min_depth),
+            bootstrap_cluster_unit=cluster_unit,
+            save_data=bool(save_data),
+        )
+        anchors = cohort[
+            cohort['is_scv'].fillna(False).astype(bool)
+        ].drop_duplicates('match_set_id')
+        controls = cohort[
+            ~cohort['is_scv'].fillna(False).astype(bool)
+        ]
+        matched_anchors = anchors[
+            pd.to_numeric(
+                anchors['n_controls_matched'], errors='coerce'
+            ).fillna(0).gt(0)
+        ]
+        requested_controls = int(
+            pd.to_numeric(
+                anchors['n_controls_requested'], errors='coerce'
+            ).dropna().iloc[0]
+        )
+        summary['sensitivity_parameter'] = 'spatial_caliper_km'
+        summary['sensitivity_value'] = float(caliper)
+        summary['spatial_caliper_km'] = float(caliper)
+        summary['n_anchor_candidates'] = int(len(anchors))
+        summary['n_matched_anchors'] = int(len(matched_anchors))
+        summary['matched_anchor_retention'] = (
+            float(len(matched_anchors) / len(anchors))
+            if len(anchors) else np.nan
+        )
+        summary['n_complete_matched_anchors'] = int(
+            pd.to_numeric(
+                anchors['n_controls_matched'], errors='coerce'
+            ).fillna(0).eq(requested_controls).sum()
+        )
+        summary['n_control_profiles_total'] = int(len(controls))
+        summary['n_control_platforms_total'] = int(
+            controls['platform_number'].nunique()
+        )
+        summaries.append(summary)
+
+    combined = pd.concat(summaries, ignore_index=True)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'scv_matched_control_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        depth_tag = _format_detection_value(float(anomaly_min_depth))
+        caliper_tag = '-'.join(
+            _format_detection_value(value) for value in calipers
+        )
+        threshold_tag = '-'.join(
+            _format_detection_value(value) for value in threshold_values
+        )
+        stem = (
+            f'scv_matching_caliper_sensitivity_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_space{caliper_tag}km_'
+            f'do{threshold_tag}_boot{cluster_unit}'
+        )
+        _atomic_write_parquet(combined, out_dir / f'{stem}.parquet')
+        combined.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] SCV matching-caliper sensitivity saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return combined
+
+
+def plot_scv_matching_caliper_sensitivity(
+    summary: pd.DataFrame,
+    *,
+    scope: str = 'Global',
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制空间 caliper 对匹配保留率与 SCV ΔDO enrichment 的影响。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_matching_caliper_sensitivity` 输出。
+        - scope (str): 右侧 OR 面板使用的区域 scope，默认 `Global`。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含 plotted rows、scope 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control_sensitivity/scv_matching_caliper_sensitivity_<scope>.png`（save_fig 时）。
+
+    说明:
+        - 左图的 matched/complete 比例以全部可进入 matching 的 SCV anchors 为分母。
+        - 右图优先绘制 anchor-platform bootstrap CI；无界上限标作∞，其他无效区间退回 pooled exact CI。
+    """
+    required = {
+        'scope', 'threshold_umol_kg', 'spatial_caliper_km',
+        'matched_anchor_retention', 'n_anchor_candidates',
+        'n_complete_matched_anchors', 'matched_mantel_haenszel_or',
+        'matched_bootstrap_ci_low', 'matched_bootstrap_ci_high',
+        'pooled_conditional_exact_or', 'pooled_exact_ci_low',
+        'pooled_exact_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Caliper-sensitivity summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary[summary['scope'].astype(str).eq(str(scope))].copy()
+    if plotted.empty:
+        raise ValueError(f'No caliper-sensitivity rows for scope={scope}.')
+    plotted['spatial_caliper_km'] = pd.to_numeric(
+        plotted['spatial_caliper_km'], errors='coerce'
+    )
+    caliper_rows = (
+        plotted.sort_values('spatial_caliper_km')
+        .drop_duplicates('spatial_caliper_km')
+    )
+    anchor_n = pd.to_numeric(
+        caliper_rows['n_anchor_candidates'], errors='coerce'
+    ).to_numpy(dtype=float)
+    matched_pct = (
+        pd.to_numeric(
+            caliper_rows['matched_anchor_retention'], errors='coerce'
+        ).to_numpy(dtype=float)
+        * 100.0
+    )
+    complete_pct = (
+        pd.to_numeric(
+            caliper_rows['n_complete_matched_anchors'], errors='coerce'
+        ).to_numpy(dtype=float)
+        / anchor_n
+        * 100.0
+    )
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(14.0, 6.2),
+        gridspec_kw={'width_ratios': [0.85, 1.35]},
+    )
+    axes[0].plot(
+        caliper_rows['spatial_caliper_km'],
+        matched_pct,
+        color=_GROUP_COLORS['scv'],
+        marker='o',
+        linewidth=2.2,
+        markersize=8,
+        label='At least one control',
+    )
+    axes[0].plot(
+        caliper_rows['spatial_caliper_km'],
+        complete_pct,
+        color=_GROUP_COLORS['baseline'],
+        marker='s',
+        linewidth=2.2,
+        markersize=7,
+        label='All requested controls',
+    )
+    axes[0].set_xlabel('Maximum SCV-control distance (km)')
+    axes[0].set_ylabel('SCV anchors retained (%)')
+    axes[0].set_ylim(0.0, 100.0)
+    axes[0].set_title('Matching retention')
+    axes[0].legend(frameon=False, loc='lower right')
+    axes[0].grid(axis='y', alpha=0.25)
+
+    finite_bounds: list[float] = []
+    threshold_series: list[dict] = []
+    thresholds = sorted(
+        pd.to_numeric(
+            plotted['threshold_umol_kg'], errors='coerce'
+        ).dropna().unique()
+    )
+    for threshold in thresholds:
+        part = plotted[
+            np.isclose(
+                pd.to_numeric(
+                    plotted['threshold_umol_kg'], errors='coerce'
+                ),
+                float(threshold),
+            )
+        ].sort_values('spatial_caliper_km')
+        _, label, color, marker = _threshold_style(float(threshold))
+        x_values: list[float] = []
+        estimates: list[float] = []
+        lows: list[float] = []
+        highs: list[float] = []
+        open_upper: list[bool] = []
+        for row in part.itertuples(index=False):
+            estimate = float(row.matched_mantel_haenszel_or)
+            low = float(row.matched_bootstrap_ci_low)
+            high = float(row.matched_bootstrap_ci_high)
+            is_open_upper = (
+                np.isfinite(estimate) and estimate > 0
+                and np.isfinite(low) and low > 0
+                and low <= estimate
+                and np.isposinf(high)
+            )
+            finite_bootstrap = (
+                np.isfinite(estimate) and estimate > 0
+                and np.isfinite(low) and low > 0
+                and np.isfinite(high) and high >= estimate
+                and low <= estimate
+            )
+            if not finite_bootstrap and not is_open_upper:
+                estimate = float(row.pooled_conditional_exact_or)
+                low = float(row.pooled_exact_ci_low)
+                high = float(row.pooled_exact_ci_high)
+            finite_interval = (
+                np.isfinite(estimate) and estimate > 0
+                and np.isfinite(low) and low > 0
+                and np.isfinite(high) and high >= estimate
+                and low <= estimate
+            )
+            if not finite_interval and not is_open_upper:
+                continue
+            x_values.append(float(row.spatial_caliper_km))
+            estimates.append(estimate)
+            lows.append(low)
+            highs.append(high)
+            open_upper.append(is_open_upper)
+            finite_bounds.extend([low, estimate])
+            if np.isfinite(high):
+                finite_bounds.append(high)
+        threshold_series.append({
+            'x': np.asarray(x_values, dtype=float),
+            'estimate': np.asarray(estimates, dtype=float),
+            'low': np.asarray(lows, dtype=float),
+            'high': np.asarray(highs, dtype=float),
+            'open_upper': np.asarray(open_upper, dtype=bool),
+            'label': label,
+            'color': color,
+            'marker': marker,
+        })
+
+    plot_upper = max(finite_bounds) * 1.35 if finite_bounds else 10.0
+    for series in threshold_series:
+        if series['estimate'].size == 0:
+            continue
+        plotted_high = series['high'].copy()
+        plotted_high[series['open_upper']] = plot_upper / 1.08
+        axes[1].errorbar(
+            series['x'],
+            series['estimate'],
+            yerr=np.vstack([
+                series['estimate'] - series['low'],
+                plotted_high - series['estimate'],
+            ]),
+            color=series['color'],
+            marker=series['marker'],
+            linewidth=2.2,
+            markersize=8,
+            capsize=4,
+            label=series['label'],
+        )
+        for x_value, is_open in zip(
+            series['x'], series['open_upper']
+        ):
+            if is_open:
+                axes[1].annotate(
+                    '∞',
+                    (x_value, plot_upper / 1.03),
+                    ha='center',
+                    va='top',
+                    color=series['color'],
+                    fontsize=_PLOT_TYPOGRAPHY['annotation'],
+                    fontweight='bold',
+                )
+    axes[1].axhline(
+        1.0, color='#4b5563', linestyle='--', linewidth=1.2
+    )
+    axes[1].set_yscale('log')
+    axes[1].set_xlabel('Maximum SCV-control distance (km)')
+    axes[1].set_ylabel('Matched odds ratio')
+    axes[1].set_title(f'ΔDO enrichment: {scope}')
+    axes[1].legend(frameon=False)
+    axes[1].grid(axis='y', which='both', alpha=0.22)
+    if finite_bounds:
+        axes[1].set_ylim(
+            max(min(finite_bounds) / 1.35, 0.1),
+            plot_upper,
+        )
+    for ax in axes:
+        _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir(
+            'scv_matched_control_sensitivity', region_slug
+        )
+    )
+    result = {'rows': plotted, 'scope': str(scope)}
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scope_tag = re.sub(
+            r'[^A-Za-z0-9]+', '_', str(scope)
+        ).strip('_').lower()
+        path = out_dir / (
+            f'scv_matching_caliper_sensitivity_{scope_tag}.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] SCV matching-caliper figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
+
+
+def summarize_scv_depth_gate_sensitivity(
+    *,
+    depth_gates_m: tuple[float, ...] | list[float] = (
+        100.0, 200.0, 300.0,
+    ),
+    do_threshold: float = 50.0,
+    spatial_caliper_km: float = 750.0,
+    scopes: tuple[str, ...] | list[str] = (
+        'Global', 'KE', 'Global excluding KE',
+    ),
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    bootstrap_cluster_unit: str | None = None,
+    output_dir: str | Path | None = None,
+    force: bool = False,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """汇总 ΔDO 与 SCV enrichment 对最浅异常深度门槛的敏感性。
+
+    每个深度门槛使用独立的 Argo profile eligibility、正式 anomalies parquet 和 McCoy threshold 表，
+    避免把历史 300 m 兼容分母错误沿用到 100/200 m。函数同时报告全体 Argo
+    occurrence、异常的 KE 占比、META membership OR、raw SCV OR 和 environment-matched SCV OR。
+
+    参数:
+        - depth_gates_m (tuple[float, ...] | list[float]): 最浅异常深度列表（m），默认 (100, 200, 300)。
+        - do_threshold (float): 固定 ΔDO 阈值（μmol kg⁻¹），默认 50。
+        - spatial_caliper_km (float): matched-control 最大水平距离（km），默认 750。
+        - scopes (tuple[str, ...] | list[str]): matched-control 区域 scope，默认 global、KE 和 KE 留出。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - bootstrap_cluster_unit (str | None): platform bootstrap 单位；None 读取配置。
+        - output_dir (str | Path | None): sensitivity 输出目录；None 使用 DO/global 默认目录。
+        - force (bool): 是否重建 depth-specific threshold 表和 matched cohort，默认 False。
+        - save_data (bool): 是否保存 combined summary parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个 depth/scope 一行的 occurrence、META、raw SCV 与 matched SCV 统计。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control_sensitivity/scv_depth_gate_sensitivity_<y0>_<y1>_depth<...>m_do<t>_space<d>km.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - 默认只扫 ΔDO50，因为当前 100/200 m 已有同 detector 的正式 anomaly parquet；不从较严格输出反推较宽阈值。
+        - 浅层异常更易受光合作用和表层过程影响。该 sweep 是 detector sensitivity，不自动把 100/200 m 升级为同等物理解释。
+        - META OR 比较 anomaly 与 non-anomaly DO-evaluable profiles；raw SCV OR 比较 SCV 与 non-catalogued profiles。
+    """
+    depth_values = sorted({float(value) for value in depth_gates_m})
+    if not depth_values or any(value < 0 for value in depth_values):
+        raise ValueError('depth_gates_m must contain non-negative values.')
+    threshold = float(do_threshold)
+    if threshold <= 0 or float(spatial_caliper_km) <= 0:
+        raise ValueError('do_threshold and spatial_caliper_km must be positive.')
+
+    region_slug = _current_region_key()
+    match_cfg = _scv_matched_control_config()
+    cluster_unit = str(
+        match_cfg['bootstrap_cluster_unit']
+        if bootstrap_cluster_unit is None else bootstrap_cluster_unit
+    )
+    matched_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    threshold_dir = make_detection_config('do').output_dir(
+        'mccoy_scv_delta_do_thresholds', region_slug
+    )
+    interacting_path = (
+        _shared_output_dir('statistics', region_slug)
+        / (
+            f'all_interacting_argo_{int(baseline_start_year)}_'
+            f'{int(baseline_end_year)}.parquet'
+        )
+    )
+    interacting_ids = set(
+        pd.to_numeric(
+            pd.read_parquet(
+                interacting_path, columns=['Profile_number']
+            )['Profile_number'],
+            errors='coerce',
+        ).dropna().astype(int)
+    )
+
+    combined_rows: list[pd.DataFrame] = []
+    threshold_tag = _format_detection_value(threshold)
+    for depth in depth_values:
+        depth_tag = _format_detection_value(depth)
+        eligibility_path = _argo_profile_eligibility_path(
+            matched_dir,
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=depth,
+            min_do_levels_below_gate=int(
+                match_cfg['min_do_levels_below_gate']
+            ),
+            min_ts_levels_below_gate=int(
+                match_cfg['min_ts_levels_below_gate']
+            ),
+        )
+        if eligibility_path.exists():
+            eligibility = pd.read_parquet(eligibility_path)
+        else:
+            eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(baseline_start_year),
+                baseline_end_year=int(baseline_end_year),
+                anomaly_min_depth=depth,
+                output_dir=matched_dir,
+                save_data=True,
+            )
+        eligibility_ids = pd.to_numeric(
+            eligibility['Profile_number'], errors='coerce'
+        ).astype('Int64')
+        evaluable_ids = set(
+            eligibility.loc[
+                eligibility['do_evaluable'].fillna(False).astype(bool)
+                & eligibility_ids.notna(),
+                'Profile_number',
+            ].astype(int)
+        )
+
+        threshold_path = threshold_dir / (
+            f'mccoy_scv_delta_do_thresholds_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_do{threshold_tag}.parquet'
+        )
+        threshold_table = build_mccoy_scv_delta_do_threshold_table(
+            thresholds=(threshold,),
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=depth,
+            profile_eligibility=eligibility,
+            profile_eligibility_path=eligibility_path,
+            force=bool(force),
+            save_data=bool(save_data),
+        )
+        anomaly_lookup, anomaly_paths = _do_threshold_anomaly_lookup(
+            [threshold],
+            start_year=int(baseline_start_year),
+            end_year=int(baseline_end_year),
+            anomaly_min_depth=depth,
+            region_slug=region_slug,
+        )
+        anomaly_ids = set(anomaly_lookup[threshold].index) & evaluable_ids
+        unexpected_anomaly_ids = set(
+            anomaly_lookup[threshold].index
+        ).difference(evaluable_ids)
+        if unexpected_anomaly_ids:
+            raise RuntimeError(
+                f'Depth {depth:g} m has {len(unexpected_anomaly_ids)} '
+                'anomaly profiles outside its DO-evaluable denominator.'
+            )
+        anomaly_path = anomaly_paths[threshold]
+        anomaly_table = pd.read_parquet(
+            anomaly_path,
+            columns=[
+                'Profile_number', 'Longitude', 'Latitude', 'delta_do',
+            ],
+        )
+        anomaly_table['Profile_number'] = pd.to_numeric(
+            anomaly_table['Profile_number'], errors='coerce'
+        ).astype('Int64')
+        anomaly_table['delta_do'] = pd.to_numeric(
+            anomaly_table['delta_do'], errors='coerce'
+        )
+        anomaly_table = anomaly_table[
+            anomaly_table['Profile_number'].notna()
+        ].copy()
+        anomaly_table['Profile_number'] = anomaly_table[
+            'Profile_number'
+        ].astype(int)
+        anomaly_table = anomaly_table[
+            anomaly_table['Profile_number'].isin(anomaly_ids)
+        ].copy()
+        best_index = anomaly_table.groupby(
+            'Profile_number'
+        )['delta_do'].idxmax().dropna()
+        anomaly_profiles = anomaly_table.loc[best_index].copy()
+        anomaly_lon = pd.to_numeric(
+            anomaly_profiles['Longitude'], errors='coerce'
+        )
+        anomaly_lat = pd.to_numeric(
+            anomaly_profiles['Latitude'], errors='coerce'
+        )
+        ke_mask = (
+            anomaly_lon.between(140.0, 170.0)
+            & anomaly_lat.between(25.0, 45.0)
+        )
+
+        anomaly_meta = len(anomaly_ids & interacting_ids)
+        non_anomaly_ids = evaluable_ids.difference(anomaly_ids)
+        non_anomaly_meta = len(non_anomaly_ids & interacting_ids)
+        (
+            meta_or,
+            meta_ci_low,
+            meta_ci_high,
+            meta_p,
+        ) = _conditional_exact_odds_ratio_ci(
+            anomaly_meta,
+            len(anomaly_ids),
+            non_anomaly_meta,
+            len(non_anomaly_ids),
+        )
+
+        scv_rows = threshold_table[
+            threshold_table['do_evaluable'].fillna(False).astype(bool)
+        ].copy()
+        scv_ids = set(
+            pd.to_numeric(
+                scv_rows['profile_number'], errors='coerce'
+            ).dropna().astype(int)
+        )
+        all_catalogued_ids = set(
+            pd.to_numeric(
+                threshold_table['profile_number'], errors='coerce'
+            ).dropna().astype(int)
+        )
+        scv_carriers = int(
+            scv_rows['has_delta_do'].fillna(False).astype(bool).sum()
+        )
+        ordinary_ids = evaluable_ids.difference(all_catalogued_ids)
+        ordinary_carriers = len(ordinary_ids & anomaly_ids)
+        (
+            raw_scv_or,
+            raw_scv_ci_low,
+            raw_scv_ci_high,
+            raw_scv_p,
+        ) = _conditional_exact_odds_ratio_ci(
+            scv_carriers,
+            len(scv_ids),
+            ordinary_carriers,
+            len(ordinary_ids),
+        )
+
+        cohort = build_scv_matched_control_cohort(
+            profile_eligibility=eligibility,
+            profile_eligibility_path=eligibility_path,
+            threshold_table=threshold_table,
+            threshold_table_path=threshold_path,
+            thresholds=(threshold,),
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=depth,
+            spatial_caliper_km=float(spatial_caliper_km),
+            force=bool(force),
+            save_data=bool(save_data),
+        )
+        matched = summarize_scv_matched_control_enrichment(
+            cohort=cohort,
+            thresholds=(threshold,),
+            scopes=scopes,
+            baseline_start_year=int(baseline_start_year),
+            baseline_end_year=int(baseline_end_year),
+            anomaly_min_depth=depth,
+            bootstrap_cluster_unit=cluster_unit,
+            save_data=bool(save_data),
+        )
+        anchors = cohort[
+            cohort['is_scv'].fillna(False).astype(bool)
+        ].drop_duplicates('match_set_id')
+        matched_anchor_count = int(
+            pd.to_numeric(
+                anchors['n_controls_matched'], errors='coerce'
+            ).fillna(0).gt(0).sum()
+        )
+        matched['depth_gate_m'] = depth
+        matched['do_threshold_umol_kg'] = threshold
+        matched['all_argo_numerator'] = int(len(anomaly_ids))
+        matched['all_argo_denominator'] = int(len(evaluable_ids))
+        matched['all_argo_occurrence_rate'] = (
+            float(len(anomaly_ids) / len(evaluable_ids))
+            if evaluable_ids else np.nan
+        )
+        matched['ke_anomaly_numerator'] = int(ke_mask.sum())
+        matched['ke_anomaly_fraction'] = (
+            float(ke_mask.mean()) if len(ke_mask) else np.nan
+        )
+        matched['anomaly_meta_numerator'] = int(anomaly_meta)
+        matched['anomaly_meta_membership_rate'] = (
+            float(anomaly_meta / len(anomaly_ids))
+            if anomaly_ids else np.nan
+        )
+        matched['evaluable_meta_numerator'] = int(
+            len(evaluable_ids & interacting_ids)
+        )
+        matched['evaluable_meta_membership_rate'] = (
+            float(len(evaluable_ids & interacting_ids) / len(evaluable_ids))
+            if evaluable_ids else np.nan
+        )
+        matched['meta_membership_or'] = meta_or
+        matched['meta_membership_ci_low'] = meta_ci_low
+        matched['meta_membership_ci_high'] = meta_ci_high
+        matched['meta_membership_fisher_p'] = meta_p
+        matched['scv_raw_numerator'] = int(scv_carriers)
+        matched['scv_raw_denominator'] = int(len(scv_ids))
+        matched['scv_raw_rate'] = (
+            float(scv_carriers / len(scv_ids)) if scv_ids else np.nan
+        )
+        matched['ordinary_argo_numerator'] = int(ordinary_carriers)
+        matched['ordinary_argo_denominator'] = int(len(ordinary_ids))
+        matched['ordinary_argo_rate'] = (
+            float(ordinary_carriers / len(ordinary_ids))
+            if ordinary_ids else np.nan
+        )
+        matched['scv_raw_or'] = raw_scv_or
+        matched['scv_raw_ci_low'] = raw_scv_ci_low
+        matched['scv_raw_ci_high'] = raw_scv_ci_high
+        matched['scv_raw_fisher_p'] = raw_scv_p
+        matched['n_anchor_candidates'] = int(len(anchors))
+        matched['n_matched_anchors'] = matched_anchor_count
+        matched['matched_anchor_retention'] = (
+            float(matched_anchor_count / len(anchors))
+            if len(anchors) else np.nan
+        )
+        matched['profile_eligibility_source'] = str(eligibility_path)
+        matched['threshold_table_source'] = str(threshold_path)
+        matched['anomaly_source'] = str(anomaly_path)
+        matched['interacting_argo_source'] = str(interacting_path)
+        combined_rows.append(matched)
+
+    combined = pd.concat(combined_rows, ignore_index=True)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else make_detection_config('do').output_dir(
+                'scv_matched_control_sensitivity', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        depth_tag = '-'.join(
+            _format_detection_value(value) for value in depth_values
+        )
+        stem = (
+            f'scv_depth_gate_sensitivity_'
+            f'{int(baseline_start_year)}_{int(baseline_end_year)}_'
+            f'depth{depth_tag}m_do{threshold_tag}_'
+            f'space{_format_detection_value(float(spatial_caliper_km))}km_'
+            f'boot{cluster_unit}'
+        )
+        _atomic_write_parquet(combined, out_dir / f'{stem}.parquet')
+        combined.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] SCV depth-gate sensitivity saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return combined
+
+
+def plot_scv_depth_gate_sensitivity(
+    summary: pd.DataFrame,
+    *,
+    scope: str = 'Global',
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制深度门槛对 occurrence、地理收紧、META 与 SCV enrichment 的影响。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_depth_gate_sensitivity` 输出。
+        - scope (str): matched SCV 面板使用的区域 scope，默认 `Global`。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含 plotted rows、scope 与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_matched_control_sensitivity/scv_depth_gate_sensitivity_<scope>.png`（save_fig 时）。
+
+    说明:
+        - occurrence 与 KE fraction 对每个 depth 只取一行；META 和 SCV OR 使用各自的 exact/bootstrap interval。
+        - 图用于 detector sensitivity。浅层结果即使统计稳健，也不排除光合作用或其他表层过程。
+    """
+    required = {
+        'scope', 'depth_gate_m', 'all_argo_numerator',
+        'all_argo_occurrence_rate', 'ke_anomaly_fraction',
+        'meta_membership_or', 'meta_membership_ci_low',
+        'meta_membership_ci_high', 'scv_raw_or', 'scv_raw_ci_low',
+        'scv_raw_ci_high', 'matched_mantel_haenszel_or',
+        'matched_bootstrap_ci_low', 'matched_bootstrap_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Depth-sensitivity summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary[summary['scope'].astype(str).eq(str(scope))].copy()
+    if plotted.empty:
+        raise ValueError(f'No depth-sensitivity rows for scope={scope}.')
+    plotted['depth_gate_m'] = pd.to_numeric(
+        plotted['depth_gate_m'], errors='coerce'
+    )
+    plotted = plotted.sort_values('depth_gate_m')
+    depth_rows = plotted.drop_duplicates('depth_gate_m')
+    depth = depth_rows['depth_gate_m'].to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.0, 10.0))
+    occurrence = (
+        pd.to_numeric(
+            depth_rows['all_argo_occurrence_rate'], errors='coerce'
+        ).to_numpy(dtype=float)
+        * 100.0
+    )
+    bars = axes[0, 0].bar(
+        depth,
+        occurrence,
+        width=max(np.min(np.diff(depth)) * 0.52, 20.0)
+        if len(depth) > 1 else 40.0,
+        color=_THRESHOLD_COLORS['DO50'],
+        alpha=0.9,
+    )
+    for bar, count in zip(
+        bars,
+        pd.to_numeric(
+            depth_rows['all_argo_numerator'], errors='coerce'
+        ).fillna(0).astype(int),
+    ):
+        axes[0, 0].annotate(
+            f'n={count:,}',
+            (bar.get_x() + bar.get_width() / 2.0, bar.get_height()),
+            xytext=(0, 5),
+            textcoords='offset points',
+            ha='center',
+            va='bottom',
+            fontsize=_PLOT_TYPOGRAPHY['annotation'],
+        )
+    axes[0, 0].set_ylabel('ΔDO50 occurrence (%)')
+    axes[0, 0].set_title('Global occurrence')
+
+    axes[0, 1].plot(
+        depth,
+        pd.to_numeric(
+            depth_rows['ke_anomaly_fraction'], errors='coerce'
+        ).to_numpy(dtype=float) * 100.0,
+        color=_THRESHOLD_COLORS['DO50'],
+        marker=_THRESHOLD_MARKERS['DO50'],
+        linewidth=2.2,
+        markersize=8,
+    )
+    axes[0, 1].set_ylabel('Anomaly profiles in KE (%)')
+    axes[0, 1].set_ylim(0.0, 100.0)
+    axes[0, 1].set_title('Geographic tightening')
+
+    meta_estimate = pd.to_numeric(
+        depth_rows['meta_membership_or'], errors='coerce'
+    ).to_numpy(dtype=float)
+    meta_low = pd.to_numeric(
+        depth_rows['meta_membership_ci_low'], errors='coerce'
+    ).to_numpy(dtype=float)
+    meta_high = pd.to_numeric(
+        depth_rows['meta_membership_ci_high'], errors='coerce'
+    ).to_numpy(dtype=float)
+    axes[1, 0].errorbar(
+        depth,
+        meta_estimate,
+        yerr=np.vstack([
+            meta_estimate - meta_low,
+            meta_high - meta_estimate,
+        ]),
+        color=_GROUP_COLORS['meta'],
+        marker='s',
+        linewidth=2.2,
+        markersize=8,
+        capsize=4,
+    )
+    axes[1, 0].axhline(
+        1.0, color='#4b5563', linestyle='--', linewidth=1.2
+    )
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].set_ylabel('META membership odds ratio')
+    axes[1, 0].set_title('Surface-catalogue association')
+
+    for prefix, label, color, marker, linestyle in (
+        ('scv_raw', 'Raw SCV vs non-catalogued Argo',
+         _GROUP_COLORS['baseline'], 'o', '--'),
+        ('matched', 'Environment-matched SCV',
+         _GROUP_COLORS['scv'], 'D', '-'),
+    ):
+        if prefix == 'matched':
+            estimate = pd.to_numeric(
+                depth_rows['matched_mantel_haenszel_or'], errors='coerce'
+            ).to_numpy(dtype=float)
+            low = pd.to_numeric(
+                depth_rows['matched_bootstrap_ci_low'], errors='coerce'
+            ).to_numpy(dtype=float)
+            high = pd.to_numeric(
+                depth_rows['matched_bootstrap_ci_high'], errors='coerce'
+            ).to_numpy(dtype=float)
+        else:
+            estimate = pd.to_numeric(
+                depth_rows[f'{prefix}_or'], errors='coerce'
+            ).to_numpy(dtype=float)
+            low = pd.to_numeric(
+                depth_rows[f'{prefix}_ci_low'], errors='coerce'
+            ).to_numpy(dtype=float)
+            high = pd.to_numeric(
+                depth_rows[f'{prefix}_ci_high'], errors='coerce'
+            ).to_numpy(dtype=float)
+        finite = (
+            np.isfinite(estimate) & (estimate > 0)
+            & np.isfinite(low) & (low > 0)
+            & np.isfinite(high) & (high >= estimate)
+            & (low <= estimate)
+        )
+        axes[1, 1].errorbar(
+            depth[finite],
+            estimate[finite],
+            yerr=np.vstack([
+                estimate[finite] - low[finite],
+                high[finite] - estimate[finite],
+            ]),
+            color=color,
+            marker=marker,
+            linestyle=linestyle,
+            linewidth=2.2,
+            markersize=8,
+            capsize=4,
+            label=label,
+        )
+    axes[1, 1].axhline(
+        1.0, color='#4b5563', linestyle='--', linewidth=1.2
+    )
+    axes[1, 1].set_yscale('log')
+    axes[1, 1].set_ylabel('SCV carrier odds ratio')
+    axes[1, 1].set_title(f'SCV enrichment: {scope}')
+    axes[1, 1].legend(frameon=False)
+
+    for ax in axes.flat:
+        ax.set_xlabel('Minimum anomaly depth (m)')
+        ax.set_xticks(depth)
+        ax.grid(axis='y', which='both', alpha=0.22)
+        _apply_axis_typography(ax)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir(
+            'scv_matched_control_sensitivity', region_slug
+        )
+    )
+    result = {'rows': plotted, 'scope': str(scope)}
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scope_tag = re.sub(
+            r'[^A-Za-z0-9]+', '_', str(scope)
+        ).strip('_').lower()
+        path = out_dir / f'scv_depth_gate_sensitivity_{scope_tag}.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] SCV depth-gate figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
 
 
 def _scv_standardization_scope_mask(
