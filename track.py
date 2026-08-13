@@ -30661,6 +30661,7 @@ def summarize_scv_matching_caliper_sensitivity(
     说明:
         - 该 sweep 只检验空间 caliper；年份、月份、EKE decile、垂向覆盖和 control 排除规则保持不变。
         - 不应按 OR 最大值选择 caliper；默认 750 km 仍是主分析，较窄 caliper 用于检查结论与样本保留的权衡。
+        - 内部 matched summaries 仅在内存中生成，避免用 sensitivity scopes 覆盖完整主分析 summary。
     """
     calipers = sorted({float(value) for value in spatial_calipers_km})
     threshold_values = sorted({float(value) for value in thresholds})
@@ -30744,7 +30745,7 @@ def summarize_scv_matching_caliper_sensitivity(
             baseline_end_year=int(baseline_end_year),
             anomaly_min_depth=float(anomaly_min_depth),
             bootstrap_cluster_unit=cluster_unit,
-            save_data=bool(save_data),
+            save_data=False,
         )
         anchors = cohort[
             cohort['is_scv'].fillna(False).astype(bool)
@@ -31103,6 +31104,7 @@ def summarize_scv_depth_gate_sensitivity(
         - 默认只扫 ΔDO50，因为当前 100/200 m 已有同 detector 的正式 anomaly parquet；不从较严格输出反推较宽阈值。
         - 浅层异常更易受光合作用和表层过程影响。该 sweep 是 detector sensitivity，不自动把 100/200 m 升级为同等物理解释。
         - META OR 比较 anomaly 与 non-anomaly DO-evaluable profiles；raw SCV OR 比较 SCV 与 non-catalogued profiles。
+        - 内部 matched summaries 仅在内存中生成，避免用 sensitivity scopes 覆盖完整主分析 summary。
     """
     depth_values = sorted({float(value) for value in depth_gates_m})
     if not depth_values or any(value < 0 for value in depth_values):
@@ -31310,7 +31312,7 @@ def summarize_scv_depth_gate_sensitivity(
             baseline_end_year=int(baseline_end_year),
             anomaly_min_depth=depth,
             bootstrap_cluster_unit=cluster_unit,
-            save_data=bool(save_data),
+            save_data=False,
         )
         anchors = cohort[
             cohort['is_scv'].fillna(False).astype(bool)
