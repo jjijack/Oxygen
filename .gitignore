@@ -22,3 +22,4 @@ GLORYS_processed/
 __pycache__/
 external/
 test/
+plot_outputs/

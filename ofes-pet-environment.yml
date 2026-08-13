@@ -1,0 +1,21 @@
+name: ofes-pet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.20
+  - pyeddytracker=3.6.1
+  - numpy=1.21.6
+  - scipy=1.11.2
+  - xarray=2023.7.0
+  - netcdf4=1.5.8
+  - pandas=2.0.3
+  - pyarrow=17.0.0
+  - matplotlib=3.8.4
+  - pyyaml=6.0.3
+
+# Verified on 2026-08-14 in /home/user3/.conda/envs/ofes-pet.
+# The environment was cloned from the previously verified PET runtime after
+# conda-forge/libmamba solving stalled.  h5py is intentionally absent: the
+# standalone PET runner does not import track.py or h5py.
+# The exact package list, module hashes, and executable paths are written into
+# each completed run manifest.

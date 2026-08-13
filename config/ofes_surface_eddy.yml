@@ -1,0 +1,57 @@
+# OFES NP30 surface eddy detector configuration.
+# Scientific parameters are frozen by ofes-surface-eddy-analysis-lock.md.
+version: 1
+
+input:
+  eta_root: ./data/OFES_NP30/eta
+  start_date: 2003-01-01
+  end_date: 2003-12-31
+  region:
+    lon_min: 140.0
+    lon_max: 170.0
+    lat_min: 25.0
+    lat_max: 45.0
+  raw_eta_units: cm
+  converted_eta_units: m
+
+filter:
+  implementation: pet_bessel_high
+  wavelength_km: 700.0
+  order: 1
+  lat_max: 85.0
+  extend: false
+
+detection:
+  contour_interval_m: 0.002
+  shape_error_pct: 70.0
+  minimum_amplitude_m: 0.004
+  pixel_limit_min: 5
+  pixel_limit_max: 2000
+  maximum_local_extrema: 1
+  nb_step_min: 2
+  nb_step_to_be_mle: 2
+  presampling_multiplier: 10
+  sampling: 50
+  sampling_method: visvalingam
+  stencil_halfwidth: 4
+  force_height_unit: m
+  force_speed_unit: m/s
+
+tracking:
+  polarity_separate: true
+  contour: effective
+  overlap_metric: intersection_over_union
+  minimum_overlap: 0.05
+  maximum_search_days: 5
+  maximum_consecutive_virtual: 4
+  minimum_duration_days: 1
+
+validation:
+  fixed_dates:
+    - 2003-01-15
+    - 2003-04-15
+    - 2003-07-15
+    - 2003-10-15
+
+output:
+  root: plot_outputs/do/ofes_np30_ke/surface_eddy

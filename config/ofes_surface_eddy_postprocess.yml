@@ -1,0 +1,18 @@
+# Event-level analysis controls.  These are deliberately separate from the
+# PET detection config so a post-processing change cannot alter the catalog
+# scientific signature.
+version: 1
+
+association:
+  ring_inner_km: 120.0
+  ring_outer_km: 240.0
+  bootstrap_replicates: 10000
+  random_seed: 20260814
+  expected_candidate_events: 59
+  expected_strict_events: 56
+  expected_rotation_events: 29
+  expected_quality_eligible_events: 161
+  representative_event_ids:
+    - OFES_DO50_E000002
+    - OFES_DO50_E000239
+    - OFES_DO50_E000176
