@@ -19,6 +19,21 @@ zonal spacing varies from approximately 3.36 km at 25 degrees N to 2.62 km at
 45 degrees N (approximately 3.04 km at 35 degrees N). Resolution differences
 and all adaptations below must be reported explicitly.
 
+One model year is sufficient for a daily object catalog, event association,
+background occupancy, and the observed-duration thresholds used here. It is
+not sufficient for an unbiased lifetime or generation-rate estimate. Zhu et
+al. reported 260 tracks observed for more than 30 days in one year, while also
+noting that many long-lived SCVs remained on the final output day and others
+left the nested domain. OFES track durations must therefore be treated as
+observed lower bounds when censored, rather than complete lifetimes.
+
+The two simulations are process analogues, not date-matched realizations.
+Zhu's nested ROMS run uses climatological surface and lateral forcing. The
+NP30 output used by Hosoda et al. is a free-running, JRA25-reanalysis-forced
+hindcast with no demonstrated ocean-state assimilation or event phase lock.
+Neither its 2003 dates nor Zhu track dates may be matched to observed SCVs;
+only methods and population properties may be compared.
+
 ## Frozen instantaneous detector
 
 1. Collocate the native B-grid `u` and `v` to tracer centers using the already
@@ -52,6 +67,16 @@ and all adaptations below must be reported explicitly.
     Northern Hemisphere anticyclones (`zeta < 0`); cyclones remain in the
     technical catalog and are reported separately.
 
+The 140.016-degree E delivered western edge lies immediately east of Zhu's
+Izu-Ogasawara Ridge generation site near 140 degrees E. The delivered OFES
+box therefore cannot support an unbiased analysis of that source region.
+Horizontal-edge-touching components remain rejected as incomplete closed
+objects. Tracks first seen within 0.5 degree of any delivered edge are marked
+`boundary_entry_censored` and must not be counted as locally generated;
+tracks last seen within 0.5 degree are marked `boundary_exit_censored`.
+Birth-site and formation-rate inference, especially at the western edge, is
+outside the primary analysis.
+
 The code must pass analytic solid-body/isolated-vortex tests and reject a pure
 shear field before any population association table is generated. The fixed
 2003-04-05 Hosoda date may be used as a positive integration test, but its
@@ -77,6 +102,13 @@ the final center spacing.
   result, but are excluded from complete-H and complete-Cz summaries; a
   sensitivity result excludes them from event containment as well.
 
+Spatial completeness is resolution limited. Zhu's cold-core mean radius of
+approximately 9 km corresponds to a diameter of only about 5-7 zonal and 4-6
+meridional OFES cells in this domain before the 0.1-degree boxcar is applied.
+The four-by-four resolved-shape gate will therefore preferentially miss the
+small end of the Zhu population. This is an a priori interpretation limit,
+not permission to relax the size or W gates after seeing the detection rate.
+
 ## Frozen daily tracking
 
 Track cyclones and anticyclones separately and compare consecutive days only.
@@ -95,6 +127,11 @@ days are not bridged. Identity and duration remain separate outputs:
 instantaneous object, tracked object, at least five consecutive days, and more
 than 30 consecutive days. Neither five nor 30 days is required for the primary
 instantaneous SCV identity.
+
+Each track also carries four independent censor flags: first model day, last
+model day, boundary entry, and boundary exit. Report observed duration and
+the proportions censored. Do not estimate a mean complete lifetime from this
+one-year, horizontally cropped delivery.
 
 ## Frozen event-to-SCV association
 
@@ -119,6 +156,19 @@ the result:
 
 Report all three metrics, their agreement, and bottom-truncation sensitivity.
 The headline prevalence and enrichment use `core_contained` only.
+
+Surface disconnection is a detector property, not proof of altimetric
+invisibility. Removal of objects whose OW mask reaches the shallowest level
+shows subsurface intensification, but it does not establish weak SSH, weak
+surface velocity, or META non-detection. Those require the separately planned
+surface-eddy comparison and cannot be inferred from the Zhu gate alone.
+
+Hydrographic sign is also separate from polarity. Both Zhu warm-core/spicy
+and cold-core/minty classes may be anticyclonic. For event and Zhu-to-McCoy
+tables, retain continuous core sigma0 and report the literature-anchored
+density strata 26.2-26.8, 26.8-27.0, and 27.0-27.3 kg m^-3, plus an outside-
+range category. Also stratify the McCoy bridge by its existing spicy/minty
+label. These are descriptive strata only and never SCV detection gates.
 
 ## Frozen background estimands
 
