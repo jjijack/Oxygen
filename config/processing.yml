@@ -1,4 +1,9 @@
 # 处理与算法参数配置
+# version 1.42 变更：
+#   - 冻结 OFES 全网格热盐/PV SCV 检测协议：25.60–27.50 kg m^-3 等密度面、
+#     McCoy seed→热盐透镜→原生速度确认三层目录、Nencioli a=3/b=2、
+#     141/141 prefilter recall、56 事件关联、全年追踪与双 null；运行签名
+#     序列化协议、源码 hash、密度节点映射与完整性/删失诊断。
 # version 1.41 变更：
 #   - 按 Zhu et al. (2024) 冻结规则新增 OFES 三维 OW 网格 SCV 检测、z-level
 #     对象/连续日追踪、365 天目录、56 事件关联与背景 null；阈值和网格适配
@@ -137,7 +142,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.41"
+version: "1.42"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -582,6 +587,38 @@ ofes:
     bootstrap_replicates: 10000
     random_seed: 20260729
     output_subdir: zhu_scv
+  grid_scv:
+    # Frozen by ofes-mccoy-grid-scv-analysis-lock.md; DO/event labels are excluded.
+    sigma0_min_kg_m3: 25.60
+    sigma0_max_kg_m3: 27.50
+    sigma0_step_kg_m3: 0.05
+    valid_depth_min_m: 100.0
+    valid_depth_max_m: 1000.0
+    shallowest_depth_min_m: 100.0
+    centroid_depth_min_m: 200.0
+    minimum_density_nodes: 3
+    lens_radius_min_km: 5.0
+    lens_radius_max_km: 50.0
+    lens_thickness_min_m: 100.0
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_min_columns: 61
+    mccoy_iqr_multiplier: 1.5
+    mccoy_source_archive_sha256: ee0abca349c4f090b3c99a695a88ee81df418fd3f756110d165f83b693b26406
+    nencioli_a_cells: 3
+    nencioli_b_cells: 2
+    circulation_sample_count: 64
+    circulation_min_finite_fraction: 0.80
+    velocity_adjacent_nodes_min: 2
+    prefilter_recall_required: 1.0
+    known_mccoy_positive_profile_count: 141
+    track_center_displacement_km: 55.66
+    track_relative_tolerance: 0.60
+    duration_threshold_days: [3, 5, 30]
+    boundary_censor_margin_deg: 0.5
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    output_subdir: grid_scv
 
 plot:
   basemap_colors:

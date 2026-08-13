@@ -33951,6 +33951,542 @@ def run_ofes_zhu_scv_catalog(
     }
 
 
+# -------------------- OFES 全网格热盐/PV SCV 检测 --------------------
+def _ofes_grid_scv_settings(overrides: dict | None = None) -> dict:
+    """解析并校验冻结的 OFES 全网格热盐/PV SCV 配置。"""
+    raw = dict(_OFES_CFG.get('grid_scv', {}) or {})
+    if overrides:
+        unknown = set(overrides) - set(raw)
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES grid-SCV override keys: {sorted(unknown)}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'sigma0_min_kg_m3': float(raw.get('sigma0_min_kg_m3', 25.60)),
+        'sigma0_max_kg_m3': float(raw.get('sigma0_max_kg_m3', 27.50)),
+        'sigma0_step_kg_m3': float(raw.get('sigma0_step_kg_m3', 0.05)),
+        'valid_depth_min_m': float(raw.get('valid_depth_min_m', 100.0)),
+        'valid_depth_max_m': float(raw.get('valid_depth_max_m', 1000.0)),
+        'shallowest_depth_min_m': float(raw.get('shallowest_depth_min_m', 100.0)),
+        'centroid_depth_min_m': float(raw.get('centroid_depth_min_m', 200.0)),
+        'minimum_density_nodes': int(raw.get('minimum_density_nodes', 3)),
+        'lens_radius_min_km': float(raw.get('lens_radius_min_km', 5.0)),
+        'lens_radius_max_km': float(raw.get('lens_radius_max_km', 50.0)),
+        'lens_thickness_min_m': float(raw.get('lens_thickness_min_m', 100.0)),
+        'background_inner_radius_km': float(raw.get('background_inner_radius_km', 120.0)),
+        'background_outer_radius_km': float(raw.get('background_outer_radius_km', 240.0)),
+        'background_min_columns': int(raw.get('background_min_columns', 61)),
+        'mccoy_iqr_multiplier': float(raw.get('mccoy_iqr_multiplier', 1.5)),
+        'mccoy_source_archive_sha256': str(raw.get('mccoy_source_archive_sha256', '')),
+        'nencioli_a_cells': int(raw.get('nencioli_a_cells', 3)),
+        'nencioli_b_cells': int(raw.get('nencioli_b_cells', 2)),
+        'circulation_sample_count': int(raw.get('circulation_sample_count', 64)),
+        'circulation_min_finite_fraction': float(raw.get('circulation_min_finite_fraction', 0.80)),
+        'velocity_adjacent_nodes_min': int(raw.get('velocity_adjacent_nodes_min', 2)),
+        'prefilter_recall_required': float(raw.get('prefilter_recall_required', 1.0)),
+        'known_mccoy_positive_profile_count': int(raw.get('known_mccoy_positive_profile_count', 141)),
+        'track_center_displacement_km': float(raw.get('track_center_displacement_km', 55.66)),
+        'track_relative_tolerance': float(raw.get('track_relative_tolerance', 0.60)),
+        'duration_threshold_days': [int(v) for v in raw.get('duration_threshold_days', [3, 5, 30])],
+        'boundary_censor_margin_deg': float(raw.get('boundary_censor_margin_deg', 0.5)),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'output_subdir': str(raw.get('output_subdir', 'grid_scv')),
+    }
+    if not np.isclose(
+        (settings['sigma0_max_kg_m3'] - settings['sigma0_min_kg_m3'])
+        / settings['sigma0_step_kg_m3'],
+        round(
+            (settings['sigma0_max_kg_m3'] - settings['sigma0_min_kg_m3'])
+            / settings['sigma0_step_kg_m3']
+        ),
+        rtol=0.0,
+        atol=1e-10,
+    ):
+        raise ValueError('OFES grid-SCV density range is not an integer grid.')
+    if (
+        settings['sigma0_min_kg_m3'] >= settings['sigma0_max_kg_m3']
+        or settings['sigma0_step_kg_m3'] <= 0
+        or settings['valid_depth_min_m'] < 0
+        or settings['valid_depth_min_m'] >= settings['valid_depth_max_m']
+        or settings['valid_depth_max_m'] <= 0
+        or settings['shallowest_depth_min_m'] < 0
+        or settings['centroid_depth_min_m'] < 0
+    ):
+        raise ValueError('OFES grid-SCV density/depth bounds are invalid.')
+    if (
+        settings['minimum_density_nodes'] < 3
+        or settings['lens_radius_min_km'] <= 0
+        or settings['lens_radius_min_km'] >= settings['lens_radius_max_km']
+        or settings['lens_radius_max_km'] <= 0
+        or settings['lens_thickness_min_m'] <= 0
+        or settings['background_inner_radius_km'] <= 0
+        or settings['background_outer_radius_km'] <= settings['background_inner_radius_km']
+        or settings['background_min_columns'] < 1
+        or settings['mccoy_iqr_multiplier'] <= 0
+    ):
+        raise ValueError('OFES grid-SCV lens/background bounds are invalid.')
+    if (
+        settings['nencioli_a_cells'] < 1
+        or settings['nencioli_b_cells'] < 1
+        or settings['circulation_sample_count'] < 8
+        or not 0 < settings['circulation_min_finite_fraction'] <= 1
+        or settings['velocity_adjacent_nodes_min'] < 2
+        or not np.isclose(settings['prefilter_recall_required'], 1.0)
+        or settings['known_mccoy_positive_profile_count'] != 141
+    ):
+        raise ValueError('OFES grid-SCV velocity/recall gates are not frozen.')
+    if (
+        settings['track_center_displacement_km'] <= 0
+        or not 0 < settings['track_relative_tolerance'] < 1
+        or len(settings['duration_threshold_days']) != 3
+        or settings['duration_threshold_days'] != sorted(set(settings['duration_threshold_days']))
+        or settings['bootstrap_replicates'] <= 0
+        or not settings['output_subdir'].strip()
+    ):
+        raise ValueError('OFES grid-SCV tracking/output settings are invalid.')
+    if settings['mccoy_source_archive_sha256'] != (
+        'ee0abca349c4f090b3c99a695a88ee81df418fd3f756110d165f83b693b26406'
+    ):
+        raise ValueError('The frozen McCoy source archive hash does not match.')
+    return settings
+
+
+def _ofes_grid_sigma0_nodes(settings: dict) -> np.ndarray:
+    """返回冻结的等密度节点。"""
+    count = int(round(
+        (settings['sigma0_max_kg_m3'] - settings['sigma0_min_kg_m3'])
+        / settings['sigma0_step_kg_m3']
+    ))
+    return (
+        settings['sigma0_min_kg_m3']
+        + settings['sigma0_step_kg_m3'] * np.arange(count + 1, dtype=float)
+    )
+
+
+def _ofes_grid_sigma0_cell_mapping(
+    target_sigma0: float,
+    settings: dict,
+) -> dict:
+    """将连续事件密度映射到冻结等密度节点的唯一半层单元。"""
+    nodes = _ofes_grid_sigma0_nodes(settings)
+    target = float(target_sigma0)
+    if not np.isfinite(target):
+        return {
+            'target_sigma0': target,
+            'mapped_sigma0': np.nan,
+            'sigma0_cell_lower': np.nan,
+            'sigma0_cell_upper': np.nan,
+            'sigma0_node_index': -1,
+            'sigma0_mapping_valid': False,
+            'sigma0_mapping_mismatch': np.nan,
+        }
+    edges = np.empty(nodes.size + 1, dtype=float)
+    edges[1:-1] = 0.5 * (nodes[:-1] + nodes[1:])
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    index = int(np.searchsorted(edges, target, side='right') - 1)
+    valid = 0 <= index < nodes.size
+    lower = edges[index] if valid else np.nan
+    upper = edges[index + 1] if valid else np.nan
+    mapped = nodes[index] if valid else np.nan
+    return {
+        'target_sigma0': target,
+        'mapped_sigma0': float(mapped),
+        'sigma0_cell_lower': float(lower),
+        'sigma0_cell_upper': float(upper),
+        'sigma0_node_index': index if valid else -1,
+        'sigma0_mapping_valid': bool(valid),
+        'sigma0_mapping_mismatch': float(mapped - target) if valid else np.nan,
+    }
+
+
+def _ofes_grid_density_interpolate(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    target_nodes: np.ndarray,
+    fields: dict[str, np.ndarray],
+    *,
+    valid_depth_min_m: float,
+    valid_depth_max_m: float,
+) -> dict:
+    """在唯一、无外推的密度交点上插值三维字段。"""
+    z = np.asarray(depth, dtype=float)
+    density = np.asarray(sigma0, dtype=float)
+    nodes = np.asarray(target_nodes, dtype=float)
+    if z.ndim != 1 or density.ndim != 3 or density.shape[0] != z.size:
+        raise ValueError('OFES density interpolation shape is invalid.')
+    if z.size < 2 or not np.all(np.diff(z) > 0):
+        raise ValueError('OFES density interpolation requires increasing depth.')
+    for name, field in fields.items():
+        if np.asarray(field).shape != density.shape:
+            raise ValueError(f'OFES field {name!r} does not match sigma0 shape.')
+    lower_density = density[:-1]
+    upper_density = density[1:]
+    denominator = upper_density - lower_density
+    node_count = nodes.size
+    shape = (node_count,) + density.shape[1:]
+    output = {
+        'depth': np.full(shape, np.nan, dtype=np.float32),
+        'crossing_count': np.zeros(shape, dtype=np.int16),
+        'unique_crossing': np.zeros(shape, dtype=bool),
+    }
+    for name in fields:
+        output[name] = np.full(shape, np.nan, dtype=np.float32)
+    for node_index, target in enumerate(nodes):
+        lower = lower_density - float(target)
+        upper = upper_density - float(target)
+        opposite_sign = (
+            ((lower < 0) & (upper > 0))
+            | ((lower > 0) & (upper < 0))
+        )
+        exact_lower = (lower == 0) & (upper != 0)
+        final_exact_upper = (
+            (upper == 0)
+            & (lower != 0)
+            & (np.arange(z.size - 1)[:, None, None] == z.size - 2)
+        )
+        crossing = (
+            np.isfinite(lower)
+            & np.isfinite(upper)
+            & np.isfinite(denominator)
+            & (denominator != 0)
+            & (opposite_sign | exact_lower | final_exact_upper)
+        )
+        count = np.count_nonzero(crossing, axis=0).astype(np.int16)
+        output['crossing_count'][node_index] = count
+        unique = count == 1
+        if not np.any(unique):
+            continue
+        pair_index = np.argmax(crossing, axis=0)
+        gather = pair_index[None, :, :]
+        fraction = np.full(pair_index.shape, np.nan, dtype=float)
+        selected_lower = np.take_along_axis(lower, gather, axis=0)[0]
+        selected_denominator = np.take_along_axis(denominator, gather, axis=0)[0]
+        fraction[unique] = -selected_lower[unique] / selected_denominator[unique]
+        crossing_depth = z[pair_index] + fraction * (z[pair_index + 1] - z[pair_index])
+        valid = unique & np.isfinite(crossing_depth)
+        valid &= crossing_depth >= float(valid_depth_min_m)
+        valid &= crossing_depth <= float(valid_depth_max_m)
+        output['unique_crossing'][node_index] = valid
+        output['depth'][node_index, valid] = crossing_depth[valid]
+        for name, field in fields.items():
+            values = np.asarray(field, dtype=float)
+            lower_values = np.take_along_axis(values[:-1], gather, axis=0)[0]
+            upper_values = np.take_along_axis(values[1:], gather, axis=0)[0]
+            interpolated = lower_values + fraction * (upper_values - lower_values)
+            field_valid = valid & np.isfinite(lower_values) & np.isfinite(upper_values)
+            output[name][node_index, field_valid] = interpolated[field_valid]
+    return output
+
+
+def _ofes_grid_n2_zlevel(
+    depth: np.ndarray,
+    salinity: np.ndarray,
+    potential_temperature: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """在 OFES z-level 上计算 TEOS-10 N2 并回填到层中心。"""
+    z = np.asarray(depth, dtype=float)
+    sal = np.asarray(salinity, dtype=float)
+    theta = np.asarray(potential_temperature, dtype=float)
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    expected = (z.size, lat_arr.size, lon_arr.size)
+    if sal.shape != expected or theta.shape != expected:
+        raise ValueError('OFES N2 fields must share the tracer grid.')
+    pressure = gsw.p_from_z(
+        -z[:, None, None],
+        lat_arr[None, :, None],
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        sal,
+        pressure,
+        lon_arr[None, None, :],
+        lat_arr[None, :, None],
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    n2_mid, _ = gsw.Nsquared(
+        absolute_salinity,
+        conservative_temperature,
+        pressure,
+        lat=lat_arr[None, :, None],
+    )
+    n2_mid = np.asarray(n2_mid, dtype=float)
+    n2 = np.full(expected, np.nan, dtype=float)
+    n2[0] = n2_mid[0]
+    n2[-1] = n2_mid[-1]
+    if z.size > 2:
+        n2[1:-1] = 0.5 * (n2_mid[:-1] + n2_mid[1:])
+    return n2
+
+
+def _ofes_grid_reference_pv_factor(
+    sigma0: np.ndarray,
+    depth: np.ndarray,
+    background_mask: np.ndarray,
+    target_nodes: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """从同日背景密度剖面得到 rescaled-PV 的参考层结因子。"""
+    density = np.asarray(sigma0, dtype=float)
+    z = np.asarray(depth, dtype=float)
+    mask = np.asarray(background_mask, dtype=bool)
+    if density.shape[1:] != mask.shape:
+        raise ValueError('OFES PV background mask shape mismatch.')
+    if np.count_nonzero(mask) < 2:
+        raise ValueError('OFES PV background requires at least two columns.')
+    background_profile = np.nanmedian(density[:, mask], axis=1)
+    finite = np.isfinite(background_profile)
+    if np.count_nonzero(finite) < 3:
+        raise ValueError('OFES PV background density profile is incomplete.')
+    ref_sigma = np.maximum.accumulate(background_profile[finite])
+    ref_depth = z[finite]
+    ref_sigma, unique = np.unique(ref_sigma, return_index=True)
+    ref_depth = ref_depth[unique]
+    if ref_sigma.size < 3 or np.any(np.diff(ref_sigma) <= 0):
+        raise ValueError('OFES PV reference density profile is not invertible.')
+    nodes = np.asarray(target_nodes, dtype=float)
+    valid_nodes = (nodes >= ref_sigma[0]) & (nodes <= ref_sigma[-1])
+    z_reference = np.full(nodes.shape, np.nan, dtype=float)
+    z_reference[valid_nodes] = np.interp(nodes[valid_nodes], ref_sigma, ref_depth)
+    dz_dsigma = np.full(nodes.shape, np.nan, dtype=float)
+    finite_nodes = np.isfinite(z_reference)
+    if np.count_nonzero(finite_nodes) >= 2:
+        dz_dsigma[finite_nodes] = np.gradient(
+            z_reference[finite_nodes], nodes[finite_nodes]
+        )
+    return z_reference, dz_dsigma
+
+
+def _ofes_grid_isopycnal_fields(
+    snapshot: dict,
+    settings: dict,
+    *,
+    background_mask: np.ndarray | None = None,
+) -> dict:
+    """计算单日 OFES 等密度面热盐、N2 和相对重标度 PV 场。"""
+    required = ('temp', 'salinity', 'u', 'v', 'lon', 'lat', 'depth')
+    missing = [key for key in required if key not in snapshot]
+    if missing:
+        raise KeyError(f'OFES grid-SCV snapshot is missing {missing}.')
+    settings = _ofes_grid_scv_settings(settings)
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    salinity = np.asarray(snapshot['salinity'], dtype=float)
+    theta = np.asarray(snapshot['temp'], dtype=float)
+    expected = (depth.size, lat.size, lon.size)
+    if salinity.shape != expected or theta.shape != expected:
+        raise ValueError('OFES grid-SCV temperature/salinity shapes mismatch.')
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    pressure = gsw.p_from_z(
+        -depth[:, None, None], lat[None, :, None]
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        pressure,
+        lon[None, None, :],
+        lat[None, :, None],
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    spiciness = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    n2_z = _ofes_grid_n2_zlevel(
+        depth, salinity, theta, lon, lat
+    )
+    metric = _ofes_zhu_metric_fields(
+        np.asarray(snapshot['u'], dtype=float),
+        np.asarray(snapshot['v'], dtype=float),
+        lat,
+        lon,
+    )
+    if background_mask is None:
+        background_mask = np.all(
+            np.isfinite(sigma0), axis=0
+        )
+    background_mask = np.asarray(background_mask, dtype=bool)
+    if background_mask.shape != (lat.size, lon.size):
+        raise ValueError('OFES grid-SCV background mask shape mismatch.')
+    if np.count_nonzero(background_mask) < settings['background_min_columns']:
+        raise ValueError(
+            'OFES grid-SCV background annulus has fewer than the frozen '
+            f"{settings['background_min_columns']} valid columns."
+        )
+    nodes = _ofes_grid_sigma0_nodes(settings)
+    fields = {
+        'spiciness': spiciness,
+        'n2': n2_z,
+        'zeta': metric['zeta_s_1'],
+        'u': np.asarray(snapshot['u'], dtype=float),
+        'v': np.asarray(snapshot['v'], dtype=float),
+    }
+    mapped = _ofes_grid_density_interpolate(
+        depth,
+        sigma0,
+        nodes,
+        fields,
+        valid_depth_min_m=settings['valid_depth_min_m'],
+        valid_depth_max_m=settings['valid_depth_max_m'],
+    )
+    z_reference, dz_dsigma = _ofes_grid_reference_pv_factor(
+        sigma0, depth, background_mask, nodes
+    )
+    dsigma_dz = np.gradient(sigma0, depth, axis=0)
+    gradient_mapped = _ofes_grid_density_interpolate(
+        depth,
+        sigma0,
+        nodes,
+        {'dsigma_dz': dsigma_dz},
+        valid_depth_min_m=settings['valid_depth_min_m'],
+        valid_depth_max_m=settings['valid_depth_max_m'],
+    )
+    coriolis = np.asarray(gsw.f(lat), dtype=float)[None, :, None]
+    pv = (
+        mapped['zeta'] + coriolis
+    ) * dz_dsigma[:, None, None] * gradient_mapped['dsigma_dz']
+    pv[~mapped['unique_crossing']] = np.nan
+    background = {}
+    anomalies = {}
+    for name in ('spiciness', 'n2', 'zeta', 'pv'):
+        values = pv if name == 'pv' else mapped[name]
+        background[name] = np.full(nodes.shape, np.nan, dtype=float)
+        for index in range(nodes.size):
+            sample = values[index][background_mask]
+            background[name][index] = (
+                float(np.nanmedian(sample))
+                if np.any(np.isfinite(sample)) else np.nan
+            )
+        anomalies[name] = values - background[name][:, None, None]
+    return {
+        'nodes_sigma0': nodes,
+        'depth': mapped['depth'],
+        'crossing_count': mapped['crossing_count'],
+        'unique_crossing': mapped['unique_crossing'],
+        'sigma0': sigma0,
+        'spiciness': mapped['spiciness'],
+        'n2': mapped['n2'],
+        'zeta': mapped['zeta'],
+        'u': mapped['u'],
+        'v': mapped['v'],
+        'pv': pv.astype(np.float32),
+        'background': background,
+        'anomalies': anomalies,
+        'background_mask': background_mask,
+        'z_reference_m': z_reference,
+        'dz_reference_dsigma': dz_dsigma,
+        'metadata': {
+            'density_nodes_count': int(nodes.size),
+            'density_min_kg_m3': float(nodes[0]),
+            'density_max_kg_m3': float(nodes[-1]),
+            'valid_depth_min_m': float(settings['valid_depth_min_m']),
+            'valid_depth_max_m': float(settings['valid_depth_max_m']),
+            'background_column_count': int(np.count_nonzero(background_mask)),
+            'pv_definition': 'rescaled isopycnal PV = (f+zeta) * dz_reference/dsigma * dsigma/dz',
+        },
+    }
+
+
+def validate_ofes_grid_scv_detector(
+    *,
+    output_path: str | Path | None = None,
+    raise_on_failure: bool = True,
+) -> dict:
+    """运行全网格 SCV 底层等密度/PV 的解析验证。
+
+    该入口只构造合成密度剖面，检查唯一交点、严格 100--1000 m 深度门和
+    连续 target-sigma0 的固定半层映射；它不读取 OFES 事件或年度结果，也不
+    授权改变已冻结的检测规则。
+
+    参数:
+        - output_path (str | Path | None): 可选 JSON 验证结果路径。
+        - raise_on_failure (bool): 验证失败时是否抛出异常，默认 True。
+
+    返回:
+        - dict: 含验证状态、各测试结果、密度节点和冻结配置。
+
+    输出:
+        - `output_path` 非空时写入 JSON 验证结果。
+    """
+    settings = _ofes_grid_scv_settings()
+    nodes = _ofes_grid_sigma0_nodes(settings)
+    depth = np.array([0.0, 100.0, 300.0, 600.0, 1000.0, 1200.0])
+    lat = np.linspace(33.0, 37.0, 9)
+    lon = np.linspace(146.0, 150.0, 9)
+    target = np.broadcast_to(
+        25.4 + 0.002 * depth[:, None, None],
+        (depth.size, lat.size, lon.size),
+    ).copy()
+    # A synthetic monotonic density field is used only for interpolation/PV
+    # engineering tests; no event association is read in this preflight.
+    sigma = target.copy()
+    field = np.broadcast_to(depth[:, None, None], sigma.shape).copy()
+    mapped = _ofes_grid_density_interpolate(
+        depth, sigma, nodes, {'depth_copy': field},
+        valid_depth_min_m=settings['valid_depth_min_m'],
+        valid_depth_max_m=settings['valid_depth_max_m'],
+    )
+    expected_nodes = nodes[(nodes >= 25.6) & (nodes <= 26.6)]
+    finite = mapped['unique_crossing'][
+        (nodes >= 25.6) & (nodes <= 26.6)
+    ]
+    interpolation_passed = bool(
+        np.all(finite)
+        and np.nanmax(np.abs(
+            mapped['depth'][
+                (nodes >= 25.6) & (nodes <= 26.6)
+            ]
+            - ((expected_nodes - 25.4) / 0.002)[:, None, None]
+        )) < 1e-8
+    )
+    mapping = _ofes_grid_sigma0_cell_mapping(25.6394061386, settings)
+    mapping_passed = bool(
+        mapping['sigma0_mapping_valid']
+        and np.isclose(mapping['mapped_sigma0'], 25.65)
+        and np.isclose(mapping['sigma0_cell_lower'], 25.625)
+        and np.isclose(mapping['sigma0_cell_upper'], 25.675)
+    )
+    stationary_passed = bool(
+        np.all(np.isfinite(mapped['depth'][
+            (nodes >= 25.6) & (nodes <= 26.6)
+        ]))
+        and np.all(mapped['crossing_count'] == 1)
+    )
+    result = {
+        'status': 'complete',
+        'passed': bool(interpolation_passed and mapping_passed and stationary_passed),
+        'tests': {
+            'unique_density_interpolation': {
+                'passed': interpolation_passed,
+                'finite_expected_node_count': int(np.count_nonzero(finite)),
+            },
+            'target_sigma0_voronoi_mapping': {
+                'passed': mapping_passed,
+                **mapping,
+            },
+            'crossing_count_invariant': {
+                'passed': stationary_passed,
+                'max_crossing_count': int(np.max(mapped['crossing_count'])),
+            },
+        },
+        'settings': settings,
+        'density_nodes': nodes.tolist(),
+        'protocol': 'ofes-mccoy-grid-scv-analysis-lock.md',
+    }
+    if output_path is not None:
+        _ofes_atomic_write_json(result, Path(output_path))
+    if raise_on_failure and not result['passed']:
+        raise RuntimeError(f'OFES grid-SCV detector validation failed: {result}')
+    return result
+
+
 def export_ofes_zhu_catalog_views(
     zhu_run_dir: str | Path,
 ) -> dict:
