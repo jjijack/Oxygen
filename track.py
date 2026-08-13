@@ -35442,7 +35442,36 @@ def _ofes_grid_track_objects(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """按冻结 consecutive-day 几何门连接全域 grid-SCV 对象。"""
     if daily_objects.empty:
-        return daily_objects.copy(), pd.DataFrame(columns=['track_id', 'observed_days'])
+        frame = daily_objects.copy()
+        # Keep a stable, bridge-readable schema even when the annual catalog
+        # contains no identity-eligible object-days.  An empty result is a
+        # valid scientific outcome, not a reason to make downstream auditing
+        # depend on whatever columns happened to be emitted by the last day.
+        empty_columns = {
+            'object_id': str,
+            'date': 'datetime64[ns]',
+            'eligible_identity': bool,
+            'velocity_confirmed': bool,
+            'volume_m3': float,
+            'center_lon': float,
+            'center_lat': float,
+            'centroid_depth_m': float,
+            'radius_km': float,
+            'spice_sign': str,
+            'track_id': str,
+        }
+        for column, dtype in empty_columns.items():
+            if column not in frame.columns:
+                frame[column] = pd.Series(dtype=dtype)
+        track_columns = [
+            'track_id', 'spice_sign', 'start_date', 'end_date',
+            'observed_days', 'duration_days', 'boundary_entry_censored',
+            'boundary_exit_censored', 'first_model_day_censored',
+            'last_model_day_censored', 'observed_duration_is_lower_bound',
+            'min_depth_m', 'max_depth_m', 'mean_centroid_depth_m',
+            'mean_radius_km', 'mean_thickness_m',
+        ]
+        return frame, pd.DataFrame(columns=track_columns)
     frame = daily_objects.copy()
     frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
     frame = frame.loc[frame['eligible_identity'].astype(bool)].copy()
@@ -35862,6 +35891,13 @@ def run_ofes_grid_scv_mccoy_bridge(
         'track_id', 'object_id', 'date', 'eligible_identity', 'volume_m3',
         'center_lon', 'center_lat', 'centroid_depth_m', 'radius_km', 'spice_sign',
     }
+    # The annual runner preserves these columns for an empty catalog.  Keep a
+    # defensive fallback here as well so a legacy empty run can still produce
+    # a complete, explicitly empty bridge audit.
+    if daily.empty:
+        for column in required_daily - set(daily.columns):
+            dtype = 'datetime64[ns]' if column == 'date' else object
+            daily[column] = pd.Series(dtype=dtype)
     missing = sorted(required_daily - set(daily.columns))
     if missing:
         raise KeyError(f'Annual grid-SCV daily objects are missing columns: {missing}')
