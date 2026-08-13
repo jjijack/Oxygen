@@ -32159,6 +32159,175 @@ def plot_scv_spatial_standardization(
     return output
 
 
+def plot_scv_spatial_standardization_scopes(
+    summary: pd.DataFrame,
+    *,
+    scopes: tuple[str, ...] | list[str] = (
+        'Global', 'KE', 'Global excluding KE',
+    ),
+    output_dir: str | Path | None = None,
+    log_scale: bool = True,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """并列绘制 global、KE 与 leave-KE-out 的空间标准化敏感性。
+
+    每个面板在相同网格尺度扫描下比较 ΔDO20/35/50 的 observed/expected ratio，
+    用于区分全球富集、KE 内富集和排除 KE 后的剩余证据。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_spatial_standardization` 输出。
+        - scopes (tuple[str, ...] | list[str]): 要并列绘制的区域 scope。
+        - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
+        - log_scale (bool): 是否使用对数纵轴，默认 True。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含 plotted rows、scope 顺序与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/do/<region>/scv_spatial_standardization/scv_spatial_standardization_scope_comparison.png`（save_fig 时）。
+
+    说明:
+        - 所有面板共享纵轴；横向虚线 O/E=1 表示按该 scope 内 SCV 地理分布加权后的背景期望。
+        - fixed-background Poisson interval 只作描述性 sensitivity，主推断仍来自 matched-control bootstrap。
+    """
+    required = {
+        'threshold_umol_kg', 'scope', 'grid_size_deg', 'n_scv',
+        'observed_expected_ratio', 'fixed_background_ratio_ci_low',
+        'fixed_background_ratio_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Spatial-standardization summary missing columns: '
+            f'{sorted(missing)}'
+        )
+    scope_order = tuple(dict.fromkeys(str(scope) for scope in scopes))
+    if not scope_order:
+        raise ValueError('scopes must not be empty.')
+    plotted = summary[
+        summary['scope'].astype(str).isin(scope_order)
+    ].copy()
+    missing_scopes = [
+        scope for scope in scope_order
+        if not plotted['scope'].astype(str).eq(scope).any()
+    ]
+    if missing_scopes:
+        raise ValueError(
+            f'No spatial-standardization rows for scopes: {missing_scopes}'
+        )
+
+    fig, axes = plt.subplots(
+        1,
+        len(scope_order),
+        figsize=(5.4 * len(scope_order), 5.8),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    axes = axes.ravel()
+    thresholds = sorted(
+        pd.to_numeric(
+            plotted['threshold_umol_kg'], errors='coerce'
+        ).dropna().unique()
+    )
+    for axis, scope in zip(axes, scope_order):
+        scoped = plotted[
+            plotted['scope'].astype(str).eq(scope)
+        ].copy()
+        for threshold in thresholds:
+            part = scoped[
+                pd.to_numeric(
+                    scoped['threshold_umol_kg'], errors='coerce'
+                ).eq(float(threshold))
+            ].sort_values('grid_size_deg')
+            if part.empty:
+                continue
+            _, display, color, marker = _threshold_style(float(threshold))
+            estimate = pd.to_numeric(
+                part['observed_expected_ratio'], errors='coerce'
+            ).to_numpy(dtype=float)
+            low = pd.to_numeric(
+                part['fixed_background_ratio_ci_low'], errors='coerce'
+            ).to_numpy(dtype=float)
+            high = pd.to_numeric(
+                part['fixed_background_ratio_ci_high'], errors='coerce'
+            ).to_numpy(dtype=float)
+            finite = (
+                np.isfinite(estimate)
+                & np.isfinite(low)
+                & np.isfinite(high)
+            )
+            axis.errorbar(
+                pd.to_numeric(
+                    part.loc[finite, 'grid_size_deg'], errors='coerce'
+                ),
+                estimate[finite],
+                yerr=np.vstack([
+                    estimate[finite] - low[finite],
+                    high[finite] - estimate[finite],
+                ]),
+                marker=marker,
+                color=color,
+                linewidth=2.2,
+                markersize=8,
+                capsize=4,
+                label=display,
+            )
+        n_values = pd.to_numeric(
+            scoped['n_scv'], errors='coerce'
+        ).dropna().unique()
+        n_label = (
+            f' (n={int(n_values[0])})' if len(n_values) == 1 else ''
+        )
+        axis.set_title(f'{scope}{n_label}')
+        axis.set_xlabel('Spatial-stratum grid size (degrees)')
+        axis.axhline(
+            1.0, color='#4b5563', linestyle='--', linewidth=1.3
+        )
+        axis.grid(
+            axis='y', which='both',
+            color='#d1d5db', linewidth=0.7, alpha=0.65,
+        )
+        _apply_axis_typography(axis)
+    axes[0].set_ylabel('Observed / spatially expected')
+    axes[0].legend(frameon=False, loc='upper left')
+    if log_scale:
+        axes[0].set_yscale('log')
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else make_detection_config('do').output_dir(
+            'scv_spatial_standardization', region_slug
+        )
+    )
+    output = {
+        'rows': plotted,
+        'scopes': scope_order,
+    }
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / (
+            'scv_spatial_standardization_scope_comparison'
+            f'{"_log" if log_scale else ""}.png'
+        )
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        output['figure_path'] = str(path)
+        print(
+            f'[*] SCV spatial-standardization scope figure saved: {path}'
+        )
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return output
+
+
 def _detector_short_label(cfg: DetectionConfig) -> str:
     """返回图标题里使用的 detector 标签。"""
     return {'do': 'ΔDO', 'aou': 'AOU', 'trim': 'TRIM'}.get(cfg.method, cfg.method.upper())
@@ -32195,43 +32364,75 @@ def _detector_evaluable_profile_ids(
     end_year: int,
     *,
     argo_data_dir: str | Path | None = None,
+    profile_eligibility: pd.DataFrame | None = None,
+    profile_eligibility_path: str | Path | None = None,
 ) -> set[int]:
     """返回当前区域内指定 detector 可评估的 Argo profile 编号集合。"""
-    if argo_data_dir is None:
-        argo_data_dir = argo_path
-    min_depth = float(cfg.anomaly_min_depth or 0.0)
-    ids: set[int] = set()
-    for year in range(int(start_year), int(end_year) + 1):
-        try:
-            df = load_argo_data(year, data_dir=argo_data_dir)
-        except Exception:
-            continue
-        if df.empty or 'Profile_number' not in df.columns or 'Depth' not in df.columns:
-            continue
-        lon = pd.to_numeric(df['Longitude'], errors='coerce').to_numpy(dtype=float)
-        lat = pd.to_numeric(df['Latitude'], errors='coerce').to_numpy(dtype=float)
-        geo = _region_lon_mask(lon, lonmin, lonmax) & (lat >= latmin) & (lat <= latmax)
-        depth_ok = pd.to_numeric(df['Depth'], errors='coerce').ge(min_depth)
-        if cfg.method == 'do':
-            var_ok = pd.to_numeric(df.get('DO'), errors='coerce').notna()
-        else:
-            if 'AOU' in df.columns:
-                aou_ok = pd.to_numeric(df['AOU'], errors='coerce').notna()
-            else:
-                aou_ok = (
-                    pd.to_numeric(df.get('DO'), errors='coerce').notna()
-                    & pd.to_numeric(df.get('Temperature'), errors='coerce').notna()
-                    & pd.to_numeric(df.get('Salinity'), errors='coerce').notna()
-                )
-            var_ok = (
-                aou_ok
-                & pd.to_numeric(df.get('Temperature'), errors='coerce').notna()
-                & pd.to_numeric(df.get('Salinity'), errors='coerce').notna()
+    depth = float(cfg.anomaly_min_depth or 0.0)
+    region_slug = _current_region_key()
+    match_cfg = _scv_matched_control_config()
+    eligibility_dir = make_detection_config('do').output_dir(
+        'scv_matched_control', region_slug
+    )
+    if profile_eligibility is None:
+        if profile_eligibility_path is None:
+            profile_eligibility_path = _argo_profile_eligibility_path(
+                eligibility_dir,
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=depth,
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
             )
-        keep = df[geo & depth_ok & var_ok]
-        if not keep.empty:
-            ids |= set(pd.to_numeric(keep['Profile_number'], errors='coerce').dropna().astype(int))
-    return ids
+        eligibility_path = Path(profile_eligibility_path)
+        if eligibility_path.exists():
+            profile_eligibility = pd.read_parquet(eligibility_path)
+        else:
+            profile_eligibility = build_argo_profile_eligibility_table(
+                baseline_start_year=int(start_year),
+                baseline_end_year=int(end_year),
+                anomaly_min_depth=depth,
+                argo_data_dir=argo_data_dir,
+                output_dir=eligibility_dir,
+                save_data=True,
+            )
+    else:
+        profile_eligibility = profile_eligibility.copy()
+    required = {
+        'Profile_number', 'do_evaluable', 'ts_evaluable_proxy',
+        'minimum_depth_m',
+    }
+    missing = required.difference(profile_eligibility.columns)
+    if missing:
+        raise ValueError(
+            f'Profile eligibility missing columns: {sorted(missing)}'
+        )
+    depth_values = pd.to_numeric(
+        profile_eligibility['minimum_depth_m'], errors='coerce'
+    ).dropna().unique()
+    if (
+        len(depth_values) != 1
+        or not np.isclose(float(depth_values[0]), depth)
+    ):
+        raise ValueError(
+            f'Eligibility depth {depth_values} does not match '
+            f'{depth:g} m.'
+        )
+    evaluable = profile_eligibility[
+        'do_evaluable'
+    ].fillna(False).astype(bool)
+    if cfg.method in {'aou', 'trim'}:
+        evaluable &= profile_eligibility[
+            'ts_evaluable_proxy'
+        ].fillna(False).astype(bool)
+    profile_ids = pd.to_numeric(
+        profile_eligibility['Profile_number'], errors='coerce'
+    ).astype('Int64')
+    return set(profile_ids.loc[evaluable & profile_ids.notna()].astype(int))
 
 
 def _mccoy_detector_carrier_frame(
@@ -32249,43 +32450,14 @@ def _mccoy_detector_carrier_frame(
     profile_ids = pd.to_numeric(anc['profile_number'], errors='coerce').astype('Int64')
     anc['profile_number'] = profile_ids
     anomaly_ids, anomalies_path = _load_detector_anomaly_ids(cfg, start_year, end_year, region_slug)
-    if cfg.method == 'do':
-        depth_tag = _format_detection_value(float(cfg.anomaly_min_depth))
-        threshold_path = (
-            make_detection_config('do').output_dir('mccoy_scv_delta_do_thresholds', region_slug)
-            / f'mccoy_scv_delta_do_thresholds_{int(start_year)}_{int(end_year)}_depth{depth_tag}m.parquet'
+    if evaluable_ids is None:
+        evaluable_ids = _detector_evaluable_profile_ids(
+            cfg, start_year, end_year
         )
-        if not threshold_path.exists():
-            build_mccoy_scv_delta_do_threshold_table(
-                thresholds=(20.0, 35.0, 50.0),
-                baseline_start_year=int(start_year),
-                baseline_end_year=int(end_year),
-                anomaly_min_depth=float(cfg.anomaly_min_depth),
-                argo_anchored_path=anc_path,
-                save_data=True,
-            )
-        threshold_table = pd.read_parquet(threshold_path)
-        selected = threshold_table[
-            np.isclose(
-                pd.to_numeric(threshold_table['threshold_umol_kg'], errors='coerce'),
-                float(cfg.do_threshold),
-            )
-        ][['profile_number', 'do_evaluable', 'has_delta_do']].copy()
-        if selected.empty:
-            raise ValueError(f'Threshold-safe McCoy table lacks DO{float(cfg.do_threshold):g}.')
-        selected['profile_number'] = pd.to_numeric(selected['profile_number'], errors='coerce').astype('Int64')
-        selected = selected.rename(columns={
-            'do_evaluable': 'detector_evaluable',
-            'has_delta_do': 'has_detector_anomaly',
-        })
-        anc = anc.merge(selected, on='profile_number', how='left', validate='one_to_one')
-        anc['detector_evaluable'] = anc['detector_evaluable'].fillna(False).astype(bool)
-        anc['has_detector_anomaly'] = anc['has_detector_anomaly'].astype('boolean').fillna(False).astype(bool)
-    else:
-        if evaluable_ids is None:
-            evaluable_ids = _detector_evaluable_profile_ids(cfg, start_year, end_year)
-        anc['detector_evaluable'] = profile_ids.isin(evaluable_ids)
-        anc['has_detector_anomaly'] = profile_ids.isin(anomaly_ids) & anc['detector_evaluable']
+    anc['detector_evaluable'] = profile_ids.isin(evaluable_ids)
+    anc['has_detector_anomaly'] = (
+        profile_ids.isin(anomaly_ids) & anc['detector_evaluable']
+    )
     return anc, anc_path, anomalies_path
 
 
@@ -32868,6 +33040,457 @@ def run_scv_detector_comparison(
     print(f"[*] SCV detector comparison summary saved: {root / f'{stem}.parquet'}")
     print(f"[*] SCV detector comparison summary saved: {root / f'{stem}.csv'}")
     return summary
+
+
+def summarize_scv_cross_detector_enrichment(
+    detector_configs: list[DetectionConfig] | tuple[DetectionConfig, ...] | None = None,
+    *,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    argo_anchored_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """汇总 McCoy SCV 在 ΔDO、AOU 与 TRIM detector 下的异常携带率富集。
+
+    每个 detector 使用自身可评估分母；AOU/TRIM 要求 depth gate 以下同时具备 DO、温度和盐度，
+    ΔDO 只要求有效 DO。背景组排除 McCoy 目录中的 profile，避免 SCV 同时进入对照分母。
+    SCV 与 ordinary-Argo 的 OR 使用 Fisher 条件精确估计和 95% CI。
+
+    参数:
+        - detector_configs (list[DetectionConfig] | tuple[DetectionConfig, ...] | None): detector 配置；None 使用 ΔDO50、默认 AOU 和默认 TRIM。
+        - baseline_start_year (int): 分析起始年份，默认 2002。
+        - baseline_end_year (int): 分析结束年份，默认 2023。
+        - argo_anchored_path (str | Path | None): Argo 锚定 McCoy parquet；None 使用默认路径。
+        - output_dir (str | Path | None): 输出目录；None 使用 shared SCV detector robustness 目录。
+        - save_data (bool): 是否保存 parquet 与 CSV，默认 True。
+
+    返回:
+        - pd.DataFrame: 每行一个 detector，含 ordinary-Argo / SCV carrier rate、Wilson CI 和 exact OR。
+
+    输出:
+        - `plot_outputs/shared/<region>/scv_detector_robustness/scv_cross_detector_enrichment_<y0>_<y1>.parquet`（save_data 时）。
+        - 同名 CSV（save_data 时）。
+
+    说明:
+        - 这是 detector-independence sensitivity，不把 AOU/TRIM 解释成 ΔDO 的阈值档位。
+        - 不同 detector 的分母规模可不同，因此图和表始终同时报告 k/n。
+    """
+    from scipy.stats import binomtest
+
+    if detector_configs is None:
+        detector_configs = [
+            make_detection_config(
+                'do', do_threshold=50.0, anomaly_min_depth=300.0
+            ),
+            make_detection_config('aou', anomaly_min_depth=300.0),
+            make_detection_config('trim', anomaly_min_depth=300.0),
+        ]
+    configs = [
+        _resolve_detection_config(cfg) for cfg in detector_configs
+    ]
+    if not configs:
+        raise ValueError('detector_configs must not be empty.')
+    run_tags = [cfg.file_stem() for cfg in configs]
+    if len(run_tags) != len(set(run_tags)):
+        raise ValueError('detector_configs contain duplicate file stems.')
+    if int(baseline_end_year) < int(baseline_start_year):
+        raise ValueError(
+            'baseline_end_year must be >= baseline_start_year.'
+        )
+
+    region_slug = _current_region_key()
+    y0, y1 = int(baseline_start_year), int(baseline_end_year)
+    baseline_path = (
+        _shared_output_dir('statistics', region_slug)
+        / f'all_region_argo_{y0}_{y1}.parquet'
+    )
+    if not baseline_path.exists():
+        raise FileNotFoundError(
+            f'Missing shared Argo baseline: {baseline_path}'
+        )
+    baseline = pd.read_parquet(
+        baseline_path, columns=['Profile_number']
+    )
+    baseline_ids = set(
+        pd.to_numeric(
+            baseline['Profile_number'], errors='coerce'
+        ).dropna().astype(int)
+    )
+    anchored_path = (
+        Path(argo_anchored_path)
+        if argo_anchored_path is not None
+        else _default_mccoy_anchored_path(region_slug)
+    )
+    anchored = pd.read_parquet(anchored_path)
+    required_anchored = {'profile_number', 'year'}
+    missing_anchored = required_anchored.difference(anchored.columns)
+    if missing_anchored:
+        raise ValueError(
+            f'McCoy anchored table missing columns: '
+            f'{sorted(missing_anchored)}'
+        )
+    anchored_year = pd.to_numeric(
+        anchored['year'], errors='coerce'
+    )
+    anchored_profile = pd.to_numeric(
+        anchored['profile_number'], errors='coerce'
+    ).astype('Int64')
+    catalogued_ids = set(
+        anchored_profile.loc[
+            anchored_year.between(y0, y1)
+            & anchored_profile.notna()
+        ].astype(int)
+    )
+    if not catalogued_ids:
+        raise RuntimeError('No McCoy profiles fall in the analysis period.')
+
+    eligibility_cache: dict[float, pd.DataFrame] = {}
+    rows: list[dict] = []
+    for cfg in configs:
+        depth = float(cfg.anomaly_min_depth or 0.0)
+        if depth not in eligibility_cache:
+            match_cfg = _scv_matched_control_config()
+            eligibility_dir = make_detection_config('do').output_dir(
+                'scv_matched_control', region_slug
+            )
+            eligibility_path = _argo_profile_eligibility_path(
+                eligibility_dir,
+                baseline_start_year=y0,
+                baseline_end_year=y1,
+                anomaly_min_depth=depth,
+                min_do_levels_below_gate=int(
+                    match_cfg['min_do_levels_below_gate']
+                ),
+                min_ts_levels_below_gate=int(
+                    match_cfg['min_ts_levels_below_gate']
+                ),
+            )
+            if eligibility_path.exists():
+                eligibility_cache[depth] = pd.read_parquet(
+                    eligibility_path
+                )
+            else:
+                eligibility_cache[depth] = (
+                    build_argo_profile_eligibility_table(
+                        baseline_start_year=y0,
+                        baseline_end_year=y1,
+                        anomaly_min_depth=depth,
+                        output_dir=eligibility_dir,
+                        save_data=True,
+                    )
+                )
+        eligibility = eligibility_cache[depth]
+        evaluable_ids = _detector_evaluable_profile_ids(
+            cfg,
+            y0,
+            y1,
+            profile_eligibility=eligibility,
+        ) & baseline_ids
+        anomaly_ids, anomaly_path = _load_detector_anomaly_ids(
+            cfg, y0, y1, region_slug
+        )
+        anomaly_ids &= baseline_ids
+        unexpected = anomaly_ids.difference(evaluable_ids)
+        if unexpected:
+            raise RuntimeError(
+                f'{cfg.file_stem()} has {len(unexpected)} anomaly profiles '
+                'outside its evaluable denominator.'
+            )
+        scv_ids = catalogued_ids & evaluable_ids
+        ordinary_ids = evaluable_ids.difference(catalogued_ids)
+        scv_carrier_ids = scv_ids & anomaly_ids
+        ordinary_carrier_ids = ordinary_ids & anomaly_ids
+        (
+            odds_ratio,
+            odds_ci_low,
+            odds_ci_high,
+            fisher_p,
+        ) = _conditional_exact_odds_ratio_ci(
+            len(scv_carrier_ids),
+            len(scv_ids),
+            len(ordinary_carrier_ids),
+            len(ordinary_ids),
+        )
+        if scv_ids:
+            scv_ci = binomtest(
+                len(scv_carrier_ids), len(scv_ids)
+            ).proportion_ci(0.95, method='wilson')
+        else:
+            scv_ci = None
+        if ordinary_ids:
+            ordinary_ci = binomtest(
+                len(ordinary_carrier_ids), len(ordinary_ids)
+            ).proportion_ci(0.95, method='wilson')
+        else:
+            ordinary_ci = None
+        rows.append({
+            'method': cfg.method,
+            'file_stem': cfg.file_stem(),
+            'detector_label': _detector_short_label(cfg),
+            'criteria': cfg.threshold_label(),
+            'anomaly_min_depth_m': depth,
+            'ordinary_carrier_n': int(len(ordinary_carrier_ids)),
+            'ordinary_evaluable_n': int(len(ordinary_ids)),
+            'ordinary_carrier_rate': (
+                float(len(ordinary_carrier_ids) / len(ordinary_ids))
+                if ordinary_ids else np.nan
+            ),
+            'ordinary_ci_low': (
+                float(ordinary_ci.low) if ordinary_ci is not None else np.nan
+            ),
+            'ordinary_ci_high': (
+                float(ordinary_ci.high) if ordinary_ci is not None else np.nan
+            ),
+            'scv_carrier_n': int(len(scv_carrier_ids)),
+            'scv_evaluable_n': int(len(scv_ids)),
+            'scv_carrier_rate': (
+                float(len(scv_carrier_ids) / len(scv_ids))
+                if scv_ids else np.nan
+            ),
+            'scv_ci_low': (
+                float(scv_ci.low) if scv_ci is not None else np.nan
+            ),
+            'scv_ci_high': (
+                float(scv_ci.high) if scv_ci is not None else np.nan
+            ),
+            'scv_vs_ordinary_or': odds_ratio,
+            'or_ci_low': odds_ci_low,
+            'or_ci_high': odds_ci_high,
+            'fisher_p': fisher_p,
+            'baseline_source': str(baseline_path),
+            'mccoy_source': str(anchored_path),
+            'anomaly_source': str(anomaly_path),
+        })
+    summary = pd.DataFrame(rows)
+    if save_data:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else _shared_output_dir(
+                'scv_detector_robustness', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = (
+            f'scv_cross_detector_enrichment_{y0}_{y1}'
+        )
+        _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
+        summary.to_csv(out_dir / f'{stem}.csv', index=False)
+        print(
+            f'[*] Cross-detector SCV enrichment saved: '
+            f'{out_dir / f"{stem}.parquet"}'
+        )
+    return summary
+
+
+def plot_scv_cross_detector_enrichment(
+    summary: pd.DataFrame,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 ΔDO、AOU 与 TRIM 下的 SCV carrier enrichment。
+
+    左图并排显示 ordinary-Argo 与 McCoy SCV carrier rate 及 Wilson 95% CI；
+    右图显示 SCV 相对 ordinary-Argo 的 Fisher 条件精确 OR 与 95% CI。
+
+    参数:
+        - summary (pd.DataFrame): `summarize_scv_cross_detector_enrichment` 输出。
+        - output_dir (str | Path | None): 输出目录；None 使用 shared SCV detector robustness 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+
+    返回:
+        - dict: 含绘图行与 figure_path（save_fig 时）。
+
+    输出:
+        - `plot_outputs/shared/<region>/scv_detector_robustness/scv_cross_detector_enrichment.png`（save_fig 时）。
+    """
+    required = {
+        'method', 'detector_label', 'criteria',
+        'ordinary_carrier_n', 'ordinary_evaluable_n',
+        'ordinary_carrier_rate', 'ordinary_ci_low', 'ordinary_ci_high',
+        'scv_carrier_n', 'scv_evaluable_n', 'scv_carrier_rate',
+        'scv_ci_low', 'scv_ci_high', 'scv_vs_ordinary_or',
+        'or_ci_low', 'or_ci_high',
+    }
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            f'Cross-detector summary missing columns: {sorted(missing)}'
+        )
+    plotted = summary.copy().reset_index(drop=True)
+    if plotted.empty:
+        raise ValueError('Cross-detector summary is empty.')
+    labels = []
+    for row in plotted.itertuples(index=False):
+        if str(row.method) == 'do':
+            threshold_match = re.search(
+                r'do([0-9]+(?:p[0-9]+)?)', str(row.file_stem)
+            )
+            threshold_label = (
+                threshold_match.group(1).replace('p', '.')
+                if threshold_match else ''
+            )
+            labels.append(f'ΔDO{threshold_label}')
+        else:
+            labels.append(str(row.detector_label))
+    x = np.arange(len(plotted), dtype=float)
+    width = 0.28
+    group_offset = 0.23
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(15.0, 5.8),
+        gridspec_kw={'width_ratios': [1.5, 0.85]},
+    )
+    ordinary_rate = pd.to_numeric(
+        plotted['ordinary_carrier_rate'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    ordinary_low = pd.to_numeric(
+        plotted['ordinary_ci_low'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    ordinary_high = pd.to_numeric(
+        plotted['ordinary_ci_high'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    scv_rate = pd.to_numeric(
+        plotted['scv_carrier_rate'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    scv_low = pd.to_numeric(
+        plotted['scv_ci_low'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    scv_high = pd.to_numeric(
+        plotted['scv_ci_high'], errors='coerce'
+    ).to_numpy(dtype=float) * 100.0
+    ordinary_bars = axes[0].bar(
+        x - group_offset,
+        ordinary_rate,
+        width,
+        color=_GROUP_COLORS['baseline'],
+        yerr=np.vstack([
+            ordinary_rate - ordinary_low,
+            ordinary_high - ordinary_rate,
+        ]),
+        capsize=4,
+        label='Ordinary Argo',
+    )
+    scv_bars = axes[0].bar(
+        x + group_offset,
+        scv_rate,
+        width,
+        color=_GROUP_COLORS['scv'],
+        yerr=np.vstack([
+            scv_rate - scv_low,
+            scv_high - scv_rate,
+        ]),
+        capsize=4,
+        label='McCoy SCVs',
+    )
+    for bars, rate, numerator, denominator in (
+        (
+            ordinary_bars,
+            ordinary_rate,
+            plotted['ordinary_carrier_n'],
+            plotted['ordinary_evaluable_n'],
+        ),
+        (
+            scv_bars,
+            scv_rate,
+            plotted['scv_carrier_n'],
+            plotted['scv_evaluable_n'],
+        ),
+    ):
+        for bar, value, k, n in zip(
+            bars, rate, numerator, denominator
+        ):
+            axes[0].annotate(
+                f'{value:.1f}%\n{int(k):,}/{int(n):,}',
+                (bar.get_x() + bar.get_width() / 2.0, bar.get_height()),
+                xytext=(0, 5),
+                textcoords='offset points',
+                ha='center',
+                va='bottom',
+                fontsize=_PLOT_TYPOGRAPHY['annotation'],
+            )
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels)
+    axes[0].set_ylabel('Anomaly carrier rate (%)')
+    axes[0].set_title('Carrier frequency')
+    axes[0].legend(frameon=False, loc='upper left')
+    axes[0].grid(axis='y', alpha=0.25)
+    axes[0].set_ylim(
+        0.0,
+        max(np.nanmax(ordinary_high), np.nanmax(scv_high)) * 1.25,
+    )
+
+    estimate = pd.to_numeric(
+        plotted['scv_vs_ordinary_or'], errors='coerce'
+    ).to_numpy(dtype=float)
+    low = pd.to_numeric(
+        plotted['or_ci_low'], errors='coerce'
+    ).to_numpy(dtype=float)
+    high = pd.to_numeric(
+        plotted['or_ci_high'], errors='coerce'
+    ).to_numpy(dtype=float)
+    axes[1].errorbar(
+        x,
+        estimate,
+        yerr=np.vstack([estimate - low, high - estimate]),
+        color=_GROUP_COLORS['scv'],
+        marker='o',
+        linestyle='none',
+        markersize=8,
+        capsize=5,
+    )
+    for x_value, value in zip(x, estimate):
+        axes[1].annotate(
+            f'{value:.1f}',
+            (x_value, value),
+            xytext=(0, 7),
+            textcoords='offset points',
+            ha='center',
+            va='bottom',
+            fontsize=_PLOT_TYPOGRAPHY['annotation'],
+        )
+    axes[1].axhline(
+        1.0, color='0.35', linestyle='--', linewidth=1.2
+    )
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels)
+    axes[1].set_yscale('log')
+    axes[1].set_ylabel('SCV versus ordinary-Argo odds ratio')
+    axes[1].set_title('SCV enrichment')
+    axes[1].grid(axis='y', which='both', alpha=0.22)
+    axes[1].set_ylim(
+        max(float(np.nanmin(low)) / 1.35, 0.5),
+        float(np.nanmax(high)) * 1.3,
+    )
+
+    for axis in axes:
+        _apply_axis_typography(axis)
+    _apply_plot_typography(fig)
+    fig.tight_layout()
+
+    region_slug = _current_region_key()
+    result = {'rows': plotted}
+    if save_fig:
+        out_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else _shared_output_dir(
+                'scv_detector_robustness', region_slug
+            )
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / 'scv_cross_detector_enrichment.png'
+        fig.savefig(path, dpi=240, bbox_inches='tight')
+        result['figure_path'] = str(path)
+        print(f'[*] Cross-detector SCV figure saved: {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return result
 
 
 def plot_mccoy_scv_catalog_context(
