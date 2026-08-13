@@ -34499,7 +34499,7 @@ def run_ofes_zhu_mccoy_bridge(
 
     输出:
         - `tracks/*.parquet`、`virtual_profile_diagnostics.parquet`、`track_summary.parquet`、
-          `analysis_summary.json` 与 `manifest.json`。
+          `boundary_exclusions.parquet`、`analysis_summary.json` 与 `manifest.json`。
 
     说明:
         - 每条 track 的选择只依赖 Zhu object volume，不依赖 DO 或已有 McCoy 命中；
@@ -34512,9 +34512,61 @@ def run_ofes_zhu_mccoy_bridge(
         raise RuntimeError('Zhu McCoy bridge requires a complete annual catalog.')
     mccoy_settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
     daily_objects = pd.read_parquet(zhu_root / 'daily_objects.parquet')
-    requests = _ofes_zhu_bridge_track_requests(daily_objects)
-    if requests.empty:
+    candidate_requests = _ofes_zhu_bridge_track_requests(daily_objects)
+    if candidate_requests.empty:
         raise RuntimeError('Zhu catalog contains no primary anticyclonic tracks for bridge.')
+    # The delivered OFES window is finite.  McCoy's fixed control rings can
+    # extend beyond it even when the Zhu object centroid itself is valid.  Do
+    # not clamp those points to the edge: classify the complete track as
+    # boundary-censored and retain an explicit exclusion table instead.
+    grid_lon, grid_lat, grid_depth, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(candidate_requests['date'].iloc[0]).normalize()
+    )
+    grid_bounds = {
+        'lon_min': float(np.min(grid_lon)),
+        'lon_max': float(np.max(grid_lon)),
+        'lat_min': float(np.min(grid_lat)),
+        'lat_max': float(np.max(grid_lat)),
+        'depth_min_m': float(np.min(grid_depth)),
+        'depth_max_m': float(np.max(grid_depth)),
+    }
+    boundary_records = []
+    valid_request_rows = []
+    for request in candidate_requests.to_dict(orient='records'):
+        points = _ofes_mccoy_sampling_points(
+            float(request['peak_lon']),
+            float(request['peak_lat']),
+            float(request['event_peak_equivalent_radius_km']),
+            mccoy_settings,
+        )
+        outside = (
+            (points['sample_lon'] < grid_bounds['lon_min'])
+            | (points['sample_lon'] > grid_bounds['lon_max'])
+            | (points['sample_lat'] < grid_bounds['lat_min'])
+            | (points['sample_lat'] > grid_bounds['lat_max'])
+        )
+        if bool(outside.any()):
+            boundary_records.append({
+                'event_id': str(request['event_id']),
+                'track_id': str(request['track_id']),
+                'date': pd.Timestamp(request['date']),
+                'peak_lon': float(request['peak_lon']),
+                'peak_lat': float(request['peak_lat']),
+                'outside_sample_count': int(outside.sum()),
+                'outside_sample_ids': json.dumps(
+                    points.loc[outside, 'sample_id'].astype(str).tolist()
+                ),
+                'exclusion_reason': 'fixed McCoy event/control sample extends beyond delivered OFES grid',
+            })
+        else:
+            valid_request_rows.append(request)
+    requests = pd.DataFrame(valid_request_rows)
+    boundary_exclusions = pd.DataFrame(boundary_records)
+    if requests.empty:
+        raise RuntimeError(
+            'All Zhu anticyclonic tracks are boundary-censored for the '
+            'fixed McCoy sampling footprint.'
+        )
     science_settings = {key: value for key, value in mccoy_settings.items() if key != 'worker_count'}
     repo_root = Path(__file__).resolve().parent
     source_archive = _mccoy_scv_source_archive
@@ -34524,7 +34576,8 @@ def run_ofes_zhu_mccoy_bridge(
         'schema_version': 1,
         'zhu_run_signature': zhu_manifest.get('run_signature'),
         'zhu_daily_objects_sha256': _file_sha256(zhu_root / 'daily_objects.parquet'),
-        'request_sha256': hashlib.sha256(requests.to_json(orient='records', date_format='iso').encode('utf-8')).hexdigest(),
+        'request_sha256': hashlib.sha256(candidate_requests.to_json(orient='records', date_format='iso').encode('utf-8')).hexdigest(),
+        'boundary_exclusion_sha256': hashlib.sha256(boundary_exclusions.to_json(orient='records', date_format='iso').encode('utf-8')).hexdigest(),
         'mccoy_settings': science_settings,
         'mccoy_source_archive_sha256': mccoy_settings['source_archive_sha256'],
         'processing_config_sha256': _file_sha256(repo_root / 'config' / 'processing.yml'),
@@ -34555,11 +34608,18 @@ def run_ofes_zhu_mccoy_bridge(
         'status': 'running',
         'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
         'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'candidate_track_count': int(len(candidate_requests)),
         'track_count': int(len(requests)),
+        'boundary_excluded_track_count': int(len(boundary_exclusions)),
+        'grid_bounds': grid_bounds,
         'completed_tracks': 0,
         'worker_count': int(worker_count or mccoy_settings['worker_count']),
         'sampling': 'center + eight points at 0.35R + eight points at 0.70R; controls are the existing 120-240 km McCoy annulus.',
     }
+    _atomic_write_parquet(
+        boundary_exclusions,
+        run_dir / 'boundary_exclusions.parquet',
+    )
     _ofes_atomic_write_json(manifest, manifest_path)
     worker_settings = dict(mccoy_settings)
     run_worker_count = int(worker_count or mccoy_settings['worker_count'])
@@ -34607,7 +34667,9 @@ def run_ofes_zhu_mccoy_bridge(
         profiles = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame()
         summary = _ofes_zhu_bridge_summary(profiles)
         analysis = {
+            'candidate_track_count': int(len(candidate_requests)),
             'zhu_track_count': int(len(requests)),
+            'boundary_excluded_track_count': int(len(boundary_exclusions)),
             'track_profile_count': int(len(profiles)),
             'track_center_mccoy_count': int(summary['center_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
             'track_any17_mccoy_count': int(summary['any_event_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
@@ -34627,6 +34689,7 @@ def run_ofes_zhu_mccoy_bridge(
                 'profiles': str((run_dir / 'virtual_profile_diagnostics.parquet').resolve()),
                 'track_summary': str((run_dir / 'track_summary.parquet').resolve()),
                 'track_audit': str((run_dir / 'track_audit.parquet').resolve()),
+                'boundary_exclusions': str((run_dir / 'boundary_exclusions.parquet').resolve()),
                 'analysis_summary': str((run_dir / 'analysis_summary.json').resolve()),
                 'track_fragments': str(tracks_dir.resolve()),
             },

@@ -27,13 +27,18 @@ def _wait_for_catalog(catalog_root: Path, poll_seconds: int) -> Path:
 
 def _find_event_population(root: Path) -> Path:
     candidates = []
-    for path in root.glob('do/ofes_np30_ke/ofes_delta_do_catalog/*/event_diagnostics/*/event_population/*/population_peak_diagnostics.parquet'):
-        manifest_path = path.parent / 'manifest.json'
-        if not manifest_path.exists():
-            continue
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        if manifest.get('status') == 'complete' and len(pd.read_parquet(path)) == 59:
-            candidates.append(path)
+    roots = [root]
+    if (root / 'plot_outputs').is_dir():
+        roots.append(root / 'plot_outputs')
+    pattern = 'do/ofes_np30_ke/ofes_delta_do_catalog/*/event_diagnostics/*/event_population/*/population_peak_diagnostics.parquet'
+    for search_root in roots:
+        for path in search_root.glob(pattern):
+            manifest_path = path.parent / 'manifest.json'
+            if not manifest_path.exists():
+                continue
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            if manifest.get('status') == 'complete' and len(pd.read_parquet(path)) == 59:
+                candidates.append(path)
     if not candidates:
         raise FileNotFoundError('No completed 59-event OFES population diagnostics found.')
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
@@ -45,14 +50,18 @@ def _find_mccoy_summary(root: Path) -> Path | None:
         'do/ofes_np30_ke/ofes_delta_do_catalog/*/event_diagnostics/*/event_population/*/event_lifecycle/*/mccoy_virtual_argo/*/event_summary.parquet',
         'do/ofes_np30_ke/ofes_delta_do_catalog/*/event_diagnostics/*/event_population/*/event_onset/*/mccoy_virtual_argo/*/event_summary.parquet',
     )
+    roots = [root]
+    if (root / 'plot_outputs').is_dir():
+        roots.append(root / 'plot_outputs')
     for pattern in patterns:
-        for path in root.glob(pattern):
-            manifest_path = path.parent / 'manifest.json'
-            if not manifest_path.exists():
-                continue
-            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-            if manifest.get('status') == 'complete':
-                candidates.append(path)
+        for search_root in roots:
+            for path in search_root.glob(pattern):
+                manifest_path = path.parent / 'manifest.json'
+                if not manifest_path.exists():
+                    continue
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                if manifest.get('status') == 'complete':
+                    candidates.append(path)
     return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
 
 
