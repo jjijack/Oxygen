@@ -33951,6 +33951,356 @@ def run_ofes_zhu_scv_catalog(
     }
 
 
+def _ofes_zhu_density_stratum(sigma0: float) -> str:
+    """将事件 core sigma0 映射为冻结的描述性密度层。"""
+    if not np.isfinite(sigma0):
+        return 'unavailable'
+    if 26.2 <= sigma0 < 26.8:
+        return '26.2-26.8'
+    if 26.8 <= sigma0 < 27.0:
+        return '26.8-27.0'
+    if 27.0 <= sigma0 <= 27.3:
+        return '27.0-27.3'
+    return 'outside'
+
+
+def _ofes_zhu_event_population_path(path: str | Path) -> Path:
+    """解析 event population 目录或 peak diagnostics parquet 路径。"""
+    candidate = Path(path)
+    if candidate.is_dir():
+        candidate = candidate / 'population_peak_diagnostics.parquet'
+    if not candidate.exists():
+        raise FileNotFoundError(f'OFES Zhu event population file not found: {candidate}')
+    return candidate
+
+
+def _ofes_zhu_event_core_pixels(
+    population_row: pd.Series,
+    catalog_run_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, int, int, int]:
+    """读取正式 DO50 peak object pixels，并返回 core cell/level。"""
+    peak_date = pd.Timestamp(population_row['peak_date']).normalize()
+    path = catalog_run_dir / 'days' / f'peak_pixels_{peak_date:%Y%m%d}.parquet'
+    if not path.exists():
+        raise FileNotFoundError(f'OFES event peak pixel file not found: {path}')
+    pixels = pd.read_parquet(path)
+    key = str(population_row['daily_object_key'])
+    try:
+        object_id = int(key.rsplit('_', 1)[-1])
+    except ValueError as error:
+        raise ValueError(f'Cannot parse DO50 daily object key: {key}') from error
+    selected = pixels.loc[pixels['object_id_do50'] == object_id].copy()
+    if selected.empty:
+        raise ValueError(f'No DO50 pixels found for event object {key}.')
+    selected = selected.sort_values(
+        ['delta_do', 'lat_index', 'lon_index'], ascending=[False, True, True], kind='mergesort'
+    ).reset_index(drop=True)
+    core = selected.iloc[0]
+    core_lat_index = int(core['lat_index'])
+    core_lon_index = int(core['lon_index'])
+    core_level_index = int(core['peak_level_index'])
+    return selected, core.to_frame().T, core_lat_index, core_lon_index, core_level_index
+
+
+def _ofes_zhu_annual_occupancy(
+    voxels: pd.DataFrame,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    depth: np.ndarray,
+    area_m2: np.ndarray,
+) -> pd.DataFrame:
+    """计算月×1°纬度×精确 z-level 的全年对象占据率 sanity null。"""
+    if voxels.empty:
+        return pd.DataFrame(
+            columns=['month', 'lat_bin_deg', 'level_index', 'depth_m', 'occupied_cell_days', 'denominator_cell_days', 'occupancy_fraction']
+        )
+    unique = voxels[['date', 'level_index', 'lat_index', 'lon_index']].drop_duplicates()
+    unique['date'] = pd.to_datetime(unique['date']).dt.normalize()
+    unique['month'] = unique['date'].dt.month.astype(int)
+    unique['lat_bin_deg'] = np.floor(lat[unique['lat_index'].to_numpy(dtype=int)]).astype(int)
+    occupied = unique.groupby(['month', 'lat_bin_deg', 'level_index'], as_index=False).size()
+    occupied = occupied.rename(columns={'size': 'occupied_cell_days'})
+    denominator_rows = []
+    for month in range(1, 13):
+        days = int(pd.Period(f'2003-{month:02d}', freq='M').days_in_month)
+        for lat_bin in range(int(np.floor(lat.min())), int(np.floor(lat.max())) + 1):
+            lat_mask = (lat >= lat_bin) & (lat < lat_bin + 1.0)
+            if not lat_mask.any():
+                continue
+            for level_index in range(len(depth)):
+                denominator_rows.append({
+                    'month': month,
+                    'lat_bin_deg': lat_bin,
+                    'level_index': level_index,
+                    'denominator_cell_days': int(days * int(np.count_nonzero(lat_mask)) * len(lon)),
+                })
+    denominator = pd.DataFrame(denominator_rows)
+    result = denominator.merge(occupied, on=['month', 'lat_bin_deg', 'level_index'], how='left')
+    result['occupied_cell_days'] = result['occupied_cell_days'].fillna(0).astype(int)
+    result['depth_m'] = depth[result['level_index'].to_numpy(dtype=int)]
+    result['occupancy_fraction'] = result['occupied_cell_days'] / result['denominator_cell_days']
+    return result
+
+
+def _ofes_zhu_bootstrap_mean(
+    values: np.ndarray,
+    replicates: int,
+    seed: int,
+) -> tuple[float, list[float]]:
+    """返回事件等权均值和可复现 bootstrap 95% CI。"""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.nan, [np.nan, np.nan]
+    rng = np.random.default_rng(int(seed))
+    indices = rng.integers(0, arr.size, size=(int(replicates), arr.size))
+    means = arr[indices].mean(axis=1)
+    ci = np.quantile(means, [0.025, 0.975])
+    return float(arr.mean()), [float(ci[0]), float(ci[1])]
+
+
+def run_ofes_zhu_event_association(
+    zhu_run_dir: str | Path,
+    event_population_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    zhu_overrides: dict | None = None,
+) -> dict:
+    """将冻结 Zhu anticyclonic objects 与 56 个正式 DO50 events 关联。
+
+    参数:
+        - zhu_run_dir (str | Path): 已完成 `run_ofes_zhu_scv_catalog` 的运行目录。
+        - event_population_path (str | Path): `population_peak_diagnostics.parquet` 或其目录。
+        - output_dir (str | Path | None): 输出目录；默认写入 Zhu run 的 `event_association`。
+        - zhu_overrides (dict | None): 仅允许覆盖已冻结 zhu_scv 键；默认使用目录 manifest 参数。
+
+    返回:
+        - dict: 含 event_association、background_null、annual_occupancy、analysis 和 manifest。
+
+    输出:
+        - `event_association.parquet`、`background_null.parquet`、`annual_occupancy.parquet`、
+          `analysis_summary.json` 与 `manifest.json`。
+
+    说明:
+        - 主指标是同日同层 `core_contained`，没有搜索半径或后验 overlap cutoff；center-within-Rz
+          与连续 peak-voxel overlap 仅作固定 secondary descriptions。
+        - ring null 是事件等权的 120--240 km 同日同层局地对照；全年月×纬度×z occupancy 只作 sanity check，
+          两者若方向冲突必须同时报告。
+    """
+    zhu_root = Path(zhu_run_dir)
+    manifest_path = zhu_root / 'manifest.json'
+    if not manifest_path.exists():
+        raise FileNotFoundError(f'OFES Zhu manifest not found: {manifest_path}')
+    zhu_manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if zhu_manifest.get('status') != 'complete':
+        raise RuntimeError('Zhu event association requires a complete annual catalog.')
+    settings = _ofes_zhu_scv_settings(zhu_overrides)
+    population_path = _ofes_zhu_event_population_path(event_population_path)
+    population = pd.read_parquet(population_path)
+    required_columns = {'event_id', 'threshold', 'population_diagnostic_passed', 'peak_date', 'daily_object_key', 'peak_depth_m', 'peak_lon', 'peak_lat'}
+    missing = sorted(required_columns - set(population.columns))
+    if missing:
+        raise KeyError(f'OFES Zhu event population is missing columns: {missing}')
+    strict = population.loc[
+        (population['threshold'].astype(float) == 50.0)
+        & population['population_diagnostic_passed'].astype(bool)
+    ].copy()
+    strict = strict.sort_values(['peak_date', 'event_id'], kind='mergesort').reset_index(drop=True)
+    if len(strict) != 56:
+        raise ValueError(f'Expected the frozen 56-event strict subset, found {len(strict)}.')
+    catalog_run_dir = population_path.parent.parents[2]
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(pd.Timestamp(strict['peak_date'].iloc[0]))
+    area_m2 = _ofes_tracer_cell_area_m2(lat, lon)
+    object_voxels = pd.read_parquet(zhu_root / 'object_voxels.parquet')
+    object_levels = pd.read_parquet(zhu_root / 'level_properties.parquet')
+    objects = pd.read_parquet(zhu_root / 'daily_objects.parquet')
+    objects = objects.loc[
+        (objects['threshold_s_2'].astype(float) == settings['w0_primary_s_2'])
+        & (objects['polarity'] == 'anticyclonic')
+        & objects['surface_disconnected'].astype(bool)
+    ].copy()
+    object_voxels = object_voxels.loc[object_voxels['object_id'].isin(objects['object_id'])].copy()
+    voxel_sets = {
+        str(object_id): set(
+            zip(
+                group['level_index'].to_numpy(dtype=int),
+                group['lat_index'].to_numpy(dtype=int),
+                group['lon_index'].to_numpy(dtype=int),
+            )
+        )
+        for object_id, group in object_voxels.groupby('object_id', sort=False)
+    }
+    all_voxel_set_by_day_level: dict[tuple[pd.Timestamp, int], set[tuple[int, int]]] = defaultdict(set)
+    for row in object_voxels.itertuples(index=False):
+        all_voxel_set_by_day_level[(pd.Timestamp(row.date).normalize(), int(row.level_index))].add((int(row.lat_index), int(row.lon_index)))
+    event_records = []
+    background_records = []
+    for population_row in strict.itertuples(index=False):
+        row = pd.Series(population_row._asdict())
+        peak_date = pd.Timestamp(row['peak_date']).normalize()
+        pixels, core_frame, core_lat_index, core_lon_index, core_level_index = _ofes_zhu_event_core_pixels(row, catalog_run_dir)
+        core = core_frame.iloc[0]
+        event_objects = objects.loc[objects['date'].dt.normalize() == peak_date].copy()
+        event_object_ids = set(event_objects['object_id'].astype(str))
+        event_voxel_sets = {object_id: voxel_sets.get(object_id, set()) for object_id in event_object_ids}
+        core_key = (core_level_index, core_lat_index, core_lon_index)
+        containing = [object_id for object_id, keys in event_voxel_sets.items() if core_key in keys]
+        core_contained = bool(containing)
+        bottom_contained = bool(
+            any(bool(event_objects.loc[event_objects['object_id'] == object_id, 'bottom_truncated'].iloc[0]) for object_id in containing)
+        )
+        same_level = object_levels.loc[
+            (object_levels['date'].dt.normalize() == peak_date)
+            & (object_levels['level_index'].astype(int) == core_level_index)
+            & (object_levels['object_id'].isin(event_object_ids))
+        ].copy()
+        if not same_level.empty:
+            same_level['distance_km'] = great_circle_distance_m(
+                same_level['center_lon'].to_numpy(dtype=float),
+                same_level['center_lat'].to_numpy(dtype=float),
+                float(core['lon']), float(core['lat']),
+            ) / 1000.0
+            same_level['distance_over_rz'] = same_level['distance_km'] / same_level['radius_km'].replace(0, np.nan)
+            within = same_level.loc[same_level['distance_over_rz'] <= 1.0].sort_values(['distance_over_rz', 'object_id'], kind='mergesort')
+        else:
+            within = same_level
+        center_within = bool(not within.empty)
+        center_object_id = str(within['object_id'].iloc[0]) if center_within else ''
+        center_distance_over_rz = float(within['distance_over_rz'].iloc[0]) if center_within else np.nan
+        core_area = float(area_m2[core_lat_index, core_lon_index])
+        occupied_peak_pixels = []
+        occupied_area = 0.0
+        for pixel in pixels.itertuples(index=False):
+            key = (int(pixel.peak_level_index), int(pixel.lat_index), int(pixel.lon_index))
+            weight = float(area_m2[int(pixel.lat_index), int(pixel.lon_index)])
+            occupied_area += weight
+            if any(key in keys for keys in event_voxel_sets.values()):
+                occupied_peak_pixels.append(key)
+        overlap_fraction = float(
+            sum(float(area_m2[lat_i, lon_i]) for _level, lat_i, lon_i in occupied_peak_pixels) / occupied_area
+        ) if occupied_area > 0 else np.nan
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        distance_grid = great_circle_distance_m(lon_grid, lat_grid, float(core['lon']), float(core['lat'])) / 1000.0
+        ring = (distance_grid >= settings['background_inner_radius_km']) & (distance_grid <= settings['background_outer_radius_km'])
+        excluded = set((int(pixel.lat_index), int(pixel.lon_index)) for pixel in pixels.itertuples(index=False))
+        if excluded:
+            for lat_i, lon_i in excluded:
+                if 0 <= lat_i < ring.shape[0] and 0 <= lon_i < ring.shape[1]:
+                    ring[lat_i, lon_i] = False
+        occupied_ring = np.zeros((len(lat), len(lon)), dtype=bool)
+        for lat_i, lon_i in all_voxel_set_by_day_level.get((peak_date, core_level_index), set()):
+            occupied_ring[lat_i, lon_i] = True
+        ring_area = float(np.sum(area_m2[ring]))
+        ring_occupancy = float(np.sum(area_m2[ring & occupied_ring]) / ring_area) if ring_area > 0 else np.nan
+        sigma0 = float(row.get('target_sigma0', np.nan))
+        event_records.append({
+            'event_id': str(row['event_id']),
+            'peak_date': peak_date,
+            'core_lon': float(core['lon']),
+            'core_lat': float(core['lat']),
+            'core_depth_m': float(core['peak_depth']),
+            'core_level_index': core_level_index,
+            'core_delta_do': float(core['delta_do']),
+            'core_contained': core_contained,
+            'core_containing_object_count': int(len(containing)),
+            'core_containing_object_ids': json.dumps(sorted(containing)),
+            'core_contained_bottom_truncated': bottom_contained,
+            'core_contained_excluding_bottom': bool(core_contained and not bottom_contained),
+            'center_within_Rz': center_within,
+            'center_object_id': center_object_id,
+            'center_distance_over_Rz': center_distance_over_rz,
+            'peak_voxel_overlap_fraction': overlap_fraction,
+            'ring_occupancy_fraction': ring_occupancy,
+            'ring_valid_cell_count': int(np.count_nonzero(ring)),
+            'target_sigma0': sigma0,
+            'density_stratum': _ofes_zhu_density_stratum(sigma0),
+            'zhu_event_object_count': int(len(event_objects)),
+        })
+        background_records.append({
+            'event_id': str(row['event_id']),
+            'peak_date': peak_date,
+            'core_contained': core_contained,
+            'ring_occupancy_fraction': ring_occupancy,
+            'event_difference': float(core_contained) - ring_occupancy if np.isfinite(ring_occupancy) else np.nan,
+            'ring_valid_cell_count': int(np.count_nonzero(ring)),
+            'bottom_truncated_core': bottom_contained,
+        })
+    event_association = pd.DataFrame(event_records).sort_values('event_id', kind='mergesort').reset_index(drop=True)
+    background_null = pd.DataFrame(background_records).sort_values('event_id', kind='mergesort').reset_index(drop=True)
+    annual_occupancy = _ofes_zhu_annual_occupancy(object_voxels, lat, lon, depth, area_m2)
+    annual_lookup = annual_occupancy.set_index(['month', 'lat_bin_deg', 'level_index'])['occupancy_fraction'] if not annual_occupancy.empty else pd.Series(dtype=float)
+    event_association['annual_occupancy_fraction'] = [
+        float(annual_lookup.get((int(pd.Timestamp(row['peak_date']).month), int(np.floor(float(row['core_lat']))), int(row['core_level_index'])), np.nan))
+        for _, row in event_association.iterrows()
+    ]
+    event_association['event_minus_annual_occupancy'] = event_association['core_contained'].astype(float) - event_association['annual_occupancy_fraction']
+    differences = background_null['event_difference'].to_numpy(dtype=float)
+    mean_difference, bootstrap_ci = _ofes_zhu_bootstrap_mean(
+        differences, settings['bootstrap_replicates'], settings['random_seed']
+    )
+    finite_difference = differences[np.isfinite(differences)]
+    if finite_difference.size:
+        paired_test = scipy.stats.wilcoxon(finite_difference, alternative='greater', zero_method='wilcox')
+        paired_payload = {'statistic': float(paired_test.statistic), 'p_value': float(paired_test.pvalue)}
+    else:
+        paired_payload = {'statistic': np.nan, 'p_value': np.nan}
+    analysis = {
+        'strict_event_count': int(len(event_association)),
+        'core_contained_count': int(event_association['core_contained'].sum()),
+        'core_contained_fraction': float(event_association['core_contained'].mean()),
+        'core_contained_excluding_bottom_count': int(event_association['core_contained_excluding_bottom'].sum()),
+        'center_within_Rz_count': int(event_association['center_within_Rz'].sum()),
+        'center_within_Rz_fraction': float(event_association['center_within_Rz'].mean()),
+        'peak_voxel_overlap_fraction_mean': float(event_association['peak_voxel_overlap_fraction'].mean()),
+        'peak_voxel_overlap_fraction_median': float(event_association['peak_voxel_overlap_fraction'].median()),
+        'ring_occupancy_fraction_mean': float(event_association['ring_occupancy_fraction'].mean()),
+        'event_equal_core_minus_ring_mean': mean_difference,
+        'event_equal_core_minus_ring_bootstrap95': bootstrap_ci,
+        'event_equal_paired_wilcoxon': paired_payload,
+        'event_equal_core_minus_annual_mean': float(event_association['event_minus_annual_occupancy'].mean()),
+        'annual_null_same_sign_as_ring': bool(
+            np.sign(mean_difference) == np.sign(float(event_association['event_minus_annual_occupancy'].mean()))
+        ) if np.isfinite(mean_difference) else False,
+        'bottom_truncated_containment_count': int(event_association['core_contained_bottom_truncated'].sum()),
+        'density_stratum_counts': event_association['density_stratum'].value_counts().to_dict(),
+        'interpretation': 'The primary estimand is event-equal local same-day ring contrast; annual occupancy is a separate sanity null and cannot replace it.',
+        'detector_comparison': 'Zhu resolved 3-D vorticity-dominant objects and McCoy virtual profiles are complementary, not mathematically equivalent.',
+    }
+    association_root = Path(output_dir) if output_dir is not None else zhu_root / 'event_association'
+    association_root.mkdir(parents=True, exist_ok=True)
+    association_manifest = {
+        'schema_version': 1,
+        'status': 'complete',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'zhu_run_dir': str(zhu_root.resolve()),
+        'zhu_run_signature': zhu_manifest.get('run_signature'),
+        'event_population_path': str(population_path.resolve()),
+        'event_population_sha256': _file_sha256(population_path),
+        'zhu_settings': settings,
+        'strict_event_count': int(len(strict)),
+        'primary_estimand': 'same-day same-nearest-depth event core containment minus 120-240 km ring occupancy',
+        'outputs': {
+            'event_association': str((association_root / 'event_association.parquet').resolve()),
+            'background_null': str((association_root / 'background_null.parquet').resolve()),
+            'annual_occupancy': str((association_root / 'annual_occupancy.parquet').resolve()),
+            'analysis_summary': str((association_root / 'analysis_summary.json').resolve()),
+        },
+    }
+    _atomic_write_parquet(event_association, association_root / 'event_association.parquet')
+    _atomic_write_parquet(background_null, association_root / 'background_null.parquet')
+    _atomic_write_parquet(annual_occupancy, association_root / 'annual_occupancy.parquet')
+    _ofes_atomic_write_json(analysis, association_root / 'analysis_summary.json')
+    _ofes_atomic_write_json(association_manifest, association_root / 'manifest.json')
+    return {
+        'run_dir': association_root,
+        'manifest': association_manifest,
+        'event_association': event_association,
+        'background_null': background_null,
+        'annual_occupancy': annual_occupancy,
+        'analysis': analysis,
+    }
+
+
 def _ofes_event_diagnostic_settings(
     overrides: dict | None = None,
 ) -> dict:
