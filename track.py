@@ -123,11 +123,8 @@ _mld_clim_root = Path(
     _PATHS_CFG.get('paths', {}).get('mld_clim_root', './data/mld_clim')
 )
 _ofes_root = Path(
-    os.environ.get(
-        'OXYGEN_OFES_ROOT',
-        _PATHS_CFG.get('paths', {}).get(
-            'ofes_root', './data/OFES_NP30'
-        ),
+    _PATHS_CFG.get('paths', {}).get(
+        'ofes_root', './data/OFES_NP30'
     )
 )
 _mccoy_scv_csv = Path(
