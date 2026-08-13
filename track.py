@@ -34282,7 +34282,11 @@ def _ofes_grid_isopycnal_fields(
     expected = (depth.size, lat.size, lon.size)
     if salinity.shape != expected or theta.shape != expected:
         raise ValueError('OFES grid-SCV temperature/salinity shapes mismatch.')
-    sigma0 = _ofes_sigma0_volume(snapshot)
+    # Keep the long-lived isopycnal catalog in float32. The TEOS-10
+    # intermediates below are evaluated in their native precision and dropped
+    # immediately; a full 900x600x75 delivery otherwise retains several GB of
+    # temporary arrays during one daily global scan.
+    sigma0 = _ofes_sigma0_volume(snapshot).astype(np.float32, copy=False)
     pressure = gsw.p_from_z(
         -depth[:, None, None], lat[None, :, None]
     )
@@ -34299,6 +34303,7 @@ def _ofes_grid_isopycnal_fields(
         gsw.spiciness0(absolute_salinity, conservative_temperature),
         dtype=float,
     )
+    del pressure, absolute_salinity, conservative_temperature
     n2_z = _ofes_grid_n2_zlevel(
         depth, salinity, theta, lon, lat
     )
@@ -34308,6 +34313,8 @@ def _ofes_grid_isopycnal_fields(
         lat,
         lon,
     )
+    zeta = metric['zeta_s_1']
+    del metric
     if background_mask is None:
         background_mask = np.all(
             np.isfinite(sigma0), axis=0
@@ -34324,7 +34331,7 @@ def _ofes_grid_isopycnal_fields(
     fields = {
         'spiciness': spiciness,
         'n2': n2_z,
-        'zeta': metric['zeta_s_1'],
+        'zeta': zeta,
         'u': np.asarray(snapshot['u'], dtype=float),
         'v': np.asarray(snapshot['v'], dtype=float),
     }
@@ -34336,6 +34343,7 @@ def _ofes_grid_isopycnal_fields(
         valid_depth_min_m=settings['valid_depth_min_m'],
         valid_depth_max_m=settings['valid_depth_max_m'],
     )
+    del spiciness, n2_z
     z_reference, dz_dsigma = _ofes_grid_reference_pv_factor(
         sigma0, depth, background_mask, nodes
     )
@@ -34349,6 +34357,7 @@ def _ofes_grid_isopycnal_fields(
         earth_radius_m * np.cos(lat_rad)[None, :, None]
     )
     dsigma_dy = dsigma_dlat / earth_radius_m
+    del dsigma_dlon, dsigma_dlat, lat_rad, lon_rad
     du_dz = np.gradient(np.asarray(snapshot['u'], dtype=float), depth, axis=0)
     dv_dz = np.gradient(np.asarray(snapshot['v'], dtype=float), depth, axis=0)
     omega_x = -dv_dz
@@ -34357,7 +34366,7 @@ def _ofes_grid_isopycnal_fields(
     pv_zlevel = (
         omega_x * dsigma_dx
         + omega_y * dsigma_dy
-        + (metric['zeta_s_1'] + coriolis) * dsigma_dz
+        + (zeta + coriolis) * dsigma_dz
     )
     mapped_pv = _ofes_grid_density_interpolate(
         depth,
@@ -34368,6 +34377,8 @@ def _ofes_grid_isopycnal_fields(
         valid_depth_max_m=settings['valid_depth_max_m'],
     )
     pv = mapped_pv['pv_zlevel'] * dz_dsigma[:, None, None]
+    del pv_zlevel, mapped_pv, dsigma_dx, dsigma_dy, dsigma_dz
+    del du_dz, dv_dz, omega_x, omega_y, coriolis, zeta
     pv[~mapped['unique_crossing']] = np.nan
     background = {}
     anomalies = {}
@@ -34553,29 +34564,28 @@ def _ofes_grid_closed_n2_masks(
                 lat_i, lon_i = np.where(component)
                 if lat_i.size == 0:
                     continue
-                weights = _ofes_tracer_cell_area_m2(lat, lon)[lat_i, lon_i]
-                center = np.array([
-                    np.average(lon[lon_i], weights=weights),
-                    np.average(lat[lat_i], weights=weights),
-                ])
-                containing = [
-                    path for path in paths if path.contains_point(center)
-                ]
-                if not containing:
+                overlapping = []
+                for path in paths:
+                    inside = path.contains_points(points).reshape(lat_grid.shape)
+                    inside &= finite
+                    overlap_count = int(np.count_nonzero(inside & component))
+                    if overlap_count:
+                        overlapping.append((path, inside, overlap_count))
+                if not overlapping:
                     continue
-                # The largest closed path containing the thermohaline component
-                # is the frozen outermost N2-anomaly boundary.
-                selected = max(
-                    containing,
+                # On the delivered grid, the thermohaline centroid can fall
+                # just outside a contour while neighboring component cells are
+                # enclosed.  Use the largest closed contour with a non-empty
+                # component overlap; no sub-grid distance threshold is added.
+                selected, inside, _ = max(
+                    overlapping,
                     key=lambda path: float(
                         np.abs(
-                            np.dot(path.vertices[:, 0], np.roll(path.vertices[:, 1], -1))
-                            - np.dot(path.vertices[:, 1], np.roll(path.vertices[:, 0], -1))
+                            np.dot(path[0].vertices[:, 0], np.roll(path[0].vertices[:, 1], -1))
+                            - np.dot(path[0].vertices[:, 1], np.roll(path[0].vertices[:, 0], -1))
                         )
                     ),
                 )
-                inside = selected.contains_points(points).reshape(lat_grid.shape)
-                inside &= finite
                 if not np.any(inside & component):
                     continue
                 closed[node_index] |= inside
@@ -34588,6 +34598,7 @@ def _ofes_grid_closed_n2_masks(
     return {
         'closed_lens': closed,
         'seed': contour_seed,
+        'contour_available': contour_count > 0,
         'contour_count': contour_count,
     }
 
@@ -34647,15 +34658,24 @@ def _ofes_grid_connect_components(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """连接相邻密度面上的热盐种子，生成三维透镜对象和 voxel 表。"""
     settings = _ofes_grid_scv_settings(settings)
-    lens = np.asarray(seed_masks['lens'], dtype=bool)
+    thermohaline_lens = np.asarray(seed_masks['lens'], dtype=bool)
     seed = np.asarray(seed_masks.get('closed_seed', seed_masks['seed']), dtype=bool)
-    closed_lens = np.asarray(seed_masks.get('closed_lens', seed_masks['lens']), dtype=bool)
+    closed_lens = np.asarray(
+        seed_masks.get('closed_lens', thermohaline_lens), dtype=bool
+    )
+    # The N2 contour is a layer boundary, not a replacement for the local
+    # thermohaline anomaly.  Intersecting the two keeps the stored object at
+    # the resolved lens scale while enforcing the frozen "no closed boundary,
+    # no layer" rule; it never fills the whole contour interior.
+    lens = thermohaline_lens & closed_lens
     nodes = np.asarray(fields['nodes_sigma0'], dtype=float)
     if lens.ndim != 3 or lens.shape[0] != nodes.size or seed.shape != lens.shape:
         raise ValueError('OFES grid seed mask has an invalid shape.')
     if closed_lens.shape != lens.shape:
         raise ValueError('OFES grid closed-lens mask has an invalid shape.')
-    lens = closed_lens
+    # The thermohaline connected component is the object volume.  The N2
+    # contour is retained as a per-layer closure diagnostic, not used to inflate
+    # a component into a basin-scale mask when its outer contour is broad.
     structure = np.ones((3, 3), dtype=np.int8)
     components: list[dict] = []
     for node_index in range(nodes.size):
@@ -34667,6 +34687,9 @@ def _ofes_grid_connect_components(
             )
             component['mask'] = mask
             component['has_pv_seed'] = bool(np.any(seed[node_index] & mask))
+            component['closed_n2_boundary'] = bool(
+                np.any(closed_lens[node_index] & mask)
+            )
             components.append(component)
     parent = list(range(len(components)))
 
@@ -34708,8 +34731,10 @@ def _ofes_grid_connect_components(
         centroid_depth = float(np.average(depths[finite], weights=areas[finite]))
         depth_min = float(np.nanmin([item['depth_min_m'] for item in members]))
         depth_max = float(np.nanmax([item['depth_max_m'] for item in members]))
-        radius = float(np.sqrt(np.sum(areas[finite]) / np.pi) / 1000.0)
+        radius = float(np.nanmax([item['radius_km'] for item in members]))
         spice_signs = {item['spice_sign'] for item in members}
+        closed_layers = int(sum(item['closed_n2_boundary'] for item in members))
+        pv_seed_layers = int(sum(item['has_pv_seed'] for item in members))
         eligible = (
             len(members) >= settings['minimum_density_nodes']
             and settings['lens_radius_min_km'] <= radius <= settings['lens_radius_max_km']
@@ -34718,6 +34743,7 @@ def _ofes_grid_connect_components(
             and depth_min > settings['shallowest_depth_min_m']
             and len(spice_signs) == 1
             and any(item['has_pv_seed'] for item in members)
+            and any(item['closed_n2_boundary'] for item in members)
         )
         object_id = f'grid_scv_{object_index:06d}'
         object_index += 1
@@ -34739,6 +34765,13 @@ def _ofes_grid_connect_components(
             'bottom_truncated': bool(any(item['touches_domain_edge'] for item in members)),
             'eligible_identity': bool(eligible),
             'seed_voxel_count': int(sum(item['lat_index'].size for item in members)),
+            'closed_n2_layer_count': closed_layers,
+            'pv_seed_layer_count': pv_seed_layers,
+            'volume_m3': float(sum(
+                item['area_m2'] * max(
+                    item['depth_max_m'] - item['depth_min_m'], 0.0
+                ) for item in members
+            )),
         })
         for member in members:
             for lat_index, lon_index in zip(member['lat_index'], member['lon_index']):
@@ -34750,6 +34783,8 @@ def _ofes_grid_connect_components(
                     'lon_index': int(lon_index),
                     'center_lat': float(member['center_lat']),
                     'center_lon': float(member['center_lon']),
+                    'voxel_lat': float(fields['lat'][lat_index]),
+                    'voxel_lon': float(fields['lon'][lon_index]),
                     'depth_m': float(fields['depth'][member['node_index'], lat_index, lon_index]),
                     'spice_sign': member['spice_sign'],
                     'pv_anomaly': float(fields['anomalies']['pv'][member['node_index'], lat_index, lon_index]),
@@ -35060,7 +35095,12 @@ def detect_ofes_grid_scv_day(
     )
     prefilter = _ofes_grid_seed_masks(fields, settings)
     closed = _ofes_grid_closed_n2_masks(fields, prefilter)
-    masks = {**prefilter, 'closed_lens': closed['closed_lens'], 'closed_seed': closed['seed']}
+    masks = {
+        **prefilter,
+        'closed_lens': closed['closed_lens'],
+        'closed_seed': closed['seed'],
+        'contour_available': closed['contour_available'],
+    }
     objects, voxels = _ofes_grid_connect_components(fields, masks, settings)
     objects = _ofes_grid_confirm_velocity(objects, voxels, fields, settings)
     if not objects.empty:
@@ -35127,6 +35167,14 @@ def _ofes_grid_scv_code_sha256() -> str:
         _ofes_grid_confirm_velocity,
         _ofes_grid_event_window,
         detect_ofes_grid_scv_day,
+        _ofes_grid_global_day_catalog,
+        _ofes_grid_track_objects,
+        _ofes_grid_annual_occupancy,
+        _ofes_grid_event_ring_occupancy,
+        _ofes_grid_object_association,
+        run_ofes_grid_scv_annual_catalog,
+        run_ofes_grid_scv_mccoy_bridge,
+        run_ofes_grid_scv_event_catalog,
     )
     source = '\n\n'.join(inspect.getsource(function) for function in functions)
     return hashlib.sha256(source.encode('utf-8')).hexdigest()
@@ -35203,6 +35251,860 @@ def _ofes_grid_mccoy_prefilter_recall(
     return pd.DataFrame(records)
 
 
+def _ofes_grid_global_day_catalog(
+    date: str | pd.Timestamp,
+    *,
+    settings: dict,
+    output_dir: str | Path,
+    resume: bool = True,
+) -> dict:
+    """生成单个全年日期的全域网格候选片段。
+
+    全域场只负责发现候选。每个候选随后在自己的 120--240 km 局部环带
+    中重新计算背景并复核身份与原生速度，避免把全域中位数带来的大尺度
+    水团梯度误当作局地透镜。
+    """
+    date_ts = pd.Timestamp(date).normalize()
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    tag = date_ts.strftime('%Y%m%d')
+    objects_path = root / f'global_objects_{tag}.parquet'
+    voxels_path = root / f'global_voxels_{tag}.parquet'
+    metadata_path = root / f'global_metadata_{tag}.json'
+    if resume and all(path.exists() for path in (objects_path, voxels_path, metadata_path)):
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        if (
+            metadata.get('date') == date_ts.strftime('%Y-%m-%d')
+            and metadata.get('code_sha256') == _ofes_grid_scv_code_sha256()
+        ):
+            return {
+                'date': date_ts,
+                'objects': pd.read_parquet(objects_path),
+                'voxels': pd.read_parquet(voxels_path),
+                'metadata': metadata,
+                'reused': True,
+            }
+    snapshot = load_ofes_snapshot(
+        date_ts, variables=['temp', 'salinity', 'u', 'v']
+    )
+    valid_mask = np.all(
+        np.isfinite(snapshot['temp'])
+        & np.isfinite(snapshot['salinity'])
+        & np.isfinite(snapshot['u'])
+        & np.isfinite(snapshot['v']),
+        axis=0,
+    )
+    fields = _ofes_grid_isopycnal_fields(
+        snapshot, settings, background_mask=valid_mask
+    )
+    prefilter = _ofes_grid_seed_masks(fields, settings)
+    provisional_masks = {
+        **prefilter,
+        'closed_lens': prefilter['lens'],
+        'closed_seed': prefilter['seed'],
+        'contour_available': np.ones(len(fields['nodes_sigma0']), dtype=bool),
+    }
+    provisional_objects, _ = _ofes_grid_connect_components(
+        fields, provisional_masks, settings
+    )
+    candidates = provisional_objects.loc[
+        provisional_objects['eligible_identity'].astype(bool)
+    ].copy() if not provisional_objects.empty else provisional_objects
+    local_object_frames = []
+    local_voxel_frames = []
+    local_recertification_failures = 0
+    for candidate in candidates.to_dict('records'):
+        try:
+            local = detect_ofes_grid_scv_day(
+                date_ts,
+                float(candidate['center_lon']),
+                float(candidate['center_lat']),
+                float(candidate['radius_km']),
+                settings=settings,
+            )
+        except ValueError:
+            local_recertification_failures += 1
+            continue
+        local_objects = local['objects'].loc[
+            local['objects']['eligible_identity'].astype(bool)
+        ].copy() if not local['objects'].empty else local['objects']
+        if local_objects.empty:
+            continue
+        local_objects['candidate_distance_km'] = great_circle_distance_m(
+            local_objects['center_lon'].to_numpy(dtype=float),
+            local_objects['center_lat'].to_numpy(dtype=float),
+            float(candidate['center_lon']), float(candidate['center_lat']),
+        ) / 1000.0
+        local_objects = local_objects.loc[
+            local_objects['candidate_distance_km'] <= max(
+                50.0, float(candidate['radius_km'])
+            )
+        ].sort_values(
+            ['candidate_distance_km', 'volume_m3', 'object_id'],
+            ascending=[True, False, True],
+            kind='mergesort',
+        )
+        if local_objects.empty:
+            continue
+        local_objects = local_objects.iloc[[0]].copy()
+        old_id = str(local_objects['object_id'].iloc[0])
+        new_id = f"grid_scv_{date_ts:%Y%m%d}_{len(local_object_frames):06d}"
+        local_objects['global_candidate_object_id'] = str(candidate['object_id'])
+        local_objects['object_id'] = new_id
+        local_objects['date'] = date_ts
+        local_objects['global_background'] = False
+        local_objects['local_background_inner_km'] = float(
+            settings['background_inner_radius_km']
+        )
+        local_objects['local_background_outer_km'] = float(
+            settings['background_outer_radius_km']
+        )
+        local_object_frames.append(local_objects)
+        local_voxels = local['voxels'].loc[
+            local['voxels']['object_id'].astype(str).eq(old_id)
+        ].copy()
+        if not local_voxels.empty:
+            local_voxels['object_id'] = new_id
+            local_voxels['global_candidate_object_id'] = str(candidate['object_id'])
+            local_voxels['date'] = date_ts
+            local_voxels['global_background'] = False
+            local_voxel_frames.append(local_voxels)
+    objects = (
+        pd.concat(local_object_frames, ignore_index=True)
+        if local_object_frames else provisional_objects.iloc[0:0].copy()
+    )
+    voxels = (
+        pd.concat(local_voxel_frames, ignore_index=True)
+        if local_voxel_frames else pd.DataFrame()
+    )
+    if objects.empty:
+        objects['velocity_confirmed'] = pd.Series(dtype=bool)
+        objects['velocity_checked_node_count'] = pd.Series(dtype=np.int16)
+        objects['velocity_passed_node_count'] = pd.Series(dtype=np.int16)
+        objects['velocity_circulation_m2_s'] = pd.Series(dtype=float)
+        objects['velocity_finite_fraction'] = pd.Series(dtype=float)
+    global_provisional_object_count = int(len(provisional_objects))
+    global_candidate_count = int(len(candidates))
+    stored_voxel_count = int(len(voxels))
+    wet_cell_counts = {}
+    unique_crossing = np.asarray(fields['unique_crossing'], dtype=bool)
+    lat_bins = np.floor(np.asarray(fields['lat'], dtype=float)).astype(int)
+    for node_index in range(unique_crossing.shape[0]):
+        for lat_bin in np.unique(lat_bins):
+            count = int(np.count_nonzero(
+                unique_crossing[node_index, lat_bins == lat_bin, :]
+            ))
+            if count:
+                wet_cell_counts[f'{node_index}:{int(lat_bin)}'] = count
+    if not objects.empty:
+        objects['date'] = date_ts
+        objects['local_background_recertified'] = True
+    metadata = {
+        'status': 'complete',
+        'date': date_ts.strftime('%Y-%m-%d'),
+        'code_sha256': _ofes_grid_scv_code_sha256(),
+        'valid_columns': int(np.count_nonzero(valid_mask)),
+        'prefilter_lens_voxel_count': int(np.count_nonzero(prefilter['lens'])),
+        'prefilter_recall_voxel_count': int(np.count_nonzero(prefilter['prefilter_recall'])),
+        'prefilter_pv_seed_count': int(np.count_nonzero(prefilter['seed'])),
+        'global_provisional_object_count': global_provisional_object_count,
+        'global_candidate_count': global_candidate_count,
+        'local_recertified_object_count': int(len(objects)),
+        'local_recertification_failures': int(local_recertification_failures),
+        'object_count': int(len(objects)),
+        'identity_eligible_count': int(objects['eligible_identity'].sum()) if not objects.empty else 0,
+        'grid_supported_scv_count': int(
+            (objects['eligible_identity'] & objects['velocity_confirmed']).sum()
+        ) if not objects.empty else 0,
+        'technical_voxel_count': stored_voxel_count,
+        'stored_identity_voxel_count': int(len(voxels)),
+        'wet_cell_counts': wet_cell_counts,
+        'background_definition': 'global field is candidate discovery only; identity and velocity are recertified with a local 120-240 km ring',
+    }
+    _atomic_write_parquet(objects, objects_path)
+    _atomic_write_parquet(voxels, voxels_path)
+    _ofes_atomic_write_json(metadata, metadata_path)
+    return {
+        'date': date_ts,
+        'objects': objects,
+        'voxels': voxels,
+        'metadata': metadata,
+        'reused': False,
+    }
+
+
+def _ofes_grid_track_objects(
+    daily_objects: pd.DataFrame,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    dates: pd.DatetimeIndex,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按冻结 consecutive-day 几何门连接全域 grid-SCV 对象。"""
+    if daily_objects.empty:
+        return daily_objects.copy(), pd.DataFrame(columns=['track_id', 'observed_days'])
+    frame = daily_objects.copy()
+    frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+    frame = frame.loc[frame['eligible_identity'].astype(bool)].copy()
+    if frame.empty:
+        frame['track_id'] = pd.Series(dtype=str)
+        return frame, pd.DataFrame(columns=['track_id', 'observed_days'])
+    frame = frame.sort_values(['date', 'spice_sign', 'object_id'], kind='mergesort').reset_index(drop=True)
+    frame['track_id'] = ''
+    previous: dict[str, pd.DataFrame] = {}
+    next_track = 1
+    for date in pd.DatetimeIndex(dates):
+        current_indices = frame.index[frame['date'].eq(pd.Timestamp(date).normalize())].to_numpy(dtype=int)
+        current = frame.loc[current_indices].copy()
+        new_previous = {}
+        for sign in ('spicy', 'minty'):
+            sign_indices = current.index[current['spice_sign'].eq(sign)].to_numpy(dtype=int)
+            current_sign = current.loc[sign_indices].copy()
+            previous_sign = previous.get(sign)
+            admissible = []
+            if previous_sign is not None and not previous_sign.empty and not current_sign.empty:
+                for prev_pos, prev_row in previous_sign.reset_index(drop=True).iterrows():
+                    distance = great_circle_distance_m(
+                        current_sign['center_lon'].to_numpy(dtype=float),
+                        current_sign['center_lat'].to_numpy(dtype=float),
+                        float(prev_row['center_lon']), float(prev_row['center_lat']),
+                    ) / 1000.0
+                    rel_depth = np.abs(current_sign['centroid_depth_m'].to_numpy(dtype=float) - float(prev_row['centroid_depth_m'])) / max(abs(float(prev_row['centroid_depth_m'])), 1.0)
+                    rel_radius = np.abs(current_sign['radius_km'].to_numpy(dtype=float) - float(prev_row['radius_km'])) / max(abs(float(prev_row['radius_km'])), 1.0e-6)
+                    rel_thickness = np.abs(current_sign['thickness_m'].to_numpy(dtype=float) - float(prev_row['thickness_m'])) / max(abs(float(prev_row['thickness_m'])), 1.0)
+                    for cur_pos in np.flatnonzero(
+                        (distance <= settings['track_center_displacement_km'])
+                        & (rel_depth < settings['track_relative_tolerance'])
+                        & (rel_radius < settings['track_relative_tolerance'])
+                        & (rel_thickness < settings['track_relative_tolerance'])
+                    ):
+                        admissible.append((int(prev_pos), int(cur_pos), float(distance[cur_pos])))
+            predecessor_counts = defaultdict(int)
+            successor_counts = defaultdict(int)
+            for prev_pos, cur_pos, _ in admissible:
+                predecessor_counts[prev_pos] += 1
+                successor_counts[cur_pos] += 1
+            linked = set()
+            for prev_pos, cur_pos, _ in sorted(admissible, key=lambda item: item[2]):
+                if predecessor_counts[prev_pos] != 1 or successor_counts[cur_pos] != 1 or cur_pos in linked:
+                    continue
+                track_id = str(previous_sign.reset_index(drop=True).iloc[prev_pos]['track_id']) if previous_sign is not None else ''
+                if not track_id:
+                    track_id = f'GRID_SCV_T{next_track:05d}'
+                    next_track += 1
+                frame.loc[current_sign.iloc[cur_pos].name, 'track_id'] = track_id
+                linked.add(cur_pos)
+            for cur_pos, row_index in enumerate(current_sign.index):
+                if cur_pos not in linked:
+                    frame.loc[row_index, 'track_id'] = f'GRID_SCV_T{next_track:05d}'
+                    next_track += 1
+            new_previous[sign] = frame.loc[current_sign.index].copy().reset_index(drop=True)
+        previous = new_previous
+    first_date, last_date = pd.Timestamp(dates[0]).normalize(), pd.Timestamp(dates[-1]).normalize()
+    frame['first_model_day_censored'] = frame['date'].eq(first_date)
+    frame['last_model_day_censored'] = frame['date'].eq(last_date)
+    edge_margin = float(settings['boundary_censor_margin_deg'])
+    frame['boundary_edge_distance_deg'] = np.minimum.reduce([
+        frame['center_lon'].to_numpy(dtype=float) - float(np.min(lon)),
+        float(np.max(lon)) - frame['center_lon'].to_numpy(dtype=float),
+        frame['center_lat'].to_numpy(dtype=float) - float(np.min(lat)),
+        float(np.max(lat)) - frame['center_lat'].to_numpy(dtype=float),
+    ])
+    frame['boundary_near_edge'] = frame['boundary_edge_distance_deg'] <= edge_margin
+    track_records = []
+    for track_id, group in frame.groupby('track_id', sort=True):
+        group = group.sort_values('date', kind='mergesort')
+        first, last = group.iloc[0], group.iloc[-1]
+        entry = bool(first['boundary_near_edge'])
+        exit_ = bool(last['boundary_near_edge'])
+        frame.loc[group.index, 'observed_days'] = int(len(group))
+        frame.loc[group.index, 'duration_days'] = int((last['date'] - first['date']).days + 1)
+        frame.loc[group.index, 'observed_duration_is_lower_bound'] = bool(entry or exit_ or first['first_model_day_censored'] or last['last_model_day_censored'])
+        track_records.append({
+            'track_id': str(track_id),
+            'spice_sign': str(group['spice_sign'].iloc[0]),
+            'start_date': first['date'],
+            'end_date': last['date'],
+            'observed_days': int(len(group)),
+            'duration_days': int((last['date'] - first['date']).days + 1),
+            'boundary_entry_censored': entry,
+            'boundary_exit_censored': exit_,
+            'first_model_day_censored': bool(first['first_model_day_censored']),
+            'last_model_day_censored': bool(last['last_model_day_censored']),
+            'observed_duration_is_lower_bound': bool(entry or exit_ or first['first_model_day_censored'] or last['last_model_day_censored']),
+            'min_depth_m': float(group['depth_min_m'].min()),
+            'max_depth_m': float(group['depth_max_m'].max()),
+            'mean_centroid_depth_m': float(group['centroid_depth_m'].mean()),
+            'mean_radius_km': float(group['radius_km'].mean()),
+            'mean_thickness_m': float(group['thickness_m'].mean()),
+        })
+    return frame, pd.DataFrame(track_records)
+
+
+def _ofes_grid_annual_occupancy(
+    object_voxels: pd.DataFrame,
+    nodes: np.ndarray,
+    *,
+    dates: pd.DatetimeIndex | None = None,
+    daily_wet_cell_counts: list[dict] | None = None,
+) -> pd.DataFrame:
+    """计算月×1°纬度×密度节点的全年对象占据率。
+
+    分母是每日有效等密度网格单元数的总和，而不是仅有对象的 cell-day
+    数；因此即便全年没有身份对象，也会返回可审计的零占据率 null。
+    """
+    columns = [
+        'month', 'lat_bin_deg', 'node_index', 'sigma0',
+        'occupied_cell_days', 'denominator_cell_days',
+        'occupied_days', 'wet_days', 'occupancy_fraction',
+    ]
+    if dates is None:
+        if object_voxels.empty:
+            return pd.DataFrame(columns=columns)
+        dates = pd.DatetimeIndex(
+            pd.to_datetime(object_voxels['date']).dt.normalize().unique()
+        ).sort_values()
+    dates = pd.DatetimeIndex(dates).normalize()
+    if dates.empty:
+        return pd.DataFrame(columns=columns)
+    if daily_wet_cell_counts is None or len(daily_wet_cell_counts) != len(dates):
+        raise ValueError(
+            'Annual occupancy requires one wet-cell count record per date.'
+        )
+    denominator_rows = []
+    for date, counts in zip(dates, daily_wet_cell_counts):
+        for key, count in counts.items():
+            node_index, lat_bin = (int(value) for value in str(key).split(':'))
+            denominator_rows.append({
+                'date': date,
+                'month': int(date.month),
+                'lat_bin_deg': lat_bin,
+                'node_index': node_index,
+                'wet_cell_count': int(count),
+            })
+    denominator = pd.DataFrame(denominator_rows)
+    if denominator.empty:
+        return pd.DataFrame(columns=columns)
+    denominator = denominator.groupby(
+        ['month', 'lat_bin_deg', 'node_index'], as_index=False
+    ).agg(
+        denominator_cell_days=('wet_cell_count', 'sum'),
+        wet_days=('date', 'nunique'),
+    )
+    if object_voxels.empty:
+        occupied_cell_days = pd.DataFrame(
+            columns=['month', 'lat_bin_deg', 'node_index', 'occupied_cell_days', 'occupied_days']
+        )
+    else:
+        frame = object_voxels.copy()
+        frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+        frame['month'] = frame['date'].dt.month.astype(int)
+        frame['lat_bin_deg'] = np.floor(frame['voxel_lat'].astype(float)).astype(int)
+        frame['node_index'] = frame['node_index'].astype(int)
+        occupied = frame[
+            ['date', 'month', 'lat_bin_deg', 'node_index', 'lat_index', 'lon_index']
+        ].drop_duplicates()
+        occupied_cell_days = occupied.groupby(
+            ['month', 'lat_bin_deg', 'node_index'], as_index=False
+        ).agg(
+            occupied_cell_days=('date', 'size'),
+            occupied_days=('date', 'nunique'),
+        )
+    result = denominator.merge(
+        occupied_cell_days,
+        on=['month', 'lat_bin_deg', 'node_index'],
+        how='left',
+    )
+    result['occupied_cell_days'] = result['occupied_cell_days'].fillna(0).astype(int)
+    result['occupied_days'] = result['occupied_days'].fillna(0).astype(int)
+    result['sigma0'] = result['node_index'].map(
+        lambda index: float(nodes[int(index)])
+    )
+    result['occupancy_fraction'] = (
+        result['occupied_cell_days']
+        / result['denominator_cell_days'].replace(0, np.nan)
+    )
+    return result[columns].sort_values(
+        ['month', 'lat_bin_deg', 'node_index'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def run_ofes_grid_scv_annual_catalog(
+    *,
+    start_date: str | pd.Timestamp = '2003-01-01',
+    end_date: str | pd.Timestamp = '2003-12-31',
+    output_dir: str | Path | None = None,
+    settings: dict | None = None,
+    resume: bool = True,
+    max_days: int | None = None,
+) -> dict:
+    """运行全域 OFES 网格 SCV 年度目录、追踪和全年占据率 null。
+
+    该入口先在每日全域温盐/PV 场中发现几何候选，再对候选逐一用冻结的
+    120--240 km 局部背景重新认证身份和原生速度，最后连接和追踪；全年
+    occupancy null 仍是 secondary，事件主估计量由单独的事件 runner 计算。
+    max_days 仅用于工程试跑。
+
+    参数:
+        - start_date (str | pd.Timestamp): 起始日期，包含端点。
+        - end_date (str | pd.Timestamp): 结束日期，包含端点。
+        - output_dir (str | Path | None): 结果目录；None 时使用外部 OFES 结果根。
+        - settings (dict | None): 已解析或覆盖的 grid-SCV 设置。
+        - resume (bool): 是否复用完成的逐日片段。
+        - max_days (int | None): 可选的工程试跑天数，不用于最终统计。
+
+    返回:
+        - dict: 含 manifest、daily_objects、object_voxels、tracks、annual_occupancy 和 summary。
+
+    输出:
+        - 每日全域片段、daily_objects.parquet、object_voxels.parquet、tracks.parquet、
+          annual_occupancy.parquet、analysis_summary.json 和 manifest.json。
+
+    说明:
+        - 这是单年裁剪 OFES 的技术目录；duration 是下界，边界 censor 随 tracks 保存。
+          全年占据率是 secondary null，不能替代事件等权的局部环带 null。
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError('OFES grid-SCV end_date must be on or after start_date.')
+    dates = pd.date_range(start, end, freq='D')
+    settings = _ofes_grid_scv_settings(settings)
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(start)
+    nodes = _ofes_grid_sigma0_nodes(settings)
+    repo_root = Path(__file__).resolve().parent
+    protocol_path = repo_root / 'ofes-mccoy-grid-scv-analysis-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    payload = {
+        'schema_version': 1,
+        'detector': 'ofes_grid_thermohaline_pv_scv_annual',
+        'start_date': start.strftime('%Y-%m-%d'),
+        'end_date': end.strftime('%Y-%m-%d'),
+        'date_count': int(len(dates)),
+        'settings': settings,
+        'code_sha256': _ofes_grid_scv_code_sha256(),
+        'protocol_sha256': _file_sha256(protocol_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'coordinate_sha256': _ofes_coordinate_sha256(lon, lat, depth),
+        'source_root': str(_ofes_root),
+        'source_root_resolved': str(_ofes_root.resolve()),
+        'background_definition': 'global field for candidate discovery; local 120-240 km background for candidate recertification; event ring remains separate',
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'), default=_ofes_json_default
+    )
+    signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    root = Path(output_dir) if output_dir is not None else (
+        Path(_ofes_root).resolve().parent / 'ofes_grid_scv_results'
+        / f'annual_{start:%Y%m%d}_{end:%Y%m%d}_{signature[:12]}'
+    )
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists() and resume and max_days is None:
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if existing.get('run_signature') == signature and existing.get('status') == 'complete':
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'daily_objects': pd.read_parquet(root / 'daily_objects.parquet'),
+                'object_voxels': pd.read_parquet(root / 'object_voxels.parquet'),
+                'tracks': pd.read_parquet(root / 'tracks.parquet'),
+                'annual_occupancy': pd.read_parquet(root / 'annual_occupancy.parquet'),
+                'analysis_summary': json.loads((root / 'analysis_summary.json').read_text(encoding='utf-8')),
+                'reused_complete_run': True,
+            }
+    run_dates = dates if max_days is None else dates[:int(max_days)]
+    root.mkdir(parents=True, exist_ok=True)
+    fragment_root = root / 'daily_fragments'
+    fragment_root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'annual_{start:%Y%m%d}_{end:%Y%m%d}_grid_scv_{signature[:12]}',
+        'status': 'running',
+        'requested_date_count': int(len(run_dates)),
+        'completed_date_count': 0,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    daily_frames: list[pd.DataFrame] = []
+    voxel_frames: list[pd.DataFrame] = []
+    try:
+        for index, date in enumerate(run_dates, start=1):
+            fragment = _ofes_grid_global_day_catalog(
+                date, settings=settings, output_dir=fragment_root, resume=resume
+            )
+            daily_frames.append(fragment['objects'])
+            voxel_frames.append(fragment['voxels'])
+            manifest['completed_date_count'] = int(index)
+            if index == 1 or index == len(run_dates) or index % 10 == 0:
+                print(
+                    f'[OFES grid SCV annual] {index:03d}/{len(run_dates):03d} '
+                    f'{pd.Timestamp(date):%Y-%m-%d}',
+                    flush=True,
+                )
+                manifest['updated_at_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+                _ofes_atomic_write_json(manifest, manifest_path)
+        daily_objects = pd.concat(daily_frames, ignore_index=True) if daily_frames else pd.DataFrame()
+        object_voxels = pd.concat(voxel_frames, ignore_index=True) if voxel_frames else pd.DataFrame()
+        tracked_objects, tracks = _ofes_grid_track_objects(
+            daily_objects, lon, lat, run_dates, settings
+        )
+        daily_wet_cell_counts = []
+        for date in run_dates:
+            fragment = _ofes_grid_global_day_catalog(
+                date, settings=settings, output_dir=fragment_root, resume=True
+            )
+            daily_wet_cell_counts.append(fragment['metadata'].get('wet_cell_counts', {}))
+        annual_occupancy = _ofes_grid_annual_occupancy(
+            object_voxels,
+            nodes,
+            dates=run_dates,
+            daily_wet_cell_counts=daily_wet_cell_counts,
+        )
+        summary = {
+            'status': 'complete',
+            'date_count': int(len(run_dates)),
+            'daily_object_rows': int(len(tracked_objects)),
+            'object_voxel_rows': int(len(object_voxels)),
+            'identity_object_days': int(tracked_objects['eligible_identity'].sum()) if not tracked_objects.empty else 0,
+            'track_count': int(len(tracks)),
+            'tracks_at_least_3d': int((tracks['observed_days'] >= settings['duration_threshold_days'][0]).sum()) if not tracks.empty else 0,
+            'tracks_at_least_5d': int((tracks['observed_days'] >= settings['duration_threshold_days'][1]).sum()) if not tracks.empty else 0,
+            'tracks_at_least_30d': int((tracks['observed_days'] >= settings['duration_threshold_days'][2]).sum()) if not tracks.empty else 0,
+            'annual_occupancy_rows': int(len(annual_occupancy)),
+            'interpretation': 'Annual occupancy is a secondary null; event-level same-day local-ring association remains the primary estimand.',
+        }
+        _atomic_write_parquet(tracked_objects, root / 'daily_objects.parquet')
+        _atomic_write_parquet(object_voxels, root / 'object_voxels.parquet')
+        _atomic_write_parquet(tracks, root / 'tracks.parquet')
+        _atomic_write_parquet(annual_occupancy, root / 'annual_occupancy.parquet')
+        _ofes_atomic_write_json(summary, root / 'analysis_summary.json')
+        manifest.update({
+            'status': 'complete',
+            'completed_date_count': int(len(run_dates)),
+            'outputs': {
+                'daily_objects': str((root / 'daily_objects.parquet').resolve()),
+                'object_voxels': str((root / 'object_voxels.parquet').resolve()),
+                'tracks': str((root / 'tracks.parquet').resolve()),
+                'annual_occupancy': str((root / 'annual_occupancy.parquet').resolve()),
+                'daily_fragments': str(fragment_root.resolve()),
+                'analysis_summary': str((root / 'analysis_summary.json').resolve()),
+            },
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update({
+            'status': 'failed',
+            'completed_date_count': int(manifest.get('completed_date_count', 0)),
+            'error_type': type(error).__name__,
+            'error': str(error),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'daily_objects': tracked_objects,
+        'object_voxels': object_voxels,
+        'tracks': tracks,
+        'annual_occupancy': annual_occupancy,
+        'analysis_summary': summary,
+        'reused_complete_run': False,
+    }
+
+
+def run_ofes_grid_scv_mccoy_bridge(
+    annual_run_dir: str | Path,
+    *,
+    source_archive_path: str | Path | None = None,
+    mccoy_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    max_objects: int | None = None,
+    resume: bool = True,
+) -> dict:
+    """对年度 grid-SCV track 的最大体积 object-day 执行 McCoy bridge。
+
+    每条身份合格 track 预先选择一个最大 volume_m3 的 object-day，再在其
+    中心、固定事件环带和固定背景 control 上调用已有 McCoy 源码门链。选择
+    不读取 McCoy 分类结果，因此该输出只用于方法可比性审计，不改变网格
+    SCV 的主估计量。
+
+    参数:
+        - annual_run_dir (str | Path): 已完成年度网格 SCV 目录。
+        - source_archive_path (str | Path | None): McCoy 源码压缩包；None 使用配置路径。
+        - mccoy_overrides (dict | None): McCoy 虚拟剖面配置覆盖。
+        - output_dir (str | Path | None): 输出目录；None 写到年度目录的 bridge 子目录。
+        - max_objects (int | None): 工程试跑最多选取的 object-day 数。
+        - resume (bool): 是否复用签名一致的完整 bridge。
+
+    返回:
+        - dict: 含选样表、profile 结果、审计表、统计摘要和 manifest。
+
+    输出:
+        - selected_object_days.parquet、bridge_profiles.parquet、bridge_audit.parquet、
+          analysis_summary.json 与 manifest.json。
+
+    说明:
+        - 这是 grid-SCV 与 McCoy 单剖面定义的双向桥接，不是把两套判据合并；
+          完整 OFES 数据不足 2000 m 时仍按现有 McCoy-method-compatible 口径报告。
+    """
+    annual_root = Path(annual_run_dir)
+    annual_manifest_path = annual_root / 'manifest.json'
+    if not annual_manifest_path.exists():
+        raise FileNotFoundError(f'OFES grid-SCV annual manifest not found: {annual_manifest_path}')
+    annual_manifest = json.loads(annual_manifest_path.read_text(encoding='utf-8'))
+    if annual_manifest.get('status') != 'complete':
+        raise RuntimeError('McCoy bridge requires a complete annual grid-SCV catalog.')
+    daily = pd.read_parquet(annual_root / 'daily_objects.parquet')
+    required_daily = {
+        'track_id', 'object_id', 'date', 'eligible_identity', 'volume_m3',
+        'center_lon', 'center_lat', 'centroid_depth_m', 'radius_km', 'spice_sign',
+    }
+    missing = sorted(required_daily - set(daily.columns))
+    if missing:
+        raise KeyError(f'Annual grid-SCV daily objects are missing columns: {missing}')
+    daily = daily.loc[daily['eligible_identity'].astype(bool)].copy()
+    daily['date'] = pd.to_datetime(daily['date']).dt.normalize()
+    daily = daily.loc[daily['track_id'].astype(str).str.len() > 0].copy()
+    selected = (
+        daily.sort_values(
+            ['track_id', 'volume_m3', 'date', 'object_id'],
+            ascending=[True, False, True, True],
+            kind='mergesort',
+        )
+        .drop_duplicates('track_id', keep='first')
+        .sort_values(['date', 'track_id'], kind='mergesort')
+        .reset_index(drop=True)
+    )
+    if max_objects is not None:
+        selected = selected.iloc[:int(max_objects)].copy()
+    mccoy_settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
+    source_path = Path(
+        source_archive_path
+        if source_archive_path is not None else _mccoy_scv_source_archive
+    )
+    if not source_path.exists():
+        raise FileNotFoundError(f'McCoy source archive not found: {source_path}')
+    source_sha = _file_sha256(source_path)
+    if source_sha != mccoy_settings['source_archive_sha256']:
+        raise RuntimeError('McCoy source archive SHA-256 does not match the frozen setting.')
+    science_settings = {
+        key: value for key, value in mccoy_settings.items() if key != 'worker_count'
+    }
+    request_payload = selected[
+        ['track_id', 'object_id', 'date', 'center_lon', 'center_lat',
+         'centroid_depth_m', 'radius_km', 'volume_m3', 'spice_sign']
+    ].copy()
+    request_payload['date'] = request_payload['date'].dt.strftime('%Y-%m-%d')
+    payload = {
+        'schema_version': 1,
+        'method': 'grid_scv_max_volume_object_day_mccoy_bridge',
+        'annual_manifest_sha256': _file_sha256(annual_manifest_path),
+        'annual_run_signature': annual_manifest.get('run_signature'),
+        'mccoy_source_archive': str(source_path.resolve()),
+        'mccoy_source_archive_sha256': source_sha,
+        'mccoy_settings': science_settings,
+        'selected_object_day_count': int(len(selected)),
+        'selected_object_days_sha256': hashlib.sha256(
+            request_payload.to_json(orient='records').encode('utf-8')
+        ).hexdigest(),
+        'code_sha256': _ofes_grid_scv_code_sha256(),
+    }
+    signature = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(',', ':'), default=_ofes_json_default).encode('utf-8')
+    ).hexdigest()
+    root = Path(output_dir) if output_dir is not None else annual_root / f'mccoy_bridge_{signature[:12]}'
+    manifest_path = root / 'manifest.json'
+    if resume and manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') == signature and previous.get('status') == 'complete':
+            return {
+                'run_dir': root,
+                'manifest': previous,
+                'selected_object_days': pd.read_parquet(root / 'selected_object_days.parquet'),
+                'bridge_profiles': pd.read_parquet(root / 'bridge_profiles.parquet'),
+                'bridge_audit': pd.read_parquet(root / 'bridge_audit.parquet'),
+                'analysis_summary': json.loads((root / 'analysis_summary.json').read_text(encoding='utf-8')),
+                'reused_complete_run': True,
+            }
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'grid_scv_mccoy_bridge_{signature[:12]}',
+        'status': 'running',
+        'completed_object_day_count': 0,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    profile_frames = []
+    audits = []
+    try:
+        for index, row in enumerate(selected.to_dict('records')):
+            bridge_id = f"grid_{row['object_id']}_{pd.Timestamp(row['date']):%Y%m%d}"
+            request = {
+                'event_id': bridge_id,
+                'event_order': index,
+                'date': pd.Timestamp(row['date']),
+                'peak_lon': float(row['center_lon']),
+                'peak_lat': float(row['center_lat']),
+                'event_peak_equivalent_radius_km': float(row['radius_km']),
+                'peak_depth_at_max': float(row['centroid_depth_m']),
+                'reference_depth_m': float(row['centroid_depth_m']),
+            }
+            profiles, audit = _ofes_mccoy_event_worker({
+                'request': request,
+                'settings': mccoy_settings,
+            })
+            profiles['grid_track_id'] = str(row['track_id'])
+            profiles['grid_object_id'] = str(row['object_id'])
+            profiles['grid_object_date'] = pd.Timestamp(row['date'])
+            profiles['grid_object_volume_m3'] = float(row['volume_m3'])
+            profiles['grid_object_spice_sign'] = str(row['spice_sign'])
+            profile_frames.append(profiles)
+            audits.append({**audit, **{
+                'grid_track_id': str(row['track_id']),
+                'grid_object_id': str(row['object_id']),
+                'grid_object_date': pd.Timestamp(row['date']),
+                'grid_object_volume_m3': float(row['volume_m3']),
+            }})
+            manifest['completed_object_day_count'] = int(index + 1)
+            if index == 0 or index + 1 == len(selected) or (index + 1) % 10 == 0:
+                _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update({
+            'status': 'failed',
+            'error_type': type(error).__name__,
+            'error': str(error),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    bridge_profiles = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame()
+    bridge_audit = pd.DataFrame(audits)
+    if bridge_profiles.empty:
+        summary = {
+            'status': 'complete',
+            'selected_track_count': int(len(selected)),
+            'processed_object_day_count': 0,
+            'center_profile_mccoy_compatible_count': 0,
+            'interpretation': 'No identity-eligible annual tracks were available for the preregistered bridge sample.',
+        }
+    else:
+        event_profiles = bridge_profiles.loc[bridge_profiles['sample_role'] == 'event']
+        controls = bridge_profiles.loc[bridge_profiles['sample_role'] == 'background_control']
+        center = event_profiles.loc[np.isclose(event_profiles['radius_km'], 0.0)]
+        event_fraction = event_profiles.groupby('event_id')['mccoy_profile_compatible'].mean()
+        control_fraction = controls.groupby('event_id')['mccoy_profile_compatible'].mean()
+        paired = (event_fraction - control_fraction).dropna().to_numpy(dtype=float)
+        mean, interval = _ofes_zhu_bootstrap_mean(
+            paired, mccoy_settings['bootstrap_replicates'], mccoy_settings['random_seed']
+        )
+        if paired.size and not np.allclose(paired, 0.0, rtol=0.0, atol=0.0):
+            test = scipy.stats.wilcoxon(paired, alternative='greater', zero_method='wilcox')
+            wilcoxon = {'statistic': float(test.statistic), 'p_value': float(test.pvalue)}
+        else:
+            wilcoxon = {'statistic': 0.0 if paired.size else np.nan, 'p_value': 1.0 if paired.size else np.nan}
+        summary = {
+            'status': 'complete',
+            'selected_track_count': int(len(selected)),
+            'processed_object_day_count': int(center['event_id'].nunique()),
+            'center_profile_mccoy_compatible_count': int(center['mccoy_profile_compatible'].sum()),
+            'center_profile_mccoy_compatible_fraction': float(center['mccoy_profile_compatible'].mean()),
+            'any_event_profile_mccoy_compatible_count': int(event_profiles.groupby('event_id')['mccoy_profile_compatible'].any().sum()),
+            'event_equal_profile_pass_fraction_mean': float(event_fraction.mean()),
+            'control_equal_profile_pass_fraction_mean': float(control_fraction.mean()),
+            'event_equal_minus_control_mean': mean,
+            'event_equal_minus_control_bootstrap95': interval,
+            'event_equal_minus_control_wilcoxon': wilcoxon,
+            'interpretation': 'McCoy bridge results are descriptive cross-method diagnostics; grid-SCV identity and velocity gates remain separate.',
+        }
+    _atomic_write_parquet(selected, root / 'selected_object_days.parquet')
+    _atomic_write_parquet(bridge_profiles, root / 'bridge_profiles.parquet')
+    _atomic_write_parquet(bridge_audit, root / 'bridge_audit.parquet')
+    _ofes_atomic_write_json(summary, root / 'analysis_summary.json')
+    manifest.update({
+        'status': 'complete',
+        'completed_object_day_count': int(len(selected)),
+        'outputs': {
+            'selected_object_days': str((root / 'selected_object_days.parquet').resolve()),
+            'bridge_profiles': str((root / 'bridge_profiles.parquet').resolve()),
+            'bridge_audit': str((root / 'bridge_audit.parquet').resolve()),
+            'analysis_summary': str((root / 'analysis_summary.json').resolve()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    })
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'selected_object_days': selected,
+        'bridge_profiles': bridge_profiles,
+        'bridge_audit': bridge_audit,
+        'analysis_summary': summary,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_grid_event_ring_occupancy(
+    event_row: pd.Series,
+    result: dict,
+    object_ids: set[str],
+    settings: dict,
+) -> dict:
+    """计算单事件同日同密度节点 120--240 km 环带占据率。"""
+    fields = result['fields']
+    mapping = _ofes_grid_sigma0_cell_mapping(
+        float(event_row['target_sigma0']), settings
+    )
+    node_index = int(mapping['sigma0_node_index'])
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    area = _ofes_tracer_cell_area_m2(lat, lon)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance = great_circle_distance_m(
+        lon_grid, lat_grid,
+        float(event_row['peak_lon']), float(event_row['peak_lat']),
+    ) / 1000.0
+    valid = bool(
+        mapping['sigma0_mapping_valid']
+        and 0 <= node_index < len(fields['nodes_sigma0'])
+    )
+    if valid:
+        unique = np.asarray(fields['unique_crossing'][node_index], dtype=bool)
+        ring = (
+            (distance >= float(settings['background_inner_radius_km']))
+            & (distance <= float(settings['background_outer_radius_km']))
+            & unique
+        )
+    else:
+        ring = np.zeros((lat.size, lon.size), dtype=bool)
+    occupied = np.zeros(ring.shape, dtype=bool)
+    voxels = result['voxels']
+    if valid and not voxels.empty and object_ids:
+        selected = voxels.loc[
+            voxels['object_id'].astype(str).isin(object_ids)
+            & voxels['node_index'].astype(int).eq(node_index)
+        ]
+        for row in selected.itertuples(index=False):
+            lat_index, lon_index = int(row.lat_index), int(row.lon_index)
+            if 0 <= lat_index < occupied.shape[0] and 0 <= lon_index < occupied.shape[1]:
+                occupied[lat_index, lon_index] = True
+    ring_area = float(np.sum(area[ring]))
+    occupied_area = float(np.sum(area[ring & occupied]))
+    fraction = occupied_area / ring_area if ring_area > 0 else np.nan
+    return {
+        'ring_valid': bool(valid and ring_area > 0),
+        'ring_valid_cell_count': int(np.count_nonzero(ring)),
+        'ring_occupied_cell_count': int(np.count_nonzero(ring & occupied)),
+        'ring_area_m2': ring_area,
+        'ring_occupied_area_m2': occupied_area,
+        'ring_occupancy_fraction': float(fraction) if np.isfinite(fraction) else np.nan,
+    }
+
+
 def _ofes_grid_object_association(
     event_row: pd.Series,
     result: dict,
@@ -35251,6 +36153,12 @@ def _ofes_grid_object_association(
     velocity_containing = sorted(
         set(target_voxels['object_id'].astype(str)) & velocity_ids
     )
+    identity_ring = _ofes_grid_event_ring_occupancy(
+        event_row, result, identity_ids, settings
+    )
+    velocity_ring = _ofes_grid_event_ring_occupancy(
+        event_row, result, velocity_ids, settings
+    )
     eligible_objects = objects.loc[
         objects['eligible_identity'].astype(bool)
     ].copy() if not objects.empty else objects
@@ -35285,9 +36193,23 @@ def _ofes_grid_object_association(
         'identity_core_contained': bool(identity_containing),
         'identity_core_object_count': int(len(identity_containing)),
         'identity_core_object_ids': json.dumps(identity_containing),
+        'identity_ring_occupancy_fraction': identity_ring['ring_occupancy_fraction'],
+        'identity_ring_valid_cell_count': identity_ring['ring_valid_cell_count'],
+        'identity_ring_occupied_cell_count': identity_ring['ring_occupied_cell_count'],
+        'identity_core_minus_ring': (
+            float(bool(identity_containing)) - identity_ring['ring_occupancy_fraction']
+            if np.isfinite(identity_ring['ring_occupancy_fraction']) else np.nan
+        ),
         'grid_supported_scv_core_contained': bool(velocity_containing),
         'grid_supported_scv_core_object_count': int(len(velocity_containing)),
         'grid_supported_scv_core_object_ids': json.dumps(velocity_containing),
+        'grid_supported_scv_ring_occupancy_fraction': velocity_ring['ring_occupancy_fraction'],
+        'grid_supported_scv_ring_valid_cell_count': velocity_ring['ring_valid_cell_count'],
+        'grid_supported_scv_ring_occupied_cell_count': velocity_ring['ring_occupied_cell_count'],
+        'grid_supported_scv_core_minus_ring': (
+            float(bool(velocity_containing)) - velocity_ring['ring_occupancy_fraction']
+            if np.isfinite(velocity_ring['ring_occupancy_fraction']) else np.nan
+        ),
         'identity_center_within_radius': bool(not center_within.empty),
         'identity_center_object_id': str(center_within['object_id'].iloc[0]) if not center_within.empty else '',
         'identity_center_distance_over_radius': float(center_within['distance_over_radius'].iloc[0]) if not center_within.empty else np.nan,
@@ -35436,6 +36358,41 @@ def run_ofes_grid_scv_event_catalog(
     voxel_inventory = pd.concat(voxel_frames, ignore_index=True) if voxel_frames else pd.DataFrame()
     recall = pd.concat(recall_frames, ignore_index=True) if recall_frames else pd.DataFrame()
     positive_recall = recall.loc[recall['in_bounds'].astype(bool)] if not recall.empty else recall
+    def ring_statistics(prefix: str) -> dict:
+        core = event_association[f'{prefix}_core_contained'].astype(float).to_numpy()
+        ring = event_association[f'{prefix}_ring_occupancy_fraction'].to_numpy(dtype=float)
+        difference = core - ring
+        finite = difference[np.isfinite(difference)]
+        mean, interval = _ofes_zhu_bootstrap_mean(
+            finite, settings['bootstrap_replicates'], settings['random_seed']
+        )
+        if finite.size == 0:
+            wilcoxon = {'statistic': np.nan, 'p_value': np.nan}
+        elif np.allclose(finite, 0.0, rtol=0.0, atol=0.0):
+            wilcoxon = {'statistic': 0.0, 'p_value': 1.0}
+        else:
+            test = scipy.stats.wilcoxon(
+                finite, alternative='greater', zero_method='wilcox'
+            )
+            wilcoxon = {
+                'statistic': float(test.statistic),
+                'p_value': float(test.pvalue),
+            }
+        return {
+            'ring_occupancy_fraction_mean': float(np.nanmean(ring)) if np.any(np.isfinite(ring)) else np.nan,
+            'event_equal_core_minus_ring_mean': mean,
+            'event_equal_core_minus_ring_bootstrap95': interval,
+            'event_equal_core_minus_ring_wilcoxon': wilcoxon,
+            'ring_valid_event_count': int(np.count_nonzero(np.isfinite(ring))),
+        }
+    identity_ring_stats = ring_statistics('identity')
+    grid_ring_stats = ring_statistics('grid_supported_scv')
+    association_nulls = {
+        'identity': identity_ring_stats,
+        'grid_supported_scv': grid_ring_stats,
+        'annual_occupancy_is_computed_by_annual_catalog': True,
+        'same_day_event_ring_definition': '120-240 km, same target sigma0 node, event-equal and area-weighted',
+    }
     summary = {
         'status': 'complete',
         'strict_event_count': int(len(strict)),
@@ -35445,6 +36402,9 @@ def run_ofes_grid_scv_event_catalog(
         'grid_supported_scv_core_contained_count': int(event_association['grid_supported_scv_core_contained'].sum()),
         'grid_supported_scv_core_contained_fraction': float(event_association['grid_supported_scv_core_contained'].mean()),
         'identity_center_within_radius_count': int(event_association['identity_center_within_radius'].sum()),
+        'identity_ring_statistics': identity_ring_stats,
+        'grid_supported_scv_ring_statistics': grid_ring_stats,
+        'association_nulls': association_nulls,
         'mccoy_positive_profile_count_expected': int(settings['known_mccoy_positive_profile_count']),
         'mccoy_positive_profile_count_processed': int(len(recall)),
         'mccoy_prefilter_recall_count': int(positive_recall['prefilter_recall'].sum()) if not positive_recall.empty else 0,
