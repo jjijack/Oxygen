@@ -34531,6 +34531,79 @@ def run_ofes_zhu_mccoy_bridge(
     return {'run_dir': run_dir, 'manifest': manifest, 'profiles': profiles, 'track_summary': summary, 'analysis': analysis, 'reused_complete_run': False}
 
 
+def build_ofes_zhu_mccoy_event_crosstab(
+    zhu_event_association_path: str | Path,
+    mccoy_event_summary_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """交叉汇总 56-event Zhu core containment 与既有 McCoy event gates。
+
+    参数:
+        - zhu_event_association_path (str | Path): Zhu `event_association.parquet`。
+        - mccoy_event_summary_path (str | Path): 已完成 McCoy virtual-Argo 的 `event_summary.parquet`。
+        - output_dir (str | Path | None): 输出目录；默认写入 Zhu association 同目录。
+
+    返回:
+        - dict: 含 crosstab、analysis 和输出目录。
+
+    输出:
+        - `zhu_mccoy_event_crosstab.parquet`、`crosstab_summary.json`。
+
+    说明:
+        - 保留 Zhu/McCoy 四个交叉格，不以后验命中数修改任一 detector；direct velocity
+          confirmation 只作为已有 McCoy 结果的平行列。
+    """
+    zhu_path = Path(zhu_event_association_path)
+    mccoy_path = Path(mccoy_event_summary_path)
+    zhu = pd.read_parquet(zhu_path)
+    mccoy = pd.read_parquet(mccoy_path)
+    if 'event_id' not in zhu.columns or 'event_id' not in mccoy.columns:
+        raise KeyError('Zhu and McCoy event tables must both contain event_id.')
+    if len(zhu) != 56:
+        raise ValueError(f'Expected 56 Zhu strict events, found {len(zhu)}.')
+    keep_mccoy = [
+        'event_id', 'center_profile_mccoy_compatible',
+        'any_event_profile_mccoy_compatible',
+        'center_profile_velocity_confirmed',
+        'any_event_profile_velocity_confirmed', 'scv_compatible',
+        'persistent_anticyclonic_rotational_carrier',
+    ]
+    available = [column for column in keep_mccoy if column in mccoy.columns]
+    merged = zhu.merge(mccoy[available], on='event_id', how='left', validate='one_to_one')
+    if merged[available[1:]].isna().all(axis=None):
+        raise ValueError('McCoy event summary did not match any Zhu event IDs.')
+    merged['zhu_core_contained'] = merged['core_contained'].astype(bool)
+    analysis = {
+        'strict_event_count': int(len(merged)),
+        'zhu_core_contained_count': int(merged['zhu_core_contained'].sum()),
+        'four_cell_crosstab_center_mccoy': {
+            f'zhu_{int(zhu_flag)}_mccoy_{int(mccoy_flag)}': int(count)
+            for (zhu_flag, mccoy_flag), count in merged.groupby(
+                ['zhu_core_contained', 'center_profile_mccoy_compatible'], dropna=False
+            ).size().items()
+        } if 'center_profile_mccoy_compatible' in merged else {},
+        'four_cell_crosstab_any17_mccoy': {
+            f'zhu_{int(zhu_flag)}_mccoy_{int(mccoy_flag)}': int(count)
+            for (zhu_flag, mccoy_flag), count in merged.groupby(
+                ['zhu_core_contained', 'any_event_profile_mccoy_compatible'], dropna=False
+            ).size().items()
+        } if 'any_event_profile_mccoy_compatible' in merged else {},
+        'four_cell_crosstab_center_velocity': {
+            f'zhu_{int(zhu_flag)}_velocity_{int(mccoy_flag)}': int(count)
+            for (zhu_flag, mccoy_flag), count in merged.groupby(
+                ['zhu_core_contained', 'center_profile_velocity_confirmed'], dropna=False
+            ).size().items()
+        } if 'center_profile_velocity_confirmed' in merged else {},
+        'interpretation': 'Zhu and McCoy are complementary detectors; all four cells remain reportable and no method is treated as a forced superset.',
+    }
+    root = Path(output_dir) if output_dir is not None else zhu_path.parent
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(merged, root / 'zhu_mccoy_event_crosstab.parquet')
+    _ofes_atomic_write_json(analysis, root / 'crosstab_summary.json')
+    return {'run_dir': root, 'crosstab': merged, 'analysis': analysis}
+
+
 def _ofes_event_diagnostic_settings(
     overrides: dict | None = None,
 ) -> dict:
