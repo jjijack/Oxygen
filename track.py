@@ -34008,8 +34008,15 @@ def _ofes_zhu_annual_occupancy(
     lon: np.ndarray,
     depth: np.ndarray,
     area_m2: np.ndarray,
+    valid_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """计算月×1°纬度×精确 z-level 的全年对象占据率 sanity null。"""
+    if valid_mask is None:
+        valid = np.ones((len(depth), len(lat), len(lon)), dtype=bool)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (len(depth), len(lat), len(lon)):
+            raise ValueError('Zhu annual occupancy valid_mask has an incompatible shape.')
     if voxels.empty:
         return pd.DataFrame(
             columns=['month', 'lat_bin_deg', 'level_index', 'depth_m', 'occupied_cell_days', 'denominator_cell_days', 'occupancy_fraction']
@@ -34028,11 +34035,12 @@ def _ofes_zhu_annual_occupancy(
             if not lat_mask.any():
                 continue
             for level_index in range(len(depth)):
+                valid_cell_count = int(np.count_nonzero(valid[level_index, lat_mask, :]))
                 denominator_rows.append({
                     'month': month,
                     'lat_bin_deg': lat_bin,
                     'level_index': level_index,
-                    'denominator_cell_days': int(days * int(np.count_nonzero(lat_mask)) * len(lon)),
+                    'denominator_cell_days': int(days * valid_cell_count),
                 })
     denominator = pd.DataFrame(denominator_rows)
     result = denominator.merge(occupied, on=['month', 'lat_bin_deg', 'level_index'], how='left')
@@ -34111,6 +34119,13 @@ def run_ofes_zhu_event_association(
     catalog_run_dir = population_path.parent.parents[2]
     lon, lat, depth, _, _ = _ofes_tracer_coordinates(pd.Timestamp(strict['peak_date'].iloc[0]))
     area_m2 = _ofes_tracer_cell_area_m2(lat, lon)
+    validity_snapshot = load_ofes_snapshot(
+        pd.Timestamp(strict['peak_date'].iloc[0]), variables=['u', 'v']
+    )
+    valid_mask = (
+        np.isfinite(np.asarray(validity_snapshot['u'], dtype=float))
+        & np.isfinite(np.asarray(validity_snapshot['v'], dtype=float))
+    )
     object_voxels = pd.read_parquet(zhu_root / 'object_voxels.parquet')
     object_levels = pd.read_parquet(zhu_root / 'level_properties.parquet')
     objects = pd.read_parquet(zhu_root / 'daily_objects.parquet')
@@ -34181,7 +34196,11 @@ def run_ofes_zhu_event_association(
         ) if occupied_area > 0 else np.nan
         lon_grid, lat_grid = np.meshgrid(lon, lat)
         distance_grid = great_circle_distance_m(lon_grid, lat_grid, float(core['lon']), float(core['lat'])) / 1000.0
-        ring = (distance_grid >= settings['background_inner_radius_km']) & (distance_grid <= settings['background_outer_radius_km'])
+        ring = (
+            (distance_grid >= settings['background_inner_radius_km'])
+            & (distance_grid <= settings['background_outer_radius_km'])
+            & valid_mask[core_level_index]
+        )
         excluded = set((int(pixel.lat_index), int(pixel.lon_index)) for pixel in pixels.itertuples(index=False))
         if excluded:
             for lat_i, lon_i in excluded:
@@ -34227,7 +34246,9 @@ def run_ofes_zhu_event_association(
         })
     event_association = pd.DataFrame(event_records).sort_values('event_id', kind='mergesort').reset_index(drop=True)
     background_null = pd.DataFrame(background_records).sort_values('event_id', kind='mergesort').reset_index(drop=True)
-    annual_occupancy = _ofes_zhu_annual_occupancy(object_voxels, lat, lon, depth, area_m2)
+    annual_occupancy = _ofes_zhu_annual_occupancy(
+        object_voxels, lat, lon, depth, area_m2, valid_mask=valid_mask
+    )
     annual_lookup = annual_occupancy.set_index(['month', 'lat_bin_deg', 'level_index'])['occupancy_fraction'] if not annual_occupancy.empty else pd.Series(dtype=float)
     event_association['annual_occupancy_fraction'] = [
         float(annual_lookup.get((int(pd.Timestamp(row['peak_date']).month), int(np.floor(float(row['core_lat']))), int(row['core_level_index'])), np.nan))
@@ -34278,6 +34299,8 @@ def run_ofes_zhu_event_association(
         'event_population_sha256': _file_sha256(population_path),
         'zhu_settings': settings,
         'strict_event_count': int(len(strict)),
+        'validity_mask_source_date': pd.Timestamp(strict['peak_date'].iloc[0]).strftime('%Y-%m-%d'),
+        'validity_mask_note': 'Finite collocated u/v mask from the first strict-event date is used as the static delivered wet-cell mask for ring and annual occupancy denominators.',
         'primary_estimand': 'same-day same-nearest-depth event core containment minus 120-240 km ring occupancy',
         'outputs': {
             'event_association': str((association_root / 'event_association.parquet').resolve()),
