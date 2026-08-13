@@ -16,7 +16,12 @@ from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 import scipy
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import gaussian_filter, label as ndimage_label
+from scipy.ndimage import (
+    binary_dilation,
+    convolve as ndimage_convolve,
+    gaussian_filter,
+    label as ndimage_label,
+)
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -32792,6 +32797,1157 @@ def build_ofes_delta_do_event_catalog(
         'scan_summary': scan_summary,
         'daily_objects': linked_objects,
         'event_catalog': event_catalog,
+    }
+
+
+def _ofes_zhu_scv_settings(overrides: dict | None = None) -> dict:
+    """解析并校验冻结的 Zhu 网格 SCV 检测参数。"""
+    raw = dict(_OFES_CFG.get('zhu_scv', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(f'Unknown OFES Zhu-SCV override keys: {unknown}.')
+        raw.update(overrides)
+    settings = {
+        'smoothing_window_deg': float(raw.get('smoothing_window_deg', 0.1)),
+        'smoothing_kernel_cells': int(raw.get('smoothing_kernel_cells', 3)),
+        'w0_primary_s_2': float(raw.get('w0_primary_s_2', 5.0e-9)),
+        'w0_sensitivity_s_2': tuple(
+            float(v) for v in raw.get('w0_sensitivity_s_2', (2.5e-9, 1.0e-8))
+        ),
+        'shape_error_max': float(raw.get('shape_error_max', 0.60)),
+        'min_lon_indices': int(raw.get('min_lon_indices', 4)),
+        'min_lat_indices': int(raw.get('min_lat_indices', 4)),
+        'vertical_overlap_cells': int(raw.get('vertical_overlap_cells', 1)),
+        'surface_depth_m': float(raw.get('surface_depth_m', 2.5)),
+        'track_center_displacement_km': float(
+            raw.get('track_center_displacement_km', 55.66)
+        ),
+        'track_relative_tolerance': float(
+            raw.get('track_relative_tolerance', 0.60)
+        ),
+        'duration_threshold_days': tuple(
+            int(v) for v in raw.get('duration_threshold_days', (5, 30))
+        ),
+        'boundary_censor_margin_deg': float(
+            raw.get('boundary_censor_margin_deg', 0.5)
+        ),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'output_subdir': str(raw.get('output_subdir', 'zhu_scv')),
+    }
+    if settings['smoothing_kernel_cells'] != 3:
+        raise ValueError('The frozen Zhu adaptation requires a 3x3 W kernel.')
+    if not np.isclose(settings['smoothing_window_deg'], 0.1, rtol=0.0, atol=1e-12):
+        raise ValueError('The frozen Zhu adaptation requires a 0.1-degree boxcar.')
+    if (
+        not np.isfinite(settings['w0_primary_s_2'])
+        or settings['w0_primary_s_2'] <= 0
+        or len(settings['w0_sensitivity_s_2']) != 2
+        or any(not np.isfinite(v) or v <= 0 for v in settings['w0_sensitivity_s_2'])
+    ):
+        raise ValueError('Zhu W0 thresholds must be finite and positive.')
+    if not (0 < settings['shape_error_max'] < 1):
+        raise ValueError('Zhu shape_error_max must lie strictly between zero and one.')
+    if settings['min_lon_indices'] < 4 or settings['min_lat_indices'] < 4:
+        raise ValueError('Zhu resolved-shape gates require at least four indices.')
+    if settings['vertical_overlap_cells'] != 1:
+        raise ValueError('The frozen Zhu adaptation requires one-cell vertical overlap.')
+    if settings['surface_depth_m'] < 0 or settings['track_center_displacement_km'] <= 0:
+        raise ValueError('Zhu surface depth and tracking displacement are invalid.')
+    if not (0 < settings['track_relative_tolerance'] < 1):
+        raise ValueError('Zhu tracking relative tolerance must lie between zero and one.')
+    if (
+        len(settings['duration_threshold_days']) != 2
+        or any(v <= 0 for v in settings['duration_threshold_days'])
+        or settings['duration_threshold_days'][0] >= settings['duration_threshold_days'][1]
+    ):
+        raise ValueError('Zhu duration thresholds must be ordered positive values.')
+    if settings['background_outer_radius_km'] <= settings['background_inner_radius_km']:
+        raise ValueError('Zhu background annulus bounds are invalid.')
+    if settings['bootstrap_replicates'] <= 0 or not settings['output_subdir'].strip():
+        raise ValueError('Zhu bootstrap and output settings are invalid.')
+    return settings
+
+
+def _ofes_tracer_cell_area_m2(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """计算规则经纬度示踪物网格的球面 cell area。"""
+    lat_arr = np.asarray(lat, dtype=float)
+    lon_arr = np.asarray(lon, dtype=float)
+    if lat_arr.ndim != 1 or lon_arr.ndim != 1 or lat_arr.size < 2 or lon_arr.size < 2:
+        raise ValueError('OFES tracer coordinates must be two non-empty 1-D axes.')
+    if not np.all(np.diff(lat_arr) > 0) or not np.all(np.diff(lon_arr) > 0):
+        raise ValueError('OFES tracer coordinates must be strictly increasing.')
+    lat_edges = np.empty(lat_arr.size + 1, dtype=float)
+    lon_edges = np.empty(lon_arr.size + 1, dtype=float)
+    lat_edges[1:-1] = 0.5 * (lat_arr[:-1] + lat_arr[1:])
+    lon_edges[1:-1] = 0.5 * (lon_arr[:-1] + lon_arr[1:])
+    lat_edges[0] = lat_arr[0] - 0.5 * (lat_arr[1] - lat_arr[0])
+    lat_edges[-1] = lat_arr[-1] + 0.5 * (lat_arr[-1] - lat_arr[-2])
+    lon_edges[0] = lon_arr[0] - 0.5 * (lon_arr[1] - lon_arr[0])
+    lon_edges[-1] = lon_arr[-1] + 0.5 * (lon_arr[-1] - lon_arr[-2])
+    earth_radius_m = 6371000.0
+    lat_band = np.sin(np.deg2rad(lat_edges[1:])) - np.sin(np.deg2rad(lat_edges[:-1]))
+    lon_width = np.deg2rad(np.diff(lon_edges))
+    return earth_radius_m ** 2 * lat_band[:, None] * lon_width[None, :]
+
+
+def _ofes_layer_interfaces_m(depth: np.ndarray) -> np.ndarray:
+    """由固定 z-level 中心构造上界 0 m 和底部半层厚度界面。"""
+    z = np.asarray(depth, dtype=float)
+    if z.ndim != 1 or z.size == 0 or not np.all(np.diff(z) > 0):
+        raise ValueError('OFES depth centers must be strictly increasing.')
+    interfaces = np.empty(z.size + 1, dtype=float)
+    interfaces[0] = 0.0
+    if z.size > 1:
+        interfaces[1:-1] = 0.5 * (z[:-1] + z[1:])
+        interfaces[-1] = z[-1] + 0.5 * (z[-1] - z[-2])
+    else:
+        interfaces[-1] = z[0] + 0.5 * z[0]
+    if np.any(np.diff(interfaces) <= 0):
+        raise ValueError('OFES layer interfaces are not strictly increasing.')
+    return interfaces
+
+
+def _ofes_zhu_metric_fields(
+    u: np.ndarray,
+    v: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> dict:
+    """在示踪物中心计算 metric-aware OW、涡度和应变分量。"""
+    u_arr = np.asarray(u, dtype=float)
+    v_arr = np.asarray(v, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    lon_arr = np.asarray(lon, dtype=float)
+    if u_arr.shape != v_arr.shape or u_arr.ndim != 3:
+        raise ValueError('Zhu u/v fields must share (depth, lat, lon) shape.')
+    if u_arr.shape[1:] != (lat_arr.size, lon_arr.size):
+        raise ValueError('Zhu u/v horizontal shape does not match coordinates.')
+    if lat_arr.size < 3 or lon_arr.size < 3:
+        raise ValueError('Zhu metric derivatives require at least three cells per axis.')
+    earth_radius_m = 6371000.0
+    lat_rad = np.deg2rad(lat_arr)
+    lon_rad = np.deg2rad(lon_arr)
+    cos_lat = np.cos(lat_rad)
+    if np.any(cos_lat <= 0):
+        raise ValueError('Zhu metric derivatives require non-polar latitudes.')
+    du_dlon = np.gradient(u_arr, lon_rad, axis=-1, edge_order=1)
+    dv_dlon = np.gradient(v_arr, lon_rad, axis=-1, edge_order=1)
+    du_dlat = np.gradient(u_arr, lat_rad, axis=-2, edge_order=1)
+    dv_dlat = np.gradient(v_arr, lat_rad, axis=-2, edge_order=1)
+    inv_dx = 1.0 / (earth_radius_m * cos_lat)
+    inv_dy = 1.0 / earth_radius_m
+    du_dx = du_dlon * inv_dx[None, :, None]
+    dv_dx = dv_dlon * inv_dx[None, :, None]
+    du_dy = du_dlat * inv_dy
+    dv_dy = dv_dlat * inv_dy
+    zeta = dv_dx - du_dy
+    normal_strain = du_dx - dv_dy
+    shear_strain = dv_dx + du_dy
+    ow = normal_strain ** 2 + shear_strain ** 2 - zeta ** 2
+    return {
+        'zeta_s_1': zeta.astype(np.float32),
+        'normal_strain_s_1': normal_strain.astype(np.float32),
+        'shear_strain_s_1': shear_strain.astype(np.float32),
+        'okubo_weiss_s_2': ow.astype(np.float32),
+    }
+
+
+def _ofes_zhu_smooth_w(w_field: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """按 Zhu 的 3×3 W boxcar 平滑，要求九格全部有限。"""
+    values = np.asarray(w_field, dtype=float)
+    if values.ndim != 3:
+        raise ValueError('Zhu W field must be three-dimensional.')
+    kernel = np.ones((1, 3, 3), dtype=float)
+    finite = np.isfinite(values)
+    summed = ndimage_convolve(
+        np.where(finite, values, 0.0), kernel, mode='constant', cval=0.0
+    )
+    count = ndimage_convolve(
+        finite.astype(float), kernel, mode='constant', cval=0.0
+    )
+    valid = count == 9.0
+    smoothed = np.full(values.shape, np.nan, dtype=np.float32)
+    smoothed[valid] = (summed[valid] / 9.0).astype(np.float32)
+    return smoothed, valid
+
+
+def _ofes_zhu_circle_shape_error(
+    cells_lat: np.ndarray,
+    cells_lon: np.ndarray,
+    area_m2: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """计算等面积圆拟合的 centroid、R 和离散 symmetric-difference error。"""
+    weights = area_m2[cells_lat, cells_lon]
+    area = float(np.sum(weights))
+    if not np.isfinite(area) or area <= 0:
+        return np.nan, np.nan, np.nan, np.nan
+    center_lat = float(np.sum(lat[cells_lat] * weights) / area)
+    center_lon = float(np.sum(lon[cells_lon] * weights) / area)
+    radius_km = float(np.sqrt(area / np.pi) / 1.0e3)
+    lat_idx_min = max(0, int(np.min(cells_lat)) - int(np.ceil(radius_km / 110.0)) - 3)
+    lat_idx_max = min(lat.size - 1, int(np.max(cells_lat)) + int(np.ceil(radius_km / 110.0)) + 3)
+    cos_center = max(float(np.cos(np.deg2rad(center_lat))), 1.0e-6)
+    lon_pad = radius_km / (110.0 * cos_center)
+    lon_local = _minimal_lon_diff_deg(lon, center_lon)
+    lon_idx = np.flatnonzero(np.abs(lon_local) <= lon_pad + 0.5)
+    if lon_idx.size == 0:
+        return center_lon, center_lat, radius_km, np.nan
+    j0, j1 = int(lon_idx.min()), int(lon_idx.max())
+    i0, i1 = lat_idx_min, lat_idx_max
+    yy, xx = np.meshgrid(lat[i0:i1 + 1], lon[j0:j1 + 1], indexing='ij')
+    dx_km = _minimal_lon_diff_deg(xx, center_lon) * 110.574 * cos_center
+    dy_km = (yy - center_lat) * 111.320
+    circle = dx_km ** 2 + dy_km ** 2 <= radius_km ** 2
+    region = np.zeros(circle.shape, dtype=bool)
+    local_i = cells_lat - i0
+    local_j = cells_lon - j0
+    keep = (
+        (local_i >= 0) & (local_i < region.shape[0])
+        & (local_j >= 0) & (local_j < region.shape[1])
+    )
+    region[local_i[keep], local_j[keep]] = True
+    local_area = area_m2[i0:i1 + 1, j0:j1 + 1]
+    symmetric_difference = float(np.sum(local_area[region ^ circle]))
+    shape_error = symmetric_difference / area
+    return center_lon, center_lat, radius_km, float(shape_error)
+
+
+def _ofes_zhu_regions_at_level(
+    smoothed_w: np.ndarray,
+    valid_w: np.ndarray,
+    threshold: float,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    area_m2: np.ndarray,
+    settings: dict,
+) -> list[dict]:
+    """提取单一 z-level 的闭合 OW candidate regions。"""
+    field = np.asarray(smoothed_w, dtype=float)
+    valid = np.asarray(valid_w, dtype=bool)
+    if field.ndim != 2 or valid.shape != field.shape:
+        raise ValueError('Zhu level W and valid mask must be 2-D and aligned.')
+    candidate = valid & np.isfinite(field) & (field <= -float(threshold))
+    labels, count = ndimage_label(candidate, structure=np.ones((3, 3), dtype=np.int8))
+    regions: list[dict] = []
+    if count == 0:
+        return regions
+    neighborhood = np.ones((3, 3), dtype=bool)
+    ny, nx = candidate.shape
+    for label_id in range(1, int(count) + 1):
+        cells = np.argwhere(labels == label_id)
+        if cells.size == 0:
+            continue
+        ci = cells[:, 0]
+        cj = cells[:, 1]
+        if ci.min() == 0 or cj.min() == 0 or ci.max() == ny - 1 or cj.max() == nx - 1:
+            continue
+        component = labels == label_id
+        around = binary_dilation(component, structure=neighborhood)
+        if np.any(around & ~valid):
+            continue
+        if np.unique(ci).size < settings['min_lat_indices']:
+            continue
+        if np.unique(cj).size < settings['min_lon_indices']:
+            continue
+        center_lon, center_lat, radius_km, shape_error = _ofes_zhu_circle_shape_error(
+            ci, cj, area_m2, lat, lon
+        )
+        if not np.isfinite(shape_error) or shape_error >= settings['shape_error_max']:
+            continue
+        regions.append(
+            {
+                'cells_lat': ci.astype(np.int32),
+                'cells_lon': cj.astype(np.int32),
+                'cell_flat': np.ravel_multi_index((ci, cj), (ny, nx)).astype(np.int32),
+                'area_m2': float(np.sum(area_m2[ci, cj])),
+                'centroid_lon': center_lon,
+                'centroid_lat': center_lat,
+                'radius_km': radius_km,
+                'shape_error': shape_error,
+                'min_lat_index': int(ci.min()),
+                'max_lat_index': int(ci.max()),
+                'min_lon_index': int(cj.min()),
+                'max_lon_index': int(cj.max()),
+                'threshold_s_2': float(threshold),
+            }
+        )
+    return regions
+
+
+def _ofes_zhu_union_find(size: int) -> tuple[np.ndarray, callable, callable]:
+    """返回轻量 union-find 的 parent、find、union。"""
+    parent = np.arange(int(size), dtype=np.int32)
+
+    def find(index: int) -> int:
+        root = int(index)
+        while parent[root] != root:
+            parent[root] = parent[parent[root]]
+            root = int(parent[root])
+        while parent[index] != index:
+            nxt = int(parent[index])
+            parent[index] = root
+            index = nxt
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(int(left))
+        right_root = find(int(right))
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    return parent, find, union
+
+
+def _ofes_zhu_build_objects(
+    date: pd.Timestamp,
+    metric_fields: dict,
+    smoothed_w: np.ndarray,
+    valid_w: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    depth: np.ndarray,
+    threshold: float,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """由逐层 OW regions 建立表面断开的三维 Zhu objects。"""
+    area_m2 = _ofes_tracer_cell_area_m2(lat, lon)
+    interfaces = _ofes_layer_interfaces_m(depth)
+    layer_thickness = np.diff(interfaces)
+    zeta = np.asarray(metric_fields['zeta_s_1'], dtype=float)
+    if zeta.shape != smoothed_w.shape:
+        raise ValueError('Zhu zeta and smoothed W shapes do not match.')
+    regions_by_level: list[list[dict]] = []
+    for level_index in range(len(depth)):
+        regions_by_level.append(
+            _ofes_zhu_regions_at_level(
+                smoothed_w[level_index],
+                valid_w[level_index],
+                threshold,
+                lat,
+                lon,
+                area_m2,
+                settings,
+            )
+        )
+    flat_regions = [region for level in regions_by_level for region in level]
+    if not flat_regions:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {
+                'threshold_s_2': float(threshold),
+                'candidate_region_count': 0,
+                'closed_region_count': 0,
+                'surface_connected_component_count': 0,
+                'object_count': 0,
+                'anticyclonic_object_count': 0,
+                'cyclonic_object_count': 0,
+            },
+        )
+    region_indices: list[list[int]] = []
+    cursor = 0
+    for level_regions in regions_by_level:
+        current = list(range(cursor, cursor + len(level_regions)))
+        region_indices.append(current)
+        for region, index in zip(level_regions, current):
+            region['global_region_index'] = index
+            region['level_index'] = len(region_indices) - 1
+        cursor += len(level_regions)
+    _, find, union = _ofes_zhu_union_find(len(flat_regions))
+    ny, nx = len(lat), len(lon)
+    for level_index in range(len(depth) - 1):
+        upper = regions_by_level[level_index]
+        lower = regions_by_level[level_index + 1]
+        if not upper or not lower:
+            continue
+        upper_by_cell: dict[int, list[int]] = defaultdict(list)
+        lower_by_cell: dict[int, list[int]] = defaultdict(list)
+        for region in upper:
+            for cell in region['cell_flat']:
+                upper_by_cell[int(cell)].append(int(region['global_region_index']))
+        for region in lower:
+            for cell in region['cell_flat']:
+                lower_by_cell[int(cell)].append(int(region['global_region_index']))
+        for cell in set(upper_by_cell).intersection(lower_by_cell):
+            for upper_index in upper_by_cell[cell]:
+                for lower_index in lower_by_cell[cell]:
+                    union(upper_index, lower_index)
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for region in flat_regions:
+        grouped[find(int(region['global_region_index']))].append(region)
+    records: list[dict] = []
+    voxel_records: list[dict] = []
+    level_records: list[dict] = []
+    surface_component_count = 0
+    object_index = 0
+    date_tag = pd.Timestamp(date).strftime('%Y%m%d')
+    for component_regions in grouped.values():
+        levels = np.array([int(region['level_index']) for region in component_regions], dtype=int)
+        if np.any(levels == 0):
+            surface_component_count += 1
+            continue
+        voxel_lat = np.concatenate([region['cells_lat'] for region in component_regions])
+        voxel_lon = np.concatenate([region['cells_lon'] for region in component_regions])
+        voxel_level = np.concatenate([
+            np.full(region['cells_lat'].size, int(region['level_index']), dtype=int)
+            for region in component_regions
+        ])
+        voxel_area = area_m2[voxel_lat, voxel_lon]
+        voxel_volume = voxel_area * layer_thickness[voxel_level]
+        total_volume = float(np.sum(voxel_volume))
+        if not np.isfinite(total_volume) or total_volume <= 0:
+            continue
+        centroid_lat = float(np.sum(lat[voxel_lat] * voxel_volume) / total_volume)
+        centroid_lon = float(np.sum(lon[voxel_lon] * voxel_volume) / total_volume)
+        centroid_depth = float(np.sum(depth[voxel_level] * voxel_volume) / total_volume)
+        horizontal_scale = np.cos(np.deg2rad(centroid_lat))
+        distance2 = (
+            ((lat[voxel_lat] - centroid_lat) * 111320.0) ** 2
+            + (_minimal_lon_diff_deg(lon[voxel_lon], centroid_lon) * 111320.0 * horizontal_scale) ** 2
+            + (depth[voxel_level] - centroid_depth) ** 2
+        )
+        nearest = int(np.nanargmin(distance2))
+        polarity = 'anticyclonic' if float(zeta[voxel_level[nearest], voxel_lat[nearest], voxel_lon[nearest]]) < 0 else 'cyclonic'
+        object_id = f'{date_tag}_ZHU_{object_index:05d}'
+        object_index += 1
+        level_values = sorted(set(int(v) for v in levels))
+        level_area = {}
+        level_centers = {}
+        max_radius = 0.0
+        for level_index in level_values:
+            mask = voxel_level == level_index
+            area_level = float(np.sum(voxel_area[mask]))
+            weights = voxel_area[mask]
+            c_lat = float(np.sum(lat[voxel_lat[mask]] * weights) / area_level)
+            c_lon = float(np.sum(lon[voxel_lon[mask]] * weights) / area_level)
+            rz = float(np.sqrt(area_level / np.pi) / 1.0e3)
+            level_area[level_index] = area_level / 1.0e6
+            level_centers[level_index] = {
+                'center_lon': c_lon,
+                'center_lat': c_lat,
+                'radius_km': rz,
+            }
+            max_radius = max(max_radius, rz)
+            level_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'object_id': object_id,
+                    'level_index': level_index,
+                    'depth_m': float(depth[level_index]),
+                    'center_lon': c_lon,
+                    'center_lat': c_lat,
+                    'area_km2': area_level / 1.0e6,
+                    'radius_km': rz,
+                    'threshold_s_2': float(threshold),
+                }
+            )
+        min_level = min(level_values)
+        max_level = max(level_values)
+        bottom_truncated = bool(max_level == len(depth) - 1)
+        object_record = {
+            'date': pd.Timestamp(date),
+            'object_id': object_id,
+            'threshold_s_2': float(threshold),
+            'polarity': polarity,
+            'surface_disconnected': True,
+            'min_level_index': int(min_level),
+            'max_level_index': int(max_level),
+            'min_depth_m': float(depth[min_level]),
+            'max_depth_m': float(depth[max_level]),
+            'cz_m': centroid_depth,
+            'centroid_lon': centroid_lon,
+            'centroid_lat': centroid_lat,
+            'volume_m3': total_volume,
+            'radius_max_km': max_radius,
+            'thickness_m': float(interfaces[max_level + 1] - interfaces[min_level]),
+            'occupied_level_count': int(len(level_values)),
+            'bottom_truncated': bottom_truncated,
+            'max_level_complete': not bottom_truncated,
+            'nearest_voxel_zeta_s_1': float(zeta[voxel_level[nearest], voxel_lat[nearest], voxel_lon[nearest]]),
+            'level_indices_json': json.dumps(level_values),
+            'level_area_km2_json': json.dumps({str(k): v for k, v in level_area.items()}, sort_keys=True),
+            'level_centers_json': json.dumps({str(k): v for k, v in level_centers.items()}, sort_keys=True),
+        }
+        records.append(object_record)
+        voxel_records.extend(
+            {
+                'date': pd.Timestamp(date),
+                'object_id': object_id,
+                'level_index': int(level_index),
+                'lat_index': int(lat_index),
+                'lon_index': int(lon_index),
+                'threshold_s_2': float(threshold),
+            }
+            for level_index, lat_index, lon_index in zip(voxel_level, voxel_lat, voxel_lon)
+        )
+    objects = pd.DataFrame(records)
+    voxels = pd.DataFrame(voxel_records)
+    diagnostics = {
+        'threshold_s_2': float(threshold),
+        'candidate_region_count': int(sum(len(v) for v in regions_by_level)),
+        'closed_region_count': int(len(flat_regions)),
+        'surface_connected_component_count': int(surface_component_count),
+        'object_count': int(len(objects)),
+        'anticyclonic_object_count': int((objects['polarity'] == 'anticyclonic').sum()) if not objects.empty else 0,
+        'cyclonic_object_count': int((objects['polarity'] == 'cyclonic').sum()) if not objects.empty else 0,
+    }
+    return objects, voxels, diagnostics
+
+
+def _ofes_empty_zhu_objects() -> pd.DataFrame:
+    """返回空 Zhu object 表并固定字段。"""
+    return pd.DataFrame(
+        columns=[
+            'date', 'object_id', 'threshold_s_2', 'polarity', 'surface_disconnected',
+            'min_level_index', 'max_level_index', 'min_depth_m', 'max_depth_m', 'cz_m',
+            'centroid_lon', 'centroid_lat', 'volume_m3', 'radius_max_km', 'thickness_m',
+            'occupied_level_count', 'bottom_truncated', 'max_level_complete',
+            'nearest_voxel_zeta_s_1', 'level_indices_json', 'level_area_km2_json',
+            'level_centers_json',
+        ]
+    )
+
+
+def _ofes_detect_zhu_scv_day_from_snapshot(
+    snapshot: dict,
+    settings: dict,
+) -> dict:
+    """对单日 snapshot 完成 Zhu OW metric、boxcar、对象和阈值敏感性。"""
+    required = ('u', 'v', 'lon', 'lat', 'depth')
+    missing = [key for key in required if key not in snapshot]
+    if missing:
+        raise KeyError(f'OFES Zhu snapshot is missing {missing}.')
+    depth_values = np.asarray(snapshot['depth'], dtype=float)
+    if not np.isclose(
+        depth_values[0], settings['surface_depth_m'], rtol=0.0, atol=1e-6
+    ):
+        raise ValueError(
+            'The delivered shallowest z-level does not match the frozen '
+            f'Zhu surface depth ({settings["surface_depth_m"]:g} m).'
+        )
+    metric = _ofes_zhu_metric_fields(
+        snapshot['u'], snapshot['v'], snapshot['lat'], snapshot['lon']
+    )
+    smoothed_w, valid_w = _ofes_zhu_smooth_w(metric['okubo_weiss_s_2'])
+    thresholds = (settings['w0_primary_s_2'],) + tuple(settings['w0_sensitivity_s_2'])
+    threshold_outputs = {}
+    for threshold in dict.fromkeys(float(v) for v in thresholds):
+        objects, voxels, diagnostics = _ofes_zhu_build_objects(
+            pd.Timestamp(snapshot['date']), metric, smoothed_w, valid_w,
+            np.asarray(snapshot['lon']), np.asarray(snapshot['lat']),
+            np.asarray(snapshot['depth']), threshold, settings,
+        )
+        threshold_outputs[float(threshold)] = {
+            'objects': objects,
+            'voxels': voxels,
+            'diagnostics': diagnostics,
+        }
+    primary = threshold_outputs[float(settings['w0_primary_s_2'])]
+    sensitivity_rows = []
+    for threshold, payload in threshold_outputs.items():
+        sensitivity_rows.append(
+            {
+                'date': pd.Timestamp(snapshot['date']),
+                'threshold_s_2': float(threshold),
+                **payload['diagnostics'],
+            }
+        )
+    return {
+        'date': pd.Timestamp(snapshot['date']),
+        'lon': np.asarray(snapshot['lon'], dtype=float),
+        'lat': np.asarray(snapshot['lat'], dtype=float),
+        'depth': np.asarray(snapshot['depth'], dtype=float),
+        'objects': primary['objects'],
+        'voxels': primary['voxels'],
+        'threshold_summaries': pd.DataFrame(sensitivity_rows),
+        'metric_fields': metric,
+        'smoothed_w': smoothed_w,
+        'valid_w': valid_w,
+        'threshold_outputs': threshold_outputs,
+    }
+
+
+def detect_ofes_zhu_scv_day(
+    date: str | pd.Timestamp = '2003-01-01',
+    *,
+    zhu_overrides: dict | None = None,
+) -> dict:
+    """读取单日 OFES u/v 并执行冻结的 Zhu 三维网格 SCV 检测。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - zhu_overrides (dict | None): 仅允许覆盖 processing.yml 的 zhu_scv 键。
+
+    返回:
+        - dict: 含 primary objects、voxels、threshold_summaries、metric fields 和 mask。
+
+    说明:
+        - 检测器只使用 u/v、坐标和固定 z-level 适配；DO、温盐、SSH 和事件标签不参与。
+        - 正式年度运行必须通过 `validate_ofes_zhu_scv_detector` 后再调用。
+    """
+    settings = _ofes_zhu_scv_settings(zhu_overrides)
+    snapshot = load_ofes_snapshot(
+        pd.Timestamp(date).normalize(), variables=['u', 'v']
+    )
+    if not np.isclose(
+        float(np.asarray(snapshot['depth'], dtype=float)[0]),
+        settings['surface_depth_m'],
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError(
+            'The delivered shallowest z-level does not match the frozen '
+            f'Zhu surface depth ({settings["surface_depth_m"]:g} m).'
+        )
+    return _ofes_detect_zhu_scv_day_from_snapshot(snapshot, settings)
+
+
+def _ofes_zhu_track_objects(
+    daily_objects: pd.DataFrame,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    dates: pd.DatetimeIndex,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按 Zhu consecutive-day displacement/shape gates链接每日对象。"""
+    if daily_objects.empty:
+        empty_tracks = pd.DataFrame(
+            columns=[
+                'track_id', 'polarity', 'start_date', 'end_date', 'observed_days',
+                'duration_days', 'boundary_entry_censored', 'boundary_exit_censored',
+                'first_model_day_censored', 'last_model_day_censored',
+                'observed_duration_is_lower_bound', 'min_depth_m', 'max_depth_m',
+                'mean_cz_m', 'mean_radius_km', 'mean_thickness_m',
+            ]
+        )
+        return daily_objects.copy(), empty_tracks
+    frame = daily_objects.copy()
+    frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+    frame = frame.sort_values(['date', 'polarity', 'object_id'], kind='mergesort').reset_index(drop=True)
+    frame['track_id'] = ''
+    previous: dict[str, pd.DataFrame] = {}
+    next_track_number = 1
+    first_date = pd.Timestamp(dates[0]).normalize()
+    last_date = pd.Timestamp(dates[-1]).normalize()
+    for date in dates:
+        date = pd.Timestamp(date).normalize()
+        current_rows = frame.index[frame['date'] == date].to_numpy(dtype=int)
+        current_by_polarity = {
+            polarity: current_rows[frame.loc[current_rows, 'polarity'].to_numpy() == polarity]
+            for polarity in ('anticyclonic', 'cyclonic')
+        }
+        new_previous: dict[str, pd.DataFrame] = {}
+        for polarity, current_indices in current_by_polarity.items():
+            current = frame.loc[current_indices].copy()
+            previous_frame = previous.get(polarity)
+            admissible: dict[tuple[int, int], float] = {}
+            if previous_frame is not None and not previous_frame.empty and not current.empty:
+                for previous_pos, previous_row in previous_frame.iterrows():
+                    distance = great_circle_distance_m(
+                        current['centroid_lon'].to_numpy(dtype=float),
+                        current['centroid_lat'].to_numpy(dtype=float),
+                        float(previous_row['centroid_lon']),
+                        float(previous_row['centroid_lat']),
+                    ) / 1000.0
+                    rel_cz = np.abs(current['cz_m'].to_numpy(dtype=float) - float(previous_row['cz_m'])) / max(abs(float(previous_row['cz_m'])), 1e-6)
+                    rel_radius = np.abs(current['radius_max_km'].to_numpy(dtype=float) - float(previous_row['radius_max_km'])) / max(abs(float(previous_row['radius_max_km'])), 1e-6)
+                    rel_thickness = np.abs(current['thickness_m'].to_numpy(dtype=float) - float(previous_row['thickness_m'])) / max(abs(float(previous_row['thickness_m'])), 1e-6)
+                    for current_pos in np.flatnonzero(
+                        (distance <= settings['track_center_displacement_km'])
+                        & (rel_cz < settings['track_relative_tolerance'])
+                        & (rel_radius < settings['track_relative_tolerance'])
+                        & (rel_thickness < settings['track_relative_tolerance'])
+                    ):
+                        admissible[(int(previous_pos), int(current_pos))] = float(distance[current_pos])
+            predecessor_counts = defaultdict(int)
+            successor_counts = defaultdict(int)
+            for previous_pos, current_pos in admissible:
+                predecessor_counts[previous_pos] += 1
+                successor_counts[current_pos] += 1
+            linked_current: set[int] = set()
+            for (previous_pos, current_pos), _distance in sorted(admissible.items(), key=lambda item: item[1]):
+                if predecessor_counts[previous_pos] != 1 or successor_counts[current_pos] != 1:
+                    continue
+                if current_pos in linked_current:
+                    continue
+                previous_track_id = str(previous_frame.iloc[previous_pos]['track_id'])
+                if not previous_track_id:
+                    previous_track_id = f'ZHU_T{next_track_number:05d}'
+                    next_track_number += 1
+                frame.loc[current.iloc[current_pos].name, 'track_id'] = previous_track_id
+                linked_current.add(current_pos)
+            for current_pos, row_index in enumerate(current.index):
+                if current_pos in linked_current:
+                    continue
+                frame.loc[row_index, 'track_id'] = f'ZHU_T{next_track_number:05d}'
+                next_track_number += 1
+            new_previous[polarity] = frame.loc[current_indices].copy().reset_index(drop=True)
+        previous = new_previous
+    # Track-level censor and duration properties are computed after all daily links exist.
+    edge_margin = float(settings['boundary_censor_margin_deg'])
+    frame['first_model_day_censored'] = frame['date'] == first_date
+    frame['last_model_day_censored'] = frame['date'] == last_date
+    frame['boundary_edge_distance_deg'] = np.minimum.reduce([
+        frame['centroid_lon'].to_numpy(dtype=float) - float(np.min(lon)),
+        float(np.max(lon)) - frame['centroid_lon'].to_numpy(dtype=float),
+        frame['centroid_lat'].to_numpy(dtype=float) - float(np.min(lat)),
+        float(np.max(lat)) - frame['centroid_lat'].to_numpy(dtype=float),
+    ])
+    frame['boundary_near_edge'] = frame['boundary_edge_distance_deg'] <= edge_margin
+    track_records: list[dict] = []
+    for track_id, group in frame.groupby('track_id', sort=True):
+        group = group.sort_values('date', kind='mergesort')
+        start_date = pd.Timestamp(group['date'].iloc[0])
+        end_date = pd.Timestamp(group['date'].iloc[-1])
+        observed_days = int(len(group))
+        duration_days = int((end_date - start_date).days + 1)
+        first_row = group.iloc[0]
+        last_row = group.iloc[-1]
+        boundary_entry = bool(first_row['boundary_near_edge'])
+        boundary_exit = bool(last_row['boundary_near_edge'])
+        frame.loc[group.index, 'observed_days'] = observed_days
+        frame.loc[group.index, 'duration_days'] = duration_days
+        frame.loc[group.index, 'boundary_entry_censored'] = boundary_entry
+        frame.loc[group.index, 'boundary_exit_censored'] = boundary_exit
+        frame.loc[group.index, 'observed_duration_is_lower_bound'] = bool(
+            boundary_entry or boundary_exit or first_row['first_model_day_censored'] or last_row['last_model_day_censored']
+        )
+        track_records.append(
+            {
+                'track_id': str(track_id),
+                'polarity': str(group['polarity'].iloc[0]),
+                'start_date': start_date,
+                'end_date': end_date,
+                'observed_days': observed_days,
+                'duration_days': duration_days,
+                'boundary_entry_censored': boundary_entry,
+                'boundary_exit_censored': boundary_exit,
+                'first_model_day_censored': bool(first_row['first_model_day_censored']),
+                'last_model_day_censored': bool(last_row['last_model_day_censored']),
+                'observed_duration_is_lower_bound': bool(
+                    boundary_entry or boundary_exit or first_row['first_model_day_censored'] or last_row['last_model_day_censored']
+                ),
+                'min_depth_m': float(group['min_depth_m'].min()),
+                'max_depth_m': float(group['max_depth_m'].max()),
+                'mean_cz_m': float(group['cz_m'].mean()),
+                'mean_radius_km': float(group['radius_max_km'].mean()),
+                'mean_thickness_m': float(group['thickness_m'].mean()),
+            }
+        )
+    tracks = pd.DataFrame(track_records)
+    return frame, tracks
+
+
+def validate_ofes_zhu_scv_detector(
+    *,
+    output_path: str | Path | None = None,
+    raise_on_failure: bool = True,
+) -> dict:
+    """运行冻结 Zhu detector 的解析 solid-body、isolated-vortex 和 pure-shear tests。"""
+    settings = _ofes_zhu_scv_settings()
+    lat = np.linspace(34.0, 36.0, 61)
+    lon = np.linspace(148.0, 150.0, 61)
+    depth = np.array([2.5, 100.0, 200.0, 300.0], dtype=float)
+    x = (lon[None, :] - 149.0) * 111320.0 * np.cos(np.deg2rad(35.0))
+    y = (lat[:, None] - 35.0) * 111320.0
+    u = np.zeros((depth.size, lat.size, lon.size), dtype=float)
+    v = np.zeros_like(u)
+    omega = -1.0e-4
+    radius_m = 22000.0
+    envelope = np.exp(-(x ** 2 + y ** 2) / radius_m ** 2)
+    u[1] = -omega * y * envelope
+    v[1] = omega * x * envelope
+    u[2] = -omega * y * envelope
+    v[2] = omega * x * envelope
+    metric = _ofes_zhu_metric_fields(u, v, lat, lon)
+    zeta_center = float(metric['zeta_s_1'][1, lat.size // 2, lon.size // 2])
+    expected_w = -4.0e-8
+    solid_body_pass = bool(np.isfinite(zeta_center) and zeta_center < 0 and np.isclose(zeta_center, 2.0 * omega, rtol=0.08))
+    w_smoothed, valid = _ofes_zhu_smooth_w(metric['okubo_weiss_s_2'])
+    isolated = _ofes_zhu_build_objects(
+        pd.Timestamp('2003-01-01'), metric, w_smoothed, valid,
+        lon, lat, depth, settings['w0_primary_s_2'], settings,
+    )[0]
+    isolated_pass = bool(
+        not isolated.empty
+        and (isolated['polarity'] == 'anticyclonic').any()
+        and np.nanmin(metric['okubo_weiss_s_2'][1:3]) < expected_w * 0.2
+    )
+    shear_u = np.broadcast_to(2.0e-5 * y, u.shape).copy()
+    shear_v = np.zeros_like(shear_u)
+    shear_metric = _ofes_zhu_metric_fields(shear_u, shear_v, lat, lon)
+    shear_smoothed, shear_valid = _ofes_zhu_smooth_w(shear_metric['okubo_weiss_s_2'])
+    shear_objects = _ofes_zhu_build_objects(
+        pd.Timestamp('2003-01-01'), shear_metric, shear_smoothed, shear_valid,
+        lon, lat, depth, settings['w0_primary_s_2'], settings,
+    )[0]
+    pure_shear_pass = bool(
+        np.nanmax(np.abs(shear_metric['okubo_weiss_s_2'])) < 1.0e-12
+        and shear_objects.empty
+    )
+    result = {
+        'status': 'complete',
+        'passed': bool(solid_body_pass and isolated_pass and pure_shear_pass),
+        'tests': {
+            'solid_body_vorticity': {
+                'passed': solid_body_pass,
+                'center_zeta_s_1': zeta_center,
+                'expected_zeta_s_1': 2.0 * omega,
+            },
+            'isolated_subsurface_vortex': {
+                'passed': isolated_pass,
+                'object_count': int(len(isolated)),
+                'anticyclonic_count': int((isolated['polarity'] == 'anticyclonic').sum()) if not isolated.empty else 0,
+            },
+            'pure_shear_rejection': {
+                'passed': pure_shear_pass,
+                'max_abs_w_s_2': float(np.nanmax(np.abs(shear_metric['okubo_weiss_s_2']))),
+                'object_count': int(len(shear_objects)),
+            },
+        },
+        'settings': settings,
+        'protocol': 'ofes-zhu-scv-analysis-lock.md',
+    }
+    if output_path is not None:
+        _ofes_atomic_write_json(result, Path(output_path))
+    if raise_on_failure and not result['passed']:
+        raise RuntimeError(f'OFES Zhu detector validation failed: {result}')
+    return result
+
+
+def _ofes_zhu_source_inventory(dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """记录 Zhu 年度目录所需 u/v 源文件的 path、size 与 mtime。"""
+    records = []
+    for date in dates:
+        for variable in ('u', 'v'):
+            path = _ofes_file_path(variable, date)
+            if not path.exists():
+                raise FileNotFoundError(f'OFES Zhu source file not found: {path}')
+            stat = path.stat()
+            records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_zhu_code_sha256() -> str:
+    """对 Zhu detector 主函数源代码做稳定 hash。"""
+    functions = (
+        _ofes_zhu_scv_settings,
+        _ofes_tracer_cell_area_m2,
+        _ofes_layer_interfaces_m,
+        _ofes_zhu_metric_fields,
+        _ofes_zhu_smooth_w,
+        _ofes_zhu_circle_shape_error,
+        _ofes_zhu_regions_at_level,
+        _ofes_zhu_build_objects,
+        _ofes_detect_zhu_scv_day_from_snapshot,
+        _ofes_zhu_track_objects,
+    )
+    source = '\n\n'.join(inspect.getsource(function) for function in functions)
+    return hashlib.sha256(source.encode('utf-8')).hexdigest()
+
+
+def _ofes_zhu_run_identity(
+    dates: pd.DatetimeIndex,
+    settings: dict,
+    source_inventory: pd.DataFrame,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    depth: np.ndarray,
+) -> dict:
+    """构造 Zhu 年度运行签名与可审计 provenance。"""
+    inventory_payload = source_inventory.assign(
+        date=source_inventory['date'].dt.strftime('%Y-%m-%d')
+    ).to_dict(orient='records')
+    inventory_sha = hashlib.sha256(
+        json.dumps(inventory_payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+    repo_root = Path(__file__).resolve().parent
+    processing_path = repo_root / 'config' / 'processing.yml'
+    protocol_path = repo_root / 'ofes-zhu-scv-analysis-lock.md'
+    payload = {
+        'schema_version': 1,
+        'start_date': pd.Timestamp(dates[0]).strftime('%Y-%m-%d'),
+        'end_date': pd.Timestamp(dates[-1]).strftime('%Y-%m-%d'),
+        'date_count': int(len(dates)),
+        'detector_settings': settings,
+        'grid': {
+            'lon_count': int(len(lon)),
+            'lat_count': int(len(lat)),
+            'depth_count': int(len(depth)),
+            'lon_min': float(lon[0]),
+            'lon_max': float(lon[-1]),
+            'lat_min': float(lat[0]),
+            'lat_max': float(lat[-1]),
+            'depth_min_m': float(depth[0]),
+            'depth_max_m': float(depth[-1]),
+        },
+        'coordinate_sha256': _ofes_coordinate_sha256(lon, lat, depth),
+        'source_inventory_sha256': inventory_sha,
+        'source_root': str(_ofes_root),
+        'source_root_resolved': str(_ofes_root.resolve()),
+        'code_sha256': _ofes_zhu_code_sha256(),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'protocol_sha256': _file_sha256(protocol_path),
+        'citation': 'Zhu et al. (2024), JPO, doi:10.1175/JPO-D-23-0072.1',
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=_ofes_json_default)
+    signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    return {
+        **payload,
+        'run_signature': signature,
+        'run_tag': f'{pd.Timestamp(dates[0]):%Y%m%d}_{pd.Timestamp(dates[-1]):%Y%m%d}_zhu_{signature[:12]}',
+        'source_identity_basis': 'u/v path, size_bytes, mtime_ns and coordinate/config/source-code hashes; NetCDF payloads are not content-hashed',
+    }
+
+
+def _ofes_zhu_load_completed_run(run_dir: Path) -> dict:
+    """加载已完成 Zhu 年度运行的核心 parquet。"""
+    manifest = json.loads((run_dir / 'manifest.json').read_text(encoding='utf-8'))
+    objects = pd.read_parquet(run_dir / 'daily_objects.parquet')
+    tracks = pd.read_parquet(run_dir / 'tracks.parquet')
+    threshold_summary = pd.read_parquet(run_dir / 'threshold_summary.parquet')
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_objects': objects,
+        'tracks': tracks,
+        'threshold_summary': threshold_summary,
+        'reused_complete_run': True,
+    }
+
+
+def run_ofes_zhu_scv_catalog(
+    start_date: str | pd.Timestamp = '2003-01-01',
+    end_date: str | pd.Timestamp = '2003-12-31',
+    *,
+    zhu_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+    validate_preflight: bool = True,
+) -> dict:
+    """建立冻结 Zhu 网格 SCV 的全年瞬时对象与连续日目录。
+
+    参数:
+        - start_date/end_date (str | pd.Timestamp): 包含端点的 OFES 日期范围。
+        - zhu_overrides (dict | None): 仅允许覆盖已冻结 zhu_scv 配置键。
+        - output_dir (str | Path | None): 输出根目录；默认 plot_outputs/do/ofes_np30_ke/zhu_scv。
+        - resume (bool): 是否复用相同签名的逐日 fragments。
+        - validate_preflight (bool): 是否先运行解析/数值 detector tests。
+
+    返回:
+        - dict: 含 run_dir、manifest、daily_objects、tracks、threshold_summary。
+
+    输出:
+        - 每日 objects/voxels/threshold fragments，以及年度 `daily_objects.parquet`、
+          `object_voxels.parquet`、`level_properties.parquet`、`tracks.parquet`、
+          `threshold_summary.parquet`、`source_inventory.parquet` 与 manifest。
+
+    说明:
+        - 主目录只保留北半球反气旋和气旋两类 surface-disconnected objects；DO/T/S/SSH
+          不进入 detector。duration 是观测下界，边界和首末日 censor 在 tracks 中显式记录。
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError('Zhu end_date must be on or after start_date.')
+    dates = pd.date_range(start, end, freq='D')
+    settings = _ofes_zhu_scv_settings(zhu_overrides)
+    source_inventory = _ofes_zhu_source_inventory(dates)
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(start)
+    identity = _ofes_zhu_run_identity(dates, settings, source_inventory, lon, lat, depth)
+    catalog_root = Path(output_dir) if output_dir is not None else (
+        Path(plots_output_root) / 'do' / 'ofes_np30_ke' / settings['output_subdir']
+    )
+    run_dir = catalog_root / identity['run_tag']
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if existing.get('run_signature') != identity['run_signature']:
+            raise RuntimeError('Existing Zhu run manifest signature does not match request.')
+        if existing.get('status') == 'complete' and resume:
+            return _ofes_zhu_load_completed_run(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    days_dir = run_dir / 'days'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(source_inventory, run_dir / 'source_inventory.parquet')
+    preflight_path = run_dir / 'detector_validation.json'
+    preflight = validate_ofes_zhu_scv_detector(
+        output_path=preflight_path, raise_on_failure=bool(validate_preflight)
+    ) if validate_preflight else {
+        'status': 'skipped_by_caller', 'passed': None,
+        'warning': 'Formal Zhu annual runs require detector validation.',
+    }
+    if not validate_preflight:
+        _ofes_atomic_write_json(preflight, preflight_path)
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_days': 0,
+        'total_days': int(len(dates)),
+        'preflight_required': bool(validate_preflight),
+        'detector_validation_passed': bool(preflight.get('passed')) if validate_preflight else None,
+        'resolution_note': 'OFES 1/30-degree grid is coarser than Zhu ~1.5-km nested grid; small SCVs can fail the frozen 4x4 and shape gates.',
+        'simulation_comparison_note': 'Zhu nested ROMS uses climatological forcing; OFES NP30 is a free-running JRA25-forced hindcast. Dates are not matched.',
+        'boundary_note': 'The delivered western edge near 140.016E is immediately east of the Izu-Ogasawara Ridge source region; edge-touching objects/tracks are censored.',
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    daily_frames: list[pd.DataFrame] = []
+    voxel_frames: list[pd.DataFrame] = []
+    level_frames: list[pd.DataFrame] = []
+    threshold_frames: list[pd.DataFrame] = []
+    completed_days = 0
+    try:
+        for day_index, date in enumerate(dates, start=1):
+            tag = pd.Timestamp(date).strftime('%Y%m%d')
+            object_path = days_dir / f'objects_{tag}.parquet'
+            voxel_path = days_dir / f'voxels_{tag}.parquet'
+            level_path = days_dir / f'levels_{tag}.parquet'
+            threshold_path = days_dir / f'thresholds_{tag}.parquet'
+            metadata_path = days_dir / f'metadata_{tag}.json'
+            reused = False
+            if resume and all(path.exists() for path in (object_path, voxel_path, level_path, threshold_path, metadata_path)):
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+                if metadata.get('run_signature') == identity['run_signature']:
+                    objects = pd.read_parquet(object_path)
+                    voxels = pd.read_parquet(voxel_path)
+                    levels = pd.read_parquet(level_path)
+                    thresholds = pd.read_parquet(threshold_path)
+                    reused = True
+            if not reused:
+                snapshot = load_ofes_snapshot(date, variables=['u', 'v'])
+                detected = _ofes_detect_zhu_scv_day_from_snapshot(snapshot, settings)
+                objects = detected['objects']
+                voxels = detected['voxels']
+                level_records = []
+                if not voxels.empty:
+                    cell_area_m2 = _ofes_tracer_cell_area_m2(lat, lon)
+                    for object_id, object_group in voxels.groupby('object_id', sort=False):
+                        object_row = objects.loc[objects['object_id'] == object_id]
+                        if object_row.empty:
+                            continue
+                        row = object_row.iloc[0]
+                        for level_index, cells in object_group.groupby('level_index'):
+                            cell_lat = cells['lat_index'].to_numpy(dtype=int)
+                            cell_lon = cells['lon_index'].to_numpy(dtype=int)
+                            weights = cell_area_m2[cell_lat, cell_lon]
+                            area_level = float(np.sum(weights)) / 1.0e6
+                            c_lat = float(np.sum(lat[cell_lat] * weights) / np.sum(weights))
+                            c_lon = float(np.sum(lon[cell_lon] * weights) / np.sum(weights))
+                            level_records.append({
+                                'date': pd.Timestamp(date), 'object_id': str(object_id),
+                                'level_index': int(level_index), 'depth_m': float(depth[int(level_index)]),
+                                'center_lon': c_lon, 'center_lat': c_lat,
+                                'area_km2': area_level, 'radius_km': float(np.sqrt(area_level / np.pi)),
+                                'threshold_s_2': float(row['threshold_s_2']),
+                            })
+                levels = pd.DataFrame(level_records)
+                thresholds = detected['threshold_summaries']
+                metadata = {
+                    'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+                    'run_signature': identity['run_signature'],
+                    'coordinate_sha256': identity['coordinate_sha256'],
+                    'reused': False,
+                    'object_count': int(len(objects)),
+                    'voxel_count': int(len(voxels)),
+                }
+                _atomic_write_parquet(objects, object_path)
+                _atomic_write_parquet(voxels, voxel_path)
+                _atomic_write_parquet(levels, level_path)
+                _atomic_write_parquet(thresholds, threshold_path)
+                _ofes_atomic_write_json(metadata, metadata_path)
+            daily_frames.append(objects)
+            voxel_frames.append(voxels)
+            level_frames.append(levels)
+            threshold_frames.append(thresholds)
+            completed_days = day_index
+            if day_index == 1 or day_index == len(dates) or day_index % 10 == 0:
+                print(f'[OFES Zhu catalog] {day_index:03d}/{len(dates):03d} {pd.Timestamp(date):%Y-%m-%d} ({"reused" if reused else "scanned"})', flush=True)
+                manifest['completed_days'] = int(completed_days)
+                manifest['updated_at_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+                _ofes_atomic_write_json(manifest, manifest_path)
+        daily_objects = pd.concat(daily_frames, ignore_index=True) if daily_frames else _ofes_empty_zhu_objects()
+        all_voxels = pd.concat(voxel_frames, ignore_index=True) if voxel_frames else pd.DataFrame(columns=['date', 'object_id', 'level_index', 'lat_index', 'lon_index', 'threshold_s_2'])
+        all_levels = pd.concat(level_frames, ignore_index=True) if level_frames else pd.DataFrame()
+        threshold_daily = pd.concat(threshold_frames, ignore_index=True) if threshold_frames else pd.DataFrame()
+        tracked_objects, tracks = _ofes_zhu_track_objects(daily_objects, lon, lat, dates, settings)
+        threshold_summary = threshold_daily.groupby('threshold_s_2', as_index=False).agg(
+            days=('date', 'count'),
+            mean_object_count=('object_count', 'mean'),
+            total_object_days=('object_count', 'sum'),
+            mean_anticyclonic_count=('anticyclonic_object_count', 'mean'),
+            mean_cyclonic_count=('cyclonic_object_count', 'mean'),
+            max_object_count=('object_count', 'max'),
+        ) if not threshold_daily.empty else pd.DataFrame()
+        _atomic_write_parquet(tracked_objects, run_dir / 'daily_objects.parquet')
+        _atomic_write_parquet(all_voxels, run_dir / 'object_voxels.parquet')
+        _atomic_write_parquet(all_levels, run_dir / 'level_properties.parquet')
+        _atomic_write_parquet(tracks, run_dir / 'tracks.parquet')
+        _atomic_write_parquet(threshold_daily, run_dir / 'threshold_daily.parquet')
+        _atomic_write_parquet(threshold_summary, run_dir / 'threshold_summary.parquet')
+        primary = tracked_objects.loc[tracked_objects['threshold_s_2'] == settings['w0_primary_s_2']] if not tracked_objects.empty else tracked_objects
+        anti = primary.loc[primary['polarity'] == 'anticyclonic'] if not primary.empty else primary
+        manifest.update({
+            'status': 'complete',
+            'completed_days': int(completed_days),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+            'daily_object_rows': int(len(tracked_objects)),
+            'object_voxel_rows': int(len(all_voxels)),
+            'track_count': int(len(tracks)),
+            'primary_object_count': int(len(primary)),
+            'primary_anticyclonic_object_count': int(len(anti)),
+            'primary_anticyclonic_track_count': int((tracks['polarity'] == 'anticyclonic').sum()) if not tracks.empty else 0,
+            'tracks_observed_at_least_5d': int((tracks['observed_days'] >= settings['duration_threshold_days'][0]).sum()) if not tracks.empty else 0,
+            'tracks_observed_over_30d': int((tracks['observed_days'] > settings['duration_threshold_days'][1]).sum()) if not tracks.empty else 0,
+            'outputs': {
+                'detector_validation': str(preflight_path.resolve()),
+                'source_inventory': str((run_dir / 'source_inventory.parquet').resolve()),
+                'daily_objects': str((run_dir / 'daily_objects.parquet').resolve()),
+                'object_voxels': str((run_dir / 'object_voxels.parquet').resolve()),
+                'level_properties': str((run_dir / 'level_properties.parquet').resolve()),
+                'tracks': str((run_dir / 'tracks.parquet').resolve()),
+                'threshold_daily': str((run_dir / 'threshold_daily.parquet').resolve()),
+                'threshold_summary': str((run_dir / 'threshold_summary.parquet').resolve()),
+                'day_fragments': str(days_dir.resolve()),
+            },
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update({
+            'status': 'failed',
+            'completed_days': int(completed_days),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+            'error_type': type(error).__name__,
+            'error': str(error),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_objects': tracked_objects,
+        'tracks': tracks,
+        'threshold_summary': threshold_summary,
+        'reused_complete_run': False,
     }
 
 

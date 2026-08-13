@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.41 变更：
+#   - 按 Zhu et al. (2024) 冻结规则新增 OFES 三维 OW 网格 SCV 检测、z-level
+#     对象/连续日追踪、365 天目录、56 事件关联与背景 null；阈值和网格适配
+#     写入版本化 manifest，检测器不使用 DO、T/S、SSH 或事件标签。
 # version 1.40 变更：
 #   - OFES 输入统一由 paths.yml 的 ./data/OFES_NP30 入口读取，快慢存储
 #     只由本地符号链接决定；移除 OXYGEN_OFES_ROOT 单次运行路径旁路。
@@ -133,7 +137,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.40"
+version: "1.41"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -558,6 +562,26 @@ ofes:
     hosoda_salinity_sigma0: 26.7
     hosoda_salinity_reference_depth_m: 600.0
     output_subdir: event_evolution
+  zhu_scv:
+    # Zhu et al. (2024) OW detector, adapted to delivered 1/30-degree z-level OFES.
+    smoothing_window_deg: 0.1
+    smoothing_kernel_cells: 3
+    w0_primary_s_2: 5.0e-9
+    w0_sensitivity_s_2: [2.5e-9, 1.0e-8]
+    shape_error_max: 0.60
+    min_lon_indices: 4
+    min_lat_indices: 4
+    vertical_overlap_cells: 1
+    surface_depth_m: 2.5
+    track_center_displacement_km: 55.66
+    track_relative_tolerance: 0.60
+    duration_threshold_days: [5, 30]
+    boundary_censor_margin_deg: 0.5
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    output_subdir: zhu_scv
 
 plot:
   basemap_colors:
