@@ -10,12 +10,15 @@ must first have a complete 365-day manifest and complete tracking outputs.
 ## Inputs and identity gate
 
 - PET manifest: explicitly passed `plot_outputs/do/ofes_np30_ke/surface_eddy/runs/<run_id>/manifest.json`.
-- DO50 population root:
+- DO50 catalog root:
   `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/`.
 - Event-diagnostics root:
-  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/event_diagnostics/ofes_events_21efbe902ab7/`.
-- McCoy-compatible event summary is selected only by an explicit path or one
-  unambiguous `event_summary.parquet` below the diagnostics root.
+  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/`.
+- Population authority directory (selected before reading event values):
+  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/`.
+- The McCoy-compatible summary is passed as an explicit path, not selected by
+  newest-directory order:
+  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/trajectory_3d_population/ofes_trajectory3d_population_1d2b102470dd/event_summary.parquet`.
 - Every input file or explicit directory inventory is SHA-256 recorded in the
   association summary. No newest/lexicographically-last run is selected.
 - The population authority is `population_peak_diagnostics.parquet`.
