@@ -34116,7 +34116,10 @@ def run_ofes_zhu_event_association(
     strict = strict.sort_values(['peak_date', 'event_id'], kind='mergesort').reset_index(drop=True)
     if len(strict) != 56:
         raise ValueError(f'Expected the frozen 56-event strict subset, found {len(strict)}.')
-    catalog_run_dir = population_path.parent.parents[2]
+    # population_peak_diagnostics.parquet lives under
+    # <catalog>/event_diagnostics/<diagnostic>/event_population/<population>/;
+    # the catalog root is therefore three parent hops above the file's parent.
+    catalog_run_dir = population_path.parent.parents[3]
     lon, lat, depth, _, _ = _ofes_tracer_coordinates(pd.Timestamp(strict['peak_date'].iloc[0]))
     area_m2 = _ofes_tracer_cell_area_m2(lat, lon)
     validity_snapshot = load_ofes_snapshot(
