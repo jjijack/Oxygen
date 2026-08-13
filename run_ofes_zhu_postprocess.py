@@ -64,6 +64,11 @@ def main() -> None:
     parser.add_argument('--skip-bridge', action='store_true')
     args = parser.parse_args()
     zhu_run = _wait_for_catalog(args.catalog_root, args.poll_seconds)
+    views = track.export_ofes_zhu_catalog_views(zhu_run)
+    print(
+        f"exported technical/anticyclonic catalog views: {views['run_dir']}",
+        flush=True,
+    )
     population = _find_event_population(args.project_root)
     association = track.run_ofes_zhu_event_association(zhu_run, population)
     print(f'completed Zhu event association: {association["run_dir"]}', flush=True)

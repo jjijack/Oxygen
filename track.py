@@ -33951,6 +33951,76 @@ def run_ofes_zhu_scv_catalog(
     }
 
 
+def export_ofes_zhu_catalog_views(
+    zhu_run_dir: str | Path,
+) -> dict:
+    """从技术目录导出协议要求的反气旋主目录视图。
+
+    参数:
+        - zhu_run_dir (str | Path): 已完成 `run_ofes_zhu_scv_catalog` 的运行目录。
+
+    返回:
+        - dict: 含技术目录与反气旋主目录的输出路径、行数和 manifest。
+
+    输出:
+        - `daily_objects_anticyclonic.parquet`、`tracks_anticyclonic.parquet` 与
+          `catalog_views.json`。
+
+    说明:
+        - `daily_objects.parquet`/`tracks.parquet` 保留 cyclonic technical catalog；
+          McCoy-facing primary view 只保留北半球 anticyclonic、surface-disconnected objects。
+          不重新扫描 OFES，也不改变冻结 detector 或既有 run signature。
+    """
+    root = Path(zhu_run_dir)
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.exists():
+        raise FileNotFoundError(f'OFES Zhu manifest not found: {manifest_path}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('status') != 'complete':
+        raise RuntimeError('Zhu catalog views require a complete annual catalog.')
+    objects = pd.read_parquet(root / 'daily_objects.parquet')
+    tracks = pd.read_parquet(root / 'tracks.parquet')
+    anti_objects = objects.loc[
+        objects['polarity'].eq('anticyclonic')
+        & objects['surface_disconnected'].astype(bool)
+    ].copy()
+    anti_track_ids = set(anti_objects['track_id'].astype(str))
+    anti_tracks = tracks.loc[tracks['track_id'].astype(str).isin(anti_track_ids)].copy()
+    object_path = root / 'daily_objects_anticyclonic.parquet'
+    track_path = root / 'tracks_anticyclonic.parquet'
+    views_path = root / 'catalog_views.json'
+    _atomic_write_parquet(anti_objects, object_path)
+    _atomic_write_parquet(anti_tracks, track_path)
+    views = {
+        'status': 'complete',
+        'zhu_run_signature': manifest.get('run_signature'),
+        'technical_catalog': {
+            'daily_objects': str((root / 'daily_objects.parquet').resolve()),
+            'tracks': str((root / 'tracks.parquet').resolve()),
+            'object_count': int(len(objects)),
+            'track_count': int(len(tracks)),
+        },
+        'primary_anticyclonic_catalog': {
+            'daily_objects': str(object_path.resolve()),
+            'tracks': str(track_path.resolve()),
+            'object_count': int(len(anti_objects)),
+            'track_count': int(len(anti_tracks)),
+            'polarity': 'Northern Hemisphere anticyclonic (zeta < 0)',
+            'surface_connected_removed': True,
+        },
+        'interpretation': 'Technical cyclonic objects are retained for reporting; primary event and McCoy-facing analyses use the anticyclonic view.',
+    }
+    _ofes_atomic_write_json(views, views_path)
+    return {
+        'run_dir': root,
+        'technical_objects': objects,
+        'technical_tracks': tracks,
+        'anticyclonic_objects': anti_objects,
+        'anticyclonic_tracks': anti_tracks,
+        'manifest': views,
+    }
+
+
 def _ofes_zhu_density_stratum(sigma0: float) -> str:
     """将事件 core sigma0 映射为冻结的描述性密度层。"""
     if not np.isfinite(sigma0):
@@ -34227,7 +34297,17 @@ def run_ofes_zhu_event_association(
             'core_containing_object_count': int(len(containing)),
             'core_containing_object_ids': json.dumps(sorted(containing)),
             'core_contained_bottom_truncated': bottom_contained,
-            'core_contained_excluding_bottom': bool(core_contained and not bottom_contained),
+            'core_contained_excluding_bottom': bool(
+                any(
+                    not bool(
+                        event_objects.loc[
+                            event_objects['object_id'] == object_id,
+                            'bottom_truncated',
+                        ].iloc[0]
+                    )
+                    for object_id in containing
+                )
+            ),
             'center_within_Rz': center_within,
             'center_object_id': center_object_id,
             'center_distance_over_Rz': center_distance_over_rz,
