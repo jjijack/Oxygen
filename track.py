@@ -34301,6 +34301,236 @@ def run_ofes_zhu_event_association(
     }
 
 
+def _ofes_zhu_bridge_track_requests(
+    daily_objects: pd.DataFrame,
+) -> pd.DataFrame:
+    """为每条 Zhu track 选择最大体积 object-day，且不读取 DO。"""
+    if daily_objects.empty:
+        return pd.DataFrame()
+    primary = daily_objects.loc[
+        (daily_objects['threshold_s_2'].astype(float) == 5.0e-9)
+        & daily_objects['polarity'].eq('anticyclonic')
+    ].copy()
+    if primary.empty:
+        return pd.DataFrame()
+    primary = primary.sort_values(
+        ['track_id', 'volume_m3', 'date', 'object_id'],
+        ascending=[True, False, True, True],
+        kind='mergesort',
+    ).drop_duplicates('track_id', keep='first')
+    records = []
+    for order, row in enumerate(primary.itertuples(index=False)):
+        records.append(
+            {
+                'event_id': f'ZHU_{row.track_id}',
+                'event_order': int(order),
+                'track_id': str(row.track_id),
+                'date': pd.Timestamp(row.date).normalize(),
+                'peak_lon': float(row.centroid_lon),
+                'peak_lat': float(row.centroid_lat),
+                'event_peak_equivalent_radius_km': float(row.radius_max_km),
+                'peak_depth_at_max': float(row.cz_m),
+                'reference_depth_m': float(row.cz_m),
+                'object_id': str(row.object_id),
+                'object_volume_m3': float(row.volume_m3),
+                'object_duration_days': float(getattr(row, 'observed_days', np.nan)),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_zhu_bridge_summary(profiles: pd.DataFrame) -> pd.DataFrame:
+    """汇总 Zhu track 17-profile McCoy conversion，而不与 event detector 混合。"""
+    records = []
+    for event_id, group in profiles.groupby('event_id', sort=True):
+        event_profiles = group.loc[group['sample_role'] == 'event']
+        center = event_profiles.loc[np.isclose(event_profiles['radius_km'], 0.0)]
+        if center.empty:
+            continue
+        records.append(
+            {
+                'event_id': str(event_id),
+                'track_id': str(group['track_id'].iloc[0]),
+                'object_id': str(group['object_id'].iloc[0]),
+                'date': pd.Timestamp(group['date'].iloc[0]),
+                'event_profile_count': int(len(event_profiles)),
+                'center_profile_mccoy_compatible': bool(center['mccoy_profile_compatible'].iloc[0]),
+                'any_event_profile_mccoy_compatible': bool(event_profiles['mccoy_profile_compatible'].any()),
+                'event_profile_mccoy_compatible_fraction': float(event_profiles['mccoy_profile_compatible'].mean()),
+                'center_profile_velocity_confirmed': bool(center['velocity_confirmed_mccoy_compatible'].iloc[0]),
+                'any_event_profile_velocity_confirmed': bool(event_profiles['velocity_confirmed_mccoy_compatible'].any()),
+                'event_profile_velocity_confirmed_fraction': float(event_profiles['velocity_confirmed_mccoy_compatible'].mean()),
+                'valid_control_profile_count': int(group['valid_control_profile_count'].iloc[0]),
+                'center_scv_type': str(center['scv_type'].iloc[0]),
+                'center_gaussian_peak_pressure_dbar': float(center['gaussian_peak_pressure_dbar'].iloc[0]),
+                'center_direct_rossby_number': float(center['direct_rossby_number'].iloc[0]),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def run_ofes_zhu_mccoy_bridge(
+    zhu_run_dir: str | Path,
+    *,
+    mccoy_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+    worker_count: int | None = None,
+) -> dict:
+    """对每条 Zhu anticyclonic track 的最大体积日执行 McCoy 17-profile bridge。
+
+    参数:
+        - zhu_run_dir (str | Path): 已完成 Zhu 年度目录。
+        - mccoy_overrides (dict | None): McCoy profile-chain 的固定配置覆盖。
+        - output_dir (str | Path | None): 输出目录；默认写入 Zhu run 的 `mccoy_bridge`。
+        - resume (bool): 是否复用同签名的 track fragments。
+        - worker_count (int | None): 执行并发度；不进入科学 run signature。
+
+    返回:
+        - dict: 含 profiles、track_summary、manifest 和 run_dir。
+
+    输出:
+        - `tracks/*.parquet`、`virtual_profile_diagnostics.parquet`、`track_summary.parquet`、
+          `analysis_summary.json` 与 `manifest.json`。
+
+    说明:
+        - 每条 track 的选择只依赖 Zhu object volume，不依赖 DO 或已有 McCoy 命中；
+          profile detector 仍调用已冻结的 McCoy-compatible worker。该结果与 56-event
+          peak association 是互补桥接，不是重新定义 Zhu identity。
+    """
+    zhu_root = Path(zhu_run_dir)
+    zhu_manifest = json.loads((zhu_root / 'manifest.json').read_text(encoding='utf-8'))
+    if zhu_manifest.get('status') != 'complete':
+        raise RuntimeError('Zhu McCoy bridge requires a complete annual catalog.')
+    mccoy_settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
+    daily_objects = pd.read_parquet(zhu_root / 'daily_objects.parquet')
+    requests = _ofes_zhu_bridge_track_requests(daily_objects)
+    if requests.empty:
+        raise RuntimeError('Zhu catalog contains no primary anticyclonic tracks for bridge.')
+    science_settings = {key: value for key, value in mccoy_settings.items() if key != 'worker_count'}
+    repo_root = Path(__file__).resolve().parent
+    source_archive = _mccoy_scv_source_archive
+    if not source_archive.exists() or _file_sha256(source_archive) != mccoy_settings['source_archive_sha256']:
+        raise RuntimeError('McCoy source archive is missing or does not match locked SHA-256.')
+    payload = {
+        'schema_version': 1,
+        'zhu_run_signature': zhu_manifest.get('run_signature'),
+        'zhu_daily_objects_sha256': _file_sha256(zhu_root / 'daily_objects.parquet'),
+        'request_sha256': hashlib.sha256(requests.to_json(orient='records', date_format='iso').encode('utf-8')).hexdigest(),
+        'mccoy_settings': science_settings,
+        'mccoy_source_archive_sha256': mccoy_settings['source_archive_sha256'],
+        'processing_config_sha256': _file_sha256(repo_root / 'config' / 'processing.yml'),
+        'bridge_code_sha256': hashlib.sha256(
+            inspect.getsource(_ofes_zhu_bridge_track_requests).encode('utf-8')
+            + inspect.getsource(_ofes_zhu_bridge_summary).encode('utf-8')
+            + inspect.getsource(run_ofes_zhu_mccoy_bridge).encode('utf-8')
+        ).hexdigest(),
+    }
+    signature = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'), default=_ofes_json_default).encode('utf-8')).hexdigest()
+    identity = {**payload, 'run_signature': signature, 'run_tag': f'ofes_zhu_mccoy_bridge_{signature[:12]}'}
+    bridge_root = Path(output_dir) if output_dir is not None else zhu_root / 'mccoy_bridge'
+    run_dir = bridge_root / identity['run_tag']
+    tracks_dir = run_dir / 'tracks'
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if previous.get('run_signature') != signature:
+            raise RuntimeError('Existing Zhu McCoy bridge signature does not match.')
+        if previous.get('status') == 'complete' and (run_dir / 'virtual_profile_diagnostics.parquet').exists():
+            profiles = pd.read_parquet(run_dir / 'virtual_profile_diagnostics.parquet')
+            summary = pd.read_parquet(run_dir / 'track_summary.parquet')
+            analysis = json.loads((run_dir / 'analysis_summary.json').read_text(encoding='utf-8'))
+            return {'run_dir': run_dir, 'manifest': previous, 'profiles': profiles, 'track_summary': summary, 'analysis': analysis, 'reused_complete_run': True}
+    manifest = {
+        **identity,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'track_count': int(len(requests)),
+        'completed_tracks': 0,
+        'worker_count': int(worker_count or mccoy_settings['worker_count']),
+        'sampling': 'center + eight points at 0.35R + eight points at 0.70R; controls are the existing 120-240 km McCoy annulus.',
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    worker_settings = dict(mccoy_settings)
+    run_worker_count = int(worker_count or mccoy_settings['worker_count'])
+    if run_worker_count <= 0:
+        raise ValueError('Zhu McCoy bridge worker_count must be positive.')
+    profile_frames = []
+    audits = []
+    completed = 0
+    try:
+        pending = []
+        for request in requests.to_dict(orient='records'):
+            fragment_path = tracks_dir / f"{request['track_id']}.parquet"
+            if resume and fragment_path.exists():
+                fragment = pd.read_parquet(fragment_path)
+                if not fragment.empty and fragment['bridge_run_signature'].astype(str).eq(signature).all():
+                    profile_frames.append(fragment)
+                    completed += 1
+                    continue
+            pending.append(request)
+        if pending:
+            arguments = [
+                {'request': request, 'settings': worker_settings}
+                for request in pending
+            ]
+            with ProcessPoolExecutor(max_workers=run_worker_count) as executor:
+                future_map = {
+                    executor.submit(_ofes_mccoy_event_worker, argument): argument['request']
+                    for argument in arguments
+                }
+                for future in futures_as_completed(future_map):
+                    request = future_map[future]
+                    profiles, audit = future.result()
+                    profiles['track_id'] = str(request['track_id'])
+                    profiles['object_id'] = str(request['object_id'])
+                    profiles['bridge_run_signature'] = signature
+                    _atomic_write_parquet(profiles, tracks_dir / f"{request['track_id']}.parquet")
+                    profile_frames.append(profiles)
+                    audits.append(audit)
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(requests):
+                        print(f'[OFES Zhu McCoy bridge] {completed}/{len(requests)}', flush=True)
+                        manifest['completed_tracks'] = int(completed)
+                        manifest['updated_at_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+                        _ofes_atomic_write_json(manifest, manifest_path)
+        profiles = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame()
+        summary = _ofes_zhu_bridge_summary(profiles)
+        analysis = {
+            'zhu_track_count': int(len(requests)),
+            'track_profile_count': int(len(profiles)),
+            'track_center_mccoy_count': int(summary['center_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
+            'track_any17_mccoy_count': int(summary['any_event_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
+            'track_center_velocity_confirmed_count': int(summary['center_profile_velocity_confirmed'].sum()) if not summary.empty else 0,
+            'track_any17_velocity_confirmed_count': int(summary['any_event_profile_velocity_confirmed'].sum()) if not summary.empty else 0,
+            'claim_limit': 'Zhu resolved-object and McCoy virtual-profile positives are complementary method layers, not catalog-equivalent detections or causal proof.',
+        }
+        _atomic_write_parquet(profiles, run_dir / 'virtual_profile_diagnostics.parquet')
+        _atomic_write_parquet(summary, run_dir / 'track_summary.parquet')
+        _atomic_write_parquet(pd.DataFrame(audits), run_dir / 'track_audit.parquet')
+        _ofes_atomic_write_json(analysis, run_dir / 'analysis_summary.json')
+        manifest.update({
+            'status': 'complete',
+            'completed_tracks': int(completed),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+            'outputs': {
+                'profiles': str((run_dir / 'virtual_profile_diagnostics.parquet').resolve()),
+                'track_summary': str((run_dir / 'track_summary.parquet').resolve()),
+                'track_audit': str((run_dir / 'track_audit.parquet').resolve()),
+                'analysis_summary': str((run_dir / 'analysis_summary.json').resolve()),
+                'track_fragments': str(tracks_dir.resolve()),
+            },
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update({'status': 'failed', 'completed_tracks': int(completed), 'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(), 'error_type': type(error).__name__, 'error': str(error)})
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {'run_dir': run_dir, 'manifest': manifest, 'profiles': profiles, 'track_summary': summary, 'analysis': analysis, 'reused_complete_run': False}
+
+
 def _ofes_event_diagnostic_settings(
     overrides: dict | None = None,
 ) -> dict:
