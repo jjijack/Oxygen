@@ -34499,7 +34499,8 @@ def run_ofes_zhu_mccoy_bridge(
 
     输出:
         - `tracks/*.parquet`、`virtual_profile_diagnostics.parquet`、`track_summary.parquet`、
-          `boundary_exclusions.parquet`、`analysis_summary.json` 与 `manifest.json`。
+          `boundary_exclusions.parquet`、`control_exclusions.parquet`、`analysis_summary.json`
+          与 `manifest.json`。
 
     说明:
         - 每条 track 的选择只依赖 Zhu object volume，不依赖 DO 或已有 McCoy 命中；
@@ -34627,6 +34628,7 @@ def run_ofes_zhu_mccoy_bridge(
         raise ValueError('Zhu McCoy bridge worker_count must be positive.')
     profile_frames = []
     audits = []
+    control_exclusions = []
     completed = 0
     try:
         pending = []
@@ -34651,7 +34653,28 @@ def run_ofes_zhu_mccoy_bridge(
                 }
                 for future in futures_as_completed(future_map):
                     request = future_map[future]
-                    profiles, audit = future.result()
+                    try:
+                        profiles, audit = future.result()
+                    except RuntimeError as error:
+                        message = str(error)
+                        if 'valid McCoy controls' not in message:
+                            raise
+                        control_exclusions.append({
+                            'event_id': str(request['event_id']),
+                            'track_id': str(request['track_id']),
+                            'date': pd.Timestamp(request['date']),
+                            'peak_lon': float(request['peak_lon']),
+                            'peak_lat': float(request['peak_lat']),
+                            'exclusion_reason': 'insufficient_valid_mccoy_controls',
+                            'error': message,
+                        })
+                        completed += 1
+                        if completed % 10 == 0 or completed == len(requests):
+                            print(f'[OFES Zhu McCoy bridge] {completed}/{len(requests)}', flush=True)
+                            manifest['completed_tracks'] = int(completed)
+                            manifest['updated_at_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+                            _ofes_atomic_write_json(manifest, manifest_path)
+                        continue
                     profiles['track_id'] = str(request['track_id'])
                     profiles['object_id'] = str(request['object_id'])
                     profiles['bridge_run_signature'] = signature
@@ -34666,10 +34689,13 @@ def run_ofes_zhu_mccoy_bridge(
                         _ofes_atomic_write_json(manifest, manifest_path)
         profiles = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame()
         summary = _ofes_zhu_bridge_summary(profiles)
+        control_exclusion_frame = pd.DataFrame(control_exclusions)
         analysis = {
             'candidate_track_count': int(len(candidate_requests)),
             'zhu_track_count': int(len(requests)),
             'boundary_excluded_track_count': int(len(boundary_exclusions)),
+            'control_excluded_track_count': int(len(control_exclusion_frame)),
+            'bridge_completed_track_count': int(len(summary)),
             'track_profile_count': int(len(profiles)),
             'track_center_mccoy_count': int(summary['center_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
             'track_any17_mccoy_count': int(summary['any_event_profile_mccoy_compatible'].sum()) if not summary.empty else 0,
@@ -34680,6 +34706,7 @@ def run_ofes_zhu_mccoy_bridge(
         _atomic_write_parquet(profiles, run_dir / 'virtual_profile_diagnostics.parquet')
         _atomic_write_parquet(summary, run_dir / 'track_summary.parquet')
         _atomic_write_parquet(pd.DataFrame(audits), run_dir / 'track_audit.parquet')
+        _atomic_write_parquet(control_exclusion_frame, run_dir / 'control_exclusions.parquet')
         _ofes_atomic_write_json(analysis, run_dir / 'analysis_summary.json')
         manifest.update({
             'status': 'complete',
@@ -34690,6 +34717,7 @@ def run_ofes_zhu_mccoy_bridge(
                 'track_summary': str((run_dir / 'track_summary.parquet').resolve()),
                 'track_audit': str((run_dir / 'track_audit.parquet').resolve()),
                 'boundary_exclusions': str((run_dir / 'boundary_exclusions.parquet').resolve()),
+                'control_exclusions': str((run_dir / 'control_exclusions.parquet').resolve()),
                 'analysis_summary': str((run_dir / 'analysis_summary.json').resolve()),
                 'track_fragments': str(tracks_dir.resolve()),
             },
