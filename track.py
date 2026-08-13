@@ -34263,7 +34263,9 @@ def run_ofes_zhu_event_association(
         differences, settings['bootstrap_replicates'], settings['random_seed']
     )
     finite_difference = differences[np.isfinite(differences)]
-    if finite_difference.size:
+    if finite_difference.size and np.allclose(finite_difference, 0.0, rtol=0.0, atol=0.0):
+        paired_payload = {'statistic': 0.0, 'p_value': 1.0}
+    elif finite_difference.size:
         paired_test = scipy.stats.wilcoxon(finite_difference, alternative='greater', zero_method='wilcox')
         paired_payload = {'statistic': float(paired_test.statistic), 'p_value': float(paired_test.pvalue)}
     else:
