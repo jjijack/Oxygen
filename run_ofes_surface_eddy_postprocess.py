@@ -1134,7 +1134,22 @@ def _rotation_crosstab(
     expected = int(config["association"]["expected_rotation_events"])
     if len(rotation) != expected:
         raise ValueError(f"Expected {expected} rotation events, found {len(rotation)}")
-    joined = rotation.merge(association, on="event_id", how="left", validate="one_to_one")
+    association_fields = {
+        "peak_core_contained_by_actual_pet_effective_contour",
+        "effective_match_polarity_codes",
+    }
+    missing_association = sorted(association_fields - set(association.columns))
+    if missing_association:
+        raise KeyError(f"Association lacks rotation fields: {missing_association}")
+    # Keep the population peak fields from ``rotation``.  The association table
+    # carries the same identity columns, so merging the full frame would make
+    # pandas suffix them to ``*_x``/``*_y`` and break the locked output schema.
+    joined = rotation.merge(
+        association[["event_id", *sorted(association_fields)]],
+        on="event_id",
+        how="left",
+        validate="one_to_one",
+    )
     deep_ro = pd.to_numeric(joined["rossby_number"], errors="coerce")
     # The source convention is Ro < 0 = anticyclonic, while PET uses +1 for
     # anticyclonic and -1 for cyclonic.
@@ -1247,15 +1262,31 @@ def _mccoy_crosstab(
 def _read_sensitivity_population(
     diagnostics_path: str | FilePath, config: Mapping[str, Any]
 ) -> pd.DataFrame:
-    path = _find_unique_named(diagnostics_path, "deep_sensitivity_ranking.parquet")
+    # The 161-event sensitivity denominator is the quality-eligible 300--1000 m
+    # catalog, not the 59-event DO50 population's deep-sensitivity ranking.
+    path = _find_unique_named(diagnostics_path, "quality_event_catalog.parquet")
     ranking = pd.read_parquet(path).copy()
-    required = {"event_id", "threshold", "deep_sensitivity_eligible", "peak_date", "peak_lon", "peak_lat"}
+    required = {
+        "event_id",
+        "threshold",
+        "quality_eligible",
+        "depth_min_m",
+        "depth_max_m",
+        "peak_date",
+        "peak_lon",
+        "peak_lat",
+    }
     missing = sorted(required - set(ranking.columns))
     if missing:
         raise KeyError(f"Sensitivity ranking lacks columns: {missing}")
+    threshold = pd.to_numeric(ranking["threshold"], errors="raise")
+    depth_min = pd.to_numeric(ranking["depth_min_m"], errors="raise")
+    depth_max = pd.to_numeric(ranking["depth_max_m"], errors="raise")
     selected = ranking.loc[
-        np.isclose(pd.to_numeric(ranking["threshold"], errors="raise"), 50.0)
-        & ranking["deep_sensitivity_eligible"].map(_as_bool).eq(True)
+        np.isclose(threshold, 50.0)
+        & ranking["quality_eligible"].map(_as_bool).eq(True)
+        & depth_min.ge(300.0)
+        & depth_max.le(1000.0)
     ].copy()
     expected = int(config["association"]["expected_quality_eligible_events"])
     if len(selected) != expected:
@@ -2325,6 +2356,8 @@ def run_authoritative_association(
     mccoy_path = output_root / "surface_eddy_mccoy_crosstab.parquet"
     mccoy_frame.to_parquet(mccoy_path, index=False)
 
+    sensitivity_input_file = _find_unique_named(diagnostics_input, "quality_event_catalog.parquet")
+    sensitivity_input_sha256 = sha256_file(sensitivity_input_file)
     sensitivity = _read_sensitivity_population(diagnostics_input, config)
     _validate_identity_consistency(strict, sensitivity)
     sensitivity_result = _sensitivity_association(sensitivity, objects)
@@ -2379,6 +2412,8 @@ def run_authoritative_association(
         "input_hashes": input_hashes,
         "population_input_file": str(population_file),
         "mccoy_input_file": str(mccoy_path_input),
+        "sensitivity_input_file": str(sensitivity_input_file),
+        "sensitivity_input_sha256": sensitivity_input_sha256,
         "candidate_events": int(len(population.loc[np.isclose(pd.to_numeric(population["threshold"], errors="coerce"), 50.0)])),
         "strict_events": int(len(association)),
         "strict_primary_analysis_eligible": int(eligible.sum()),
@@ -2387,6 +2422,19 @@ def run_authoritative_association(
         "effective_peak_footprint_overlap": {
             "n": int(association["effective_peak_footprint_overlap_fraction"].notna().sum()),
             "median": float(association["effective_peak_footprint_overlap_fraction"].median()),
+        },
+        "primary_denominator": {
+            "strict_input": int(len(association)),
+            "core_filter_valid_and_ocean_valid": int(
+                association["peak_core_filter_valid"].map(_as_bool)
+                .mul(association["peak_core_ocean_valid"].map(_as_bool))
+                .sum()
+            ),
+            "complete_background_ring": int(association["ring_occupancy_fraction"].notna().sum()),
+            "effective_core_contained": int(core_effective.fillna(False).sum()),
+            "speed_core_contained": int(
+                association["peak_core_contained_by_actual_pet_speed_contour"].map(_as_bool).eq(True).sum()
+            ),
         },
         "local_ring_null": {
             "core_minus_ring_mean": local_mean,
@@ -2454,6 +2502,8 @@ def run_authoritative_association(
             "plots": plot_paths,
         },
     }
+    association_manifest_path = output_root / "surface_eddy_event_association_manifest.json"
+    summary["paths"]["manifest"] = str(association_manifest_path)
     summary_path = output_root / "surface_eddy_summary.json"
     _write_json(summary_path, summary)
     manifest["event_association"] = {
@@ -2465,11 +2515,52 @@ def run_authoritative_association(
         "association_lock_path": str(association_lock_path),
         "association_lock_sha256": association_lock_sha256,
         "input_hashes": input_hashes,
+        "sensitivity_input_file": str(sensitivity_input_file),
+        "sensitivity_input_sha256": sensitivity_input_sha256,
         "paths": {key: str(value) for key, value in summary["paths"].items()},
     }
     manifest["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     _write_json(manifest_file, manifest)
-    return {key: str(value) for key, value in {"association": association_path, "nulls": null_path, "surface_ro_crosstab": surface_ro_path, "mccoy_crosstab": mccoy_path, "summary": summary_path}.items()}
+    association_manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "catalog_manifest": str(manifest_file),
+        "catalog_manifest_sha256": sha256_file(manifest_file),
+        "catalog_run_id": manifest["run_id"],
+        "association_lock_path": str(association_lock_path),
+        "association_lock_sha256": association_lock_sha256,
+        "postprocess_config_path": str(postprocess_config_path),
+        "postprocess_config_sha256": sha256_file(postprocess_config_path),
+        "postprocessor_sha256": sha256_file(FilePath(__file__)),
+        "input_hashes": input_hashes,
+        "population_input_file": str(population_file),
+        "mccoy_input_file": str(mccoy_path_input),
+        "sensitivity_input_file": str(sensitivity_input_file),
+        "sensitivity_input_sha256": sensitivity_input_sha256,
+        "selection": {
+            "candidate_events": int(
+                len(population.loc[np.isclose(pd.to_numeric(population["threshold"], errors="coerce"), 50.0)])
+            ),
+            "strict_events": int(len(association)),
+            "primary_analysis_eligible": int(eligible.sum()),
+            "quality_eligible_161": int(len(sensitivity_result)),
+        },
+        "outputs": summary["paths"],
+        "summary_sha256": sha256_file(summary_path),
+    }
+    _write_json(association_manifest_path, association_manifest)
+    return {
+        key: str(value)
+        for key, value in {
+            "association": association_path,
+            "nulls": null_path,
+            "surface_ro_crosstab": surface_ro_path,
+            "mccoy_crosstab": mccoy_path,
+            "summary": summary_path,
+            "manifest": association_manifest_path,
+        }.items()
+    }
 
 
 def _plot_contour(ax: Any, row: Mapping[str, Any], name: str, **kwargs: Any) -> None:

@@ -3,6 +3,20 @@
 Status: pre-registered before reading any authoritative DO50 event result.
 Lock date: 2026-08-14 (Asia/Shanghai)
 
+Schema-path correction: the initially noted `trajectory_3d_population/event_summary.parquet`
+is a 52-row trajectory-validation table and does not contain the four McCoy
+event flags. Before the successful association run, the explicit McCoy input
+was corrected to the lifecycle McCoy virtual-Argo summary below. This changes
+no event selection, threshold, denominator, or scientific parameter.
+
+Sensitivity schema correction: the initially attempted
+`deep_sensitivity_ranking.parquet` is a different 59-row ranking and does not
+define the task-book sensitivity denominator. The locked 161-row source is the
+event-diagnostics `quality_event_catalog.parquet`, selected by
+`threshold == 50`, `quality_eligible == True`, `depth_min_m >= 300`, and
+`depth_max_m <= 1000`. This is an input-schema correction, not a change to the
+pre-registered 161-event denominator.
+
 This is the event-level companion to `ofes-surface-eddy-analysis-lock.md`.
 It does not alter the PET detection or tracking signature. The PET catalog
 must first have a complete 365-day manifest and complete tracking outputs.
@@ -16,9 +30,13 @@ must first have a complete 365-day manifest and complete tracking outputs.
   `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/`.
 - Population authority directory (selected before reading event values):
   `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/`.
-- The McCoy-compatible summary is passed as an explicit path, not selected by
-  newest-directory order:
-  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/trajectory_3d_population/ofes_trajectory3d_population_1d2b102470dd/event_summary.parquet`.
+- The McCoy-compatible summary is passed as this explicit path, not selected
+  by newest-directory order:
+  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/event_lifecycle/ofes_lifecycle_f7290df019c2/mccoy_virtual_argo/ofes_mccoy_virtual_argo_a8409b27a056/event_summary.parquet`.
+- The corresponding McCoy manifest is:
+  `/mnt/w2/scratch/user3/Oxygen-ofes/plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/event_lifecycle/ofes_lifecycle_f7290df019c2/mccoy_virtual_argo/ofes_mccoy_virtual_argo_a8409b27a056/manifest.json`.
+- McCoy summary SHA-256: `12ce1fcc749f9f6d5e7f8dea6e910914087c7085570f9ae2210b866a18a2705f`.
+- McCoy manifest SHA-256: `90dd157be61c77a36426eb1287909d4156604290344f386c3f9dce74ac2e18e1`.
 - Every input file or explicit directory inventory is SHA-256 recorded in the
   association summary. No newest/lexicographically-last run is selected.
 - The population authority is `population_peak_diagnostics.parquet`.
@@ -73,7 +91,10 @@ must first have a complete 365-day manifest and complete tracking outputs.
   `any_event_profile_mccoy_compatible` 19/56, and
   `any_event_profile_velocity_confirmed` 11/56. A count mismatch aborts.
 - The 161-row `threshold == 50` quality-eligible sensitivity population is
-  reported separately and never merged into the strict 56 denominator.
+  reported separately and never merged into the strict 56 denominator. Its
+  authoritative source is the event-diagnostics
+  `quality_event_catalog.parquet`; the explicit 300--1000 m bounds are checked
+  before the 161-row count gate.
 
 ## Fixed plots and outputs
 
