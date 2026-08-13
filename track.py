@@ -35231,6 +35231,8 @@ def _ofes_grid_object_association(
         ].copy()
     else:
         target_voxels = pd.DataFrame(columns=voxels.columns)
+    if 'object_id' not in target_voxels.columns:
+        target_voxels = pd.DataFrame({'object_id': pd.Series(dtype=str)})
     identity_ids = set(
         objects.loc[objects['eligible_identity'].astype(bool), 'object_id'].astype(str)
     ) if not objects.empty else set()
