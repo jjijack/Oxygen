@@ -34483,6 +34483,7 @@ def _ofes_grid_seed_masks(
     )
     lens = valid & (spicy | minty) & weak_n2
     seed = lens & local_minimum
+    prefilter_recall = valid & np.isfinite(spice) & np.isfinite(n2)
     return {
         'spicy': spicy & valid,
         'minty': minty & valid,
@@ -34490,6 +34491,7 @@ def _ofes_grid_seed_masks(
         'pv_local_minimum': local_minimum & valid,
         'lens': lens,
         'seed': seed,
+        'prefilter_recall': prefilter_recall,
         'spice_lower': spice_low,
         'spice_upper': spice_high,
         'spice_background_median': spice_median,
@@ -35194,6 +35196,7 @@ def _ofes_grid_mccoy_prefilter_recall(
             'lon_index': int(lon_index),
             'node_index': node_index,
             'in_bounds': in_bounds,
+            'prefilter_recall': bool(masks['prefilter_recall'][node_index, lat_index, lon_index]) if in_bounds else False,
             'prefilter_lens': bool(masks['lens'][node_index, lat_index, lon_index]) if in_bounds else False,
             'prefilter_pv_seed': bool(masks['seed'][node_index, lat_index, lon_index]) if in_bounds else False,
         })
@@ -35444,8 +35447,9 @@ def run_ofes_grid_scv_event_catalog(
         'identity_center_within_radius_count': int(event_association['identity_center_within_radius'].sum()),
         'mccoy_positive_profile_count_expected': int(settings['known_mccoy_positive_profile_count']),
         'mccoy_positive_profile_count_processed': int(len(recall)),
-        'mccoy_prefilter_recall_count': int(positive_recall['prefilter_lens'].sum()) if not positive_recall.empty else 0,
-        'mccoy_prefilter_recall_fraction': float(positive_recall['prefilter_lens'].mean()) if not positive_recall.empty else np.nan,
+        'mccoy_prefilter_recall_count': int(positive_recall['prefilter_recall'].sum()) if not positive_recall.empty else 0,
+        'mccoy_prefilter_recall_fraction': float(positive_recall['prefilter_recall'].mean()) if not positive_recall.empty else np.nan,
+        'mccoy_prefilter_lens_count': int(positive_recall['prefilter_lens'].sum()) if not positive_recall.empty else 0,
         'mccoy_prefilter_pv_seed_count': int(positive_recall['prefilter_pv_seed'].sum()) if not positive_recall.empty else 0,
         'object_inventory_count': int(len(object_inventory)),
         'velocity_confirmed_object_count': int(object_inventory['velocity_confirmed'].sum()) if not object_inventory.empty else 0,
