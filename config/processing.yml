@@ -1,4 +1,14 @@
 # 处理与算法参数配置
+# version 1.44 变更：
+#   - Tier-2 候选中心改用对象三维体积质心（connect_lenses 的 volume-weighted
+#     centroid），不再用每层 voxel 经纬度的算术平均；well_resolved_grid_lens
+#     改用逐 voxel 界面法算出的物理厚度 thickness_m 判定（≥100 m）。
+#   - 每层闭合轮廓内的同号 spice voxel 数显式记录并随日片落盘
+#     （layer_diagnostics.parquet + objects.spice_voxel_count）。
+#   - 年度 tile 网格首尾贴边（首个中心距域边 half_spacing）、相邻中心中点作
+#     Voronoi 边界，全域覆盖无空洞无双计；经度轴按域内最靠赤道的纬度取 cos
+#     并留 0.1% 球面余量；布局构造内置硬验证（每格点 owner 恰一、到所属中心
+#     大圆距离 ≤240 km + 1 m），失败即抛错。
 # version 1.43 变更：
 #   - 新增 OFES grid-SCV v2 修复锁配置：Tier-0 完整 McCoy 门链种子、
 #     Tier-1 闭合 N2 热盐透镜（Barabinot 边界、5–100 km、分层身份）、
@@ -151,7 +161,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.43"
+version: "1.44"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0

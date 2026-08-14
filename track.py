@@ -37215,10 +37215,12 @@ def _ofes_grid_v2_closed_lens_masks(
             inside_cache[key] = inside
         return inside_cache[key]
 
-    def sign_present(inside: np.ndarray, node_index: int, seed_sign: str) -> bool:
+    def sign_count(inside: np.ndarray, node_index: int, seed_sign: str) -> int:
+        # lock §Tier 1：记录（不只验证）掩膜内同号 spice voxel 数，数量
+        # 随 layer/object 诊断落盘供审计复用；为零即判该层失败。
         if seed_sign == 'spicy':
-            return bool(np.count_nonzero(inside & (spice_anomaly[node_index] > 0)) > 0)
-        return bool(np.count_nonzero(inside & (spice_anomaly[node_index] < 0)) > 0)
+            return int(np.count_nonzero(inside & (spice_anomaly[node_index] > 0)))
+        return int(np.count_nonzero(inside & (spice_anomaly[node_index] < 0)))
 
     layers: dict[int, list[dict]] = {}
     for seed in seeds.to_dict('records'):
@@ -37255,7 +37257,8 @@ def _ofes_grid_v2_closed_lens_masks(
             continue
         path_index, selected, _ = max(containing, key=lambda item: abs(item[2]))
         seed_inside = inside_mask_for(node_index, path_index, selected)
-        if not sign_present(seed_inside, node_index, seed_sign):
+        seed_sign_count = sign_count(seed_inside, node_index, seed_sign)
+        if seed_sign_count == 0:
             layers.setdefault(node_index, []).append({
                 'seed': seed,
                 'failed': True,
@@ -37279,6 +37282,7 @@ def _ofes_grid_v2_closed_lens_masks(
                 'mask': seed_inside,
                 'path_vertices': np.asarray(selected.vertices, dtype=float),
                 'spice_sign': seed_sign,
+                'spice_voxel_count': int(seed_sign_count),
                 'seeds': [],
                 'failed': False,
                 'failure_reason': '',
@@ -37305,7 +37309,8 @@ def _ofes_grid_v2_closed_lens_masks(
                     overlapping, key=lambda item: abs(item[2])
                 )
                 inside = inside_mask_for(node, path_index, chosen)
-                if not sign_present(inside, node, seed_sign):
+                growth_sign_count = sign_count(inside, node, seed_sign)
+                if growth_sign_count == 0:
                     break
                 # 同节点同轮廓同号层已存在时不重复添加（另一 seed 已生长
                 # 或在此锚定）；继续用同一掩膜向更远处生长。
@@ -37321,6 +37326,7 @@ def _ofes_grid_v2_closed_lens_masks(
                         'mask': inside,
                         'path_vertices': np.asarray(chosen.vertices, dtype=float),
                         'spice_sign': seed_sign,
+                        'spice_voxel_count': int(growth_sign_count),
                         'seeds': [],
                         'failed': False,
                         'failure_reason': '',
@@ -37347,11 +37353,20 @@ def _ofes_grid_v2_layer_properties(
     valid_depth = depth_values[np.isfinite(depth_values)]
     depth_min = float(np.nanmin(valid_depth)) if valid_depth.size else np.nan
     depth_max = float(np.nanmax(valid_depth)) if valid_depth.size else np.nan
+    spice_voxel_count = int(layer.get('spice_voxel_count', -1))
+    if spice_voxel_count < 0:
+        # 手工构造的 layer（回归测试）未带计数时按同号 spice 现算。
+        spice = np.asarray(fields['anomalies']['spiciness'][node_index], dtype=float)
+        sign = str(layer['spice_sign'])
+        spice_voxel_count = int(np.count_nonzero(
+            mask & (spice > 0 if sign == 'spicy' else spice < 0)
+        ))
     return {
         'node_index': node_index,
         'mask': mask,
         'path_vertices': np.asarray(layer['path_vertices'], dtype=float),
         'spice_sign': str(layer['spice_sign']),
+        'spice_voxel_count': spice_voxel_count,
         'seed_count': int(len(layer['seeds'])),
         'lat_index': lat_idx.astype(np.int32),
         'lon_index': lon_idx.astype(np.int32),
@@ -37370,6 +37385,31 @@ def _ofes_grid_v2_layer_properties(
             or np.any(lon_idx == 0) or np.any(lon_idx == lon.size - 1)
         ),
     }
+
+
+def _ofes_grid_v2_layer_diagnostics(
+    layers: dict[int, list[dict]],
+) -> pd.DataFrame:
+    """把每层闭合轮廓的同号 spice voxel 数等审计字段落成诊断表。
+
+    lock §Tier 1 要求记录（不只验证）每层掩膜内的同号 spice voxel 数；
+    日片随 objects/voxels 一起落盘，避免审计阶段再改 track.py（整文件
+    哈希会使已跑日片失效）。`object_id` 由 connect_lenses 分组时回写。
+    """
+    rows = []
+    for node_index, items in layers.items():
+        for item in items:
+            if item.get('failed'):
+                continue
+            rows.append({
+                'object_id': str(item.get('object_id', '')),
+                'node_index': int(node_index),
+                'path_index': int(item.get('path_index', -1)),
+                'spice_sign': str(item.get('spice_sign', '')),
+                'spice_voxel_count': int(item.get('spice_voxel_count', 0)),
+                'seed_count': int(len(item.get('seeds', []))),
+            })
+    return pd.DataFrame(rows)
 
 
 def _ofes_grid_v2_connect_lenses(
@@ -37400,7 +37440,11 @@ def _ofes_grid_v2_connect_lenses(
                         'failure_reason': str(item['failure_reason']),
                     })
                 continue
-            layer_rows.append(_ofes_grid_v2_layer_properties(item, fields))
+            prop = _ofes_grid_v2_layer_properties(item, fields)
+            # 保留源 layer dict 引用：分组后把 object_id 回写到源层，供
+            # layer 级诊断落盘（同号 spice voxel 数等审计字段）。
+            prop['_source_layer'] = item
+            layer_rows.append(prop)
     empty_schema = {
         'object_id': pd.Series(dtype=str),
         'tier1_identity': pd.Series(dtype=str),
@@ -37419,6 +37463,7 @@ def _ofes_grid_v2_connect_lenses(
         'sigma0_max': pd.Series(dtype=float),
         'spice_sign': pd.Series(dtype=str),
         'seed_count': pd.Series(dtype=int),
+        'spice_voxel_count': pd.Series(dtype=int),
         'volume_m3': pd.Series(dtype=float),
         'touches_domain_edge': pd.Series(dtype=bool),
         'touches_upper_bound': pd.Series(dtype=bool),
@@ -37561,7 +37606,10 @@ def _ofes_grid_v2_connect_lenses(
         volume_m3 = float(np.sum(voxel_volume))
         union_area = float(np.sum(area_field[union_mask]))
         thickness_m = volume_m3 / union_area if union_area > 0 else 0.0
-        lat_grid_c, lon_grid_c = np.meshgrid(
+        # meshgrid(lon, lat) 的第一个输出是 lon 网格（沿列变化）、第二个是
+        # lat 网格（沿行变化）；命名必须对应，否则体积质心经纬互换（Tier-2
+        # 中心参考与 Tier-3 位移全错）。
+        lon_grid_c, lat_grid_c = np.meshgrid(
             np.asarray(fields['lon'], dtype=float),
             np.asarray(fields['lat'], dtype=float),
         )
@@ -37616,14 +37664,23 @@ def _ofes_grid_v2_connect_lenses(
             identity = 'depth_identity_failed'
         else:
             identity = 'grid_lens'
+        # lock §Tier 1：well_resolved 用逐 voxel 界面法算出的物理厚度
+        # thickness_m（体积/并集面积），不是 depth_max - depth_min——倾斜
+        # 等密面上后者会高估厚度。
         well_resolved = bool(
             identity == 'grid_lens'
             and node_count >= v2_settings['well_resolved_min_nodes']
-            and depth_max - depth_min >= v2_settings['well_resolved_thickness_min_m']
+            and np.isfinite(thickness_m)
+            and thickness_m >= v2_settings['well_resolved_thickness_min_m']
         )
         boundary_censored = bool(touches_edge or touches_upper or touches_bottom)
         object_id = f'ofes_grid_lens_{object_index:06d}'
         object_index += 1
+        # 把 object_id 回写到源 layer dict（layer 级诊断落盘用）。
+        for member in members:
+            source = member.get('_source_layer')
+            if isinstance(source, dict) and not source.get('failed'):
+                source['object_id'] = object_id
         object_rows.append({
             'object_id': object_id,
             'tier1_identity': identity,
@@ -37645,6 +37702,9 @@ def _ofes_grid_v2_connect_lenses(
             'sigma0_max': float(fields['nodes_sigma0'][max(unique_nodes)]),
             'spice_sign': next(iter(spice_signs)) if spice_signs else 'unknown',
             'seed_count': int(sum(item['seed_count'] for item in members)),
+            'spice_voxel_count': int(
+                sum(item['spice_voxel_count'] for item in members)
+            ),
             'volume_m3': volume_m3,
             'touches_domain_edge': touches_edge,
             'touches_upper_bound': touches_upper,
@@ -38042,8 +38102,12 @@ def _ofes_grid_v2_velocity_support(
                 ))
                 if overlap and (layer is None or overlap > layer[1]):
                     layer = (candidate, overlap)
-            centroid_lat = float(node_voxels['voxel_lat'].mean())
-            centroid_lon = float(node_voxels['voxel_lon'].mean())
+            # lock §Tier 2：中心参考点用对象行 center_lat/center_lon
+            # （connect_lenses 的三维体积加权质心）。旧实现取该层 voxel
+            # 经纬度的算术平均，在倾斜/厚度不均的透镜上会与体积质心差
+            # 出格点，进而翻转 Nencioli weak/strong 判定。
+            centroid_lat = float(row['center_lat'])
+            centroid_lon = float(row['center_lon'])
             u = np.asarray(fields['anomalies']['u'][node_index], dtype=float)
             v = np.asarray(fields['anomalies']['v'][node_index], dtype=float)
             candidates = np.flatnonzero(mask & np.isfinite(u) & np.isfinite(v))
@@ -38276,8 +38340,8 @@ def detect_ofes_grid_scv_v2_day(
     输出:
         - `output_dir` 非空时写入 `seeds.parquet`、`prefilter_scan.parquet`、
           `objects.parquet`、`voxels.parquet`、`node_support.parquet`、
-          `profile_only.parquet`、`profile_cache.parquet` 与
-          `day_summary.json`。
+          `layer_diagnostics.parquet`、`profile_only.parquet`、
+          `profile_cache.parquet` 与 `day_summary.json`。
 
     说明:
         - `tier1_identity` 是形态/分辨率分级，不是乘法身份门；只有
@@ -38375,6 +38439,7 @@ def _ofes_grid_scv_v2_day_from_snapshot(
     objects, node_support = _ofes_grid_v2_velocity_support(
         objects, voxels, fields, layers, v2_settings
     )
+    layer_diagnostics = _ofes_grid_v2_layer_diagnostics(layers)
     if not objects.empty:
         objects['date'] = date_ts
         objects['window_core_lon'] = float(core_lon)
@@ -38390,6 +38455,8 @@ def _ofes_grid_scv_v2_day_from_snapshot(
         profile_only['date'] = date_ts
     if not node_support.empty:
         node_support['date'] = date_ts
+    if not layer_diagnostics.empty:
+        layer_diagnostics['date'] = date_ts
     grid_lenses = (
         objects.loc[objects['tier1_identity'].eq('grid_lens')]
         if not objects.empty else objects
@@ -38440,6 +38507,9 @@ def _ofes_grid_scv_v2_day_from_snapshot(
         _atomic_write_parquet(profile_only, root / 'profile_only.parquet')
         _atomic_write_parquet(node_support, root / 'node_support.parquet')
         _atomic_write_parquet(
+            layer_diagnostics, root / 'layer_diagnostics.parquet'
+        )
+        _atomic_write_parquet(
             _ofes_grid_v2_profile_frame(profile_cache),
             root / 'profile_cache.parquet',
         )
@@ -38454,6 +38524,7 @@ def _ofes_grid_scv_v2_day_from_snapshot(
         'layers': layers,
         'objects': objects,
         'voxels': voxels,
+        'layer_diagnostics': layer_diagnostics,
         'node_support': node_support,
         'profile_only': profile_only,
         'summary': summary,
@@ -38512,7 +38583,7 @@ def _ofes_grid_v2_load_day_from_dir(
     required = (
         'seeds.parquet', 'prefilter_scan.parquet', 'objects.parquet',
         'voxels.parquet', 'profile_only.parquet', 'node_support.parquet',
-        'profile_cache.parquet',
+        'layer_diagnostics.parquet', 'profile_cache.parquet',
     )
     if not all((day_dir / name).exists() for name in required):
         return None
@@ -38555,6 +38626,9 @@ def _ofes_grid_v2_load_day_from_dir(
         'voxels': pd.read_parquet(day_dir / 'voxels.parquet'),
         'profile_only': pd.read_parquet(day_dir / 'profile_only.parquet'),
         'node_support': pd.read_parquet(day_dir / 'node_support.parquet'),
+        'layer_diagnostics': pd.read_parquet(
+            day_dir / 'layer_diagnostics.parquet'
+        ),
         'summary': summary,
     }
 
@@ -38763,6 +38837,115 @@ def _ofes_grid_v2_track_objects(
     return tracks, objects, summary
 
 
+def _ofes_grid_v2_nearest_center(
+    points: np.ndarray,
+    centers: np.ndarray,
+) -> np.ndarray:
+    """一维坐标点按最近中心归属（有序中心二分 + 左右比较），中心须升序。"""
+    points = np.asarray(points, dtype=float)
+    centers = np.asarray(centers, dtype=float)
+    if centers.size == 1:
+        return np.zeros(points.shape, dtype=np.int32)
+    idx = np.searchsorted(centers, points)
+    idx = np.clip(idx, 1, centers.size - 1)
+    left = centers[idx - 1]
+    right = centers[idx]
+    return np.where(
+        points - left <= right - points, idx - 1, idx
+    ).astype(np.int32)
+
+
+def _ofes_grid_v2_tile_layout(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    outer_km: float,
+) -> dict:
+    """构造年度扫描的规则 tile 中心与每个交付域格点的唯一归属。
+
+    规则格网间距 √2·R 保证任意格点到最近 tile 中心的距离 <= R：纬度轴
+    间距恒为 √2·R km；经度轴按域内最靠赤道的纬度取 cos（最大 km/度），
+    使全域经向 km 间距 <= √2·R。中心列首尾贴边（第一个中心距域边
+    half_spacing、最后一个对称），相邻中心中点作 Voronoi 边界、域边本身
+    是首尾边界：覆盖完整、无空洞、无双计。平面 √2·R 在球面大圆下角落会
+    超 ~14 m，再留 0.1% 余量（√2·R·(1-1e-3)），保证大圆距离 <= R。
+
+    归属 = 每格点按经纬两轴各自就近（searchsorted），每格点恰一个
+    owner。硬验证：所有格点 owner 唯一有效、到所属中心大圆距离 <=
+    outer_km + 1 m（浮点容差），否则 RuntimeError。
+
+    参数:
+        - lon (np.ndarray): 交付域一维经度坐标。
+        - lat (np.ndarray): 交付域一维纬度坐标。
+        - outer_km (float): 分析域半径 R（km）。
+
+    返回:
+        - dict: `tile_centers`（行主序 (lon, lat) 中心列表）、
+          `lat_centers`、`lon_centers`、`owner_grid`（(n_lat, n_lon)
+          int32 tile 索引）与 `max_distance_km`（硬验证通过的最大大圆
+          距离）。
+    """
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    lat_min, lat_max = float(lat.min()), float(lat.max())
+    lon_min, lon_max = float(lon.min()), float(lon.max())
+    spacing_km = np.sqrt(2.0) * float(outer_km) * (1.0 - 1.0e-3)
+    lat_spacing_deg = spacing_km / 111.32
+    # 经度轴：取域内最靠赤道的纬度（最大 km/度），保证任何纬度的经向
+    # km 间距 <= √2·R。
+    equatorward = min([lat_min, lat_max], key=abs)
+    cos_ref = max(float(np.cos(np.deg2rad(abs(equatorward)))), 1.0e-3)
+    lon_spacing_deg = spacing_km / (111.32 * cos_ref)
+
+    def centers_axis(lo: float, hi: float, spacing_deg: float) -> np.ndarray:
+        width = hi - lo
+        if width <= spacing_deg:
+            return np.asarray([0.5 * (lo + hi)])
+        count = int(np.ceil(width / spacing_deg))
+        # 首尾贴边：第一个中心距域边 half_spacing、最后一个对称；中间
+        # 均匀，相邻中心中点即 Voronoi 边界。
+        interior = (width - spacing_deg) / (count - 1)
+        return lo + 0.5 * spacing_deg + interior * np.arange(count)
+
+    lat_centers = centers_axis(lat_min, lat_max, lat_spacing_deg)
+    lon_centers = centers_axis(lon_min, lon_max, lon_spacing_deg)
+    lat_owner = _ofes_grid_v2_nearest_center(lat, lat_centers)
+    lon_owner = _ofes_grid_v2_nearest_center(lon, lon_centers)
+    owner_grid = lat_owner[:, None] * lon_centers.size + lon_owner[None, :]
+    tile_centers = [
+        (float(lon_c), float(lat_c))
+        for lat_c in lat_centers for lon_c in lon_centers
+    ]
+    # 硬验证：覆盖完整（全部格点有 owner）、无双计（owner 网格单值）、
+    # 到所属中心大圆距离 <= outer_km + 1 m 浮点容差。
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    owner_distance_m = np.full(owner_grid.shape, np.nan, dtype=float)
+    for tile_index, (c_lon, c_lat) in enumerate(tile_centers):
+        mask = owner_grid == tile_index
+        if not np.any(mask):
+            continue
+        owner_distance_m[mask] = great_circle_distance_m(
+            lon_grid[mask], lat_grid[mask], float(c_lon), float(c_lat)
+        )
+    max_distance_km = float(np.nanmax(owner_distance_m)) / 1000.0
+    tolerance_km = 1.0e-3
+    if (
+        not np.all(np.isfinite(owner_distance_m))
+        or max_distance_km > float(outer_km) + tolerance_km
+    ):
+        raise RuntimeError(
+            'Annual tile layout coverage check failed: max grid-point '
+            f'great-circle distance to owner center {max_distance_km:.6f} km '
+            f'exceeds {float(outer_km)} km + {tolerance_km} km tolerance.'
+        )
+    return {
+        'tile_centers': tile_centers,
+        'lat_centers': lat_centers,
+        'lon_centers': lon_centers,
+        'owner_grid': owner_grid,
+        'max_distance_km': max_distance_km,
+    }
+
+
 def run_ofes_grid_scv_v2_annual_catalog(
     *,
     year: int = 2003,
@@ -38779,12 +38962,14 @@ def run_ofes_grid_scv_v2_annual_catalog(
     硬前置：56-event 目录的 manifest 必须是**全量正式运行**（`max_events`
     为 None、requested == strict 总数）、`status == 'complete'`、三哈希与
     当前一致、Tier-1 环带 occupancy 均值非零有限（lock 的启动条件）。检测
-    按 √2·R 间隔的规则 tile 网格（任何格点到最近 tile 中心 <= R，完整覆盖，
-    无角落空洞）逐日逐 tile 跑；湿格点按矩形 Voronoi 单元归属最近 tile
-    （每格点恰好计一次）；跨 tile 重复检测的同一物理对象按中心距离去重。
-    occupancy null 的分子分母统一为 cell-days 口径（分母 = Voronoi 湿格点
-    cell-days，分子 = 去重对象 voxels 按日期+坐标键的 cell-days）。Tier-3
-    追踪在去重对象上按三个嵌套检测家族分别运行。
+    按 √2·R 间隔、首尾贴边的规则 tile 网格（相邻中心中点作 Voronoi 边界，
+    任何格点到所属 tile 中心的大圆距离 <= R；布局构造内置硬验证：每格点
+    owner 恰一、无未覆盖/双计，失败在跑任何日片前抛错）逐日逐 tile 跑；
+    湿格点按同一最近中心规则归属（每格点恰好计一次）；跨 tile 重复检测的
+    同一物理对象按中心距离去重。occupancy null 的分子分母统一为 cell-days
+    口径（分母 = Voronoi 湿格点 cell-days，分子 = 去重对象 voxels 按
+    日期+坐标键的 cell-days）。Tier-3 追踪在去重对象上按三个嵌套检测家族
+    分别运行。
 
     参数:
         - year (int): OFES 年度（默认 2003，本交付唯一完整年度）。
@@ -38808,7 +38993,8 @@ def run_ofes_grid_scv_v2_annual_catalog(
     说明:
         - 年度全域成本约等于 tile 数 x 天数 x 单日片时长，工程试跑请先用
           `max_days`；是否正式运行由节点 6 依据 56-event 结果决策。
-        - 边界格点同时属于两个相切内域时按最近 tile 中心归属（对象去重）。
+        - 相邻 tile 边界格点按最近中心归属（每格点恰属一个 Voronoi 单元）；
+          跨 tile 对象去重按中心距离，与分母归属相互独立。
     """
     v2_settings = _ofes_grid_scv_v2_settings(settings)
     repo_root = Path(__file__).resolve().parent
@@ -38872,32 +39058,15 @@ def run_ofes_grid_scv_v2_annual_catalog(
     lon_all, lat_all, _, _, _ = _ofes_tracer_coordinates(dates[0])
     lon_all = np.asarray(lon_all, dtype=float)
     lat_all = np.asarray(lat_all, dtype=float)
-    lon_min, lon_max = float(lon_all.min()), float(lon_all.max())
-    lat_min, lat_max = float(lat_all.min()), float(lat_all.max())
     outer_km = float(v2_settings['background_outer_radius_km'])
-    mid_lat = 0.5 * (lat_min + lat_max)
-    # 相切圆覆盖会留下 ~21.5% 的方格角落空洞；改用 √2·R 间隔的规则格网
-    # （任何格点到最近 tile 中心的距离 <= R，完整覆盖），湿格点按矩形
-    # Voronoi 单元（相邻 tile 中点边界）归属最近 tile，无双计。
-    tile_spacing_km = np.sqrt(2.0) * outer_km
-    tile_lat_deg = tile_spacing_km / 111.32
-    tile_lon_deg = tile_spacing_km / (111.32 * np.cos(np.deg2rad(mid_lat)))
-    half_lat_deg = 0.5 * tile_lat_deg
-    half_lon_deg = 0.5 * tile_lon_deg
-    lat_centers = np.arange(
-        lat_min + half_lat_deg, lat_max - half_lat_deg + 1e-9, tile_lat_deg
-    )
-    lon_centers = np.arange(
-        lon_min + half_lon_deg, lon_max - half_lon_deg + 1e-9, tile_lon_deg
-    )
-    if lat_centers.size == 0:
-        lat_centers = np.asarray([0.5 * (lat_min + lat_max)])
-    if lon_centers.size == 0:
-        lon_centers = np.asarray([0.5 * (lon_min + lon_max)])
-    tile_centers = [
-        (float(lon_c), float(lat_c))
-        for lat_c in lat_centers for lon_c in lon_centers
-    ]
+    # 相切圆覆盖会留下 ~21.5% 的方格角落空洞；改用 √2·R 间隔、首尾贴边
+    # 的规则格网（相邻中心中点作 Voronoi 边界），任何格点到所属 tile
+    # 中心的大圆距离 <= R，覆盖完整、无双计；布局构造内置硬验证（owner
+    # 恰一 + 距离上限），失败在跑任何日片前直接 RuntimeError。
+    tile_layout = _ofes_grid_v2_tile_layout(lon_all, lat_all, outer_km)
+    tile_centers = tile_layout['tile_centers']
+    lat_centers = tile_layout['lat_centers']
+    lon_centers = tile_layout['lon_centers']
     root = Path(output_dir) if output_dir is not None else results_root / 'annual'
     root.mkdir(parents=True, exist_ok=True)
     day_root = root / 'days'
@@ -38909,6 +39078,7 @@ def run_ofes_grid_scv_v2_annual_catalog(
         'tile_count': int(len(tile_centers)),
         'tile_lon_centers': [float(v) for v in lon_centers],
         'tile_lat_centers': [float(v) for v in lat_centers],
+        'tile_coverage_max_distance_km': float(tile_layout['max_distance_km']),
         'max_days': max_days,
         'event_catalog_manifest_sha256': _file_sha256(event_catalog_manifest_path),
         'protocol_sha256': _file_sha256(protocol_path),
@@ -38969,17 +39139,19 @@ def run_ofes_grid_scv_v2_annual_catalog(
                     )
                 # 矩形 Voronoi 单元内的湿格点计数（每个格点恰好归属一个
                 # tile，无双计），逐节点 x 1 度纬度带，作为 occupancy null
-                # 的 cell-days 分母。
+                # 的 cell-days 分母。tile 局地网格按与全局归属相同的最近
+                # 中心规则归属（首尾贴边 + 相邻中心中点边界）。
                 fields = day_result['fields']
                 unique = np.asarray(fields['unique_crossing'], dtype=bool)
-                lon_grid, lat_grid = np.meshgrid(
-                    np.asarray(fields['lon'], dtype=float),
-                    np.asarray(fields['lat'], dtype=float),
+                owner_local = (
+                    _ofes_grid_v2_nearest_center(
+                        np.asarray(fields['lat'], dtype=float), lat_centers
+                    )[:, None] * lon_centers.size
+                    + _ofes_grid_v2_nearest_center(
+                        np.asarray(fields['lon'], dtype=float), lon_centers
+                    )[None, :]
                 )
-                voronoi_cell = (
-                    (np.abs(lon_grid - tile_lon) <= half_lon_deg)
-                    & (np.abs(lat_grid - tile_lat) <= half_lat_deg)
-                )
+                voronoi_cell = owner_local == tile_index
                 lat_bands = np.floor(np.asarray(fields['lat'], dtype=float)).astype(int)
                 lat_bands_grid = np.broadcast_to(
                     lat_bands[:, None], unique.shape[1:]
@@ -39997,7 +40169,8 @@ def _ofes_grid_scv_v2_analytic_validation(
     raise_on_failure: bool = True,
     worker_count: int = 4,
 ) -> dict:
-    """运行 lock 冻结的 14 项解析/工程验证并落盘 detector_validation.json。"""
+    """运行 19 项解析/工程验证（lock 冻结 14 项 + 两轮修复新增 5 项）并
+    落盘 detector_validation.json。"""
     v2_settings = _ofes_grid_scv_v2_settings()
     checks: dict[str, dict] = {}
 
@@ -40441,7 +40614,7 @@ def _ofes_grid_v2_regression_validation(
     output_path: str | Path | None = None,
     raise_on_failure: bool = True,
 ) -> dict:
-    """运行 lock 14 项之外的 10 项实现回归测试并落盘
+    """运行 lock 14 项之外的 11 项实现回归测试并落盘
     regression_validation.json。
 
     测试（对应外部 AI 审核意见的实现层回归）：
@@ -40453,7 +40626,11 @@ def _ofes_grid_v2_regression_validation(
     6. 非均匀层距的逐 voxel 界面厚度与体积加权质心；
     7. underresolved 对象不升级 Tier-2 weak/strong/cyclonic；
     8. 141/4480 控制分母缺样本时 audit 抛错、transition 报 gate_failed；
-    9. 日片复用（resume）在 hash/schema/窗口边界不一致或缺文件时拒绝。
+    9. 日片复用（resume）在 hash/schema/窗口边界不一致或缺文件时拒绝；
+    10. Tier-2 候选中心 = 速度最小格点中离对象体积质心最近者（不是
+        每层 voxel 经纬度算术平均）；
+    11. 年度 tile 布局首尾贴边、每格点 owner 恰一、到所属中心大圆距离
+        <= 240 km、无未覆盖/双计格点。
     """
     v2_settings = _ofes_grid_scv_v2_settings()
     mccoy_settings = _ofes_mccoy_virtual_argo_settings()
@@ -40859,6 +41036,147 @@ def _ofes_grid_v2_regression_validation(
         rejected_bad_code_hash=rejected_bad_code_hash,
         rejected_bad_bounds=rejected_bad_bounds,
         rejected_missing_parquet=rejected_missing_parquet,
+    )
+
+    # R8:Tier-2 候选中心 = 该层掩膜内速度最小格点中离对象三维体积质心
+    # 最近者(不是每层 voxel 经纬度的算术平均)。构造 node0 大而薄
+    # (14x14, 50 m)、node1 小而厚(10x10, 250 m)的两层对象:体积质心
+    # 偏向 node1 小块,node0 自身算术平均在大块中心。两个速度最小格点
+    # 分别落在这两处,旧实现选 (15,15)(离 node0 算术平均近),新实现
+    # 必须选 (10,10)(离体积质心近)。
+    depth_cv = np.full((3, 40, 40), np.nan, dtype=float)
+    depth_cv[0] = 400.0
+    depth_cv[1] = 450.0
+    depth_cv[2] = 900.0
+    u_cv = np.zeros((3, 40, 40), dtype=float)
+    v_cv = np.full((3, 40, 40), 0.05, dtype=float)
+    v_cv[:, 10, 10] = 0.0
+    v_cv[:, 15, 15] = 0.0
+    fields_cv = {
+        'nodes_sigma0': np.asarray([26.0, 26.05, 26.10]),
+        'lat': lat,
+        'lon': lon,
+        'depth': depth_cv,
+        'anomalies': {
+            'spiciness': np.full((3, 40, 40), 0.3),
+            'n2': np.full((3, 40, 40), -1.0),
+            'zeta': np.zeros((3, 40, 40)),
+            'pv': np.zeros((3, 40, 40)),
+            'u': u_cv,
+            'v': v_cv,
+        },
+    }
+    layers_cv = {
+        0: [layer_dict(0, mask_block(40, 8, 8, 14))],
+        1: [layer_dict(1, mask_block(40, 6, 6, 10))],
+    }
+    objects_cv, voxels_cv, _ = _ofes_grid_v2_connect_lenses(
+        fields_cv, layers_cv, v2_settings
+    )
+    objects_cv2, node_support_cv = _ofes_grid_v2_velocity_support(
+        objects_cv, voxels_cv, fields_cv, layers_cv, v2_settings
+    )
+    node0_support = node_support_cv.loc[
+        node_support_cv['node_index'].eq(0)
+    ]
+    chosen_lat = (
+        float(node0_support['center_lat'].iloc[0])
+        if len(node0_support) else np.nan
+    )
+    chosen_lon = (
+        float(node0_support['center_lon'].iloc[0])
+        if len(node0_support) else np.nan
+    )
+    # 独立期望:体积质心行 = (196x50x14.5 + 100x250x10.5) / (196x50 +
+    # 100x250) = 11.63,离 (10,10) 比 (15,15) 近;node0 算术平均行 14.5
+    # 离 (15,15) 更近(旧实现会选错)。
+    centroid_row_expected = (
+        (196.0 * 50.0 * 14.5 + 100.0 * 250.0 * 10.5)
+        / (196.0 * 50.0 + 100.0 * 250.0)
+    )
+    centroid_lat_expected = float(lat[0]) + centroid_row_expected * (
+        float(lat[-1]) - float(lat[0])
+    ) / (lat.size - 1)
+    record(
+        'tier2_center_uses_volume_centroid',
+        bool(
+            len(node0_support) == 1
+            and len(objects_cv2) == 1
+            and abs(chosen_lat - float(lat[10])) < 1e-12
+            and abs(chosen_lon - float(lon[10])) < 1e-12
+            and abs(
+                float(objects_cv2['center_lat'].iloc[0])
+                - centroid_lat_expected
+            ) < 0.1
+        ),
+        chosen_lat=chosen_lat,
+        chosen_lon=chosen_lon,
+        object_center_lat=(
+            float(objects_cv2['center_lat'].iloc[0]) if len(objects_cv2) else np.nan
+        ),
+        centroid_lat_expected=centroid_lat_expected,
+        node0_arithmetic_mean_lat=float(np.mean(lat[8:22])),
+    )
+
+    # R9:年度 tile 布局——首尾贴边、每格点 owner 恰一、到所属中心大圆
+    # 距离 <= 240 km、无未覆盖/双计格点(交付域 25-45N x 140-170E,
+    # 0.25 度格距)。旧 arange 方案最后一个 Voronoi 单元只盖到 ~43.29N,
+    # 北侧 ~1.71 度无分母;tile 数 7x9 由冻结的 240 km 半径决定。
+    lat_gl = np.arange(25.0, 45.0 + 1e-9, 0.25)
+    lon_gl = np.arange(140.0, 170.0 + 1e-9, 0.25)
+    layout_gl = _ofes_grid_v2_tile_layout(
+        lon_gl, lat_gl, float(v2_settings['background_outer_radius_km'])
+    )
+    s_lat_deg = (
+        np.sqrt(2.0) * float(v2_settings['background_outer_radius_km'])
+        * (1.0 - 1.0e-3) / 111.32
+    )
+    flush_lat = bool(
+        abs(layout_gl['lat_centers'][0] - (25.0 + 0.5 * s_lat_deg)) < 1e-9
+        and abs(layout_gl['lat_centers'][-1] - (45.0 - 0.5 * s_lat_deg)) < 1e-9
+    )
+    owner_gl = layout_gl['owner_grid']
+    centers_gl = np.asarray(layout_gl['tile_centers'])
+    # 独立复验:每格点到所有中心的 argmin == owner(无双计、无覆盖漏洞),
+    # 且 max 大圆距离 <= 240 km + 1 m;每个 tile 至少一个格点。
+    lon_grid_gl, lat_grid_gl = np.meshgrid(lon_gl, lat_gl)
+    all_distances = np.column_stack([
+        great_circle_distance_m(
+            lon_grid_gl.ravel(), lat_grid_gl.ravel(),
+            float(c_lon), float(c_lat),
+        )
+        for c_lon, c_lat in centers_gl
+    ])
+    argmin_owner = np.argmin(all_distances, axis=1)
+    argmin_ok = bool(np.all(argmin_owner == owner_gl.ravel()))
+    owner_distance_m = all_distances[
+        np.arange(all_distances.shape[0]), owner_gl.ravel()
+    ]
+    max_distance_test_km = float(np.max(owner_distance_m)) / 1000.0
+    tiles_used = bool(np.all(
+        np.bincount(owner_gl.ravel(), minlength=centers_gl.shape[0]) > 0
+    ))
+    record(
+        'annual_tile_full_coverage',
+        bool(
+            flush_lat
+            and layout_gl['lat_centers'].size == 7
+            and layout_gl['lon_centers'].size == 9
+            and bool(np.all(owner_gl >= 0))
+            and argmin_ok
+            and tiles_used
+            and max_distance_test_km <= 240.0 + 1e-3
+            and layout_gl['max_distance_km'] <= 240.0 + 1e-3
+        ),
+        lat_center_count=int(layout_gl['lat_centers'].size),
+        lon_center_count=int(layout_gl['lon_centers'].size),
+        tile_count=int(len(layout_gl['tile_centers'])),
+        first_lat_center=float(layout_gl['lat_centers'][0]),
+        last_lat_center=float(layout_gl['lat_centers'][-1]),
+        argmin_matches_owner=argmin_ok,
+        tiles_all_used=tiles_used,
+        max_distance_km=max_distance_test_km,
+        layout_max_distance_km=float(layout_gl['max_distance_km']),
     )
     passed = all(checks[name]['passed'] for name in checks)
     result = {
@@ -41504,7 +41822,7 @@ def run_ofes_grid_scv_v2_validation(
 ) -> dict:
     """运行 v2 全部解析验证、审计日与阳性/背景控制，并冻结门控。
 
-    顺序：14 项解析验证 + 10 项实现回归 -> 4 审计日预筛 recall -> 56 事件
+    顺序：19 项解析验证 + 12 项实现回归 -> 4 审计日预筛 recall -> 56 事件
     日扫描（resume 只复用三哈希/窗口边界一致的 complete 日片） ->
     seed_control_audit / matched_background_control / tier_transition_summary。
     门控要求：解析验证与回归全过、预筛 recall 141/141、Tier-0 精确位置

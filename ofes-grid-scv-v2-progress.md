@@ -21,8 +21,12 @@ weak/strong `native_anticyclonic_support`(Nencioli 四规则 + N2 边界 circula
   审计/控制 runner + 14 项验证框架)
 - `3d1040a` **Repair the grid SCV v2 detector and run gates**(外部 AI 审核
   15 项实现层 bug 修复 + 8 项回归测试 + 年度 runner / Tier-3 tracking)
-- **未提交(工作区)**:第二轮复审修复(halo 窗口/逐 voxel 体积/Nencioli
-  完整门/节点 4 证据链硬门/年度 runner 5 处/Tier-3 嵌套与 split 规则)
+- `63ed5ab` **Complete the grid SCV v2 window halo and frozen gates**(第二轮
+  复审:halo 490 km 窗口/逐 voxel 体积/Nencioli 完整门/节点 4 证据链硬门/
+  年度 runner 5 处/Tier-3 嵌套与 split 规则;19 解析 + 10 回归 PASS)
+- `5a60678` **Correct the grid SCV v2 centroid usage and annual tile
+  coverage**(第三轮局部修正:体积质心中心/物理厚度 well_resolved/年度
+  tile 首尾贴边全覆盖/spice voxel 计数落盘;19 解析 + 12 回归 PASS)
 
 v1 拒绝输出已写 SUPERSEDED 标记:
 `Oxygen-cache/ofes_grid_scv_results/{annual_*_localrecert*, event_catalog_final}/SUPERSEDED.txt`
@@ -83,10 +87,10 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 为 0 / underresolved 不升级 Tier-2 / 141·4480 分母缺样本硬失败 / transition
 缺失行 gate_failed / 日片复用在 hash·schema·窗口不一致时拒绝。
 
-## 验证状态(第二轮修复后全量重跑,2026-08-15)
+## 验证状态(第三轮修正后全量重跑,2026-08-15)
 
 - 解析验证:19/19 PASS
-- 回归验证:10/10 PASS
+- 回归验证:12/12 PASS
 - `py_compile` OK
 
 ### 第二轮修复(外部 AI 复审意见,全部落码)
@@ -115,6 +119,30 @@ v1 拒绝输出已写 SUPERSEDED 标记:
   merge 一律全部开新 track
 - **回归测试**:新增同节点两 mask 传递 union、非均匀层距逐 voxel 厚度
 
+### 第三轮修正(外部 AI 局部复审意见,全部落码)
+
+- **Tier-2 中心 = 体积质心**:velocity_support 的速度最小点选择参考点改用
+  对象行 center_lat/center_lon(三维体积加权质心),不再用每层 voxel 经纬度
+  算术平均。途中发现并修复 connect_lenses 的 meshgrid 命名互换 bug
+  (meshgrid(lon, lat) 第一个输出是 lon 网格——旧代码体积质心经纬互换,
+  Tier-2 中心参考与 Tier-3 位移全错;新回归测试 R8 直接暴露)
+- **well_resolved 物理厚度**:改用 thickness_m(体积/并集面积) >= 100 m,
+  与 lock 冻结口径("physical vertical thickness")一致;旧实现
+  depth_max - depth_min 在倾斜等密面上高估厚度
+- **年度 tile 全覆盖**:首尾贴边中心(第一个中心距域边 half_spacing)+
+  相邻中心中点作 Voronoi 边界(旧 arange 方案北侧 ~1.71° 无分母);经度轴
+  按域内最靠赤道纬度取 cos + 0.1% 球面余量(平面 √2·R 换大圆会超 ~14 m);
+  布局内置硬验证(每格点 owner 恰一、到所属中心大圆距离 <= 240 km + 1 m),
+  失败在跑任何日片前抛错;tile 局地网格按同一最近中心规则归属,无双计
+- **spice voxel 数落盘**:closed_lens_masks 记录每层闭合轮廓内同号 spice
+  voxel 数(不只验证存在);objects 增 spice_voxel_count 列、日片新增
+  layer_diagnostics.parquet——lock §Tier 1 "record the count" 的审计字段
+  不再需要后续改 track.py(整文件哈希会使已跑日片失效)
+- **回归测试**:新增 tier2_center_uses_volume_centroid(质心 vs 算术平均
+  判别场景)、annual_tile_full_coverage(25-45N x 140-170E 全域独立
+  argmin 复验 + 距离硬上限)
+- **配置**:processing.yml 升 1.44(changelog 记录本轮全部修复)
+
 ## 冻结输入(路径均存在且已核验)
 
 - population: `plot_outputs/do/ofes_np30_ke/ofes_delta_do_catalog/20030101_20031231_cf957935d38a/event_diagnostics/ofes_events_21efbe902ab7/event_population/ofes_population_254ae68988a6/population_peak_diagnostics.parquet`(sha b91435f2...)
@@ -124,10 +152,10 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 
 ## 下一步
 
-1. 用户提交第二轮修复 commit(工作区未提交)
+1. 提交第三轮修正 commit(工作区)
 2. **节点 4**: `run_ofes_grid_scv_v2_validation(population_path, mccoy_diag_path,
    event_summary_path, output_dir=..., worker_count=16, resume=True)`
-   - 14 项解析 + 8 项回归(重跑落盘)→ 4 审计日 → 56 事件日扫描(~5 min/日,
+   - 19 项解析 + 12 项回归(重跑落盘)→ 4 审计日 → 56 事件日扫描(~5 min/日,
      16 workers ≈ 4.7 hr wall)→ seed_control_audit(141 硬门)→
      matched_background_control(4480 硬门)→ tier_transition_summary
      (attrition 到 weak/strong)
