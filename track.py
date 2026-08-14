@@ -34707,13 +34707,33 @@ def _ofes_grid_connect_components(
     by_node: dict[int, list[int]] = defaultdict(list)
     for index, component in enumerate(components):
         by_node[int(component['node_index'])].append(index)
+    # Build adjacent-layer overlap pairs from shared grid cells rather than
+    # testing every component pair.  The two implementations are equivalent
+    # for the frozen "same sign + shared voxel" rule, but the pairwise form
+    # becomes quadratic when a noisy deep layer contains many components.
+    component_lookup = {}
+    for node_index, indices in by_node.items():
+        labels = np.zeros(lens.shape[1:], dtype=np.int32)
+        for component_index in indices:
+            labels[components[component_index]['mask']] = int(component_index) + 1
+        component_lookup[int(node_index)] = labels
     for node_index in range(nodes.size - 1):
-        for left in by_node.get(node_index, []):
-            for right in by_node.get(node_index + 1, []):
-                if components[left]['spice_sign'] != components[right]['spice_sign']:
-                    continue
-                if np.any(components[left]['mask'] & components[right]['mask']):
-                    union(left, right)
+        left_labels = component_lookup.get(node_index)
+        right_labels = component_lookup.get(node_index + 1)
+        if left_labels is None or right_labels is None:
+            continue
+        shared = (left_labels > 0) & (right_labels > 0)
+        if not np.any(shared):
+            continue
+        pairs = np.unique(
+            np.column_stack((left_labels[shared], right_labels[shared])),
+            axis=0,
+        )
+        for left_label, right_label in pairs:
+            left = int(left_label) - 1
+            right = int(right_label) - 1
+            if components[left]['spice_sign'] == components[right]['spice_sign']:
+                union(left, right)
     grouped: dict[int, list[dict]] = defaultdict(list)
     for index, component in enumerate(components):
         grouped[find(index)].append(component)
