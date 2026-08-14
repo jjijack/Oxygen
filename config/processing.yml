@@ -646,6 +646,7 @@ ofes:
     classical_size_max_km: 50.0
     background_inner_radius_km: 120.0
     background_outer_radius_km: 240.0
+    background_control_radius_km: 230.0
     background_min_columns: 61
     n2_density_tolerance_kg_m3: 0.2
     nencioli_a_cells: 3

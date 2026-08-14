@@ -19,8 +19,10 @@ weak/strong `native_anticyclonic_support`(Nencioli 四规则 + N2 边界 circula
 - `9e9a779` **Build the McCoy-seeded grid SCV detector**(track.py +3290 行 +
   processing.yml v1.43 `grid_scv_v2:` 段;Tier 0–3 全部代码 + 56-event runner +
   审计/控制 runner + 14 项验证框架)
-- **未提交(工作区)**:外部 AI 审核的 15 项实现层 bug 修复 + 8 项回归测试
-  + 年度 runner / Tier-3 tracking(见下)
+- `3d1040a` **Repair the grid SCV v2 detector and run gates**(外部 AI 审核
+  15 项实现层 bug 修复 + 8 项回归测试 + 年度 runner / Tier-3 tracking)
+- **未提交(工作区)**:第二轮复审修复(halo 窗口/逐 voxel 体积/Nencioli
+  完整门/节点 4 证据链硬门/年度 runner 5 处/Tier-3 嵌套与 split 规则)
 
 v1 拒绝输出已写 SUPERSEDED 标记:
 `Oxygen-cache/ofes_grid_scv_results/{annual_*_localrecert*, event_catalog_final}/SUPERSEDED.txt`
@@ -81,11 +83,37 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 为 0 / underresolved 不升级 Tier-2 / 141·4480 分母缺样本硬失败 / transition
 缺失行 gate_failed / 日片复用在 hash·schema·窗口不一致时拒绝。
 
-## 验证状态(修复后全量重跑)
+## 验证状态(第二轮修复后全量重跑,2026-08-15)
 
-- 解析验证:14/14 PASS + 2 项新增 PASS(含界面法体积两场景)
-- 回归验证:8/8 PASS
-- `py_compile` OK;节点 4 gate 现含 analytic + regression + 141/4480 分母硬门
+- 解析验证:19/19 PASS
+- 回归验证:10/10 PASS
+- `py_compile` OK
+
+### 第二轮修复(外部 AI 复审意见,全部落码)
+
+- **事件窗口 halo**:读取域 = 分析域 240 km + 候选点自身 McCoy 背景环带
+  230 km + margin 20 = 490 km;`daily_seeds` 只在分析域内列跑完整分类,
+  halo 列只供 per-column ring controls(越界拒绝逻辑保留)。合成验证的
+  run_day core 移到域中心、含透镜检查用 96 格域(56 格域环带背景几何随
+  core 移动会让 N2=0 闭合轮廓不稳定),检查 13 改为异号双透镜(spicy+
+  minty 水平相邻,0 轮廓连体也按 lock 不合并)
+- **体积逐 voxel**:同节点多个 layer 取 mask 并集;`density_node_count`
+  按唯一节点;每个 (node, lat, lon) 独立算上下界面/厚度/体积(非均匀层距
+  与局地缺层正确);三维经纬深质心全部 volume 加权;修复 nan*False 清零
+- **Nencioli 完整门**:方形周界 8 点(offset b 方形角点,非圆周取整);
+  8 点全有效;6/8 切向对齐进入 passed/weak/strong;气旋用对称切向门
+  (正对齐 <=2/8)+ cyclonic circulation/core zeta
+- **节点 4 硬门**:4480 背景位置逐位 >= 61 个有效 per-position controls;
+  9/56、19/56、6/56、11/56 冻结计数逐项 exact 复现(reproduction 硬门);
+  manifest 记录 3 个输入 parquet 路径+hash 与 McCoy source archive hash
+- **年度 runner 修复**:lat_bands 二维索引维度修复;occupied_frame truth
+  判定;√2·R 间隔 tile + 矩形 Voronoi 归属(完整覆盖无双计);occupancy
+  分子分母统一 cell-days 口径(cell_key 加 date);start gate 拒绝
+  max_events 部分目录
+- **Tier-3 修复**:strong 对象嵌套进入 strong/weak/seed-lens 三家族追踪
+  (per-family track_id 列);track 延续只在双向 1:1 匹配时发生,split/
+  merge 一律全部开新 track
+- **回归测试**:新增同节点两 mask 传递 union、非均匀层距逐 voxel 厚度
 
 ## 冻结输入(路径均存在且已核验)
 
@@ -96,7 +124,7 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 
 ## 下一步
 
-1. 用户提交修复 commit(工作区未提交)
+1. 用户提交第二轮修复 commit(工作区未提交)
 2. **节点 4**: `run_ofes_grid_scv_v2_validation(population_path, mccoy_diag_path,
    event_summary_path, output_dir=..., worker_count=16, resume=True)`
    - 14 项解析 + 8 项回归(重跑落盘)→ 4 审计日 → 56 事件日扫描(~5 min/日,
