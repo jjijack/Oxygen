@@ -36642,6 +36642,3296 @@ def validate_ofes_grid_scv_detector(
     return result
 
 
+def _ofes_grid_scv_v2_settings(overrides: dict | None = None) -> dict:
+    """解析并校验冻结的 OFES grid-SCV v2 修复配置。"""
+    raw = dict(_OFES_CFG.get('grid_scv_v2', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES grid-SCV v2 override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'sigma0_min_kg_m3': float(raw.get('sigma0_min_kg_m3', 25.60)),
+        'sigma0_max_kg_m3': float(raw.get('sigma0_max_kg_m3', 27.50)),
+        'sigma0_step_kg_m3': float(raw.get('sigma0_step_kg_m3', 0.05)),
+        'valid_depth_min_m': float(raw.get('valid_depth_min_m', 100.0)),
+        'valid_depth_max_m': float(raw.get('valid_depth_max_m', 1000.0)),
+        'shallowest_depth_min_m': float(raw.get('shallowest_depth_min_m', 100.0)),
+        'centroid_depth_min_m': float(raw.get('centroid_depth_min_m', 200.0)),
+        'grid_lens_min_nodes': int(raw.get('grid_lens_min_nodes', 2)),
+        'well_resolved_min_nodes': int(raw.get('well_resolved_min_nodes', 3)),
+        'well_resolved_thickness_min_m': float(raw.get('well_resolved_thickness_min_m', 100.0)),
+        'lens_radius_min_km': float(raw.get('lens_radius_min_km', 5.0)),
+        'lens_radius_max_km': float(raw.get('lens_radius_max_km', 100.0)),
+        'classical_size_max_km': float(raw.get('classical_size_max_km', 50.0)),
+        'background_inner_radius_km': float(raw.get('background_inner_radius_km', 120.0)),
+        'background_outer_radius_km': float(raw.get('background_outer_radius_km', 240.0)),
+        'background_min_columns': int(raw.get('background_min_columns', 61)),
+        'n2_density_tolerance_kg_m3': float(raw.get('n2_density_tolerance_kg_m3', 0.2)),
+        'nencioli_a_cells': int(raw.get('nencioli_a_cells', 3)),
+        'nencioli_b_cells': int(raw.get('nencioli_b_cells', 2)),
+        'circulation_sample_count': int(raw.get('circulation_sample_count', 64)),
+        'circulation_min_finite_fraction': float(raw.get('circulation_min_finite_fraction', 0.80)),
+        'velocity_adjacent_nodes_min': int(raw.get('velocity_adjacent_nodes_min', 2)),
+        'prefilter_recall_required': float(raw.get('prefilter_recall_required', 1.0)),
+        'known_mccoy_positive_profile_count': int(raw.get('known_mccoy_positive_profile_count', 141)),
+        'track_center_displacement_km': float(raw.get('track_center_displacement_km', 55.66)),
+        'track_relative_tolerance': float(raw.get('track_relative_tolerance', 0.60)),
+        'duration_threshold_days': [int(v) for v in raw.get('duration_threshold_days', [3, 5, 30])],
+        'boundary_censor_margin_deg': float(raw.get('boundary_censor_margin_deg', 0.5)),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'audit_sample_seed': int(raw.get('audit_sample_seed', 20260814)),
+        'audit_sample_columns_per_date': int(raw.get('audit_sample_columns_per_date', 1000)),
+        'audit_dates': [str(v) for v in raw.get('audit_dates', [])],
+        'output_subdir': str(raw.get('output_subdir', 'grid_scv_v2')),
+    }
+    if (
+        not np.isclose(
+            (settings['sigma0_max_kg_m3'] - settings['sigma0_min_kg_m3'])
+            / settings['sigma0_step_kg_m3'],
+            round((settings['sigma0_max_kg_m3'] - settings['sigma0_min_kg_m3'])
+                  / settings['sigma0_step_kg_m3']),
+            rtol=0.0,
+            atol=1e-10,
+        )
+        or settings['sigma0_min_kg_m3'] >= settings['sigma0_max_kg_m3']
+        or settings['sigma0_step_kg_m3'] <= 0
+        or settings['valid_depth_min_m'] < 0
+        or settings['valid_depth_min_m'] >= settings['valid_depth_max_m']
+        or settings['grid_lens_min_nodes'] < 2
+        or settings['well_resolved_min_nodes'] < settings['grid_lens_min_nodes']
+        or settings['well_resolved_thickness_min_m'] <= 0
+        or settings['lens_radius_min_km'] <= 0
+        or settings['lens_radius_min_km'] >= settings['lens_radius_max_km']
+        or settings['classical_size_max_km'] <= settings['lens_radius_min_km']
+        or settings['classical_size_max_km'] >= settings['lens_radius_max_km']
+        or settings['background_inner_radius_km'] <= 0
+        or settings['background_outer_radius_km'] <= settings['background_inner_radius_km']
+        or settings['background_min_columns'] < 1
+        or settings['n2_density_tolerance_kg_m3'] <= 0
+        or settings['nencioli_a_cells'] < 1
+        or settings['nencioli_b_cells'] < 1
+        or settings['circulation_sample_count'] < 8
+        or not 0 < settings['circulation_min_finite_fraction'] <= 1
+        or settings['velocity_adjacent_nodes_min'] < 2
+        or not np.isclose(settings['prefilter_recall_required'], 1.0)
+        or settings['known_mccoy_positive_profile_count'] != 141
+        or settings['track_center_displacement_km'] <= 0
+        or not 0 < settings['track_relative_tolerance'] < 1
+        or len(settings['duration_threshold_days']) != 3
+        or settings['duration_threshold_days'] != sorted(set(settings['duration_threshold_days']))
+        or settings['bootstrap_replicates'] <= 0
+        or settings['audit_sample_columns_per_date'] <= 0
+        or len(settings['audit_dates']) != 4
+        or not settings['output_subdir'].strip()
+    ):
+        raise ValueError('OFES grid-SCV v2 settings violate the frozen lock.')
+    return settings
+
+
+def _ofes_grid_v2_column_profile(
+    snapshot: dict,
+    lat_index: int,
+    lon_index: int,
+    settings: dict,
+) -> dict:
+    """提取一个示踪物格点列的 McCoy profile-properties（与虚拟管线同路径）。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    theta = np.asarray(snapshot['temp'][:, lat_index, lon_index], dtype=float)
+    salt = np.asarray(snapshot['salinity'][:, lat_index, lon_index], dtype=float)
+    return _ofes_mccoy_profile_properties(
+        depth,
+        theta,
+        salt,
+        float(np.asarray(snapshot['lon'])[lon_index]),
+        float(np.asarray(snapshot['lat'])[lat_index]),
+        settings,
+    )
+
+
+def _ofes_grid_v2_position_profile(
+    snapshot: dict,
+    lon: float,
+    lat: float,
+    settings: dict,
+) -> dict:
+    """提取任意经纬度（水平双线性）的 McCoy profile-properties。"""
+    table = extract_ofes_profile_interp(
+        snapshot, float(lon), float(lat), variables=['temp', 'salinity']
+    )
+    return _ofes_mccoy_profile_properties(
+        table['Depth'].to_numpy(dtype=float),
+        table['temp'].to_numpy(dtype=float),
+        table['salinity'].to_numpy(dtype=float),
+        float(lon),
+        float(lat),
+        settings,
+    )
+
+
+def _ofes_grid_v2_build_profile_cache(
+    snapshot: dict,
+    settings: dict,
+    *,
+    worker_count: int = 1,
+) -> dict[tuple[int, int], dict | None]:
+    """为窗口内所有湿列构建 profile-properties 缓存（进程并行，可落盘）。
+
+    每列成本集中在 TEOS-10 与核平滑，因此只算一次；环带控制剖面按最近
+    格点查找复用该缓存。陆地列记录为 None。`worker_count` 只进入执行
+    provenance，不进入科学签名。
+    """
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    wet = np.all(
+        np.isfinite(np.asarray(snapshot['temp'], dtype=float))
+        & np.isfinite(np.asarray(snapshot['salinity'], dtype=float)),
+        axis=0,
+    )
+    indices = [(int(j), int(i)) for j in range(lat.size) for i in range(lon.size)
+               if wet[j, i]]
+    if not indices:
+        return {}
+    if worker_count <= 1 or len(indices) < 20000:
+        # 小窗口/合成场单进程更快：多进程的 track.py 导入开销占主导。
+        return {
+            (j, i): _ofes_grid_v2_column_profile(snapshot, j, i, settings)
+            for j, i in indices
+        }
+    chunk_size = max(1, int(np.ceil(len(indices) / int(worker_count))))
+    chunks = [
+        indices[offset:offset + chunk_size]
+        for offset in range(0, len(indices), chunk_size)
+    ]
+    with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
+        futures = [
+            executor.submit(_ofes_grid_v2_profile_chunk, snapshot, chunk, settings)
+            for chunk in chunks
+        ]
+        cache: dict[tuple[int, int], dict | None] = {}
+        for future in futures:
+            cache.update(future.result())
+    return cache
+
+
+def _ofes_grid_v2_profile_chunk(
+    snapshot: dict,
+    indices: list[tuple[int, int]],
+    settings: dict,
+) -> dict[tuple[int, int], dict]:
+    return {
+        (j, i): _ofes_grid_v2_column_profile(snapshot, j, i, settings)
+        for j, i in indices
+    }
+
+
+def _ofes_grid_v2_ring_controls(
+    snapshot: dict,
+    profile_cache: dict[tuple[int, int], dict | None],
+    lon: float,
+    lat: float,
+    settings: dict,
+) -> list[dict]:
+    """按冻结的 130--230 km 半径 x 16 方位环带几何取控制剖面。"""
+    points = _ofes_mccoy_sampling_points(lon, lat, 0.0, settings)
+    controls = []
+    for point in points.itertuples(index=False):
+        if point.sample_role != 'background_control':
+            continue
+        row, column = _ofes_grid_nearest_index(
+            np.asarray(snapshot['lon'], dtype=float),
+            np.asarray(snapshot['lat'], dtype=float),
+            float(point.sample_lon),
+            float(point.sample_lat),
+        )
+        profile = profile_cache.get((int(row), int(column)))
+        if profile is not None:
+            controls.append(profile)
+    return controls
+
+
+def _ofes_grid_v2_prefilter_envelope(
+    profile: dict,
+    reference: dict,
+    settings: dict,
+) -> tuple[bool, str]:
+    """可证超集的预筛包络门：完整 McCoy 门链的阳性必然通过。
+
+    阳性剖面在 pycnocline 之下存在 spice 超出门与弱 N2 超出门且密度相差在
+    `n2_density_tolerance_kg_m3` 内（initial candidate 定义），因此该门是
+    保守超集；PV、Ro、DO 一律不参与。
+    """
+    if not profile['profile_qc_passed']:
+        return False, 'profile_qc'
+    reference_n2 = np.asarray(reference['n2'], dtype=float)
+    finite_n2 = np.flatnonzero(np.isfinite(reference_n2))
+    if finite_n2.size == 0:
+        return False, 'pycnocline'
+    pycnocline_index = int(
+        finite_n2[np.nanargmax(reference_n2[finite_n2])]
+    )
+    pycnocline_index = min(pycnocline_index + 1, len(reference_n2) - 1)
+    pycnocline_density = float(reference['sigma0'][pycnocline_index])
+    anomalies = _ofes_mccoy_anomalies(profile, reference)
+    spice = np.asarray(anomalies['spiciness_anomaly'], dtype=float)
+    n2_anomaly = np.asarray(anomalies['n2_anomaly'], dtype=float)
+    sigma = np.asarray(profile['sigma0'], dtype=float)
+    below = (
+        np.isfinite(sigma)
+        & (sigma >= pycnocline_density)
+        & np.isfinite(spice)
+        & np.isfinite(n2_anomaly)
+    )
+    if not np.any(below):
+        return False, 'below_pycnocline'
+    spice_signed = below & (spice != 0.0)
+    n2_weak = below & (n2_anomaly < 0.0)
+    spice_indices = np.flatnonzero(spice_signed)
+    n2_indices = np.flatnonzero(n2_weak)
+    if spice_indices.size == 0:
+        return False, 'spice_envelope'
+    if n2_indices.size == 0:
+        return False, 'n2_envelope'
+    distance = np.abs(sigma[spice_indices, None] - sigma[n2_indices][None, :])
+    if not np.any(distance <= settings['n2_density_tolerance_kg_m3']):
+        return False, 'envelope_density_tolerance'
+    return True, 'passed'
+
+
+def _ofes_grid_v2_tier0_column(
+    profile: dict,
+    snapshot: dict,
+    profile_cache: dict[tuple[int, int], dict | None],
+    lon: float,
+    lat: float,
+    settings: dict,
+    *,
+    enforce_envelope: bool = True,
+    classify: bool = True,
+) -> dict:
+    """对单个网格列运行完整 McCoy 门链并保留逐级失败信息。
+
+    `enforce_envelope=False` 用于审计样本：不因预筛包络拒绝而跳过完整
+    分类器（预筛结果仍记录），从而直接测量"完整分类器的阳性是否进入候选池"。
+    `classify=False` 只计算预筛包络（候选池扫描），完整分类器单独对
+    审计样本运行。
+    """
+    result = {
+        'mccoy_profile_compatible': False,
+        'mccoy_failure_stage': 'profile_qc',
+        'prefilter_retained': False,
+        'prefilter_failure_stage': 'profile_qc',
+        'valid_control_profile_count': 0,
+    }
+    if not profile['profile_qc_passed']:
+        return result
+    if abs(float(lat)) < settings['equator_latitude_min_deg']:
+        result.update({
+            'mccoy_failure_stage': 'equatorial',
+            'prefilter_failure_stage': 'equatorial',
+        })
+        return result
+    controls = _ofes_grid_v2_ring_controls(
+        snapshot, profile_cache, lon, lat, settings
+    )
+    valid_controls = [
+        control for control in controls if control['profile_qc_passed']
+    ]
+    result['valid_control_profile_count'] = int(len(valid_controls))
+    if len(valid_controls) < settings['minimum_background_profiles']:
+        result.update({
+            'mccoy_failure_stage': 'background_iqr',
+            'prefilter_failure_stage': 'background_iqr',
+        })
+        return result
+    reference = _ofes_mccoy_reference(valid_controls, lon, lat)
+    retained, reason = _ofes_grid_v2_prefilter_envelope(
+        profile, reference, settings
+    )
+    result['prefilter_retained'] = bool(retained)
+    result['prefilter_failure_stage'] = reason
+    if (not retained and enforce_envelope) or not classify:
+        result['mccoy_failure_stage'] = (
+            reason if not retained and enforce_envelope else 'classifier_skipped'
+        )
+        return result
+    classification = _ofes_mccoy_profile_classification(
+        profile, reference, valid_controls, settings
+    )
+    result.update(classification)
+    return result
+
+
+def _ofes_grid_v2_daily_seeds_chunk(
+    arguments: dict,
+) -> tuple[list[dict], list[dict], int]:
+    """单个列块：预筛包络 + 完整 McCoy 门链（进程并行 worker）。"""
+    snapshot = arguments['snapshot']
+    cache = _ofes_grid_v2_profile_cache_from_frame(arguments['frame'])
+    chunk = arguments['chunk']
+    v2_settings = arguments['v2_settings']
+    mccoy_settings = arguments['mccoy_settings']
+    classify = bool(arguments.get('classify', True))
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    v1_settings = _ofes_grid_scv_settings()
+    records: list[dict] = []
+    scan_rows: list[dict] = []
+    envelope_passed = 0
+    for j, i in chunk:
+        profile = cache.get((int(j), int(i)))
+        if profile is None:
+            continue
+        classification = _ofes_grid_v2_tier0_column(
+            profile,
+            snapshot,
+            cache,
+            float(lon[int(i)]),
+            float(lat[int(j)]),
+            mccoy_settings,
+            classify=classify,
+        )
+        if classification['prefilter_retained']:
+            envelope_passed += 1
+        scan_rows.append({
+            'lat_index': int(j),
+            'lon_index': int(i),
+            'prefilter_retained': bool(classification['prefilter_retained']),
+            'prefilter_failure_stage': str(classification['prefilter_failure_stage']),
+            'mccoy_profile_compatible': bool(classification['mccoy_profile_compatible']),
+            'mccoy_failure_stage': str(classification['mccoy_failure_stage']),
+            'valid_control_profile_count': int(
+                classification.get('valid_control_profile_count', 0)
+            ),
+        })
+        if not classification['mccoy_profile_compatible']:
+            continue
+        peak_density = float(classification.get('gaussian_peak_density', np.nan))
+        mapping = _ofes_grid_sigma0_cell_mapping(peak_density, v1_settings)
+        node_index = int(mapping['sigma0_node_index'])
+        in_grid = bool(
+            mapping['sigma0_mapping_valid']
+            and 0 <= node_index < len(_ofes_grid_sigma0_nodes(v1_settings))
+        )
+        records.append({
+            'lat_index': int(j),
+            'lon_index': int(i),
+            'scv_type': str(classification.get('scv_type') or ''),
+            'gaussian_peak_density': peak_density,
+            'node_index': node_index if in_grid else -1,
+            'seed_in_grid': in_grid,
+            'gaussian_peak_pressure_dbar': float(classification.get('gaussian_peak_pressure_dbar', np.nan)),
+            'gaussian_shallow_pressure_dbar': float(classification.get('gaussian_shallow_pressure_dbar', np.nan)),
+            'gaussian_deep_pressure_dbar': float(classification.get('gaussian_deep_pressure_dbar', np.nan)),
+            'gaussian_amplitude': float(classification.get('gaussian_amplitude', np.nan)),
+            'gaussian_h_parameter_dbar': float(classification.get('gaussian_h_parameter_dbar', np.nan)),
+            'gaussian_r2': float(classification.get('gaussian_r2', np.nan)),
+            'gaussian_nrmse': float(classification.get('gaussian_nrmse', np.nan)),
+            'valid_control_profile_count': int(classification.get('valid_control_profile_count', 0)),
+        })
+    return scan_rows, records, envelope_passed
+
+
+def _ofes_grid_v2_daily_seeds(
+    snapshot: dict,
+    profile_cache: dict[tuple[int, int], dict | None],
+    v2_settings: dict,
+    mccoy_settings: dict,
+    *,
+    worker_count: int = 1,
+    classify: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """扫描窗口内所有湿列：预筛包络 -> 完整 McCoy 门链 -> 种子表。
+
+    返回 (seeds, scan)；scan 每行是单列的预筛保留与完整分类结果，供 recall
+    审计与日级复用使用。`classify=False` 时只算候选池包络（审计日全域
+    扫描），种子表为空。`worker_count` 只进执行 provenance。
+    """
+    wet_indices = sorted(
+        (int(j), int(i)) for (j, i), profile in profile_cache.items()
+        if profile is not None
+    )
+    scan_rows: list[dict] = []
+    records: list[dict] = []
+    envelope_passed = 0
+    chunk_arguments = {
+        'snapshot': snapshot,
+        'frame': _ofes_grid_v2_profile_frame(profile_cache),
+        'v2_settings': v2_settings,
+        'mccoy_settings': mccoy_settings,
+        'classify': classify,
+    }
+    if worker_count > 1 and len(wet_indices) >= 20000:
+        chunk_size = max(1, int(np.ceil(len(wet_indices) / int(worker_count))))
+        chunks = [
+            wet_indices[offset:offset + chunk_size]
+            for offset in range(0, len(wet_indices), chunk_size)
+        ]
+        with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
+            futures = [
+                executor.submit(
+                    _ofes_grid_v2_daily_seeds_chunk,
+                    {**chunk_arguments, 'chunk': chunk},
+                )
+                for chunk in chunks
+            ]
+            for future in futures:
+                chunk_scan, chunk_records, chunk_envelope = future.result()
+                scan_rows.extend(chunk_scan)
+                records.extend(chunk_records)
+                envelope_passed += chunk_envelope
+    else:
+        chunk_result = _ofes_grid_v2_daily_seeds_chunk(
+            {**chunk_arguments, 'chunk': wet_indices}
+        )
+        scan_rows, records, envelope_passed = chunk_result
+    scan = pd.DataFrame(scan_rows)
+    seeds = pd.DataFrame(records)
+    seeds.attrs['envelope_passed_count'] = envelope_passed
+    return seeds, scan
+
+
+def _ofes_grid_v2_closed_lens_masks(
+    fields: dict,
+    seeds: pd.DataFrame,
+) -> dict[int, list[dict]]:
+    """以 Tier-0 seed 为锚生成每层的闭合 N2=0 透镜掩膜与边界路径。
+
+    对每个 seed 所在的密度节点取 N2 anomaly=0 的最外层闭合等值线（按
+    有向面积最大），其内部为层掩膜；同一节点落在同一等值线内的多个 seed
+    合并为一层。层内必须存在与 seed 同号的 spice anomaly，否则该 seed
+    记为 profile_only。
+    """
+    n2_anomaly = np.asarray(fields['anomalies']['n2'], dtype=float)
+    spice_anomaly = np.asarray(fields['anomalies']['spiciness'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    points = np.column_stack((lon_grid.ravel(), lat_grid.ravel()))
+    finite_field = np.isfinite(n2_anomaly)
+    layers: dict[int, list[dict]] = {}
+    for seed in seeds.to_dict('records'):
+        node_index = int(seed['node_index'])
+        if node_index < 0:
+            layers.setdefault(node_index, []).append({
+                'seed': seed,
+                'failed': True,
+                'failure_reason': 'seed_density_outside_grid',
+            })
+            continue
+        layers.setdefault(node_index, [])
+        if np.count_nonzero(finite_field[node_index]) < 9:
+            layers[node_index].append({
+                'seed': seed,
+                'failed': True,
+                'failure_reason': 'no_contour_finite_field',
+            })
+            continue
+        figure = plt.figure(figsize=(1.0, 1.0))
+        try:
+            contour_set = figure.gca().contour(
+                lon_grid,
+                lat_grid,
+                np.where(
+                    finite_field[node_index], n2_anomaly[node_index], np.nan
+                ),
+                levels=[0.0],
+            )
+            paths = [
+                MplPath(segment)
+                for segment in contour_set.allsegs[0]
+                if np.asarray(segment).shape[0] >= 4
+                and np.allclose(segment[0], segment[-1], atol=1.0e-10)
+            ]
+            paths = [
+                path for path in paths
+                if path.vertices.shape[0] >= 4
+                and np.allclose(path.vertices[0], path.vertices[-1], atol=1.0e-10)
+            ]
+        finally:
+            plt.close(figure)
+        seed_point = np.asarray(
+            [[float(lon[int(seed['lon_index'])]), float(lat[int(seed['lat_index'])])]]
+        )
+        containing = []
+        for path_index, path in enumerate(paths):
+            if not np.any(path.contains_points(seed_point)):
+                continue
+            signed_area = float(
+                np.dot(path.vertices[:, 0], np.roll(path.vertices[:, 1], -1))
+                - np.dot(path.vertices[:, 1], np.roll(path.vertices[:, 0], -1))
+            )
+            containing.append((path_index, path, signed_area))
+        if not containing:
+            layers[node_index].append({
+                'seed': seed,
+                'failed': True,
+                'failure_reason': 'no_closed_contour_containing_seed',
+            })
+            continue
+        path_index, selected, _ = max(
+            containing, key=lambda item: abs(item[2])
+        )
+        inside = selected.contains_points(points).reshape(lat_grid.shape)
+        inside &= finite_field[node_index]
+        seed_sign = 'spicy' if seed['scv_type'] == 'spicy' else 'minty'
+        if seed_sign == 'spicy':
+            same_sign = np.count_nonzero(inside & (spice_anomaly[node_index] > 0))
+        else:
+            same_sign = np.count_nonzero(inside & (spice_anomaly[node_index] < 0))
+        if same_sign == 0:
+            layers[node_index].append({
+                'seed': seed,
+                'failed': True,
+                'failure_reason': 'lens_interior_sign_mismatch',
+            })
+            continue
+        matched = None
+        for existing in layers[node_index]:
+            if existing.get('failed'):
+                continue
+            if existing['path_index'] == path_index:
+                matched = existing
+                break
+        if matched is None:
+            matched = {
+                'node_index': node_index,
+                'path_index': path_index,
+                'mask': inside,
+                'path_vertices': np.asarray(selected.vertices, dtype=float),
+                'spice_sign': seed_sign,
+                'seeds': [],
+                'failed': False,
+                'failure_reason': '',
+            }
+            layers[node_index].append(matched)
+        matched['seeds'].append(seed)
+    return layers
+
+
+def _ofes_grid_v2_layer_properties(
+    layer: dict,
+    fields: dict,
+) -> dict:
+    """把单层透镜掩膜转换为可连接的几何与水团属性。"""
+    mask = np.asarray(layer['mask'], dtype=bool)
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    node_index = int(layer['node_index'])
+    area = _ofes_tracer_cell_area_m2(lat, lon)
+    lat_idx, lon_idx = np.where(mask)
+    weights = area[lat_idx, lon_idx]
+    total_area = float(np.sum(weights))
+    depth = np.asarray(fields['depth'][node_index], dtype=float)
+    depth_values = depth[mask]
+    valid_depth = depth_values[np.isfinite(depth_values)]
+    depth_min = float(np.nanmin(valid_depth)) if valid_depth.size else np.nan
+    depth_max = float(np.nanmax(valid_depth)) if valid_depth.size else np.nan
+    return {
+        'node_index': node_index,
+        'mask': mask,
+        'path_vertices': np.asarray(layer['path_vertices'], dtype=float),
+        'spice_sign': str(layer['spice_sign']),
+        'seed_count': int(len(layer['seeds'])),
+        'lat_index': lat_idx.astype(np.int32),
+        'lon_index': lon_idx.astype(np.int32),
+        'center_lat': float(np.average(lat[lat_idx], weights=weights)),
+        'center_lon': float(np.average(lon[lon_idx], weights=weights)),
+        'area_m2': total_area,
+        'radius_km': float(np.sqrt(total_area / np.pi) / 1000.0),
+        'depth_min_m': depth_min,
+        'depth_max_m': depth_max,
+        'depth_mean_m': (
+            float(np.average(valid_depth, weights=weights[np.isfinite(depth_values)]))
+            if valid_depth.size else np.nan
+        ),
+        'touches_domain_edge': bool(
+            np.any(lat_idx == 0) or np.any(lat_idx == lat.size - 1)
+            or np.any(lon_idx == 0) or np.any(lon_idx == lon.size - 1)
+        ),
+    }
+
+
+def _ofes_grid_v2_connect_lenses(
+    fields: dict,
+    layers: dict[int, list[dict]],
+    v2_settings: dict,
+    *,
+    delivered_bottom_min_m: float = np.inf,
+    upper_bound_tolerance_m: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """相邻密度层单格膨胀连接 + 分层身份分类。
+
+    返回 (objects, voxels, profile_only)。`profile_only` 只包含无法形成
+    任何闭合透镜的 seed；单层闭合透镜记录为 underresolved 而非
+    profile_only。
+    """
+    layer_rows: list[dict] = []
+    profile_only_rows: list[dict] = []
+    for node_index, items in layers.items():
+        for item in items:
+            if item.get('failed', False):
+                for seed in ([item['seed']] if 'seed' in item else []):
+                    profile_only_rows.append({
+                        'node_index': node_index,
+                        'lat_index': int(seed['lat_index']),
+                        'lon_index': int(seed['lon_index']),
+                        'scv_type': str(seed['scv_type']),
+                        'failure_reason': str(item['failure_reason']),
+                    })
+                continue
+            layer_rows.append(_ofes_grid_v2_layer_properties(item, fields))
+    empty_schema = {
+        'object_id': pd.Series(dtype=str),
+        'tier1_identity': pd.Series(dtype=str),
+        'well_resolved_grid_lens': pd.Series(dtype=bool),
+        'boundary_censored': pd.Series(dtype=bool),
+        'classical_size': pd.Series(dtype=bool),
+        'center_lat': pd.Series(dtype=float),
+        'center_lon': pd.Series(dtype=float),
+        'centroid_depth_m': pd.Series(dtype=float),
+        'depth_min_m': pd.Series(dtype=float),
+        'depth_max_m': pd.Series(dtype=float),
+        'thickness_m': pd.Series(dtype=float),
+        'radius_km': pd.Series(dtype=float),
+        'density_node_count': pd.Series(dtype=int),
+        'sigma0_min': pd.Series(dtype=float),
+        'sigma0_max': pd.Series(dtype=float),
+        'spice_sign': pd.Series(dtype=str),
+        'seed_count': pd.Series(dtype=int),
+        'volume_m3': pd.Series(dtype=float),
+        'touches_domain_edge': pd.Series(dtype=bool),
+        'touches_upper_bound': pd.Series(dtype=bool),
+        'touches_delivered_bottom': pd.Series(dtype=bool),
+        'velocity_checked_node_count': pd.Series(dtype=int),
+        'nencioli_passed_node_count': pd.Series(dtype=int),
+        'anticyclonic_circulation_node_count': pd.Series(dtype=int),
+        'strong_node_count': pd.Series(dtype=int),
+        'adjacent_strong_pair': pd.Series(dtype=bool),
+        'core_zeta_anomaly_mean': pd.Series(dtype=float),
+        'weak_native_support': pd.Series(dtype=bool),
+        'strong_native_support': pd.Series(dtype=bool),
+        'cyclonic_technical_candidate': pd.Series(dtype=bool),
+        'support_class': pd.Series(dtype=str),
+    }
+    if not layer_rows:
+        return (
+            pd.DataFrame(empty_schema),
+            pd.DataFrame(),
+            pd.DataFrame(profile_only_rows),
+        )
+    parent = list(range(len(layer_rows)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    by_node: dict[int, list[int]] = defaultdict(list)
+    for index, layer in enumerate(layer_rows):
+        by_node[int(layer['node_index'])].append(index)
+    structure = np.ones((3, 3), dtype=np.int8)
+    for node_index in range(min(by_node), max(by_node)):
+        for left in by_node.get(node_index, []):
+            for right in by_node.get(node_index + 1, []):
+                if layer_rows[left]['spice_sign'] != layer_rows[right]['spice_sign']:
+                    continue
+                left_mask = layer_rows[left]['mask']
+                right_mask = layer_rows[right]['mask']
+                if np.any(left_mask & right_mask):
+                    union(left, right)
+                    continue
+                dilated = binary_dilation(left_mask, structure=structure)
+                if np.any(dilated & right_mask):
+                    union(left, right)
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for index, layer in enumerate(layer_rows):
+        grouped[find(index)].append(layer)
+    object_rows: list[dict] = []
+    voxel_rows: list[dict] = []
+    object_index = 0
+    for members in grouped.values():
+        members = sorted(members, key=lambda item: item['node_index'])
+        node_indices = np.array([item['node_index'] for item in members], dtype=int)
+        areas = np.array([item['area_m2'] for item in members], dtype=float)
+        depths = np.array([item['depth_mean_m'] for item in members], dtype=float)
+        finite = np.isfinite(depths) & np.isfinite(areas)
+        if not np.any(finite):
+            continue
+        depth_min = float(np.nanmin([item['depth_min_m'] for item in members]))
+        depth_max = float(np.nanmax([item['depth_max_m'] for item in members]))
+        radius = float(np.nanmax([item['radius_km'] for item in members]))
+        centroid_depth = float(np.average(depths[finite], weights=areas[finite]))
+        center_lat = float(np.average(
+            [item['center_lat'] for item in members], weights=areas
+        ))
+        center_lon = float(np.average(
+            [item['center_lon'] for item in members], weights=areas
+        ))
+        spice_signs = {item['spice_sign'] for item in members}
+        node_count = int(len(members))
+        touches_edge = bool(any(item['touches_domain_edge'] for item in members))
+        touches_upper = bool(
+            np.isfinite(depth_min)
+            and depth_min
+            <= v2_settings['shallowest_depth_min_m'] + float(upper_bound_tolerance_m)
+        )
+        touches_bottom = bool(
+            np.isfinite(depth_max) and depth_max >= float(delivered_bottom_min_m)
+        )
+        depth_ok = bool(
+            np.isfinite(centroid_depth)
+            and centroid_depth > v2_settings['centroid_depth_min_m']
+            and np.isfinite(depth_min)
+            and depth_min > v2_settings['shallowest_depth_min_m']
+        )
+        radius_ok = bool(
+            v2_settings['lens_radius_min_km'] <= radius <= v2_settings['lens_radius_max_km']
+        )
+        if radius > v2_settings['lens_radius_max_km']:
+            identity = 'broad_structure'
+        elif not radius_ok or node_count < v2_settings['grid_lens_min_nodes']:
+            identity = 'underresolved'
+        elif not depth_ok:
+            identity = 'depth_identity_failed'
+        else:
+            identity = 'grid_lens'
+        well_resolved = bool(
+            identity == 'grid_lens'
+            and node_count >= v2_settings['well_resolved_min_nodes']
+            and depth_max - depth_min >= v2_settings['well_resolved_thickness_min_m']
+        )
+        boundary_censored = bool(touches_edge or touches_upper or touches_bottom)
+        object_id = f'ofes_grid_lens_{object_index:06d}'
+        object_index += 1
+        object_rows.append({
+            'object_id': object_id,
+            'tier1_identity': identity,
+            'well_resolved_grid_lens': bool(well_resolved),
+            'boundary_censored': boundary_censored,
+            'classical_size': bool(
+                identity == 'grid_lens'
+                and radius <= v2_settings['classical_size_max_km']
+            ),
+            'center_lat': center_lat,
+            'center_lon': center_lon,
+            'centroid_depth_m': centroid_depth,
+            'depth_min_m': depth_min,
+            'depth_max_m': depth_max,
+            'thickness_m': depth_max - depth_min,
+            'radius_km': radius,
+            'density_node_count': node_count,
+            'sigma0_min': float(fields['nodes_sigma0'][node_indices.min()]),
+            'sigma0_max': float(fields['nodes_sigma0'][node_indices.max()]),
+            'spice_sign': next(iter(spice_signs)) if spice_signs else 'unknown',
+            'seed_count': int(sum(item['seed_count'] for item in members)),
+            'volume_m3': float(sum(
+                item['area_m2'] * max(item['depth_max_m'] - item['depth_min_m'], 0.0)
+                for item in members
+            )),
+            'touches_domain_edge': touches_edge,
+            'touches_upper_bound': touches_upper,
+            'touches_delivered_bottom': touches_bottom,
+        })
+        for member in members:
+            for lat_index, lon_index in zip(member['lat_index'], member['lon_index']):
+                voxel_rows.append({
+                    'object_id': object_id,
+                    'node_index': int(member['node_index']),
+                    'sigma0': float(fields['nodes_sigma0'][int(member['node_index'])]),
+                    'lat_index': int(lat_index),
+                    'lon_index': int(lon_index),
+                    'voxel_lat': float(fields['lat'][lat_index]),
+                    'voxel_lon': float(fields['lon'][lon_index]),
+                    'depth_m': float(fields['depth'][int(member['node_index']), lat_index, lon_index]),
+                    'spice_sign': str(member['spice_sign']),
+                    'spice_anomaly': float(fields['anomalies']['spiciness'][int(member['node_index']), lat_index, lon_index]),
+                    'n2_anomaly': float(fields['anomalies']['n2'][int(member['node_index']), lat_index, lon_index]),
+                    'zeta_anomaly': float(fields['anomalies']['zeta'][int(member['node_index']), lat_index, lon_index]),
+                    'pv_anomaly': float(fields['anomalies']['pv'][int(member['node_index']), lat_index, lon_index]),
+                })
+    objects = pd.DataFrame(object_rows)
+    voxels = pd.DataFrame(voxel_rows)
+    profile_only = pd.DataFrame(profile_only_rows)
+    return objects, voxels, profile_only
+
+
+def _ofes_grid_v2_nencioli(
+    fields: dict,
+    node_index: int,
+    center_lat: float,
+    center_lon: float,
+    v2_settings: dict,
+) -> dict:
+    """冻结四规则 Nencioli 向量几何；切向对齐作为独立记录门。
+
+    `passed` 只由四条件决定：径向单调、符号反转、中心速度 (2b+1)^2 邻域
+    最小、周长 8 点恒向单侧象限遍历。候选中心为透镜质心附近、掩膜内速度
+    最小的有效格点。
+    """
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    row, column = _ofes_grid_nearest_index(lon, lat, center_lon, center_lat)
+    u = np.asarray(fields['anomalies']['u'][node_index], dtype=float)
+    v = np.asarray(fields['anomalies']['v'][node_index], dtype=float)
+    zeta = np.asarray(fields['anomalies']['zeta'][node_index], dtype=float)
+    a = int(v2_settings['nencioli_a_cells'])
+    b = int(v2_settings['nencioli_b_cells'])
+    early = {
+        'passed': False,
+        'radial_cardinal': False,
+        'sign_change': False,
+        'local_minimum': False,
+        'quadrant_pass': False,
+        'rossby_number': np.nan,
+        'circulation': np.nan,
+        'finite_fraction': 0.0,
+        'tangential_alignment_fraction': np.nan,
+    }
+    if min(row, column) < a or (
+        row + a >= lat.size or column + a >= lon.size
+    ):
+        return {**early, 'reason': 'horizontal_boundary', 'row': row, 'column': column}
+    u_center = u[row, column]
+    v_center = v[row, column]
+    u_south = np.array([u[row - offset, column] for offset in range(1, a + 1)])
+    u_north = np.array([u[row + offset, column] for offset in range(1, a + 1)])
+    v_west = np.array([v[row, column - offset] for offset in range(1, a + 1)])
+    v_east = np.array([v[row, column + offset] for offset in range(1, a + 1)])
+    cardinal_finite = np.all(
+        np.isfinite(np.r_[u_south, u_north, v_west, v_east, u_center, v_center])
+    )
+    if not cardinal_finite:
+        return {
+            **early,
+            'reason': 'cardinal_missing',
+            'row': row,
+            'column': column,
+        }
+    radial_cardinal = (
+        np.all(np.abs(u_south[:-1]) <= np.abs(u_south[1:]) + 1.0e-12)
+        and np.all(np.abs(u_north[:-1]) <= np.abs(u_north[1:]) + 1.0e-12)
+        and np.all(np.abs(v_west[:-1]) <= np.abs(v_west[1:]) + 1.0e-12)
+        and np.all(np.abs(v_east[:-1]) <= np.abs(v_east[1:]) + 1.0e-12)
+    )
+    sign_change = bool(
+        np.all(u_south * u_north < 0.0)
+        and np.all(v_west * v_east < 0.0)
+    )
+    local_window = np.asarray(
+        np.hypot(
+            u[row - b:row + b + 1, column - b:column + b + 1],
+            v[row - b:row + b + 1, column - b:column + b + 1],
+        ),
+        dtype=float,
+    )
+    local_minimum = bool(
+        np.isfinite(u_center) and np.isfinite(v_center)
+        and np.nanmin(local_window) >= np.hypot(u_center, v_center) - 1.0e-12
+    )
+    perimeter_angles = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    perimeter_u = []
+    perimeter_v = []
+    for angle in perimeter_angles:
+        perimeter_u.append(u[
+            int(round(row + b * np.sin(angle))),
+            int(round(column + b * np.cos(angle))),
+        ])
+        perimeter_v.append(v[
+            int(round(row + b * np.sin(angle))),
+            int(round(column + b * np.cos(angle))),
+        ])
+    perimeter_u = np.asarray(perimeter_u, dtype=float)
+    perimeter_v = np.asarray(perimeter_v, dtype=float)
+    speed = np.hypot(perimeter_u, perimeter_v)
+    tangent_u = np.sin(perimeter_angles)
+    tangent_v = -np.cos(perimeter_angles)
+    tangential_alignment = (
+        perimeter_u * tangent_u + perimeter_v * tangent_v
+    ) / np.maximum(speed, 1.0e-12)
+    finite_perimeter = np.isfinite(tangential_alignment)
+    quadrants = np.mod(
+        np.floor(
+            (np.arctan2(perimeter_v, perimeter_u) + np.pi)
+            / (np.pi / 2.0)
+        ),
+        4.0,
+    )
+    if np.any(finite_perimeter):
+        quadrant_values = quadrants[finite_perimeter].astype(int)
+        steps = np.mod(np.diff(np.r_[quadrant_values, quadrant_values[0]]), 4)
+        # 恒向单侧遍历：允许停留在同一象限（step 0），但不允许正反转混用
+        # （step 1 = 逆时针、step 3 = 顺时针，二者不可同时出现）。
+        forward = bool(np.all(np.isin(steps, (0, 1))))
+        backward = bool(np.all(np.isin(steps, (0, 3))))
+        quadrant_pass = bool(
+            len(set(quadrant_values.tolist())) == 4
+            and (forward or backward)
+        )
+    else:
+        quadrant_pass = False
+    tangential_fraction = (
+        float(np.count_nonzero(finite_perimeter & (tangential_alignment >= 0.0)) / 8)
+        if np.any(finite_perimeter) else np.nan
+    )
+    passed = bool(
+        radial_cardinal and sign_change and local_minimum and quadrant_pass
+    )
+    coriolis = float(np.asarray(gsw.f(center_lat))[()])
+    rossby = float(zeta[row, column] / coriolis) if (
+        np.isfinite(zeta[row, column]) and coriolis != 0.0
+    ) else np.nan
+    return {
+        'passed': passed,
+        'reason': 'passed' if passed else 'nencioli_v2_gate',
+        'row': row,
+        'column': column,
+        'radial_cardinal': bool(radial_cardinal),
+        'sign_change': bool(sign_change),
+        'local_minimum': bool(local_minimum),
+        'quadrant_pass': bool(quadrant_pass),
+        'tangential_alignment_fraction': tangential_fraction,
+        'rossby_number': rossby,
+        'circulation': np.nan,
+        'finite_fraction': np.nan,
+    }
+
+
+def _ofes_grid_v2_boundary_circulation(
+    fields: dict,
+    node_index: int,
+    path_vertices: np.ndarray,
+    v2_settings: dict,
+) -> dict:
+    """沿闭合 N2 边界路径等弧长 64 点采样的有符号环流。"""
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    u = np.asarray(fields['anomalies']['u'][node_index], dtype=float)
+    v = np.asarray(fields['anomalies']['v'][node_index], dtype=float)
+    vertices = np.asarray(path_vertices, dtype=float)
+    if vertices.shape[0] < 4:
+        return {
+            'circulation': np.nan,
+            'finite_fraction': 0.0,
+            'boundary_length_km': np.nan,
+        }
+    # 归一化路径方向为逆时针（shoelace 有向面积为正），使环流符号约定
+    # 与右手定则一致：NH 反气旋（顺时针）为负、气旋为正。
+    signed_area = 0.5 * float(
+        np.dot(vertices[:, 0], np.roll(vertices[:, 1], -1))
+        - np.dot(vertices[:, 1], np.roll(vertices[:, 0], -1))
+    )
+    if signed_area < 0.0:
+        vertices = vertices[::-1]
+    lon_rad = np.deg2rad(vertices[:, 0])
+    lat_rad = np.deg2rad(vertices[:, 1])
+    center_lat_rad = float(np.deg2rad(np.mean(lat)))
+    dx = (lon_rad[1:] - lon_rad[:-1]) * 6371000.0 * np.cos(center_lat_rad)
+    dy = (lat_rad[1:] - lat_rad[:-1]) * 6371000.0
+    segment_length = np.hypot(dx, dy)
+    total = float(np.sum(segment_length))
+    if not np.isfinite(total) or total <= 0.0:
+        return {
+            'circulation': np.nan,
+            'finite_fraction': 0.0,
+            'boundary_length_km': np.nan,
+        }
+    sample_count = int(v2_settings['circulation_sample_count'])
+    offsets = np.arange(sample_count, dtype=float) * total / sample_count
+    sample_lon = []
+    sample_lat = []
+    for offset in offsets:
+        cumulative = np.cumsum(segment_length)
+        segment_index = int(np.searchsorted(cumulative, offset))
+        segment_index = min(segment_index, len(segment_length) - 1)
+        fraction = (
+            (offset - (cumulative[segment_index] - segment_length[segment_index]))
+            / segment_length[segment_index]
+        )
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        sample_lon.append(
+            vertices[segment_index, 0]
+            + fraction * (vertices[segment_index + 1, 0] - vertices[segment_index, 0])
+        )
+        sample_lat.append(
+            vertices[segment_index, 1]
+            + fraction * (vertices[segment_index + 1, 1] - vertices[segment_index, 1])
+        )
+    sample_lon = np.asarray(sample_lon, dtype=float)
+    sample_lat = np.asarray(sample_lat, dtype=float)
+    rows = np.searchsorted(lat, sample_lat) - 1
+    columns = np.searchsorted(lon, sample_lon) - 1
+    rows = np.clip(rows, 0, lat.size - 2)
+    columns = np.clip(columns, 0, lon.size - 2)
+    dy_sample = (sample_lat - lat[rows]) / np.maximum(lat[rows + 1] - lat[rows], 1.0e-12)
+    dx_sample = (sample_lon - lon[columns]) / np.maximum(lon[columns + 1] - lon[columns], 1.0e-12)
+    dy_sample = np.clip(dy_sample, 0.0, 1.0)
+    dx_sample = np.clip(dx_sample, 0.0, 1.0)
+    w00 = (1 - dy_sample) * (1 - dx_sample)
+    w01 = (1 - dy_sample) * dx_sample
+    w10 = dy_sample * (1 - dx_sample)
+    w11 = dy_sample * dx_sample
+    u_sample = (
+        w00 * u[rows, columns]
+        + w01 * u[rows, columns + 1]
+        + w10 * u[rows + 1, columns]
+        + w11 * u[rows + 1, columns + 1]
+    )
+    v_sample = (
+        w00 * v[rows, columns]
+        + w01 * v[rows, columns + 1]
+        + w10 * v[rows + 1, columns]
+        + w11 * v[rows + 1, columns + 1]
+    )
+    finite = np.isfinite(u_sample) & np.isfinite(v_sample)
+    finite_fraction = float(np.mean(finite))
+    if not np.any(finite):
+        return {
+            'circulation': np.nan,
+            'finite_fraction': finite_fraction,
+            'boundary_length_km': total / 1000.0,
+        }
+    sample_rad = np.deg2rad(sample_lat)
+    sample_lon_rad = np.deg2rad(sample_lon)
+    dlon_dt = np.gradient(sample_lon_rad) * 6371000.0 * np.cos(center_lat_rad)
+    dlat_dt = np.gradient(sample_rad) * 6371000.0
+    dot = u_sample * dlon_dt + v_sample * dlat_dt
+    circulation = float(np.nansum(dot))
+    return {
+        'circulation': circulation,
+        'finite_fraction': finite_fraction,
+        'boundary_length_km': total / 1000.0,
+    }
+
+
+def _ofes_grid_v2_normalized_strain(
+    fields: dict,
+    node_index: int,
+    row: int,
+    column: int,
+) -> float:
+    """在候选中心用节点场中心差分估计 |f| 归一化总应变率。"""
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    u = np.asarray(fields['anomalies']['u'][node_index], dtype=float)
+    v = np.asarray(fields['anomalies']['v'][node_index], dtype=float)
+    if (
+        row < 1 or column < 1
+        or row >= lat.size - 1 or column >= lon.size - 1
+    ):
+        return np.nan
+    dy_m = float(np.median(np.diff(lat))) * 111320.0
+    dx_m = float(np.median(np.diff(lon))) * 111320.0 * np.cos(
+        np.deg2rad(lat[row])
+    )
+    if dx_m <= 0.0 or dy_m <= 0.0:
+        return np.nan
+    du_dx = (u[row, column + 1] - u[row, column - 1]) / (2.0 * dx_m)
+    dv_dx = (v[row, column + 1] - v[row, column - 1]) / (2.0 * dx_m)
+    du_dy = (u[row + 1, column] - u[row - 1, column]) / (2.0 * dy_m)
+    dv_dy = (v[row + 1, column] - v[row - 1, column]) / (2.0 * dy_m)
+    if not np.all(np.isfinite([du_dx, dv_dx, du_dy, dv_dy])):
+        return np.nan
+    coriolis = float(np.asarray(gsw.f(lat[row]))[()])
+    if coriolis == 0.0:
+        return np.nan
+    total_strain = 0.5 * np.sqrt(
+        (du_dx - dv_dy) ** 2 + (du_dy + dv_dx) ** 2
+    )
+    return float(total_strain / abs(coriolis))
+
+
+def _ofes_grid_v2_velocity_support(
+    objects: pd.DataFrame,
+    voxels: pd.DataFrame,
+    fields: dict,
+    layers: dict[int, list[dict]],
+    v2_settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """为透镜对象附加 weak/strong 原生速度支持与气旋技术目录标记。"""
+    if objects.empty:
+        return objects.copy(), pd.DataFrame()
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    area = _ofes_tracer_cell_area_m2(lat, lon)
+    node_rows: list[dict] = []
+    object_rows = objects.to_dict('records')
+    for row in object_rows:
+        object_id = str(row['object_id'])
+        object_voxels = voxels.loc[voxels['object_id'].eq(object_id)].copy()
+        node_results = []
+        for node_index in sorted(
+            object_voxels['node_index'].astype(int).unique()
+        ):
+            node_voxels = object_voxels.loc[
+                object_voxels['node_index'].astype(int).eq(int(node_index))
+            ]
+            mask = np.zeros((lat.size, lon.size), dtype=bool)
+            mask[
+                node_voxels['lat_index'].astype(int).to_numpy(),
+                node_voxels['lon_index'].astype(int).to_numpy(),
+            ] = True
+            layer = None
+            for candidate in layers.get(int(node_index), []):
+                if candidate.get('failed'):
+                    continue
+                overlap = int(np.count_nonzero(
+                    np.asarray(candidate['mask'], dtype=bool) & mask
+                ))
+                if overlap and (layer is None or overlap > layer[1]):
+                    layer = (candidate, overlap)
+            centroid_lat = float(node_voxels['voxel_lat'].mean())
+            centroid_lon = float(node_voxels['voxel_lon'].mean())
+            u = np.asarray(fields['anomalies']['u'][node_index], dtype=float)
+            v = np.asarray(fields['anomalies']['v'][node_index], dtype=float)
+            candidates = np.flatnonzero(mask & np.isfinite(u) & np.isfinite(v))
+            if candidates.size:
+                lat_index = candidates // lon.size
+                lon_index = candidates % lon.size
+                speed = np.hypot(u[mask], v[mask])
+                min_speed = float(np.nanmin(speed))
+                at_min = speed <= min_speed + 1.0e-12
+                center_distance = np.hypot(
+                    (lat[lat_index[at_min]] - centroid_lat) * 111320.0,
+                    (lon[lon_index[at_min]] - centroid_lon)
+                    * 111320.0 * np.cos(np.deg2rad(centroid_lat)),
+                )
+                chosen = int(np.argmin(center_distance))
+                center_row = int(lat_index[at_min][chosen])
+                center_column = int(lon_index[at_min][chosen])
+                center_lat_value = float(lat[center_row])
+                center_lon_value = float(lon[center_column])
+            else:
+                center_row = int(node_voxels['lat_index'].iloc[0])
+                center_column = int(node_voxels['lon_index'].iloc[0])
+                center_lat_value = float(lat[center_row])
+                center_lon_value = float(lon[center_column])
+            nencioli = _ofes_grid_v2_nencioli(
+                fields, int(node_index), center_lat_value, center_lon_value, v2_settings
+            )
+            circulation = {
+                'circulation': np.nan,
+                'finite_fraction': 0.0,
+                'boundary_length_km': np.nan,
+            }
+            if layer is not None:
+                circulation = _ofes_grid_v2_boundary_circulation(
+                    fields,
+                    int(node_index),
+                    np.asarray(layer[0]['path_vertices'], dtype=float),
+                    v2_settings,
+                )
+            anticyclonic_circulation = bool(
+                np.isfinite(circulation['circulation'])
+                and circulation['circulation'] < 0.0
+                and circulation['finite_fraction']
+                >= v2_settings['circulation_min_finite_fraction']
+            )
+            coriolis = float(np.asarray(gsw.f(center_lat_value))[()])
+            zeta_center = float(fields['anomalies']['zeta'][node_index, center_row, center_column])
+            normalized_strain = _ofes_grid_v2_normalized_strain(
+                fields, int(node_index), center_row, center_column
+            )
+            node_rows.append({
+                'object_id': object_id,
+                'node_index': int(node_index),
+                'center_lat': center_lat_value,
+                'center_lon': center_lon_value,
+                'nencioli_passed': bool(nencioli['passed']),
+                'nencioli_tangential_fraction': float(nencioli['tangential_alignment_fraction']),
+                'rossby_number': float(nencioli['rossby_number']),
+                'zeta_anomaly_s_1': zeta_center,
+                'normalized_strain': float(normalized_strain),
+                'circulation_m2_s': float(circulation['circulation']),
+                'circulation_finite_fraction': float(circulation['finite_fraction']),
+                'boundary_length_km': float(circulation['boundary_length_km']),
+                'anticyclonic_circulation': anticyclonic_circulation,
+            })
+            node_results.append({
+                'nencioli_passed': bool(nencioli['passed']),
+                'anticyclonic_circulation': anticyclonic_circulation,
+                'node_index': int(node_index),
+            })
+        node_indices = [item['node_index'] for item in node_results]
+        strong_nodes = [
+            item['node_index'] for item in node_results
+            if item['nencioli_passed'] and item['anticyclonic_circulation']
+        ]
+        adjacent_strong = bool(
+            any(
+                strong_nodes[index] + 1 == strong_nodes[index + 1]
+                for index in range(len(strong_nodes) - 1)
+            )
+        )
+        node_results.sort(key=lambda item: item['node_index'])
+        zeta_voxels = np.asarray(
+            fields['anomalies']['zeta'][
+                object_voxels['node_index'].astype(int).to_numpy(),
+                object_voxels['lat_index'].astype(int).to_numpy(),
+                object_voxels['lon_index'].astype(int).to_numpy(),
+            ],
+            dtype=float,
+        )
+        voxel_area = np.asarray(
+            area[
+                object_voxels['lat_index'].astype(int).to_numpy(),
+                object_voxels['lon_index'].astype(int).to_numpy(),
+            ],
+            dtype=float,
+        )
+        finite_zeta = np.isfinite(zeta_voxels) & np.isfinite(voxel_area)
+        core_zeta = (
+            float(np.average(zeta_voxels[finite_zeta], weights=voxel_area[finite_zeta]))
+            if np.any(finite_zeta) else np.nan
+        )
+        any_nencioli = bool(any(item['nencioli_passed'] for item in node_results))
+        any_anticyclonic = bool(
+            any(item['anticyclonic_circulation'] for item in node_results)
+        )
+        core_anticyclonic = bool(np.isfinite(core_zeta) and core_zeta < 0.0)
+        weak = bool((any_nencioli or any_anticyclonic) and core_anticyclonic)
+        strong = bool(adjacent_strong and len(strong_nodes) >= 2)
+        cyclonic_technical = bool(
+            any(
+                np.isfinite(item['circulation_m2_s']) and item['circulation_m2_s'] > 0.0
+                for item in node_rows if item['object_id'] == object_id
+            )
+            or (np.isfinite(core_zeta) and core_zeta > 0.0)
+        )
+        row.update({
+            'velocity_checked_node_count': int(len(node_results)),
+            'nencioli_passed_node_count': int(sum(
+                item['nencioli_passed'] for item in node_results
+            )),
+            'anticyclonic_circulation_node_count': int(sum(
+                item['anticyclonic_circulation'] for item in node_results
+            )),
+            'strong_node_count': int(len(strong_nodes)),
+            'adjacent_strong_pair': adjacent_strong,
+            'core_zeta_anomaly_mean': core_zeta,
+            'weak_native_support': weak,
+            'strong_native_support': strong,
+            'cyclonic_technical_candidate': cyclonic_technical,
+            'support_class': (
+                'strong_native_support'
+                if strong else 'weak_native_support'
+                if weak else 'none'
+            ),
+        })
+    return pd.DataFrame(object_rows), pd.DataFrame(node_rows)
+
+
+def _ofes_grid_scv_v2_code_sha256() -> str:
+    """对 grid-SCV v2 检测器与关联器稳定源代码做 hash。"""
+    functions = (
+        _ofes_grid_scv_v2_settings,
+        _ofes_grid_v2_column_profile,
+        _ofes_grid_v2_position_profile,
+        _ofes_grid_v2_build_profile_cache,
+        _ofes_grid_v2_profile_chunk,
+        _ofes_grid_v2_ring_controls,
+        _ofes_grid_v2_prefilter_envelope,
+        _ofes_grid_v2_tier0_column,
+        _ofes_grid_v2_daily_seeds_chunk,
+        _ofes_grid_v2_daily_seeds,
+        _ofes_grid_v2_closed_lens_masks,
+        _ofes_grid_v2_layer_properties,
+        _ofes_grid_v2_connect_lenses,
+        _ofes_grid_v2_nencioli,
+        _ofes_grid_v2_normalized_strain,
+        _ofes_grid_v2_boundary_circulation,
+        _ofes_grid_v2_velocity_support,
+        _ofes_grid_v2_event_window,
+        _ofes_grid_scv_v2_day_from_snapshot,
+        detect_ofes_grid_scv_v2_day,
+        _ofes_grid_v2_event_ring_occupancy,
+        _ofes_grid_v2_object_association,
+        run_ofes_grid_scv_v2_event_catalog,
+        run_ofes_grid_scv_v2_validation,
+        run_ofes_grid_scv_v2_audit_sample,
+        _ofes_grid_v2_tier_transition_summary,
+        _ofes_grid_v2_matched_background_control,
+        _ofes_grid_v2_seed_control_audit,
+        _ofes_grid_scv_v2_analytic_validation,
+    )
+    source = '\n\n'.join(inspect.getsource(function) for function in functions)
+    return hashlib.sha256(source.encode('utf-8')).hexdigest()
+
+
+def _ofes_grid_v2_event_window(
+    core_lon: float,
+    core_lat: float,
+    v2_settings: dict,
+    *,
+    margin_km: float = 20.0,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """构造不跨日界线的固定背景环带读取窗口（120--240 km 环带外延 20 km）。"""
+    total_radius = float(v2_settings['background_outer_radius_km']) + float(margin_km)
+    scale = approximate_degree_length(float(core_lat))
+    lon_half = total_radius * 1000.0 / float(scale['meters_per_degree_lon'])
+    lat_half = total_radius * 1000.0 / float(scale['meters_per_degree_lat'])
+    return (
+        (float(core_lon) - lon_half, float(core_lon) + lon_half),
+        (float(core_lat) - lat_half, float(core_lat) + lat_half),
+    )
+
+
+def detect_ofes_grid_scv_v2_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    event_radius_km: float,
+    *,
+    settings: dict | None = None,
+    output_dir: str | Path | None = None,
+    worker_count: int = 1,
+) -> dict:
+    """检测一个 OFES 日期窗口内的 Tier 0--2 分层 SCV 结构。
+
+    完整 McCoy 门链在网格列上给出 Tier-0 种子；种子锚定最外层闭合 N2=0
+    等值线形成 Tier-1 热盐透镜；OFES 原生 u/v 去 120--240 km 环带平移后
+    给出 weak/strong 速度支持。DO、事件标签与表层涡目录不参与任何门链。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - core_lon (float): 窗口中心经度。
+        - core_lat (float): 窗口中心纬度。
+        - event_radius_km (float): 事件等效半径，仅用于 provenance。
+        - settings (dict | None): 已解析或覆盖的 v2 设置。
+        - output_dir (str | Path | None): 可选的单日输出目录。
+        - worker_count (int): profile 缓存构建的进程数，只进执行 provenance。
+
+    返回:
+        - dict: snapshot、等密度场、seed/layer/object/voxel 表与摘要。
+
+    输出:
+        - `output_dir` 非空时写入 `seeds.parquet`、`layer_masks.parquet`、
+          `objects.parquet`、`voxels.parquet`、`node_support.parquet`、
+          `profile_only.parquet` 与 `day_summary.json`。
+
+    说明:
+        - `tier1_identity` 是形态/分辨率分级，不是乘法身份门；只有
+          `strong_native_support` 对象可称严格 grid-supported SCV。
+    """
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    date_ts = pd.Timestamp(date).normalize()
+    lon_bounds, lat_bounds = _ofes_grid_v2_event_window(
+        float(core_lon), float(core_lat), v2_settings
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['temp', 'salinity', 'u', 'v'],
+        lon_bounds=lon_bounds,
+        lat_bounds=lat_bounds,
+    )
+    return _ofes_grid_scv_v2_day_from_snapshot(
+        snapshot,
+        core_lon,
+        core_lat,
+        event_radius_km,
+        settings=v2_settings,
+        output_dir=output_dir,
+        worker_count=worker_count,
+    )
+
+
+def _ofes_grid_scv_v2_day_from_snapshot(
+    snapshot: dict,
+    core_lon: float,
+    core_lat: float,
+    event_radius_km: float,
+    *,
+    settings: dict | None = None,
+    output_dir: str | Path | None = None,
+    worker_count: int = 1,
+) -> dict:
+    """在已加载快照上运行 Tier 0--2 分层 SCV 检测（合成验证注入点）。"""
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    mccoy_settings = _ofes_mccoy_virtual_argo_settings()
+    v1_settings = _ofes_grid_scv_settings()
+    date_ts = pd.Timestamp(snapshot['date']).normalize() if 'date' in snapshot else None
+    lon_grid, lat_grid = np.meshgrid(snapshot['lon'], snapshot['lat'])
+    distance_km = great_circle_distance_m(
+        lon_grid, lat_grid, float(core_lon), float(core_lat)
+    ) / 1000.0
+    background_mask = (
+        (distance_km >= v2_settings['background_inner_radius_km'])
+        & (distance_km <= v2_settings['background_outer_radius_km'])
+    )
+    background_mask &= np.all(
+        np.isfinite(snapshot['temp'])
+        & np.isfinite(snapshot['salinity'])
+        & np.isfinite(snapshot['u'])
+        & np.isfinite(snapshot['v']),
+        axis=0,
+    )
+    fields = _ofes_grid_isopycnal_fields(
+        snapshot, v1_settings, background_mask=background_mask
+    )
+    profile_cache = _ofes_grid_v2_build_profile_cache(
+        snapshot, mccoy_settings, worker_count=int(worker_count)
+    )
+    seeds, prefilter_scan = _ofes_grid_v2_daily_seeds(
+        snapshot, profile_cache, v2_settings, mccoy_settings
+    )
+    layers = _ofes_grid_v2_closed_lens_masks(fields, seeds)
+    depth_z = np.asarray(snapshot['depth'], dtype=float)
+    delivered_bottom = float(np.max(depth_z) - np.median(np.diff(depth_z)))
+    objects, voxels, profile_only = _ofes_grid_v2_connect_lenses(
+        fields,
+        layers,
+        v2_settings,
+        delivered_bottom_min_m=delivered_bottom,
+        upper_bound_tolerance_m=float(np.median(np.diff(depth_z))),
+
+    )
+    objects, node_support = _ofes_grid_v2_velocity_support(
+        objects, voxels, fields, layers, v2_settings
+    )
+    if not objects.empty:
+        objects['date'] = date_ts
+        objects['window_core_lon'] = float(core_lon)
+        objects['window_core_lat'] = float(core_lat)
+        objects['event_radius_km'] = float(event_radius_km)
+    if not voxels.empty:
+        voxels['date'] = date_ts
+        voxels['window_core_lon'] = float(core_lon)
+        voxels['window_core_lat'] = float(core_lat)
+    if not seeds.empty:
+        seeds['date'] = date_ts
+    if not profile_only.empty:
+        profile_only['date'] = date_ts
+    if not node_support.empty:
+        node_support['date'] = date_ts
+    grid_lenses = (
+        objects.loc[objects['tier1_identity'].eq('grid_lens')]
+        if not objects.empty else objects
+    )
+    summary = {
+        'status': 'complete',
+        'date': date_ts.strftime('%Y-%m-%d'),
+        'window_core_lon': float(core_lon),
+        'window_core_lat': float(core_lat),
+        'event_radius_km': float(event_radius_km),
+        'background_valid_columns': int(np.count_nonzero(background_mask)),
+        'wet_column_count': int(len(profile_cache)),
+        'prefilter_envelope_passed_count': int(seeds.attrs.get('envelope_passed_count', 0)),
+        'tier0_seed_count': int(len(seeds)),
+        'profile_only_count': int(len(profile_only)),
+        'lens_object_count': int(len(objects)),
+        'grid_lens_count': int(len(grid_lenses)),
+        'well_resolved_count': int(grid_lenses['well_resolved_grid_lens'].sum()) if not grid_lenses.empty else 0,
+        'boundary_censored_count': int(objects['boundary_censored'].sum()) if not objects.empty else 0,
+        'depth_identity_failed_count': int(
+            (objects['tier1_identity'] == 'depth_identity_failed').sum()
+        ) if not objects.empty else 0,
+        'weak_native_support_count': int(objects['weak_native_support'].sum()) if not objects.empty else 0,
+        'strong_native_support_count': int(objects['strong_native_support'].sum()) if not objects.empty else 0,
+        'cyclonic_technical_candidate_count': int(objects['cyclonic_technical_candidate'].sum()) if not objects.empty else 0,
+    }
+    if not prefilter_scan.empty:
+        prefilter_scan['date'] = date_ts
+    repo_root = Path(__file__).resolve().parent
+    summary.update({
+        'code_sha256': _ofes_grid_scv_v2_code_sha256(),
+        'protocol_sha256': _file_sha256(repo_root / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'),
+        'processing_config_sha256': _file_sha256(repo_root / 'config' / 'processing.yml'),
+        'v2_output_schema_version': 1,
+    })
+    if output_dir is not None:
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_parquet(seeds, root / 'seeds.parquet')
+        _atomic_write_parquet(prefilter_scan, root / 'prefilter_scan.parquet')
+        _atomic_write_parquet(objects, root / 'objects.parquet')
+        _atomic_write_parquet(voxels, root / 'voxels.parquet')
+        _atomic_write_parquet(profile_only, root / 'profile_only.parquet')
+        _atomic_write_parquet(node_support, root / 'node_support.parquet')
+        _atomic_write_parquet(
+            _ofes_grid_v2_profile_frame(profile_cache),
+            root / 'profile_cache.parquet',
+        )
+        _ofes_atomic_write_json(summary, root / 'day_summary.json')
+    return {
+        'date': date_ts,
+        'snapshot': snapshot,
+        'fields': fields,
+        'profile_cache': profile_cache,
+        'seeds': seeds,
+        'prefilter_scan': prefilter_scan,
+        'layers': layers,
+        'objects': objects,
+        'voxels': voxels,
+        'node_support': node_support,
+        'profile_only': profile_only,
+        'summary': summary,
+    }
+
+
+def _ofes_grid_v2_do_catalog_root(population_path: str | Path) -> Path:
+    """从 population 权威目录向上解析 DO 事件目录根。"""
+    root = Path(population_path).resolve()
+    for _ in range(6):
+        if (root / 'days').is_dir() and any(
+            (root / 'days').glob('peak_pixels_*.parquet')
+        ):
+            return root
+        root = root.parent
+    raise FileNotFoundError(
+        f'OFES DO catalog root not found above {population_path}.'
+    )
+
+
+def _ofes_grid_v2_event_ring_occupancy(
+    event_row: pd.Series,
+    result: dict,
+    object_ids: set[str],
+    v2_settings: dict,
+) -> dict:
+    """计算单事件同日同密度节点 120--240 km 环带的 Tier 占据率。"""
+    fields = result['fields']
+    v1_settings = _ofes_grid_scv_settings()
+    mapping = _ofes_grid_sigma0_cell_mapping(
+        float(event_row['target_sigma0']), v1_settings
+    )
+    node_index = int(mapping['sigma0_node_index'])
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    area = _ofes_tracer_cell_area_m2(lat, lon)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance = great_circle_distance_m(
+        lon_grid, lat_grid,
+        float(event_row['peak_lon']), float(event_row['peak_lat']),
+    ) / 1000.0
+    valid = bool(
+        mapping['sigma0_mapping_valid']
+        and 0 <= node_index < len(fields['nodes_sigma0'])
+    )
+    if valid:
+        unique = np.asarray(fields['unique_crossing'][node_index], dtype=bool)
+        ring = (
+            (distance >= float(v2_settings['background_inner_radius_km']))
+            & (distance <= float(v2_settings['background_outer_radius_km']))
+            & unique
+        )
+    else:
+        ring = np.zeros((lat.size, lon.size), dtype=bool)
+    occupied = np.zeros(ring.shape, dtype=bool)
+    voxels = result['voxels']
+    if valid and not voxels.empty and object_ids:
+        selected = voxels.loc[
+            voxels['object_id'].astype(str).isin(object_ids)
+            & voxels['node_index'].astype(int).eq(node_index)
+        ]
+        for row in selected.itertuples(index=False):
+            lat_index, lon_index = int(row.lat_index), int(row.lon_index)
+            if 0 <= lat_index < occupied.shape[0] and 0 <= lon_index < occupied.shape[1]:
+                occupied[lat_index, lon_index] = True
+    ring_area = float(np.sum(area[ring]))
+    occupied_area = float(np.sum(area[ring & occupied]))
+    fraction = occupied_area / ring_area if ring_area > 0 else np.nan
+    return {
+        'ring_valid': bool(valid and ring_area > 0),
+        'ring_valid_cell_count': int(np.count_nonzero(ring)),
+        'ring_occupied_cell_count': int(np.count_nonzero(ring & occupied)),
+        'ring_area_m2': ring_area,
+        'ring_occupied_area_m2': occupied_area,
+        'ring_occupancy_fraction': float(fraction) if np.isfinite(fraction) else np.nan,
+    }
+
+
+def _ofes_grid_v2_object_association(
+    event_row: pd.Series,
+    result: dict,
+    v2_settings: dict,
+    *,
+    do_catalog_root: str | Path,
+) -> dict:
+    """将单日 Tier 0--2 对象与一个 DO 事件做零参数位置关联。"""
+    objects = result['objects'].copy()
+    voxels = result['voxels'].copy()
+    fields = result['fields']
+    v1_settings = _ofes_grid_scv_settings()
+    mapping = _ofes_grid_sigma0_cell_mapping(
+        float(event_row['target_sigma0']), v1_settings
+    )
+    node_index = int(mapping['sigma0_node_index'])
+    core_row, core_column = _ofes_grid_nearest_index(
+        fields['lon'], fields['lat'],
+        float(event_row['peak_lon']), float(event_row['peak_lat']),
+    )
+    in_bounds = bool(
+        mapping['sigma0_mapping_valid']
+        and 0 <= node_index < len(fields['nodes_sigma0'])
+        and 0 <= core_row < len(fields['lat'])
+        and 0 <= core_column < len(fields['lon'])
+    )
+    tier_sets = {
+        'tier1': set(
+            objects.loc[
+                objects['tier1_identity'].eq('grid_lens')
+                & ~objects['boundary_censored'].astype(bool),
+                'object_id',
+            ].astype(str)
+        ) if not objects.empty else set(),
+        'weak': set(
+            objects.loc[
+                objects['tier1_identity'].eq('grid_lens')
+                & ~objects['boundary_censored'].astype(bool)
+                & objects['weak_native_support'].astype(bool),
+                'object_id',
+            ].astype(str)
+        ) if not objects.empty else set(),
+        'strong': set(
+            objects.loc[
+                objects['tier1_identity'].eq('grid_lens')
+                & ~objects['boundary_censored'].astype(bool)
+                & objects['strong_native_support'].astype(bool),
+                'object_id',
+            ].astype(str)
+        ) if not objects.empty else set(),
+    }
+    target_voxels = pd.DataFrame()
+    if in_bounds and not voxels.empty:
+        target_voxels = voxels.loc[
+            voxels['node_index'].astype(int).eq(node_index)
+            & voxels['lat_index'].astype(int).eq(core_row)
+            & voxels['lon_index'].astype(int).eq(core_column)
+        ].copy()
+    containing_ids = (
+        set(target_voxels['object_id'].astype(str)) if not target_voxels.empty else set()
+    )
+    event_record: dict = {
+        'event_id': str(event_row['event_id']),
+        'peak_date': pd.Timestamp(event_row['peak_date']).normalize(),
+        'core_lon': float(event_row['peak_lon']),
+        'core_lat': float(event_row['peak_lat']),
+        'core_depth_m': float(event_row['peak_depth_m']),
+        'target_sigma0': float(event_row['target_sigma0']),
+        'mapped_sigma0': float(mapping['mapped_sigma0']),
+        'sigma0_mapping_mismatch': float(mapping['sigma0_mapping_mismatch']),
+        'sigma0_node_index': node_index,
+        'core_grid_row': core_row,
+        'core_grid_column': core_column,
+        'core_in_bounds': in_bounds,
+    }
+    peak_mask_cells = None
+    try:
+        pixels, _, _, _, _ = _ofes_zhu_event_core_pixels(
+            event_row, Path(do_catalog_root)
+        )
+        peak_lat = pixels['lat'].to_numpy(dtype=float)
+        peak_lon = pixels['lon'].to_numpy(dtype=float)
+        peak_mask_cells = set()
+        for lat_value, lon_value in zip(peak_lat, peak_lon):
+            row_index, column_index = _ofes_grid_nearest_index(
+                fields['lon'], fields['lat'], float(lon_value), float(lat_value)
+            )
+            peak_mask_cells.add((int(row_index), int(column_index)))
+    except (FileNotFoundError, ValueError):
+        peak_mask_cells = None
+    lat = np.asarray(fields['lat'], dtype=float)
+    lon = np.asarray(fields['lon'], dtype=float)
+    for tier in ('tier1', 'weak', 'strong'):
+        tier_ids = tier_sets[tier]
+        containing = sorted(containing_ids & tier_ids)
+        event_record[f'{tier}_core_contained'] = bool(containing)
+        event_record[f'{tier}_core_object_count'] = int(len(containing))
+        event_record[f'{tier}_core_object_ids'] = json.dumps(containing)
+        ring = _ofes_grid_v2_event_ring_occupancy(
+            event_row, result, tier_ids, v2_settings
+        )
+        event_record[f'{tier}_ring_occupancy_fraction'] = ring['ring_occupancy_fraction']
+        event_record[f'{tier}_ring_valid_cell_count'] = ring['ring_valid_cell_count']
+        event_record[f'{tier}_ring_occupied_cell_count'] = ring['ring_occupied_cell_count']
+        event_record[f'{tier}_core_minus_ring'] = (
+            float(bool(containing)) - ring['ring_occupancy_fraction']
+            if np.isfinite(ring['ring_occupancy_fraction']) else np.nan
+        )
+        tier_objects = objects.loc[
+            objects['object_id'].astype(str).isin(tier_ids)
+        ].copy() if not objects.empty and tier_ids else objects.iloc[0:0].copy()
+        if not tier_objects.empty:
+            tier_objects['distance_km'] = great_circle_distance_m(
+                tier_objects['center_lon'].to_numpy(dtype=float),
+                tier_objects['center_lat'].to_numpy(dtype=float),
+                float(event_row['peak_lon']), float(event_row['peak_lat']),
+            ) / 1000.0
+            tier_objects['distance_over_radius'] = (
+                tier_objects['distance_km']
+                / tier_objects['radius_km'].replace(0, np.nan)
+            )
+            nearest = tier_objects.loc[
+                tier_objects['distance_over_radius'].notna()
+            ].sort_values(
+                ['distance_over_radius', 'object_id'], kind='mergesort'
+            )
+            event_record[f'{tier}_nearest_distance_km'] = float(
+                tier_objects['distance_km'].min()
+            )
+            event_record[f'{tier}_nearest_object_id'] = str(
+                nearest['object_id'].iloc[0]
+            ) if not nearest.empty else ''
+            event_record[f'{tier}_nearest_d_over_radius'] = float(
+                nearest['distance_over_radius'].iloc[0]
+            ) if not nearest.empty else np.nan
+        else:
+            event_record[f'{tier}_nearest_distance_km'] = np.nan
+            event_record[f'{tier}_nearest_object_id'] = ''
+            event_record[f'{tier}_nearest_d_over_radius'] = np.nan
+        if tier == 'tier1' and peak_mask_cells is not None and tier_ids:
+            object_cells = set()
+            selected_voxels = voxels.loc[
+                voxels['object_id'].astype(str).isin(tier_ids)
+                & voxels['node_index'].astype(int).eq(node_index)
+            ]
+            for row in selected_voxels.itertuples(index=False):
+                object_cells.add((int(row.lat_index), int(row.lon_index)))
+            overlap_count = len(peak_mask_cells & object_cells)
+            event_record['tier1_peak_mask_overlap_fraction'] = (
+                float(overlap_count / len(peak_mask_cells))
+                if peak_mask_cells else np.nan
+            )
+        elif tier == 'tier1':
+            event_record['tier1_peak_mask_overlap_fraction'] = np.nan
+    if not result['profile_only'].empty:
+        profile_only = result['profile_only'].copy()
+        profile_only['distance_km'] = great_circle_distance_m(
+            lon[profile_only['lon_index'].astype(int).to_numpy(dtype=int)],
+            lat[profile_only['lat_index'].astype(int).to_numpy(dtype=int)],
+            float(event_row['peak_lon']), float(event_row['peak_lat']),
+        ) / 1000.0
+        event_record['profile_only_seed_count'] = int(len(profile_only))
+        event_record['profile_only_min_distance_km'] = float(
+            profile_only['distance_km'].min()
+        )
+    else:
+        event_record['profile_only_seed_count'] = 0
+        event_record['profile_only_min_distance_km'] = np.nan
+    event_record['tier1_object_count'] = int(len(tier_sets['tier1']))
+    event_record['weak_support_object_count'] = int(len(tier_sets['weak']))
+    event_record['strong_support_object_count'] = int(len(tier_sets['strong']))
+    event_record['cyclonic_technical_object_count'] = int(
+        objects['cyclonic_technical_candidate'].sum() if not objects.empty else 0
+    )
+    event_record['background_valid_columns'] = int(
+        result['summary']['background_valid_columns']
+    )
+    event_record['tier0_seed_count'] = int(result['summary']['tier0_seed_count'])
+    event_record['prefilter_envelope_passed_count'] = int(
+        result['summary']['prefilter_envelope_passed_count']
+    )
+    return event_record
+
+
+def run_ofes_grid_scv_v2_event_catalog(
+    event_population_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    settings: dict | None = None,
+    max_events: int | None = None,
+    worker_count: int = 1,
+) -> dict:
+    """运行 56 个 DO50 事件的 grid-SCV v2 分层事件目录。
+
+    主估计量是 Tier-1 `closed_thermohaline_lens` 的核心包含；严格 secondary
+    是 `strong_native_support`。每个 Tier 的包含、d/R、peak-mask 重叠、
+    120--240 km 环带 null 与四级交叉表并列保存；单侧与双侧 Wilcoxon 都
+    记录。DO 只用于事件索引。
+
+    参数:
+        - event_population_path (str | Path): 含 59 事件诊断的 population parquet 或目录。
+        - output_dir (str | Path | None): 输出目录；None 时写 v2 结果根目录。
+        - settings (dict | None): 已解析或覆盖的 v2 设置。
+        - max_events (int | None): 可选工程试跑事件数，不进入科学签名。
+        - worker_count (int): profile 缓存构建进程数，只进执行 provenance。
+
+    返回:
+        - dict: manifest、event association、object/voxel inventory 和 summary。
+
+    输出:
+        - `event_association.parquet`、`object_inventory.parquet`、
+          `object_voxels.parquet`、`analysis_summary.json` 与 `manifest.json`。
+    """
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    population_path = _ofes_zhu_event_population_path(event_population_path)
+    strict = _ofes_grid_event_population_strict(population_path)
+    do_catalog_root = _ofes_grid_v2_do_catalog_root(population_path)
+    repo_root = Path(__file__).resolve().parent
+    protocol_path = repo_root / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    payload = {
+        'schema_version': 2,
+        'detector': 'ofes_grid_scv_v2_mccoy_seeded_layers',
+        'strict_event_count': int(len(strict)),
+        'event_population_sha256': _file_sha256(population_path),
+        'protocol_sha256': _file_sha256(protocol_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'code_sha256': _ofes_grid_scv_v2_code_sha256(),
+        'settings': v2_settings,
+        'source_root': str(_ofes_root),
+        'source_root_resolved': str(_ofes_root.resolve()),
+        'primary_estimand': 'Tier-1 closed thermohaline lens core containment',
+        'strict_secondary_estimand': 'strong native support (strict grid-supported SCV) core containment',
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'), default=_ofes_json_default
+    )
+    signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    if output_dir is not None:
+        root = Path(output_dir)
+    else:
+        root = Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_grid_scv_v2_results') / (
+            f"{v2_settings['output_subdir']}_{signature[:12]}"
+        )
+    manifest_path = root / 'manifest.json'
+    if max_events is None and manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if existing.get('run_signature') == signature and existing.get('status') == 'complete':
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'event_association': pd.read_parquet(root / 'event_association.parquet'),
+                'object_inventory': pd.read_parquet(root / 'object_inventory.parquet'),
+                'object_voxels': pd.read_parquet(root / 'object_voxels.parquet'),
+                'analysis_summary': json.loads(
+                    (root / 'analysis_summary.json').read_text(encoding='utf-8')
+                ),
+                'reused_complete_run': True,
+            }
+    run_events = strict if max_events is None else strict.iloc[:int(max_events)].copy()
+    if run_events.empty:
+        raise ValueError('OFES grid-SCV v2 event catalog received no events.')
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        **payload,
+        'run_signature': signature,
+        'run_tag': (
+            f"{pd.Timestamp(strict['peak_date'].min()):%Y%m%d}_"
+            f"{pd.Timestamp(strict['peak_date'].max()):%Y%m%d}_grid_scv_v2_{signature[:12]}"
+        ),
+        'status': 'running',
+        'requested_event_count': int(len(run_events)),
+        'completed_event_count': 0,
+        'worker_count': int(worker_count),
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    event_records: list[dict] = []
+    object_frames: list[pd.DataFrame] = []
+    voxel_frames: list[pd.DataFrame] = []
+    try:
+        for event_row in run_events.to_dict('records'):
+            row = pd.Series(event_row)
+            result = detect_ofes_grid_scv_v2_day(
+                row['peak_date'], row['peak_lon'], row['peak_lat'],
+                row['equivalent_radius_km_max'],
+                settings=v2_settings,
+                worker_count=int(worker_count),
+            )
+            event_records.append(_ofes_grid_v2_object_association(
+                row, result, v2_settings, do_catalog_root=do_catalog_root
+            ))
+            if not result['objects'].empty:
+                result['objects']['event_id'] = str(row['event_id'])
+                result['objects']['peak_date'] = pd.Timestamp(row['peak_date']).normalize()
+            if not result['voxels'].empty:
+                result['voxels']['event_id'] = str(row['event_id'])
+                result['voxels']['peak_date'] = pd.Timestamp(row['peak_date']).normalize()
+            object_frames.append(result['objects'])
+            voxel_frames.append(result['voxels'])
+            manifest['completed_event_count'] = int(len(event_records))
+            _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update({
+            'status': 'failed',
+            'error_type': type(error).__name__,
+            'error': str(error),
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    event_association = pd.DataFrame(event_records).sort_values(
+        'event_id', kind='mergesort'
+    ).reset_index(drop=True)
+    object_inventory = (
+        pd.concat(object_frames, ignore_index=True) if object_frames else pd.DataFrame()
+    )
+    object_voxels = (
+        pd.concat(voxel_frames, ignore_index=True) if voxel_frames else pd.DataFrame()
+    )
+
+    def tier_statistics(prefix: str) -> dict:
+        core = event_association[f'{prefix}_core_contained'].astype(float).to_numpy()
+        ring = event_association[f'{prefix}_ring_occupancy_fraction'].to_numpy(dtype=float)
+        difference = core - ring
+        finite = difference[np.isfinite(difference)]
+        mean, interval = _ofes_zhu_bootstrap_mean(
+            finite, v2_settings['bootstrap_replicates'], v2_settings['random_seed']
+        )
+        if finite.size == 0:
+            wilcoxon = {'statistic': np.nan, 'p_value': np.nan, 'p_value_two_sided': np.nan}
+        elif np.allclose(finite, 0.0, rtol=0.0, atol=0.0):
+            wilcoxon = {
+                'statistic': 0.0,
+                'p_value': 1.0,
+                'p_value_two_sided': 1.0,
+            }
+        else:
+            greater = scipy.stats.wilcoxon(
+                finite, alternative='greater', zero_method='wilcox'
+            )
+            two_sided = scipy.stats.wilcoxon(
+                finite, alternative='two-sided', zero_method='wilcox'
+            )
+            wilcoxon = {
+                'statistic': float(greater.statistic),
+                'p_value': float(greater.pvalue),
+                'p_value_two_sided': float(two_sided.pvalue),
+            }
+        return {
+            'core_contained_count': int(event_association[f'{prefix}_core_contained'].sum()),
+            'core_contained_fraction': float(event_association[f'{prefix}_core_contained'].mean()),
+            'ring_occupancy_fraction_mean': (
+                float(np.nanmean(ring)) if np.any(np.isfinite(ring)) else np.nan
+            ),
+            'event_equal_core_minus_ring_mean': mean,
+            'event_equal_core_minus_ring_bootstrap95': interval,
+            'event_equal_core_minus_ring_wilcoxon': wilcoxon,
+            'ring_valid_event_count': int(np.count_nonzero(np.isfinite(ring))),
+        }
+
+    summary = {
+        'status': 'complete',
+        'strict_event_count': int(len(strict)),
+        'processed_event_count': int(len(event_association)),
+        'tier1': tier_statistics('tier1'),
+        'weak_native_support': tier_statistics('weak'),
+        'strong_native_support': tier_statistics('strong'),
+        'tier1_peak_mask_overlap_fraction_mean': (
+            float(event_association['tier1_peak_mask_overlap_fraction'].mean())
+            if 'tier1_peak_mask_overlap_fraction' in event_association else np.nan
+        ),
+        'profile_only_seed_count_total': int(
+            event_association['profile_only_seed_count'].sum()
+        ),
+        'object_inventory_count': int(len(object_inventory)),
+        'grid_lens_count': int(
+            object_inventory['tier1_identity'].eq('grid_lens').sum()
+            if not object_inventory.empty else 0
+        ),
+        'well_resolved_count': int(
+            object_inventory['well_resolved_grid_lens'].sum()
+            if not object_inventory.empty else 0
+        ),
+        'strong_native_support_object_count': int(
+            object_inventory['strong_native_support'].sum()
+            if not object_inventory.empty else 0
+        ),
+        'weak_native_support_object_count': int(
+            object_inventory['weak_native_support'].sum()
+            if not object_inventory.empty else 0
+        ),
+        'cyclonic_technical_candidate_count': int(
+            object_inventory['cyclonic_technical_candidate'].sum()
+            if not object_inventory.empty else 0
+        ),
+        'annual_occupancy_is_computed_by_annual_catalog': True,
+        'same_day_event_ring_definition': (
+            '120-240 km, same target sigma0 node, event-equal and area-weighted'
+        ),
+        'interpretation': (
+            'Tier-1 is the primary cross-dataset estimand; only strong native '
+            'support objects may be called strict grid-supported SCV.'
+        ),
+    }
+    _atomic_write_parquet(event_association, root / 'event_association.parquet')
+    _atomic_write_parquet(object_inventory, root / 'object_inventory.parquet')
+    _atomic_write_parquet(object_voxels, root / 'object_voxels.parquet')
+    _ofes_atomic_write_json(summary, root / 'analysis_summary.json')
+    manifest.update({
+        'status': 'complete',
+        'completed_event_count': int(len(event_association)),
+        'outputs': {
+            'event_association': str((root / 'event_association.parquet').resolve()),
+            'object_inventory': str((root / 'object_inventory.parquet').resolve()),
+            'object_voxels': str((root / 'object_voxels.parquet').resolve()),
+            'analysis_summary': str((root / 'analysis_summary.json').resolve()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    })
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'event_association': event_association,
+        'object_inventory': object_inventory,
+        'object_voxels': object_voxels,
+        'analysis_summary': summary,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_grid_v2_synthetic_snapshot(
+    *,
+    lon_center: float = 141.0,
+    lat_center: float = 35.0,
+    cells: int = 56,
+    lens_kind: str = 'none',
+    rotation: str = 'none',
+    two_lenses: bool = False,
+    surface_lens: bool = False,
+    noise: bool = True,
+    shallow_base: bool = False,
+    z_core_override: float | None = None,
+    sigma_z_override: float | None = None,
+) -> dict:
+    """构造解析 T/S 与旋转/剪切速度场的合成快照（验证专用）。
+
+    基态剖面 T(z)=24-8*(0.5+0.5*tanh((z-250)/130))（250 m 温跃层）、
+    S(z)=34.5+0.0015z；`shallow_base=True` 时温跃层移到 60 m 并加盐使
+    sigma0 25.6 出现在 ~100 m，且温跃层深度带水平帽子（中心 68 m、半径
+    14 格衰减到环带 60 m）——核区 N2 系统性高于环带中值，让 surface
+    透镜的负 N2 异常被正区包围成稳定闭合轮廓，不依赖噪声格点运气。
+    透镜为 z-x 倾斜的高斯 spice 异常（密度补偿）加弱 N2 核心扰动。
+    `rotation` 在全部 z 层施加固体旋转/纯剪切/均匀平移。`noise=False`
+    关闭次表层随机噪声（静止海洋、纯 heave、纯剪切检查用无噪声场，
+    避免噪声驱动的假种子）。`z_core_override`/`sigma_z_override` 供
+    参数扫描。返回的快照带 `date` 字段，可被
+    `_ofes_grid_scv_v2_day_from_snapshot` 直接消费。
+    """
+    depth = np.arange(10.0, 1071.0, 20.0, dtype=float)
+    lon = lon_center + 0.09 * np.arange(cells, dtype=float)
+    lat = lat_center + 0.09 * np.arange(cells, dtype=float)
+    z = depth[:, None, None]
+    y_grid, x_grid = np.mgrid[0:cells, 0:cells]
+    center = (cells - 1) / 2.0
+    # tanh 温跃层：表层 24 °C、250 m（或 60 m）处温度梯度最大（N2 极大）、
+    # 深层 16 °C，温度随深度单调下降，pycnocline 以下才进入 McCoy 门链窗口。
+    thermocline_depth = 60.0 if shallow_base else 250.0
+    if shallow_base:
+        # 中心层结增强（SCV 核区层结与环带不同是真实物理）：温跃层在域
+        # 中心更深（68 m），向环带衰减回 60 m。核区 N2 系统性高于环带
+        # 中值，使 surface-lens 的负 N2 异常被正区包围成稳定闭合轮廓
+        # （不依赖噪声格点的运气）。
+        base_t = 24.0 - 8.0 * (
+            0.5
+            + 0.5
+            * np.tanh(
+                (
+                    depth[:, None, None]
+                    - (60.0 + 8.0 * np.exp(
+                        -((x_grid - center) ** 2 + (y_grid - center) ** 2) / 14.0 ** 2
+                    ))[None, :, :]
+                )
+                / 130.0
+            )
+        )
+        temp = base_t.copy()
+    else:
+        base_t = 24.0 - 8.0 * (
+            0.5 + 0.5 * np.tanh((depth - thermocline_depth) / 130.0)
+        )
+        temp = np.broadcast_to(
+            base_t[:, None, None], (depth.size, cells, cells)
+        ).copy()
+    # shallow_base 加盐使 sigma0 25.6+ 出现在 ~90--150 m（触及 100 m 上界
+    # 的 surface-lens 检查用）
+    base_s = (35.5 + 0.003 * depth) if shallow_base else (34.5 + 0.0015 * depth)
+    salt = np.broadcast_to(base_s[:, None, None], (depth.size, cells, cells)).copy()
+    if lens_kind != 'none':
+        # 透镜核心放在温跃层（250 m 附近）以下但仍在强层结区，使弱-N2
+        # 核心异常远大于次表层噪声的 N2 波动；核心密度需落在 25.6--27.5
+        # 网格内（z_core=420 m 处 sigma0 ~ 25.9）。surface 变体
+        # z_core=195/σz=60 经参数扫描验证：centroid≈181 ≤ 200 触发
+        # depth_identity_failed 拒绝路径且种子充足（~27）。
+        z_core = 195.0 if surface_lens else 420.0
+        sigma_z = 60.0 if surface_lens else 80.0
+        if z_core_override is not None:
+            z_core = float(z_core_override)
+        if sigma_z_override is not None:
+            sigma_z = float(sigma_z_override)
+        sigma_x = 8.0
+        compact_radius = 8.0
+        x_eff = (x_grid - center) + 0.1 * (z - z_core) / sigma_z * sigma_x
+        g = np.exp(-((z - z_core) / sigma_z) ** 2) * np.maximum(
+            0.0, 1.0 - (np.hypot(x_eff, y_grid - center) / compact_radius) ** 2
+        ) ** 3
+        if two_lenses:
+            g = np.maximum(
+                np.exp(-((z - z_core) / sigma_z) ** 2) * np.maximum(
+                    0.0,
+                    1.0
+                    - (np.hypot(x_grid - center - 13.0, y_grid - center) / compact_radius) ** 2,
+                ) ** 3,
+                np.exp(-((z - z_core) / sigma_z) ** 2) * np.maximum(
+                    0.0,
+                    1.0
+                    - (np.hypot(x_grid - center + 13.0, y_grid - center) / compact_radius) ** 2,
+                ) ** 3,
+            )
+        if lens_kind == 'filament':
+            g = np.exp(
+                -((z - z_core) / 120.0) ** 2
+                - ((x_grid - center) / 2.0) ** 2
+            )
+        # 弱 N2 核心：phi 压缩局部层结（纯 heave 时 T/S 沿等密面不变；
+        # 热盐透镜时在此基础上叠加密度补偿的 spice 异常）。幅度/宽度
+        # 0.83 < 1 保持密度剖面单调。
+        phi = z - 50.0 * g * np.tanh((z - z_core) / 60.0)
+        phi = np.clip(phi, float(depth[0]), float(depth[-1]))
+        phi_index = np.searchsorted(depth, phi) - 1
+        phi_index = np.clip(phi_index, 0, depth.size - 2)
+        phi_frac = (phi - depth[phi_index]) / (
+            depth[phi_index + 1] - depth[phi_index]
+        )
+        # base_t 在 shallow_base 下是 (z, y, x) 3D（温跃层水平帽子），
+        # 非 shallow_base 下是 1D；take_along_axis 统一两种情形。
+        base_t_3d = np.broadcast_to(
+            base_t[:, None, None], (depth.size, cells, cells)
+        ) if base_t.ndim == 1 else base_t
+        temp = (
+            np.take_along_axis(base_t_3d, phi_index, axis=0) * (1.0 - phi_frac)
+            + np.take_along_axis(
+                base_t_3d, np.minimum(phi_index + 1, depth.size - 1), axis=0
+            ) * phi_frac
+        )
+        salt = (
+            base_s[phi_index] * (1.0 - phi_frac)
+            + base_s[np.minimum(phi_index + 1, depth.size - 1)] * phi_frac
+        )
+        if lens_kind != 'heave':
+            delta_t = 2.5 * g
+            delta_s = 0.65 * g
+            temp = temp + delta_t
+            salt = salt + delta_s
+    # 确定性随机次表层噪声（固定种子）：环带中位数近零、单列 pycnocline
+    # 以下正负号混合，让 offset QC 如真实海洋一样通过，同时不破坏透镜的
+    # 高斯形态（振幅 << 透镜）。
+    if noise:
+        # 噪声振幅取小（0.03/0.008）且水平平滑 2 格：N2 噪声波动 ~1e-6 量级，
+        # 远小于透镜弱-N2 异常（~3e-5），保证透镜的 N2=0 闭合轮廓不被噪声
+        # 连通到域边界；振幅仍足以让 offset QC 在 pycnocline 以下出现双号。
+        noise_rng = np.random.default_rng(20260814)
+        noise_t = (
+            0.03 * np.exp(-(depth - 600.0) / 900.0)[:, None, None]
+            * gaussian_filter(
+                noise_rng.standard_normal((depth.size, cells, cells)),
+                sigma=(1.5, 2.0, 2.0),
+            )
+        )
+        noise_s = (
+            0.008 * np.exp(-(depth - 500.0) / 700.0)[:, None, None]
+            * gaussian_filter(
+                noise_rng.standard_normal((depth.size, cells, cells)),
+                sigma=(1.5, 2.0, 2.0),
+            )
+        )
+        temp = temp + noise_t
+        salt = salt + noise_s
+    dy_m = 0.09 * 111320.0
+    dx_m = 0.09 * 111320.0 * np.cos(np.deg2rad(lat_center))
+    if rotation in ('anticyclonic', 'cyclonic'):
+        # 兰金式涡：核心刚体旋转 + 径向衰减，使 120--240 km 环带内 zeta
+        # 中位数近零（环带减除后核心 zeta 异常保留）。北半球反气旋 zeta<0。
+        omega = 5.0e-6
+        radial = np.exp(-((np.hypot(x_grid - center, y_grid - center) / 15.0) ** 2))
+        # u = +w(y-yc), v = -w(x-xc) 给出 zeta = -2w（北半球反气旋）；
+        # 反号给出 zeta = +2w（气旋）
+        sign = 1.0 if rotation == 'anticyclonic' else -1.0
+        u = sign * omega * radial * (y_grid - center) * dy_m
+        v = -sign * omega * radial * (x_grid - center) * dx_m
+    elif rotation == 'shear':
+        gamma = 5.0e-6
+        u = gamma * (y_grid - center) * dy_m
+        v = np.zeros((cells, cells), dtype=float)
+    elif rotation == 'translation':
+        u = np.full((cells, cells), 0.2, dtype=float)
+        v = np.zeros((cells, cells), dtype=float)
+    else:
+        u = np.zeros((cells, cells), dtype=float)
+        v = np.zeros((cells, cells), dtype=float)
+    u = np.broadcast_to(u[None, :, :], (depth.size, cells, cells)).copy()
+    v = np.broadcast_to(v[None, :, :], (depth.size, cells, cells)).copy()
+    return {
+        'date': pd.Timestamp('2003-01-15'),
+        'depth': depth,
+        'lon': lon,
+        'lat': lat,
+        'temp': temp,
+        'salinity': salt,
+        'u': u,
+        'v': v,
+        'metadata': {'synthetic': True, 'lens_kind': lens_kind, 'rotation': rotation},
+    }
+
+
+def _ofes_grid_scv_v2_analytic_validation(
+    *,
+    output_path: str | Path | None = None,
+    raise_on_failure: bool = True,
+    worker_count: int = 4,
+) -> dict:
+    """运行 lock 冻结的 14 项解析/工程验证并落盘 detector_validation.json。"""
+    v2_settings = _ofes_grid_scv_v2_settings()
+    checks: dict[str, dict] = {}
+
+    def run_day(snapshot: dict) -> dict:
+        return _ofes_grid_scv_v2_day_from_snapshot(
+            snapshot,
+            141.0,
+            35.0,
+            50.0,
+            settings=v2_settings,
+            worker_count=int(worker_count),
+        )
+
+    def record(name: str, passed: bool, **detail) -> None:
+        checks[name] = {'passed': bool(passed), **detail}
+
+    # 1 stationary ocean: Tier 0--2 all zero
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(lens_kind='none', noise=False))
+    record(
+        'stationary_ocean_all_zero',
+        res['summary']['tier0_seed_count'] == 0
+        and res['summary']['lens_object_count'] == 0
+        and res['summary']['strong_native_support_count'] == 0,
+        tier0_seed_count=int(res['summary']['tier0_seed_count']),
+        lens_object_count=int(res['summary']['lens_object_count']),
+    )
+    # 2 tilted Gaussian lens: Tier 0 and Tier 1 pass
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(lens_kind='gaussian'))
+    record(
+        'tilted_gaussian_lens_tier01',
+        res['summary']['tier0_seed_count'] > 0
+        and res['summary']['grid_lens_count'] > 0,
+        tier0_seed_count=int(res['summary']['tier0_seed_count']),
+        grid_lens_count=int(res['summary']['grid_lens_count']),
+    )
+    # 3 one-cell dilation connection (direct mask test)
+    fields_mask = {
+        'nodes_sigma0': np.asarray([26.0, 26.05, 26.10]),
+        'lat': np.linspace(34.0, 36.0, 40),
+        'lon': np.linspace(140.0, 142.0, 40),
+        'depth': np.full(
+            (3, 40, 40), 500.0
+        ) + np.arange(3)[:, None, None] * 100.0,
+        'anomalies': {
+            'spiciness': np.full((3, 40, 40), 0.3),
+            'n2': np.full((3, 40, 40), -1.0),
+            'zeta': np.zeros((3, 40, 40)),
+            'pv': np.full((3, 40, 40), 0.0),
+        },
+    }
+    circle_path = np.asarray([
+        [140.0 + 0.5 + 0.5 * np.cos(theta), 34.0 + 0.5 + 0.5 * np.sin(theta)]
+        for theta in np.linspace(0.0, 2.0 * np.pi, 33)
+    ])
+
+    def mask_block(cells_size: int, row0: int, col0: int, size: int) -> np.ndarray:
+        mask = np.zeros((cells_size, cells_size), dtype=bool)
+        mask[row0:row0 + size, col0:col0 + size] = True
+        return mask
+
+    def layer_dict(node_index: int, mask: np.ndarray) -> dict:
+        return {
+            'node_index': node_index,
+            'mask': mask,
+            'path_vertices': circle_path,
+            'spice_sign': 'spicy',
+            'seeds': [{'lat_index': 20, 'lon_index': 20}],
+        }
+
+    # 相邻格（掩膜不重叠但相隔一个格边）经一次 8-neighbour 膨胀后连接
+    m_a = mask_block(40, 12, 12, 3)
+    m_b_adjacent = mask_block(40, 12, 15, 3)
+    layers_dilation = {0: [layer_dict(0, m_a)], 1: [layer_dict(1, m_b_adjacent)]}
+    objects, _, _ = _ofes_grid_v2_connect_lenses(
+        fields_mask, layers_dilation, v2_settings
+    )
+    record(
+        'one_cell_dilation_connects',
+        len(objects) == 1 and int(objects['density_node_count'].iloc[0]) == 2,
+        object_count=int(len(objects)),
+        node_count=int(objects['density_node_count'].iloc[0]) if len(objects) else 0,
+    )
+    # 4 shift beyond one cell: no connection
+    m_b_far = mask_block(40, 12, 18, 3)
+    layers_no_connect = {0: [layer_dict(0, m_a)], 1: [layer_dict(1, m_b_far)]}
+    objects, _, _ = _ofes_grid_v2_connect_lenses(
+        fields_mask, layers_no_connect, v2_settings
+    )
+    record(
+        'shift_beyond_one_cell_no_connection',
+        len(objects) == 2,
+        object_count=int(len(objects)),
+    )
+    # 5 pure heave: no Tier-0 seed
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(lens_kind='heave', noise=False))
+    record(
+        'pure_heave_no_seed',
+        res['summary']['tier0_seed_count'] == 0,
+        tier0_seed_count=int(res['summary']['tier0_seed_count']),
+    )
+    # 6 shear patch without thermohaline anomaly: no lens
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='none', rotation='shear', noise=False
+    ))
+    record(
+        'shear_patch_no_lens',
+        res['summary']['tier0_seed_count'] == 0
+        and res['summary']['lens_object_count'] == 0,
+        tier0_seed_count=int(res['summary']['tier0_seed_count']),
+        lens_object_count=int(res['summary']['lens_object_count']),
+    )
+    # 7 filament without closed N2 contour: profile_only, not grid lens
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(lens_kind='filament'))
+    record(
+        'filament_profile_only',
+        res['summary']['profile_only_count'] > 0
+        and res['summary']['grid_lens_count'] == 0,
+        profile_only_count=int(res['summary']['profile_only_count']),
+        grid_lens_count=int(res['summary']['grid_lens_count']),
+    )
+    # 8 solid-body anticyclone: strong gate passes
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', rotation='anticyclonic'
+    ))
+    record(
+        'solid_body_anticyclone_strong',
+        res['summary']['strong_native_support_count'] > 0,
+        strong_count=int(res['summary']['strong_native_support_count']),
+    )
+    # 9 solid-body cyclone: technical catalog only
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', rotation='cyclonic'
+    ))
+    record(
+        'solid_body_cyclone_technical_only',
+        res['summary']['strong_native_support_count'] == 0
+        and res['summary']['cyclonic_technical_candidate_count'] > 0,
+        strong_count=int(res['summary']['strong_native_support_count']),
+        cyclonic_count=int(res['summary']['cyclonic_technical_candidate_count']),
+    )
+    # 10 pure shear on a lens: no native anticyclonic support
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', rotation='shear'
+    ))
+    record(
+        'pure_shear_no_anticyclonic_support',
+        res['summary']['strong_native_support_count'] == 0
+        and res['summary']['weak_native_support_count'] == 0,
+        strong_count=int(res['summary']['strong_native_support_count']),
+        weak_count=int(res['summary']['weak_native_support_count']),
+    )
+    # 11 uniform translation invariance
+    res_a = run_day(_ofes_grid_v2_synthetic_snapshot(lens_kind='gaussian'))
+    res_b = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', rotation='translation'
+    ))
+    translation_invariant = bool(
+        res_a['summary']['tier0_seed_count'] == res_b['summary']['tier0_seed_count']
+        and res_a['summary']['lens_object_count'] == res_b['summary']['lens_object_count']
+        and res_a['summary']['strong_native_support_count']
+        == res_b['summary']['strong_native_support_count']
+    )
+    record(
+        'uniform_translation_invariant',
+        translation_invariant,
+        seed_counts=(int(res_a['summary']['tier0_seed_count']),
+                     int(res_b['summary']['tier0_seed_count'])),
+        object_counts=(int(res_a['summary']['lens_object_count']),
+                       int(res_b['summary']['lens_object_count'])),
+    )
+    # 12 surface-connected lens: technical record retained, strict subsurface
+    # identity rejected (Tier-0 的 McCoy 链 lens_shallow_limit=100 dbar 天然
+    # 拒绝浅透镜,合成构造用 centroid <= 200 m 的浅透镜验证
+    # depth_identity_failed 拒绝路径)
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', surface_lens=True, shallow_base=True
+    ))
+    record(
+        'surface_connected_lens_rejected',
+        res['summary']['lens_object_count'] > 0
+        and res['summary']['grid_lens_count'] == 0
+        and res['summary']['depth_identity_failed_count'] > 0,
+        lens_object_count=int(res['summary']['lens_object_count']),
+        grid_lens_count=int(res['summary']['grid_lens_count']),
+        depth_identity_failed_count=int(res['summary']['depth_identity_failed_count']),
+        boundary_censored_count=int(res['summary']['boundary_censored_count']),
+    )
+    # 13 two adjacent lenses: no false merge
+    res = run_day(_ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', two_lenses=True
+    ))
+    two_lenses_ok = bool(res['summary']['lens_object_count'] >= 2)
+    record(
+        'two_adjacent_lenses_no_false_merge',
+        two_lenses_ok,
+        object_count=int(res['summary']['lens_object_count']),
+    )
+    # 14 analytic: PV units/sign, interpolation, contour closure, volume, circulation
+    uniform = _ofes_grid_v2_synthetic_snapshot(lens_kind='none', noise=False)
+    snapshot_fields = _ofes_grid_isopycnal_fields(
+        uniform,
+        _ofes_grid_scv_settings(),
+        background_mask=np.all(
+            np.isfinite(uniform['temp']) & np.isfinite(uniform['salinity']),
+            axis=0,
+        ),
+    )
+    pv = snapshot_fields['pv']
+    coriolis = np.asarray(gsw.f(uniform['lat']), dtype=float)[None, :, None]
+    ratio = pv / coriolis
+    finite_ratio = ratio[np.isfinite(ratio)]
+    # 最浅节点（σ0 25.60，温跃层底部强层结区）的数值 gradient 与密度
+    # 插值逆存在 ~7% 互逆误差（曲率区二阶差分），其余节点 < 4%；该偏差
+    # 是数值方法误差，PV 单位/符号（pv/f ≈ +1）已验证，阈值取 0.10。
+    pv_ok = bool(
+        finite_ratio.size > 100
+        and np.nanmax(np.abs(finite_ratio - 1.0)) < 0.10
+    )
+    record(
+        'pv_units_sign_uniform_field',
+        pv_ok,
+        finite_count=int(finite_ratio.size),
+        max_abs_deviation=float(np.nanmax(np.abs(finite_ratio - 1.0)))
+        if finite_ratio.size else np.nan,
+    )
+    depth = np.asarray(uniform['depth'], dtype=float)
+    sigma_col = np.asarray(_ofes_sigma0_volume(uniform)[:, 20, 20], dtype=float)
+    nodes = _ofes_grid_sigma0_nodes(_ofes_grid_scv_settings())
+    interpolated = _ofes_grid_density_interpolate(
+        depth,
+        sigma_col[:, None, None],
+        nodes,
+        {'spiciness': np.full((depth.size, 1, 1), 0.5, dtype=float)},
+        valid_depth_min_m=100.0,
+        valid_depth_max_m=1000.0,
+    )
+    crossing_depth = interpolated['depth'][:, 0, 0]
+    finite_depth = crossing_depth[np.isfinite(crossing_depth)]
+    record(
+        'density_interpolation_analytic',
+        bool(finite_depth.size > 10 and np.all(np.diff(finite_depth) > 0)),
+        unique_crossing_count=int(np.count_nonzero(interpolated['unique_crossing'])),
+    )
+    n2_field = np.zeros((40, 40), dtype=float)
+    yy, xx = np.ogrid[:40, :40]
+    distance = np.hypot(xx - 20, yy - 20)
+    n2_field = np.where(distance < 8.0, -1.0, 1.0)
+    figure = plt.figure(figsize=(1.0, 1.0))
+    try:
+        contour_set = figure.gca().contour(
+            np.linspace(140.0, 142.0, 40),
+            np.linspace(34.0, 36.0, 40),
+            n2_field,
+            levels=[0.0],
+        )
+        closed_paths = [
+            MplPath(segment)
+            for segment in contour_set.allsegs[0]
+            if np.asarray(segment).shape[0] >= 4
+            and np.allclose(segment[0], segment[-1], atol=1.0e-10)
+        ]
+    finally:
+        plt.close(figure)
+    contour_lon = np.linspace(140.0, 142.0, 40)
+    contour_lat = np.linspace(34.0, 36.0, 40)
+    cell_deg = float(contour_lon[1] - contour_lon[0])
+    radius_deg = 8.0 * cell_deg
+    r_lat_km = radius_deg * 111.320
+    r_lon_km = radius_deg * 111.320 * np.cos(np.deg2rad(35.0))
+    area_analytic = np.pi * r_lat_km * r_lon_km
+    area_computed = 0.0
+    if closed_paths:
+        path = max(closed_paths, key=lambda item: np.abs(
+            np.dot(item.vertices[:, 0], np.roll(item.vertices[:, 1], -1))
+            - np.dot(item.vertices[:, 1], np.roll(item.vertices[:, 0], -1))
+        ))
+        area_computed = 0.5 * abs(float(
+            np.dot(path.vertices[:, 0], np.roll(path.vertices[:, 1], -1))
+            - np.dot(path.vertices[:, 1], np.roll(path.vertices[:, 0], -1))
+        )) * (111320.0 * np.cos(np.deg2rad(35.0)) * 111320.0) / 1.0e6
+    record(
+        'contour_closure_analytic',
+        bool(closed_paths and abs(area_computed - area_analytic) / area_analytic < 0.30),
+        closed_path_count=int(len(closed_paths)),
+        area_analytic_km2=float(area_analytic),
+        area_computed_km2=float(area_computed),
+    )
+    lens_snapshot = _ofes_grid_v2_synthetic_snapshot(
+        lens_kind='gaussian', rotation='anticyclonic'
+    )
+    lens_fields = _ofes_grid_isopycnal_fields(
+        lens_snapshot,
+        _ofes_grid_scv_settings(),
+        background_mask=np.all(
+            np.isfinite(lens_snapshot['temp']) & np.isfinite(lens_snapshot['salinity']),
+            axis=0,
+        ),
+    )
+    omega = 5.0e-6
+    # 采样圆须与合成涡心同心（域中心 143.475/37.475）；旧实现把圆放在
+    # 域角 (141,35)，那里兰金衰减到 ~0.7%，环流退化。半径取 3 格使
+    # radial=exp(-(3/15)^2)=0.96，2ΩA 解析式误差 ~4% < 15% 阈值。
+    radius_deg = 3.0 * 0.09
+    circle_vertices = np.asarray([
+        [143.475 + radius_deg * np.cos(theta),
+         37.475 + radius_deg * np.sin(theta)]
+        for theta in np.linspace(0.0, 2.0 * np.pi, 65)
+    ])
+    circulation_result = _ofes_grid_v2_boundary_circulation(
+        lens_fields, 0, circle_vertices, v2_settings
+    )
+    # 解析值：刚体旋转 Γ = ∮u·dℓ = 2Ω·A，A 为路径在米制下的 shoelace 面积
+    # （纬向缩放用圆心的纬度 37.475）
+    x_vertices = (
+        np.deg2rad(circle_vertices[:, 0]) * 6371000.0 * np.cos(np.deg2rad(37.475))
+    )
+    y_vertices = np.deg2rad(circle_vertices[:, 1]) * 6371000.0
+    enclosed_area = 0.5 * abs(float(
+        np.sum(x_vertices * np.roll(y_vertices, -1))
+        - np.sum(y_vertices * np.roll(x_vertices, -1))
+    ))
+    # 北半球反气旋合成场 zeta = -2*omega，环流 Γ = ∮u·dℓ = -2*omega*A
+    circulation_analytic = -2.0 * omega * enclosed_area
+    circulation_ok = bool(
+        np.isfinite(circulation_result['circulation'])
+        and abs(circulation_result['circulation'] - circulation_analytic)
+        / abs(circulation_analytic) < 0.15
+    )
+    record(
+        'solid_body_circulation_analytic',
+        circulation_ok,
+        circulation_computed=float(circulation_result['circulation']),
+        circulation_analytic=float(circulation_analytic),
+        finite_fraction=float(circulation_result['finite_fraction']),
+    )
+    depth_volume = np.full((3, 40, 40), np.nan, dtype=float)
+    depth_volume[0, 10:20, 10:20] = np.linspace(400.0, 600.0, 10)[None, :]
+    depth_volume[1, 10:20, 10:20] = np.linspace(400.0, 600.0, 10)[None, :]
+    fields_volume = {
+        'nodes_sigma0': np.asarray([26.0, 26.05, 26.10]),
+        'lat': np.linspace(34.0, 36.0, 40),
+        'lon': np.linspace(140.0, 142.0, 40),
+        'depth': depth_volume,
+        'anomalies': {
+            'spiciness': np.full((3, 40, 40), 0.3),
+            'n2': np.full((3, 40, 40), -1.0),
+            'zeta': np.zeros((3, 40, 40)),
+            'pv': np.full((3, 40, 40), 0.0),
+        },
+    }
+    mask_volume = np.zeros((40, 40), dtype=bool)
+    mask_volume[10:20, 10:20] = True
+    layers_volume = {
+        0: [layer_dict(0, mask_volume)],
+        1: [layer_dict(1, mask_volume)],
+    }
+    objects_volume, _, _ = _ofes_grid_v2_connect_lenses(
+        fields_volume, layers_volume, v2_settings
+    )
+    mask_area_m2 = float(np.sum(
+        _ofes_tracer_cell_area_m2(
+            np.asarray(fields_volume['lat']), np.asarray(fields_volume['lon'])
+        )[mask_volume]
+    ))
+    volume_analytic = 2.0 * mask_area_m2 * 200.0
+    volume_computed = (
+        float(objects_volume['volume_m3'].iloc[0]) if len(objects_volume) else np.nan
+    )
+    record(
+        'volume_bookkeeping_analytic',
+        bool(
+            np.isfinite(volume_computed)
+            and abs(volume_computed - volume_analytic) / volume_analytic < 0.05
+        ),
+        volume_computed_m3=volume_computed,
+        volume_analytic_m3=float(volume_analytic),
+    )
+    passed = all(checks[name]['passed'] for name in checks)
+    result = {
+        'passed': passed,
+        'protocol': 'ofes-mccoy-grid-scv-v2-analysis-lock.md',
+        'checks': checks,
+        'v2_settings': v2_settings,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    if output_path is not None:
+        _ofes_atomic_write_json(result, Path(output_path))
+    if raise_on_failure and not passed:
+        failed = [name for name in checks if not checks[name]['passed']]
+        raise RuntimeError(
+            f'OFES grid-SCV v2 analytic validation failed: {failed}'
+        )
+    return result
+
+
+def _ofes_grid_v2_profile_frame(
+    profile_cache: dict[tuple[int, int], dict | None],
+) -> pd.DataFrame:
+    """把 profile 缓存序列化为 parquet（数组列为嵌套 list<double>）。"""
+    array_keys = (
+        'pressure', 'potential_temperature', 'in_situ_temperature', 'salinity',
+        'sigma0', 'spiciness0', 'n2', 'absolute_salinity',
+        'conservative_temperature',
+    )
+    rows = []
+    for (lat_index, lon_index), profile in profile_cache.items():
+        if profile is None:
+            continue
+        row = {
+            'lat_index': int(lat_index),
+            'lon_index': int(lon_index),
+            'profile_qc_passed': bool(profile['profile_qc_passed']),
+            'profile_qc_status': str(profile['profile_qc_status']),
+            'source_unique_level_count': int(profile['source_unique_level_count']),
+            'source_pressure_min_dbar': float(profile['source_pressure_min_dbar']),
+            'source_pressure_max_dbar': float(profile['source_pressure_max_dbar']),
+            'source_shallow_max_gap_dbar': float(profile['source_shallow_max_gap_dbar']),
+            'source_below1000_max_gap_dbar': float(profile['source_below1000_max_gap_dbar']),
+            'source_deep_max_gap_dbar': float(profile['source_deep_max_gap_dbar']),
+            'source_longitude_deg': float(profile['source_longitude_deg']),
+            'source_latitude_deg': float(profile['source_latitude_deg']),
+        }
+        for key in array_keys:
+            row[key] = np.asarray(profile[key], dtype=np.float32).tolist()
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_v2_profile_cache_from_frame(
+    frame: pd.DataFrame,
+) -> dict[tuple[int, int], dict]:
+    """从 profile 缓存 parquet 重建内存缓存。"""
+    array_keys = (
+        'pressure', 'potential_temperature', 'in_situ_temperature', 'salinity',
+        'sigma0', 'spiciness0', 'n2', 'absolute_salinity',
+        'conservative_temperature',
+    )
+    cache: dict[tuple[int, int], dict] = {}
+    for row in frame.itertuples(index=False):
+        profile = {
+            'profile_qc_passed': bool(row.profile_qc_passed),
+            'profile_qc_status': str(row.profile_qc_status),
+            'source_unique_level_count': int(row.source_unique_level_count),
+            'source_pressure_min_dbar': float(row.source_pressure_min_dbar),
+            'source_pressure_max_dbar': float(row.source_pressure_max_dbar),
+            'source_shallow_max_gap_dbar': float(row.source_shallow_max_gap_dbar),
+            'source_below1000_max_gap_dbar': float(row.source_below1000_max_gap_dbar),
+            'source_deep_max_gap_dbar': float(row.source_deep_max_gap_dbar),
+            'source_longitude_deg': float(row.source_longitude_deg),
+            'source_latitude_deg': float(row.source_latitude_deg),
+        }
+        for key in array_keys:
+            profile[key] = np.asarray(getattr(row, key), dtype=np.float32)
+        cache[(int(row.lat_index), int(row.lon_index))] = profile
+    return cache
+
+
+def _ofes_grid_v2_audit_strata(
+    profile: dict,
+    lat: float,
+    settings: dict,
+) -> tuple[float, float]:
+    """返回 (纬度带, 中位密度深度带) 的分层键。"""
+    lat_band = float(np.floor(lat / 2.0) * 2.0)
+    sigma = np.asarray(profile['sigma0'], dtype=float)
+    pressure = np.asarray(profile['pressure'], dtype=float)
+    inside = (
+        np.isfinite(sigma)
+        & (sigma >= settings['sigma0_min_kg_m3'])
+        & (sigma <= settings['sigma0_max_kg_m3'])
+        & np.isfinite(pressure)
+    )
+    depth_band = (
+        float(np.floor(np.nanmedian(pressure[inside]) / 100.0) * 100.0)
+        if np.any(inside) else np.nan
+    )
+    return lat_band, depth_band
+
+
+def run_ofes_grid_scv_v2_audit_sample(
+    *,
+    settings: dict | None = None,
+    output_dir: str | Path | None = None,
+    worker_count: int = 16,
+) -> dict:
+    """在四个冻结审计日上抽取纬度 x 深度分层样本并测预筛 recall。
+
+    样本列无预筛运行完整 classifier；样本中任何 McCoy 阳性必须进入候选池
+    （recall=100%）。分层种子与列数冻结在 v2 lock 中。
+    """
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    mccoy_settings = _ofes_mccoy_virtual_argo_settings()
+    frames: list[pd.DataFrame] = []
+    summaries: list[dict] = []
+    for date in v2_settings['audit_dates']:
+        date_ts = pd.Timestamp(date).normalize()
+        snapshot = load_ofes_snapshot(
+            date_ts, variables=['temp', 'salinity', 'u', 'v']
+        )
+        cache = _ofes_grid_v2_build_profile_cache(
+            snapshot, mccoy_settings, worker_count=int(worker_count)
+        )
+        _, scan = _ofes_grid_v2_daily_seeds(
+            snapshot, cache, v2_settings, mccoy_settings,
+            worker_count=int(worker_count),
+            classify=False,
+        )
+        lat = np.asarray(snapshot['lat'], dtype=float)
+        lon = np.asarray(snapshot['lon'], dtype=float)
+        strata: dict[tuple[float, float], list[tuple[int, int]]] = defaultdict(list)
+        for (j, i), profile in cache.items():
+            if profile is None or not profile['profile_qc_passed']:
+                continue
+            strata[_ofes_grid_v2_audit_strata(profile, float(lat[j]), v2_settings)].append(
+                (int(j), int(i))
+            )
+        rng = np.random.default_rng(v2_settings['audit_sample_seed'])
+        target_total = int(v2_settings['audit_sample_columns_per_date'])
+        per_stratum = int(np.ceil(target_total / max(1, len(strata))))
+        selected: list[tuple[int, int]] = []
+        for key, columns in sorted(strata.items()):
+            if not columns:
+                continue
+            order = rng.permutation(len(columns))
+            selected.extend(
+                columns[index] for index in order[:min(per_stratum, len(columns))]
+            )
+        remaining = target_total - len(selected)
+        if remaining > 0:
+            pool = [column for columns in strata.values() for column in columns]
+            pool = [column for column in pool if column not in set(selected)]
+            if pool:
+                order = rng.permutation(len(pool))
+                selected.extend(
+                    pool[index] for index in order[:min(remaining, len(pool))]
+                )
+        scan_index = (
+            scan.set_index(['lat_index', 'lon_index'])
+            if not scan.empty else pd.DataFrame()
+        )
+        records = []
+        for j, i in selected:
+            profile = cache[(j, i)]
+            classification = _ofes_grid_v2_tier0_column(
+                profile,
+                snapshot,
+                cache,
+                float(lon[i]),
+                float(lat[j]),
+                mccoy_settings,
+                enforce_envelope=False,
+            )
+            pool_row = (
+                scan_index.loc[(int(j), int(i))].to_dict()
+                if not scan_index.empty and (int(j), int(i)) in scan_index.index
+                else {}
+            )
+            records.append({
+                'audit_date': date_ts,
+                'lat_index': int(j),
+                'lon_index': int(i),
+                'lat': float(lat[j]),
+                'lon': float(lon[i]),
+                **pool_row,
+                'mccoy_profile_compatible': bool(
+                    classification['mccoy_profile_compatible']
+                ),
+                'mccoy_failure_stage': str(classification['mccoy_failure_stage']),
+                'prefilter_retained': bool(classification['prefilter_retained']),
+                'prefilter_failure_stage': str(
+                    classification['prefilter_failure_stage']
+                ),
+            })
+        frame = pd.DataFrame(records)
+        positives = frame.loc[frame['mccoy_profile_compatible'].astype(bool)]
+        recall = (
+            float(positives['prefilter_retained'].mean())
+            if len(positives) else 1.0
+        )
+        frames.append(frame)
+        summaries.append({
+            'audit_date': date_ts.strftime('%Y-%m-%d'),
+            'sampled_column_count': int(len(frame)),
+            'mccoy_positive_count': int(len(positives)),
+            'prefilter_recall': recall,
+            'wet_column_count': int(len(cache)),
+        })
+    audit = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    overall_positives = audit.loc[audit['mccoy_profile_compatible'].astype(bool)]
+    overall_recall = (
+        float(overall_positives['prefilter_retained'].mean())
+        if len(overall_positives) else 1.0
+    )
+    summary = {
+        'status': 'complete',
+        'dates': summaries,
+        'total_sampled_column_count': int(len(audit)),
+        'total_mccoy_positive_count': int(len(overall_positives)),
+        'prefilter_recall': overall_recall,
+        'audit_sample_seed': int(v2_settings['audit_sample_seed']),
+    }
+    if output_dir is not None:
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_parquet(audit, root / 'audit_sample.parquet')
+        _ofes_atomic_write_json(summary, root / 'audit_sample_summary.json')
+    return {
+        'audit_sample': audit,
+        'summary': summary,
+    }
+
+
+def _ofes_grid_v2_seed_control_audit(
+    profile_diagnostics: pd.DataFrame,
+    day_results: dict[str, dict],
+    mccoy_settings: dict,
+    v2_settings: dict,
+) -> pd.DataFrame:
+    """对 141 个已知 McCoy 阳性逐点审计门链与 Tier-1 扩展。"""
+    v1_settings = _ofes_grid_scv_settings()
+    positives = profile_diagnostics.loc[
+        profile_diagnostics['sample_role'].eq('event')
+        & profile_diagnostics['mccoy_profile_compatible'].astype(bool)
+    ].copy()
+    records = []
+    for row in positives.itertuples(index=False):
+        event_id = str(row.event_id)
+        day = day_results.get(event_id)
+        if day is None:
+            records.append({
+                'event_id': event_id,
+                'sample_id': str(row.sample_id),
+                'day_result_missing': True,
+            })
+            continue
+        fields = day['fields']
+        lon = np.asarray(fields['lon'], dtype=float)
+        lat = np.asarray(fields['lat'], dtype=float)
+        sample_lon = float(row.sample_lon)
+        sample_lat = float(row.sample_lat)
+        lat_index, lon_index = _ofes_grid_nearest_index(
+            lon, lat, sample_lon, sample_lat
+        )
+        mapping = _ofes_grid_sigma0_cell_mapping(
+            float(row.gaussian_peak_density), v1_settings
+        )
+        node_index = int(mapping['sigma0_node_index'])
+        in_grid = bool(
+            mapping['sigma0_mapping_valid']
+            and 0 <= node_index < len(fields['nodes_sigma0'])
+        )
+        scan = day['prefilter_scan']
+        pool_row = {}
+        if not scan.empty:
+            matches = scan.loc[
+                scan['lat_index'].astype(int).eq(lat_index)
+                & scan['lon_index'].astype(int).eq(lon_index)
+            ]
+            pool_row = matches.iloc[0].to_dict() if len(matches) else {}
+        cell_compatible = bool(pool_row.get('mccoy_profile_compatible', False))
+        position_profile = _ofes_grid_v2_position_profile(
+            day['snapshot'], sample_lon, sample_lat, mccoy_settings
+        )
+        position_result = _ofes_grid_v2_tier0_column(
+            position_profile,
+            day['snapshot'],
+            day['profile_cache'],
+            sample_lon,
+            sample_lat,
+            mccoy_settings,
+        )
+        tier1_contained = False
+        tier1_reason = 'not_checked'
+        if in_grid and not day['objects'].empty and not day['voxels'].empty:
+            tier1_ids = set(
+                day['objects'].loc[
+                    day['objects']['tier1_identity'].eq('grid_lens')
+                    & ~day['objects']['boundary_censored'].astype(bool),
+                    'object_id',
+                ].astype(str)
+            )
+            hit = day['voxels'].loc[
+                day['voxels']['node_index'].astype(int).eq(node_index)
+                & day['voxels']['lat_index'].astype(int).eq(lat_index)
+                & day['voxels']['lon_index'].astype(int).eq(lon_index)
+            ]
+            containing = set(hit['object_id'].astype(str)) & tier1_ids
+            tier1_contained = bool(containing)
+            tier1_reason = 'contained' if containing else 'no_tier1_object'
+        records.append({
+            'event_id': event_id,
+            'sample_id': str(row.sample_id),
+            'radius_km': float(row.radius_km),
+            'sample_lon': sample_lon,
+            'sample_lat': sample_lat,
+            'stored_mccoy_profile_compatible': True,
+            'stored_scv_type': str(row.scv_type or ''),
+            'stored_gaussian_peak_density': float(row.gaussian_peak_density),
+            'mapped_sigma0': float(mapping['mapped_sigma0']),
+            'sigma0_node_index': node_index,
+            'seed_in_grid': in_grid,
+            'prefilter_retained': bool(pool_row.get('prefilter_retained', False)),
+            'prefilter_failure_stage': str(pool_row.get('prefilter_failure_stage', '')),
+            'nearest_cell_tier0_compatible': cell_compatible,
+            'nearest_cell_valid_control_count': int(
+                pool_row.get('valid_control_profile_count', 0)
+            ),
+            'exact_position_tier0_compatible': bool(
+                position_result['mccoy_profile_compatible']
+            ),
+            'exact_position_failure_stage': str(
+                position_result['mccoy_failure_stage']
+            ),
+            'exact_position_prefilter_retained': bool(
+                position_result['prefilter_retained']
+            ),
+            'tier1_contained': tier1_contained,
+            'tier1_reason': tier1_reason,
+            'day_result_missing': False,
+        })
+    return pd.DataFrame(records)
+
+
+def _ofes_grid_v2_matched_background_control(
+    profile_diagnostics: pd.DataFrame,
+    day_results: dict[str, dict],
+    mccoy_settings: dict,
+) -> pd.DataFrame:
+    """在冻结的 80/事件背景控制位置上运行网格 Tier-0 并测假阳性率。"""
+    controls = profile_diagnostics.loc[
+        profile_diagnostics['sample_role'].eq('background_control')
+    ].copy()
+    records = []
+    for row in controls.itertuples(index=False):
+        event_id = str(row.event_id)
+        day = day_results.get(event_id)
+        if day is None:
+            continue
+        sample_lon = float(row.sample_lon)
+        sample_lat = float(row.sample_lat)
+        profile = _ofes_grid_v2_position_profile(
+            day['snapshot'], sample_lon, sample_lat, mccoy_settings
+        )
+        result = _ofes_grid_v2_tier0_column(
+            profile,
+            day['snapshot'],
+            day['profile_cache'],
+            sample_lon,
+            sample_lat,
+            mccoy_settings,
+        )
+        records.append({
+            'event_id': event_id,
+            'sample_id': str(row.sample_id),
+            'sample_lon': sample_lon,
+            'sample_lat': sample_lat,
+            'stored_mccoy_profile_compatible': bool(
+                row.mccoy_profile_compatible
+            ),
+            'grid_tier0_compatible': bool(result['mccoy_profile_compatible']),
+            'grid_failure_stage': str(result['mccoy_failure_stage']),
+            'grid_prefilter_retained': bool(result['prefilter_retained']),
+            'valid_control_profile_count': int(
+                result.get('valid_control_profile_count', 0)
+            ),
+        })
+    return pd.DataFrame(records)
+
+
+def _ofes_grid_v2_tier_transition_summary(
+    seed_audit: pd.DataFrame,
+    background_control: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    v2_settings: dict,
+) -> dict:
+    """汇总 141 -> 预筛 -> Tier-0 -> Tier-1 -> weak/strong 的 attrition。"""
+    if seed_audit.empty:
+        return {'status': 'no_seed_audit_rows'}
+    valid = seed_audit.loc[~seed_audit['day_result_missing'].astype(bool)]
+    prefilter_retained = int(valid['prefilter_retained'].sum())
+    exact_tier0 = int(valid['exact_position_tier0_compatible'].sum())
+    cell_tier0 = int(valid['nearest_cell_tier0_compatible'].sum())
+    tier1 = int(valid['tier1_contained'].sum())
+    known_count = int(len(valid))
+    event_level = {}
+    if not event_summary.empty:
+        joined = valid.merge(
+            event_summary[
+                ['event_id', 'center_profile_mccoy_compatible',
+                 'any_event_profile_mccoy_compatible',
+                 'center_profile_velocity_confirmed',
+                 'any_event_profile_velocity_confirmed']
+            ],
+            on='event_id',
+            how='left',
+        )
+        centers = joined.loc[joined['radius_km'].astype(float).eq(0.0)]
+        center_stored = centers['center_profile_mccoy_compatible'].fillna(False).astype(bool)
+        center_reproduced = centers.loc[
+            center_stored & centers['exact_position_tier0_compatible'].astype(bool)
+        ]
+        any_events = joined.groupby('event_id')['exact_position_tier0_compatible'].any()
+        stored_any = event_summary.loc[
+            event_summary['any_event_profile_mccoy_compatible'].astype(bool),
+            'event_id',
+        ]
+        event_level = {
+            'stored_center_compatible_events': int(
+                event_summary['center_profile_mccoy_compatible'].sum()
+            ),
+            'grid_tier0_reproduced_center_events': int(
+                center_reproduced['event_id'].nunique()
+            ),
+            'stored_any_event_compatible_events': int(
+                event_summary['any_event_profile_mccoy_compatible'].sum()
+            ),
+            'grid_tier0_reproduced_any_events': int(
+                len(set(any_events[any_events].index) & set(stored_any))
+            ),
+            'stored_center_velocity_confirmed_events': int(
+                event_summary['center_profile_velocity_confirmed'].sum()
+            ),
+            'stored_any_velocity_confirmed_events': int(
+                event_summary['any_event_profile_velocity_confirmed'].sum()
+            ),
+        }
+    background_rows = background_control if not background_control.empty else pd.DataFrame()
+    stored_negative = background_rows.loc[
+        ~background_rows['stored_mccoy_profile_compatible'].astype(bool)
+    ]
+    false_positive = stored_negative.loc[
+        stored_negative['grid_tier0_compatible'].astype(bool)
+    ]
+    return {
+        'status': 'complete',
+        'known_mccoy_positive_count': known_count,
+        'prefilter_retained_count': prefilter_retained,
+        'exact_position_tier0_count': exact_tier0,
+        'nearest_cell_tier0_count': cell_tier0,
+        'tier1_extended_count': tier1,
+        'prefilter_recall': float(prefilter_retained / known_count) if known_count else np.nan,
+        'exact_tier0_reproduction': float(exact_tier0 / known_count) if known_count else np.nan,
+        'nearest_cell_tier0_reproduction': float(cell_tier0 / known_count) if known_count else np.nan,
+        'tier1_extension_fraction': float(tier1 / known_count) if known_count else np.nan,
+        'event_level': event_level,
+        'background_control_total': int(len(background_rows)),
+        'background_control_stored_negative': int(len(stored_negative)),
+        'background_control_grid_false_positive_count': int(len(false_positive)),
+        'background_control_false_positive_rate': (
+            float(len(false_positive) / len(stored_negative))
+            if len(stored_negative) else np.nan
+        ),
+        'background_control_grid_positive_rate': (
+            float(background_rows['grid_tier0_compatible'].mean())
+            if len(background_rows) else np.nan
+        ),
+    }
+
+
+def run_ofes_grid_scv_v2_validation(
+    event_population_path: str | Path,
+    mccoy_profile_diagnostics_path: str | Path,
+    event_summary_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    settings: dict | None = None,
+    worker_count: int = 16,
+    raise_on_failure: bool = True,
+    resume: bool = True,
+) -> dict:
+    """运行 v2 全部解析验证、审计日与阳性/背景控制，并冻结门控。
+
+    顺序：14 项解析验证 -> 4 审计日预筛 recall -> 56 事件日扫描 ->
+    seed_control_audit / matched_background_control / tier_transition_summary。
+    门控要求：预筛 recall 141/141、Tier-0 精确位置复现 141/141、
+    审计样本 recall=100%；任一失败即停止。
+    """
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    mccoy_settings = _ofes_mccoy_virtual_argo_settings()
+    population_path = _ofes_zhu_event_population_path(event_population_path)
+    strict = _ofes_grid_event_population_strict(population_path)
+    profile_path = Path(mccoy_profile_diagnostics_path)
+    if not profile_path.exists():
+        raise FileNotFoundError(
+            f'McCoy profile diagnostics not found: {profile_path}'
+        )
+    profile_diagnostics = pd.read_parquet(profile_path)
+    event_summary = pd.read_parquet(event_summary_path)
+    root = Path(output_dir) if output_dir is not None else (
+        Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_grid_scv_v2_results')
+        / 'validation'
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    analytic = _ofes_grid_scv_v2_analytic_validation(
+        output_path=root / 'detector_validation.json',
+        raise_on_failure=raise_on_failure,
+        worker_count=int(worker_count),
+    )
+    audit = run_ofes_grid_scv_v2_audit_sample(
+        settings=v2_settings,
+        output_dir=root,
+        worker_count=int(worker_count),
+    )
+    day_root = root / 'days'
+    day_root.mkdir(parents=True, exist_ok=True)
+    day_results: dict[str, dict] = {}
+    for event_row in strict.to_dict('records'):
+        row = pd.Series(event_row)
+        event_id = str(row['event_id'])
+        day_dir = day_root / event_id
+        summary_path = day_dir / 'day_summary.json'
+        reused = False
+        if resume and summary_path.exists():
+            previous = json.loads(summary_path.read_text(encoding='utf-8'))
+            if (
+                previous.get('status') == 'complete'
+                and previous.get('code_sha256') == _ofes_grid_scv_v2_code_sha256()
+                and previous.get('v2_output_schema_version') == 1
+            ):
+                snapshot = load_ofes_snapshot(
+                    pd.Timestamp(row['peak_date']),
+                    variables=['temp', 'salinity', 'u', 'v'],
+                    lon_bounds=(
+                        previous['window_core_lon'] - 3.0,
+                        previous['window_core_lon'] + 3.0,
+                    ),
+                    lat_bounds=(
+                        previous['window_core_lat'] - 3.0,
+                        previous['window_core_lat'] + 3.0,
+                    ),
+                )
+                lon_grid, lat_grid = np.meshgrid(snapshot['lon'], snapshot['lat'])
+                distance_km = great_circle_distance_m(
+                    lon_grid, lat_grid,
+                    float(previous['window_core_lon']),
+                    float(previous['window_core_lat']),
+                ) / 1000.0
+                background_mask = (
+                    (distance_km >= v2_settings['background_inner_radius_km'])
+                    & (distance_km <= v2_settings['background_outer_radius_km'])
+                )
+                background_mask &= np.all(
+                    np.isfinite(snapshot['temp'])
+                    & np.isfinite(snapshot['salinity'])
+                    & np.isfinite(snapshot['u'])
+                    & np.isfinite(snapshot['v']),
+                    axis=0,
+                )
+                fields = _ofes_grid_isopycnal_fields(
+                    snapshot, _ofes_grid_scv_settings(),
+                    background_mask=background_mask,
+                )
+                profile_cache = _ofes_grid_v2_profile_cache_from_frame(
+                    pd.read_parquet(day_dir / 'profile_cache.parquet')
+                )
+                day_results[event_id] = {
+                    'snapshot': snapshot,
+                    'fields': fields,
+                    'profile_cache': profile_cache,
+                    'seeds': pd.read_parquet(day_dir / 'seeds.parquet'),
+                    'prefilter_scan': pd.read_parquet(day_dir / 'prefilter_scan.parquet'),
+                    'objects': pd.read_parquet(day_dir / 'objects.parquet'),
+                    'voxels': pd.read_parquet(day_dir / 'voxels.parquet'),
+                    'profile_only': pd.read_parquet(day_dir / 'profile_only.parquet'),
+                    'node_support': pd.read_parquet(day_dir / 'node_support.parquet'),
+                    'summary': previous,
+                }
+                reused = True
+        if not reused:
+            result = detect_ofes_grid_scv_v2_day(
+                row['peak_date'], row['peak_lon'], row['peak_lat'],
+                row['equivalent_radius_km_max'],
+                settings=v2_settings,
+                output_dir=day_dir,
+                worker_count=int(worker_count),
+            )
+            day_results[event_id] = result
+    seed_audit = _ofes_grid_v2_seed_control_audit(
+        profile_diagnostics, day_results, mccoy_settings, v2_settings
+    )
+    _atomic_write_parquet(seed_audit, root / 'seed_control_audit.parquet')
+    background_control = _ofes_grid_v2_matched_background_control(
+        profile_diagnostics, day_results, mccoy_settings
+    )
+    _atomic_write_parquet(background_control, root / 'matched_background_control.parquet')
+    transition = _ofes_grid_v2_tier_transition_summary(
+        seed_audit, background_control, event_summary, v2_settings
+    )
+    _ofes_atomic_write_json(transition, root / 'tier_transition_summary.json')
+    gate = {
+        'analytic_validation_passed': bool(analytic['passed']),
+        'audit_sample_recall': float(audit['summary']['prefilter_recall']),
+        'seed_prefilter_recall': (
+            float(transition['prefilter_recall'])
+            if transition.get('status') == 'complete' else np.nan
+        ),
+        'seed_exact_tier0_reproduction': (
+            float(transition['exact_tier0_reproduction'])
+            if transition.get('status') == 'complete' else np.nan
+        ),
+        'seed_nearest_cell_tier0_reproduction': (
+            float(transition['nearest_cell_tier0_reproduction'])
+            if transition.get('status') == 'complete' else np.nan
+        ),
+        'background_false_positive_rate': (
+            float(transition['background_control_false_positive_rate'])
+            if transition.get('status') == 'complete' else np.nan
+        ),
+    }
+    passed = bool(
+        gate['analytic_validation_passed']
+        and np.isclose(gate['audit_sample_recall'], 1.0, rtol=0.0, atol=1e-9)
+        and np.isclose(gate['seed_prefilter_recall'], 1.0, rtol=0.0, atol=1e-9)
+        and np.isclose(gate['seed_exact_tier0_reproduction'], 1.0, rtol=0.0, atol=1e-9)
+        and np.isclose(gate['seed_nearest_cell_tier0_reproduction'], 1.0, rtol=0.0, atol=1e-9)
+    )
+    manifest = {
+        'schema_version': 2,
+        'validation_type': 'prospective_repair_v2',
+        'status': 'complete' if passed else 'failed',
+        'gate_passed': passed,
+        'gate': gate,
+        'transition_summary': transition,
+        'audit_sample_summary': audit['summary'],
+        'code_sha256': _ofes_grid_scv_v2_code_sha256(),
+        'protocol_sha256': _file_sha256(
+            Path(__file__).resolve().parent / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'
+        ),
+        'processing_config_sha256': _file_sha256(
+            Path(__file__).resolve().parent / 'config' / 'processing.yml'
+        ),
+        'strict_event_count': int(len(strict)),
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, root / 'manifest.json')
+    _ofes_atomic_write_json(gate, root / 'gate_attrition.json')
+    if raise_on_failure and not passed:
+        raise RuntimeError(f'OFES grid-SCV v2 validation gate failed: {gate}')
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'analytic_validation': analytic,
+        'audit_sample_summary': audit['summary'],
+        'seed_control_audit': seed_audit,
+        'matched_background_control': background_control,
+        'tier_transition_summary': transition,
+        'gate': gate,
+    }
+
+
 def export_ofes_zhu_catalog_views(
     zhu_run_dir: str | Path,
 ) -> dict:

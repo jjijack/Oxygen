@@ -1,4 +1,11 @@
 # 处理与算法参数配置
+# version 1.43 变更：
+#   - 新增 OFES grid-SCV v2 修复锁配置：Tier-0 完整 McCoy 门链种子、
+#     Tier-1 闭合 N2 热盐透镜（Barabinot 边界、5–100 km、分层身份）、
+#     Tier-2 weak/strong 原生速度支持（Nencioli 四规则 + N2 边界 circulation）、
+#     Tier-3 描述性追踪；预筛 recall 141/141、审计日 4×1000 分层样本、
+#     14 项解析验证、56 事件关联与双 null；规则冻结于
+#     ofes-mccoy-grid-scv-v2-analysis-lock.md。
 # version 1.42 变更：
 #   - 冻结 OFES 全网格热盐/PV SCV 检测协议：25.60–27.50 kg m^-3 等密度面、
 #     McCoy seed→热盐透镜→原生速度确认三层目录、Nencioli a=3/b=2、
@@ -619,6 +626,43 @@ ofes:
     bootstrap_replicates: 10000
     random_seed: 20260729
     output_subdir: grid_scv
+  grid_scv_v2:
+    # Frozen by ofes-mccoy-grid-scv-v2-analysis-lock.md (2026-08-14);
+    # DO/event labels never enter detector gates.
+    sigma0_min_kg_m3: 25.60
+    sigma0_max_kg_m3: 27.50
+    sigma0_step_kg_m3: 0.05
+    valid_depth_min_m: 100.0
+    valid_depth_max_m: 1000.0
+    shallowest_depth_min_m: 100.0
+    centroid_depth_min_m: 200.0
+    grid_lens_min_nodes: 2
+    well_resolved_min_nodes: 3
+    well_resolved_thickness_min_m: 100.0
+    lens_radius_min_km: 5.0
+    lens_radius_max_km: 100.0
+    classical_size_max_km: 50.0
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_min_columns: 61
+    n2_density_tolerance_kg_m3: 0.2
+    nencioli_a_cells: 3
+    nencioli_b_cells: 2
+    circulation_sample_count: 64
+    circulation_min_finite_fraction: 0.80
+    velocity_adjacent_nodes_min: 2
+    prefilter_recall_required: 1.0
+    known_mccoy_positive_profile_count: 141
+    track_center_displacement_km: 55.66
+    track_relative_tolerance: 0.60
+    duration_threshold_days: [3, 5, 30]
+    boundary_censor_margin_deg: 0.5
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    audit_sample_seed: 20260814
+    audit_sample_columns_per_date: 1000
+    audit_dates: ['2003-01-15', '2003-04-15', '2003-07-15', '2003-10-15']
+    output_subdir: grid_scv_v2
 
 plot:
   basemap_colors:
