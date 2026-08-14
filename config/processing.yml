@@ -6,6 +6,8 @@
 #     Tier-3 描述性追踪；预筛 recall 141/141、审计日 4×1000 分层样本、
 #     14 项解析验证、56 事件关联与双 null；规则冻结于
 #     ofes-mccoy-grid-scv-v2-analysis-lock.md。
+#   - 补充 4480 背景控制硬门（known_background_control_profile_count），
+#     并把 version 字段同步为 1.43。
 # version 1.42 变更：
 #   - 冻结 OFES 全网格热盐/PV SCV 检测协议：25.60–27.50 kg m^-3 等密度面、
 #     McCoy seed→热盐透镜→原生速度确认三层目录、Nencioli a=3/b=2、
@@ -149,7 +151,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: "1.42"
+version: "1.43"
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -653,6 +655,7 @@ ofes:
     velocity_adjacent_nodes_min: 2
     prefilter_recall_required: 1.0
     known_mccoy_positive_profile_count: 141
+    known_background_control_profile_count: 4480
     track_center_displacement_km: 55.66
     track_relative_tolerance: 0.60
     duration_threshold_days: [3, 5, 30]
