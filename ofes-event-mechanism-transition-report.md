@@ -65,15 +65,17 @@ peak-rotation 组的 post-peak AUC 仍显著更大(衰减更慢),carrier 组衰�
 2. **rotation 是否提高异常寿命/相干性?部分、且有限。** 寿命无独立贡献
    (幅度/深度主导);衰减速度确实更慢(AUC p=0.015 显著、斜率 p=0.05
    边缘);指纹保持两组无差别。
-3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接已完成(19-event
-   条件子集,运行 `ofes_mccoy_stage_bridge_14d0247c0a06`,peak 日与完成运行
-   一致性检查 0 错配):start 3/19、peak 19/19(构造)、last 6/19;mean 兼容
-   占比 0.050 / 0.437 / 0.257;start–last 配对 Wilcoxon p=0.042。**信号是
-   peak-成熟期特征,不是 onset 特征**;持续到 late 的 6 个事件中 5 个是
-   rotation_day_fraction=1.0 的全旋转 persistent carrier(另 1 个是
-   E000176,rotation 占比 0.5 的锋生对照)——**SCV 型形态的滞留与反气旋
-   载体重合**。E000171(唯一 surface-obscured SCV-compatible)peak 日
-   17/17 兼容 + 17/17 原生速度确认——表层盲区 SCV 端元的典范案例。
+3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接已完成(全部 56
+   事件 × start/peak/last,168 请求,运行 `ofes_mccoy_stage_bridge_adcffa512438`,
+   peak 日与完成运行一致性检查 56/56 零错配;先前的 19-event 条件子集运行
+   `14d0247c0a06` 保留为溯源,不再引用):start 4/56、peak 19/56(构造)、
+   last 6/56;mean 兼容占比 0.023 / 0.148 / 0.087;start–last 配对
+   Wilcoxon p=0.058。**信号是 peak-成熟期特征,不是 onset 特征**;持续到
+   late 的 6 个事件中 5 个是 rotation_day_fraction=1.0 的全旋转 persistent
+   carrier(另 1 个是 E000176,rotation 占比 0.5 的锋生对照)——**SCV 型
+   形态的滞留与反气旋载体重合**。E000171(唯一 surface-obscured
+   SCV-compatible)peak 日 17/17 兼容 + 17/17 原生速度确认——表层盲区
+   SCV 端元的典范案例。
 4. **当前最高可用措辞:** `front/strain-dominated filamentary transport`
    与 `anticyclonic subsurface rotational carrier` 是 OFES KE 中并存的
    两种常见形态(起始各 ~50%);strict SCV-like 端元是 always-rotation
@@ -119,4 +121,6 @@ upward contrast;全链条三例作示意图候选(E000276 优先,blind 案例天
 
 - 年度 grid-SCV 背景线:工程试跑完成后按成本外推决策(见 ofes worktree
   结果报告第四节)。
-- McCoy 桥接已完成,19-event 条件子集结论不外推(见裁决 3)。
+- McCoy 桥接已完成(全 56 事件,见裁决 3);19-event 子集运行保留为溯源。
+- 新运行:全 650 观测日 w_along(`ofes_walong_6f4cf2337fd1`)与逐日
+  water-mass/heave 分解(运行中)回填后,retention B 将换用真实水团项。
