@@ -134,5 +134,33 @@ upward contrast;全链条三例作示意图候选(E000276 优先,blind 案例天
 - McCoy 桥接已完成(全 56 事件,见裁决 3);19-event 子集运行保留为溯源。
 - 全 650 观测日 w_along 与逐日 water-mass/heave 分解均已完成并回填
   (见主分析 B)。
-- 可选大件:161 个 quality-eligible 事件中非 deep 的 ~100 个补跑 population
-  诊断(入口 `diagnose_ofes_ranked_events`),事件选择口径待定。
+- 161 事件 quality 普查已完成(见第七节)。
+
+## 七、161 事件 quality 普查(2026-08-16 补跑完成)
+
+- 运行:`event_diagnostics/ofes_events_4447b51c2486`
+  (`diagnose_ofes_ranked_events`,candidate_count=161 = 全部
+  quality-eligible),0.91 h,1290 event-days,manifest complete,
+  selected_events 161 行。
+- **一致性**:与旧 population 运行(59 事件)的公共事件在 8 个关键峰值列
+  (target_sigma0、fixed-depth/water-mass/heave 分解、θ/AOU 等密面对比、
+  Ro、normalized_strain)上**逐位零差(59/59)**——新旧 code hash 不同但
+  诊断机器输出不变,transition 报告全部数字立得住。
+- **诊断通过**:153/161(all_sampled_days_passed);56 严格事件 56/56 全
+  通过,其余 105 事件 97/105。
+- **普查口径峰值动力学**:
+
+| 子集 | n | 反气旋(负 Ro) | rotation-dominant | 双条件 | wm fraction 中位 |
+|---|---|---|---|---|---|
+| 56 严格 | 56 | 52/56 | 29/56 | 27/56 | 71.7 |
+| 其余 105 | 105 | 63/105 | 39/105 | 29/105 | 71.5 |
+| 合计 | 161 | 115/161 | 68/161 | 56/161 | 71.6 |
+
+- **水团异常分量在 161 普查上依旧主导**(wm fraction 中位 71.6,p25/p75
+  60.1/89.2;heave 中位 11.1)——56 事件的分解结论在全部 quality 事件上
+  复现,不是 deep 子集的偶然。
+- 严格子集的反气旋占比(52/56)高于非严格(63/105)——deep-sensitivity
+  选择口径天然富集反气旋事件,这是选择效应,不是新证据;普查口径
+  (115/161)是更公允的总体估计。
+- 旧 5 事件运行(ofes_events_21efbe902ab7 顶层 summary 5 行)是最初
+  blind top-5 溯源,保留不动。
