@@ -36777,6 +36777,13 @@ def _ofes_grid_v2_position_profile(
     )
 
 
+# fork 并行 worker 的只读共享槽：主进程把超大 snapshot / profile cache 放入
+# 后 fork 出子进程（COW 共享），避免 `ProcessPoolExecutor.submit` 对每个 chunk
+# 逐份 pickle 传输——51 万列 profile cache 约 10 GB，16 个 worker 各重建一份会
+# 把峰值顶到物理内存上限并触发换出/oomd 杀进程。worker 只读这些对象。
+_OFES_GRID_V2_SHARED: dict = {}
+
+
 def _ofes_grid_v2_build_profile_cache(
     snapshot: dict,
     settings: dict,
@@ -36811,22 +36818,26 @@ def _ofes_grid_v2_build_profile_cache(
         indices[offset:offset + chunk_size]
         for offset in range(0, len(indices), chunk_size)
     ]
-    with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
-        futures = [
-            executor.submit(_ofes_grid_v2_profile_chunk, snapshot, chunk, settings)
-            for chunk in chunks
-        ]
-        cache: dict[tuple[int, int], dict | None] = {}
-        for future in futures:
-            cache.update(future.result())
+    _OFES_GRID_V2_SHARED['snapshot'] = snapshot
+    try:
+        with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
+            futures = [
+                executor.submit(_ofes_grid_v2_profile_chunk, chunk, settings)
+                for chunk in chunks
+            ]
+            cache: dict[tuple[int, int], dict | None] = {}
+            for future in futures:
+                cache.update(future.result())
+    finally:
+        _OFES_GRID_V2_SHARED.clear()
     return cache
 
 
 def _ofes_grid_v2_profile_chunk(
-    snapshot: dict,
     indices: list[tuple[int, int]],
     settings: dict,
 ) -> dict[tuple[int, int], dict]:
+    snapshot = _OFES_GRID_V2_SHARED['snapshot']
     return {
         (j, i): _ofes_grid_v2_column_profile(snapshot, j, i, settings)
         for j, i in indices
@@ -37008,9 +37019,13 @@ def _ofes_grid_v2_tier0_column(
 def _ofes_grid_v2_daily_seeds_chunk(
     arguments: dict,
 ) -> tuple[list[dict], list[dict], int]:
-    """单个列块：预筛包络 + 完整 McCoy 门链（进程并行 worker）。"""
-    snapshot = arguments['snapshot']
-    cache = _ofes_grid_v2_profile_cache_from_frame(arguments['frame'])
+    """单个列块：预筛包络 + 完整 McCoy 门链（进程并行 worker）。
+
+    snapshot / profile cache 从 fork 共享槽读取（COW 只读，见
+    `_OFES_GRID_V2_SHARED`），不再逐 chunk pickle 传输。
+    """
+    snapshot = _OFES_GRID_V2_SHARED['snapshot']
+    cache = _OFES_GRID_V2_SHARED['profile_cache']
     chunk = arguments['chunk']
     v2_settings = arguments['v2_settings']
     mccoy_settings = arguments['mccoy_settings']
@@ -37107,36 +37122,41 @@ def _ofes_grid_v2_daily_seeds(
     records: list[dict] = []
     envelope_passed = 0
     chunk_arguments = {
-        'snapshot': snapshot,
-        'frame': _ofes_grid_v2_profile_frame(profile_cache),
         'v2_settings': v2_settings,
         'mccoy_settings': mccoy_settings,
         'classify': classify,
     }
-    if worker_count > 1 and len(wet_indices) >= 20000:
-        chunk_size = max(1, int(np.ceil(len(wet_indices) / int(worker_count))))
-        chunks = [
-            wet_indices[offset:offset + chunk_size]
-            for offset in range(0, len(wet_indices), chunk_size)
-        ]
-        with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
-            futures = [
-                executor.submit(
-                    _ofes_grid_v2_daily_seeds_chunk,
-                    {**chunk_arguments, 'chunk': chunk},
-                )
-                for chunk in chunks
+    # 两个分支的 chunk 实现都从共享槽读 snapshot / profile cache(fork COW
+    # 只读);单进程分支不 fork,直接读同一引用,行为一致。
+    _OFES_GRID_V2_SHARED['snapshot'] = snapshot
+    _OFES_GRID_V2_SHARED['profile_cache'] = profile_cache
+    try:
+        if worker_count > 1 and len(wet_indices) >= 20000:
+            chunk_size = max(1, int(np.ceil(len(wet_indices) / int(worker_count))))
+            chunks = [
+                wet_indices[offset:offset + chunk_size]
+                for offset in range(0, len(wet_indices), chunk_size)
             ]
-            for future in futures:
-                chunk_scan, chunk_records, chunk_envelope = future.result()
-                scan_rows.extend(chunk_scan)
-                records.extend(chunk_records)
-                envelope_passed += chunk_envelope
-    else:
-        chunk_result = _ofes_grid_v2_daily_seeds_chunk(
-            {**chunk_arguments, 'chunk': wet_indices}
-        )
-        scan_rows, records, envelope_passed = chunk_result
+            with ProcessPoolExecutor(max_workers=int(worker_count)) as executor:
+                futures = [
+                    executor.submit(
+                        _ofes_grid_v2_daily_seeds_chunk,
+                        {**chunk_arguments, 'chunk': chunk},
+                    )
+                    for chunk in chunks
+                ]
+                for future in futures:
+                    chunk_scan, chunk_records, chunk_envelope = future.result()
+                    scan_rows.extend(chunk_scan)
+                    records.extend(chunk_records)
+                    envelope_passed += chunk_envelope
+        else:
+            chunk_result = _ofes_grid_v2_daily_seeds_chunk(
+                {**chunk_arguments, 'chunk': wet_indices}
+            )
+            scan_rows, records, envelope_passed = chunk_result
+    finally:
+        _OFES_GRID_V2_SHARED.clear()
     scan = pd.DataFrame(scan_rows)
     seeds = pd.DataFrame(records)
     seeds.attrs['envelope_passed_count'] = envelope_passed
