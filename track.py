@@ -22,6 +22,7 @@ from scipy.ndimage import (
     gaussian_filter,
     label as ndimage_label,
     minimum_filter,
+    uniform_filter,
 )
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -62921,6 +62922,945 @@ def _ofes_sigma0_volume(snapshot: dict) -> np.ndarray:
         ),
         dtype=float,
     )
+
+
+def _ofes_nan_uniform_filter(field: np.ndarray, size: int) -> np.ndarray:
+    """NaN-safe 均匀滤波;有效值占比不足一半的格点保持 NaN。"""
+    values = np.asarray(field, dtype=float)
+    if values.size == 0 or int(size) <= 1:
+        return values.copy()
+    valid = np.isfinite(values).astype(float)
+    numerator = uniform_filter(
+        np.where(valid > 0, values, 0.0), size=int(size), mode='nearest'
+    )
+    denominator = uniform_filter(valid, size=int(size), mode='nearest')
+    smoothed = np.full(values.shape, np.nan, dtype=float)
+    np.divide(numerator, denominator, out=smoothed, where=denominator > 0.5)
+    return smoothed
+
+
+def _ofes_isopycnal_audit_gradients(
+    field_2d: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """二维场的物理 x/y 梯度(米每米):度空间梯度除以当地米每度因子。"""
+    dlon = float(np.diff(lon).mean())
+    dlat = float(np.diff(lat).mean())
+    grad_lon = np.gradient(field_2d, dlon, axis=1)
+    grad_lat = np.gradient(field_2d, dlat, axis=0)
+    factors = approximate_degree_length(lat)
+    m_per_deg_lon = np.asarray(
+        factors['meters_per_degree_lon'], dtype=float
+    )
+    m_per_deg_lat = np.asarray(
+        factors['meters_per_degree_lat'], dtype=float
+    )
+    return (
+        grad_lon / m_per_deg_lon[:, None],
+        grad_lat / m_per_deg_lat[:, None],
+    )
+
+
+def _ofes_isopycnal_audit_day_metrics(
+    z_sigma: np.ndarray,
+    u_sigma: np.ndarray,
+    v_sigma: np.ndarray,
+    do2_sigma: np.ndarray,
+    crossing_count: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    core_lon: float,
+    core_lat: float,
+    core_radius_km: float,
+    ring_inner_km: float,
+    ring_outer_km: float,
+    smooth_cells: int,
+) -> dict:
+    """从单日映射场计算 core/ring 分组指标。
+
+    w_along = V·∇z_σ(z 向下为正,正 = 朝深),按斜率×流速×对准余弦分解;
+    另给沿等密面 DO 平流倾向代理 V·∇_σ(DO) 与其余弦。core/ring 掩膜按
+    大圆距离构造,valid 要求目标等密面有交点且全指标有限。
+    """
+    sm_z = _ofes_nan_uniform_filter(z_sigma, smooth_cells)
+    sm_u = _ofes_nan_uniform_filter(u_sigma, smooth_cells)
+    sm_v = _ofes_nan_uniform_filter(v_sigma, smooth_cells)
+    sm_do = _ofes_nan_uniform_filter(do2_sigma, smooth_cells)
+    dz_dx, dz_dy = _ofes_isopycnal_audit_gradients(sm_z, lon, lat)
+    ddo_dx, ddo_dy = _ofes_isopycnal_audit_gradients(sm_do, lon, lat)
+    w_along_raw = sm_u * dz_dx + sm_v * dz_dy
+    do_tend_raw = sm_u * ddo_dx + sm_v * ddo_dy
+    slope = np.hypot(dz_dx, dz_dy)
+    speed = np.hypot(sm_u, sm_v)
+    grad_do = np.hypot(ddo_dx, ddo_dy)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cos = np.where(
+            (speed > 0) & (slope > 0),
+            w_along_raw / (speed * slope),
+            np.nan,
+        )
+        cos_do = np.where(
+            (speed > 0) & (grad_do > 0),
+            do_tend_raw / (speed * grad_do),
+            np.nan,
+        )
+    w_along = w_along_raw * 86400.0
+    do_tendency = do_tend_raw * 86400.0
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_m = great_circle_distance_m(
+        lon_grid, lat_grid, core_lon, core_lat
+    )
+    core_mask = distance_m <= core_radius_km * 1000.0
+    ring_mask = (
+        (distance_m >= ring_inner_km * 1000.0)
+        & (distance_m <= ring_outer_km * 1000.0)
+    )
+    # 俯冲族(z/u/v)与 DO 平流族(do2/u/v)各自使用独立有限性掩膜:
+    # 一族指标的 NaN 不传染另一族(lock 口径,即使当前数据下数值一致)。
+    valid_w = (
+        (crossing_count > 0)
+        & np.isfinite(sm_z)
+        & np.isfinite(sm_u)
+        & np.isfinite(sm_v)
+        & np.isfinite(w_along)
+        & np.isfinite(cos)
+    )
+    valid_do = (
+        (crossing_count > 0)
+        & np.isfinite(sm_do)
+        & np.isfinite(sm_u)
+        & np.isfinite(sm_v)
+        & np.isfinite(do_tendency)
+        & np.isfinite(cos_do)
+    )
+    fields = {
+        'w_along': (w_along, valid_w),
+        'slope': (slope, valid_w),
+        'speed': (speed, valid_w),
+        'cos': (cos, valid_w),
+        'do_tendency': (do_tendency, valid_do),
+        'cos_do': (cos_do, valid_do),
+    }
+    result: dict = {}
+    for region_name, mask in (('core', core_mask), ('ring', ring_mask)):
+        total_cells = int(np.count_nonzero(mask))
+        result[f'{region_name}_total_cells'] = total_cells
+        if total_cells == 0:
+            result[f'{region_name}_availability'] = np.nan
+            result[f'{region_name}_do_availability'] = np.nan
+            continue
+        valid_mask = mask & valid_w
+        valid_do_mask = mask & valid_do
+        available_cells = int(np.count_nonzero(valid_mask))
+        result[f'{region_name}_available_cells'] = available_cells
+        result[f'{region_name}_availability'] = (
+            available_cells / total_cells
+        )
+        result[f'{region_name}_do_availability'] = float(
+            np.count_nonzero(valid_do_mask) / total_cells
+        )
+        if available_cells == 0:
+            continue
+        result[f'{region_name}_w_along_mean'] = float(
+            np.nanmean(w_along[valid_mask])
+        )
+        result[f'{region_name}_w_along_median'] = float(
+            np.nanmedian(w_along[valid_mask])
+        )
+        result[f'{region_name}_w_along_positive_fraction'] = float(
+            np.mean(w_along[valid_mask] > 0)
+        )
+        for key in ('slope', 'speed', 'cos'):
+            values, _ = fields[key]
+            result[f'{region_name}_{key}_mean'] = float(
+                np.nanmean(values[valid_mask])
+            )
+            result[f'{region_name}_{key}_median'] = float(
+                np.nanmedian(values[valid_mask])
+            )
+        if np.count_nonzero(valid_do_mask) > 0:
+            result[f'{region_name}_do_tendency_mean'] = float(
+                np.nanmean(do_tendency[valid_do_mask])
+            )
+            result[f'{region_name}_do_tendency_median'] = float(
+                np.nanmedian(do_tendency[valid_do_mask])
+            )
+            result[f'{region_name}_cos_do_mean'] = float(
+                np.nanmean(cos_do[valid_do_mask])
+            )
+            result[f'{region_name}_cos_do_median'] = float(
+                np.nanmedian(cos_do[valid_do_mask])
+            )
+    return result
+
+
+def _ofes_isopycnal_audit_save_fields(
+    path: str | Path,
+    date: str,
+    core_lon: float,
+    core_lat: float,
+    target_sigma0: float,
+    reference_depth_m: float,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    z_sigma: np.ndarray,
+    u_sigma: np.ndarray,
+    v_sigma: np.ndarray,
+    do2_sigma: np.ndarray,
+    crossing_count: np.ndarray,
+    window_meta: dict,
+) -> Path:
+    """把单 event-day 映射场落盘为 netCDF,供事后平滑/半径敏感性重算。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with Dataset(path, 'w') as store:
+        store.createDimension('lat', lat.size)
+        store.createDimension('lon', lon.size)
+        store.createVariable('lat', 'f8', ('lat',))[:] = lat
+        store.createVariable('lon', 'f8', ('lon',))[:] = lon
+        for name, values in (
+            ('z_sigma', z_sigma),
+            ('u_sigma', u_sigma),
+            ('v_sigma', v_sigma),
+            ('do2_sigma', do2_sigma),
+            ('crossing_count', crossing_count.astype(np.int16)),
+        ):
+            store.createVariable(name, 'f8', ('lat', 'lon'))[:] = values
+        store.date = str(date)
+        store.core_lon = float(core_lon)
+        store.core_lat = float(core_lat)
+        store.target_sigma0 = float(target_sigma0)
+        store.reference_depth_m = float(reference_depth_m)
+        for key, value in window_meta.items():
+            if isinstance(value, (list, tuple)):
+                value = ','.join(str(v) for v in value)
+            if isinstance(value, (int, float, str, bool)):
+                store.setncattr(f'window_{key}', value)
+    return path
+
+
+def _ofes_isopycnal_audit_task(task: dict) -> dict:
+    """单 event-day 任务:加载窗口、算 σ0、映射到目标面并落盘映射场。"""
+    try:
+        date = str(task['date'])
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['temp', 'salinity', 'u', 'v', 'do2'],
+            lon_bounds=tuple(task['lon_bounds']),
+            lat_bounds=tuple(task['lat_bounds']),
+        )
+        sigma0 = _ofes_sigma0_volume(snapshot)
+        mapped = _ofes_fields_on_sigma0(
+            np.asarray(snapshot['depth'], dtype=float),
+            sigma0,
+            float(task['target_sigma0']),
+            float(task['reference_depth_m']),
+            {
+                'u': np.asarray(snapshot['u'], dtype=float),
+                'v': np.asarray(snapshot['v'], dtype=float),
+                'do2': np.asarray(snapshot['do2'], dtype=float),
+            },
+        )
+        window_meta = {
+            'requested_lon_bounds': task['lon_bounds'],
+            'requested_lat_bounds': task['lat_bounds'],
+            'loaded_lon_bounds': [
+                float(np.asarray(snapshot['lon']).min()),
+                float(np.asarray(snapshot['lon']).max()),
+            ],
+            'loaded_lat_bounds': [
+                float(np.asarray(snapshot['lat']).min()),
+                float(np.asarray(snapshot['lat']).max()),
+            ],
+        }
+        _ofes_isopycnal_audit_save_fields(
+            Path(task['fields_path']),
+            date,
+            float(task['core_lon']),
+            float(task['core_lat']),
+            float(task['target_sigma0']),
+            float(task['reference_depth_m']),
+            np.asarray(snapshot['lon'], dtype=float),
+            np.asarray(snapshot['lat'], dtype=float),
+            mapped['depth'],
+            mapped['u'],
+            mapped['v'],
+            mapped['do2'],
+            mapped['crossing_count'],
+            window_meta,
+        )
+        return {
+            'event_id': task['event_id'],
+            'date': date,
+            'status': 'ok',
+            'loaded_shape': [int(v) for v in sigma0.shape],
+        }
+    except Exception as exc:  # 单任务失败不拖垮整跑,记入 manifest
+        return {
+            'event_id': task.get('event_id'),
+            'date': task.get('date'),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+
+
+def _ofes_walong_smooth_cells_maps(
+    association: pd.DataFrame,
+    fields_root: Path,
+    smooth_km: float,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """每事件主口径(lock 约 3 格)与敏感性(旧版 5 格)的平滑格数。"""
+    cells3: dict[str, int] = {}
+    cells5: dict[str, int] = {}
+    for row in association.itertuples(index=False):
+        candidates = sorted((fields_root / str(row.event_id)).glob('*.nc'))
+        if not candidates:
+            cells3[str(row.event_id)] = 3
+            cells5[str(row.event_id)] = 5
+            continue
+        with Dataset(candidates[0], 'r') as store:
+            lon = np.asarray(store.variables['lon'][:], dtype=float)
+            lat = np.asarray(store.variables['lat'][:], dtype=float)
+        cell_km = float(
+            np.median(
+                approximate_degree_length(lat)['meters_per_degree_lon']
+                * np.diff(lon).mean()
+            )
+            / 1000.0
+        )
+        cells3[str(row.event_id)] = max(
+            3, int(np.floor(smooth_km / cell_km / 2.0) * 2 + 1)
+        )
+        cells5[str(row.event_id)] = max(
+            3, int(round(smooth_km / cell_km / 2.0) * 2 + 1)
+        )
+    return cells3, cells5
+
+
+def _ofes_walong_assemble(
+    association: pd.DataFrame,
+    fields_root: Path,
+    time_window_days: int,
+    core_radius_km: float,
+    ring_inner_km: float,
+    ring_outer_km: float,
+    smooth_cells_map: dict[str, int],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """从落盘映射场组装逐日指标与三重口径审计表。
+
+    冻结门:core 盘可用率 < 0.8 的 event-day 其 core 指标记 NaN 并计数
+    (lock 口径);ring 只计数不置 NaN。返回 (audit, daily, gate_stats)。
+    """
+    daily_rows: list[dict] = []
+    audit_rows: list[dict] = []
+    ring_clip_fractions: list[float] = []
+    gate_stats = {
+        'core_below_threshold_event_days': 0,
+        'ring_below_threshold_event_days': 0,
+    }
+    for row in association.itertuples(index=False):
+        peak_date = pd.Timestamp(row.peak_date).normalize()
+        event_dir = fields_root / str(row.event_id)
+        per_day: dict[str, dict] = {}
+        for offset in range(-int(time_window_days), int(time_window_days) + 1):
+            date = peak_date + pd.Timedelta(days=int(offset))
+            date_str = date.strftime('%Y-%m-%d')
+            path = event_dir / f"{row.event_id}_{date.strftime('%Y%m%d')}.nc"
+            if not path.exists():
+                per_day[date_str] = {}
+                continue
+            with Dataset(path, 'r') as store:
+                lon = np.asarray(store.variables['lon'][:], dtype=float)
+                lat = np.asarray(store.variables['lat'][:], dtype=float)
+                z_sigma = np.asarray(
+                    store.variables['z_sigma'][:], dtype=float
+                )
+                u_sigma = np.asarray(
+                    store.variables['u_sigma'][:], dtype=float
+                )
+                v_sigma = np.asarray(
+                    store.variables['v_sigma'][:], dtype=float
+                )
+                do2_sigma = np.asarray(
+                    store.variables['do2_sigma'][:], dtype=float
+                )
+                crossing = np.asarray(
+                    store.variables['crossing_count'][:], dtype=float
+                )
+                meta = {}
+                for key in (
+                    'requested_lon_bounds', 'requested_lat_bounds',
+                    'loaded_lon_bounds', 'loaded_lat_bounds',
+                ):
+                    value = store.getncattr(f'window_{key}')
+                    if isinstance(value, str) and ',' in value:
+                        value = [float(v) for v in value.split(',')]
+                    meta[key] = value
+            metrics = _ofes_isopycnal_audit_day_metrics(
+                z_sigma, u_sigma, v_sigma, do2_sigma, crossing,
+                lon, lat, float(row.core_lon), float(row.core_lat),
+                core_radius_km, ring_inner_km, ring_outer_km,
+                smooth_cells_map[str(row.event_id)],
+            )
+            per_day[date_str] = metrics
+            requested = meta['requested_lon_bounds']
+            loaded = meta['loaded_lon_bounds']
+            if loaded[1] - loaded[0] > 0:
+                ring_clip_fractions.append(
+                    1.0 - min(
+                        requested[1] - requested[0],
+                        loaded[1] - loaded[0],
+                    ) / (requested[1] - requested[0])
+                )
+            for region in ('core', 'ring'):
+                availability = metrics.get(
+                    f'{region}_availability', np.nan
+                )
+                if pd.notna(availability) and availability < 0.8:
+                    gate_stats[f'{region}_below_threshold_event_days'] += 1
+                    if region == 'core':
+                        kept = {
+                            'core_total_cells', 'core_available_cells',
+                            'core_availability', 'core_do_availability',
+                        }
+                        for key in [
+                            k for k in metrics
+                            if k.startswith('core_') and k not in kept
+                        ]:
+                            metrics[key] = np.nan
+                daily_rows.append({
+                    'event_id': str(row.event_id),
+                    'date': date_str,
+                    'region': region,
+                    **{
+                        k: v for k, v in metrics.items()
+                        if k.startswith(region)
+                    },
+                })
+        available_days = [d for d, m in per_day.items() if m]
+        if not available_days:
+            audit_rows.append({
+                'event_id': str(row.event_id),
+                'aggregation': 'single',
+                'region': 'core',
+                'day_count': 0,
+            })
+            continue
+        peak_str = peak_date.strftime('%Y-%m-%d')
+        for aggregation in ('single', 'field_mean', 'daily_mean'):
+            for region in ('core', 'ring'):
+                if aggregation == 'single':
+                    merged = per_day.get(peak_str, {})
+                    day_count = 1 if peak_str in per_day else 0
+                elif aggregation == 'daily_mean':
+                    merged = {}
+                    prefix = f'{region}_'
+                    keys = {
+                        key[len(prefix):]
+                        for day in per_day.values()
+                        for key in day
+                        if key.startswith(prefix)
+                        and isinstance(day[key], float)
+                    }
+                    for key in keys:
+                        values = [
+                            day[f'{prefix}{key}']
+                            for day in per_day.values()
+                            if isinstance(day.get(f'{prefix}{key}'), float)
+                        ]
+                        if values:
+                            merged[f'{prefix}{key}'] = float(
+                                np.nanmean(values)
+                            )
+                    day_count = len(available_days)
+                else:
+                    stacks: dict[str, list[np.ndarray]] = {}
+                    for date_str in available_days:
+                        with Dataset(
+                            event_dir / f"{row.event_id}_{pd.Timestamp(date_str).strftime('%Y%m%d')}.nc",
+                            'r',
+                        ) as store:
+                            for key in (
+                                'z_sigma', 'u_sigma', 'v_sigma',
+                                'do2_sigma', 'crossing_count',
+                            ):
+                                stacks.setdefault(key, []).append(
+                                    np.asarray(
+                                        store.variables[key][:], dtype=float
+                                    )
+                                )
+                    with Dataset(
+                        event_dir / f"{row.event_id}_{pd.Timestamp(available_days[0]).strftime('%Y%m%d')}.nc",
+                        'r',
+                    ) as store:
+                        lon = np.asarray(store.variables['lon'][:], dtype=float)
+                        lat = np.asarray(store.variables['lat'][:], dtype=float)
+                    merged = _ofes_isopycnal_audit_day_metrics(
+                        np.nanmean(np.stack(stacks['z_sigma']), axis=0),
+                        np.nanmean(np.stack(stacks['u_sigma']), axis=0),
+                        np.nanmean(np.stack(stacks['v_sigma']), axis=0),
+                        np.nanmean(np.stack(stacks['do2_sigma']), axis=0),
+                        np.nanmean(np.stack(stacks['crossing_count']), axis=0),
+                        lon, lat, float(row.core_lon), float(row.core_lat),
+                        core_radius_km, ring_inner_km, ring_outer_km,
+                        smooth_cells_map[str(row.event_id)],
+                    )
+                    day_count = len(available_days)
+                audit_rows.append({
+                    'event_id': str(row.event_id),
+                    'aggregation': aggregation,
+                    'region': region,
+                    'day_count': day_count,
+                    **{
+                        key: merged.get(key, np.nan)
+                        for key in merged
+                        if key.startswith(f'{region}_')
+                    },
+                })
+    gate_stats['ring_clip_fraction_median'] = float(
+        np.nanmedian(ring_clip_fractions)
+    ) if ring_clip_fractions else np.nan
+    return pd.DataFrame(audit_rows), pd.DataFrame(daily_rows), gate_stats
+
+
+def _ofes_walong_tests(
+    audit: pd.DataFrame,
+    joined: pd.DataFrame,
+) -> tuple[dict, dict]:
+    """审计表报告统计:core−ring 配对、regime 对照与方向一致性行。"""
+    from scipy.stats import mannwhitneyu, wilcoxon
+
+    def _paired_bootstrap(diffs: np.ndarray, n_reps: int = 10000):
+        rng = np.random.default_rng(20260816)
+        idx = rng.integers(0, diffs.size, size=(n_reps, diffs.size))
+        means = diffs[idx].mean(axis=1)
+        return float(np.percentile(means, 2.5)), float(
+            np.percentile(means, 97.5)
+        )
+
+    tests: dict = {}
+    for aggregation in ('single', 'field_mean', 'daily_mean'):
+        sub = audit.loc[
+            (audit['aggregation'] == aggregation)
+        ].merge(joined, on='event_id', how='left')
+        core = sub.loc[sub['region'] == 'core', 'core_w_along_mean']
+        ring = sub.loc[sub['region'] == 'ring', 'ring_w_along_mean']
+        paired = core.to_numpy(dtype=float) - ring.to_numpy(dtype=float)
+        paired = paired[np.isfinite(paired)]
+        tests[aggregation] = {
+            'core_ring_paired_mean_diff': float(np.nanmean(paired)),
+            'core_ring_paired_wilcoxon_p': float(
+                wilcoxon(
+                    paired, alternative='two-sided', zero_method='wilcox'
+                ).pvalue
+            ) if paired.size > 0 else np.nan,
+            'core_ring_paired_bootstrap_ci': (
+                _paired_bootstrap(paired) if paired.size > 1 else None
+            ),
+            'core_w_along_pooled_median': float(
+                np.nanmedian(core.to_numpy(dtype=float))
+            ),
+            'core_w_along_pooled_max': float(
+                np.nanmax(np.abs(core.to_numpy(dtype=float)))
+            ),
+            'core_positive_fraction_pooled': float(
+                np.nanmean((core.to_numpy(dtype=float) > 0).astype(float))
+            ),
+        }
+        group_columns = (
+            ('rotation_dominated', 'rotation_vs_strain'),
+            ('resolved_downward_pathway_supported', 'resolved_down_vs_rest'),
+            ('resolved_upward_pathway_supported', 'resolved_up_vs_rest'),
+            ('water_mass_dominated', 'water_mass_vs_heave'),
+        )
+        for column, label in group_columns:
+            true_vals = core[sub[column] == True].to_numpy(dtype=float)
+            false_vals = core[sub[column] == False].to_numpy(dtype=float)
+            tests[aggregation][f'{label}_true_n'] = int(
+                np.count_nonzero(np.isfinite(true_vals))
+            )
+            tests[aggregation][f'{label}_false_n'] = int(
+                np.count_nonzero(np.isfinite(false_vals))
+            )
+            if (
+                np.count_nonzero(np.isfinite(true_vals)) >= 2
+                and np.count_nonzero(np.isfinite(false_vals)) >= 2
+            ):
+                tests[aggregation][f'{label}_mw_p'] = float(
+                    mannwhitneyu(
+                        true_vals[np.isfinite(true_vals)],
+                        false_vals[np.isfinite(false_vals)],
+                        alternative='two-sided',
+                    ).pvalue
+                )
+                tests[aggregation][f'{label}_true_median'] = float(
+                    np.nanmedian(true_vals)
+                )
+                tests[aggregation][f'{label}_false_median'] = float(
+                    np.nanmedian(false_vals)
+                )
+    direction_rows = {
+        str(r.event_id): (
+            r.core_w_along_mean
+            if pd.notna(r.core_w_along_mean) else np.nan
+        )
+        for r in audit.loc[audit['aggregation'] == 'single'].itertuples()
+        if r.region == 'core'
+    }
+    return tests, direction_rows
+
+
+def _ofes_isopycnal_audit_analytic_check() -> tuple[float, float, float]:
+    """解析检验:平直等密面 w_along 恰为 0;已知斜率下 w_along 复现解析值。"""
+    depth = np.linspace(100.0, 600.0, 20)
+    lon = np.linspace(145.0, 145.5, 8)
+    lat = np.linspace(33.0, 33.5, 8)
+    u = np.full((20, 8, 8), 0.5)
+    v = np.full((20, 8, 8), 0.2)
+    do2 = np.full((20, 8, 8), 200.0 - depth[:, None, None] * 0.1)
+    sigma0_flat = depth[:, None, None] * 0.01 + np.zeros((8, 8))[None, :, :]
+    mapped_flat = _ofes_fields_on_sigma0(
+        depth, sigma0_flat, 3.0, 300.0,
+        {'u': u, 'v': v, 'do2': do2},
+    )
+    dz_dx, dz_dy = _ofes_isopycnal_audit_gradients(
+        mapped_flat['depth'], lon, lat
+    )
+    w_flat = np.nanmax(np.abs(mapped_flat['u'] * dz_dx + mapped_flat['v'] * dz_dy))
+    # 倾斜等密面:sigma0 = 0.01*(depth + 0.05*lon_deg) → dz/dlon = -0.05 度/度
+    lon_grid_3d = np.meshgrid(depth, lat, lon, indexing='ij')[2]
+    sigma0_tilt = 0.01 * (
+        depth[:, None, None] + 0.05 * lon_grid_3d
+    )
+    mapped_tilt = _ofes_fields_on_sigma0(
+        depth, sigma0_tilt, 3.0, 300.0,
+        {'u': u, 'v': v, 'do2': do2},
+    )
+    dz_dx_t, _ = _ofes_isopycnal_audit_gradients(
+        mapped_tilt['depth'], lon, lat
+    )
+    factors = approximate_degree_length(lat)
+    expected = -0.05 / np.asarray(
+        factors['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    rel_err = float(np.nanmax(
+        np.abs(dz_dx_t - expected) / np.abs(expected)
+    ))
+    return float(w_flat), float(np.nanmean(dz_dx_t)), rel_err
+
+
+def run_ofes_event_isopycnal_velocity_audit(
+    event_association_path: str | Path,
+    *,
+    trajectory_classification_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    time_window_days: int = 3,
+    core_radius_km: float = 20.0,
+    ring_inner_km: float = 120.0,
+    ring_outer_km: float = 240.0,
+    window_margin_km: float = 25.0,
+    smooth_km: float = 10.0,
+    worker_count: int = 8,
+    resume: bool = True,
+) -> dict:
+    """56-event 沿等密面速度审计:OFES 1/30° 上 w_along 是否可分辨。
+
+    对 56 个严格 OFES ΔDO 事件(节点 5 的 event_association 表),在 peak 日
+    ±time_window_days 的窗口内,把 T/S 算成 TEOS-10 σ0、将 u/v/do2 线性映射到
+    事件 target_sigma0 面(交点参考 core_depth_m),计算沿等密面俯冲率
+    w_along = V·∇z_σ(z 向下为正)及其斜率×流速×对准余弦分解,外加沿等密面
+    DO 平流倾向代理 V·∇_σ(DO)。core(20 km 盘)与同日 120–240 km 环带
+    同场对照;单日、±3 天先平均场(欧拉)、±3 天逐日平均(拉格朗日)三重口径
+    镜像 GLORYS 1/12° null 实验。映射场逐 event-day 落盘,平滑半径与区域半径
+    的敏感性可事后重算,不必重读 OFES。定位是探索性表征(lock 已写明),
+    不是门控冻结实验,也不单独证明俯冲发生。
+
+    参数:
+        - event_association_path (str | Path): 节点 5 完成的 56-event
+          event_association.parquet(含 target_sigma0/core_depth_m)。
+        - trajectory_classification_path (str | Path | None): 三维轨迹总体
+          population_classification.parquet,提供 resolved down/up 与
+          rotation/strain 分组;None 时取完成运行
+          `ofes_trajectory3d_population_1d2b102470dd`。
+        - output_dir (str | Path | None): 输出根;None 时写
+          `Oxygen-cache/ofes_walong_results/ofes_walong_<sig>/`。
+        - time_window_days (int): peak 日前后扩展天数(总 2n+1 天)。
+        - core_radius_km (float): core 盘半径(km)。
+        - ring_inner_km / ring_outer_km (float): 环带内/外半径(km)。
+        - window_margin_km (float): 环带外缘之外的平滑余量(km)。
+        - smooth_km (float): 梯度前 NaN-safe 均匀滤波尺度(km),奇数格点。
+        - worker_count (int): event-day 并行进程数(只进 provenance)。
+        - resume (bool): 复用已落盘的 event-day 映射场。
+
+    返回:
+        - dict: run_dir、manifest、audit 表(事件×口径×区域)、逐日表、
+          summary(门与对照统计)。
+
+    输出:
+        - `manifest.json`、`audit.parquet`、`daily_metrics.parquet`、
+          `audit_smooth5.parquet`(旧版 5 格敏感性)、
+          `daily_metrics_smooth5.parquet`、`summary.json` 与
+          `fields/<event_id>/<event_id>_<YYYYMMDD>.nc`。
+
+    说明:
+        - 门是轻量自检(G1 输入、G2 覆盖、G3 量级、G4 解析零检验),失败只
+          记入 manifest,不重跑不封锁;regime 对照与 core−ring 配对全部是
+          报告项,不设事后通过阈值。
+        - core 盘可用率 < 0.8 的 event-day 按 lock 口径记 NaN 并计数
+          (gate_stats);俯冲族与 DO 平流族使用各自独立的有限性掩膜。
+        - 窗口超出交付域时 loader 裁切并记录;环带被裁切的格点按可用子集
+          统计,裁切比例记入逐日表。
+    """
+    from multiprocessing import get_context
+
+    repo_root = Path(__file__).resolve().parent
+    association_path = Path(event_association_path)
+    association = pd.read_parquet(association_path)
+    if trajectory_classification_path is None:
+        trajectory_classification_path = (
+            repo_root / 'plot_outputs' / 'do' / 'ofes_np30_ke'
+            / 'ofes_delta_do_catalog' / '20030101_20031231_cf957935d38a'
+            / 'event_diagnostics' / 'ofes_events_21efbe902ab7'
+            / 'event_population' / 'ofes_population_254ae68988a6'
+            / 'trajectory_3d_population'
+            / 'ofes_trajectory3d_population_1d2b102470dd'
+            / 'population_classification.parquet'
+        )
+    trajectory_classification_path = Path(trajectory_classification_path)
+    trajectory = pd.read_parquet(trajectory_classification_path)
+    lock_path = repo_root / 'ofes-isopycnal-velocity-audit-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    settings = {
+        'time_window_days': int(time_window_days),
+        'core_radius_km': float(core_radius_km),
+        'ring_inner_km': float(ring_inner_km),
+        'ring_outer_km': float(ring_outer_km),
+        'window_margin_km': float(window_margin_km),
+        'smooth_km': float(smooth_km),
+    }
+    payload = {
+        'code_sha256': _file_sha256(Path(__file__).resolve()),
+        'lock_sha256': _file_sha256(lock_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'event_association_sha256': _file_sha256(association_path),
+        'trajectory_classification_sha256': _file_sha256(
+            trajectory_classification_path
+        ),
+        'settings': settings,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    root = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_walong_results')
+            / f'ofes_walong_{run_signature[:12]}'
+        )
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            existing.get('run_signature') == run_signature
+            and existing.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'audit': pd.read_parquet(root / 'audit.parquet'),
+                'daily_metrics': pd.read_parquet(
+                    root / 'daily_metrics.parquet'
+                ),
+                'summary': json.loads(
+                    (root / 'summary.json').read_text(encoding='utf-8')
+                ),
+            }
+    manifest = {
+        'schema_version': 1,
+        'created_at_utc': pd.Timestamp.utcnow().isoformat(),
+        'run_signature': run_signature,
+        'status': 'running',
+        'worker_count': int(worker_count),
+        **payload,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+
+    # G4:解析零检验(平直等密面 w_along=0;已知斜率复现解析梯度)。
+    w_flat, dz_dx_t_mean, rel_err = _ofes_isopycnal_audit_analytic_check()
+    analytic_check = {
+        'flat_surface_max_abs_w_along_m_s': w_flat,
+        'tilted_surface_mean_dz_dx': dz_dx_t_mean,
+        'tilted_surface_gradient_relative_error': rel_err,
+        'passed': bool(w_flat < 1e-9 and rel_err < 1e-6),
+    }
+    if not analytic_check['passed']:
+        manifest['status'] = 'failed_analytic_check'
+        manifest['analytic_check'] = analytic_check
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, default=_ofes_json_default),
+            encoding='utf-8',
+        )
+        raise RuntimeError(
+            'Isopycnal audit analytic check failed: '
+            f'{analytic_check}'
+        )
+
+    tasks: list[dict] = []
+    fields_root = root / 'fields'
+    for row in association.itertuples(index=False):
+        row_factors = approximate_degree_length(float(row.core_lat))
+        peak_date = pd.Timestamp(row.peak_date).normalize()
+        for offset in range(-int(time_window_days), int(time_window_days) + 1):
+            date = peak_date + pd.Timedelta(days=int(offset))
+            date_str = date.strftime('%Y-%m-%d')
+            fields_path = (
+                fields_root / str(row.event_id)
+                / f"{row.event_id}_{date.strftime('%Y%m%d')}.nc"
+            )
+            if resume and fields_path.exists():
+                continue
+            dx_deg = (
+                float(ring_outer_km) + float(window_margin_km)
+            ) * 1000.0 / float(row_factors['meters_per_degree_lon'])
+            dy_deg = (
+                float(ring_outer_km) + float(window_margin_km)
+            ) * 1000.0 / float(row_factors['meters_per_degree_lat'])
+            tasks.append({
+                'event_id': str(row.event_id),
+                'date': date_str,
+                'core_lon': float(row.core_lon),
+                'core_lat': float(row.core_lat),
+                'target_sigma0': float(row.target_sigma0),
+                'reference_depth_m': float(row.core_depth_m),
+                'lon_bounds': [
+                    float(row.core_lon) - dx_deg,
+                    float(row.core_lon) + dx_deg,
+                ],
+                'lat_bounds': [
+                    float(row.core_lat) - dy_deg,
+                    float(row.core_lat) + dy_deg,
+                ],
+                'fields_path': str(fields_path),
+            })
+
+    task_results: list[dict] = []
+    if tasks:
+        with get_context('fork').Pool(int(worker_count)) as pool:
+            task_results = list(pool.map(_ofes_isopycnal_audit_task, tasks))
+    errors = [r for r in task_results if r.get('status') == 'error']
+    manifest['task_count'] = len(tasks)
+    manifest['task_error_count'] = len(errors)
+    manifest['analytic_check'] = analytic_check
+
+    cells3_map, cells5_map = _ofes_walong_smooth_cells_maps(
+        association, fields_root, smooth_km
+    )
+    audit, daily_metrics, gate_stats = _ofes_walong_assemble(
+        association, fields_root, time_window_days,
+        core_radius_km, ring_inner_km, ring_outer_km, cells3_map,
+    )
+    audit_smooth5, daily_metrics_smooth5, _ = _ofes_walong_assemble(
+        association, fields_root, time_window_days,
+        core_radius_km, ring_inner_km, ring_outer_km, cells5_map,
+    )
+    joined = association[['event_id', 'target_sigma0']].merge(
+        trajectory[
+            [
+                'event_id', 'rotation_dominated',
+                'resolved_downward_pathway_supported',
+                'resolved_upward_pathway_supported',
+                'resolved_vertical_pathway_supported',
+                'water_mass_dominated',
+            ]
+        ],
+        on='event_id', how='left',
+    )
+    tests, direction_rows = _ofes_walong_tests(audit, joined)
+    tests_smooth5, _ = _ofes_walong_tests(audit_smooth5, joined)
+    sensitivity = {
+        'smooth_cells': '5-cell (~15 km) legacy smoothing sensitivity',
+        'single_core_ring_paired_mean_diff': (
+            tests_smooth5['single']['core_ring_paired_mean_diff']
+        ),
+        'single_core_ring_paired_wilcoxon_p': (
+            tests_smooth5['single']['core_ring_paired_wilcoxon_p']
+        ),
+        'field_mean_resolved_down_mw_p': (
+            tests_smooth5['field_mean'].get('resolved_down_vs_rest_mw_p')
+        ),
+        'daily_mean_resolved_down_mw_p': (
+            tests_smooth5['daily_mean'].get('resolved_down_vs_rest_mw_p')
+        ),
+        'daily_mean_resolved_down_true_median': (
+            tests_smooth5['daily_mean'].get(
+                'resolved_down_vs_rest_true_median'
+            )
+        ),
+    }
+
+    summary = {
+        'analytic_check': analytic_check,
+        'task_count': len(tasks),
+        'task_error_count': len(errors),
+        'task_errors': [e['error'] for e in errors[:20]],
+        'event_count': int(len(association)),
+        'events_with_all_days_available': int(
+            sum(
+                1
+                for r in audit.loc[
+                    audit['aggregation'] == 'daily_mean'
+                ].itertuples()
+                if r.region == 'core'
+                and r.day_count == 2 * int(time_window_days) + 1
+            )
+        ),
+        'gate_stats': gate_stats,
+        'smooth_cells_by_event': cells3_map,
+        'sensitivity': sensitivity,
+        'tests': tests,
+        'directional_consistency': {
+            'OFES_DO50_E000239_single_core_w_along_mean_m_per_day': (
+                direction_rows.get('OFES_DO50_E000239', np.nan)
+            ),
+            'OFES_DO50_E000176_single_core_w_along_mean_m_per_day': (
+                direction_rows.get('OFES_DO50_E000176', np.nan)
+            ),
+            'note': 'E000239 三维 ensemble 下沉 96.3 m、E000176 上浮 24.6 m;'
+                    '符号一致仅为报告项,不作门。',
+        },
+    }
+    audit.to_parquet(root / 'audit.parquet', index=False)
+    daily_metrics.to_parquet(root / 'daily_metrics.parquet', index=False)
+    audit_smooth5.to_parquet(root / 'audit_smooth5.parquet', index=False)
+    daily_metrics_smooth5.to_parquet(
+        root / 'daily_metrics_smooth5.parquet', index=False
+    )
+    (root / 'summary.json').write_text(
+        json.dumps(summary, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    manifest['status'] = 'complete' if not errors else 'partial_with_errors'
+    manifest['updated_at_utc'] = pd.Timestamp.utcnow().isoformat()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'audit': audit,
+        'daily_metrics': daily_metrics,
+        'summary': summary,
+    }
 
 
 def _ofes_event_context_requests(
