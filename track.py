@@ -64946,6 +64946,366 @@ def run_ofes_event_mechanism_transition_audit(
     }
 
 
+def run_ofes_mccoy_virtual_argo_stage_bridge(
+    lifecycle_run_dir: str | Path,
+    *,
+    event_ids: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    worker_count: int = 12,
+    resume: bool = True,
+) -> dict:
+    """19-event McCoy 三阶段桥接:start/peak/last 三日 17 点足迹。
+
+    在既有 peak-McCoy-positive 事件(默认 = 完成运行
+    `ofes_mccoy_virtual_argo_a8409b27a056` 的 19 个 any-compatible)的
+    start/peak/last 三个检测日各跑一次生产 self-ring 口径的 McCoy 门链,
+    回答"SCV 型剖面形态是 onset 已有还是生命周期后期才成熟"。三阶段共用
+    peak 核心位置的同一套 17 点足迹,只换日期(可比);复用
+    `_ofes_mccoy_event_worker` 与冻结 settings,不调任何 McCoy/grid-SCV/
+    rotation 阈值。条件子集结论不外推到 56 事件(transition lock
+    §McCoy 桥接)。
+
+    参数:
+        - lifecycle_run_dir (str | Path): schema-v2 lifecycle 完成运行目录。
+        - event_ids (list[str] | None): 显式事件列表;None 时取完成运行的
+          19 个 any-compatible。
+        - output_dir (str | Path | None): 输出根;None 写
+          `Oxygen-cache/ofes_mccoy_stage_bridge/<sig>/`。
+        - worker_count (int): 并行进程数(只进 provenance)。
+        - resume (bool): 复用已落盘的 stage fragment。
+
+    返回:
+        - dict: run_dir、manifest、stage_diagnostics(逐 event × stage
+          行)与 summary(含 stage 汇总、start-last 配对与 peak 一致性
+          检查)。
+
+    输出:
+        - `manifest.json`、`stage_diagnostics.parquet`、`summary.json` 与
+          `fragments/<event_id>_<YYYYMMDD>.parquet`。
+
+    说明:
+        - 19-event 子集按 transition lock 标为条件子集;peak 日的数字应与
+          完成运行一致(同一管线),作为内置一致性检查报告。
+    """
+    repo_root = Path(__file__).resolve().parent
+    lifecycle_root = Path(lifecycle_run_dir)
+    lifecycle_manifest = json.loads(
+        (lifecycle_root / 'manifest.json').read_text(encoding='utf-8')
+    )
+    if (
+        lifecycle_manifest.get('status') != 'complete'
+        or int(lifecycle_manifest.get('schema_version', 0)) != 2
+    ):
+        raise RuntimeError(
+            'McCoy stage bridge requires a complete schema-v2 '
+            'lifecycle run.'
+        )
+    settings = _ofes_mccoy_virtual_argo_settings({})
+    source_path = Path(_mccoy_scv_source_archive)
+    source_sha256 = _file_sha256(source_path)
+    if source_sha256 != settings['source_archive_sha256']:
+        raise RuntimeError(
+            'McCoy source archive SHA-256 does not match the '
+            'preregistered value.'
+        )
+    daily = pd.read_parquet(
+        lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+    )
+    completed_mccoy = pd.read_parquet(
+        lifecycle_root / 'mccoy_virtual_argo'
+        / 'ofes_mccoy_virtual_argo_a8409b27a056'
+        / 'event_summary.parquet'
+    )
+    if event_ids is None:
+        event_ids = completed_mccoy.loc[
+            completed_mccoy['any_event_profile_mccoy_compatible'] == True,
+            'event_id',
+        ].astype(str).tolist()
+    else:
+        event_ids = [str(value) for value in event_ids]
+    lock_path = repo_root / 'ofes-event-mechanism-transition-analysis-lock.md'
+    daily_subset = daily.loc[
+        daily['event_id'].astype(str).isin(event_ids)
+    ]
+    request_rows: list[dict] = []
+    for event_id, group in daily_subset.groupby('event_id', sort=False):
+        group = group.sort_values('date')
+        start_row = group.iloc[0]
+        peak_rows = group.loc[group['is_event_peak_day']]
+        last_row = group.iloc[-1]
+        if not len(peak_rows):
+            raise RuntimeError(
+                f'No peak-day row for {event_id} in lifecycle daily.'
+            )
+        # daily 表的 peak_lon/peak_lat 是逐日对象峰位置;三阶段统一用
+        # peak 日行的事件级值,保证 17 点足迹同一几何。
+        event_peak_lon = float(peak_rows.iloc[0]['peak_lon'])
+        event_peak_lat = float(peak_rows.iloc[0]['peak_lat'])
+        for stage, row in (
+            ('start', start_row),
+            ('peak', peak_rows.iloc[0]),
+            ('last', last_row),
+        ):
+            request = row.to_dict()
+            request['stage'] = str(stage)
+            request['peak_lon'] = event_peak_lon
+            request['peak_lat'] = event_peak_lat
+            request_rows.append(request)
+    requests = pd.DataFrame(request_rows)
+    science_settings = {
+        key: value
+        for key, value in settings.items()
+        if key != 'worker_count'
+    }
+    payload = {
+        'schema_version': 1,
+        'method': 'mccoy_2020_source_gates_stage_bridge',
+        'lifecycle_run_signature': lifecycle_manifest['run_signature'],
+        'lock_sha256': _file_sha256(lock_path),
+        'input_sha256': {
+            'lifecycle_daily_diagnostics.parquet': _file_sha256(
+                lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+            ),
+            'completed_mccoy_event_summary.parquet': _file_sha256(
+                lifecycle_root / 'mccoy_virtual_argo'
+                / 'ofes_mccoy_virtual_argo_a8409b27a056'
+                / 'event_summary.parquet'
+            ),
+        },
+        'mccoy_source_archive_sha256': source_sha256,
+        'settings': science_settings,
+        'request_count': int(len(requests)),
+        'request_sha256': hashlib.sha256(
+            requests.to_json(
+                orient='records', date_format='iso'
+            ).encode('utf-8')
+        ).hexdigest(),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            default=_ofes_json_default,
+        ).encode('utf-8')
+    ).hexdigest()
+    run_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_mccoy_stage_bridge')
+    )
+    run_dir = run_root / f'ofes_mccoy_stage_bridge_{signature[:12]}'
+    fragments_dir = run_dir / 'fragments'
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            previous.get('run_signature') == signature
+            and previous.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': run_dir,
+                'manifest': previous,
+                'stage_diagnostics': pd.read_parquet(
+                    run_dir / 'stage_diagnostics.parquet'
+                ),
+                'summary': json.loads(
+                    (run_dir / 'summary.json').read_text(encoding='utf-8')
+                ),
+            }
+    manifest = {
+        **payload,
+        'run_signature': signature,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(worker_count),
+        'completed_requests': 0,
+        'total_requests': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+
+    diagnostics: list[dict] = []
+    pending: list[dict] = []
+    for row in requests.itertuples(index=False):
+        date = pd.Timestamp(row.date).normalize()
+        fragment_path = (
+            fragments_dir / f"{row.event_id}_{date.strftime('%Y%m%d')}.parquet"
+        )
+        if resume and fragment_path.exists():
+            fragment = pd.read_parquet(fragment_path)
+            if (
+                len(fragment)
+                and fragment['mccoy_run_signature'].astype(str)
+                .eq(signature).all()
+            ):
+                diagnostics.append(_ofes_stage_bridge_fragment_stats(
+                    fragment, row, fragment_reused=True
+                ))
+                continue
+        pending.append({
+            'request': row._asdict(),
+            'settings': settings,
+            'fragment_path': fragment_path,
+        })
+    if pending:
+        from concurrent.futures import ProcessPoolExecutor
+
+        workers = min(int(worker_count), len(pending))
+        if workers == 1:
+            results = [
+                (argument, _ofes_mccoy_event_worker(argument))
+                for argument in pending
+            ]
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(_ofes_mccoy_event_worker, argument)
+                    for argument in pending
+                ]
+                results = [
+                    (argument, future.result())
+                    for argument, future in zip(pending, futures)
+                ]
+        for argument, (fragment, _audit) in results:
+            fragment['mccoy_run_signature'] = signature
+            _atomic_write_parquet(fragment, argument['fragment_path'])
+            diagnostics.append(_ofes_stage_bridge_fragment_stats(
+                fragment, argument['request'], fragment_reused=False
+            ))
+    stage_diagnostics = pd.DataFrame(diagnostics)
+    stage_diagnostics.to_parquet(
+        run_dir / 'stage_diagnostics.parquet', index=False
+    )
+
+    from scipy.stats import wilcoxon
+
+    wide = stage_diagnostics.pivot_table(
+        index='event_id', columns='stage',
+        values='event_compatible_fraction',
+    )
+    for stage in ('start', 'peak', 'last'):
+        if stage not in wide.columns:
+            wide[stage] = np.nan
+    paired = wide[['start', 'last']].dropna()
+    paired_stats = {}
+    if len(paired) >= 2:
+        diffs = (paired['last'] - paired['start']).to_numpy(dtype=float)
+        paired_stats = {
+            'n': int(len(paired)),
+            'start_median': float(paired['start'].median()),
+            'last_median': float(paired['last'].median()),
+            'median_diff_last_minus_start': float(
+                paired['last'].median() - paired['start'].median()
+            ),
+            'wilcoxon_p': (
+                float(wilcoxon(
+                    diffs, alternative='two-sided', zero_method='wilcox'
+                ).pvalue)
+                if np.count_nonzero(diffs != 0) > 0 else 1.0
+            ),
+        }
+    stage_summary = {
+        stage: {
+            'events_with_any_compatible': int(
+                (stage_diagnostics.loc[
+                    stage_diagnostics['stage'] == stage,
+                    'event_compatible_count',
+                ] > 0).sum()
+            ),
+            'mean_event_compatible_fraction': float(np.nanmean(
+                stage_diagnostics.loc[
+                    stage_diagnostics['stage'] == stage,
+                    'event_compatible_fraction',
+                ]
+            )),
+            'mean_control_pass_fraction': float(np.nanmean(
+                stage_diagnostics.loc[
+                    stage_diagnostics['stage'] == stage,
+                    'control_pass_fraction',
+                ]
+            )),
+        }
+        for stage in ('start', 'peak', 'last')
+    }
+    # peak 日与完成运行的内置一致性检查(同一管线)。
+    completed_peak = completed_mccoy.loc[
+        completed_mccoy['event_id'].astype(str).isin(event_ids)
+    ].set_index('event_id')
+    peak_check_rows = stage_diagnostics.loc[
+        stage_diagnostics['stage'] == 'peak'
+    ]
+    peak_consistency = {
+        'n_compared': int(len(peak_check_rows)),
+        'mismatch_count': int(sum(
+            bool(row.event_compatible_count > 0)
+            != bool(completed_peak.loc[
+                row.event_id, 'any_event_profile_mccoy_compatible'
+            ])
+            for row in peak_check_rows.itertuples()
+        )),
+    }
+    summary = {
+        'event_count': int(requests['event_id'].nunique()),
+        'request_count': int(len(requests)),
+        'stage_summary': stage_summary,
+        'paired_start_last': paired_stats,
+        'peak_consistency_with_completed_run': peak_consistency,
+        'notes': [
+            '19-event 条件子集,不外推到 56 事件(transition lock)。',
+            '三阶段共用 peak 核心位置的同一套 17 点足迹,只换日期。',
+            '全部为报告项,不设通过门槛。',
+        ],
+    }
+    (run_dir / 'summary.json').write_text(
+        json.dumps(summary, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    manifest['status'] = 'complete'
+    manifest['updated_at_utc'] = pd.Timestamp.now(tz='UTC').isoformat()
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'stage_diagnostics': stage_diagnostics,
+        'summary': summary,
+    }
+
+
+def _ofes_stage_bridge_fragment_stats(
+    fragment: pd.DataFrame,
+    request: dict,
+    *,
+    fragment_reused: bool,
+) -> dict:
+    """单 fragment 的 stage 统计:事件足迹兼容数/占比与 control 通过率。"""
+    event_rows = fragment.loc[fragment['sample_role'] == 'event']
+    control_rows = fragment.loc[
+        fragment['sample_role'] == 'background_control'
+    ]
+    return {
+        'event_id': str(request['event_id']),
+        'stage': str(request['stage']),
+        'date': pd.Timestamp(request['date']).normalize(),
+        'event_profile_count': int(len(event_rows)),
+        'event_compatible_count': int(
+            event_rows['mccoy_profile_compatible'].sum()
+        ),
+        'event_velocity_confirmed_count': int(
+            event_rows['velocity_confirmed_mccoy_compatible'].sum()
+        ),
+        'event_compatible_fraction': float(
+            event_rows['mccoy_profile_compatible'].mean()
+        ) if len(event_rows) else np.nan,
+        'control_profile_count': int(len(control_rows)),
+        'control_pass_fraction': float(
+            control_rows['mccoy_profile_compatible'].mean()
+        ) if len(control_rows) else np.nan,
+        'fragment_reused': bool(fragment_reused),
+    }
+
+
 def _ofes_event_context_requests(
     selected_events: pd.DataFrame,
     daily_diagnostics: pd.DataFrame,
