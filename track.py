@@ -41457,9 +41457,14 @@ def _ofes_grid_v2_seed_control_audit(
             f'McCoy-compatible event profiles, found {len(positives)}; '
             'refusing to audit a shrunken denominator.'
         )
-    if positives['sample_id'].astype(str).nunique() != expected:
+    # sample_id 是事件级标签(17 个唯一值对应 141 个剖面),不能要求逐行
+    # 唯一;逐行唯一的是 (event_id, 剖面位置) 复合键,用它防御重复行。
+    if (
+        positives[['event_id', 'sample_lon', 'sample_lat']]
+        .drop_duplicates().shape[0] != expected
+    ):
         raise RuntimeError(
-            'Frozen positive controls contain duplicate sample_ids.'
+            'Frozen positive controls contain duplicate (event, position) rows.'
         )
     records = []
     for row in positives.itertuples(index=False):
@@ -41597,9 +41602,14 @@ def _ofes_grid_v2_matched_background_control(
             f'Frozen background-control count mismatch: expected {expected}, '
             f'found {len(controls)}; refusing to audit a shrunken denominator.'
         )
-    if controls['sample_id'].astype(str).nunique() != expected:
+    # sample_id 是控制位标签(80 个唯一值对应 4480 个剖面),逐行唯一的是
+    # (event_id, 剖面位置) 复合键。
+    if (
+        controls[['event_id', 'sample_lon', 'sample_lat']]
+        .drop_duplicates().shape[0] != expected
+    ):
         raise RuntimeError(
-            'Frozen background controls contain duplicate sample_ids.'
+            'Frozen background controls contain duplicate (event, position) rows.'
         )
     records = []
     for row in controls.itertuples(index=False):
@@ -41667,21 +41677,13 @@ def _ofes_grid_v2_tier_transition_summary(
         if not background_control.empty and 'day_result_missing' in background_control
         else 0
     )
-    seed_ids_unique = bool(
-        not seed_audit.empty
-        and seed_audit['sample_id'].astype(str).is_unique
-    )
-    control_ids_unique = bool(
-        not background_control.empty
-        and background_control['sample_id'].astype(str).is_unique
-    )
+    # 行唯一性由 seed/background 入口的 (event_id, 位置) 复合键检查保证,
+    # 这里只查行数与缺失行。
     intact = bool(
         not seed_audit.empty
         and not background_control.empty
         and len(seed_audit) == expected_positive
         and len(background_control) == expected_control
-        and seed_ids_unique
-        and control_ids_unique
         and seed_missing == 0
         and control_missing == 0
     )
@@ -41695,8 +41697,6 @@ def _ofes_grid_v2_tier_transition_summary(
             'expected_background_control_total': expected_control,
             'seed_audit_missing_rows': seed_missing,
             'background_control_missing_rows': control_missing,
-            'seed_audit_sample_ids_unique': seed_ids_unique,
-            'background_control_sample_ids_unique': control_ids_unique,
         }
     valid = seed_audit.loc[~seed_audit['day_result_missing'].astype(bool)]
     prefilter_retained = int(valid['prefilter_retained'].sum())

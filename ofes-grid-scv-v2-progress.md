@@ -27,6 +27,10 @@ weak/strong `native_anticyclonic_support`(Nencioli 四规则 + N2 边界 circula
 - `5a60678` **Correct the grid SCV v2 centroid usage and annual tile
   coverage**(第三轮局部修正:体积质心中心/物理厚度 well_resolved/年度
   tile 首尾贴边全覆盖/spice voxel 计数落盘;19 解析 + 12 回归 PASS)
+- `0ecd0e4` **Share the grid SCV v2 profile cache with fork workers**(第四轮
+  修复:进程池逐 chunk pickle ~10GB frame 造成三次 OOM 崩溃;改 fork + 只读
+  共享槽,峰值 ~180GB→~30GB;单进程/进程池数值等价验证 + 19 解析 + 12 回归
+  全 PASS)
 
 v1 拒绝输出已写 SUPERSEDED 标记:
 `Oxygen-cache/ofes_grid_scv_results/{annual_*_localrecert*, event_catalog_final}/SUPERSEDED.txt`
@@ -87,10 +91,11 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 为 0 / underresolved 不升级 Tier-2 / 141·4480 分母缺样本硬失败 / transition
 缺失行 gate_failed / 日片复用在 hash·schema·窗口不一致时拒绝。
 
-## 验证状态(第三轮修正后全量重跑,2026-08-15)
+## 验证状态(第四轮修复后,2026-08-15)
 
 - 解析验证:19/19 PASS
 - 回归验证:12/12 PASS
+- 单进程 vs 进程池数值等价:POOL EQUIVALENCE OK(4 万列合成场逐位一致)
 - `py_compile` OK
 
 ### 第二轮修复(外部 AI 复审意见,全部落码)
@@ -173,3 +178,22 @@ v1 拒绝输出已写 SUPERSEDED 标记:
   worker_count 排除在科学签名外
 - DO/event labels 绝不进入 detector gates;绝不以 DO overlap 调门
 - 输出原子写入;v1 锁文件与 SUPERSEDED 标记不得改动
+
+## 节点 4 运行状态(2026-08-15)
+
+- 第四次启动 13:56:31(pid 343567,`_tmp_node4_run.py`,worker_count=16,
+  resume=True)。前三轮崩溃均为 audit 池阶段 OOM(见 memory
+  grid-scv-v2-repair-progress),0ecd0e4 fork 共享槽修复后峰值 ~12GB
+- 19 解析 + 12 回归 14:08 完成;4 审计日(16w 池)14:27 完成
+- **56 事件日实测 ~13.5 min/日**(窗口湿列 ~85.6k,cache 构建与 daily_seeds
+  均走 16w 池;13.5min 大头=快照 I/O + 等密面场 + 462MB profile_cache
+  落盘),串行需到次日 03:00 → 横向并行:
+  - A(主跑,16w)正序 strict 行 0-10;B/C/D(worker 脚本
+    `_tmp_node4_workers.py`,各 8w)倒序行 [41,56)/[26,41)/[11,26)
+  - worker_count 不进科学签名(等价检查已证逐位一致),8w 选择仅为
+    匹配 32 核机器(16+8×3=40 workers,近乎零超订)
+  - 撞车防护:双方各以 `_ofes_grid_v2_load_day_from_dir` 三哈希 resume
+    检查;最坏情形同一日片被算两遍(同 code hash 同输入,原子写,无害)
+  - 日志 /tmp/node4_wB/wC/wD.log;worker 单日失败继续跑,留给 A 兜底
+- 预计日片 18:30-19:00 全落盘,随后 A 收尾 seed_control_audit →
+  matched_background_control → tier_transition_summary → gate
