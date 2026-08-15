@@ -51,6 +51,16 @@ Secondary(peak rotation 29 vs 27):lifetime +5(p=0.75);衰减斜率 +0.011
 (p=0.125);**post-peak AUC +5.5,CI [1.05, +7.38],p=0.015**。
 time_to_half 53/56 右删失(检测期内未降到 peak 50%),不参与比较。
 
+**真实水团项版(650 观测日逐日 water-mass/heave 分解,运行
+`ofes_daily_water_mass_afa024fe7a6e`,peak 日与 population 逐位一致
+56/56 零差)**:carrier 组归一化水团项衰减斜率 −0.118/day vs 非 carrier
+−0.254/day(慢约 2.2 倍,方向与 ΔDO 代理一致,median diff +0.136,
+bootstrap CI [−0.001, +0.377],MW p=0.127);post-peak AUC 0.94 vs 0.72
+(p=0.18);wm_peak 75.6 vs 65.6 μmol kg⁻¹。真实分量上的滞留优势方向一致
+但弱于代理版、未达显著——如实记录,retention 结论保持"有限"。
+另外全 650 观测日 w_along(`ofes_walong_6f4cf2337fd1`,0 错误、56/56
+全天数)已落盘,可做逐日俯冲强度时序。
+
 稳健性回归(lifetime ~ persistent_carrier + peak_ΔDO + core_depth +
 sigma0 + start_doy,n=56):carrier β=+3.1,p=0.23(ns);**peak_ΔDO
 β=+0.43,p=3e-8**;core_depth β=+0.089,p=1e-3;其余 ns。事件寿命主要由
@@ -122,5 +132,7 @@ upward contrast;全链条三例作示意图候选(E000276 优先,blind 案例天
 - 年度 grid-SCV 背景线:工程试跑完成后按成本外推决策(见 ofes worktree
   结果报告第四节)。
 - McCoy 桥接已完成(全 56 事件,见裁决 3);19-event 子集运行保留为溯源。
-- 新运行:全 650 观测日 w_along(`ofes_walong_6f4cf2337fd1`)与逐日
-  water-mass/heave 分解(运行中)回填后,retention B 将换用真实水团项。
+- 全 650 观测日 w_along 与逐日 water-mass/heave 分解均已完成并回填
+  (见主分析 B)。
+- 可选大件:161 个 quality-eligible 事件中非 deep 的 ~100 个补跑 population
+  诊断(入口 `diagnose_ofes_ranked_events`),事件选择口径待定。

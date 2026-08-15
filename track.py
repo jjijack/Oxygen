@@ -63241,7 +63241,7 @@ def _ofes_walong_smooth_cells_maps(
 def _ofes_walong_assemble(
     association: pd.DataFrame,
     fields_root: Path,
-    time_window_days: int,
+    offsets_map: dict[str, list[int]],
     core_radius_km: float,
     ring_inner_km: float,
     ring_outer_km: float,
@@ -63263,7 +63263,7 @@ def _ofes_walong_assemble(
         peak_date = pd.Timestamp(row.peak_date).normalize()
         event_dir = fields_root / str(row.event_id)
         per_day: dict[str, dict] = {}
-        for offset in range(-int(time_window_days), int(time_window_days) + 1):
+        for offset in offsets_map.get(str(row.event_id), []):
             date = peak_date + pd.Timedelta(days=int(offset))
             date_str = date.strftime('%Y-%m-%d')
             path = event_dir / f"{row.event_id}_{date.strftime('%Y%m%d')}.nc"
@@ -63556,6 +63556,7 @@ def run_ofes_event_isopycnal_velocity_audit(
     trajectory_classification_path: str | Path | None = None,
     output_dir: str | Path | None = None,
     time_window_days: int = 3,
+    event_offsets: dict[str, list[int]] | None = None,
     core_radius_km: float = 20.0,
     ring_inner_km: float = 120.0,
     ring_outer_km: float = 240.0,
@@ -63586,6 +63587,9 @@ def run_ofes_event_isopycnal_velocity_audit(
         - output_dir (str | Path | None): 输出根;None 时写
           `Oxygen-cache/ofes_walong_results/ofes_walong_<sig>/`。
         - time_window_days (int): peak 日前后扩展天数(总 2n+1 天)。
+        - event_offsets (dict[str, list[int]] | None): 逐事件相对 peak 的
+          天数列表;None 时用 ±time_window_days 对称窗;给定时覆盖
+          time_window_days(用于全部观测日的扩展运行)。
         - core_radius_km (float): core 盘半径(km)。
         - ring_inner_km / ring_outer_km (float): 环带内/外半径(km)。
         - window_margin_km (float): 环带外缘之外的平滑余量(km)。
@@ -63631,7 +63635,22 @@ def run_ofes_event_isopycnal_velocity_audit(
     trajectory = pd.read_parquet(trajectory_classification_path)
     lock_path = repo_root / 'ofes-isopycnal-velocity-audit-lock.md'
     processing_path = repo_root / 'config' / 'processing.yml'
+    if event_offsets is None:
+        offsets_map = {
+            str(row.event_id): list(
+                range(-int(time_window_days), int(time_window_days) + 1)
+            )
+            for row in association.itertuples(index=False)
+        }
+        offsets_mode = f'peak_window_pm{int(time_window_days)}'
+    else:
+        offsets_map = {
+            str(event_id): [int(v) for v in values]
+            for event_id, values in event_offsets.items()
+        }
+        offsets_mode = 'custom_event_offsets'
     settings = {
+        'offsets_mode': offsets_mode,
         'time_window_days': int(time_window_days),
         'core_radius_km': float(core_radius_km),
         'ring_inner_km': float(ring_inner_km),
@@ -63719,7 +63738,7 @@ def run_ofes_event_isopycnal_velocity_audit(
     for row in association.itertuples(index=False):
         row_factors = approximate_degree_length(float(row.core_lat))
         peak_date = pd.Timestamp(row.peak_date).normalize()
-        for offset in range(-int(time_window_days), int(time_window_days) + 1):
+        for offset in offsets_map.get(str(row.event_id), []):
             date = peak_date + pd.Timedelta(days=int(offset))
             date_str = date.strftime('%Y-%m-%d')
             fields_path = (
@@ -63765,11 +63784,11 @@ def run_ofes_event_isopycnal_velocity_audit(
         association, fields_root, smooth_km
     )
     audit, daily_metrics, gate_stats = _ofes_walong_assemble(
-        association, fields_root, time_window_days,
+        association, fields_root, offsets_map,
         core_radius_km, ring_inner_km, ring_outer_km, cells3_map,
     )
     audit_smooth5, daily_metrics_smooth5, _ = _ofes_walong_assemble(
-        association, fields_root, time_window_days,
+        association, fields_root, offsets_map,
         core_radius_km, ring_inner_km, ring_outer_km, cells5_map,
     )
     joined = association[['event_id', 'target_sigma0']].merge(
@@ -63820,7 +63839,9 @@ def run_ofes_event_isopycnal_velocity_audit(
                     audit['aggregation'] == 'daily_mean'
                 ].itertuples()
                 if r.region == 'core'
-                and r.day_count == 2 * int(time_window_days) + 1
+                and r.day_count == len(
+                    offsets_map.get(str(r.event_id), [])
+                )
             )
         ),
         'gate_stats': gate_stats,
@@ -65303,6 +65324,333 @@ def _ofes_stage_bridge_fragment_stats(
             control_rows['mccoy_profile_compatible'].mean()
         ) if len(control_rows) else np.nan,
         'fragment_reused': bool(fragment_reused),
+    }
+
+
+def _ofes_daily_water_mass_task(task: dict) -> dict:
+    """单 (event, observed day) 任务:核心相对环带背景的水团/heave 分解。"""
+    try:
+        diagnosis = _ofes_diagnose_water_mass_day(
+            str(task['date']),
+            float(task['core_lon']),
+            float(task['core_lat']),
+            float(task['reference_depth_m']),
+            task['settings'],
+        )
+        diagnosis['event_id'] = str(task['event_id'])
+        diagnosis['date'] = str(task['date'])
+        return diagnosis
+    except Exception as exc:
+        import traceback
+
+        return {
+            'event_id': task.get('event_id'),
+            'date': task.get('date'),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+            'traceback': traceback.format_exc(),
+        }
+
+
+def run_ofes_event_daily_water_mass_audit(
+    event_association_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    worker_count: int = 16,
+    resume: bool = True,
+) -> dict:
+    """56-event 逐日水团项审计:全部观测日的 water-mass/heave 分解。
+
+    对 56 个严格事件的全部 650 个观测日,复用冻结的
+    `_ofes_diagnose_water_mass_day`(与 population 运行同一机器与 settings),
+    在固定的 peak 核心位置、固定参考深度(事件 core_depth_m)上逐日分解
+    fixed-depth / water-mass / heave 三项。目的是把 transition 审计
+    retention 分析的"ΔDO 幅度代理"换成真实的水团项序列(lock 的 fallback
+    设计:无逐日 water-mass 时用 delta_do_max 替代并标注;本运行补上真实
+    量,proxy 保留作敏感性)。
+
+    参数:
+        - event_association_path (str | Path): 节点 5 完成的 56-event
+          event_association.parquet。
+        - output_dir (str | Path | None): 输出根;None 时写
+          `Oxygen-cache/ofes_daily_water_mass/<sig>/`。
+        - worker_count (int): 并行进程数(只进 provenance)。
+        - resume (bool): 已完成运行按签名直接返回。
+
+    返回:
+        - dict: run_dir、manifest、daily_water_mass(逐 event-day)、
+          event_summary(逐事件 start/peak/last 与衰减量)与 summary。
+
+    输出:
+        - `manifest.json`、`daily_water_mass.parquet`、
+          `event_summary.parquet`、`summary.json`。
+
+    说明:
+        - 逐日几何固定 = peak 核心位置 + 事件参考深度,保证系列可比;
+          与 peak 日 population 值的一致性检查记入 summary。
+        - DO 不参与任何分组门,只作响应变量(transition lock 纪律)。
+    """
+    from multiprocessing import get_context
+
+    repo_root = Path(__file__).resolve().parent
+    association_path = Path(event_association_path)
+    association = pd.read_parquet(association_path)
+    lifecycle_root = (
+        repo_root / 'plot_outputs' / 'do' / 'ofes_np30_ke'
+        / 'ofes_delta_do_catalog' / '20030101_20031231_cf957935d38a'
+        / 'event_diagnostics' / 'ofes_events_21efbe902ab7'
+        / 'event_population' / 'ofes_population_254ae68988a6'
+    )
+    daily_path = (
+        lifecycle_root / 'event_lifecycle' / 'ofes_lifecycle_f7290df019c2'
+        / 'lifecycle_daily_diagnostics.parquet'
+    )
+    population_path = lifecycle_root / 'population_peak_diagnostics.parquet'
+    lock_path = repo_root / 'ofes-event-mechanism-transition-analysis-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    settings = _ofes_event_diagnostic_settings()
+    payload = {
+        'code_sha256': _file_sha256(Path(__file__).resolve()),
+        'lock_sha256': _file_sha256(lock_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'event_association_sha256': _file_sha256(association_path),
+        'lifecycle_daily_sha256': _file_sha256(daily_path),
+        'population_peak_sha256': _file_sha256(population_path),
+        'settings': settings,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    root = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_daily_water_mass')
+            / f'ofes_daily_water_mass_{run_signature[:12]}'
+        )
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            existing.get('run_signature') == run_signature
+            and existing.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'daily_water_mass': pd.read_parquet(
+                    root / 'daily_water_mass.parquet'
+                ),
+                'event_summary': pd.read_parquet(
+                    root / 'event_summary.parquet'
+                ),
+                'summary': json.loads(
+                    (root / 'summary.json').read_text(encoding='utf-8')
+                ),
+            }
+    manifest = {
+        'schema_version': 1,
+        'created_at_utc': pd.Timestamp.utcnow().isoformat(),
+        'run_signature': run_signature,
+        'status': 'running',
+        'worker_count': int(worker_count),
+        **payload,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+
+    daily = pd.read_parquet(daily_path)
+    daily = daily[daily['event_id'].isin(set(association['event_id']))]
+    # 固定几何:每事件的 peak 行位置 + association 参考深度。
+    peak_rows = daily.loc[daily['is_event_peak_day']].set_index('event_id')
+    tasks: list[dict] = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        core_lon = float(peak_rows.loc[event_id, 'peak_lon'])
+        core_lat = float(peak_rows.loc[event_id, 'peak_lat'])
+        reference_depth_m = float(
+            association.loc[
+                association['event_id'] == event_id, 'core_depth_m'
+            ].iloc[0]
+        )
+        for row in group.itertuples(index=False):
+            tasks.append({
+                'event_id': str(event_id),
+                'date': pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                'core_lon': core_lon,
+                'core_lat': core_lat,
+                'reference_depth_m': reference_depth_m,
+                'settings': settings,
+            })
+    task_results: list[dict] = []
+    if tasks:
+        with get_context('fork').Pool(int(worker_count)) as pool:
+            task_results = list(pool.map(_ofes_daily_water_mass_task, tasks))
+    errors = [r for r in task_results if r.get('status') == 'error']
+    rows = [r for r in task_results if r.get('status') != 'error']
+    daily_water_mass = pd.DataFrame(rows)
+    daily_water_mass['date'] = pd.to_datetime(daily_water_mass['date'])
+    daily_water_mass.to_parquet(
+        root / 'daily_water_mass.parquet', index=False
+    )
+
+    # 与 population peak 值的一致性检查(同一机器,固定几何同口径)。
+    population = pd.read_parquet(population_path)
+    peak_daily = daily_water_mass.merge(
+        daily.loc[daily['is_event_peak_day'], ['event_id', 'date']]
+        .assign(date=lambda frame: pd.to_datetime(frame['date'])),
+        on=['event_id', 'date'],
+    )
+    consistency = population[
+        ['event_id', 'water_mass_do_contrast', 'heave_do_contribution',
+         'fixed_depth_do_contrast']
+    ].merge(
+        peak_daily[
+            ['event_id', 'water_mass_do_contrast', 'heave_do_contribution',
+             'fixed_depth_do_contrast']
+        ].rename(columns={
+            'water_mass_do_contrast': 'daily_wm',
+            'heave_do_contribution': 'daily_heave',
+            'fixed_depth_do_contrast': 'daily_fixed',
+        }),
+        on='event_id', how='inner',
+    )
+    peak_consistency = {
+        'n_compared': int(len(consistency)),
+        'water_mass_max_abs_diff': float(
+            (consistency['water_mass_do_contrast']
+             - consistency['daily_wm']).abs().max()
+        ),
+        'heave_max_abs_diff': float(
+            (consistency['heave_do_contribution']
+             - consistency['daily_heave']).abs().max()
+        ),
+    }
+
+    # 事件级汇总:start/peak/last 水团项 + 归一化衰减斜率与 AUC。
+    event_rows: list[dict] = []
+    for event_id, group in daily_water_mass.groupby('event_id', sort=False):
+        group = group.sort_values('date')
+        wm = group['water_mass_do_contrast'].to_numpy(dtype=float)
+        peak_do_row = peak_rows.loc[event_id]
+        peak_date = pd.Timestamp(peak_do_row['date']).normalize()
+        peak_mask = group['date'].dt.normalize() == peak_date
+        peak_wm = (
+            float(group.loc[peak_mask, 'water_mass_do_contrast'].iloc[0])
+            if peak_mask.any() else np.nan
+        )
+        decay_slope = np.nan
+        auc = np.nan
+        if np.isfinite(peak_wm) and peak_wm != 0:
+            post = group.loc[group['date'].dt.normalize() >= peak_date]
+            post = post.sort_values('date')
+            y = (
+                post['water_mass_do_contrast'].to_numpy(dtype=float)
+                / peak_wm
+            )
+            x = (
+                (post['date'].dt.normalize() - peak_date)
+                .dt.days.to_numpy(dtype=float)
+            )
+            finite = np.isfinite(y)
+            if np.count_nonzero(finite) >= 2:
+                slope, _ = np.polyfit(x[finite], y[finite], 1)
+                decay_slope = float(slope)
+                auc = float(np.trapz(y[finite], x[finite]))
+        event_rows.append({
+            'event_id': str(event_id),
+            'wm_start': float(wm[0]) if wm.size else np.nan,
+            'wm_peak': peak_wm,
+            'wm_last': float(wm[-1]) if wm.size else np.nan,
+            'wm_normalized_decay_slope': decay_slope,
+            'wm_post_peak_auc': auc,
+            'observed_days': int(len(group)),
+        })
+    event_summary = pd.DataFrame(event_rows)
+    # 与 carrier 标签交叉(retention B 的真实分量版)。
+    lifecycle_summary = pd.read_parquet(
+        lifecycle_root / 'event_lifecycle' / 'ofes_lifecycle_f7290df019c2'
+        / 'lifecycle_event_summary.parquet'
+    )
+    event_summary = event_summary.merge(
+        lifecycle_summary[[
+            'event_id', 'persistent_anticyclonic_rotational_carrier',
+            'rotation_day_fraction',
+        ]],
+        on='event_id', how='left',
+    )
+    event_summary.to_parquet(root / 'event_summary.parquet', index=False)
+
+    from scipy.stats import mannwhitneyu
+
+    def _group_compare(column: str) -> dict:
+        true_group = event_summary.loc[
+            event_summary['persistent_anticyclonic_rotational_carrier']
+            == True
+        ][column].to_numpy(dtype=float)
+        false_group = event_summary.loc[
+            event_summary['persistent_anticyclonic_rotational_carrier']
+            == False
+        ][column].to_numpy(dtype=float)
+        true_group = true_group[np.isfinite(true_group)]
+        false_group = false_group[np.isfinite(false_group)]
+        if true_group.size < 2 or false_group.size < 2:
+            return None
+        med_diff, lo, hi = _ofes_transition_bootstrap_median_diff(
+            true_group, false_group
+        )
+        return {
+            'median_true': float(np.median(true_group)),
+            'median_false': float(np.median(false_group)),
+            'median_diff': med_diff,
+            'bootstrap_ci': [lo, hi],
+            'mw_p': float(mannwhitneyu(
+                true_group, false_group, alternative='two-sided'
+            ).pvalue),
+        }
+
+    summary = {
+        'task_count': len(tasks),
+        'task_error_count': len(errors),
+        'task_errors': [e['error'] for e in errors[:20]],
+        'event_day_count': int(len(daily_water_mass)),
+        'peak_consistency_with_population': peak_consistency,
+        'carrier_retention': {
+            'wm_normalized_decay_slope': _group_compare(
+                'wm_normalized_decay_slope'
+            ),
+            'wm_post_peak_auc': _group_compare('wm_post_peak_auc'),
+            'wm_peak': _group_compare('wm_peak'),
+        },
+        'notes': [
+            '逐日几何固定(peak 核心位置 + 事件参考深度),系列可比。',
+            'water-mass 分量为 retention B 的真实量;delta_do_max 代理'
+            '保留作敏感性(transition lock fallback)。',
+        ],
+    }
+    (root / 'summary.json').write_text(
+        json.dumps(summary, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    manifest['status'] = 'complete' if not errors else 'partial_with_errors'
+    manifest['task_count'] = len(tasks)
+    manifest['task_error_count'] = len(errors)
+    manifest['updated_at_utc'] = pd.Timestamp.utcnow().isoformat()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'daily_water_mass': daily_water_mass,
+        'event_summary': event_summary,
+        'summary': summary,
     }
 
 
