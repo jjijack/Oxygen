@@ -64224,6 +64224,728 @@ def run_ofes_event_winter_mld_audit(
     }
 
 
+def _ofes_transition_ols(
+    names: list[str],
+    y: np.ndarray,
+    X: np.ndarray,
+) -> dict:
+    """小型 OLS:截距 + 各列 beta/se/p,只作稳健性检查不作因果解释。"""
+    from scipy.stats import t as t_dist
+
+    design = np.column_stack([np.ones(len(y)), X])
+    beta, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+    residual = y - design @ beta
+    n, p = design.shape
+    dof = n - p
+    s2 = float((residual @ residual) / dof) if dof > 0 else np.nan
+    cov = s2 * np.linalg.inv(design.T @ design)
+    se = np.sqrt(np.diag(cov))
+    t_values = beta / se
+    p_values = 2.0 * (1.0 - t_dist.cdf(np.abs(t_values), dof))
+    out = {'intercept': {
+        'beta': float(beta[0]), 'se': float(se[0]),
+        'p': float(p_values[0]),
+    }}
+    for idx, name in enumerate(names):
+        out[name] = {
+            'beta': float(beta[idx + 1]),
+            'se': float(se[idx + 1]),
+            'p': float(p_values[idx + 1]),
+        }
+    out['n'] = int(n)
+    return out
+
+
+def _ofes_transition_bootstrap_median_diff(
+    a: np.ndarray,
+    b: np.ndarray,
+    seed: int = 20260729,
+    n_reps: int = 10000,
+) -> tuple[float, float, float]:
+    """事件级 bootstrap:两组中位差的 2.5/97.5 分位与原始中位差。"""
+    rng = np.random.default_rng(int(seed))
+    idx_a = rng.integers(0, a.size, size=(n_reps, a.size))
+    idx_b = rng.integers(0, b.size, size=(n_reps, b.size))
+    diffs = np.median(a[idx_a], axis=1) - np.median(b[idx_b], axis=1)
+    return (
+        float(np.median(a) - np.median(b)),
+        float(np.percentile(diffs, 2.5)),
+        float(np.percentile(diffs, 97.5)),
+    )
+
+
+def run_ofes_event_mechanism_transition_audit(
+    event_association_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    resume: bool = True,
+) -> dict:
+    """56-event formation–organization–retention 时间序审计(H1/H2/H3)。
+
+    从既有完成运行组装逐日机制表(时间/水团信号/动力/形态/轨迹/通风),
+    跑三个冻结主分析:阶段转化(early/peak/late 的 rotation-strain 类转移
+    与 start→peak 连续变化)、retention 对比(persistent carrier vs 其余,
+    event-level bootstrap)、形成-组织 lag(strain vs r_share、strain vs
+    DO 增长,每事件一个 lag 再事件层汇总)。三个假说 H1/H2/H3 全部接受,
+    不以"更像 SCV"为成功标准;DO 不参与任何 rotation/strain 身份门,只作
+    响应变量。数据全部复用既有产物,零新增 OFES 读取;完整冻结设计见
+    `ofes-event-mechanism-transition-analysis-lock.md`。
+
+    参数:
+        - event_association_path (str | Path): 节点 5 完成的 56-event
+          event_association.parquet。
+        - output_dir (str | Path | None): 输出根;None 时写
+          `Oxygen-cache/ofes_mechanism_transition/<sig>/`。
+        - resume (bool): 已完成运行按签名直接返回。
+
+    返回:
+        - dict: run_dir、manifest、daily_event_mechanism、
+          phase_transition_table、retention_comparison、
+          event_lag_diagnostics 与 summary。
+
+    输出:
+        - `manifest.json`、`daily_event_mechanism.parquet`、
+          `phase_transition_table.parquet`、`retention_comparison.parquet`、
+          `event_lag_diagnostics.parquet`、`mechanism_transition_summary.json`。
+
+    说明:
+        - 全部统计单位是事件,不是 event-day 或 particle;event-level
+          bootstrap seed 20260729。
+        - 形态量(bbox 纵横比)与锋生(仅三例 onset)只作连续分布报告,
+          不设事后二分类门槛;submesoscale 措辞须有尺度依据。
+    """
+    repo_root = Path(__file__).resolve().parent
+    association_path = Path(event_association_path)
+    association = pd.read_parquet(association_path)
+    lock_path = repo_root / 'ofes-event-mechanism-transition-analysis-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    population_root = (
+        repo_root / 'plot_outputs' / 'do' / 'ofes_np30_ke'
+        / 'ofes_delta_do_catalog' / '20030101_20031231_cf957935d38a'
+        / 'event_diagnostics' / 'ofes_events_21efbe902ab7'
+        / 'event_population' / 'ofes_population_254ae68988a6'
+    )
+    lifecycle_root = population_root / 'event_lifecycle' / 'ofes_lifecycle_f7290df019c2'
+    trajectory_root = (
+        population_root / 'trajectory_3d_population'
+        / 'ofes_trajectory3d_population_1d2b102470dd'
+    )
+    input_paths = {
+        'event_association': association_path,
+        'lifecycle_daily': (
+            lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+        ),
+        'lifecycle_event_summary': (
+            lifecycle_root / 'lifecycle_event_summary.parquet'
+        ),
+        'population_peak': population_root / 'population_peak_diagnostics.parquet',
+        'trajectory_classification': (
+            trajectory_root / 'population_classification.parquet'
+        ),
+        'tracers_daily': (
+            trajectory_root / 'trajectory_tracers'
+            / 'ofes_trajectory_tracers_85144de4609a'
+            / 'daily_tracer_summary.parquet'
+        ),
+        'tracers_event': (
+            trajectory_root / 'trajectory_tracers'
+            / 'ofes_trajectory_tracers_85144de4609a'
+            / 'event_tracer_summary.parquet'
+        ),
+        'ventilation_daily': (
+            trajectory_root / 'trajectory_ventilation'
+            / 'ofes_trajectory_ventilation_bd4e029be65e'
+            / 'daily_ventilation_diagnostics.parquet'
+        ),
+        'mccoy_event_summary': (
+            lifecycle_root / 'mccoy_virtual_argo'
+            / 'ofes_mccoy_virtual_argo_a8409b27a056'
+            / 'event_summary.parquet'
+        ),
+        'lock': lock_path,
+        'processing_config': processing_path,
+    }
+    payload = {
+        key: _file_sha256(path)
+        for key, path in input_paths.items()
+    }
+    payload['code_sha256'] = _file_sha256(Path(__file__).resolve())
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':')
+    )
+    run_signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    root = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_mechanism_transition')
+            / f'ofes_mechanism_transition_{run_signature[:12]}'
+        )
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            existing.get('run_signature') == run_signature
+            and existing.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'daily_event_mechanism': pd.read_parquet(
+                    root / 'daily_event_mechanism.parquet'
+                ),
+                'phase_transition_table': pd.read_parquet(
+                    root / 'phase_transition_table.parquet'
+                ),
+                'retention_comparison': pd.read_parquet(
+                    root / 'retention_comparison.parquet'
+                ),
+                'event_lag_diagnostics': pd.read_parquet(
+                    root / 'event_lag_diagnostics.parquet'
+                ),
+                'summary': json.loads(
+                    (root / 'mechanism_transition_summary.json').read_text(
+                        encoding='utf-8'
+                    )
+                ),
+            }
+    manifest = {
+        'schema_version': 1,
+        'created_at_utc': pd.Timestamp.utcnow().isoformat(),
+        'run_signature': run_signature,
+        'status': 'running',
+        **payload,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2), encoding='utf-8'
+    )
+
+    strict_ids = set(association['event_id'])
+    lifecycle_daily = pd.read_parquet(
+        input_paths['lifecycle_daily']
+    )
+    lifecycle_daily = lifecycle_daily[
+        lifecycle_daily['event_id'].isin(strict_ids)
+    ].copy()
+    lifecycle_summary = pd.read_parquet(
+        input_paths['lifecycle_event_summary']
+    )
+    population = pd.read_parquet(input_paths['population_peak'])
+    trajectory_class = pd.read_parquet(
+        input_paths['trajectory_classification']
+    )
+    tracers_daily = pd.read_parquet(input_paths['tracers_daily'])
+    tracers_event = pd.read_parquet(input_paths['tracers_event'])
+    ventilation_daily = pd.read_parquet(input_paths['ventilation_daily'])
+    mccoy_event = pd.read_parquet(input_paths['mccoy_event_summary'])
+
+    # 事件级基础列(population 59 → strict 56)。
+    event_base = population.loc[
+        population['event_id'].isin(strict_ids)
+    ].merge(
+        association[['event_id', 'core_depth_m']],
+        on='event_id', how='left',
+    ).merge(
+        lifecycle_summary[[
+            'event_id', 'rotation_day_fraction',
+            'anticyclonic_fraction_among_rotation_days',
+            'maximum_consecutive_scv_compatible_days',
+            'persistent_anticyclonic_rotational_carrier',
+            'scv_compatible', 'surface_obscured_scv_compatible',
+            'population_peak_rotation_dominated',
+        ]],
+        on='event_id', how='left',
+    ).merge(
+        trajectory_class[[
+            'event_id', 'event_validation_passed',
+            'resolved_vertical_pathway_supported',
+            'resolved_downward_pathway_supported',
+            'resolved_upward_pathway_supported',
+            'observed_vertical_motion', 'particle_vertical_motion',
+            'vertical_direction_matched',
+        ]],
+        on='event_id', how='left',
+    ).merge(
+        mccoy_event[[
+            'event_id', 'center_profile_mccoy_compatible',
+            'any_event_profile_mccoy_compatible',
+            'center_profile_velocity_confirmed',
+            'any_event_profile_velocity_confirmed',
+        ]],
+        on='event_id', how='left',
+    ).merge(
+        tracers_event.loc[
+            tracers_event['integration_label']
+            == 'forward_observed_start_to_peak'
+        ][[
+            'event_id', 'do_fingerprint_day_fraction',
+            'do_fingerprint_persistent',
+            'salinity_fingerprint_day_fraction',
+        ]],
+        on='event_id', how='left',
+    )
+
+    # 逐日机制表:时间/水团信号/动力/形态/轨迹/通风。
+    # start_date/peak_date/delta_do_max 等已随 lifecycle_daily 自带,
+    # 只并入不冲突的事件级列(避免 merge 后缀把列名改掉)。
+    daily = lifecycle_daily.merge(
+        event_base[
+            ['event_id', 'end_date', 'span_days',
+             'water_mass_dominated', 'water_mass_absolute_fraction',
+             'persistent_anticyclonic_rotational_carrier',
+             'scv_compatible', 'resolved_downward_pathway_supported',
+             'resolved_upward_pathway_supported',
+             'center_profile_mccoy_compatible',
+             'any_event_profile_mccoy_compatible',
+             'core_depth_m', 'target_sigma0', 'observed_days']
+        ],
+        on='event_id', how='left',
+    )
+    daily['date'] = pd.to_datetime(daily['date'])
+    daily['days_from_start'] = (
+        daily['date'] - pd.to_datetime(daily['start_date'])
+    ).dt.days
+    daily['days_from_peak'] = (
+        daily['date'] - pd.to_datetime(daily['peak_date'])
+    ).dt.days
+    daily['phase_norm'] = daily['days_from_start'] / daily[
+        'span_days'
+    ].clip(lower=1)
+    daily['is_start'] = daily['days_from_start'] == 0
+    daily['is_peak'] = daily['days_from_peak'] == 0
+    daily['is_end'] = daily['date'] == pd.to_datetime(daily['end_date'])
+    deep_entry = (
+        daily.loc[daily['depth_mean'] >= 500.0]
+        .groupby('event_id')['date'].min()
+        .rename('deep_entry_date')
+    )
+    daily = daily.merge(deep_entry, on='event_id', how='left')
+    daily['is_deep_entry'] = daily['date'] == daily['deep_entry_date']
+    # 冻结连续指标与冻结标签(rotation_dominated 已有;strain = 非 rotation
+    # 且 Ro/strain 有效;r_share = |Ro| / (|Ro| + normalized_strain))。
+    valid_dyn = (
+        daily['rossby_number'].notna()
+        & daily['normalized_strain'].notna()
+    )
+    daily['r_share'] = np.where(
+        valid_dyn
+        & (
+            daily['rossby_number'].abs()
+            + daily['normalized_strain'].abs()
+            > 0
+        ),
+        daily['rossby_number'].abs()
+        / (
+            daily['rossby_number'].abs()
+            + daily['normalized_strain'].abs()
+        ),
+        np.nan,
+    )
+    daily['strain_dominated'] = (
+        valid_dyn
+        & ~daily['rotation_dominated'].fillna(False).astype(bool)
+    )
+    factors = approximate_degree_length(
+        np.asarray(daily['centroid_lat'], dtype=float)
+    )
+    m_per_deg_lon = np.asarray(
+        factors['meters_per_degree_lon'], dtype=float
+    )
+    m_per_deg_lat = np.asarray(
+        factors['meters_per_degree_lat'], dtype=float
+    )
+    lon_span_km = (daily['lon_max'] - daily['lon_min']) * m_per_deg_lon
+    lat_span_km = (daily['lat_max'] - daily['lat_min']) * m_per_deg_lat
+    daily['bbox_aspect_ratio'] = lat_span_km / lon_span_km.clip(
+        lower=1e-6
+    )
+    daily['daily_class'] = np.where(
+        daily['rotation_dominated'].fillna(False).astype(bool),
+        'rotation',
+        np.where(daily['strain_dominated'], 'strain', 'unclassified'),
+    )
+    # 轨迹逐日(forward 标签)与通风逐日(anomaly 组接触比例)。
+    tracers_fwd = tracers_daily.loc[
+        tracers_daily['integration_label']
+        == 'forward_observed_start_to_peak'
+    ][
+        ['event_id', 'date', 'active_fraction',
+         'ensemble_centroid_depth_m']
+    ].copy()
+    tracers_fwd['date'] = pd.to_datetime(tracers_fwd['date'])
+    daily = daily.merge(
+        tracers_fwd.rename(columns={
+            'active_fraction': 'trajectory_active_fraction',
+            'ensemble_centroid_depth_m': 'trajectory_centroid_depth_m',
+        }),
+        on=['event_id', 'date'], how='left',
+    )
+    vent_anomaly = ventilation_daily.loc[
+        ventilation_daily['particle_group'] == 'anomaly'
+    ].copy()
+    vent_anomaly['date'] = pd.to_datetime(vent_anomaly['date'])
+    vent_by_day = (
+        vent_anomaly.groupby(['event_id', 'date'])
+        .agg(
+            vent_particle_count=('particle_id', 'count'),
+            direct_mld_contact_fraction=('direct_mld_contact', 'mean'),
+            near_mld_contact_fraction=('near_mld_contact', 'mean'),
+            outcrop_opportunity_fraction=(
+                'isopycnal_outcrop_opportunity', 'mean'
+            ),
+        )
+        .reset_index()
+    )
+    daily = daily.merge(
+        vent_by_day, on=['event_id', 'date'], how='left'
+    )
+    daily.to_parquet(root / 'daily_event_mechanism.parquet', index=False)
+
+    # 主分析 A:阶段转化表。
+    phase_rows: list[dict] = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        group = group.sort_values('date')
+        early = group.head(3)
+        late = group.tail(3)
+        peak = group.loc[group['is_peak']]
+        early_class = early['daily_class'].mode()
+        peak_class = peak['daily_class'].mode()
+        late_class = late['daily_class'].mode()
+        early_class = (
+            str(early_class.iloc[0]) if len(early_class) else 'missing'
+        )
+        peak_class = (
+            str(peak_class.iloc[0]) if len(peak_class) else 'missing'
+        )
+        late_class = (
+            str(late_class.iloc[0]) if len(late_class) else 'missing'
+        )
+        start_row = group.loc[group['is_start']]
+        peak_row = group.loc[group['is_peak']]
+        base = event_base.loc[event_base['event_id'] == event_id].iloc[0]
+        phase_rows.append({
+            'event_id': str(event_id),
+            'early_class': early_class,
+            'peak_class': peak_class,
+            'late_class': late_class,
+            'transition': f'{early_class}->{late_class}',
+            'n_days': int(len(group)),
+            'delta_r_share_start_to_peak': float(
+                peak_row['r_share'].iloc[0] - start_row['r_share'].iloc[0]
+            ) if len(peak_row) and len(start_row) else np.nan,
+            'delta_normalized_strain_start_to_peak': float(
+                peak_row['normalized_strain'].iloc[0]
+                - start_row['normalized_strain'].iloc[0]
+            ) if len(peak_row) and len(start_row) else np.nan,
+            'delta_bbox_aspect_start_to_peak': float(
+                peak_row['bbox_aspect_ratio'].iloc[0]
+                - start_row['bbox_aspect_ratio'].iloc[0]
+            ) if len(peak_row) and len(start_row) else np.nan,
+            'delta_do_start_to_peak': float(
+                peak_row['delta_do_max'].iloc[0]
+                - start_row['delta_do_max'].iloc[0]
+            ) if len(peak_row) and len(start_row) else np.nan,
+            'persistent_carrier': bool(base['persistent_anticyclonic_rotational_carrier']),
+            'scv_compatible': bool(base['scv_compatible']),
+            'mccoy_any_compatible': bool(
+                base['any_event_profile_mccoy_compatible']
+            ),
+            'resolved_downward': bool(
+                base['resolved_downward_pathway_supported']
+            ),
+        })
+    phase_table = pd.DataFrame(phase_rows)
+    phase_table.to_parquet(
+        root / 'phase_transition_table.parquet', index=False
+    )
+    transition_counts = (
+        phase_table['transition'].value_counts().to_dict()
+    )
+    transition_props = {}
+    for transition, rows in phase_table.groupby('transition'):
+        transition_props[transition] = {
+            'n': int(len(rows)),
+            'persistent_carrier': int(rows['persistent_carrier'].sum()),
+            'scv_compatible': int(rows['scv_compatible'].sum()),
+            'mccoy_any_compatible': int(rows['mccoy_any_compatible'].sum()),
+            'resolved_downward': int(rows['resolved_downward'].sum()),
+        }
+
+    # 主分析 B:retention 对比。
+    retention_rows: list[dict] = []
+    for _, base in event_base.iterrows():
+        group = daily.loc[daily['event_id'] == base['event_id']].sort_values(
+            'date'
+        )
+        peak_do = group.loc[group['is_peak'], 'delta_do_max']
+        decay_slope = np.nan
+        half_time = np.nan
+        censored = True
+        auc = np.nan
+        if (
+            len(peak_do)
+            and pd.notna(peak_do.iloc[0])
+            and float(peak_do.iloc[0]) > 0
+        ):
+            post = group.loc[group['days_from_peak'] > 0]
+            if len(post) >= 2:
+                y = (
+                    post['delta_do_max'].to_numpy(dtype=float)
+                    / float(peak_do.iloc[0])
+                )
+                x = post['days_from_peak'].to_numpy(dtype=float)
+                finite = np.isfinite(y)
+                if np.count_nonzero(finite) >= 2:
+                    slope, _ = np.polyfit(x[finite], y[finite], 1)
+                    decay_slope = float(slope)
+                below_half = post.loc[
+                    post['delta_do_max'] < 0.5 * float(peak_do.iloc[0])
+                ]
+                if len(below_half):
+                    half_time = float(
+                        below_half['days_from_peak'].iloc[0]
+                    )
+                    censored = False
+                all_post = pd.concat([
+                    group.loc[group['is_peak']], post
+                ]).sort_values('days_from_peak')
+                yv = (
+                    all_post['delta_do_max'].to_numpy(dtype=float)
+                    / float(peak_do.iloc[0])
+                )
+                xv = all_post['days_from_peak'].to_numpy(dtype=float)
+                finite_all = np.isfinite(yv)
+                if np.count_nonzero(finite_all) >= 2:
+                    auc = float(np.trapz(
+                        yv[finite_all], xv[finite_all]
+                    ))
+        retention_rows.append({
+            'event_id': str(base['event_id']),
+            'persistent_carrier': bool(
+                base['persistent_anticyclonic_rotational_carrier']
+            ),
+            'peak_rotation': bool(
+                base['population_peak_rotation_dominated']
+            ),
+            'lifetime_days': float(base['span_days']),
+            'post_peak_decay_slope': decay_slope,
+            'post_peak_auc': auc,
+            'time_to_half_days': half_time,
+            'time_to_half_right_censored': bool(censored),
+            'do_fingerprint_day_fraction': float(
+                base['do_fingerprint_day_fraction']
+            ) if pd.notna(base['do_fingerprint_day_fraction']) else np.nan,
+            'peak_delta_do': float(base['delta_do_max']),
+            'core_depth_m': float(base['core_depth_m']),
+            'target_sigma0': float(base['target_sigma0']),
+        })
+    retention = pd.DataFrame(retention_rows)
+    retention.to_parquet(
+        root / 'retention_comparison.parquet', index=False
+    )
+    from scipy.stats import mannwhitneyu
+
+    def _retention_compare(mask_column: str) -> dict:
+        true_group = retention.loc[retention[mask_column] == True]
+        false_group = retention.loc[retention[mask_column] == False]
+        out: dict = {
+            f'{mask_column}_n': [int(len(true_group)), int(len(false_group))],
+        }
+        for response in (
+            'lifetime_days', 'post_peak_decay_slope', 'post_peak_auc',
+            'do_fingerprint_day_fraction',
+        ):
+            a = true_group[response].to_numpy(dtype=float)
+            b = false_group[response].to_numpy(dtype=float)
+            a, b = a[np.isfinite(a)], b[np.isfinite(b)]
+            if a.size < 2 or b.size < 2:
+                out[response] = None
+                continue
+            med_diff, lo, hi = _ofes_transition_bootstrap_median_diff(a, b)
+            out[response] = {
+                'median_true': float(np.median(a)),
+                'median_false': float(np.median(b)),
+                'median_diff': med_diff,
+                'bootstrap_ci': [lo, hi],
+                'mw_p': float(mannwhitneyu(
+                    a, b, alternative='two-sided'
+                ).pvalue),
+            }
+        return out
+
+    retention_comparison = {
+        'primary_persistent_carrier': _retention_compare(
+            'persistent_carrier'
+        ),
+        'secondary_peak_rotation': _retention_compare('peak_rotation'),
+    }
+    # 稳健性回归(不解释为因果)。
+    reg_y = retention['lifetime_days'].to_numpy(dtype=float)
+    reg_mask = np.isfinite(reg_y) & np.isfinite(
+        retention['peak_delta_do'].to_numpy(dtype=float)
+    ) & np.isfinite(
+        retention['core_depth_m'].to_numpy(dtype=float)
+    ) & np.isfinite(
+        retention['target_sigma0'].to_numpy(dtype=float)
+    )
+    start_doy = pd.to_datetime(
+        event_base.set_index('event_id')['start_date']
+    ).dt.dayofyear
+    reg_X = np.column_stack([
+        retention['persistent_carrier'].astype(float),
+        retention['peak_delta_do'],
+        retention['core_depth_m'],
+        retention['target_sigma0'],
+        retention['event_id'].map(start_doy).to_numpy(dtype=float),
+    ])[reg_mask]
+    retention_regression = _ofes_transition_ols(
+        ['persistent_carrier', 'peak_delta_do', 'core_depth_m',
+         'target_sigma0', 'start_day_of_year'],
+        reg_y[reg_mask], reg_X,
+    )
+
+    # 主分析 C:形成-组织 lag(事件级)。
+    lag_rows: list[dict] = []
+
+    def _best_lag(x: np.ndarray, y: np.ndarray, k_max: int) -> float:
+        """corr(x[t], y[t+k]) 的 argmax k,k ∈ [−k_max, k_max];≥7 有效对。"""
+        best_k = np.nan
+        best_r = -2.0
+        for k in range(-int(k_max), int(k_max) + 1):
+            x_shift = x[max(0, -k): x.size - max(0, k)]
+            y_shift = y[max(0, k): y.size - max(0, -k)]
+            valid = np.isfinite(x_shift) & np.isfinite(y_shift)
+            if np.count_nonzero(valid) < 7:
+                continue
+            r = float(np.corrcoef(
+                x_shift[valid], y_shift[valid]
+            )[0, 1])
+            if r > best_r:
+                best_r = r
+                best_k = float(k)
+        return best_k
+
+    for event_id, group in daily.groupby('event_id', sort=False):
+        group = group.sort_values('date')
+        if len(group) < 7:
+            continue
+        strain_series = group['normalized_strain'].to_numpy(dtype=float)
+        rshare_series = group['r_share'].to_numpy(dtype=float)
+        do_series = group['delta_do_max'].to_numpy(dtype=float)
+        do_growth = np.full(do_series.size, np.nan)
+        do_growth[1:] = np.diff(do_series)
+        k_max = int(min(5, (len(group) - 1) // 3))
+        lag_rows.append({
+            'event_id': str(event_id),
+            'n_days': int(len(group)),
+            'k_max': k_max,
+            'lag_strain_to_rshare_days': _best_lag(
+                strain_series, rshare_series, k_max
+            ),
+            'lag_strain_to_do_growth_days': _best_lag(
+                strain_series, do_growth, k_max
+            ),
+        })
+    lag_diag = pd.DataFrame(lag_rows)
+    lag_diag.to_parquet(
+        root / 'event_lag_diagnostics.parquet', index=False
+    )
+    from scipy.stats import binomtest
+
+    def _lag_summary(column: str) -> dict:
+        values = lag_diag[column].dropna().to_numpy(dtype=float)
+        if values.size == 0:
+            return {'n': 0}
+        positive = np.count_nonzero(values > 0)
+        negative = np.count_nonzero(values < 0)
+        zero = np.count_nonzero(values == 0)
+        return {
+            'n': int(values.size),
+            'median_lag_days': float(np.median(values)),
+            'positive_count': int(positive),
+            'negative_count': int(negative),
+            'zero_count': int(zero),
+            'sign_test_p_two_sided': float(binomtest(
+                max(positive, negative), positive + negative, 0.5
+            ).pvalue),
+        }
+
+    summary = {
+        'event_count': int(len(strict_ids)),
+        'daily_row_count': int(len(daily)),
+        'transition_counts': transition_counts,
+        'transition_props': transition_props,
+        'always_strain_n': int((
+            (phase_table['early_class'] == 'strain')
+            & (phase_table['late_class'] == 'strain')
+        ).sum()),
+        'always_rotation_n': int((
+            (phase_table['early_class'] == 'rotation')
+            & (phase_table['late_class'] == 'rotation')
+        ).sum()),
+        'strain_to_rotation_n': int((
+            (phase_table['early_class'] == 'strain')
+            & (phase_table['late_class'] == 'rotation')
+        ).sum()),
+        'rotation_to_strain_n': int((
+            (phase_table['early_class'] == 'rotation')
+            & (phase_table['late_class'] == 'strain')
+        ).sum()),
+        'continuous_changes_start_to_peak': {
+            'delta_r_share_median': float(np.nanmedian(
+                phase_table['delta_r_share_start_to_peak']
+            )),
+            'delta_r_share_positive_fraction': float(np.nanmean(
+                phase_table['delta_r_share_start_to_peak'] > 0
+            )),
+            'delta_normalized_strain_median': float(np.nanmedian(
+                phase_table['delta_normalized_strain_start_to_peak']
+            )),
+            'delta_bbox_aspect_median': float(np.nanmedian(
+                phase_table['delta_bbox_aspect_start_to_peak']
+            )),
+            'delta_do_median': float(np.nanmedian(
+                phase_table['delta_do_start_to_peak']
+            )),
+        },
+        'retention_comparison': retention_comparison,
+        'retention_regression': retention_regression,
+        'lag_summary': {
+            'strain_to_rshare': _lag_summary('lag_strain_to_rshare_days'),
+            'strain_to_do_growth': _lag_summary(
+                'lag_strain_to_do_growth_days'
+            ),
+        },
+        'notes': [
+            'H1/H2/H3 解释规则见 lock;全部为报告项,不设通过门槛。',
+            'time_to_half 右删失与后峰斜率只对后峰 ≥2 观测日事件计算。',
+            'time_to_half_days 53/56 右删失,不参与分组比较;'
+            '仅 3 个事件在检测期内降到 peak 50% 以下。',
+            'submesoscale 措辞须有尺度依据(见 lock)。',
+        ],
+    }
+    (root / 'mechanism_transition_summary.json').write_text(
+        json.dumps(summary, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    manifest['status'] = 'complete'
+    manifest['updated_at_utc'] = pd.Timestamp.utcnow().isoformat()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2), encoding='utf-8'
+    )
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'daily_event_mechanism': daily,
+        'phase_transition_table': phase_table,
+        'retention_comparison': retention,
+        'event_lag_diagnostics': lag_diag,
+        'summary': summary,
+    }
+
+
 def _ofes_event_context_requests(
     selected_events: pd.DataFrame,
     daily_diagnostics: pd.DataFrame,
