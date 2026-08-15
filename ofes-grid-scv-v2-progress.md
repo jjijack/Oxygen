@@ -24,7 +24,7 @@ weak/strong `native_anticyclonic_support`(Nencioli 四规则 + N2 边界 circula
 - `63ed5ab` **Complete the grid SCV v2 window halo and frozen gates**(第二轮
   复审:halo 490 km 窗口/逐 voxel 体积/Nencioli 完整门/节点 4 证据链硬门/
   年度 runner 5 处/Tier-3 嵌套与 split 规则;19 解析 + 10 回归 PASS)
-- `5a60678` **Correct the grid SCV v2 centroid usage and annual tile
+- `40abfe0` **Correct the grid SCV v2 centroid usage and annual tile
   coverage**(第三轮局部修正:体积质心中心/物理厚度 well_resolved/年度
   tile 首尾贴边全覆盖/spice voxel 计数落盘;19 解析 + 12 回归 PASS)
 - `0ecd0e4` **Share the grid SCV v2 profile cache with fork workers**(第四轮
@@ -197,3 +197,81 @@ v1 拒绝输出已写 SUPERSEDED 标记:
   - 日志 /tmp/node4_wB/wC/wD.log;worker 单日失败继续跑,留给 A 兜底
 - 预计日片 18:30-19:00 全落盘,随后 A 收尾 seed_control_audit →
   matched_background_control → tier_transition_summary → gate
+
+## 节点 4 第二次运行(2026-08-15 17:13,修复 1a71768)
+
+- 第一次运行 16:54 在 seed_control_audit 入口炸 `duplicate sample_ids`:
+  **代码 bug,非数据问题**——sample_id 是事件级标签(141 阳性剖面仅
+  17 个 id、4480 背景仅 80 个),3d1040a 加的逐行唯一检查语义错误,且
+  该路径此前从未被执行过(前三轮崩溃都在更早的 audit 池阶段)
+- 修复 `1a71768`:seed/background 入口改查 (event_id, sample_lon,
+  sample_lat) 复合键(真实数据 141/141、4480/4480 唯一);transition
+  删冗余 id 检查(其输入永远来自上述两入口,行数检查兜底)
+- 修复后:py_compile OK、12 回归全过、单日 smoke 全链路无雷
+  (seed 141 行/background 4480 行正常落盘,其他 55 天 missing 如预期)
+- code hash 变 → 55 个旧日片作废已清;smoke 的 E000002(新 hash)复用
+- 第二次运行 17:13:51 起(A 16w 正序 + B/C/D 8w 倒序,同前布局)
+- 教训:shutil.move 到已存在目录会把源目录嵌套进目标(第一次复用
+  E000002 时踩到,已纠正为逐文件提升)
+
+## 节点 4 门控裁决与三口径拆分(2026-08-16)
+
+### 第二次 gate 失败 → 双根因(环带中心 + 插值方式)
+
+- 第二次运行 19:14 gate 失败:exact 62.4%(88/141)、nearest_cell 63.1%
+  (89/141)、insufficient 88、事件级 9/18/6/10(vs 冻结 9/19/6/11)。
+  排除法(15 个 `_ofes_mccoy_*` 函数逐字一致、数据逐字节一致)→ 决定性
+  实验锁定双根因:①环带中心——虚拟管线用**事件核心**(peak_lon/lat),
+  v2 审计错用样本自身位置;②控制剖面——虚拟管线在采样点**双线性插值**,
+  v2 错用最近格点。修复后事件核心环带口径逐位复现冻结分类
+  (pycnocline 25.760484172932138 = stored)。
+- 修复后预演(gatecheck,21:06):exact 141/141、事件级 9/19/6/11 exact、
+  背景假阳性 0、insufficient 0;唯一剩项 nearest_cell(事件环带 + 单元
+  剖面)134/141。
+
+### nearest_cell 7 个翻转的诊断(23:02 flipcheck)
+
+- 7 个翻转全部是**格内位置与插值敏感性**:样本离单元中心 0.75–1.56 km;
+  单元剖面与"双线性@单元中心"逐位相同(剖面构建正确);样本处通过、
+  中心处失败。失败 stage:gaussian ×4(lens_extent ×2、
+  missing_lens_limits、no_matching_spice_n2_peak)、dynamic_height ×1、
+  profile_offset_qc ×2。双线性只是四节点插值,不是模式解析出的亚格子
+  物理,故不构成实现缺陷。
+- 支撑列/3×3 独立复核(00:08 cornercheck,生产口径):5/7 在 4 个双线性
+  支撑列中至少一列通过,2/7 四列都不通过;7/7 在最近单元 3×3 邻域内
+  至少一列通过。描述性审计,不注册成成功门。
+
+### 门控裁决(gate adjudication)
+
+- 外部 AI 复核指出:lock 把"旧虚拟管线重放"和"生产网格转移"混装在
+  同一 141/141 要求中。lock Tier-0 定义(same-position ring)与生产代码
+  `_ofes_grid_v2_ring_controls` 均证实生产口径 = 网格列自身局地环带 +
+  最近格点控制;失败 manifest 的生产口径数字(89/141、9/18/6/10、
+  FP 0.29%、insufficient 88)属实(已逐项核实)。
+- 用户裁决(2026-08-16):不把 134/141 改成新门槛、不伪装通过;拆三证据
+  线,`ofes-grid-scv-v2-gate-adjudication.md` 冻结于重跑前;最终数字只
+  进结果报告/progress,不回填裁决文档。
+- **硬门**:19 解析、12 回归、141/4480 分母完整无缺失行、预筛 141/141、
+  旧管线重放 141/141、事件级 9/19/6/11 重放一致、输入与代码 hash 完整。
+- **报告项**(不参与 gate_passed):event_reference_nearest_cell(134/141
+  预期)、production_self_ring(89/141 预期)、背景 FP 率(0.29% 预期)、
+  背景 insufficient(88 预期,生产口径 background_iqr 失败是正常记录)、
+  四支撑列/3×3、Tier-1/2 升级率、生产口径事件级(9/17/6/10 预期;失败 manifest 的 9/18/6/10 出自其 exact-position 混合线)。
+- 运行纪律:旧 validation 目录整体归档为
+  `failed_run_20260815_production_caliber/`(不删除);全新 validation
+  目录从零重跑;长跑期间不改 track.py;日片生产路径变更必须重跑,
+  统计/绘图/报告不触发重跑。
+
+### 三口径代码实施(未提交)
+
+- `_ofes_grid_v2_event_ring_reference`:stored-pipeline replay 口径
+  (事件核心环带 + 双线性控制剖面),exact 检查专用。
+- seed audit 输出三线:exact_position(硬门)+ nearest_cell 双口径
+  (事件环带 + 单元剖面 / 单元自身局地环带 + 单元剖面,均报告,附各自
+  failure stage)。
+- background 恢复 lock 字面 per-position ring 生产口径,FP 率与不足数
+  报告。
+- manifest schema v3:gate 分 `hard_gates`/`reported_items`,
+  `gate_passed = all(hard_gates)`;新增 `gate_adjudication_sha256`。
+- 节点 5/6 代码无需改动(event_catalog 的 manifest 前置条件与
+  `gate_passed` 顶层键兼容)。

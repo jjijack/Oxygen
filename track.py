@@ -41434,6 +41434,49 @@ def run_ofes_grid_scv_v2_audit_sample(
     }
 
 
+def _ofes_grid_v2_event_ring_reference(
+    snapshot: dict,
+    core_lon: float,
+    core_lat: float,
+    event_radius_km: float,
+    settings: dict,
+) -> tuple[list[dict], dict]:
+    """构建 stored-pipeline replay 口径的事件核心环带 reference。
+
+    与 55e24d4 虚拟管线逐字一致:控制点 = `_ofes_mccoy_sampling_points`
+    (事件核心) 的 background_control 点,剖面在采样点双线性插值(不是
+    最近格点),reference 以事件核心为参考位置。17 条事件剖面与 80 个
+    背景控制共享同一套环带;seed audit 用它逐位复现冻结分类(硬门
+    stored_pipeline_replay)。生产口径是各列自身的局地环带
+    (`_ofes_grid_v2_tier0_column`),两者见 gate adjudication。
+    """
+    points = _ofes_mccoy_sampling_points(
+        core_lon, core_lat, event_radius_km, settings
+    )
+    controls = []
+    for point in points.itertuples(index=False):
+        if point.sample_role != 'background_control':
+            continue
+        table = extract_ofes_profile_interp(
+            snapshot,
+            float(point.sample_lon),
+            float(point.sample_lat),
+            variables=['temp', 'salinity'],
+        )
+        controls.append(
+            _ofes_mccoy_profile_properties(
+                table['Depth'].to_numpy(dtype=float),
+                table['temp'].to_numpy(dtype=float),
+                table['salinity'].to_numpy(dtype=float),
+                float(point.sample_lon),
+                float(point.sample_lat),
+                settings,
+            )
+        )
+    reference = _ofes_mccoy_reference(controls, core_lon, core_lat)
+    return controls, reference
+
+
 def _ofes_grid_v2_seed_control_audit(
     profile_diagnostics: pd.DataFrame,
     day_results: dict[str, dict],
@@ -41442,8 +41485,13 @@ def _ofes_grid_v2_seed_control_audit(
 ) -> pd.DataFrame:
     """对 141 个已知 McCoy 阳性逐点审计门链与 Tier-1 扩展。
 
-    分母是 lock 冻结的已知全集：阳性数不等于 141 或 sample_id 重复时直接
-    拒绝运行，绝不缩小分母后虚报 recall。
+    分母是 lock 冻结的已知全集：阳性数不等于 141 或 (event, 位置) 重复时
+    直接拒绝运行，绝不缩小分母后虚报 recall。输出三证据线
+    （见 gate adjudication）：exact_position 用虚拟管线口径（同事件所有
+    剖面共享事件核心环带 reference、双线性控制剖面，逐位复现冻结分类，
+    硬门）；nearest_cell 双口径（事件环带 + 单元剖面 = 格内位置/插值
+    敏感性；单元自身局地环带 + 单元剖面 = 生产检测器实际行为），两者
+    均为报告项。
     """
     v1_settings = _ofes_grid_scv_settings()
     positives = profile_diagnostics.loc[
@@ -41467,6 +41515,7 @@ def _ofes_grid_v2_seed_control_audit(
             'Frozen positive controls contain duplicate (event, position) rows.'
         )
     records = []
+    event_rings: dict[str, tuple[list[dict], dict]] = {}
     for row in positives.itertuples(index=False):
         event_id = str(row.event_id)
         day = day_results.get(event_id)
@@ -41477,6 +41526,20 @@ def _ofes_grid_v2_seed_control_audit(
                 'day_result_missing': True,
             })
             continue
+        # 冻结分类的环带口径:同事件所有剖面共享事件核心环带 reference
+        # (虚拟管线 exactly-as),不是逐样本自环带。
+        if event_id not in event_rings:
+            event_rings[event_id] = _ofes_grid_v2_event_ring_reference(
+                day['snapshot'],
+                float(row.event_peak_lon),
+                float(row.event_peak_lat),
+                float(row.event_equivalent_radius_km),
+                mccoy_settings,
+            )
+        ring_controls, ring_reference = event_rings[event_id]
+        ring_valid_count = int(
+            sum(1 for c in ring_controls if c['profile_qc_passed'])
+        )
         fields = day['fields']
         lon = np.asarray(fields['lon'], dtype=float)
         lat = np.asarray(fields['lat'], dtype=float)
@@ -41501,18 +41564,64 @@ def _ofes_grid_v2_seed_control_audit(
                 & scan['lon_index'].astype(int).eq(lon_index)
             ]
             pool_row = matches.iloc[0].to_dict() if len(matches) else {}
-        cell_compatible = bool(pool_row.get('mccoy_profile_compatible', False))
+        # 最近单元判定记两个口径(gate adjudication 三证据线):
+        # - event_reference_nearest_cell:同事件核心环带 + 单元剖面,
+        #   度量格内位置/插值敏感性(报告);
+        # - production_self_ring:单元自身局地环带 + 单元剖面,
+        #   即生产检测器的实际行为(报告)。
+        cell_profile = day['profile_cache'].get(
+            (int(lat_index), int(lon_index))
+        )
+        if cell_profile is not None:
+            cell_classification = _ofes_mccoy_profile_classification(
+                cell_profile, ring_reference, ring_controls, mccoy_settings
+            )
+            cell_compatible = bool(
+                cell_classification['mccoy_profile_compatible']
+            )
+            cell_failure_stage = str(
+                cell_classification['mccoy_failure_stage']
+            )
+            production_classification = _ofes_grid_v2_tier0_column(
+                cell_profile,
+                day['snapshot'],
+                day['profile_cache'],
+                float(lon[lon_index]),
+                float(lat[lat_index]),
+                mccoy_settings,
+            )
+            production_compatible = bool(
+                production_classification['mccoy_profile_compatible']
+            )
+            production_failure_stage = str(
+                production_classification['mccoy_failure_stage']
+            )
+            production_valid_count = int(
+                production_classification['valid_control_profile_count']
+            )
+        else:
+            cell_compatible = False
+            cell_failure_stage = 'missing_cell_profile'
+            production_compatible = False
+            production_failure_stage = 'missing_cell_profile'
+            production_valid_count = 0
         position_profile = _ofes_grid_v2_position_profile(
             day['snapshot'], sample_lon, sample_lat, mccoy_settings
         )
-        position_result = _ofes_grid_v2_tier0_column(
-            position_profile,
-            day['snapshot'],
-            day['profile_cache'],
-            sample_lon,
-            sample_lat,
-            mccoy_settings,
+        position_classification = _ofes_mccoy_profile_classification(
+            position_profile, ring_reference, ring_controls, mccoy_settings
         )
+        position_result = {
+            'mccoy_profile_compatible': bool(
+                position_classification['mccoy_profile_compatible']
+            ),
+            'mccoy_failure_stage': str(
+                position_classification['mccoy_failure_stage']
+            ),
+            'prefilter_retained': bool(
+                position_classification['initial_candidate_passed']
+            ),
+        }
         tier1_contained = False
         tier1_reason = 'not_checked'
         containing: set[str] = set()
@@ -41562,9 +41671,11 @@ def _ofes_grid_v2_seed_control_audit(
             'prefilter_retained': bool(pool_row.get('prefilter_retained', False)),
             'prefilter_failure_stage': str(pool_row.get('prefilter_failure_stage', '')),
             'nearest_cell_tier0_compatible': cell_compatible,
-            'nearest_cell_valid_control_count': int(
-                pool_row.get('valid_control_profile_count', 0)
-            ),
+            'nearest_cell_failure_stage': cell_failure_stage,
+            'nearest_cell_valid_control_count': ring_valid_count,
+            'nearest_cell_production_compatible': production_compatible,
+            'nearest_cell_production_failure_stage': production_failure_stage,
+            'nearest_cell_production_valid_control_count': production_valid_count,
             'exact_position_tier0_compatible': bool(
                 position_result['mccoy_profile_compatible']
             ),
@@ -41588,10 +41699,13 @@ def _ofes_grid_v2_matched_background_control(
     mccoy_settings: dict,
     v2_settings: dict,
 ) -> pd.DataFrame:
-    """在冻结的 80/事件背景控制位置上运行网格 Tier-0 并测假阳性率。
+    """在冻结的 80/事件背景控制位置上运行门链并测假阳性率。
 
-    分母是 lock 冻结的 4480 全集：控制数不等于 4480、sample_id 重复、
-    或事件日片缺失时都显式记录/拒绝，绝不静默跳过行来缩小分母。
+    分母是 lock 冻结的 4480 全集：控制数不等于 4480、(event, 位置) 重复、
+    或事件日片缺失时都显式记录/拒绝，绝不静默跳过行来缩小分母。门链按
+    lock 字面的 per-position ring 口径运行（每个控制位置围绕自身建局地
+    环带，与生产检测器一致，见 gate adjudication）；假阳性率与环带不足
+    61 条的位置数只报告，不设通过阈值。
     """
     controls = profile_diagnostics.loc[
         profile_diagnostics['sample_role'].eq('background_control')
@@ -41664,7 +41778,9 @@ def _ofes_grid_v2_tier_transition_summary(
 
     分母是 lock 冻结的已知全集（141 阳性、4480 背景控制），绝不用"未缺失
     行数"充当分母；样本缺失、重复或行数不等于冻结值时报 `gate_failed`
-    并把所有缺口显式列出，validation 门控据此失败。
+    并把所有缺口显式列出，validation 门控据此失败。事件级与 nearest_cell
+    同时记重放口径（硬门）与生产口径（报告）两组计数，见 gate
+    adjudication。
     """
     expected_positive = int(v2_settings['known_mccoy_positive_profile_count'])
     expected_control = int(v2_settings['known_background_control_profile_count'])
@@ -41702,6 +41818,9 @@ def _ofes_grid_v2_tier_transition_summary(
     prefilter_retained = int(valid['prefilter_retained'].sum())
     exact_tier0 = int(valid['exact_position_tier0_compatible'].sum())
     cell_tier0 = int(valid['nearest_cell_tier0_compatible'].sum())
+    production_tier0 = int(
+        valid['nearest_cell_production_compatible'].sum()
+    )
     tier1 = int(valid['tier1_contained'].sum())
     known_count = expected_positive
     event_level = {}
@@ -41740,6 +41859,20 @@ def _ofes_grid_v2_tier_transition_summary(
             event_summary['any_event_profile_velocity_confirmed'].astype(bool),
             'event_id',
         ]
+        # 生产口径(单元自身局地环带)的事件级计数:报告项,不设要求。
+        center_production_reproduced = centers.loc[
+            center_stored
+            & centers['nearest_cell_production_compatible'].astype(bool)
+        ]
+        any_production = joined.groupby('event_id')[
+            'nearest_cell_production_compatible'
+        ].any()
+        center_velocity_production = centers.loc[
+            centers['event_id'].astype(str).isin(
+                set(center_velocity_stored.astype(str))
+            )
+            & centers['nearest_cell_production_compatible'].astype(bool)
+        ]
         event_level = {
             'stored_center_compatible_events': int(
                 event_summary['center_profile_mccoy_compatible'].sum()
@@ -41765,6 +41898,24 @@ def _ofes_grid_v2_tier_transition_summary(
             'grid_tier0_reproduced_any_velocity_events': int(
                 len(
                     set(any_events[any_events].index)
+                    & set(any_velocity_stored.astype(str))
+                )
+            ),
+            'grid_production_reproduced_center_events': int(
+                center_production_reproduced['event_id'].nunique()
+            ),
+            'grid_production_reproduced_any_events': int(
+                len(
+                    set(any_production[any_production].index)
+                    & set(stored_any.astype(str))
+                )
+            ),
+            'grid_production_reproduced_center_velocity_events': int(
+                center_velocity_production['event_id'].nunique()
+            ),
+            'grid_production_reproduced_any_velocity_events': int(
+                len(
+                    set(any_production[any_production].index)
                     & set(any_velocity_stored.astype(str))
                 )
             ),
@@ -41797,12 +41948,16 @@ def _ofes_grid_v2_tier_transition_summary(
         'prefilter_retained_count': prefilter_retained,
         'exact_position_tier0_count': exact_tier0,
         'nearest_cell_tier0_count': cell_tier0,
+        'nearest_cell_production_tier0_count': production_tier0,
         'tier1_extended_count': tier1,
         'tier1_weak_support_count': weak_count,
         'tier1_strong_support_count': strong_count,
         'prefilter_recall': float(prefilter_retained / known_count) if known_count else np.nan,
         'exact_tier0_reproduction': float(exact_tier0 / known_count) if known_count else np.nan,
         'nearest_cell_tier0_reproduction': float(cell_tier0 / known_count) if known_count else np.nan,
+        'nearest_cell_production_reproduction': (
+            float(production_tier0 / known_count) if known_count else np.nan
+        ),
         'tier1_extension_fraction': float(tier1 / known_count) if known_count else np.nan,
         'tier1_weak_support_fraction': float(weak_count / known_count) if known_count else np.nan,
         'tier1_strong_support_fraction': float(strong_count / known_count) if known_count else np.nan,
@@ -41845,10 +42000,13 @@ def run_ofes_grid_scv_v2_validation(
     顺序：19 项解析验证 + 12 项实现回归 -> 4 审计日预筛 recall -> 56 事件
     日扫描（resume 只复用三哈希/窗口边界一致的 complete 日片） ->
     seed_control_audit / matched_background_control / tier_transition_summary。
-    门控要求：解析验证与回归全过、预筛 recall 141/141、Tier-0 精确位置
-    复现 141/141、审计样本 recall=100%、141/4480 控制分母完整无缺失行且
-    4480 个背景位置逐位 >= 61 个有效 per-position controls、9/56、19/56、
-    6/56、11/56 冻结计数逐项 exact 复现；任一失败即停止。
+    门控（硬门）要求：解析验证与回归全过、预筛 recall 141/141、旧管线
+    重放 exact Tier-0 141/141、审计样本 recall=100%、141/4480 控制分母
+    完整无缺失行、事件级 9/56、19/56、6/56、11/56 冻结计数重放口径逐项
+    exact 复现、输入与代码 hash 完整记录。生产口径与格内敏感性数字
+    （nearest_cell 双口径、背景假阳性率、背景不足数、Tier-1/2 升级率）
+    为报告项，不参与 gate_passed（见 gate adjudication）；任一硬门失败
+    即停止。
 
     参数:
         - event_population_path (str | Path): 56-event population parquet 或目录。
@@ -41936,10 +42094,19 @@ def run_ofes_grid_scv_v2_validation(
     )
     _ofes_atomic_write_json(transition, root / 'tier_transition_summary.json')
     transition_ok = transition.get('status') == 'complete'
-    gate = {
+    # gate adjudication:硬门只含解析/回归、分母完整、预筛、旧管线重放、
+    # 事件级重放一致与输入/代码 hash 完整;生产口径与格内敏感性数字
+    # 全部是报告项,不参与 gate_passed(见
+    # ofes-grid-scv-v2-gate-adjudication.md)。
+    pop_sha = _file_sha256(population_path)
+    profile_sha = _file_sha256(profile_path)
+    summary_sha = _file_sha256(Path(event_summary_path))
+    adjudication_sha = _file_sha256(
+        Path(__file__).resolve().parent / 'ofes-grid-scv-v2-gate-adjudication.md'
+    )
+    hard_gates = {
         'analytic_validation_passed': bool(analytic['passed']),
         'regression_validation_passed': bool(regression['passed']),
-        'audit_sample_recall': float(audit['summary']['prefilter_recall']),
         'control_denominators_intact': bool(transition_ok),
         'known_positive_count_exact': bool(
             transition_ok
@@ -41951,14 +42118,11 @@ def run_ofes_grid_scv_v2_validation(
             and transition['background_control_total']
             == transition['expected_background_control_total']
         ),
-        'seed_audit_missing_rows': int(
-            transition.get('seed_audit_missing_rows', -1)
+        'seed_audit_missing_rows_zero': bool(
+            transition.get('seed_audit_missing_rows', -1) == 0
         ),
-        'background_control_missing_rows': int(
-            transition.get('background_control_missing_rows', -1)
-        ),
-        'background_control_insufficient_controls_count': int(
-            transition.get('background_control_insufficient_controls_count', -1)
+        'background_control_missing_rows_zero': bool(
+            transition.get('background_control_missing_rows', -1) == 0
         ),
         'frozen_event_reproduction_exact': bool(
             transition_ok
@@ -41977,40 +42141,72 @@ def run_ofes_grid_scv_v2_validation(
                 )
             )
         ),
-        'seed_prefilter_recall': (
-            float(transition['prefilter_recall'])
-            if transition_ok else np.nan
+        'audit_sample_recall_exact': bool(
+            np.isclose(
+                float(audit['summary']['prefilter_recall']),
+                1.0, rtol=0.0, atol=1e-9,
+            )
         ),
-        'seed_exact_tier0_reproduction': (
-            float(transition['exact_tier0_reproduction'])
-            if transition_ok else np.nan
+        'seed_prefilter_recall_exact': bool(
+            transition_ok
+            and np.isclose(
+                float(transition['prefilter_recall']),
+                1.0, rtol=0.0, atol=1e-9,
+            )
         ),
-        'seed_nearest_cell_tier0_reproduction': (
+        'stored_pipeline_replay_exact': bool(
+            transition_ok
+            and np.isclose(
+                float(transition['exact_tier0_reproduction']),
+                1.0, rtol=0.0, atol=1e-9,
+            )
+        ),
+        'input_and_code_hashes_recorded': bool(
+            pop_sha and profile_sha and summary_sha and adjudication_sha
+            and _ofes_grid_scv_v2_code_sha256()
+        ),
+    }
+    reported_items = {
+        'event_reference_nearest_cell_reproduction': (
             float(transition['nearest_cell_tier0_reproduction'])
             if transition_ok else np.nan
         ),
-        'background_false_positive_rate': (
+        'production_self_ring_reproduction': (
+            float(transition['nearest_cell_production_reproduction'])
+            if transition_ok else np.nan
+        ),
+        'production_event_level': (
+            {
+                key: value
+                for key, value in transition['event_level'].items()
+                if key.startswith('grid_production_')
+            }
+            if transition_ok else {}
+        ),
+        'background_control_false_positive_rate': (
             float(transition['background_control_false_positive_rate'])
             if transition_ok else np.nan
         ),
+        'background_control_insufficient_controls_count': int(
+            transition.get('background_control_insufficient_controls_count', -1)
+        ),
+        'tier1_extension_fraction': (
+            float(transition['tier1_extension_fraction'])
+            if transition_ok else np.nan
+        ),
+        'tier1_weak_support_fraction': (
+            float(transition['tier1_weak_support_fraction'])
+            if transition_ok else np.nan
+        ),
+        'tier1_strong_support_fraction': (
+            float(transition['tier1_strong_support_fraction'])
+            if transition_ok else np.nan
+        ),
     }
-    passed = bool(
-        gate['analytic_validation_passed']
-        and gate['regression_validation_passed']
-        and gate['control_denominators_intact']
-        and gate['known_positive_count_exact']
-        and gate['background_control_count_exact']
-        and gate['seed_audit_missing_rows'] == 0
-        and gate['background_control_missing_rows'] == 0
-        and gate['background_control_insufficient_controls_count'] == 0
-        and gate['frozen_event_reproduction_exact']
-        and np.isclose(gate['audit_sample_recall'], 1.0, rtol=0.0, atol=1e-9)
-        and np.isclose(gate['seed_prefilter_recall'], 1.0, rtol=0.0, atol=1e-9)
-        and np.isclose(gate['seed_exact_tier0_reproduction'], 1.0, rtol=0.0, atol=1e-9)
-        and np.isclose(gate['seed_nearest_cell_tier0_reproduction'], 1.0, rtol=0.0, atol=1e-9)
-    )
+    gate = {'hard_gates': hard_gates, 'reported_items': reported_items}
+    passed = bool(all(hard_gates.values()))
     manifest = {
-        'schema_version': 2,
+        'schema_version': 3,
         'validation_type': 'prospective_repair_v2',
         'status': 'complete' if passed else 'failed',
         'gate_passed': passed,
@@ -42020,11 +42216,11 @@ def run_ofes_grid_scv_v2_validation(
         'regression_validation_passed': bool(regression['passed']),
         'input_paths': {
             'event_population': str(Path(population_path).resolve()),
-            'event_population_sha256': _file_sha256(population_path),
+            'event_population_sha256': pop_sha,
             'mccoy_profile_diagnostics': str(profile_path.resolve()),
-            'mccoy_profile_diagnostics_sha256': _file_sha256(profile_path),
+            'mccoy_profile_diagnostics_sha256': profile_sha,
             'event_summary': str(Path(event_summary_path).resolve()),
-            'event_summary_sha256': _file_sha256(Path(event_summary_path)),
+            'event_summary_sha256': summary_sha,
         },
         'mccoy_source_archive_sha256': str(
             mccoy_settings.get('source_archive_sha256', '')
@@ -42033,6 +42229,7 @@ def run_ofes_grid_scv_v2_validation(
         'protocol_sha256': _file_sha256(
             Path(__file__).resolve().parent / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'
         ),
+        'gate_adjudication_sha256': adjudication_sha,
         'processing_config_sha256': _file_sha256(
             Path(__file__).resolve().parent / 'config' / 'processing.yml'
         ),
