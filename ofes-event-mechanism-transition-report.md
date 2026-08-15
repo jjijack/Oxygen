@@ -81,17 +81,33 @@ rotation),但无"后装载水团"的时序证据。→ **多机制异质性,不�
 
 ## 五、对论文主线的收束
 
-- 全球观测:成熟次表层相干反气旋(SCV)是深层高氧异常最强、最稳健的单一
-  富集结构(P(DO50|SCV)=6.97% vs 背景 0.369%,OR=20.22)。
-- OFES:异常水团由通风水团经锋面/应变与可分辨垂向输送进入温跃层,承载
-  形态在锋面 filament 与反气旋旋转载体之间大致各半并存;SCV-like 端元
-  是旋转组内少数子集;无 population-level 形成顺序。
-- 网格 detector 负结果:解释"为什么不能把所有异常直接等同于成熟 SCV"
-  (形成阶段、形变过程与模式分辨率共同限制)。
-- 代表案例:E000002 = rotation but non-material counterexample;
-  E000239 = strain-dominated resolved downward;E000176 = frontogenetic/
-  upward contrast。"strain→rotation 且 retention 增强"的示意图候选可
-  从 strain→rotation(8)∩ carrier(2)中选,只作示意图不作证明。
+**SCV 主线的 OFES 侧富集证据(已存在于完成运行,本文档升为主叙事数字):**
+
+- 全球观测:P(DO50 | SCV)= 6.97% vs 普通 Argo 0.369%,OR = 20.22。
+- OFES 同构:事件核心 McCoy 型虚拟剖面通过率 vs 同日背景 controls =
+  14.9% vs 0.45%(背景 20/4480,与全球 0.369% 同量级),pooled OR =
+  **38.77**(Fisher p = 1.55e-87),事件等权通过率差 0.144,bootstrap95
+  [0.076, 0.221],paired Wilcoxon **p = 9.84e-5**。全球富集在模式里被
+  同方向、更强地复现。
+- 载体证据:27/56 persistent anticyclonic carrier;6/56 严格
+  SCV-compatible(**6/6 都是 carrier**,1/6 surface-obscured);11/56
+  原生速度确认(反气旋且 rotation>strain);表层弱/反极性在 carrier 内
+  4/27 persistent——**表层涡目录(META)盲区的直接解释**。
+- 输送证据:15 条 resolved-downward 中 9 条由旋转载体承担,且其核心
+  运动学 w_along 显著为正(G1)。
+- 全链条 exemplar(SCV-compatible ∩ persistent carrier ∩ resolved
+  downward):E000276、E000073、E000267;E000276 为 blind top-5 第 3。
+
+**限制的重新定位**:grid-SCV Tier-1 闭合 0 不否定 SCV 重要性,而是
+"1/30° 网格分辨不了闭合透镜动力学"——观测层富集最强与模式层闭合最难是
+同一枚硬币(SCV 是形成连续体的稳定端元;McCoy 定义本身含锋面潜沉、
+重层化隔离与亚中尺度卷起)。本审计的"无两阶段时序"只否定"总体逐日
+时序规律",降为"形成路径异质"的次级陈述,不动摇富集主线。
+
+**代表案例**:E000002 = rotation but non-material counterexample;
+E000239 = strain-dominated resolved downward;E000176 = frontogenetic/
+upward contrast;全链条三例作示意图候选(E000276 优先,blind 案例天然
+成立)。
 
 ## 六、待执行
 
