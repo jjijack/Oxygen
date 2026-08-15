@@ -63863,6 +63863,367 @@ def run_ofes_event_isopycnal_velocity_audit(
     }
 
 
+def _ofes_winter_mld_task(task: dict) -> dict:
+    """单 (event, winter day) 任务:核心最近单元的 T/S 剖面 → 单日 MLD。"""
+    try:
+        snapshot = load_ofes_snapshot(
+            str(task['date']),
+            variables=['temp', 'salinity'],
+            lon_bounds=tuple(task['lon_bounds']),
+            lat_bounds=tuple(task['lat_bounds']),
+        )
+        lon = np.asarray(snapshot['lon'], dtype=float)
+        lat = np.asarray(snapshot['lat'], dtype=float)
+        depth = np.asarray(snapshot['depth'], dtype=float)
+        sigma0 = _ofes_sigma0_volume(snapshot)
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        distance_m = great_circle_distance_m(
+            lon_grid, lat_grid,
+            float(task['core_lon']), float(task['core_lat']),
+        )
+        flat = int(np.nanargmin(distance_m))
+        j, i = np.unravel_index(flat, distance_m.shape)
+        profile_sigma = np.asarray(sigma0[:, j, i], dtype=float)
+        finite = np.isfinite(depth) & np.isfinite(profile_sigma)
+        mld_m = float('nan')
+        capped = True
+        if np.count_nonzero(finite) >= 3:
+            d = depth[finite]
+            sigma = profile_sigma[finite]
+            reference_index = int(
+                np.argmin(
+                    np.abs(d - float(task['mld_reference_depth_m']))
+                )
+            )
+            threshold_reached = bool(
+                np.any(
+                    (d > d[reference_index])
+                    & (
+                        sigma - sigma[reference_index]
+                        >= float(task['mld_density_threshold_kg_m3'])
+                    )
+                )
+            )
+            mld_m = _mld_from_sigma(
+                d, sigma,
+                float(task['mld_density_threshold_kg_m3']),
+                float(task['mld_reference_depth_m']),
+            )
+            capped = not threshold_reached
+        return {
+            'event_id': task['event_id'],
+            'date': str(task['date']),
+            'mld_m': float(mld_m),
+            'capped': bool(capped),
+            'cell_distance_km': float(distance_m[j, i] / 1000.0),
+            'status': 'ok',
+        }
+    except Exception as exc:
+        import traceback
+
+        return {
+            'event_id': task.get('event_id'),
+            'date': task.get('date'),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+            'traceback': traceback.format_exc(),
+        }
+
+
+def run_ofes_event_winter_mld_audit(
+    event_association_path: str | Path,
+    *,
+    trajectory_horizon_summary_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    winter_start: str = '2003-01-01',
+    winter_end: str = '2003-03-31',
+    window_deg: float = 0.05,
+    worker_count: int = 8,
+    resume: bool = True,
+) -> dict:
+    """56-event 冬季 MLD 审计:核心相对本地通风层的深度尺(OFES 侧 V/I 类比)。
+
+    对 56 个严格事件,在 2003 冬(默认 01-01..03-31)逐日在核心最近网格单元
+    取 T/S 剖面,按通风历史同口径(参考深度 10 m、密度阈值 0.03 kg m⁻³)算
+    单日 MLD,聚合为每事件冬季最大/中位 MLD 与 core_depth_m 的差(快照
+    heave-可达性),并与 30 天轨迹通风可达性(event_horizon_summary 的
+    median_minimum_depth_minus_mld_m)交叉。定位是探索性表征(lock 已写明):
+    只给"核心相对通风层的深度尺",不构成通风证明。
+
+    参数:
+        - event_association_path (str | Path): 节点 5 完成的 56-event
+          event_association.parquet。
+        - trajectory_horizon_summary_path (str | Path | None): 通风历史
+          event_horizon_summary.parquet;None 时取完成运行
+          `ofes_trajectory_ventilation_bd4e029be65e`。
+        - output_dir (str | Path | None): 输出根;None 时写
+          `Oxygen-cache/ofes_winter_mld_results/ofes_winter_mld_<sig>/`。
+        - winter_start / winter_end (str): 冬季窗口(默认 2003-01-01 至
+          2003-03-31;交付只有 2003 一个完整年,所有事件共用同一冬季)。
+        - window_deg (float): 核心周围加载半宽(度),取最近网格单元剖面。
+        - worker_count (int): 并行进程数(只进 provenance)。
+        - resume (bool): 已完成运行按签名直接返回。
+
+    返回:
+        - dict: run_dir、manifest、winter_mld(逐 event-day)、
+          event_summary(逐事件)与 summary(门与对照统计)。
+
+    输出:
+        - `manifest.json`、`winter_mld.parquet`、`event_summary.parquet`、
+          `summary.json`。
+
+    说明:
+        - MLD 口径与 56-event 通风历史完全一致(同 processing.yml
+          `trajectory_ventilation` 键),阈值未达的日记封顶(capped)。
+        - 快照冬季 MLD 与 30 天轨迹可达性测不同对象(冬季混合极值 vs
+          30 天过程接触),不一致不互否;两者对照表只作报告。
+    """
+    from multiprocessing import get_context
+
+    repo_root = Path(__file__).resolve().parent
+    association_path = Path(event_association_path)
+    association = pd.read_parquet(association_path)
+    ventilation_cfg = _OFES_CFG.get('trajectory_ventilation', {})
+    mld_reference_depth_m = float(
+        ventilation_cfg.get('mld_reference_depth_m', 10.0)
+    )
+    mld_density_threshold_kg_m3 = float(
+        ventilation_cfg.get('mld_density_threshold_kg_m3', 0.03)
+    )
+    if trajectory_horizon_summary_path is None:
+        trajectory_horizon_summary_path = (
+            repo_root / 'plot_outputs' / 'do' / 'ofes_np30_ke'
+            / 'ofes_delta_do_catalog' / '20030101_20031231_cf957935d38a'
+            / 'event_diagnostics' / 'ofes_events_21efbe902ab7'
+            / 'event_population' / 'ofes_population_254ae68988a6'
+            / 'trajectory_3d_population'
+            / 'ofes_trajectory3d_population_1d2b102470dd'
+            / 'trajectory_ventilation'
+            / 'ofes_trajectory_ventilation_bd4e029be65e'
+            / 'event_horizon_summary.parquet'
+        )
+    trajectory_horizon_summary_path = Path(trajectory_horizon_summary_path)
+    horizon = pd.read_parquet(trajectory_horizon_summary_path)
+    lock_path = repo_root / 'ofes-winter-mld-audit-lock.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    settings = {
+        'winter_start': str(winter_start),
+        'winter_end': str(winter_end),
+        'window_deg': float(window_deg),
+        'mld_reference_depth_m': mld_reference_depth_m,
+        'mld_density_threshold_kg_m3': mld_density_threshold_kg_m3,
+    }
+    payload = {
+        'code_sha256': _file_sha256(Path(__file__).resolve()),
+        'lock_sha256': _file_sha256(lock_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'event_association_sha256': _file_sha256(association_path),
+        'trajectory_horizon_summary_sha256': _file_sha256(
+            trajectory_horizon_summary_path
+        ),
+        'settings': settings,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    root = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_winter_mld_results')
+            / f'ofes_winter_mld_{run_signature[:12]}'
+        )
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            existing.get('run_signature') == run_signature
+            and existing.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'winter_mld': pd.read_parquet(root / 'winter_mld.parquet'),
+                'event_summary': pd.read_parquet(
+                    root / 'event_summary.parquet'
+                ),
+                'summary': json.loads(
+                    (root / 'summary.json').read_text(encoding='utf-8')
+                ),
+            }
+    manifest = {
+        'schema_version': 1,
+        'created_at_utc': pd.Timestamp.utcnow().isoformat(),
+        'run_signature': run_signature,
+        'status': 'running',
+        'worker_count': int(worker_count),
+        **payload,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+
+    dates = pd.date_range(
+        start=str(winter_start), end=str(winter_end), freq='D'
+    )
+    tasks: list[dict] = []
+    for row in association.itertuples(index=False):
+        for date in dates:
+            tasks.append({
+                'event_id': str(row.event_id),
+                'date': date.strftime('%Y-%m-%d'),
+                'core_lon': float(row.core_lon),
+                'core_lat': float(row.core_lat),
+                'lon_bounds': [
+                    float(row.core_lon) - float(window_deg),
+                    float(row.core_lon) + float(window_deg),
+                ],
+                'lat_bounds': [
+                    float(row.core_lat) - float(window_deg),
+                    float(row.core_lat) + float(window_deg),
+                ],
+                'mld_reference_depth_m': mld_reference_depth_m,
+                'mld_density_threshold_kg_m3': mld_density_threshold_kg_m3,
+            })
+    task_results: list[dict] = []
+    if tasks:
+        with get_context('fork').Pool(int(worker_count)) as pool:
+            task_results = list(pool.map(_ofes_winter_mld_task, tasks))
+    errors = [r for r in task_results if r.get('status') == 'error']
+    rows = [
+        {
+            'event_id': r['event_id'],
+            'date': r['date'],
+            'mld_m': r.get('mld_m', np.nan),
+            'capped': r.get('capped', True),
+            'cell_distance_km': r.get('cell_distance_km', np.nan),
+        }
+        for r in task_results
+        if r.get('status') == 'ok'
+    ]
+    winter_mld = pd.DataFrame(rows)
+    winter_mld.to_parquet(root / 'winter_mld.parquet', index=False)
+
+    event_rows: list[dict] = []
+    for row in association.itertuples(index=False):
+        sub = winter_mld.loc[winter_mld['event_id'] == row.event_id]
+        uncapped = sub.loc[~sub['capped'] & sub['mld_m'].notna(), 'mld_m']
+        event_rows.append({
+            'event_id': str(row.event_id),
+            'core_depth_m': float(row.core_depth_m),
+            'winter_max_mld_m': (
+                float(uncapped.max()) if not uncapped.empty else np.nan
+            ),
+            'winter_median_mld_m': (
+                float(uncapped.median()) if not uncapped.empty else np.nan
+            ),
+            'valid_day_count': int(len(uncapped)),
+            'capped_day_count': int(sub['capped'].sum()),
+            'core_minus_winter_max_mld_m': (
+                float(row.core_depth_m - uncapped.max())
+                if not uncapped.empty else np.nan
+            ),
+        })
+    event_summary = pd.DataFrame(event_rows)
+
+    # 30 天轨迹可达性(anomaly 组)交叉。
+    anomaly_30 = horizon.loc[
+        (horizon['particle_group'] == 'anomaly')
+        & (horizon['horizon_days'] == 30)
+    ][
+        ['event_id', 'median_minimum_depth_minus_mld_m']
+    ].rename(
+        columns={'median_minimum_depth_minus_mld_m': 'trajectory_median_min_depth_minus_mld_m'}
+    )
+    merged = event_summary.merge(anomaly_30, on='event_id', how='left')
+    regime_cols = [
+        'rotation_dominated', 'resolved_downward_pathway_supported',
+        'resolved_upward_pathway_supported', 'water_mass_dominated',
+    ]
+    trajectory = pd.read_parquet(
+        repo_root / 'plot_outputs' / 'do' / 'ofes_np30_ke'
+        / 'ofes_delta_do_catalog' / '20030101_20031231_cf957935d38a'
+        / 'event_diagnostics' / 'ofes_events_21efbe902ab7'
+        / 'event_population' / 'ofes_population_254ae68988a6'
+        / 'trajectory_3d_population'
+        / 'ofes_trajectory3d_population_1d2b102470dd'
+        / 'population_classification.parquet'
+    )[['event_id'] + regime_cols]
+    merged = merged.merge(trajectory, on='event_id', how='left')
+    merged.to_parquet(root / 'event_summary.parquet', index=False)
+
+    margin = merged['core_minus_winter_max_mld_m'].to_numpy(dtype=float)
+    margin = margin[np.isfinite(margin)]
+    summary = {
+        'task_count': len(tasks),
+        'task_error_count': len(errors),
+        'task_errors': [e['error'] for e in errors[:20]],
+        'task_error_tracebacks': [
+            e.get('traceback', '') for e in errors[:5]
+        ],
+        'event_count': int(len(association)),
+        'events_with_valid_days_ge_45': int(
+            (merged['valid_day_count'] >= 45).sum()
+        ),
+        'winter_max_mld_m': {
+            'median': float(np.nanmedian(merged['winter_max_mld_m'])),
+            'p10': float(np.nanpercentile(merged['winter_max_mld_m'], 10)),
+            'p90': float(np.nanpercentile(merged['winter_max_mld_m'], 90)),
+        },
+        'core_minus_winter_max_mld_m': {
+            'median': float(np.nanmedian(margin)),
+            'min': float(np.nanmin(margin)) if margin.size else np.nan,
+            'max': float(np.nanmax(margin)) if margin.size else np.nan,
+            'negative_count': int(np.count_nonzero(margin < 0)),
+        },
+        'regime_medians': {
+            column: {
+                'true': float(np.nanmedian(
+                    merged.loc[merged[column] == True, 'core_minus_winter_max_mld_m']
+                )),
+                'false': float(np.nanmedian(
+                    merged.loc[merged[column] == False, 'core_minus_winter_max_mld_m']
+                )),
+            }
+            for column in regime_cols
+        },
+        'trajectory_reachability': {
+            'events_with_trajectory_min_reached': int(
+                (
+                    merged['trajectory_median_min_depth_minus_mld_m'] <= 0
+                ).sum()
+            ),
+            'events_with_trajectory_value': int(
+                merged['trajectory_median_min_depth_minus_mld_m'].notna().sum()
+            ),
+        },
+    }
+    (root / 'summary.json').write_text(
+        json.dumps(summary, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    manifest['status'] = 'complete' if not errors else 'partial_with_errors'
+    manifest['task_count'] = len(tasks)
+    manifest['task_error_count'] = len(errors)
+    manifest['updated_at_utc'] = pd.Timestamp.utcnow().isoformat()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'winter_mld': winter_mld,
+        'event_summary': merged,
+        'summary': summary,
+    }
+
+
 def _ofes_event_context_requests(
     selected_events: pd.DataFrame,
     daily_diagnostics: pd.DataFrame,
