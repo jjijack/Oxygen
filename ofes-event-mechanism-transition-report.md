@@ -100,22 +100,28 @@ carrier 组衰减斜率名义上减半(p=0.050,CI 跨 0)——AUC 类响应受�
 1. **是否存在 population-level strain→rotation 顺序?不存在。** lag 中位
    0、符号检验 p=1.0/0.65;转化双向对称(8 vs 10);Δr_share 无系统增长。
 2. **rotation 是否提高异常寿命/相干性?部分、且有限。** 寿命无独立贡献
-   (幅度/深度主导);衰减速度确实更慢(AUC p=0.015 显著、斜率 p=0.05
-   边缘);指纹保持两组无差别。
-3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接首版已完成(全部 56
-   事件 × start/peak/last,168 请求,运行 `ofes_mccoy_stage_bridge_adcffa512438`,
-   peak 日与完成运行一致性检查 56/56 零错配;先前的 19-event 条件子集运行
-   `14d0247c0a06` 保留为溯源,不再引用):start 4/56、peak 19/56(构造)、
-   last 6/56;mean 兼容占比 0.023 / 0.148 / 0.087;start–last 配对
-   Wilcoxon p=0.058。**首版口径缺陷(2026-08-16 修订中)**:三个阶段的
-   17 点足迹统一取 peak 日位置的 peak_lon/peak_lat——"4→19→6"只说明
-   信号经过固定 peak 位置时强,不能证明"事件在 peak 阶段成熟"。已改为
-   start/peak/last 各自逐日位置的版本重跑(旧版保留为 Eulerian
-   fixed-site sensitivity);本节数字待重跑后更新。
-   (旧版 summary 内"19-event 条件子集"字样是遗留标签错误,以本报告
-   为准。)
-   首版可先结论:E000171(唯一 surface-obscured SCV-compatible)peak 日
-   17/17 兼容 + 17/17 原生速度确认——表层盲区 SCV 端元的典范案例。
+   (幅度/深度主导);直接衰减证据(斜率)仅名义边缘(p=0.050,CI 跨 0;
+   真实水团项版 fixed-site p=0.127、moving-core p=0.122),AUC 类响应
+   受观测持续时间影响不作独立证据;指纹保持两组无差别。
+3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接两版完成(全部 56
+   事件 × start/peak/last,168 请求,peak 日与完成运行一致性检查 56/56
+   零错配;先前的 19-event 条件子集运行 `14d0247c0a06` 保留为溯源,不再
+   引用):
+
+   | 版本 | start | peak | last | start–last 配对 p |
+   |---|---|---|---|---|
+   | fixed_peak(Eulerian sensitivity,`adcffa512438`) | 4/56(0.023) | 19/56(0.148) | 6/56(0.087) | 0.058 |
+   | **per_stage(正式,`99a6ed364260`)** | **10/56(0.072)** | 19/56(0.148) | **9/56(0.106)** | **0.624** |
+
+   fixed_peak 版三个阶段统一用 peak 日位置的 17 点足迹——"4→19→6"只
+   说明信号经过固定 peak 位置时强。per_stage 版改用 start/peak/last
+   各自逐日位置后:**start 已有 10/56 兼容(占比 0.072),与 last 无显著
+   差异**——McCoy 型剖面形态在 onset 已存在,不是"后期成熟"。这与
+   H3(载体先行)方向一致,不支持"信号是 peak-成熟期特征"的首版叙事;
+   首版结论作废。域边事件(E000222 等)230 km 控制环落出交付域的
+   控制点显式剔除并计数(生产路径 peak 日不受影响,一致性零错配)。
+   E000171(唯一 surface-obscured SCV-compatible)peak 日 17/17 兼容 +
+   17/17 原生速度确认——表层盲区 SCV 端元的典范案例。
 4. **当前最高可用措辞:** `front/strain-dominated filamentary transport`
    与 `anticyclonic subsurface rotational carrier` 是 OFES KE 中并存的
    两种常见形态(起始各 ~50%);strict SCV-like 端元是 always-rotation
@@ -123,9 +129,11 @@ carrier 组衰减斜率名义上减半(p=0.050,CI 跨 0)——AUC 类响应受�
 
 **H1/H2/H3 裁决(全部为报告,不设门槛)**:H1(锋面先、反气旋后)不被支持
 (无时序);H2(纯锋面)部分支持(半数事件始终 strain),但 rotation 的衰减
-优势反对"反气旋完全无关";H3(载体先行)形态上常见(29/56 onset 即
-rotation),但无"后装载水团"的时序证据。→ **多机制异质性,不强行归一**
-(lock 冻结规则)。
+优势(名义)反对"反气旋完全无关";H3(载体先行)形态上常见(29/56 onset
+即 rotation),**per_stage McCoy 桥接进一步支持:SCV 型剖面形态在
+start 已存在 10/56(与 last 无显著差异,p=0.624),不是后期成熟**——
+"后装载水团"仍无时序证据(装载发生在事件窗内、低于日分辨率,无法排除)。
+→ **多机制异质性,不强行归一**(lock 冻结规则)。
 
 ## 五、对论文主线的收束
 
@@ -164,11 +172,13 @@ upward contrast;全链条三例作示意图候选(E000276 优先,blind 案例天
 
 ## 六、待执行
 
-- 年度 grid-SCV 背景线:工程试跑完成后按成本外推决策(见 ofes worktree
-  结果报告第四节)。
-- McCoy 桥接已完成(全 56 事件,见裁决 3);19-event 子集运行保留为溯源。
+- 年度 grid-SCV 背景线:S5 系统抽样敏感性(独立协议)已冻结,紧凑
+  runner 已提交,基准与 73 天运行进行中(见 ofes worktree 结果报告
+  第四节)。
+- McCoy 桥接已完成(全 56 事件,fixed_peak 与 per_stage 两版,见裁决
+  3);19-event 子集运行保留为溯源。
 - 全 650 观测日 w_along 与逐日 water-mass/heave 分解均已完成并回填
-  (见主分析 B)。
+  (见主分析 B;fixed-site 与 moving-core 两口径)。
 - 161 事件 quality 普查已完成(见第七节)。
 
 ## 七、161 事件 quality 普查(2026-08-16 补跑完成)
