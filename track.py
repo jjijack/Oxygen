@@ -44019,8 +44019,15 @@ def _ofes_diagnose_water_mass_day(
     core_lat: float,
     reference_depth: float,
     settings: dict,
+    *,
+    target_sigma0_override: float | None = None,
 ) -> dict:
-    """诊断单日 OFES 核心相对环带背景的水团与 heave 分量。"""
+    """诊断单日 OFES 核心相对环带背景的水团与 heave 分量。
+
+    `target_sigma0_override` 非空时(逐日移动核心口径):目标 σ0 不由当日
+    核心在 reference_depth 处的密度给出,而用事件 peak 日的冻结
+    target_sigma0;此时 `reference_depth` 只作背景剖面等密面交点的
+    连续性选择提示(取离提示深度最近的交点)。"""
     date_ts = pd.Timestamp(date).normalize()
     outer_radius = float(
         settings['background_outer_radius_km']
@@ -44147,8 +44154,12 @@ def _ofes_diagnose_water_mass_day(
         )
         for key, values in background_profiles.items()
     }
-    target_sigma0 = _ofes_profile_value_at_depth(
-        depth, core_sigma0, float(reference_depth)
+    target_sigma0 = (
+        float(target_sigma0_override)
+        if target_sigma0_override is not None
+        else _ofes_profile_value_at_depth(
+            depth, core_sigma0, float(reference_depth)
+        )
     )
     background_on_sigma = (
         _ofes_density_crossing_near_depth(
@@ -64971,25 +64982,29 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
     lifecycle_run_dir: str | Path,
     *,
     event_ids: list[str] | None = None,
+    footprint_mode: str = 'per_stage',
     output_dir: str | Path | None = None,
     worker_count: int = 12,
     resume: bool = True,
 ) -> dict:
-    """19-event McCoy 三阶段桥接:start/peak/last 三日 17 点足迹。
+    """McCoy 三阶段桥接:start/peak/last 三日各跑 17 点足迹。
 
-    在既有 peak-McCoy-positive 事件(默认 = 完成运行
-    `ofes_mccoy_virtual_argo_a8409b27a056` 的 19 个 any-compatible)的
-    start/peak/last 三个检测日各跑一次生产 self-ring 口径的 McCoy 门链,
-    回答"SCV 型剖面形态是 onset 已有还是生命周期后期才成熟"。三阶段共用
-    peak 核心位置的同一套 17 点足迹,只换日期(可比);复用
-    `_ofes_mccoy_event_worker` 与冻结 settings,不调任何 McCoy/grid-SCV/
-    rotation 阈值。条件子集结论不外推到 56 事件(transition lock
-    §McCoy 桥接)。
+    对每个事件的 start/peak/last 三个检测日各跑一次生产 self-ring 口径
+    的 McCoy 门链,回答"SCV 型剖面形态是 onset 已有还是生命周期后期才
+    成熟"。默认 `footprint_mode='per_stage'`:**三个阶段各自使用该阶段
+    逐日行的对象峰位置**(daily 表的 peak_lon/peak_lat 为逐日对象峰),
+    测的是事件随载体移动时形态信号的阶段演化;`'fixed_peak'` 保持旧版
+    行为(三阶段统一用 peak 日位置,只换日期),即 Eulerian fixed-site
+    sensitivity,只用于对照。复用 `_ofes_mccoy_event_worker` 与冻结
+    settings,不调任何 McCoy/grid-SCV/rotation 阈值。
 
     参数:
         - lifecycle_run_dir (str | Path): schema-v2 lifecycle 完成运行目录。
-        - event_ids (list[str] | None): 显式事件列表;None 时取完成运行的
-          19 个 any-compatible。
+        - event_ids (list[str] | None): 显式事件列表;None 时取 daily 表
+          全部事件(56 事件全普查,2026-08-16 起为默认;早先的 19-event
+          条件子集不再是默认口径)。
+        - footprint_mode (str): 'per_stage'(默认,各阶段自身逐日位置)
+          或 'fixed_peak'(旧版固定 peak 位置,Eulerian sensitivity)。
         - output_dir (str | Path | None): 输出根;None 写
           `Oxygen-cache/ofes_mccoy_stage_bridge/<sig>/`。
         - worker_count (int): 并行进程数(只进 provenance)。
@@ -65005,8 +65020,8 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
           `fragments/<event_id>_<YYYYMMDD>.parquet`。
 
     说明:
-        - 19-event 子集按 transition lock 标为条件子集;peak 日的数字应与
-          完成运行一致(同一管线),作为内置一致性检查报告。
+        - peak 日的数字应与完成运行一致(同一管线),作为内置一致性检查
+          报告。
     """
     repo_root = Path(__file__).resolve().parent
     lifecycle_root = Path(lifecycle_run_dir)
@@ -65038,12 +65053,13 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
         / 'event_summary.parquet'
     )
     if event_ids is None:
-        event_ids = completed_mccoy.loc[
-            completed_mccoy['any_event_profile_mccoy_compatible'] == True,
-            'event_id',
-        ].astype(str).tolist()
+        event_ids = sorted(daily['event_id'].astype(str).unique())
     else:
         event_ids = [str(value) for value in event_ids]
+    if footprint_mode not in ('per_stage', 'fixed_peak'):
+        raise ValueError(
+            "footprint_mode must be 'per_stage' or 'fixed_peak'."
+        )
     lock_path = repo_root / 'ofes-event-mechanism-transition-analysis-lock.md'
     daily_subset = daily.loc[
         daily['event_id'].astype(str).isin(event_ids)
@@ -65058,8 +65074,7 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
             raise RuntimeError(
                 f'No peak-day row for {event_id} in lifecycle daily.'
             )
-        # daily 表的 peak_lon/peak_lat 是逐日对象峰位置;三阶段统一用
-        # peak 日行的事件级值,保证 17 点足迹同一几何。
+        # daily 表的 peak_lon/peak_lat 是逐日对象峰位置。
         event_peak_lon = float(peak_rows.iloc[0]['peak_lon'])
         event_peak_lat = float(peak_rows.iloc[0]['peak_lat'])
         for stage, row in (
@@ -65069,8 +65084,12 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
         ):
             request = row.to_dict()
             request['stage'] = str(stage)
-            request['peak_lon'] = event_peak_lon
-            request['peak_lat'] = event_peak_lat
+            if footprint_mode == 'fixed_peak':
+                # 旧版 Eulerian fixed-site sensitivity:三阶段统一
+                # peak 日位置的同一套 17 点足迹,只换日期。
+                request['peak_lon'] = event_peak_lon
+                request['peak_lat'] = event_peak_lat
+            # per_stage 默认:保留该阶段逐日行自身的对象峰位置。
             request_rows.append(request)
     requests = pd.DataFrame(request_rows)
     science_settings = {
@@ -65081,6 +65100,7 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
     payload = {
         'schema_version': 1,
         'method': 'mccoy_2020_source_gates_stage_bridge',
+        'footprint_mode': str(footprint_mode),
         'lifecycle_run_signature': lifecycle_manifest['run_signature'],
         'lock_sha256': _file_sha256(lock_path),
         'input_sha256': {
@@ -65270,12 +65290,17 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
     summary = {
         'event_count': int(requests['event_id'].nunique()),
         'request_count': int(len(requests)),
+        'footprint_mode': str(footprint_mode),
         'stage_summary': stage_summary,
         'paired_start_last': paired_stats,
         'peak_consistency_with_completed_run': peak_consistency,
         'notes': [
-            '19-event 条件子集,不外推到 56 事件(transition lock)。',
-            '三阶段共用 peak 核心位置的同一套 17 点足迹,只换日期。',
+            (
+                'per_stage: 三阶段各用该阶段逐日行的对象峰位置。'
+                if footprint_mode == 'per_stage' else
+                'fixed_peak: 三阶段统一 peak 日位置的同一套 17 点足迹,'
+                '只换日期(Eulerian fixed-site sensitivity)。'
+            ),
             '全部为报告项,不设通过门槛。',
         ],
     }
@@ -65352,9 +65377,53 @@ def _ofes_daily_water_mass_task(task: dict) -> dict:
         }
 
 
+def _ofes_moving_water_mass_event_task(task: dict) -> list[dict]:
+    """单个事件的 moving-core 逐日序列(按日期顺序连续推进)。
+
+    水平位置逐日跟随该日对象峰;目标 σ0 固定为事件 peak 日冻结值;
+    参考深度沿前一日背景等密面交点连续选择,首日以事件 core_depth_m
+    为提示。单日失败记 error 行并沿用上一有效交点继续推进。
+    """
+    try:
+        rows = list(task['rows'])
+        settings = dict(task['settings'])
+        target_sigma0 = float(task['target_sigma0'])
+        hint_depth = float(task['core_depth_m'])
+        outputs: list[dict] = []
+        for row in rows:
+            diagnosis = _ofes_diagnose_water_mass_day(
+                str(row['date']),
+                float(row['peak_lon']),
+                float(row['peak_lat']),
+                hint_depth,
+                settings,
+                target_sigma0_override=target_sigma0,
+            )
+            diagnosis['event_id'] = str(task['event_id'])
+            diagnosis['date'] = str(row['date'])
+            outputs.append(diagnosis)
+            crossing = diagnosis.get('background_sigma_depth_m')
+            if (
+                crossing is not None
+                and np.isfinite(float(crossing))
+            ):
+                hint_depth = float(crossing)
+        return outputs
+    except Exception as exc:
+        import traceback
+
+        return [{
+            'event_id': task.get('event_id'),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+            'traceback': traceback.format_exc(),
+        }]
+
+
 def run_ofes_event_daily_water_mass_audit(
     event_association_path: str | Path,
     *,
+    geometry_mode: str = 'fixed_site',
     output_dir: str | Path | None = None,
     worker_count: int = 16,
     resume: bool = True,
@@ -65362,16 +65431,25 @@ def run_ofes_event_daily_water_mass_audit(
     """56-event 逐日水团项审计:全部观测日的 water-mass/heave 分解。
 
     对 56 个严格事件的全部 650 个观测日,复用冻结的
-    `_ofes_diagnose_water_mass_day`(与 population 运行同一机器与 settings),
-    在固定的 peak 核心位置、固定参考深度(事件 core_depth_m)上逐日分解
-    fixed-depth / water-mass / heave 三项。目的是把 transition 审计
-    retention 分析的"ΔDO 幅度代理"换成真实的水团项序列(lock 的 fallback
-    设计:无逐日 water-mass 时用 delta_do_max 替代并标注;本运行补上真实
-    量,proxy 保留作敏感性)。
+    `_ofes_diagnose_water_mass_day`(与 population 运行同一机器与
+    settings)逐日分解 fixed-depth / water-mass / heave 三项。目的是把
+    transition 审计 retention 分析的"ΔDO 幅度代理"换成真实的水团项
+    序列(lock 的 fallback 设计:无逐日 water-mass 时用 delta_do_max
+    替代并标注;本运行补上真实量,proxy 保留作敏感性)。
+
+    几何口径 `geometry_mode`:
+        - 'fixed_site'(默认)= 固定 peak 核心位置 + 固定参考深度(事件
+          core_depth_m),即 **Eulerian fixed-site persistence**:测同一
+          固定站点上的水团信号持续,不是移动载体的 retention。
+        - 'moving_core' = 逐日水平位置跟随该日对象峰(daily 表的
+          peak_lon/peak_lat),目标 σ0 固定为事件 peak 日的冻结
+          target_sigma0,参考深度沿前一日等密面交点连续选择(首日以事件
+          core_depth_m 为提示)——测移动载体本身的水团项演化。
 
     参数:
         - event_association_path (str | Path): 节点 5 完成的 56-event
           event_association.parquet。
+        - geometry_mode (str): 'fixed_site' 或 'moving_core'。
         - output_dir (str | Path | None): 输出根;None 时写
           `Oxygen-cache/ofes_daily_water_mass/<sig>/`。
         - worker_count (int): 并行进程数(只进 provenance)。
@@ -65386,12 +65464,16 @@ def run_ofes_event_daily_water_mass_audit(
           `event_summary.parquet`、`summary.json`。
 
     说明:
-        - 逐日几何固定 = peak 核心位置 + 事件参考深度,保证系列可比;
-          与 peak 日 population 值的一致性检查记入 summary。
+        - fixed_site 与 peak 日 population 值的一致性检查记入 summary;
+          moving_core 因参考深度逐日不同,不与该值逐位一致(作报告项)。
         - DO 不参与任何分组门,只作响应变量(transition lock 纪律)。
     """
     from multiprocessing import get_context
 
+    if geometry_mode not in ('fixed_site', 'moving_core'):
+        raise ValueError(
+            "geometry_mode must be 'fixed_site' or 'moving_core'."
+        )
     repo_root = Path(__file__).resolve().parent
     association_path = Path(event_association_path)
     association = pd.read_parquet(association_path)
@@ -65416,6 +65498,7 @@ def run_ofes_event_daily_water_mass_audit(
         'event_association_sha256': _file_sha256(association_path),
         'lifecycle_daily_sha256': _file_sha256(daily_path),
         'population_peak_sha256': _file_sha256(population_path),
+        'geometry_mode': str(geometry_mode),
         'settings': settings,
     }
     canonical = json.dumps(
@@ -65469,28 +65552,68 @@ def run_ofes_event_daily_water_mass_audit(
     daily = daily[daily['event_id'].isin(set(association['event_id']))]
     # 固定几何:每事件的 peak 行位置 + association 参考深度。
     peak_rows = daily.loc[daily['is_event_peak_day']].set_index('event_id')
-    tasks: list[dict] = []
-    for event_id, group in daily.groupby('event_id', sort=False):
-        core_lon = float(peak_rows.loc[event_id, 'peak_lon'])
-        core_lat = float(peak_rows.loc[event_id, 'peak_lat'])
-        reference_depth_m = float(
-            association.loc[
-                association['event_id'] == event_id, 'core_depth_m'
-            ].iloc[0]
-        )
-        for row in group.itertuples(index=False):
-            tasks.append({
+    if geometry_mode == 'fixed_site':
+        tasks: list[dict] = []
+        for event_id, group in daily.groupby('event_id', sort=False):
+            core_lon = float(peak_rows.loc[event_id, 'peak_lon'])
+            core_lat = float(peak_rows.loc[event_id, 'peak_lat'])
+            reference_depth_m = float(
+                association.loc[
+                    association['event_id'] == event_id, 'core_depth_m'
+                ].iloc[0]
+            )
+            for row in group.itertuples(index=False):
+                tasks.append({
+                    'event_id': str(event_id),
+                    'date': pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                    'core_lon': core_lon,
+                    'core_lat': core_lat,
+                    'reference_depth_m': reference_depth_m,
+                    'settings': settings,
+                })
+        task_results: list[dict] = []
+        if tasks:
+            with get_context('fork').Pool(int(worker_count)) as pool:
+                task_results = list(
+                    pool.map(_ofes_daily_water_mass_task, tasks)
+                )
+    else:
+        # moving_core:每事件一条任务,内部按日期顺序推进,参考深度沿
+        # 前一日背景等密面交点连续选择;首日以事件 core_depth_m 为提示。
+        population = pd.read_parquet(population_path)
+        peak_target = population.set_index('event_id')['target_sigma0']
+        moving_tasks: list[dict] = []
+        for event_id, group in daily.groupby('event_id', sort=False):
+            group = group.sort_values('date')
+            moving_tasks.append({
                 'event_id': str(event_id),
-                'date': pd.Timestamp(row.date).strftime('%Y-%m-%d'),
-                'core_lon': core_lon,
-                'core_lat': core_lat,
-                'reference_depth_m': reference_depth_m,
+                'rows': [
+                    {
+                        'date': pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                        'peak_lon': float(row.peak_lon),
+                        'peak_lat': float(row.peak_lat),
+                    }
+                    for row in group.itertuples(index=False)
+                ],
+                'target_sigma0': float(peak_target.loc[event_id]),
+                'core_depth_m': float(
+                    association.loc[
+                        association['event_id'] == event_id, 'core_depth_m'
+                    ].iloc[0]
+                ),
                 'settings': settings,
             })
-    task_results: list[dict] = []
-    if tasks:
-        with get_context('fork').Pool(int(worker_count)) as pool:
-            task_results = list(pool.map(_ofes_daily_water_mass_task, tasks))
+        task_results = []
+        if moving_tasks:
+            with get_context('fork').Pool(int(worker_count)) as pool:
+                task_results = list(
+                    pool.map(_ofes_moving_water_mass_event_task,
+                            moving_tasks)
+                )
+            task_results = [
+                item for event_items in task_results
+                for item in event_items
+            ]
     errors = [r for r in task_results if r.get('status') == 'error']
     rows = [r for r in task_results if r.get('status') != 'error']
     daily_water_mass = pd.DataFrame(rows)
@@ -65506,31 +65629,52 @@ def run_ofes_event_daily_water_mass_audit(
         .assign(date=lambda frame: pd.to_datetime(frame['date'])),
         on=['event_id', 'date'],
     )
-    consistency = population[
-        ['event_id', 'water_mass_do_contrast', 'heave_do_contribution',
-         'fixed_depth_do_contrast']
-    ].merge(
-        peak_daily[
+    if geometry_mode == 'fixed_site':
+        consistency = population[
             ['event_id', 'water_mass_do_contrast', 'heave_do_contribution',
              'fixed_depth_do_contrast']
-        ].rename(columns={
-            'water_mass_do_contrast': 'daily_wm',
-            'heave_do_contribution': 'daily_heave',
-            'fixed_depth_do_contrast': 'daily_fixed',
-        }),
-        on='event_id', how='inner',
-    )
-    peak_consistency = {
-        'n_compared': int(len(consistency)),
-        'water_mass_max_abs_diff': float(
-            (consistency['water_mass_do_contrast']
-             - consistency['daily_wm']).abs().max()
-        ),
-        'heave_max_abs_diff': float(
-            (consistency['heave_do_contribution']
-             - consistency['daily_heave']).abs().max()
-        ),
-    }
+        ].merge(
+            peak_daily[
+                ['event_id', 'water_mass_do_contrast',
+                 'heave_do_contribution', 'fixed_depth_do_contrast']
+            ].rename(columns={
+                'water_mass_do_contrast': 'daily_wm',
+                'heave_do_contribution': 'daily_heave',
+                'fixed_depth_do_contrast': 'daily_fixed',
+            }),
+            on='event_id', how='inner',
+        )
+        peak_consistency = {
+            'n_compared': int(len(consistency)),
+            'water_mass_max_abs_diff': float(
+                (consistency['water_mass_do_contrast']
+                 - consistency['daily_wm']).abs().max()
+            ),
+            'heave_max_abs_diff': float(
+                (consistency['heave_do_contribution']
+                 - consistency['daily_heave']).abs().max()
+            ),
+        }
+    else:
+        # moving_core:参考深度逐日不同,不与 population 逐位一致;
+        # 只报告 peak 日的 σ0 一致性(构造上等于冻结 target_sigma0)。
+        sigma_check = population[
+            ['event_id', 'target_sigma0']
+        ].merge(
+            peak_daily[['event_id', 'target_sigma0']].rename(
+                columns={'target_sigma0': 'daily_target_sigma0'}
+            ),
+            on='event_id', how='inner',
+        )
+        peak_consistency = {
+            'n_compared': int(len(sigma_check)),
+            'target_sigma0_max_abs_diff': float(
+                (sigma_check['target_sigma0']
+                 - sigma_check['daily_target_sigma0']).abs().max()
+            ),
+            'note': 'moving_core 参考深度逐日连续选择,不与 population '
+                    'fixed-depth 值逐位比较;只校验目标 σ0 冻结一致。',
+        }
 
     # 事件级汇总:start/peak/last 水团项 + 归一化衰减斜率与 AUC。
     event_rows: list[dict] = []
@@ -65628,7 +65772,13 @@ def run_ofes_event_daily_water_mass_audit(
             'wm_peak': _group_compare('wm_peak'),
         },
         'notes': [
-            '逐日几何固定(peak 核心位置 + 事件参考深度),系列可比。',
+            (
+                'fixed_site(Eulerian fixed-site persistence):逐日几何'
+                '固定 = peak 核心位置 + 事件参考深度,系列可比。'
+                if geometry_mode == 'fixed_site' else
+                'moving_core:水平位置逐日跟随对象峰,目标 σ0 冻结为'
+                '事件 peak 值,参考深度沿前一日等密面交点连续选择。'
+            ),
             'water-mass 分量为 retention B 的真实量;delta_do_max 代理'
             '保留作敏感性(transition lock fallback)。',
         ],
