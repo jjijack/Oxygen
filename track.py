@@ -53165,6 +53165,28 @@ def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
     points = _ofes_mccoy_sampling_points(
         core_lon, core_lat, event_radius, settings
     )
+    # 靠近域边的逐日位置(per-stage 口径)的 230 km 控制环可能落出
+    # OFES 交付域(140-170E, 25-45N)之外;这类点没有数据,显式剔除并
+    # 计数进 fragment,不静默夹取。peak 日位置全部在域内(完成运行
+    # a8409b27a056 未遇此路径),peak 一致性检查不受影响。
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(date)
+    domain_lon = (float(full_lon[0]), float(full_lon[-1]))
+    domain_lat = (float(full_lat[0]), float(full_lat[-1]))
+    in_domain = (
+        points['sample_lon'].between(
+            domain_lon[0] - 1e-6, domain_lon[1] + 1e-6
+        )
+        & points['sample_lat'].between(
+            domain_lat[0] - 1e-6, domain_lat[1] + 1e-6
+        )
+    )
+    off_domain_event = int(
+        ((~in_domain) & (points['sample_role'] == 'event')).sum()
+    )
+    off_domain_control = int(
+        ((~in_domain) & (points['sample_role'] == 'background_control')).sum()
+    )
+    points = points.loc[in_domain].reset_index(drop=True)
     # 加载窗口必须覆盖最远的 0.70R 采样点(per-stage 逐日半径可大于
     # peak 半径);窗口扩大不改变同一批采样点的任何插值结果。
     load_radius = max(
@@ -53304,6 +53326,8 @@ def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
                 'sample_lon': float(point.sample_lon),
                 'sample_lat': float(point.sample_lat),
                 'valid_control_profile_count': int(valid_control_count),
+                'off_domain_dropped_event_count': int(off_domain_event),
+                'off_domain_dropped_control_count': int(off_domain_control),
                 **classification,
                 **direct,
             }
@@ -53319,6 +53343,8 @@ def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
             (event_frame['sample_role'] == 'background_control').sum()
         ),
         'valid_control_profile_count': int(valid_control_count),
+        'off_domain_dropped_event_count': int(off_domain_event),
+        'off_domain_dropped_control_count': int(off_domain_control),
         'reference_pressure_max_dbar': float(
             np.nanmax(reference['pressure'][
                 np.isfinite(reference['in_situ_temperature'])
@@ -65353,6 +65379,16 @@ def _ofes_stage_bridge_fragment_stats(
         'control_pass_fraction': float(
             control_rows['mccoy_profile_compatible'].mean()
         ) if len(control_rows) else np.nan,
+        'off_domain_dropped_event_count': int(
+            fragment['off_domain_dropped_event_count'].max()
+        ) if 'off_domain_dropped_event_count' in fragment.columns and len(
+            fragment
+        ) else 0,
+        'off_domain_dropped_control_count': int(
+            fragment['off_domain_dropped_control_count'].max()
+        ) if 'off_domain_dropped_control_count' in fragment.columns and len(
+            fragment
+        ) else 0,
         'fragment_reused': bool(fragment_reused),
     }
 
