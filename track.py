@@ -53232,9 +53232,16 @@ def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
     valid_control_count = sum(
         profile['profile_qc_passed'] for profile in control_profiles
     )
-    if valid_control_count < settings['minimum_background_profiles']:
+    # 域外剔除的控制点物理上不存在,不计入 QC 门槛(生产路径
+    # off_domain_control=0,门槛与冻结值完全一致)。
+    required_controls = (
+        int(settings['minimum_background_profiles']) - off_domain_control
+    )
+    if valid_control_count < required_controls:
         raise RuntimeError(
-            f'{event_id} has only {valid_control_count} valid McCoy controls.'
+            f'{event_id} has only {valid_control_count} valid McCoy '
+            f'controls (required {required_controls} after dropping '
+            f'{off_domain_control} off-domain).'
         )
     reference = _ofes_mccoy_reference(
         control_profiles, core_lon, core_lat
