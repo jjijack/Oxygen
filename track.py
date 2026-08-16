@@ -39402,64 +39402,78 @@ def _ofes_grid_scv_v2_s5_tile_day_task(task: dict) -> dict:
 
     与既有 annual runner 相同的检测调用与 wet-counts 口径(每格点恰好
     归属一个 tile、无双计),worker_count=1(实测 worker 数几乎无增益)。
+    异常不抛出:返回 error 行由 runner 降级重试,防止单个 tile-day 杀
+    死整个进程池。
     """
-    date = pd.Timestamp(task['date'])
-    tile_dir = Path(task['tile_dir'])
-    v2_settings = dict(task['settings'])
-    result = detect_ofes_grid_scv_v2_day(
-        date,
-        float(task['tile_lon']),
-        float(task['tile_lat']),
-        0.0,
-        settings=v2_settings,
-        output_dir=tile_dir,
-        worker_count=int(task.get('tile_worker_count', 1)),
-    )
-    cache_path = tile_dir / 'profile_cache.parquet'
-    if cache_path.exists():
-        cache_path.unlink()
-    summary = dict(result['summary'])
-    summary['storage_mode'] = 'compact'
-    _ofes_atomic_write_json(summary, tile_dir / 'day_summary.json')
-    fields = result['fields']
-    lat_centers = task['lat_centers']
-    lon_centers = task['lon_centers']
-    tile_index = int(task['tile_index'])
-    unique = np.asarray(fields['unique_crossing'], dtype=bool)
-    owner_local = (
-        _ofes_grid_v2_nearest_center(
-            np.asarray(fields['lat'], dtype=float), lat_centers
-        )[:, None] * lon_centers.size
-        + _ofes_grid_v2_nearest_center(
-            np.asarray(fields['lon'], dtype=float), lon_centers
-        )[None, :]
-    )
-    voronoi_cell = owner_local == tile_index
-    lat_bands = np.floor(np.asarray(fields['lat'], dtype=float)).astype(int)
-    lat_bands_grid = np.broadcast_to(lat_bands[:, None], unique.shape[1:])
-    wet_rows: list[dict] = []
-    for node_index in range(unique.shape[0]):
-        node_inner = unique[node_index] & voronoi_cell
-        band_counts = np.bincount(
-            lat_bands_grid[node_inner], minlength=91
+    try:
+        date = pd.Timestamp(task['date'])
+        tile_dir = Path(task['tile_dir'])
+        v2_settings = dict(task['settings'])
+        result = detect_ofes_grid_scv_v2_day(
+            date,
+            float(task['tile_lon']),
+            float(task['tile_lat']),
+            0.0,
+            settings=v2_settings,
+            output_dir=tile_dir,
+            worker_count=int(task.get('tile_worker_count', 1)),
         )
-        for band in np.flatnonzero(band_counts):
-            wet_rows.append({
-                'node_index': int(node_index),
-                'sigma0': float(fields['nodes_sigma0'][node_index]),
-                'lat_band_deg': int(band),
-                'wet_cell_count': int(band_counts[band]),
-            })
-    _atomic_write_parquet(
-        pd.DataFrame(wet_rows), tile_dir / 'node_wet_counts.parquet'
-    )
-    return {
-        'tile_dir': str(tile_dir),
-        'date': pd.Timestamp(date).normalize(),
-        'objects': result['objects'],
-        'voxels': result['voxels'],
-        'summary': summary,
-    }
+        cache_path = tile_dir / 'profile_cache.parquet'
+        if cache_path.exists():
+            cache_path.unlink()
+        summary = dict(result['summary'])
+        summary['storage_mode'] = 'compact'
+        _ofes_atomic_write_json(summary, tile_dir / 'day_summary.json')
+        fields = result['fields']
+        lat_centers = task['lat_centers']
+        lon_centers = task['lon_centers']
+        tile_index = int(task['tile_index'])
+        unique = np.asarray(fields['unique_crossing'], dtype=bool)
+        owner_local = (
+            _ofes_grid_v2_nearest_center(
+                np.asarray(fields['lat'], dtype=float), lat_centers
+            )[:, None] * lon_centers.size
+            + _ofes_grid_v2_nearest_center(
+                np.asarray(fields['lon'], dtype=float), lon_centers
+            )[None, :]
+        )
+        voronoi_cell = owner_local == tile_index
+        lat_bands = np.floor(
+            np.asarray(fields['lat'], dtype=float)
+        ).astype(int)
+        lat_bands_grid = np.broadcast_to(
+            lat_bands[:, None], unique.shape[1:]
+        )
+        wet_rows: list[dict] = []
+        for node_index in range(unique.shape[0]):
+            node_inner = unique[node_index] & voronoi_cell
+            band_counts = np.bincount(
+                lat_bands_grid[node_inner], minlength=91
+            )
+            for band in np.flatnonzero(band_counts):
+                wet_rows.append({
+                    'node_index': int(node_index),
+                    'sigma0': float(fields['nodes_sigma0'][node_index]),
+                    'lat_band_deg': int(band),
+                    'wet_cell_count': int(band_counts[band]),
+                })
+        _atomic_write_parquet(
+            pd.DataFrame(wet_rows), tile_dir / 'node_wet_counts.parquet'
+        )
+        return {
+            'tile_dir': str(tile_dir),
+            'date': pd.Timestamp(date).normalize(),
+            'objects': result['objects'],
+            'voxels': result['voxels'],
+            'summary': summary,
+        }
+    except Exception as exc:
+        return {
+            'tile_dir': str(task.get('tile_dir')),
+            'date': str(task.get('date')),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
 
 
 def _ofes_grid_scv_v2_s5_resume(
@@ -39545,6 +39559,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
           年度背景敏感性。
     """
     from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
     import time as time_module
 
     v2_settings = _ofes_grid_scv_v2_settings(settings)
@@ -39655,19 +39670,52 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     started = time_module.time()
     if pending:
         workers = min(int(tile_day_workers), len(pending))
-        if workers == 1:
-            results = [
-                _ofes_grid_scv_v2_s5_tile_day_task(task) for task in pending
-            ]
-        else:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(
-                        _ofes_grid_scv_v2_s5_tile_day_task, task
+        results: list[dict] = []
+        error_results: list[dict] = []
+        pool_broken_tasks: list[dict] = list(pending)
+        attempt_workers = int(workers)
+        while pool_broken_tasks:
+            batch = pool_broken_tasks
+            pool_broken_tasks = []
+            batch_results: list[dict] = []
+            try:
+                if attempt_workers <= 1:
+                    batch_results = [
+                        _ofes_grid_scv_v2_s5_tile_day_task(task)
+                        for task in batch
+                    ]
+                else:
+                    with ProcessPoolExecutor(
+                        max_workers=attempt_workers
+                    ) as executor:
+                        futures = [
+                            executor.submit(
+                                _ofes_grid_scv_v2_s5_tile_day_task, task
+                            )
+                            for task in batch
+                        ]
+                        batch_results = [
+                            future.result() for future in futures
+                        ]
+            except BrokenProcessPool:
+                # 进程池被 OOM/段错误打断:已完成目录由 resume 复用,
+                # 未完成任务降级(进程数减半,最低 1)重试。
+                remaining = [
+                    task for task in batch
+                    if not _ofes_grid_scv_v2_s5_resume(
+                        Path(task['tile_dir']), v2_settings
                     )
-                    for task in pending
                 ]
-                results = [future.result() for future in futures]
+                attempt_workers = max(1, int(attempt_workers // 2))
+                if remaining:
+                    pool_broken_tasks = remaining
+                    continue
+                batch_results = []
+            for item in batch_results:
+                if item.get('status') == 'error':
+                    error_results.append(item)
+                else:
+                    results.append(item)
         completed_tile_days += len(results)
     elapsed_h = (time_module.time() - started) / 3600.0
     if benchmark_mode:
@@ -39698,6 +39746,10 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     voxel_frames: list[pd.DataFrame] = []
     wet_frames: list[pd.DataFrame] = []
     for tile_dir in sorted(day_root.iterdir()):
+        # 只聚合通过 resume 校验的完整紧凑日片;崩溃残留的不完整目录
+        # 由下一轮 resume 重算,不进入聚合。
+        if not _ofes_grid_scv_v2_s5_resume(tile_dir, v2_settings):
+            continue
         objects_path = tile_dir / 'objects.parquet'
         if objects_path.exists():
             tile_objects = pd.read_parquet(objects_path)
@@ -39920,6 +39972,8 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
         'date_count': int(len(dates)),
         'total_tile_day_count': total_tile_days,
         'completed_tile_day_count': completed_tile_days,
+        'task_error_count': int(len(error_results)),
+        'task_errors': [e['error'] for e in error_results[:20]],
         'object_count': int(len(objects)),
         'reproducibility_gate': gate,
         'tier_object_counts': (
@@ -39976,6 +40030,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     manifest.update({
         'status': 'complete',
         'completed_tile_day_count': completed_tile_days,
+        'task_error_count': int(len(error_results)),
         'outputs': {
             's5_objects': str((root / 's5_objects.parquet').resolve()),
             's5_occupancy': str((root / 's5_occupancy.parquet').resolve()),
