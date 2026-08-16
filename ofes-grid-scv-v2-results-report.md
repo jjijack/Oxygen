@@ -102,3 +102,30 @@ lock 的节点 6 剩余项:是否启动 `run_ofes_grid_scv_v2_annual_catalog`
   否决——冬季块季节偏置且不匹配全年事件月份,半年不完整,全年收益不
   匹配成本,改旧 lock 冒充 365 日正式 null 不许可。**采用独立命名的
   systematic 5-day sampled sensitivity**(协议见下)。
+
+### 2026-08-16 S5 敏感性:协议冻结、基准与复现门(全跑进行中)
+
+- 协议 `ofes-grid-scv-v2-s5-background-sensitivity.md` 已冻结:步长 5
+  天共 73 天、分 Tier occupancy、无 Tier-3、紧凑存储、tile-day 并行、
+  01-01 复现门。旧 v2 lock 未动,本运行不声称 365 日 null。
+- **三轮基准(tile-day 进程 × per-tile worker 双轴,同一批 21
+  tile-day,scratch 目录测后删除)**:
+  | 配置 | tile-days/h |
+  |---|---|
+  | (8, 1) | 62.7 |
+  | (12, 1) | 76.5 |
+  | (16, 1) | 80.3 |
+  | (8, 4) | 64.3 |
+  | (12, 2) | 78.5 |
+  | **(16, 2)** | **87.4** |
+  | (8, 8) | 65.1 |
+  | (12, 4) | 76.5 |
+  | (16, 4) | 84.5 |
+  结论:tile-day 并行增益递减、per-tile worker > 2 因超订阅反降;
+  **最优 (16, 2)**,全 4599 tile-days 外推 ~52.6 h。
+- **01-01 复现门通过**(63 tile-days @ (16,2),0.49 h,实测 128.2/h):
+  与既有试跑 7/7 对象逐列零差——tier1_identity 5 grid_lens / 1
+  underresolved / 1 broad_structure、weak 3、strong 1、well_resolved
+  0,center_lon/center_lat/radius_km 最大差 0.00。
+- 全 73 天已启动((16,2),resume 复用 01-01,剩余 4536 tile-days);
+  完成后本报告回填分 Tier occupancy 与对象分级数字。
