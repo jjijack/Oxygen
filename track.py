@@ -53165,7 +53165,12 @@ def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
     points = _ofes_mccoy_sampling_points(
         core_lon, core_lat, event_radius, settings
     )
-    load_radius = settings['background_outer_radius_km'] + 30.0
+    # 加载窗口必须覆盖最远的 0.70R 采样点(per-stage 逐日半径可大于
+    # peak 半径);窗口扩大不改变同一批采样点的任何插值结果。
+    load_radius = max(
+        float(settings['background_outer_radius_km']) + 30.0,
+        0.70 * float(event_radius) + 30.0,
+    )
     scale = approximate_degree_length(core_lat)
     lon_half = (
         load_radius * 1000.0 / float(scale['meters_per_degree_lon'])
@@ -65603,6 +65608,7 @@ def run_ofes_event_daily_water_mass_audit(
                 ),
                 'settings': settings,
             })
+        tasks = moving_tasks
         task_results = []
         if moving_tasks:
             with get_context('fork').Pool(int(worker_count)) as pool:
