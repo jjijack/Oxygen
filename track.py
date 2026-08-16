@@ -39397,6 +39397,597 @@ def run_ofes_grid_scv_v2_annual_catalog(
     }
 
 
+def _ofes_grid_scv_v2_s5_tile_day_task(task: dict) -> dict:
+    """单 tile-day 紧凑任务:检测、删 profile_cache、写 Voronoi wet counts。
+
+    与既有 annual runner 相同的检测调用与 wet-counts 口径(每格点恰好
+    归属一个 tile、无双计),worker_count=1(实测 worker 数几乎无增益)。
+    """
+    date = pd.Timestamp(task['date'])
+    tile_dir = Path(task['tile_dir'])
+    v2_settings = dict(task['settings'])
+    result = detect_ofes_grid_scv_v2_day(
+        date,
+        float(task['tile_lon']),
+        float(task['tile_lat']),
+        0.0,
+        settings=v2_settings,
+        output_dir=tile_dir,
+        worker_count=1,
+    )
+    cache_path = tile_dir / 'profile_cache.parquet'
+    if cache_path.exists():
+        cache_path.unlink()
+    summary = dict(result['summary'])
+    summary['storage_mode'] = 'compact'
+    _ofes_atomic_write_json(summary, tile_dir / 'day_summary.json')
+    fields = result['fields']
+    lat_centers = task['lat_centers']
+    lon_centers = task['lon_centers']
+    tile_index = int(task['tile_index'])
+    unique = np.asarray(fields['unique_crossing'], dtype=bool)
+    owner_local = (
+        _ofes_grid_v2_nearest_center(
+            np.asarray(fields['lat'], dtype=float), lat_centers
+        )[:, None] * lon_centers.size
+        + _ofes_grid_v2_nearest_center(
+            np.asarray(fields['lon'], dtype=float), lon_centers
+        )[None, :]
+    )
+    voronoi_cell = owner_local == tile_index
+    lat_bands = np.floor(np.asarray(fields['lat'], dtype=float)).astype(int)
+    lat_bands_grid = np.broadcast_to(lat_bands[:, None], unique.shape[1:])
+    wet_rows: list[dict] = []
+    for node_index in range(unique.shape[0]):
+        node_inner = unique[node_index] & voronoi_cell
+        band_counts = np.bincount(
+            lat_bands_grid[node_inner], minlength=91
+        )
+        for band in np.flatnonzero(band_counts):
+            wet_rows.append({
+                'node_index': int(node_index),
+                'sigma0': float(fields['nodes_sigma0'][node_index]),
+                'lat_band_deg': int(band),
+                'wet_cell_count': int(band_counts[band]),
+            })
+    _atomic_write_parquet(
+        pd.DataFrame(wet_rows), tile_dir / 'node_wet_counts.parquet'
+    )
+    return {
+        'tile_dir': str(tile_dir),
+        'date': pd.Timestamp(date).normalize(),
+        'objects': result['objects'],
+        'voxels': result['voxels'],
+        'summary': summary,
+    }
+
+
+def _ofes_grid_scv_v2_s5_resume(
+    tile_dir: Path,
+    v2_settings: dict,
+) -> bool:
+    """S5 紧凑日片 resume 判定:complete、三哈希一致、compact 标记、
+    九个紧凑文件齐全(不要求 profile_cache)。"""
+    summary_path = tile_dir / 'day_summary.json'
+    if not summary_path.exists():
+        return False
+    try:
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return False
+    repo_root = Path(__file__).resolve().parent
+    if summary.get('status') != 'complete':
+        return False
+    if summary.get('storage_mode') != 'compact':
+        return False
+    if summary.get('code_sha256') != _ofes_grid_scv_v2_code_sha256():
+        return False
+    if summary.get('processing_config_sha256') != _file_sha256(
+        repo_root / 'config' / 'processing.yml'
+    ):
+        return False
+    required = (
+        'seeds.parquet', 'prefilter_scan.parquet', 'objects.parquet',
+        'voxels.parquet', 'profile_only.parquet', 'node_support.parquet',
+        'layer_diagnostics.parquet', 'node_wet_counts.parquet',
+    )
+    return all((tile_dir / name).exists() for name in required)
+
+
+def run_ofes_grid_scv_v2_s5_background_sensitivity(
+    *,
+    year: int = 2003,
+    stride_days: int = 5,
+    output_dir: str | Path | None = None,
+    settings: dict | None = None,
+    tile_day_workers: int = 1,
+    resume: bool = True,
+    max_tile_days: int | None = None,
+) -> dict:
+    """S5 系统抽样年度背景敏感性(独立协议,不冒充 365 日 null)。
+
+    按冻结协议 `ofes-grid-scv-v2-s5-background-sensitivity.md` 运行
+    2003-01-01 起每 `stride_days` 天一天的逐日逐 tile 检测(73 天 × 63
+    tile = 4599 tile-day):tile-day 级并行(基准 8/12/16 进程);紧凑
+    存储(不持久化 profile_cache);occupancy 按 detector tier 分列
+    (tier1 / weak_native / strong_native / well_resolved);**不做 Tier-3
+    逐日追踪**(5 天间隔与逐日关联不兼容)。复现门:2003-01-01 的 7 个
+    对象分级必须与既有试跑逐值一致,否则停止。
+
+    参数:
+        - year (int): OFES 年度(默认 2003)。
+        - stride_days (int): 抽样步长(默认 5;协议冻结值,改值即新运行
+          签名)。
+        - output_dir (str | Path | None): 输出根;None 写 v2 结果根的
+          `annual_s5_stride5/`。
+        - settings (dict | None): 已解析或覆盖的 v2 设置。
+        - tile_day_workers (int): tile-day 级并行进程数(只进 provenance,
+          不进科学签名)。
+        - resume (bool): 复用紧凑日片(三哈希 + compact 标记齐全)。
+        - max_tile_days (int | None): 基准模式:只新算前 N 个 tile-day,
+          跳过聚合与复现门,只报墙钟与吞吐。
+
+    返回:
+        - dict: run_dir、manifest、objects、occupancy、summary(基准
+          模式为 benchmark 摘要)。
+
+    输出:
+        - `manifest.json`、`s5_objects.parquet`、`s5_occupancy.parquet`、
+          `s5_summary.json` 与逐 tile-day 紧凑日片目录。
+
+    说明:
+        - 检测调用与阈值和既有 annual runner 完全相同;S5 协议只冻结
+          抽样、存储与统计口径。
+        - 论文主 null 仍是同日 120–240 km 事件环带对比;本运行只作
+          年度背景敏感性。
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import time as time_module
+
+    v2_settings = _ofes_grid_scv_v2_settings(settings)
+    repo_root = Path(__file__).resolve().parent
+    protocol_path = repo_root / 'ofes-grid-scv-v2-s5-background-sensitivity.md'
+    processing_path = repo_root / 'config' / 'processing.yml'
+    results_root = Path('/mnt/w2/scratch/user3/Oxygen-cache/ofes_grid_scv_v2_results')
+    dates = pd.date_range(
+        start=f'{int(year)}-01-01', end=f'{int(year)}-12-31', freq='D'
+    )[::int(stride_days)]
+    lon_all, lat_all, _, _, _ = _ofes_tracer_coordinates(dates[0])
+    lon_all = np.asarray(lon_all, dtype=float)
+    lat_all = np.asarray(lat_all, dtype=float)
+    outer_km = float(v2_settings['background_outer_radius_km'])
+    tile_layout = _ofes_grid_v2_tile_layout(lon_all, lat_all, outer_km)
+    tile_centers = tile_layout['tile_centers']
+    lat_centers = tile_layout['lat_centers']
+    lon_centers = tile_layout['lon_centers']
+    root = (
+        Path(output_dir)
+        if output_dir is not None
+        else results_root / f'annual_s5_stride{int(stride_days)}'
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    day_root = root / 'days'
+    day_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'schema_version': 3,
+        'method': 'ofes_grid_scv_v2_s5_background_sensitivity',
+        'year': int(year),
+        'stride_days': int(stride_days),
+        'date_count': int(len(dates)),
+        'dates': [pd.Timestamp(date).strftime('%Y-%m-%d') for date in dates],
+        'tile_count': int(len(tile_centers)),
+        'tile_lon_centers': [float(v) for v in lon_centers],
+        'tile_lat_centers': [float(v) for v in lat_centers],
+        'tile_coverage_max_distance_km': float(
+            tile_layout['max_distance_km']
+        ),
+        'compact_storage': True,
+        'tier3_tracking': False,
+        'detection_protocol_sha256': _file_sha256(
+            repo_root / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'
+        ),
+        's5_protocol_sha256': _file_sha256(protocol_path),
+        'processing_config_sha256': _file_sha256(processing_path),
+        'code_sha256': _ofes_grid_scv_v2_code_sha256(),
+        'settings': v2_settings,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'),
+        default=_ofes_json_default,
+    )
+    run_signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            existing.get('run_signature') == run_signature
+            and existing.get('status') == 'complete'
+        ):
+            return {
+                'run_dir': root,
+                'manifest': existing,
+                'objects': pd.read_parquet(root / 's5_objects.parquet'),
+                'occupancy': pd.read_parquet(root / 's5_occupancy.parquet'),
+                'summary': json.loads(
+                    (root / 's5_summary.json').read_text(encoding='utf-8')
+                ),
+                'reused_complete_run': True,
+            }
+    manifest = {
+        **payload,
+        'run_signature': run_signature,
+        'status': 'running',
+        'tile_day_workers': int(tile_day_workers),
+        'completed_tile_day_count': 0,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    pending: list[dict] = []
+    completed_tile_days = 0
+    for date_index, date in enumerate(dates):
+        for tile_index, (tile_lon, tile_lat) in enumerate(tile_centers):
+            tile_id = f't{date_index:03d}_{tile_index:03d}'
+            tile_dir = day_root / f'{pd.Timestamp(date):%Y%m%d}_{tile_id}'
+            if resume and _ofes_grid_scv_v2_s5_resume(
+                tile_dir, v2_settings
+            ):
+                completed_tile_days += 1
+                continue
+            pending.append({
+                'date': pd.Timestamp(date).normalize(),
+                'tile_lon': float(tile_lon),
+                'tile_lat': float(tile_lat),
+                'tile_dir': str(tile_dir),
+                'tile_index': int(tile_index),
+                'lat_centers': lat_centers,
+                'lon_centers': lon_centers,
+                'settings': v2_settings,
+            })
+    total_tile_days = int(len(dates) * len(tile_centers))
+    benchmark_mode = max_tile_days is not None
+    if benchmark_mode and pending:
+        pending = pending[:int(max_tile_days)]
+    started = time_module.time()
+    if pending:
+        workers = min(int(tile_day_workers), len(pending))
+        if workers == 1:
+            results = [
+                _ofes_grid_scv_v2_s5_tile_day_task(task) for task in pending
+            ]
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        _ofes_grid_scv_v2_s5_tile_day_task, task
+                    )
+                    for task in pending
+                ]
+                results = [future.result() for future in futures]
+        completed_tile_days += len(results)
+    elapsed_h = (time_module.time() - started) / 3600.0
+    if benchmark_mode:
+        benchmark = {
+            'status': 'benchmark_complete',
+            'tile_day_workers': int(tile_day_workers),
+            'computed_tile_days': len(pending),
+            'elapsed_hours': float(elapsed_h),
+            'tile_days_per_hour': (
+                float(len(pending) / elapsed_h) if elapsed_h > 0 else np.nan
+            ),
+            'pending_remaining': int(total_tile_days - completed_tile_days),
+        }
+        manifest.update({
+            'status': 'benchmark',
+            'benchmark': benchmark,
+            'completed_tile_day_count': completed_tile_days,
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        return {
+            'run_dir': root,
+            'manifest': manifest,
+            'benchmark': benchmark,
+        }
+    # 聚合:同日同号中心去重(与既有 annual runner 同一规则)。
+    object_frames: list[pd.DataFrame] = []
+    voxel_frames: list[pd.DataFrame] = []
+    wet_frames: list[pd.DataFrame] = []
+    for tile_dir in sorted(day_root.iterdir()):
+        objects_path = tile_dir / 'objects.parquet'
+        if objects_path.exists():
+            tile_objects = pd.read_parquet(objects_path)
+            if not tile_objects.empty:
+                tile_objects = tile_objects.copy()
+                tile_objects['tile_dir'] = str(tile_dir.name)
+                tile_objects['object_id'] = (
+                    tile_dir.name + '_' + tile_objects['object_id'].astype(str)
+                )
+                object_frames.append(tile_objects)
+        voxels_path = tile_dir / 'voxels.parquet'
+        if voxels_path.exists():
+            tile_voxels = pd.read_parquet(voxels_path)
+            if not tile_voxels.empty:
+                tile_voxels = tile_voxels.copy()
+                tile_voxels['object_id'] = (
+                    tile_dir.name + '_' + tile_voxels['object_id'].astype(str)
+                )
+                voxel_frames.append(tile_voxels)
+        wet_path = tile_dir / 'node_wet_counts.parquet'
+        if wet_path.exists():
+            wet = pd.read_parquet(wet_path)
+            if not wet.empty:
+                wet = wet.copy()
+                wet['tile_dir'] = str(tile_dir.name)
+                wet['month'] = pd.to_datetime(
+                    tile_dir.name[:8], format='%Y%m%d'
+                ).month
+                wet_frames.append(wet)
+    objects = (
+        pd.concat(object_frames, ignore_index=True) if object_frames
+        else pd.DataFrame()
+    )
+    voxels = (
+        pd.concat(voxel_frames, ignore_index=True) if voxel_frames
+        else pd.DataFrame()
+    )
+    wet_counts = (
+        pd.concat(wet_frames, ignore_index=True) if wet_frames
+        else pd.DataFrame()
+    )
+    keep_ids: set[str] = set()
+    if not objects.empty:
+        objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+        objects['radius_km'] = objects['radius_km'].astype(float)
+        dropped = set()
+        for (date, sign), group in objects.groupby(
+            ['date', 'spice_sign'], sort=True
+        ):
+            ordered = group.sort_values(
+                'radius_km', ascending=False, kind='mergesort'
+            )
+            kept: list[dict] = []
+            for record in ordered.to_dict('records'):
+                duplicate = False
+                for kept_record in kept:
+                    separation = float(great_circle_distance_m(
+                        np.asarray([kept_record['center_lon']]),
+                        np.asarray([kept_record['center_lat']]),
+                        float(record['center_lon']),
+                        float(record['center_lat']),
+                    )[0]) / 1000.0
+                    if separation < 0.5 * min(
+                        float(kept_record['radius_km']),
+                        float(record['radius_km']),
+                    ):
+                        duplicate = True
+                        break
+                if duplicate:
+                    dropped.add(str(record['object_id']))
+                else:
+                    kept.append(record)
+        objects = objects.loc[
+            ~objects['object_id'].astype(str).isin(dropped)
+        ].reset_index(drop=True)
+        keep_ids = set(objects['object_id'].astype(str))
+    if not voxels.empty:
+        voxels = voxels.loc[
+            voxels['object_id'].astype(str).isin(keep_ids)
+        ].reset_index(drop=True)
+    # 复现门(协议第六节):2003-01-01 与既有试跑逐值一致。
+    trial_dir = results_root / 'annual'
+    trial_objects = pd.read_parquet(trial_dir / 'annual_objects.parquet')
+    trial_day = trial_objects.loc[
+        pd.to_datetime(trial_objects['date']).dt.normalize()
+        == pd.Timestamp('2003-01-01')
+    ]
+    s5_day = objects.loc[
+        objects['date'].dt.normalize() == pd.Timestamp('2003-01-01')
+    ] if not objects.empty else objects
+    compare_columns = [
+        'spice_sign', 'tier1_identity', 'weak_native_support',
+        'strong_native_support', 'well_resolved_grid_lens',
+        'center_lon', 'center_lat', 'radius_km',
+    ]
+    trial_key = trial_day[compare_columns].sort_values(
+        ['center_lat', 'center_lon']
+    ).reset_index(drop=True)
+    s5_key = s5_day[compare_columns].sort_values(
+        ['center_lat', 'center_lon']
+    ).reset_index(drop=True)
+    gate = {
+        'trial_20030101_objects': int(len(trial_day)),
+        's5_20030101_objects': int(len(s5_day)),
+        'compared_columns': compare_columns,
+        'all_close': bool(
+            len(trial_day) == len(s5_day)
+            and len(s5_day) > 0
+            and all(
+                np.allclose(
+                    trial_key[column].astype(float)
+                    if pd.api.types.is_numeric_dtype(trial_key[column])
+                    else trial_key[column],
+                    s5_key[column].astype(float)
+                    if pd.api.types.is_numeric_dtype(trial_key[column])
+                    else s5_key[column],
+                    rtol=0.0,
+                    atol=1e-9,
+                    equal_nan=True,
+                )
+                if pd.api.types.is_numeric_dtype(trial_key[column])
+                else trial_key[column].astype(str).equals(
+                    s5_key[column].astype(str)
+                )
+                for column in compare_columns
+            )
+        ),
+        'trial_tier1_grid_lens': int(
+            (trial_day['tier1_identity'] == 'grid_lens').sum()
+        ),
+        's5_tier1_grid_lens': int(
+            (s5_day['tier1_identity'] == 'grid_lens').sum()
+        ),
+    }
+    if not gate['all_close']:
+        manifest.update({
+            'status': 'failed',
+            'error': (
+                'S5 reproducibility gate failed for 2003-01-01: '
+                f"trial {gate['trial_20030101_objects']} objects vs "
+                f"s5 {gate['s5_20030101_objects']} objects not "
+                'matching on '
+                f"{', '.join(compare_columns)}."
+            ),
+            'reproducibility_gate': gate,
+            'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        })
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise RuntimeError(manifest['error'])
+    # 分 Tier occupancy(协议第三节):四 tier 共享分母,分子分列。
+    occupancy_rows: list[dict] = []
+    if not wet_counts.empty:
+        wet_keyed = wet_counts.groupby(
+            ['month', 'lat_band_deg', 'node_index'], as_index=False
+        )['wet_cell_count'].sum()
+        if not voxels.empty:
+            voxel_summary = voxels.merge(
+                objects[['object_id', 'tier1_identity',
+                         'weak_native_support', 'strong_native_support',
+                         'well_resolved_grid_lens']],
+                on='object_id', how='inner',
+            )
+            voxel_summary['month'] = pd.to_datetime(
+                voxel_summary['date']
+            ).dt.month
+            voxel_summary['lat_band_deg'] = np.floor(
+                voxel_summary['voxel_lat'].astype(float)
+            ).astype(int)
+            voxel_summary['cell_key'] = (
+                voxel_summary['date'].astype(str) + '_'
+                + voxel_summary['month'].astype(str) + '_'
+                + voxel_summary['lat_band_deg'].astype(str) + '_'
+                + voxel_summary['node_index'].astype(str) + '_'
+                + (voxel_summary['voxel_lat'].astype(float)
+                   * 100).round().astype(str) + '_'
+                + (voxel_summary['voxel_lon'].astype(float)
+                   * 100).round().astype(str)
+            )
+            tiers = (
+                ('tier1', voxel_summary['tier1_identity'] == 'grid_lens'),
+                ('weak_native', voxel_summary['weak_native_support']),
+                ('strong_native', voxel_summary['strong_native_support']),
+                ('well_resolved', voxel_summary['well_resolved_grid_lens']),
+            )
+            for tier_name, tier_mask in tiers:
+                unique_cells = voxel_summary.loc[tier_mask].drop_duplicates(
+                    'cell_key'
+                )
+                occupied = unique_cells.groupby(
+                    ['month', 'lat_band_deg', 'node_index'], as_index=False
+                ).size().rename(columns={'size': 'occupied_cell_count'})
+                merged = wet_keyed.merge(
+                    occupied,
+                    on=['month', 'lat_band_deg', 'node_index'],
+                    how='left',
+                )
+                merged['occupied_cell_count'] = (
+                    merged['occupied_cell_count'].fillna(0).astype(int)
+                )
+                merged['occupancy_fraction'] = (
+                    merged['occupied_cell_count']
+                    / merged['wet_cell_count']
+                )
+                merged['tier'] = tier_name
+                occupancy_rows.append(merged)
+    occupancy = pd.concat(
+        occupancy_rows, ignore_index=True
+    ) if occupancy_rows else pd.DataFrame()
+    if not occupancy.empty:
+        occupancy['sigma0'] = occupancy['node_index'].map(
+            dict(enumerate(np.asarray(
+                _ofes_grid_sigma0_nodes(_ofes_grid_scv_settings())
+            )))
+        )
+    _atomic_write_parquet(objects, root / 's5_objects.parquet')
+    _atomic_write_parquet(occupancy, root / 's5_occupancy.parquet')
+    s5_summary = {
+        'status': 'complete',
+        'tile_count': int(len(tile_centers)),
+        'date_count': int(len(dates)),
+        'total_tile_day_count': total_tile_days,
+        'completed_tile_day_count': completed_tile_days,
+        'object_count': int(len(objects)),
+        'reproducibility_gate': gate,
+        'tier_object_counts': (
+            {
+                'tier1_grid_lens': int(
+                    (objects['tier1_identity'] == 'grid_lens').sum()
+                ) if not objects.empty else 0,
+                'weak_native': int(
+                    objects['weak_native_support'].sum()
+                ) if not objects.empty else 0,
+                'strong_native': int(
+                    objects['strong_native_support'].sum()
+                ) if not objects.empty else 0,
+                'well_resolved': int(
+                    objects['well_resolved_grid_lens'].sum()
+                ) if not objects.empty else 0,
+            }
+        ),
+        'occupancy': (
+            {
+                tier: {
+                    'occupied_cell_total': int(
+                        occupancy.loc[
+                            occupancy['tier'] == tier,
+                            'occupied_cell_count',
+                        ].sum()
+                    ),
+                    'overall_fraction': float(
+                        occupancy.loc[
+                            occupancy['tier'] == tier,
+                            'occupied_cell_count',
+                        ].sum()
+                        / occupancy.loc[
+                            occupancy['tier'] == tier,
+                            'wet_cell_count',
+                        ].sum()
+                    ),
+                }
+                for tier in (
+                    'tier1', 'weak_native', 'strong_native',
+                    'well_resolved',
+                )
+            }
+            if not occupancy.empty else {}
+        ),
+        'elapsed_hours': float(elapsed_h),
+        'notes': [
+            'S5 系统抽样敏感性;不声称完成 365 日 null。',
+            '不做 Tier-3 逐日追踪(5 天间隔不兼容)。',
+            '论文主 null 仍是同日 120-240 km 事件环带对比。',
+        ],
+    }
+    _ofes_atomic_write_json(s5_summary, root / 's5_summary.json')
+    manifest.update({
+        'status': 'complete',
+        'completed_tile_day_count': completed_tile_days,
+        'outputs': {
+            's5_objects': str((root / 's5_objects.parquet').resolve()),
+            's5_occupancy': str((root / 's5_occupancy.parquet').resolve()),
+            's5_summary': str((root / 's5_summary.json').resolve()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    })
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'objects': objects,
+        'occupancy': occupancy,
+        'summary': s5_summary,
+    }
+
+
 def _ofes_grid_v2_do_catalog_root(population_path: str | Path) -> Path:
     """从 population 权威目录向上解析 DO 事件目录根。"""
     root = Path(population_path).resolve()
