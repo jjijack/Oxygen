@@ -39413,7 +39413,7 @@ def _ofes_grid_scv_v2_s5_tile_day_task(task: dict) -> dict:
         0.0,
         settings=v2_settings,
         output_dir=tile_dir,
-        worker_count=1,
+        worker_count=int(task.get('tile_worker_count', 1)),
     )
     cache_path = tile_dir / 'profile_cache.parquet'
     if cache_path.exists():
@@ -39501,6 +39501,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     output_dir: str | Path | None = None,
     settings: dict | None = None,
     tile_day_workers: int = 1,
+    tile_worker_count: int = 1,
     resume: bool = True,
     max_tile_days: int | None = None,
 ) -> dict:
@@ -39523,6 +39524,8 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
         - settings (dict | None): 已解析或覆盖的 v2 设置。
         - tile_day_workers (int): tile-day 级并行进程数(只进 provenance,
           不进科学签名)。
+        - tile_worker_count (int): 每个 tile-day 内 profile 缓存的
+          进程数(只进 provenance;基准显示此轴影响显著,试跑口径 8)。
         - resume (bool): 复用紧凑日片(三哈希 + compact 标记齐全)。
         - max_tile_days (int | None): 基准模式:只新算前 N 个 tile-day,
           跳过聚合与复现门,只报墙钟与吞吐。
@@ -39618,6 +39621,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
         'run_signature': run_signature,
         'status': 'running',
         'tile_day_workers': int(tile_day_workers),
+        'tile_worker_count': int(tile_worker_count),
         'completed_tile_day_count': 0,
         'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
     }
@@ -39639,6 +39643,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
                 'tile_lat': float(tile_lat),
                 'tile_dir': str(tile_dir),
                 'tile_index': int(tile_index),
+                'tile_worker_count': int(tile_worker_count),
                 'lat_centers': lat_centers,
                 'lon_centers': lon_centers,
                 'settings': v2_settings,
