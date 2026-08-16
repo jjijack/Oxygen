@@ -61,15 +61,32 @@ time_to_half 53/56 右删失(检测期内未降到 peak 50%),不参与比较。
 "衰减速度显著更慢";直接衰减证据只有 slope——代理版 p=0.050 仅名义
 边缘(CI 跨 0),真实水团项版 p=0.127,retention 结论保持"有限"。
 
-**真实水团项版(650 观测日逐日 water-mass/heave 分解,运行
-`ofes_daily_water_mass_afa024fe7a6e`,peak 日与 population 逐位一致
-56/56 零差)**:carrier 组归一化水团项衰减斜率 −0.118/day vs 非 carrier
-−0.254/day(慢约 2.2 倍,方向与 ΔDO 代理一致,median diff +0.136,
-bootstrap CI [−0.001, +0.377],MW p=0.127);post-peak AUC 0.94 vs 0.72
-(p=0.18);wm_peak 75.6 vs 65.6 μmol kg⁻¹。真实分量上的滞留优势方向一致
-但弱于代理版、未达显著——如实记录,retention 结论保持"有限"。
-另外全 650 观测日 w_along(`ofes_walong_6f4cf2337fd1`,0 错误、56/56
-全天数)已落盘,可做逐日俯冲强度时序。
+**真实水团项版,两种几何口径(2026-08-16 按审核修正)**:
+
+- **fixed-site persistence(Eulerian,运行
+  `ofes_daily_water_mass_afa024fe7a6e`,peak 日与 population 逐位一致
+  56/56 零差)**:固定 peak 核心位置 + 事件 core_depth_m 参考深度。
+  carrier 组归一化水团项衰减斜率 −0.118/day vs 非 carrier −0.254/day
+  (慢约 2.2 倍,方向与 ΔDO 代理一致,median diff +0.136,bootstrap CI
+  [−0.001, +0.377],MW p=0.127);post-peak AUC 0.94 vs 0.72(p=0.18);
+  wm_peak 75.6 vs 65.6 μmol kg⁻¹。测的是同一固定站点上的信号持续,
+  **不是移动载体的 retention**。
+- **moving-core(运行 `ofes_daily_water_mass_256fb2a16c4e`,56 任务 0
+  错误,peak 日目标 σ0 与冻结值 56/56 零差)**:水平位置逐日跟随对象峰,
+  目标 σ0 冻结为事件 peak 值,参考深度沿前一日等密面交点连续选择。
+  carrier 组水团项衰减斜率 −0.0025/day vs 非 carrier −0.0885/day
+  (median diff +0.086,bootstrap CI [0.004, 0.190],MW p=0.122);
+  wm_peak 52.5 vs 42.0 μmol kg⁻¹(p=0.094;峰值值与 fixed-site 不同是
+  参考深度口径所致——moving-core 用逐日连续交点深度,fixed-site 用
+  事件 core_depth_m,不矛盾)。**随载体移动时水团信号几乎不衰减**
+  (斜率比 fixed-site 小一个量级以上)——这是移动参考系下 retention 的
+  直接证据,但组间差异仍未达显著(与 FDR 纪律一致)。
+
+三个口径(ΔDO 代理、fixed-site、moving-core)方向全部一致:carrier 组
+衰减更慢。moving-core 的斜率差 CI 不含 0 但 MW p=0.122——如实记录,
+retention 结论保持"有限";AUC 类响应受观测持续时间直接影响,不作
+独立证据。另外全 650 观测日 w_along(`ofes_walong_6f4cf2337fd1`,
+0 错误、56/56 全天数)已落盘,可做逐日俯冲强度时序。
 
 稳健性回归(lifetime ~ persistent_carrier + peak_ΔDO + core_depth +
 sigma0 + start_doy,n=56):carrier β=+3.1,p=0.23(ns);**peak_ΔDO
