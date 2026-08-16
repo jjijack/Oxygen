@@ -18,11 +18,17 @@
 | strain→rotation | 8 | 2 | 1 | 3 | 4 |
 | rotation→strain | 10 | 6 | 1 | 2 | 3 |
 
-- **rotation 在 onset 已存在的事件 = 29/56**(19 始终 + 10 转出);strain
-  起始 = 27/56(19 始终 + 8 转入)。两类起始形态几乎各半。
+- **rotation 在 early 阶段(前 ≤3 个 detected 日)已存在的事件 =
+  29/56**(19 始终 + 10 转出);strain 起始 = 27/56(19 始终 + 8 转入)。
+  两类起始形态几乎各半。
 - strain→rotation(8)只有 2/8 成为 persistent carrier——**后期转入旋转
-  并不带来滞留身份**;persistent carrier 几乎全部(19/19)在 onset 就是
-  rotation。SCV-compatible(4/6)与 McCoy-any(8/19)集中于 always-rotation。
+  并不带来滞留身份**;persistent carrier 几乎全部(19/19)在 always-
+  rotation(early 与 late 都为 rotation)。**口径注意(2026-08-16 修正)**:
+  early 三日分类 ≠ 真正 start-day——按逐日 rotation_dominated 的
+  start-day 口径,persistent carrier 中 start-day 即为 rotation 的是
+  23/27,early 三日口径为 25/27;"19/19"只是 always-rotation 组内的
+  数,不应读成"carrier 从第一天起就旋转"。SCV-compatible(4/6)与
+  McCoy-any(8/19)集中于 always-rotation。
 - start→peak 连续变化:Δr_share 中位 0.0(正占比 0.48,无系统增长);
   Δnormalized_strain 中位 +0.011;Δbbox 纵横比中位 +0.18(对象向 peak
   变得更细长);ΔDO 中位 +7.17(构造性增长)。
@@ -48,8 +54,12 @@
 | DO 指纹保持日占比 | 1.0 vs 1.0 | 0 | [0, 0] | 0.31 |
 
 Secondary(peak rotation 29 vs 27):lifetime +5(p=0.75);衰减斜率 +0.011
-(p=0.125);**post-peak AUC +5.5,CI [1.05, +7.38],p=0.015**。
+(p=0.125);post-peak AUC +5.5,CI [1.05, +7.38],p=0.015。
 time_to_half 53/56 右删失(检测期内未降到 peak 50%),不参与比较。
+
+**解释纪律(2026-08-16 修正)**:AUC 受观测持续时间直接影响,不得写成
+"衰减速度显著更慢";直接衰减证据只有 slope——代理版 p=0.050 仅名义
+边缘(CI 跨 0),真实水团项版 p=0.127,retention 结论保持"有限"。
 
 **真实水团项版(650 观测日逐日 water-mass/heave 分解,运行
 `ofes_daily_water_mass_afa024fe7a6e`,peak 日与 population 逐位一致
@@ -64,9 +74,9 @@ bootstrap CI [−0.001, +0.377],MW p=0.127);post-peak AUC 0.94 vs 0.72
 稳健性回归(lifetime ~ persistent_carrier + peak_ΔDO + core_depth +
 sigma0 + start_doy,n=56):carrier β=+3.1,p=0.23(ns);**peak_ΔDO
 β=+0.43,p=3e-8**;core_depth β=+0.089,p=1e-3;其余 ns。事件寿命主要由
-异常幅度与核心深度决定,**rotation 的寿命优势在控制后被解释掉**;但
-peak-rotation 组的 post-peak AUC 仍显著更大(衰减更慢),carrier 组衰减
-斜率减半(p=0.050,CI 跨 0)。
+异常幅度与核心深度决定,**rotation 的寿命优势在控制后被解释掉**;
+carrier 组衰减斜率名义上减半(p=0.050,CI 跨 0)——AUC 类响应受观测
+持续时间直接影响,不作"衰减更慢"的独立证据(见解释纪律)。
 
 ## 四、明确裁决(lock 要求)
 
@@ -75,17 +85,20 @@ peak-rotation 组的 post-peak AUC 仍显著更大(衰减更慢),carrier 组衰�
 2. **rotation 是否提高异常寿命/相干性?部分、且有限。** 寿命无独立贡献
    (幅度/深度主导);衰减速度确实更慢(AUC p=0.015 显著、斜率 p=0.05
    边缘);指纹保持两组无差别。
-3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接已完成(全部 56
+3. **McCoy-compatible 信号更像哪个阶段?** 三阶段桥接首版已完成(全部 56
    事件 × start/peak/last,168 请求,运行 `ofes_mccoy_stage_bridge_adcffa512438`,
    peak 日与完成运行一致性检查 56/56 零错配;先前的 19-event 条件子集运行
    `14d0247c0a06` 保留为溯源,不再引用):start 4/56、peak 19/56(构造)、
    last 6/56;mean 兼容占比 0.023 / 0.148 / 0.087;start–last 配对
-   Wilcoxon p=0.058。**信号是 peak-成熟期特征,不是 onset 特征**;持续到
-   late 的 6 个事件中 5 个是 rotation_day_fraction=1.0 的全旋转 persistent
-   carrier(另 1 个是 E000176,rotation 占比 0.5 的锋生对照)——**SCV 型
-   形态的滞留与反气旋载体重合**。E000171(唯一 surface-obscured
-   SCV-compatible)peak 日 17/17 兼容 + 17/17 原生速度确认——表层盲区
-   SCV 端元的典范案例。
+   Wilcoxon p=0.058。**首版口径缺陷(2026-08-16 修订中)**:三个阶段的
+   17 点足迹统一取 peak 日位置的 peak_lon/peak_lat——"4→19→6"只说明
+   信号经过固定 peak 位置时强,不能证明"事件在 peak 阶段成熟"。已改为
+   start/peak/last 各自逐日位置的版本重跑(旧版保留为 Eulerian
+   fixed-site sensitivity);本节数字待重跑后更新。
+   (旧版 summary 内"19-event 条件子集"字样是遗留标签错误,以本报告
+   为准。)
+   首版可先结论:E000171(唯一 surface-obscured SCV-compatible)peak 日
+   17/17 兼容 + 17/17 原生速度确认——表层盲区 SCV 端元的典范案例。
 4. **当前最高可用措辞:** `front/strain-dominated filamentary transport`
    与 `anticyclonic subsurface rotational carrier` 是 OFES KE 中并存的
    两种常见形态(起始各 ~50%);strict SCV-like 端元是 always-rotation
@@ -104,13 +117,18 @@ rotation),但无"后装载水团"的时序证据。→ **多机制异质性,不�
 - 全球观测:P(DO50 | SCV)= 6.97% vs 普通 Argo 0.369%,OR = 20.22。
 - OFES 同构:事件核心 McCoy 型虚拟剖面通过率 vs 同日背景 controls =
   14.9% vs 0.45%(背景 20/4480,与全球 0.369% 同量级),pooled OR =
-  **38.77**(Fisher p = 1.55e-87),事件等权通过率差 0.144,bootstrap95
-  [0.076, 0.221],paired Wilcoxon **p = 9.84e-5**。全球富集在模式里被
-  同方向、更强地复现。
+  38.77。**推断纪律(2026-08-16 修正)**:pooled OR 的 952 个足迹与
+  4480 个控制并非独立样本,Fisher p=1.55e-87 存在空间/事件内伪重复;
+  论文推断以**事件等权通过率差 0.144、bootstrap 95% CI [0.076, 0.221]、
+  paired Wilcoxon p = 9.84e-5** 为准,pooled OR 只作描述性量级。全球
+  OR 20.22 与 OFES OR 38.77 的估计口径、条件概率方向与抽样设计不同,
+  不可比较"孰强孰弱",只陈述"同方向富集"。
 - 载体证据:27/56 persistent anticyclonic carrier;6/56 严格
-  SCV-compatible(**6/6 都是 carrier**,1/6 surface-obscured);11/56
-  原生速度确认(反气旋且 rotation>strain);表层弱/反极性在 carrier 内
-  4/27 persistent——**表层涡目录(META)盲区的直接解释**。
+  SCV-compatible,其中 6/6 都是 carrier——**注意这是定义内包含关系
+  (SCV-compatible 定义含持久旋转),不是独立证据**;独立信息是 1/6
+  surface-obscured(E000171,表层盲区)与 11/56 原生速度确认(反气旋且
+  rotation>strain)。表层弱/反极性在 carrier 内 4/27 persistent——
+  **表层涡目录(META)盲区的直接解释**。
 - 输送证据:15 条 resolved-downward 中 9 条由旋转载体承担,且其核心
   运动学 w_along 显著为正(G1)。
 - 全链条 exemplar(SCV-compatible ∩ persistent carrier ∩ resolved

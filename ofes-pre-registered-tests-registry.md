@@ -12,9 +12,9 @@
 
 | # | 检验 | 来源 lock | p | 单测名义 | FDR 后 |
 |---|---|---|---|---|---|
-| 1 | w_along core−ring 单日 | G1 lock | 0.40 | ns | ns |
-| 2 | w_along core−ring 欧拉场 | G1 lock | 0.86 | ns | ns |
-| 3 | w_along core−ring 拉格朗日 | G1 lock | 0.57 | ns | ns |
+| 1 | w_along core−ring 单日 | G1 lock | 0.916 | ns | ns |
+| 2 | w_along core−ring 欧拉场 | G1 lock | 0.574 | ns | ns |
+| 3 | w_along core−ring 逐日平均 | G1 lock | 0.401 | ns | ns |
 | 4 | lag strain→r_share 符号检验 | transition lock | 1.00 | ns | ns |
 | 5 | lag strain→DO 符号检验 | transition lock | 0.648 | ns | ns |
 | 6 | retention lifetime(carrier vs 其余) | transition lock | 0.74 | ns | ns |
@@ -22,11 +22,17 @@
 | 8 | retention post-peak AUC(primary) | transition lock | 0.117 | ns | ns |
 | 9 | McCoy start–last 配对 | transition lock | 0.058 | 边缘 | ns |
 
+(2026-08-16 修正:w_along 三口径 p 值取自最终 3 格平滑运行
+`ofes_walong_16e0d8158d21` 的正式 tests 块——单日 0.916、欧拉场
+0.574、逐日平均 0.401;初版表误抄了旧 5 格敏感性数字,已更正。)
+
 **BH-FDR(q=0.05 与 q=0.10):0/9 存活。** 机制线的全部统计检验在多重
 比较校正下无一显著。这与既有措辞纪律一致(transition 报告已用"有限/
 无两阶段时序"),但把约束显式化:**论文中机制线不得出现"显著"字样,
 一律用描述性/一致性措辞**(如 p=0.050 的衰减斜率只能写"名义上边缘,
-未通过多重比较校正")。
+未通过多重比较校正";AUC 受观测持续时间直接影响,不得写成"衰减速度
+显著更慢"——直接衰减证据是 slope,代理版仅名义边缘、真实水团项版
+p=0.127)。
 
 ## 二、探索性检验(不进 FDR 分母,论文须标注 exploratory)
 
