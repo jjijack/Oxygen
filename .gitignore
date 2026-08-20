@@ -19,6 +19,7 @@ Mat_data_results/
 META_tracks/
 GLORYS_processed/
 *tmp*/
+_tmp_*.py
 __pycache__/
 external/
 test/
