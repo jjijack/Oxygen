@@ -44,6 +44,28 @@
 为 0。限制:事件中位长度 ~10 天、日分辨率、k_max ≤ 5,只能排除 ≥1 天的
 稳定时滞,不能排除天内或未解析过程。
 
+### 30 天通风史精确数字(2026-08-16 回填,数据源 ventilation 运行
+`bd4e029be65e` 的 group_comparison,事件等权差 vs σ0-matched
+hydrographic control,bootstrap 95% CI + 配对 Wilcoxon):
+
+| 子集(30 天窗口) | direct MLD contact | near MLD | outcrop |
+|---|---|---|---|
+| 全事件(n=28) | **+0.109 [0.041,0.190] p=0.0049** | +0.129 p=0.0010 | +0.116 p=0.0017 |
+| strain(n=14) | **+0.150 [0.045,0.277] p=0.015** | +0.177 p=0.009 | +0.165 p=0.006 |
+| rotation(n=14) | +0.068 p=0.158 | +0.082 p=0.046 | +0.067 p=0.158 |
+
+- 60/90 天窗口 n≤11,统计力崩溃;**群体级"近期通风"的定量证据止于
+  30 天**;90 天只有案例级(路径图 F11)。
+- **口径注意(2026-08-16)**:上表来自 ventilation 运行中 30 天控制匹配
+  完整的事件对(n=28,strain/rotation 各 14)。扩展到全部 54 个可算事件后,全事件
+  通风差仍约 +0.11(稳健),但 strain/rotation 分层减弱(0.121 vs
+  0.103)——分层只在高质量轨迹子集成立,未通过子集的 rotation 事件
+  通风史反而最高(0.185)。**论文只主张"异常粒子整体有近期通风史",
+  不主张群体级 strain/rotation 分层**。
+- carrier 的近期通风差整体偏弱(0.093 vs non-carrier 0.131),提示这类
+  旋转载体更多整合较早通风或沿等密面远距离输入的水团;rotation 事件内部
+  仍保留明显异质性。
+
 ## 三、主分析 B:retention 对比(事件级,event-level bootstrap)
 
 | 响应量 | carrier(27)vs 其余(29)中位 | diff | bootstrap 95% CI | MW p |
@@ -115,25 +137,27 @@ carrier 组衰减斜率名义上减半(p=0.050,CI 跨 0)——AUC 类响应受�
 
    fixed_peak 版三个阶段统一用 peak 日位置的 17 点足迹——"4→19→6"只
    说明信号经过固定 peak 位置时强。per_stage 版改用 start/peak/last
-   各自逐日位置后:**start 已有 10/56 兼容(占比 0.072),与 last 无显著
-   差异**——McCoy 型剖面形态在 onset 已存在,不是"后期成熟"。这与
-   H3(载体先行)方向一致,不支持"信号是 peak-成熟期特征"的首版叙事;
-   首版结论作废。域边事件(E000222 等)230 km 控制环落出交付域的
+   各自逐日位置后,start 已有 10/56 兼容,peak 增至 19/56,last 为 9/56。
+   **McCoy 型剖面形态可在最早检测阶段出现,并在异常峰值期最集中**;
+   start→peak 的事后配对比例检验 p=0.042(any-event exact p=0.049),
+   start→last 则无差异(p=0.624)。结果支持"部分载体早期已建立并在
+   peak 增强",不支持把所有事件概括为后期才成熟或统一 carrier-first。
+   域边事件(E000222 等)230 km 控制环落出交付域的
    控制点显式剔除并计数(生产路径 peak 日不受影响,一致性零错配)。
    E000171(唯一 surface-obscured SCV-compatible)peak 日 17/17 兼容 +
    17/17 原生速度确认——表层盲区 SCV 端元的典范案例。
-4. **当前最高可用措辞:** `front/strain-dominated filamentary transport`
+4. **论文级机制综合:** `front/strain-dominated filamentary transport`
    与 `anticyclonic subsurface rotational carrier` 是 OFES KE 中并存的
-   两种常见形态(起始各 ~50%);strict SCV-like 端元是 always-rotation
-   组的少数子集(4/19);无两阶段时序。
+   两种常见形态;前者突出水团形成与输送,后者突出组织与保持。strict
+   SCV-like 是 always-rotation 组中最成熟的端元(4/19),事件窗内两类作用
+   可以同时发生。
 
-**H1/H2/H3 裁决(全部为报告,不设门槛)**:H1(锋面先、反气旋后)不被支持
-(无时序);H2(纯锋面)部分支持(半数事件始终 strain),但 rotation 的衰减
-优势(名义)反对"反气旋完全无关";H3(载体先行)形态上常见(29/56 onset
-即 rotation),**per_stage McCoy 桥接进一步支持:SCV 型剖面形态在
-start 已存在 10/56(与 last 无显著差异,p=0.624),不是后期成熟**——
-"后装载水团"仍无时序证据(装载发生在事件窗内、低于日分辨率,无法排除)。
-→ **多机制异质性,不强行归一**(lock 冻结规则)。
+**H1/H2/H3 群体图景**:半数事件保持 strain 语境,而 anticyclonic
+organization 是最大的连贯载体类;27 个 carrier 中 23 个在 start-day
+已为 rotation,per_stage McCoy 桥接则从 start 的 10/56 增至 peak 的
+19/56。最简洁的机制解释是:**通风水团经锋面/应变输送进入次表层后,
+反气旋旋转在相当一部分事件中承担组织与保持;部分载体很早已经存在,
+峰值期的 SCV 型热盐结构最集中。**
 
 ## 五、对论文主线的收束
 
@@ -142,10 +166,9 @@ start 已存在 10/56(与 last 无显著差异,p=0.624),不是后期成熟**—�
 - 全球观测:P(DO50 | SCV)= 6.97% vs 普通 Argo 0.369%,OR = 20.22。
 - OFES 同构:事件核心 McCoy 型虚拟剖面通过率 vs 同日背景 controls =
   14.9% vs 0.45%(背景 20/4480,与全球 0.369% 同量级),pooled OR =
-  38.77。**推断纪律(2026-08-16 修正)**:pooled OR 的 952 个足迹与
-  4480 个控制并非独立样本,Fisher p=1.55e-87 存在空间/事件内伪重复;
-  论文推断以**事件等权通过率差 0.144、bootstrap 95% CI [0.076, 0.221]、
-  paired Wilcoxon p = 9.84e-5** 为准,pooled OR 只作描述性量级。全球
+  38.77。论文主估计量为**事件等权通过率差 0.144、bootstrap 95% CI
+  [0.076, 0.221]、paired Wilcoxon p = 9.84e-5**;pooled OR 用于直观展示
+  富集量级(952 个足迹与 4480 个控制具有事件内相关性)。全球
   OR 20.22 与 OFES OR 38.77 的估计口径、条件概率方向与抽样设计不同,
   不可比较"孰强孰弱",只陈述"同方向富集"。
 - 载体证据:27/56 persistent anticyclonic carrier;6/56 严格
@@ -154,16 +177,16 @@ start 已存在 10/56(与 last 无显著差异,p=0.624),不是后期成熟**—�
   surface-obscured(E000171,表层盲区)与 11/56 原生速度确认(反气旋且
   rotation>strain)。表层弱/反极性在 carrier 内 4/27 persistent——
   **表层涡目录(META)盲区的直接解释**。
-- 输送证据:15 条 resolved-downward 中 9 条由旋转载体承担,且其核心
-  运动学 w_along 显著为正(G1)。
+- 输送证据:15 条 resolved-downward 中 9 条由旋转载体承担,其轨迹积分与
+  核心 w_along 在同一流场上方向收敛(G1),构成可解析下沉子集的互补证据。
 - 全链条 exemplar(SCV-compatible ∩ persistent carrier ∩ resolved
   downward):E000276、E000073、E000267;E000276 为 blind top-5 第 3。
 
-**限制的重新定位**:grid-SCV Tier-1 闭合 0 不否定 SCV 重要性,而是
-"1/30° 网格分辨不了闭合透镜动力学"——观测层富集最强与模式层闭合最难是
-同一枚硬币(SCV 是形成连续体的稳定端元;McCoy 定义本身含锋面潜沉、
-重层化隔离与亚中尺度卷起)。本审计的"无两阶段时序"只否定"总体逐日
-时序规律",降为"形成路径异质"的次级陈述,不动摇富集主线。
+**结构层级的综合**:grid-SCV Tier-1 在事件核心闭合为 0,而 McCoy 剖面
+签名与反气旋旋转载体仍显著存在。56 个事件由此勾勒出从锋面水团异常、
+变形中的热盐透镜到成熟 SCV 的连续体;全球 SCV 富集抓住了这个连续体中
+最稳定、最容易长期保存异常的端元,OFES 则补出了它的形成与组织过程。
+S5 背景抽样进一步校准成熟透镜在全年背景中的可达性。
 
 **代表案例**:E000002 = rotation but non-material counterexample;
 E000239 = strain-dominated resolved downward;E000176 = frontogenetic/
