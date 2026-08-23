@@ -223,7 +223,13 @@ EVENT_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 TABLE_SUFFIXES = (".parquet", ".pq", ".csv", ".json")
-PRIMARY_PET_CATEGORIES = ("same", "opposite", "no-PET", "ambiguous")
+PRIMARY_PET_CATEGORIES = (
+    "same",
+    "opposite",
+    "no-PET",
+    "ambiguous",
+    "unassessable",
+)
 
 
 def _load_postprocess_config(path: str | FilePath) -> tuple[dict[str, Any], FilePath]:
@@ -1094,12 +1100,15 @@ def _lifecycle_association(
 
 
 def _pet_peak_category(row: Mapping[str, Any], deep_code: int | float) -> str:
-    """Classify a rotation-event PET peak as same/opposite/no/ambiguous."""
+    """Classify a rotation-event PET peak without treating missingness as absence."""
 
-    if not bool(row.get("peak_core_analysis_eligible", False)):
-        return "no-PET"
+    eligible = row.get("peak_core_analysis_eligible")
+    if _is_missing(eligible) or not bool(eligible):
+        return "unassessable"
     contained = row.get("peak_core_contained_by_actual_pet_effective_contour")
-    if _is_missing(contained) or not bool(contained):
+    if _is_missing(contained):
+        return "unassessable"
+    if not bool(contained):
         return "no-PET"
     if _is_missing(deep_code) or not np.isfinite(float(deep_code)):
         return "ambiguous"
@@ -1135,6 +1144,7 @@ def _rotation_crosstab(
     if len(rotation) != expected:
         raise ValueError(f"Expected {expected} rotation events, found {len(rotation)}")
     association_fields = {
+        "peak_core_analysis_eligible",
         "peak_core_contained_by_actual_pet_effective_contour",
         "effective_match_polarity_codes",
     }
@@ -1171,6 +1181,7 @@ def _rotation_crosstab(
             "surface_core_rotation_polarity_match",
             "surface_core_weighted_rossby_number",
             "pet_peak_category",
+            "peak_core_analysis_eligible",
             "peak_core_contained_by_actual_pet_effective_contour",
             "effective_match_polarity_codes",
         ]
@@ -1296,22 +1307,46 @@ def _read_sensitivity_population(
     return selected
 
 
-def _sensitivity_association(ranking: pd.DataFrame, objects: pd.DataFrame) -> pd.DataFrame:
+def _sensitivity_association(
+    ranking: pd.DataFrame,
+    objects: pd.DataFrame,
+    domain: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Associate sensitivity events while preserving PET-domain eligibility."""
+
     records = []
     for row in ranking.to_dict("records"):
         date = pd.Timestamp(row["peak_date"]).normalize()
+        peak_lon, peak_lat = float(row["peak_lon"]), float(row["peak_lat"])
+        lon_index = _nearest_index(domain["lon"], peak_lon)
+        lat_index = _nearest_index(domain["lat"], peak_lat)
+        filter_valid = bool(domain["filter_valid"][lat_index, lon_index])
+        ocean_valid = bool(domain["ocean_valid"][lat_index, lon_index])
+        eligible = filter_valid and ocean_valid
         actual = _valid_surface_rows(objects, date, virtual=False)
-        effective = _point_matches(actual, float(row["peak_lon"]), float(row["peak_lat"]), "effective")
-        speed = _point_matches(actual, float(row["peak_lon"]), float(row["peak_lat"]), "speed")
+        effective = (
+            _point_matches(actual, peak_lon, peak_lat, "effective")
+            if eligible
+            else pd.DataFrame(columns=actual.columns)
+        )
+        speed = (
+            _point_matches(actual, peak_lon, peak_lat, "speed")
+            if eligible
+            else pd.DataFrame(columns=actual.columns)
+        )
         records.append(
             {
                 "event_id": str(row["event_id"]),
                 "peak_date": date,
-                "peak_lon": float(row["peak_lon"]),
-                "peak_lat": float(row["peak_lat"]),
-                "pet_effective_contained": bool(not effective.empty),
-                "pet_speed_contained": bool(not speed.empty),
-                "effective_match_count": int(len(effective)),
+                "peak_lon": peak_lon,
+                "peak_lat": peak_lat,
+                "pet_filter_valid": filter_valid,
+                "pet_ocean_valid": ocean_valid,
+                "pet_analysis_eligible": eligible,
+                "pet_effective_contained": bool(not effective.empty) if eligible else np.nan,
+                "pet_speed_contained": bool(not speed.empty) if eligible else np.nan,
+                "effective_match_count": int(len(effective)) if eligible else np.nan,
+                "speed_match_count": int(len(speed)) if eligible else np.nan,
             }
         )
     return pd.DataFrame(records).sort_values("event_id", kind="mergesort").reset_index(drop=True)
@@ -1338,6 +1373,32 @@ def _wilcoxon_greater(values: Sequence[float]) -> tuple[float, float]:
         return 0.0, 1.0
     result = wilcoxon(array, alternative="greater", zero_method="wilcox")
     return float(result.statistic), float(result.pvalue)
+
+
+def _wilcoxon_two_sided(values: Sequence[float]) -> tuple[float, float]:
+    """Return the paired two-sided Wilcoxon result on finite event values."""
+
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return np.nan, np.nan
+    if np.allclose(array, 0.0, rtol=0.0, atol=0.0):
+        return 0.0, 1.0
+    result = wilcoxon(array, alternative="two-sided", zero_method="wilcox")
+    return float(result.statistic), float(result.pvalue)
+
+
+def _signed_value_counts(values: Sequence[float]) -> dict[str, int]:
+    """Count finite negative, zero, and positive event-level differences."""
+
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    return {
+        "n": int(array.size),
+        "negative": int(np.count_nonzero(array < 0.0)),
+        "zero": int(np.count_nonzero(array == 0.0)),
+        "positive": int(np.count_nonzero(array > 0.0)),
+    }
 
 
 def _as_float(value: Any) -> float:
@@ -2263,10 +2324,11 @@ def run_authoritative_association(
     association["peak_core_containment_any_polarity"] = association[
         "peak_core_contained_by_actual_pet_effective_contour"
     ]
-    association["pet_peak_category"] = np.where(
-        association["peak_core_contained_by_actual_pet_effective_contour"].map(_as_bool).eq(True),
-        "PET-present",
-        "no-PET",
+    containment = association["peak_core_contained_by_actual_pet_effective_contour"]
+    association["pet_peak_category"] = np.select(
+        [containment.isna(), containment.map(_as_bool).eq(True)],
+        ["unassessable", "PET-present"],
+        default="no-PET",
     )
 
     lifecycle = _lifecycle_association(strict, do_daily, observations)
@@ -2337,8 +2399,13 @@ def run_authoritative_association(
     pd.DataFrame(null_rows).to_parquet(null_path, index=False)
 
     rotation = _rotation_crosstab(strict, association, config)
-    association = association.drop(columns=["pet_peak_category"]).merge(
-        rotation[["event_id", "pet_peak_category"]], on="event_id", how="left", validate="one_to_one"
+    association = association.merge(
+        rotation[["event_id", "pet_peak_category"]].rename(
+            columns={"pet_peak_category": "rotation_pet_peak_category"}
+        ),
+        on="event_id",
+        how="left",
+        validate="one_to_one",
     )
     association.to_parquet(association_path, index=False)
     surface_ro_path = output_root / "surface_eddy_surface_ro_crosstab.parquet"
@@ -2360,7 +2427,7 @@ def run_authoritative_association(
     sensitivity_input_sha256 = sha256_file(sensitivity_input_file)
     sensitivity = _read_sensitivity_population(diagnostics_input, config)
     _validate_identity_consistency(strict, sensitivity)
-    sensitivity_result = _sensitivity_association(sensitivity, objects)
+    sensitivity_result = _sensitivity_association(sensitivity, objects, domain)
     sensitivity_path = output_root / "surface_eddy_quality_eligible_161.parquet"
     sensitivity_result.to_parquet(sensitivity_path, index=False)
     plot_paths = _write_plot_outputs(
@@ -2385,6 +2452,9 @@ def run_authoritative_association(
     )
     eligible = association["peak_core_analysis_eligible"].map(_as_bool).eq(True)
     core_effective = association["peak_core_contained_by_actual_pet_effective_contour"].map(_as_bool)
+    sensitivity_eligible = sensitivity_result["pet_analysis_eligible"].map(_as_bool).eq(True)
+    sensitivity_effective = sensitivity_result["pet_effective_contained"].map(_as_bool).eq(True)
+    sensitivity_speed = sensitivity_result["pet_speed_contained"].map(_as_bool).eq(True)
     duration_counts = (
         {str(key): int(value) for key, value in tracks["duration_class"].value_counts().items()}
         if "duration_class" in tracks
@@ -2439,16 +2509,23 @@ def run_authoritative_association(
         "local_ring_null": {
             "core_minus_ring_mean": local_mean,
             "bootstrap_95ci": [local_low, local_high],
+            "event_counts": _signed_value_counts(local_values),
             "wilcoxon_greater": _wilcoxon_greater(local_values),
+            "wilcoxon_two_sided": _wilcoxon_two_sided(local_values),
         },
         "annual_month_latitude_null": {
             "core_minus_annual_mean": annual_mean,
             "bootstrap_95ci": [annual_low, annual_high],
+            "event_counts": _signed_value_counts(annual_values),
             "wilcoxon_greater": _wilcoxon_greater(annual_values),
+            "wilcoxon_two_sided": _wilcoxon_two_sided(annual_values),
             "occupancy_table": str(annual_path),
         },
         "rotation_29": {
             "n": int(len(rotation)),
+            "analysis_eligible": int(
+                rotation["peak_core_analysis_eligible"].map(_as_bool).eq(True).sum()
+            ),
             "pet_peak_category_counts": {str(key): int(value) for key, value in rotation["pet_peak_category"].value_counts().items()},
             "surface_ro_same_polarity_counts": {str(key): int(value) for key, value in rotation["surface_core_rotation_polarity_match"].value_counts(dropna=False).items()},
         },
@@ -2466,8 +2543,10 @@ def run_authoritative_association(
         },
         "quality_eligible_161": {
             "n": int(len(sensitivity_result)),
-            "effective_contained": int(sensitivity_result["pet_effective_contained"].sum()),
-            "speed_contained": int(sensitivity_result["pet_speed_contained"].sum()),
+            "analysis_eligible": int(sensitivity_eligible.sum()),
+            "unassessable": int((~sensitivity_eligible).sum()),
+            "effective_contained": int(sensitivity_effective.sum()),
+            "speed_contained": int(sensitivity_speed.sum()),
             "path": str(sensitivity_path),
         },
         "daily_objects": {
@@ -2510,6 +2589,11 @@ def run_authoritative_association(
         "status": "complete",
         "strict_events": int(len(association)),
         "primary_analysis_eligible": int(eligible.sum()),
+        "rotation_analysis_eligible": int(
+            rotation["peak_core_analysis_eligible"].map(_as_bool).eq(True).sum()
+        ),
+        "quality_sensitivity_events": int(len(sensitivity_result)),
+        "quality_sensitivity_analysis_eligible": int(sensitivity_eligible.sum()),
         "postprocess_config_path": str(postprocess_config_path),
         "postprocess_config_sha256": sha256_file(postprocess_config_path),
         "association_lock_path": str(association_lock_path),
@@ -2522,7 +2606,7 @@ def run_authoritative_association(
     manifest["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     _write_json(manifest_file, manifest)
     association_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "catalog_manifest": str(manifest_file),
@@ -2545,6 +2629,11 @@ def run_authoritative_association(
             "strict_events": int(len(association)),
             "primary_analysis_eligible": int(eligible.sum()),
             "quality_eligible_161": int(len(sensitivity_result)),
+            "quality_analysis_eligible": int(sensitivity_eligible.sum()),
+            "rotation_events": int(len(rotation)),
+            "rotation_analysis_eligible": int(
+                rotation["peak_core_analysis_eligible"].map(_as_bool).eq(True).sum()
+            ),
         },
         "outputs": summary["paths"],
         "summary_sha256": sha256_file(summary_path),
