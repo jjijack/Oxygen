@@ -59,13 +59,14 @@ reported_items(不参与 gate_passed):
 - 正式运行:`validation/`(manifest schema v3,两区 gate)
 - 长跑期间 track.py 零改动;唯一新提交 `50ed103`
 
-## 四、年度扫描决策(待用户)
+## 四、年度扫描决策与 S5 背景校准(已完成)
 
 lock 的节点 6 剩余项:是否启动 `run_ofes_grid_scv_v2_annual_catalog`
 (2003 全年逐日逐 tile 检测,Tier-1 环带 occupancy 启动门)。鉴于
 56 事件结果为 Result C 形态,年度扫描的科学价值取决于目标——若为
 "生产检测器的全球/全年 SCV 目录统计"则可跑;若为"验证 McCoy 等价"
-则不需要(已由节点 4 裁决关闭)。决策待定。
+则不需要(已由节点 4 裁决关闭)。最终采用下述独立命名的 S5 系统抽样
+敏感性完成背景可达性校准,不再把高成本 365 日目录作为本文写作前置条件。
 
 ### 2026-08-16 工程试跑完成(63 tile-days = 2003-01-01)
 
@@ -103,7 +104,7 @@ lock 的节点 6 剩余项:是否启动 `run_ofes_grid_scv_v2_annual_catalog`
   匹配成本,改旧 lock 冒充 365 日正式 null 不许可。**采用独立命名的
   systematic 5-day sampled sensitivity**(协议见下)。
 
-### 2026-08-16 S5 敏感性:协议冻结、基准与复现门(全跑进行中)
+### 2026-08-16--22 S5 敏感性:协议冻结、基准与正式结果
 
 - 协议 `ofes-grid-scv-v2-s5-background-sensitivity.md` 已冻结:步长 5
   天共 73 天、分 Tier occupancy、无 Tier-3、紧凑存储、tile-day 并行、
@@ -127,5 +128,18 @@ lock 的节点 6 剩余项:是否启动 `run_ofes_grid_scv_v2_annual_catalog`
   与既有试跑 7/7 对象逐列零差——tier1_identity 5 grid_lens / 1
   underresolved / 1 broad_structure、weak 3、strong 1、well_resolved
   0,center_lon/center_lat/radius_km 最大差 0.00。
-- 全 73 天已启动((16,2),resume 复用 01-01,剩余 4536 tile-days);
-  完成后本报告回填分 Tier occupancy 与对象分级数字。
+- 全 73 天 × 63 tile 已完成：4599/4599 tile-day、0 个任务错误；
+  01-01 复现门为 7/7 对象、Tier-1 5/5，全部比较字段逐值一致。
+- 共得到 949 个去重对象：Tier-1 549、weak-native 309、
+  strong-native 153、well-resolved 98。按相同 wet-cell 分母计算的背景
+  occupancy 分别为 0.227%、0.119%、0.086% 和 0.082%。
+- 这说明检测器在年度背景中能够找到对象，但强、well-resolved 对象非常
+  稀疏；56 个事件核心的 Tier-1/2 零重合应按低背景占据率解释，不能当作
+  SCV 机制的强反证。S5 仍是 5 天系统抽样敏感性，不冒充 365 日 null。
+- 按事件月份、1° 纬带和目标 σ0 匹配 S5 occupancy，56 个核心的期望命中数
+  仅为 Tier-1 0.237、weak 0.098、strong 0.057、well-resolved 0.024；
+  独立 Bernoulli 参考下观察到 0 个的概率分别为 79%、91%、94%、98%。
+  因此事件核心 0/56 对成熟闭合 grid-SCV 的区分力很低，真正有信息量的仍是
+  McCoy-compatible 剖面富集、原生速度支持子集和过程轨迹。
+- 结果图：`plot_outputs/do/ofes_np30_ke/ofes_paper_figures/
+  F22_grid_scv_s5_background.png`。

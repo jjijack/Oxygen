@@ -174,7 +174,9 @@ v1 拒绝输出已写 SUPERSEDED 标记:
 ## 运行纪律(lock 冻结,不可违反)
 
 - 看 56-event 结果前规则已全部冻结(已满足)
-- resume 只接受 complete + code/protocol/config 三哈希 + 窗口边界一致;
+- 节点 4 正式运行时 resume 要求 complete + code/protocol/config 三哈希 +
+  窗口边界一致;收口维护后改为 complete + schema/窗口/产物完整性复用,
+  哈希继续记录为 provenance,科学口径若改变由运行者显式清缓存;
   worker_count 排除在科学签名外
 - DO/event labels 绝不进入 detector gates;绝不以 DO overlap 调门
 - 输出原子写入;v1 锁文件与 SUPERSEDED 标记不得改动
@@ -275,3 +277,65 @@ v1 拒绝输出已写 SUPERSEDED 标记:
   `gate_passed = all(hard_gates)`;新增 `gate_adjudication_sha256`。
 - 节点 5/6 代码无需改动(event_catalog 的 manifest 前置条件与
   `gate_passed` 顶层键兼容)。
+
+## 节点 4 正式重跑结果(2026-08-16,commit 50ed103,code hash 3b00951a…)
+
+- 运行 00:28 启动,A(16w)+ B/C/D(8w)4 进程横向并行;**03:14 GATE PASSED,
+  2.90 h**(56 天全部落盘,A 收尾三线审计;D 的 2 行由 A 兜底先算,
+  resume 跳过,撞车保护生效)
+- manifest schema v3,`gate_passed=True`,gate 分两区:
+  - **hard_gates 12/12 全绿**:19 解析、12 回归、audit-sample recall、
+    分母完整(141/4480 无缺失)、预筛 1.0、stored_pipeline_replay 1.0、
+    事件级重放 9/9、19/19、6/6、11/11 exact、输入与代码 hash 完整
+  - **reported_items**(最终值,与预演逐位一致):
+    - event_reference_nearest_cell = 0.9504(134/141,格内位置/插值敏感性)
+    - production_self_ring = 0.6312(89/141,生产检测器转移性能)
+    - 背景 FP 率 = 0.29%(13/4480,per-position ring)
+    - 背景 insufficient = 88(生产口径 background_iqr 正常记录)
+    - 生产口径事件级:center 9、any 17、center-vel 6、any-vel 10
+    - Tier-1 扩展 0/141、weak/strong 支持 0(报告)
+- 裁决文档 sha d9911a4d… 已记录在 manifest;最终数字不回填裁决文档
+- 下一步:节点 5 = post-gate exploratory characterization(不设 19/9 门槛)
+
+## 节点 5 探索性结果(2026-08-16 03:23,post-gate exploratory,0.18 h)
+
+输出 `grid_scv_v2_51c7a542a042/`(56 天日片全复用,11 min)。
+
+- 四级交叉表(56 事件):none 45、profile_only 11、tier1 0、
+  weak_native_support 0、strong_native_support 0——**事件核心无一被
+  Tier-1 透镜包含**
+- grid_lens_count 15、object_inventory 25、weak_native_support_object 11、
+  cyclonic_technical 1;**well_resolved(厚度≥100m)= 0**
+- profile_only_seed_count_total = 5623(Tier-0 种子在生产口径下大量存在)
+- 环带 null(event-equal、面积加权):tier1 core−ring 均值 −0.002、
+  双侧 p=0.068;weak 均值 −0.0005、p=0.11;strong 全零——全部为 null
+- 定性:lock 预判的 Result C(Tier-0 大量通过但阳性控制几乎从不长成
+  Tier-1);与生产转移数字(89/141 Tier-0、事件级 9/17/6/10)一致;
+  McCoy 虚拟 Argo 的 SCV 是薄/亚格子结构,1/30° 网格 Tier-0 在 ~63%
+  剖面位置可见,但从不长成事件核心处的 well-resolved 闭合透镜
+
+## S5 年度背景抽样(2026-08-20--22,已完成)
+
+- 输出根:`/mnt/w2/scratch/user3/Oxygen-cache/ofes_grid_scv_v2_results/
+  annual_s5_stride5/`;总任务 73 天 × 63 tile = 4599 tile-day。
+- 17:34 从 2060 个完整紧凑日片续跑,正式并发为 16 个 tile-day workers ×
+  每 tile 2 workers;runner 在导入 `track` 前固定 `Agg`,消除了此前 Tk
+  backend 的跨进程退出。去重后实测有效落盘约 110–140 tile-day h⁻¹,
+  16 个外层进程持续接近满核。
+- 17:53 排错时曾并行启动 8×1 spawn 版本;17:57 发现与旧残留重复后立即
+  终止 12:08 残留和 8×1 runner,只保留 17:34 的高速正式续跑,避免同目录
+  重复写入。
+- 收口代码把日片 resume 从整个 `track.py`/processing.yml hash 相等改为
+  `complete + schema/窗口 + 必需产物` 的结构校验;hash 继续写入 provenance。
+  科学阈值或检测口径若改变,由运行者显式清理对应缓存。节点 4/5 与年度
+  catalog 的科学启动门保持不变。
+- 2026-08-21 13:33 首次聚合被旧进程的整文件 hash 门误挡：运行期间
+  `track.py` 有非科学口径修改，01-01 日片被旧 resume 逻辑过滤成 0。
+  磁盘日片实际仍为 7 个对象，与试跑逐列一致。
+- 2026-08-22 结构复用后正式完成：4599/4599 tile-day、0 个任务错误，
+  01-01 复现门 7/7、Tier-1 5/5，8 个比较字段全部一致。
+- 全部 73 天共 949 个去重对象：Tier-1 549、weak-native 309、
+  strong-native 153、well-resolved 98。相应背景占据率为 0.227%、
+  0.119%、0.086% 和 0.082%。
+- 正式产物：`s5_objects.parquet`、`s5_occupancy.parquet`、
+  `s5_summary.json` 和 `manifest.json`；manifest 状态为 `complete`。

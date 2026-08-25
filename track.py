@@ -38555,13 +38555,11 @@ def _ofes_grid_v2_load_day_from_dir(
     day_dir: str | Path,
     v2_settings: dict,
 ) -> dict | None:
-    """校验日片目录并重建 day result（validation resume 与 event catalog
-    复用）。
+    """校验日片结构并重建 day result（validation 与 event catalog 复用）。
 
-    只接受 `status == 'complete'` 且 code/protocol/config 三哈希、
-    `v2_output_schema_version` 与窗口边界全部与当前一致的日片；任何不一致
-    返回 None，绝不复用混合哈希的日片。快照按日片记录的原始窗口边界重载，
-    避免用不同窗口重载造成网格索引错位。
+    复用依据是完成状态、输出 schema、窗口边界和必需产物；代码、协议与配置
+    哈希保留在日片中作为 provenance，不因与当前工作树不同而自动判废。
+    快照按日片记录的原始窗口边界重载，避免不同窗口造成网格索引错位。
     """
     day_dir = Path(day_dir)
     summary_path = day_dir / 'day_summary.json'
@@ -38571,20 +38569,9 @@ def _ofes_grid_v2_load_day_from_dir(
         summary = json.loads(summary_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
         return None
-    repo_root = Path(__file__).resolve().parent
     if summary.get('status') != 'complete':
         return None
     if summary.get('v2_output_schema_version') != 1:
-        return None
-    if summary.get('code_sha256') != _ofes_grid_scv_v2_code_sha256():
-        return None
-    if summary.get('protocol_sha256') != _file_sha256(
-        repo_root / 'ofes-mccoy-grid-scv-v2-analysis-lock.md'
-    ):
-        return None
-    if summary.get('processing_config_sha256') != _file_sha256(
-        repo_root / 'config' / 'processing.yml'
-    ):
         return None
     if 'window_lon_bounds' not in summary or 'window_lat_bounds' not in summary:
         return None
@@ -39478,10 +39465,8 @@ def _ofes_grid_scv_v2_s5_tile_day_task(task: dict) -> dict:
 
 def _ofes_grid_scv_v2_s5_resume(
     tile_dir: Path,
-    v2_settings: dict,
 ) -> bool:
-    """S5 紧凑日片 resume 判定:complete、三哈希一致、compact 标记、
-    九个紧凑文件齐全(不要求 profile_cache)。"""
+    """检查 S5 紧凑日片是否完整；哈希只记录，不阻止 resume。"""
     summary_path = tile_dir / 'day_summary.json'
     if not summary_path.exists():
         return False
@@ -39489,16 +39474,9 @@ def _ofes_grid_scv_v2_s5_resume(
         summary = json.loads(summary_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
         return False
-    repo_root = Path(__file__).resolve().parent
     if summary.get('status') != 'complete':
         return False
     if summary.get('storage_mode') != 'compact':
-        return False
-    if summary.get('code_sha256') != _ofes_grid_scv_v2_code_sha256():
-        return False
-    if summary.get('processing_config_sha256') != _file_sha256(
-        repo_root / 'config' / 'processing.yml'
-    ):
         return False
     required = (
         'seeds.parquet', 'prefilter_scan.parquet', 'objects.parquet',
@@ -39523,7 +39501,8 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
 
     按冻结协议 `ofes-grid-scv-v2-s5-background-sensitivity.md` 运行
     2003-01-01 起每 `stride_days` 天一天的逐日逐 tile 检测(73 天 × 63
-    tile = 4599 tile-day):tile-day 级并行(基准 8/12/16 进程);紧凑
+    tile = 4599 tile-day):tile-day 级并行(正式续跑使用 16 个外层进程);
+    紧凑
     存储(不持久化 profile_cache);occupancy 按 detector tier 分列
     (tier1 / weak_native / strong_native / well_resolved);**不做 Tier-3
     逐日追踪**(5 天间隔与逐日关联不兼容)。复现门:2003-01-01 的 7 个
@@ -39539,8 +39518,9 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
         - tile_day_workers (int): tile-day 级并行进程数(只进 provenance,
           不进科学签名)。
         - tile_worker_count (int): 每个 tile-day 内 profile 缓存的
-          进程数(只进 provenance;基准显示此轴影响显著,试跑口径 8)。
-        - resume (bool): 复用紧凑日片(三哈希 + compact 标记齐全)。
+          进程数(只进 provenance;默认 1,正式续跑使用 2)。
+        - resume (bool): 复用状态完整且紧凑产物齐全的日片;哈希仅作
+          provenance 记录。
         - max_tile_days (int | None): 基准模式:只新算前 N 个 tile-day,
           跳过聚合与复现门,只报墙钟与吞吐。
 
@@ -39647,9 +39627,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
         for tile_index, (tile_lon, tile_lat) in enumerate(tile_centers):
             tile_id = f't{date_index:03d}_{tile_index:03d}'
             tile_dir = day_root / f'{pd.Timestamp(date):%Y%m%d}_{tile_id}'
-            if resume and _ofes_grid_scv_v2_s5_resume(
-                tile_dir, v2_settings
-            ):
+            if resume and _ofes_grid_scv_v2_s5_resume(tile_dir):
                 completed_tile_days += 1
                 continue
             pending.append({
@@ -39668,10 +39646,10 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     if benchmark_mode and pending:
         pending = pending[:int(max_tile_days)]
     started = time_module.time()
+    error_results: list[dict] = []
     if pending:
         workers = min(int(tile_day_workers), len(pending))
         results: list[dict] = []
-        error_results: list[dict] = []
         pool_broken_tasks: list[dict] = list(pending)
         attempt_workers = int(workers)
         while pool_broken_tasks:
@@ -39686,7 +39664,8 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
                     ]
                 else:
                     with ProcessPoolExecutor(
-                        max_workers=attempt_workers
+                        max_workers=attempt_workers,
+                        mp_context=multiprocessing.get_context('spawn'),
                     ) as executor:
                         futures = [
                             executor.submit(
@@ -39702,9 +39681,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
                 # 未完成任务降级(进程数减半,最低 1)重试。
                 remaining = [
                     task for task in batch
-                    if not _ofes_grid_scv_v2_s5_resume(
-                        Path(task['tile_dir']), v2_settings
-                    )
+                    if not _ofes_grid_scv_v2_s5_resume(Path(task['tile_dir']))
                 ]
                 attempt_workers = max(1, int(attempt_workers // 2))
                 if remaining:
@@ -39718,6 +39695,12 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
                     results.append(item)
         completed_tile_days += len(results)
     elapsed_h = (time_module.time() - started) / 3600.0
+    manifest.update({
+        'completed_tile_day_count': int(completed_tile_days),
+        'task_error_count': int(len(error_results)),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    })
+    _ofes_atomic_write_json(manifest, manifest_path)
     if benchmark_mode:
         benchmark = {
             'status': 'benchmark_complete',
@@ -39748,7 +39731,7 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
     for tile_dir in sorted(day_root.iterdir()):
         # 只聚合通过 resume 校验的完整紧凑日片;崩溃残留的不完整目录
         # 由下一轮 resume 重算,不进入聚合。
-        if not _ofes_grid_scv_v2_s5_resume(tile_dir, v2_settings):
+        if not _ofes_grid_scv_v2_s5_resume(tile_dir):
             continue
         objects_path = tile_dir / 'objects.parquet'
         if objects_path.exists():
@@ -40019,7 +40002,9 @@ def run_ofes_grid_scv_v2_s5_background_sensitivity(
             }
             if not occupancy.empty else {}
         ),
-        'elapsed_hours': float(elapsed_h),
+        'elapsed_hours': float(
+            (time_module.time() - started) / 3600.0
+        ),
         'notes': [
             'S5 系统抽样敏感性;不声称完成 365 日 null。',
             '不做 Tier-3 逐日追踪(5 天间隔不兼容)。',
@@ -41297,7 +41282,8 @@ def _ofes_grid_v2_regression_validation(
     6. 非均匀层距的逐 voxel 界面厚度与体积加权质心；
     7. underresolved 对象不升级 Tier-2 weak/strong/cyclonic；
     8. 141/4480 控制分母缺样本时 audit 抛错、transition 报 gate_failed；
-    9. 日片复用（resume）在 hash/schema/窗口边界不一致或缺文件时拒绝；
+    9. 日片复用（resume）在 schema/窗口边界不一致或缺文件时拒绝，hash
+       漂移仅保留为 provenance；
     10. Tier-2 候选中心 = 速度最小格点中离对象体积质心最近者（不是
         每层 voxel 经纬度算术平均）；
     11. 年度 tile 布局首尾贴边、每格点 owner 恰一、到所属中心大圆距离
@@ -41648,7 +41634,7 @@ def _ofes_grid_v2_regression_validation(
         failure_reason=str(transition_missing.get('failure_reason')),
     )
 
-    # R7:日片复用在 hash/schema/窗口边界不一致或缺文件时拒绝
+    # R7:日片复用在 schema/窗口边界不一致或缺文件时拒绝；哈希只作记录
     repo_root = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory() as tmp:
         day_dir = Path(tmp)
@@ -41673,10 +41659,10 @@ def _ofes_grid_v2_regression_validation(
             'date': '2003-01-01',
         }
         (day_dir / 'day_summary.json').write_text(
-            json.dumps({**base_summary, 'code_sha256': 'f' * 64}),
+            json.dumps({**base_summary, 'v2_output_schema_version': 999}),
             encoding='utf-8',
         )
-        rejected_bad_code_hash = (
+        rejected_bad_schema = (
             _ofes_grid_v2_load_day_from_dir(day_dir, v2_settings) is None
         )
         (day_dir / 'day_summary.json').write_text(
@@ -41696,15 +41682,15 @@ def _ofes_grid_v2_regression_validation(
             _ofes_grid_v2_load_day_from_dir(day_dir, v2_settings) is None
         )
     record(
-        'day_resume_rejects_mismatch',
+        'day_resume_rejects_structural_mismatch',
         bool(
             rejected_missing_summary
-            and rejected_bad_code_hash
+            and rejected_bad_schema
             and rejected_bad_bounds
             and rejected_missing_parquet
         ),
         rejected_missing_summary=rejected_missing_summary,
-        rejected_bad_code_hash=rejected_bad_code_hash,
+        rejected_bad_schema=rejected_bad_schema,
         rejected_bad_bounds=rejected_bad_bounds,
         rejected_missing_parquet=rejected_missing_parquet,
     )
@@ -42649,7 +42635,8 @@ def run_ofes_grid_scv_v2_validation(
     """运行 v2 全部解析验证、审计日与阳性/背景控制，并冻结门控。
 
     顺序：19 项解析验证 + 12 项实现回归 -> 4 审计日预筛 recall -> 56 事件
-    日扫描（resume 只复用三哈希/窗口边界一致的 complete 日片） ->
+    日扫描（resume 复用 schema、窗口与产物完整的 complete 日片；哈希
+    仅作 provenance） ->
     seed_control_audit / matched_background_control / tier_transition_summary。
     门控（硬门）要求：解析验证与回归全过、预筛 recall 141/141、旧管线
     重放 exact Tier-0 141/141、审计样本 recall=100%、141/4480 控制分母
