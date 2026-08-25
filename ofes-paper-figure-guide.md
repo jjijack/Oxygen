@@ -1,7 +1,10 @@
 # OFES 机制图库阅读指南
 
-配合 `ofes_figures_preview/` 使用。目录 01–06 为历史运行产物，07 为论文候选图。
-全部图的冻结数字以各 `analysis_summary.json` / 正式报告为准，图中标注与之一致。
+配合 `ofes_figures_preview/` 使用。目录 01–06 为过程与验证产物，07 为最新论文候选图，
+08–10 分别保存报告/冻结协议、核心表格和运行 provenance。全部图的冻结数字以各
+`analysis_summary.json` / 正式报告为准，图中标注与之一致。
+
+grid-SCV S5 背景敏感性已完成；它是每 5 日系统抽样敏感性，不冒充 365 日年度 null。
 
 **通用读图习惯**：事件/异常粒子=红 `#d62728`；对照/背景=蓝 `#4c78a8`；次级对照=青
 `#72b7b2`；SCV/ensemble=紫 `#7b61a8`；观测核心=近黑 `#111827`。中位线+分位带
@@ -82,7 +85,8 @@ w_along（沿等密面下沉）的结果才可解释。不是科学结果图，�
 三个客观机制代表事件 pre-start→peak 的逐日标量：frontogenesis 率、密度梯度、归一化
 kinematics。
 - **怎么看**：onset 之前 frontogenesis/密度梯度是否先增强——若先于 ΔDO 增强，则
-  "锋生组织在先、异常在后"，支持形成机制的时间顺序。
+  单事件上支持“锋生组织在先、异常在后”的候选解释。群体 lag 审计未发现统一的
+  strain→rotation 日级时滞，因此本图不用于推广固定两阶段顺序。
 
 ### E000002 / E000054 / E000176_onset_maps.png（单事件 onset 地图）
 单个事件的 onset 日地图：等密度面 DO 场 + 水平 frontogenesis 场 + 流场箭头。
@@ -128,8 +132,8 @@ surface-obscured SCV 计数柱，虚线=28 的半数参考）、**旋转日分�
 ### hosoda_benchmark.png（Hosoda 观测基准）
 用 Hosoda et al. (2021) 文献观测日期（2003 年 4–5 月，KE 区）在 OFES 场上做高 DO/低盐
 双等密度面集成检验。
-- **怎么看**：OFES 场在独立文献观测锚点上能否再现同样的水团结构——模式场代表性的
-  **外部验证**。
+- **怎么看**：同一 2003 OFES 配置是否能再现 Hosoda 报道的水团/filament 图景。这是
+  文献一致性与管线正对照，不是独立模拟或独立事件的外部验证。
 
 ### negative_control_comparison.png（负对照）
 负对照事件的三面板：精确分解、动力学与层结、匹配分数。
@@ -144,7 +148,8 @@ surface-obscured SCV 计数柱，虚线=28 的半数参考）、**旋转日分�
 左：事件核心 vs 同天背景的 McCoy 兼容率均值柱 + 逐事件配对灰线；右：事件等权均值差
 的 bootstrap 分布（10,000 次），橙带=95% CI。
 - **怎么看**：左图柱高差 0.144 且配对线大多向右上走；右图分布整体在 0 右侧、CI
-  [0.076, 0.220] 不含 0、双侧配对 p=9.8×10⁻⁵；19/56 事件至少包含一条
+  [0.076, 0.221] 不含 0；预设方向的单侧配对 p=9.8×10⁻⁵，透明双侧值
+  p=1.97×10⁻⁴；19/56 事件至少包含一条
   McCoy-compatible 虚拟剖面。**这是全论文富集主张的核心图**。
 
 ### F3_global_ofes_bridge.png（全球↔OFES 桥接图）
@@ -176,8 +181,9 @@ E000193 是同时呈现 McCoy-compatible、persistent carrier 与 resolved-downw
 ### F5_winter_mld_vs_core.png（核心深度 vs 冬季 MLD）
 56 点散点，对角线=核心深度=冬季最大 MLD。全部点在对角线**下方**（核心更深），
 中位超出 +212 m，范围 108–437 m。
-- **怎么看**：所有事件核心都在"冬季混合层够不到"的深度之下——通风发生在 onset 前，
-  异常水团是被"留在"层结内的。通风史（trajectory_ventilation）的静态对应。
+- **怎么看**：所有事件核心都在"当地冬季混合层直接够不到"的深度之下，说明异常到达
+  核心深度必须经历脱离表层连通层的输送过程。它本身不是通风时间证明；与
+  matched-control trajectory ventilation 联用后才支持近期通风—潜沉解释。
 
 ### F6_transition_and_lag.png（相态转化与滞后）
 左：early→late 相态转化四类计数，柱上标注 carrier 数；右：strain→r_share 与
@@ -250,24 +256,29 @@ E000073 的双视角 3D 轨迹（lon-lat-depth）：左=斜俯视（看路径水
 
 ### F14_surface_containment.png（PET 包含率）
 两面板：(a) 四组柱（strict-56 effective/speed、quality-161 effective/speed），
-蓝=分析合格分母、红=被 PET 涡包含数（全 0）；(b) 最近 PET 涡中心距离/有效半径
-直方图（log x）。
-- **怎么看**：strict 56 中 31 个通过 PET 滤波有效域门，合格事件中包含数为 0；
-  中位距离 9.2×半径说明不是刚好错过，而是与闭合 SSH 目录系统性脱钩。它不否认
-  表层存在动力表达（见 F16）。
+蓝=PET 可分析分母、红=被 PET 涡包含数（全 0）；strict 为 31/56，quality
+敏感性为 58/161，其余分别是 25、103 个不可判定。(b) 仅对 31 个可分析严格事件
+绘制最近 PET 涡中心距离/有效半径直方图（log x）。
+- **怎么看**：strict 与 quality 两个口径中包含数分别为 0/31、0/58；严格事件到
+  最近目录涡的中位距离为 5.9×有效半径，说明事件核心与闭合 SSH 目录存在
+  系统脱钩。结合 F16 的表层 Ro 同号结果，这不是“没有表层动力”，而是相关
+  次表层载体没有组织成传统目录要求的闭合 SSH 涡。
 
 ### F15_surface_null_two_sided.png（双侧 null 森林图）
 左：两口径森林图（annual 月×1° 与同日 120–240 km 环带）的 core−null 均值与
 bootstrap 95% CI——**两个 CI 全在 0 左**（annual p ≈ 1.7×10⁻⁶；同日环带
-p ≈ 8.9×10⁻⁵，均为双侧）；右：逐事件 core−null 直方图（无事件为正）。
-- **怎么看**：事件核心的表面涡占有率显著**低于**背景 = 空间回避。这是
-  2026-08-14 审计修正后的双侧正式口径（原单侧 greater p≈1.0 掩盖了对侧信号）。
+p ≈ 8.9×10⁻⁵，均为双侧，paired n=31）；右：逐事件 core−null 直方图
+（annual 30/31 负、ring 20/31 负，其余为零，无正值）。
+- **怎么看**：PET 可分析事件核心优先位于闭合 SSH 目录涡之外，占有率显著低于
+  两种背景。这是“系统脱钩”而非少数案例未匹配。图中使用 2026-08-14
+  审计修正后的双侧正式口径（原单侧 greater p≈1.0 掩盖了对侧信号）。
 
 ### F16_surface_rotation_pet.png（rotation×PET 交叉）
-左：29 个峰日旋转主导事件全部 no-PET（29/29）；右：表层核心加权 Ro 与深层
-极性同号 26/29。
-- **怎么看**：深层旋转信号在表层 Ro 上有影子，但从未组织成闭合 SSH 等高线的
-  PET 涡——这是深浅 Ro 极性一致与表面涡目录脱钩的共存，不声称深层信号向上传播。
+左：29 个峰日旋转主导事件中 16 个 PET 可分析且均未包含目录涡（0/16），
+13 个不可判定；右：表层核心加权 Ro 与深层极性同号 26/29。
+- **怎么看**：这是“表层有旋转印记、闭合 SSH 目录却脱钩”的关键桥梁。相关
+  次表层旋转载体能够产生同号表层 Ro 响应，却未组织成 PET 所要求的闭合 SSH
+  等高线涡，从而为全球 SCV 强关联与 META 弱关联的反差提供模式侧解释。
 
 ### F17_glorys_reproduction_stratification.png（GLORYS 重现分层）
 三个 ΔDO 阈值下比较 GLORYS reproduced(89)与 missed(71)的观测 SCV 载体率；
@@ -299,8 +310,21 @@ trajectory-complete diagnostic subset、黑圈=carrier。
   完整性差异。
 
 ### F21_walong_resolved_subset.png（w_along resolved 子集）
-左：resolved-down 子集（n=19）三口径 core/ring w_along 柱（+7.3/+3.9/+4.8，
+左：population flag 的 resolved-down 子集（n=19）三口径 core/ring w_along 柱
+（+7.3/+3.9/+4.8，
 Lagrangian p=0.040 nominal）；右：观测垂直方向评估（21 降 / 3 升 / 32 低于
 25 m 门槛）。
 - **怎么看**：可分类事件以下沉为主,强 core−ring 对准集中在 resolved 子集；总体
-  事件并没有共同的运动学对准背景。p=0.040 为探索性子集结果。
+  事件并没有共同的运动学对准背景。这里的 n=19 与轨迹严格门下 15 条
+  high-confidence resolved-downward 使用不同判定链，不能混成同一分母；p=0.040
+  为探索性子集结果。
+
+### F22_grid_scv_s5_background.png（grid-SCV S5 背景可达性）
+左：四个 detector tier 的逐月日均对象数；中：按 σ0 的背景占据率，灰带为 56 个
+DO50 事件的 5–95% 密度范围；右：按事件月份、纬带和 σ0 匹配后，56 个事件核心的
+预期命中数与实际 0 命中。
+- **怎么看**：背景有 549 个 Tier-1 对象，但面积占据率仅 0.227%；事件匹配后的
+  Tier-1 预期命中数只有 0.237，出现 0 个的参考概率约 79%。因此 0/56 说明成熟闭合
+  grid-SCV 不是事件核心的常见解析形态，却不足以否定 SCV-like/亚格子载体。
+- 叙事角色：解释 grid detector 零重合为什么不推翻全球 McCoy SCV 富集，并把主证据
+  放回剖面富集、原生速度支持子集与 Lagrangian 过程链。
