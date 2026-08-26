@@ -103,4 +103,5 @@ PET 全年检出 614 对象、64 轨迹,说明结果不是检测器空转。这�
   - `Figure6_surface_ssh_decoupling.png`:E000002 案例、同一 16-event
     子集的 15/16 对 0/16 比较,以及 n=31 的两类 event-equal null 对比。
     strict PET-eligible 为 31/56,rotation PET-eligible 为 16/29,
-    quality PET-eligible 为 58/161;最近距离直方图移出主图。
+    quality PET-eligible 为 58/161;最近距离直方图移出主图。案例图中的
+    surface Ro 使用核心点和有色光环标示，不把未保存的 Ro 轮廓误读为空间 footprint。

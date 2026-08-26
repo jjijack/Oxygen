@@ -80,8 +80,8 @@ def _plot_case_panel(
     number, and nearest PET distance, but not gridded SSH values or contour
     vertices. If an already-rendered audited case map is supplied, it is used
     as a visual backdrop only; no numerical values are inferred from it.
-    Otherwise the panel marks the nearest closed-contour footprint
-    schematically. Numerical annotations always come from parquet rows.
+    The surface-Ro mark is a core point with a colored halo, not an inferred
+    spatial footprint. Numerical annotations always come from parquet rows.
     """
 
     lon = float(case["peak_lon"])
@@ -119,17 +119,25 @@ def _plot_case_panel(
     axis.set_ylabel("Latitude (°N)")
 
     patch_color = BLUE if ro < 0 else RED
-    axis.add_patch(
-        Ellipse(
-            (lon, lat),
-            width=1.8,
-            height=1.2,
-            facecolor=patch_color,
-            edgecolor=INK,
-            alpha=0.35,
-            linewidth=1.2,
-            label="surface Ro patch",
-        )
+    axis.scatter(
+        [lon],
+        [lat],
+        s=330,
+        facecolors="none",
+        edgecolors=patch_color,
+        linewidths=2.2,
+        alpha=0.9,
+        zorder=4,
+    )
+    axis.scatter(
+        [lon],
+        [lat],
+        s=82,
+        color=patch_color,
+        edgecolor=INK,
+        linewidth=0.8,
+        zorder=5,
+        label="core-weighted surface Ro",
     )
     axis.scatter(
         [lon],
@@ -167,7 +175,7 @@ def _plot_case_panel(
         )
     else:
         axis.annotate(
-            "deep core / surface Ro patch",
+            "deep rotational core\n(core-weighted surface Ro)",
             xy=(lon, lat),
             xytext=(lon - 2.6, lat - 2.0),
             arrowprops={"arrowstyle": "->", "color": INK, "lw": 0.9},
@@ -176,7 +184,7 @@ def _plot_case_panel(
     axis.text(
         0.02,
         0.03,
-        f"core Ro = {ro:+.3f}\nPET containment: False\n"
+        f"core-weighted surface Ro = {ro:+.3f}\nPET containment: False\n"
         f"nearest centre = {distance:.0f} km ({radius_ratio:.2f}R)",
         transform=axis.transAxes,
         fontsize=8.5,
@@ -185,16 +193,6 @@ def _plot_case_panel(
     )
     if case_map is None:
         axis.legend(frameon=False, fontsize=7.5, loc="upper left")
-    else:
-        axis.text(
-            0.02,
-            0.96,
-            "blue ellipse: core-weighted surface Ro patch",
-            transform=axis.transAxes,
-            fontsize=8.0,
-            va="top",
-            bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none"},
-        )
 
 
 def _plot_figure6(
