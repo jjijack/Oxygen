@@ -1,4 +1,9 @@
 # 处理与算法参数配置
+# version 1.25 变更：
+#   - 新增最终 grid-SCV v2 分层检测、事件日关联和 S5 系统抽样背景敏感性；
+#     统一使用固定正式输出目录，保存结构性 provenance，不以代码/配置哈希阻断读取。
+#   - S5 的日期、步长、tile worker 和输出目录集中由 `grid_scv_v2_s5` 管理。
+#   - 清理 grid-SCV v2 中未被正式生产流程使用的 tracking 与 boundary-margin 配置项。
 # version 1.24 变更：
 #   - 新增 OFES 二维/三维 ensemble trajectories、数据集专项 w 连续方程验证和严格事件总体推广，
 #     并沿既有路径诊断热盐指纹、McCoy-method-compatible 虚拟剖面及 matched-control 通风历史。
@@ -92,7 +97,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.24
+version: 1.25
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -524,6 +529,41 @@ ofes:
     random_seed: 20260729
     figure_dpi: 180
     output_subdir: trajectory_ventilation
+  grid_scv_v2:
+    sigma0_min_kg_m3: 25.60
+    sigma0_max_kg_m3: 27.50
+    sigma0_step_kg_m3: 0.05
+    valid_depth_min_m: 100.0
+    valid_depth_max_m: 1000.0
+    shallowest_depth_min_m: 100.0
+    centroid_depth_min_m: 200.0
+    grid_lens_min_nodes: 2
+    well_resolved_min_nodes: 3
+    well_resolved_thickness_min_m: 100.0
+    lens_radius_min_km: 5.0
+    lens_radius_max_km: 100.0
+    classical_size_max_km: 50.0
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_control_radius_km: 230.0
+    background_min_columns: 61
+    n2_density_tolerance_kg_m3: 0.2
+    nencioli_a_cells: 3
+    nencioli_b_cells: 2
+    circulation_sample_count: 64
+    circulation_min_finite_fraction: 0.80
+    velocity_adjacent_nodes_min: 2
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    output_subdir: grid_scv_v2
+    event_catalog_output_subdir: grid_scv_v2_event_catalog
+  grid_scv_v2_s5:
+    start_date: '2003-01-01'
+    end_date: '2003-12-31'
+    stride_days: 5
+    tile_day_workers: 1
+    tile_worker_count: 1
+    output_subdir: grid_scv_v2_s5
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12
