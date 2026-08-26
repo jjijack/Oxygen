@@ -1,4 +1,6 @@
 # 数据路径配置
+# version 1.10 变更：
+#   - 新增 ofes_surface_eddy_root：OFES PET surface-eddy 正式目录。
 # version 1.9 变更：
 #   - 新增 mccoy_scv_source_archive，将 OFES 虚拟 Argo 复现运行绑定到 McCoy et al. (2020)
 #     公开 MATLAB 源码归档的实际文件身份。
@@ -21,7 +23,7 @@
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.9
+version: 1.10
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
@@ -37,5 +39,6 @@ paths:
   woa23_root: ./data/woa23
   mld_clim_root: ./data/mld_clim
   ofes_root: ./data/OFES_NP30
+  ofes_surface_eddy_root: ./plot_outputs/do/ofes_np30_ke/surface_eddy
   mccoy_scv_csv: ./data/mccoy2020_scv/SCVs.csv
   mccoy_scv_source_archive: ./data/mccoy2020_scv/ArgoSCVs-v1.3.zip

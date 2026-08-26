@@ -54,7 +54,7 @@ import traceback
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
 import hashlib
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import zarr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -67017,3 +67017,1165 @@ def validate_ofes_grid_scv_v2_analytic(
         worker_count=int(worker_count),
     )
 _OFES_GRID_V2_SHARED: dict = {}
+
+
+# PET production runs in the standalone ``run_ofes_surface_eddy.py`` command;
+# readers, reducers, and plots operate only on completed parquet products.
+
+
+def _ofes_surface_eddy_settings(overrides: Mapping[str, Any] | None = None) -> dict:
+    """Return the configured PET surface-eddy settings with optional overrides."""
+
+    settings = copy.deepcopy(_OFES_CFG.get('surface_eddy', {}) or {})
+
+    def merge(target: dict, source: Mapping[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, Mapping) and isinstance(target.get(key), Mapping):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    if overrides:
+        merge(settings, overrides)
+    settings.setdefault('date_start', '2003-01-01')
+    settings.setdefault('date_end', '2003-12-31')
+    settings.setdefault('region', {'lon_min': 140.0, 'lon_max': 170.0,
+                                   'lat_min': 25.0, 'lat_max': 45.0})
+    settings.setdefault('raw_eta_units', 'cm')
+    settings.setdefault('filter', {})
+    settings.setdefault('detection', {})
+    settings.setdefault('tracking', {})
+    settings.setdefault('association', {})
+    return settings
+
+
+def _ofes_surface_eddy_output_root(output_dir: str | Path | None = None) -> Path:
+    """Resolve the fixed semantic output directory for PET products."""
+
+    configured = _PATHS_CFG.get('paths', {}).get(
+        'ofes_surface_eddy_root',
+        './plot_outputs/do/ofes_np30_ke/surface_eddy',
+    )
+    return Path(output_dir if output_dir is not None else configured).expanduser()
+
+
+def _ofes_surface_eddy_read_json(path: Path) -> dict:
+    """Read a runtime manifest and require an object value."""
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError(f'Expected JSON object in {path}')
+    return value
+
+
+def _ofes_surface_eddy_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Write a small runtime JSON manifest atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, default=_ofes_json_default),
+        encoding='utf-8',
+    )
+    os.replace(temporary, path)
+
+
+def _ofes_surface_eddy_catalog_paths(root: Path) -> dict[str, Path]:
+    """Return the stable PET catalog filenames below one explicit root."""
+
+    return {
+        'manifest': root / 'manifest.json',
+        'valid_domain': root / 'surface_eddy_valid_domain.npz',
+        'daily_objects': root / 'surface_eddy_daily_objects.parquet',
+        'track_observations': root / 'surface_eddy_track_observations.parquet',
+        'tracks': root / 'surface_eddy_tracks.parquet',
+        'summary': root / 'surface_eddy_catalog_summary.json',
+    }
+
+
+def _ofes_surface_eddy_catalog_result(root: Path, manifest: Mapping[str, Any]) -> dict:
+    """Load a complete catalog result from its explicit fixed directory."""
+
+    paths = _ofes_surface_eddy_catalog_paths(root)
+    for key in ('valid_domain', 'daily_objects', 'track_observations', 'tracks'):
+        if not paths[key].is_file():
+            raise FileNotFoundError(paths[key])
+    result = {
+        'run_dir': root,
+        'manifest': dict(manifest),
+        'valid_domain_path': paths['valid_domain'],
+        'daily_objects': pd.read_parquet(paths['daily_objects']),
+        'track_observations': pd.read_parquet(paths['track_observations']),
+        'tracks': pd.read_parquet(paths['tracks']),
+    }
+    if paths['summary'].is_file():
+        result['summary'] = _ofes_surface_eddy_read_json(paths['summary'])
+    return result
+
+
+def load_ofes_surface_eddy_catalog(
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Load a completed OFES PET daily/tracked catalog.
+
+    参数:
+        - output_dir (str | Path | None): explicit fixed catalog directory.
+
+    返回:
+        - dict: manifest, daily objects, track observations, and tracks.
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 不访问 OFES NetCDF、不导入 PET、不创建目录，也不猜测最新运行。
+    """
+
+    root = _ofes_surface_eddy_output_root(output_dir)
+    manifest = _ofes_surface_eddy_read_json(root / 'manifest.json')
+    if manifest.get('status') != 'complete':
+        raise RuntimeError(f'Surface-eddy catalog is not complete: {root}')
+    return _ofes_surface_eddy_catalog_result(root, manifest)
+
+
+def _ofes_surface_eddy_parse_sequence(value: Any) -> np.ndarray:
+    """Parse a contour sequence stored as a parquet list or literal string."""
+
+    if value is None:
+        return np.array([], dtype=float)
+    if isinstance(value, str):
+        try:
+            import ast
+            value = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return np.array([], dtype=float)
+    try:
+        values = np.asarray(value, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return np.array([], dtype=float)
+    return values[np.isfinite(values)]
+
+
+def _ofes_surface_eddy_bool(value: Any) -> bool | float:
+    """Normalize common parquet boolean encodings while preserving missingness."""
+
+    if value is None or pd.isna(value):
+        return np.nan
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {'true', '1', 'yes', 'y'}:
+            return True
+        if text in {'false', '0', 'no', 'n'}:
+            return False
+    return bool(value)
+
+
+def _ofes_surface_eddy_pick(row: Mapping[str, Any], names: Sequence[str], default: Any = np.nan) -> Any:
+    """Pick the first present, non-missing alias from one input row."""
+
+    for name in names:
+        if name in row:
+            value = row[name]
+            if value is not None and not (isinstance(value, float) and np.isnan(value)):
+                return value
+    return default
+
+
+def _ofes_surface_eddy_resolve_table(
+    value: str | Path,
+    filenames: Sequence[str],
+) -> Path:
+    """Resolve an explicit table path or one unambiguous named child."""
+
+    path = Path(value).expanduser()
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    for filename in filenames:
+        candidate = path / filename
+        if candidate.is_file():
+            return candidate
+    candidates = [candidate for filename in filenames for candidate in path.rglob(filename) if candidate.is_file()]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(f'No expected table below {path}: {list(filenames)}')
+    raise ValueError(f'Ambiguous table below {path}; pass an explicit file: {candidates}')
+
+
+def _ofes_surface_eddy_polygon_contains(row: Mapping[str, Any], lon: float, lat: float, contour: str) -> bool:
+    """Return whether a point lies inside one stored PET contour."""
+
+    contour_lon = _ofes_surface_eddy_parse_sequence(row.get(f'{contour}_contour_lon'))
+    contour_lat = _ofes_surface_eddy_parse_sequence(row.get(f'{contour}_contour_lat'))
+    if contour_lon.size < 3 or contour_lon.size != contour_lat.size:
+        return False
+    contour_lon = float(lon) + _minimal_lon_diff_deg(contour_lon, float(lon))
+    vertices = np.column_stack([contour_lon, contour_lat])
+    if not np.array_equal(vertices[0], vertices[-1]):
+        vertices = np.vstack([vertices, vertices[0]])
+    return bool(MplPath(vertices, closed=True).contains_point((float(lon), float(lat)), radius=1e-10))
+
+
+def _ofes_surface_eddy_valid_objects(objects: pd.DataFrame, date: pd.Timestamp) -> pd.DataFrame:
+    """Select non-virtual, filter-valid, non-censored objects for one day."""
+
+    if objects.empty:
+        return objects.copy()
+    result = objects.copy()
+    result['date'] = pd.to_datetime(result['date'], errors='raise').dt.normalize()
+    for column in ('is_virtual', 'filter_valid', 'boundary_censored'):
+        if column not in result:
+            result[column] = False if column == 'is_virtual' else True
+        result[column] = result[column].map(_ofes_surface_eddy_bool)
+    return result.loc[
+        result['date'].eq(pd.Timestamp(date).normalize())
+        & result['is_virtual'].eq(False)
+        & result['filter_valid'].eq(True)
+        & result['boundary_censored'].eq(False)
+    ].reset_index(drop=True)
+
+
+def _ofes_surface_eddy_distance_km(
+    lon: Any, lat: Any, lon0: float, lat0: float
+) -> np.ndarray:
+    """Vectorized great-circle distance in kilometres."""
+
+    lon, lat, lon0, lat0 = [
+        np.deg2rad(np.asarray(value, dtype=float))
+        for value in (lon, lat, lon0, lat0)
+    ]
+    dlon = (lon0 - lon + np.pi) % (2.0 * np.pi) - np.pi
+    dlat = lat0 - lat
+    haversine = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(lat) * np.cos(lat0) * np.sin(dlon / 2.0) ** 2
+    )
+    return (
+        2.0
+        * 6371.0088
+        * np.arcsin(np.sqrt(np.clip(haversine, 0.0, 1.0)))
+    )
+
+
+def _ofes_surface_eddy_cell_area_m2(
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """Calculate spherical cell areas from ascending center coordinates."""
+
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    if lat.size < 2 or lon.size < 2:
+        raise ValueError('Surface-eddy domain needs at least two latitude and longitude cells.')
+    lat_edges = np.empty(lat.size + 1, dtype=float)
+    lon_edges = np.empty(lon.size + 1, dtype=float)
+    lat_edges[1:-1] = (lat[:-1] + lat[1:]) / 2.0
+    lon_edges[1:-1] = (lon[:-1] + lon[1:]) / 2.0
+    lat_edges[0] = lat[0] - (lat[1] - lat[0]) / 2.0
+    lat_edges[-1] = lat[-1] + (lat[-1] - lat[-2]) / 2.0
+    lon_edges[0] = lon[0] - (lon[1] - lon[0]) / 2.0
+    lon_edges[-1] = lon[-1] + (lon[-1] - lon[-2]) / 2.0
+    lat_edges = np.clip(lat_edges, -90.0, 90.0)
+    return (
+        6_371_000.0 ** 2
+        * np.diff(np.sin(np.deg2rad(lat_edges)))[:, None]
+        * np.deg2rad(np.diff(lon_edges))[None, :]
+    )
+
+
+def _ofes_surface_eddy_load_valid_domain(catalog: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    """Load the persisted PET filter-valid and ocean-valid analysis domain."""
+
+    path = Path(catalog['valid_domain_path']).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as payload:
+        lon = np.asarray(payload['lon'], dtype=float)
+        lat = np.asarray(payload['lat'], dtype=float)
+        filter_valid = np.asarray(payload['filter_valid'], dtype=bool)
+        ocean_valid = np.asarray(payload['ocean_valid'], dtype=bool)
+    expected = (lat.size, lon.size)
+    if filter_valid.shape != expected or ocean_valid.shape != expected:
+        raise ValueError(
+            f'Surface-eddy valid-domain masks must have shape {expected}; '
+            f'found {filter_valid.shape} and {ocean_valid.shape}.'
+        )
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    return {
+        'lon': lon,
+        'lat': lat,
+        'lon_grid': lon_grid,
+        'lat_grid': lat_grid,
+        'filter_valid': filter_valid,
+        'ocean_valid': ocean_valid,
+        'area_m2': _ofes_surface_eddy_cell_area_m2(lat, lon),
+    }
+
+
+def _ofes_surface_eddy_covered_by_rows(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    rows: pd.DataFrame,
+    contour: str,
+) -> np.ndarray:
+    """Return cell-wise coverage by the stored PET contours."""
+
+    lon_values = np.asarray(lon, dtype=float).ravel()
+    lat_values = np.asarray(lat, dtype=float).ravel()
+    if lon_values.size != lat_values.size:
+        raise ValueError('Surface-eddy coverage coordinates must have equal size.')
+    covered = np.zeros(lon_values.size, dtype=bool)
+    for row in rows.to_dict('records'):
+        contour_lon = _ofes_surface_eddy_parse_sequence(
+            row.get(f'{contour}_contour_lon')
+        )
+        contour_lat = _ofes_surface_eddy_parse_sequence(
+            row.get(f'{contour}_contour_lat')
+        )
+        if contour_lon.size < 3 or contour_lon.size != contour_lat.size:
+            continue
+        reference = float(np.nanmedian(contour_lon))
+        vertices = np.column_stack([
+            reference + _minimal_lon_diff_deg(contour_lon, reference),
+            contour_lat,
+        ])
+        if not np.array_equal(vertices[0], vertices[-1]):
+            vertices = np.vstack([vertices, vertices[0]])
+        points = np.column_stack([
+            reference + _minimal_lon_diff_deg(lon_values, reference),
+            lat_values,
+        ])
+        covered |= MplPath(vertices, closed=True).contains_points(
+            points,
+            radius=1e-10,
+        )
+    return covered
+
+
+def _ofes_surface_eddy_peak_pixels(
+    delta_do_catalog_dir: str | Path,
+    event: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Load the formal DO50 peak pixels for one event peak day."""
+
+    root = Path(delta_do_catalog_dir).expanduser()
+    date = pd.Timestamp(event['peak_date']).normalize()
+    path = root / 'days' / f'peak_pixels_{date:%Y%m%d}.parquet'
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    pixels = pd.read_parquet(path)
+    required = {'object_id_do50', 'lat_index', 'lon_index'}
+    missing = sorted(required.difference(pixels.columns))
+    if missing:
+        raise KeyError(f'Peak-pixel table lacks columns: {missing}')
+    key = str(_ofes_surface_eddy_pick(
+        event,
+        ('daily_object_key', 'peak_daily_object_key'),
+        '',
+    ))
+    try:
+        object_id = int(key.rsplit('_', 1)[-1])
+    except ValueError as exc:
+        raise ValueError(f'Cannot parse daily object key for {event["event_id"]}: {key}') from exc
+    selected = pixels.loc[
+        pd.to_numeric(pixels['object_id_do50'], errors='coerce').eq(object_id)
+    ].copy()
+    if selected.empty:
+        raise ValueError(f'No DO50 peak pixels for {event["event_id"]} / {key}')
+    return selected
+
+
+def _ofes_surface_eddy_population(frame: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize event identity and derive strict/quality/rotation subsets."""
+
+    aliases = {
+        'event_id': ('event_id', 'event', 'id'),
+        'peak_date': ('peak_date', 'event_peak_date', 'date_peak', 'date'),
+        'peak_lon': ('peak_lon', 'peak_core_lon', 'event_lon', 'center_lon', 'lon'),
+        'peak_lat': ('peak_lat', 'peak_core_lat', 'event_lat', 'center_lat', 'lat'),
+    }
+    result = frame.copy()
+    for canonical, names in aliases.items():
+        if canonical not in result:
+            source = next((name for name in names if name in result.columns), None)
+            if source is None:
+                raise KeyError(f'Event population lacks {canonical}')
+            result[canonical] = result[source]
+    result['event_id'] = result['event_id'].astype(str)
+    if result['event_id'].duplicated().any():
+        raise ValueError('Event population contains duplicate event_id values')
+    result['peak_date'] = pd.to_datetime(result['peak_date'], errors='raise').dt.normalize()
+    result['peak_lon'] = pd.to_numeric(result['peak_lon'], errors='raise')
+    result['peak_lat'] = pd.to_numeric(result['peak_lat'], errors='raise')
+    threshold = pd.to_numeric(result.get('threshold', pd.Series(50.0, index=result.index)), errors='coerce')
+    candidate = result.loc[np.isclose(threshold, 50.0, equal_nan=False)].copy()
+    if candidate.empty:
+        candidate = result.copy()
+    strict_column = next(
+        (name for name in ('strict_eligible', 'population_diagnostic_passed', 'strict_event') if name in candidate),
+        None,
+    )
+    if strict_column is not None:
+        strict = candidate.loc[candidate[strict_column].map(_ofes_surface_eddy_bool).eq(True)].copy()
+        if strict.empty:
+            strict = candidate.copy()
+    else:
+        strict = candidate.copy()
+    strict['strict_eligible'] = True
+    rotation_column = next(
+        (name for name in ('rotation_dominated', 'deep_rotation_dominated', 'rotation_event') if name in strict),
+        None,
+    )
+    strict['rotation_dominated'] = (
+        strict[rotation_column].map(_ofes_surface_eddy_bool).fillna(False)
+        if rotation_column is not None else False
+    )
+    return strict.reset_index(drop=True)
+
+
+def _ofes_surface_eddy_associate_event(
+    event: Mapping[str, Any],
+    objects: pd.DataFrame,
+    domain: Mapping[str, np.ndarray],
+    delta_do_catalog_dir: str | Path,
+    association_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Associate one event with the formal PET domain, contours, and ring null."""
+
+    event_id = str(event['event_id'])
+    date = pd.Timestamp(event['peak_date']).normalize()
+    lon = float(event['peak_lon'])
+    lat = float(event['peak_lat'])
+    lon_index = int(np.nanargmin(np.abs(domain['lon'] - lon)))
+    lat_index = int(np.nanargmin(np.abs(domain['lat'] - lat)))
+    core_filter_valid = bool(domain['filter_valid'][lat_index, lon_index])
+    core_ocean_valid = bool(domain['ocean_valid'][lat_index, lon_index])
+    eligible = core_filter_valid and core_ocean_valid
+    rows = _ofes_surface_eddy_valid_objects(objects, date)
+    effective_matches = (
+        [
+            row for row in rows.to_dict('records')
+            if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'effective')
+        ]
+        if eligible else []
+    )
+    speed_matches = (
+        [
+            row for row in rows.to_dict('records')
+            if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'speed')
+        ]
+        if eligible else []
+    )
+    pixels = _ofes_surface_eddy_peak_pixels(delta_do_catalog_dir, event)
+    pixel_lat = pd.to_numeric(pixels['lat_index'], errors='raise').to_numpy(int)
+    pixel_lon = pd.to_numeric(pixels['lon_index'], errors='raise').to_numpy(int)
+    inside = (
+        (pixel_lat >= 0)
+        & (pixel_lat < domain['lat'].size)
+        & (pixel_lon >= 0)
+        & (pixel_lon < domain['lon'].size)
+    )
+    pixel_lat = pixel_lat[inside]
+    pixel_lon = pixel_lon[inside]
+    pixel_valid = (
+        domain['filter_valid'][pixel_lat, pixel_lon]
+        & domain['ocean_valid'][pixel_lat, pixel_lon]
+    )
+    pixel_area = domain['area_m2'][pixel_lat, pixel_lon]
+    pixel_covered = _ofes_surface_eddy_covered_by_rows(
+        domain['lon'][pixel_lon],
+        domain['lat'][pixel_lat],
+        rows,
+        'effective',
+    )
+    valid_peak_area = float(np.sum(pixel_area[pixel_valid]))
+    peak_overlap = (
+        float(np.sum(pixel_area[pixel_valid & pixel_covered]) / valid_peak_area)
+        if valid_peak_area > 0 else np.nan
+    )
+    if rows.empty:
+        nearest_center = np.nan
+        nearest_vertex = np.nan
+        radius_ratio = np.nan
+    else:
+        center_distances = _ofes_surface_eddy_distance_km(
+            rows['center_lon'].to_numpy(float), rows['center_lat'].to_numpy(float), lon, lat
+        )
+        nearest_index = int(np.nanargmin(center_distances))
+        nearest_center = float(center_distances[nearest_index])
+        nearest = rows.iloc[nearest_index]
+        radius = pd.to_numeric(pd.Series([nearest.get('effective_radius_km', np.nan)]), errors='coerce').iloc[0]
+        radius_ratio = nearest_center / float(radius) if pd.notna(radius) and radius > 0 else np.nan
+        vertex_distances: list[float] = []
+        for row in rows.to_dict('records'):
+            contour_lon = _ofes_surface_eddy_parse_sequence(row.get('effective_contour_lon'))
+            contour_lat = _ofes_surface_eddy_parse_sequence(row.get('effective_contour_lat'))
+            if contour_lon.size and contour_lon.size == contour_lat.size:
+                vertex_distances.append(float(np.nanmin(_ofes_surface_eddy_distance_km(contour_lon, contour_lat, lon, lat))))
+        nearest_vertex = float(np.nanmin(vertex_distances)) if vertex_distances else np.nan
+    inner = float(association_cfg.get('ring_inner_km', 120.0))
+    outer = float(association_cfg.get('ring_outer_km', 240.0))
+    distance = _ofes_surface_eddy_distance_km(
+        domain['lon_grid'], domain['lat_grid'], lon, lat
+    )
+    ring = (
+        (distance >= inner)
+        & (distance <= outer)
+        & domain['filter_valid']
+        & domain['ocean_valid']
+    )
+    ring[pixel_lat, pixel_lon] = False
+    ring_covered = _ofes_surface_eddy_covered_by_rows(
+        domain['lon_grid'][ring],
+        domain['lat_grid'][ring],
+        rows,
+        'effective',
+    )
+    ring_area = float(np.sum(domain['area_m2'][ring]))
+    ring_occupied_area = (
+        float(np.sum(domain['area_m2'][ring][ring_covered]))
+        if ring_area > 0 else np.nan
+    )
+    ring_fraction = ring_occupied_area / ring_area if ring_area > 0 else np.nan
+    surface_ro = _ofes_surface_eddy_pick(
+        event,
+        ('surface_core_weighted_rossby_number', 'surface_core_rossby_number', 'surface_ro'),
+        np.nan,
+    )
+    if not np.isfinite(pd.to_numeric(pd.Series([surface_ro]), errors='coerce').iloc[0]) and effective_matches:
+        surface_ro = _ofes_surface_eddy_pick(effective_matches[0], ('surface_core_weighted_rossby_number', 'surface_ro'), np.nan)
+    surface_ro_value = pd.to_numeric(pd.Series([surface_ro]), errors='coerce').iloc[0]
+    surface_ro = float(surface_ro_value) if pd.notna(surface_ro_value) else np.nan
+    deep_ro = _ofes_surface_eddy_pick(event, ('deep_ro_sign', 'rossby_number', 'deep_core_rossby_number'), np.nan)
+    deep_value = pd.to_numeric(pd.Series([deep_ro]), errors='coerce').iloc[0]
+    deep_code = float(np.where(deep_value < 0, 1, np.where(deep_value > 0, -1, np.nan))) if pd.notna(deep_value) else np.nan
+    surface_match = _ofes_surface_eddy_pick(event, ('surface_core_rotation_polarity_match', 'surface_ro_same_sign', 'surface_ro_same_polarity'), np.nan)
+    if pd.isna(surface_match) and np.isfinite(surface_ro) and np.isfinite(deep_code):
+        surface_match = bool((1 if surface_ro < 0 else -1) == deep_code)
+    contained = bool(effective_matches) if eligible else np.nan
+    speed_contained = bool(speed_matches) if eligible else np.nan
+    if not eligible:
+        category = 'unassessable'
+    elif not contained:
+        category = 'no-PET'
+    else:
+        codes = {int(row.get('polarity_code')) for row in effective_matches if pd.notna(row.get('polarity_code'))}
+        category = 'same' if np.isfinite(deep_code) and int(deep_code) in codes and -int(deep_code) not in codes else 'opposite' if np.isfinite(deep_code) and -int(deep_code) in codes and int(deep_code) not in codes else 'ambiguous'
+    return {
+        'event_id': event_id,
+        'peak_date': date,
+        'peak_lon': lon,
+        'peak_lat': lat,
+        'peak_depth_m': float(_ofes_surface_eddy_pick(
+            event,
+            ('peak_depth_m', 'core_depth_m', 'reference_depth_m'),
+            np.nan,
+        )),
+        'peak_core_filter_valid': core_filter_valid,
+        'peak_core_ocean_valid': core_ocean_valid,
+        'peak_core_analysis_eligible': eligible,
+        'peak_core_contained_by_actual_pet_effective_contour': contained,
+        'peak_core_contained_by_actual_pet_speed_contour': speed_contained,
+        'effective_match_count': int(len(effective_matches)),
+        'speed_match_count': int(len(speed_matches)),
+        'effective_match_polarity_codes': json.dumps(sorted({int(row.get('polarity_code')) for row in effective_matches if pd.notna(row.get('polarity_code'))})),
+        'effective_match_object_ids': json.dumps(sorted(str(row.get('object_id')) for row in effective_matches)),
+        'effective_peak_footprint_overlap_fraction': peak_overlap,
+        'ring_occupancy_fraction': ring_fraction,
+        'ring_valid_cell_count': int(np.count_nonzero(ring)),
+        'ring_valid_area_m2': ring_area,
+        'ring_occupied_area_m2': ring_occupied_area,
+        'nearest_pet_center_distance_km': nearest_center,
+        'nearest_pet_effective_contour_vertex_distance_km': nearest_vertex,
+        'nearest_pet_center_distance_over_effective_radius': radius_ratio,
+        'surface_core_weighted_rossby_number': surface_ro,
+        'deep_polarity_code': deep_code,
+        'surface_core_rotation_polarity_match': _ofes_surface_eddy_bool(surface_match),
+        'pet_peak_category': category,
+    }
+
+
+def _ofes_surface_eddy_quality_association(
+    quality: pd.DataFrame,
+    objects: pd.DataFrame,
+    domain: Mapping[str, np.ndarray],
+) -> pd.DataFrame:
+    """Associate a quality-eligible event table without changing its denominator."""
+
+    quality_events = quality.copy()
+    for target, names in (
+        ('event_id', ('event_id', 'event', 'id')),
+        ('peak_date', ('peak_date', 'event_peak_date', 'date_peak', 'date')),
+        ('peak_lon', ('peak_lon', 'peak_core_lon', 'event_lon', 'center_lon', 'lon')),
+        ('peak_lat', ('peak_lat', 'peak_core_lat', 'event_lat', 'center_lat', 'lat')),
+    ):
+        if target not in quality_events:
+            source = next((name for name in names if name in quality_events), None)
+            if source is None:
+                raise KeyError(f'Quality-event table lacks {target}')
+            quality_events[target] = quality_events[source]
+    if 'threshold' in quality_events:
+        quality_events = quality_events.loc[
+            np.isclose(pd.to_numeric(quality_events['threshold'], errors='coerce'), 50.0)
+        ]
+    if 'quality_eligible' in quality_events:
+        quality_events = quality_events.loc[
+            quality_events['quality_eligible'].map(_ofes_surface_eddy_bool).eq(True)
+        ]
+    if {'depth_min_m', 'depth_max_m'}.issubset(quality_events.columns):
+        quality_events = quality_events.loc[
+            pd.to_numeric(quality_events['depth_min_m'], errors='coerce').ge(300.0)
+            & pd.to_numeric(quality_events['depth_max_m'], errors='coerce').le(1000.0)
+        ]
+    quality_events = quality_events.copy()
+    quality_events['event_id'] = quality_events['event_id'].astype(str)
+    quality_events['peak_date'] = pd.to_datetime(
+        quality_events['peak_date'], errors='raise'
+    ).dt.normalize()
+    rows = []
+    for event in quality_events.to_dict('records'):
+        date = pd.Timestamp(event['peak_date']).normalize()
+        lon = float(event['peak_lon'])
+        lat = float(event['peak_lat'])
+        lon_index = int(np.nanargmin(np.abs(domain['lon'] - lon)))
+        lat_index = int(np.nanargmin(np.abs(domain['lat'] - lat)))
+        filter_valid = bool(domain['filter_valid'][lat_index, lon_index])
+        ocean_valid = bool(domain['ocean_valid'][lat_index, lon_index])
+        eligible = filter_valid and ocean_valid
+        actual = _ofes_surface_eddy_valid_objects(objects, date)
+        effective = (
+            [
+                row for row in actual.to_dict('records')
+                if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'effective')
+            ]
+            if eligible else []
+        )
+        speed = (
+            [
+                row for row in actual.to_dict('records')
+                if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'speed')
+            ]
+            if eligible else []
+        )
+        rows.append({
+            'event_id': str(event['event_id']),
+            'peak_date': date,
+            'peak_lon': lon,
+            'peak_lat': lat,
+            'pet_filter_valid': filter_valid,
+            'pet_ocean_valid': ocean_valid,
+            'pet_analysis_eligible': eligible,
+            'pet_effective_contained': bool(effective) if eligible else np.nan,
+            'pet_speed_contained': bool(speed) if eligible else np.nan,
+            'effective_match_count': int(len(effective)) if eligible else np.nan,
+            'speed_match_count': int(len(speed)) if eligible else np.nan,
+        })
+    return pd.DataFrame(rows).sort_values('event_id', kind='mergesort').reset_index(drop=True)
+
+
+def _ofes_surface_eddy_annual_null(
+    objects: pd.DataFrame,
+    domain: Mapping[str, np.ndarray],
+    dates: Sequence[pd.Timestamp],
+) -> pd.DataFrame:
+    """Compute the daily cell-area-weighted month × latitude PET occupancy."""
+
+    valid = domain['filter_valid'] & domain['ocean_valid']
+    lat_bins = range(
+        int(np.floor(domain['lat'].min())),
+        int(np.floor(domain['lat'].max())) + 1,
+    )
+    records: list[dict[str, Any]] = []
+    for value in dates:
+        date = pd.Timestamp(value).normalize()
+        actual = _ofes_surface_eddy_valid_objects(objects, date)
+        covered = _ofes_surface_eddy_covered_by_rows(
+            domain['lon_grid'].ravel(),
+            domain['lat_grid'].ravel(),
+            actual,
+            'effective',
+        ).reshape(valid.shape)
+        for lat_bin in lat_bins:
+            latitude = (domain['lat'] >= lat_bin) & (domain['lat'] < lat_bin + 1.0)
+            mask = valid & latitude[:, None]
+            records.append({
+                'date': date,
+                'month': int(date.month),
+                'lat_bin_deg': int(lat_bin),
+                'denominator_cell_count': int(np.count_nonzero(mask)),
+                'occupied_cell_count': int(np.count_nonzero(mask & covered)),
+                'denominator_area_m2': float(np.sum(domain['area_m2'][mask])),
+                'occupied_area_m2': float(np.sum(domain['area_m2'][mask & covered])),
+            })
+    daily = pd.DataFrame(records)
+    if daily.empty:
+        return daily
+    result = daily.groupby(['month', 'lat_bin_deg'], as_index=False)[[
+        'denominator_cell_count',
+        'occupied_cell_count',
+        'denominator_area_m2',
+        'occupied_area_m2',
+    ]].sum()
+    result['occupancy_fraction'] = (
+        result['occupied_area_m2']
+        / result['denominator_area_m2'].replace(0.0, np.nan)
+    )
+    return result
+
+
+def run_ofes_surface_eddy_event_diagnostics(
+    population_path: str | Path,
+    catalog_dir: str | Path | None = None,
+    *,
+    delta_do_catalog_dir: str | Path,
+    quality_path: str | Path | None = None,
+    event_diagnostics_path: str | Path | None = None,
+    mccoy_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    event_ids: Sequence[str] | None = None,
+) -> dict:
+    """Reduce a completed PET catalog into event associations and two nulls.
+
+    This lightweight reducer consumes the formal event population and PET
+    parquet tables.  It separates PET-eligible, unassessable, and negative
+    outcomes, derives strict/quality/rotation subsets from the supplied rows,
+    and writes the local-ring plus annual month × latitude null tables.
+
+    参数:
+        - population_path (str | Path): event population table or its directory.
+        - catalog_dir (str | Path | None): explicit completed PET catalog;
+          defaults to the configured surface output root.
+        - delta_do_catalog_dir (str | Path): completed OFES ΔDO catalog root
+          containing the formal daily peak-pixel tables.
+        - quality_path (str | Path | None): optional quality-event table.
+        - event_diagnostics_path (str | Path | None): optional directory used
+          to locate a quality table when `quality_path` is omitted.
+        - mccoy_path (str | Path | None): optional event-level McCoy table.
+        - output_dir (str | Path | None): explicit association output root.
+        - event_ids (Sequence[str] | None): optional explicit strict subset.
+
+    返回:
+        - dict: association, nulls, rotation crosstab, quality association,
+          annual occupancy, summary, and manifest.
+
+    输出:
+        - Stable association/null/crosstab parquet files and one summary JSON.
+
+    说明:
+        - 不访问 OFES 原始场、不导入 PET、不重新运行 detector；只消费
+          已完成 catalog、valid-domain 与 event tables。所有分母由输入
+          事件集合和实际 filter-valid/ocean-valid 网格派生。
+    """
+
+    catalog = load_ofes_surface_eddy_catalog(catalog_dir)
+    objects = catalog['daily_objects']
+    domain = _ofes_surface_eddy_load_valid_domain(catalog)
+    population_file = _ofes_surface_eddy_resolve_table(population_path, ('population_peak_diagnostics.parquet', 'event_population.parquet', 'event_association.parquet'))
+    population = pd.read_parquet(population_file)
+    strict = _ofes_surface_eddy_population(population)
+    if event_ids is not None:
+        requested = {str(value) for value in event_ids}
+        missing = requested.difference(set(strict['event_id']))
+        if missing:
+            raise ValueError(f'event_ids are absent from population: {sorted(missing)}')
+        strict = strict.loc[strict['event_id'].isin(requested)].reset_index(drop=True)
+    cfg = _ofes_surface_eddy_settings()
+    association_cfg = cfg.get('association', {})
+    association = pd.DataFrame([
+        _ofes_surface_eddy_associate_event(
+            event,
+            objects,
+            domain,
+            delta_do_catalog_dir,
+            association_cfg,
+        )
+        for event in strict.to_dict('records')
+    ])
+    if association.empty:
+        association = pd.DataFrame(columns=[
+            'event_id', 'peak_date', 'peak_lon', 'peak_lat',
+            'peak_core_analysis_eligible',
+            'peak_core_contained_by_actual_pet_effective_contour',
+            'peak_core_contained_by_actual_pet_speed_contour',
+            'ring_occupancy_fraction',
+        ])
+    catalog_request = catalog['manifest'].get('request', {})
+    dates = pd.date_range(
+        pd.Timestamp(catalog_request.get('date_start', cfg['date_start'])),
+        pd.Timestamp(catalog_request.get('date_end', cfg['date_end'])),
+        freq='D',
+    )
+    annual = _ofes_surface_eddy_annual_null(objects, domain, dates)
+    annual_lookup = {
+        (int(row.month), int(row.lat_bin_deg)): float(row.occupancy_fraction)
+        for row in annual.itertuples(index=False)
+    }
+    association['annual_month_latitude_occupancy_fraction'] = [
+        annual_lookup.get((pd.Timestamp(date).month, int(np.floor(float(lat)))), np.nan)
+        for date, lat in zip(association.get('peak_date', []), association.get('peak_lat', []))
+    ]
+    association['core_minus_local_ring_occupancy'] = pd.to_numeric(association.get('peak_core_contained_by_actual_pet_effective_contour'), errors='coerce') - pd.to_numeric(association.get('ring_occupancy_fraction'), errors='coerce')
+    association['core_minus_annual_stratified_occupancy'] = pd.to_numeric(association.get('peak_core_contained_by_actual_pet_effective_contour'), errors='coerce') - pd.to_numeric(association.get('annual_month_latitude_occupancy_fraction'), errors='coerce')
+    association['annual_null_stratum'] = [
+        f'month={pd.Timestamp(date).month:02d};latitude_band={int(np.floor(float(lat)))}--{int(np.floor(float(lat))) + 1}N'
+        for date, lat in zip(association.get('peak_date', []), association.get('peak_lat', []))
+    ]
+    null_rows = []
+    for row in association.to_dict('records'):
+        for null_type, value, difference in (
+            ('local_ring_120_240km', row.get('ring_occupancy_fraction'), row.get('core_minus_local_ring_occupancy')),
+            ('annual_month_latitude_occupancy', row.get('annual_month_latitude_occupancy_fraction'), row.get('core_minus_annual_stratified_occupancy')),
+        ):
+            null_rows.append({
+                'event_id': row['event_id'],
+                'peak_date': row['peak_date'],
+                'peak_lon': row['peak_lon'],
+                'peak_lat': row['peak_lat'],
+                'null_type': null_type,
+                'occupancy_fraction': value,
+                'core_indicator': row.get('peak_core_contained_by_actual_pet_effective_contour'),
+                'core_minus_null': difference,
+                'ring_valid_cell_count': row.get('ring_valid_cell_count'),
+                'ring_valid_area_m2': row.get('ring_valid_area_m2'),
+                'stratum': (
+                    row.get('annual_null_stratum')
+                    if null_type == 'annual_month_latitude_occupancy'
+                    else 'same-day 120--240 km filter-valid/ocean-valid ring'
+                ),
+            })
+    nulls = pd.DataFrame(null_rows)
+    rotation = association.loc[
+        strict.set_index('event_id').reindex(association['event_id'])['rotation_dominated'].fillna(False).to_numpy(bool)
+    ].copy() if not association.empty else association.copy()
+    if not association.empty:
+        rotation = association.loc[
+            strict.set_index('event_id').reindex(association['event_id'])['rotation_dominated'].fillna(False).to_numpy(bool)
+        ].copy()
+        rotation['event_id'] = rotation['event_id'].astype(str)
+    if quality_path is None and event_diagnostics_path is not None:
+        try:
+            quality_path = _ofes_surface_eddy_resolve_table(event_diagnostics_path, ('quality_event_catalog.parquet', 'quality_eligible_events.parquet'))
+        except (FileNotFoundError, ValueError):
+            quality_path = None
+    quality = (
+        _ofes_surface_eddy_quality_association(
+            pd.read_parquet(_ofes_surface_eddy_resolve_table(
+                quality_path,
+                ('quality_event_catalog.parquet', 'quality_eligible_events.parquet'),
+            )),
+            objects,
+            domain,
+        )
+        if quality_path is not None else
+        association.rename(columns={
+            'peak_core_analysis_eligible': 'pet_analysis_eligible',
+            'peak_core_contained_by_actual_pet_effective_contour': 'pet_effective_contained',
+            'peak_core_contained_by_actual_pet_speed_contour': 'pet_speed_contained',
+        }).reindex(columns=[
+            'event_id', 'peak_date', 'peak_lon', 'peak_lat',
+            'pet_analysis_eligible', 'pet_effective_contained', 'pet_speed_contained',
+            'nearest_pet_center_distance_km',
+        ]).copy()
+    )
+    if mccoy_path is not None:
+        mccoy = pd.read_parquet(_ofes_surface_eddy_resolve_table(mccoy_path, ('event_summary.parquet', 'mccoy_event_summary.parquet')))
+        if 'event_id' not in mccoy:
+            raise KeyError('McCoy table lacks event_id')
+        association = association.merge(mccoy, on='event_id', how='left', suffixes=('', '_mccoy'), validate='one_to_one')
+    root = _ofes_surface_eddy_output_root(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        'association': root / 'surface_eddy_event_association.parquet',
+        'nulls': root / 'surface_eddy_event_nulls.parquet',
+        'rotation': root / 'surface_eddy_surface_ro_crosstab.parquet',
+        'quality': root / 'surface_eddy_quality_eligible_161.parquet',
+        'annual': root / 'surface_eddy_annual_occupancy.parquet',
+        'summary': root / 'surface_eddy_summary.json',
+        'manifest': root / 'surface_eddy_event_association_manifest.json',
+    }
+    association.to_parquet(outputs['association'], index=False)
+    nulls.to_parquet(outputs['nulls'], index=False)
+    rotation.to_parquet(outputs['rotation'], index=False)
+    quality.to_parquet(outputs['quality'], index=False)
+    annual.to_parquet(outputs['annual'], index=False)
+    local_values = pd.to_numeric(association.get('core_minus_local_ring_occupancy'), errors='coerce').dropna().to_numpy(float)
+    annual_values = pd.to_numeric(association.get('core_minus_annual_stratified_occupancy'), errors='coerce').dropna().to_numpy(float)
+    def _mean_ci(values: np.ndarray, seed: int) -> tuple[float, float, float]:
+        if values.size == 0:
+            return np.nan, np.nan, np.nan
+        rng = np.random.default_rng(seed)
+        replicates = int(association_cfg.get('bootstrap_replicates', 10000))
+        sample = rng.choice(values, size=(replicates, values.size), replace=True)
+        return (
+            float(values.mean()),
+            float(np.percentile(sample.mean(axis=1), 2.5)),
+            float(np.percentile(sample.mean(axis=1), 97.5)),
+        )
+
+    def _signed_counts(values: np.ndarray) -> dict[str, int]:
+        finite = values[np.isfinite(values)]
+        return {
+            'n': int(finite.size),
+            'negative': int(np.count_nonzero(finite < 0)),
+            'zero': int(np.count_nonzero(finite == 0)),
+            'positive': int(np.count_nonzero(finite > 0)),
+        }
+
+    def _wilcoxon_two_sided(values: np.ndarray) -> dict[str, float]:
+        from scipy.stats import wilcoxon
+
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return {'statistic': np.nan, 'pvalue': np.nan}
+        if np.allclose(finite, 0.0, rtol=0.0, atol=0.0):
+            return {'statistic': 0.0, 'pvalue': 1.0}
+        result = wilcoxon(finite, alternative='two-sided', zero_method='wilcox')
+        return {'statistic': float(result.statistic), 'pvalue': float(result.pvalue)}
+
+    seed = int(association_cfg.get('random_seed', 20260814))
+    local_mean, local_low, local_high = _mean_ci(local_values, seed)
+    annual_mean, annual_low, annual_high = _mean_ci(annual_values, seed + 1)
+    strict_eligible = pd.Series(
+        association.get('peak_core_analysis_eligible', []), dtype='object'
+    ).map(_ofes_surface_eddy_bool).eq(True)
+    rotation_eligible = pd.Series(
+        rotation.get('peak_core_analysis_eligible', []), dtype='object'
+    ).map(_ofes_surface_eddy_bool).eq(True)
+    quality_eligible = pd.Series(
+        quality.get('pet_analysis_eligible', []), dtype='object'
+    ).map(_ofes_surface_eddy_bool).eq(True)
+    summary = {
+        'candidate_events': int(len(population)),
+        'strict_events': int(len(association)),
+        'strict_primary_analysis_eligible': int(strict_eligible.sum()),
+        'rotation_events': int(len(rotation)),
+        'quality_events': int(len(quality)),
+        'quality_analysis_eligible': int(quality_eligible.sum()),
+        'primary_denominator': {
+            'strict_input': int(len(association)),
+            'core_filter_valid_and_ocean_valid': int(strict_eligible.sum()),
+            'complete_background_ring': int(pd.to_numeric(
+                association.get(
+                    'ring_valid_cell_count',
+                    pd.Series(index=association.index, dtype=float),
+                ),
+                errors='coerce',
+            ).gt(0).sum()),
+            'paired_core_minus_ring': int(np.isfinite(local_values).sum()),
+            'effective_core_contained': int(pd.Series(
+                association.get('peak_core_contained_by_actual_pet_effective_contour', []),
+                dtype='object',
+            ).map(_ofes_surface_eddy_bool).eq(True).sum()),
+        },
+        'local_ring_null': {
+            'core_minus_ring_mean': local_mean,
+            'bootstrap_95ci': [local_low, local_high],
+            'event_counts': _signed_counts(local_values),
+            'wilcoxon_two_sided': _wilcoxon_two_sided(local_values),
+        },
+        'annual_month_latitude_null': {
+            'core_minus_annual_mean': annual_mean,
+            'bootstrap_95ci': [annual_low, annual_high],
+            'event_counts': _signed_counts(annual_values),
+            'wilcoxon_two_sided': _wilcoxon_two_sided(annual_values),
+            'occupancy_table': str(outputs['annual']),
+        },
+        'rotation_29': {
+            'n': int(len(rotation)),
+            'analysis_eligible': int(rotation_eligible.sum()),
+        },
+        'quality_eligible_161': {
+            'n': int(len(quality)),
+            'analysis_eligible': int(quality_eligible.sum()),
+            'unassessable': int((~quality_eligible).sum()),
+            'effective_contained': int(pd.Series(
+                quality.get('pet_effective_contained', []), dtype='object'
+            ).map(_ofes_surface_eddy_bool).eq(True).sum()),
+        },
+        'paths': {key: str(value) for key, value in outputs.items()},
+    }
+    _ofes_surface_eddy_write_json(outputs['summary'], summary)
+    manifest = {
+        'schema_version': 1,
+        'status': 'complete',
+        'request': {
+            'population_path': str(population_file),
+            'delta_do_catalog_dir': str(Path(delta_do_catalog_dir).expanduser()),
+            'quality_path': str(quality_path) if quality_path is not None else None,
+            'mccoy_path': str(mccoy_path) if mccoy_path is not None else None,
+            'event_ids': sorted(association['event_id'].astype(str).tolist()),
+        },
+        'outputs': {key: str(value) for key, value in outputs.items()},
+    }
+    _ofes_surface_eddy_write_json(outputs['manifest'], manifest)
+    return {
+        'run_dir': root,
+        'association': association,
+        'nulls': nulls,
+        'rotation': rotation,
+        'quality': quality,
+        'annual_occupancy': annual,
+        'summary': summary,
+        'manifest': manifest,
+    }
+
+
+def load_ofes_surface_eddy_event_diagnostics(
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Load completed surface-eddy associations, nulls, and summaries.
+
+    参数:
+        - output_dir (str | Path | None): explicit association output root.
+
+    返回:
+        - dict: association, nulls, rotation, quality, annual occupancy,
+          summary, and manifest tables.
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 不访问 OFES 原始场、不导入 PET、不创建目录，也不猜测运行。
+    """
+
+    root = _ofes_surface_eddy_output_root(output_dir)
+    names = {
+        'association': 'surface_eddy_event_association.parquet',
+        'nulls': 'surface_eddy_event_nulls.parquet',
+        'rotation': 'surface_eddy_surface_ro_crosstab.parquet',
+        'quality': 'surface_eddy_quality_eligible_161.parquet',
+        'annual_occupancy': 'surface_eddy_annual_occupancy.parquet',
+        'summary': 'surface_eddy_summary.json',
+        'manifest': 'surface_eddy_event_association_manifest.json',
+    }
+    result: dict[str, Any] = {'run_dir': root}
+    for key, name in names.items():
+        path = root / name
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        result[key] = _ofes_surface_eddy_read_json(path) if path.suffix == '.json' else pd.read_parquet(path)
+    return result
+
+
+def load_ofes_surface_eddy_association(output_dir: str | Path | None = None) -> pd.DataFrame:
+    """Load the formal OFES surface-eddy event association table.
+
+    参数:
+        - output_dir (str | Path | None): explicit association output root.
+    返回:
+        - pandas.DataFrame: event-level PET association rows.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不导入 PET、不创建目录。
+    """
+
+    return load_ofes_surface_eddy_event_diagnostics(output_dir)['association']
+
+
+def load_ofes_surface_eddy_nulls(output_dir: str | Path | None = None) -> pd.DataFrame:
+    """Load the formal local-ring and annual-stratified null table.
+
+    参数:
+        - output_dir (str | Path | None): explicit association output root.
+    返回:
+        - pandas.DataFrame: event-by-null rows.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不导入 PET、不创建目录。
+    """
+
+    return load_ofes_surface_eddy_event_diagnostics(output_dir)['nulls']
+
+
+def summarize_ofes_surface_eddy_association(
+    result: Mapping[str, Any] | None = None,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Return a concise denominator and category summary for PET associations.
+
+    参数:
+        - result (Mapping | None): result from the reducer; None loads it.
+        - output_dir (str | Path | None): explicit association output root.
+
+    返回:
+        - dict: event counts, PET categories, and null sample sizes.
+
+    输出:
+        - 无；只读取并汇总已有正式产物。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行 PET 或任何 reducer。
+    """
+
+    payload = result if result is not None else load_ofes_surface_eddy_event_diagnostics(output_dir)
+    association = payload['association']
+    category_counts = association['pet_peak_category'].value_counts(dropna=False).to_dict() if 'pet_peak_category' in association else {}
+    return {
+        'strict_events': int(len(association)),
+        'analysis_eligible': int(pd.Series(association.get('peak_core_analysis_eligible', []), dtype='object').map(_ofes_surface_eddy_bool).eq(True).sum()),
+        'pet_peak_category_counts': {str(key): int(value) for key, value in category_counts.items()},
+        'local_null_n': int(pd.to_numeric(association.get('core_minus_local_ring_occupancy'), errors='coerce').notna().sum()),
+        'annual_null_n': int(pd.to_numeric(association.get('core_minus_annual_stratified_occupancy'), errors='coerce').notna().sum()),
+    }
+
+
+def plot_ofes_surface_eddy_diagnostics(
+    result: Mapping[str, Any] | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """Plot lightweight PET category and null summaries.
+
+    参数:
+        - result (Mapping | None): reducer result; None loads fixed outputs.
+        - output_dir (str | Path | None): explicit output directory.
+        - show_fig (bool): whether to display the figure.
+        - save_fig (bool): overwrite the fixed summary PNG when True.
+
+    返回:
+        - dict: figure and optional figure path.
+
+    输出:
+        - `surface_eddy_association_summary.png` when `save_fig=True`.
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤，只消费 reducer output。
+    """
+
+    payload = result if result is not None else load_ofes_surface_eddy_event_diagnostics(output_dir)
+    association = payload['association']
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8))
+    categories = association.get('pet_peak_category', pd.Series(dtype=str)).value_counts()
+    axes[0].bar(categories.index.astype(str), categories.to_numpy(), color='#4c78a8')
+    axes[0].set_ylabel('Events')
+    axes[0].set_title('PET peak categories')
+    values = []
+    labels = []
+    for label, column in (('local ring', 'core_minus_local_ring_occupancy'), ('annual stratified', 'core_minus_annual_stratified_occupancy')):
+        if column in association:
+            values.append(pd.to_numeric(association[column], errors='coerce').dropna().to_numpy(float))
+            labels.append(label)
+    axes[1].boxplot(values, labels=labels, showmeans=True) if values else axes[1].text(0.5, 0.5, 'No null values', ha='center', va='center')
+    axes[1].axhline(0.0, color='0.3', linestyle='--', linewidth=0.8)
+    axes[1].set_ylabel('Core − null occupancy')
+    axes[1].set_title('Surface-eddy null contrasts')
+    fig.tight_layout()
+    path = None
+    if save_fig:
+        root = _ofes_surface_eddy_output_root(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / 'surface_eddy_association_summary.png'
+        fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    return {'figure': fig, 'figure_path': path}

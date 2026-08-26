@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.26 变更：
+#   - 新增 OFES PET surface-eddy detection、tracking、valid-domain 与
+#     event-association/null 的正式科学参数；输出目录由 paths.yml 控制。
 # version 1.25 变更：
 #   - 新增最终 grid-SCV v2 分层检测、事件日关联和 S5 系统抽样背景敏感性；
 #     统一使用固定正式输出目录，保存结构性 provenance，不以代码/配置哈希阻断读取。
@@ -97,7 +100,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.25
+version: 1.26
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -274,6 +277,45 @@ ofes:
   variable_semantics:
     eta: sea_surface_height
     pressur: surface_air_pressure
+  surface_eddy:
+    eta_subdir: eta
+    date_start: 2003-01-01
+    date_end: 2003-12-31
+    region:
+      lon_min: 140.0
+      lon_max: 170.0
+      lat_min: 25.0
+      lat_max: 45.0
+    raw_eta_units: cm
+    filter:
+      wavelength_km: 700.0
+      order: 1
+      lat_max: 85.0
+      extend: false
+    detection:
+      contour_interval_m: 0.002
+      shape_error_pct: 70.0
+      pixel_limit_min: 5
+      pixel_limit_max: 2000
+      maximum_local_extrema: 1
+      nb_step_min: 2
+      nb_step_to_be_mle: 2
+      presampling_multiplier: 10
+      sampling: 50
+      sampling_method: visvalingam
+      stencil_halfwidth: 4
+      force_height_unit: m
+      force_speed_unit: m/s
+    tracking:
+      minimum_overlap: 0.05
+      maximum_search_days: 5
+      maximum_consecutive_virtual: 4
+    association:
+      ring_inner_km: 120.0
+      ring_outer_km: 240.0
+      annual_latitude_bin_deg: 1.0
+      bootstrap_replicates: 10000
+      random_seed: 20260814
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
   delta_do_catalog:
     thresholds: [20.0, 35.0, 50.0]
