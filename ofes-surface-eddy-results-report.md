@@ -33,11 +33,14 @@
   **5.87×有效半径**;全体严格事件的 9.22×不作为主口径,因为混入了
   滤波域外峰核。
 - 29 个峰日旋转主导事件中 16 个 PET 可分析:包含数 **0/16**;
-  另 13 个不可判定。
+  另 13 个不可判定。该同一分母中有 **15/16** 个事件保留同号
+  表层–深层 Ro 对应,因此主比较是 **15/16 same-sign surface–deep Ro
+  correspondence** 对 **0/16 closed-SSH containment**。
 
-结论:这些深层 DO50 峰核呈现**表层有旋转动力印记、但与闭合 SSH 涡目录
+结论:这些深层 DO50 峰核呈现**同号表层–深层 Ro 对应、但与闭合 SSH 涡目录
 系统脱钩**的结构。在 PET 可分析域内没有事件核心被目录涡包含,其目录占有率
-还显著低于局地与年度背景;与此同时,26/29 个旋转事件保留同号表层 Ro。
+还显著低于局地与年度背景;在同一 16-event rotation 子集中,15/16
+保留同号表层–深层 Ro 对应,而闭合 SSH 包含为 0/16。
 PET 全年检出 614 对象、64 轨迹,说明结果不是检测器空转。这里的“脱钩”限定于
 冻结的 PET/META-family 闭合 SSH 目录,强调的是目录对这类次表层旋转载体的
 代表性不足,而不是表层完全没有动力表达。
@@ -65,9 +68,9 @@ PET 全年检出 614 对象、64 轨迹,说明结果不是检测器空转。这�
 ## 四、旋转与 McCoy 交叉表
 
 - rotation_29 与表面 Ro:深极性反气旋 27 / 气旋 2;
-  **表层核心加权 Ro 同极性 26/29**。深层旋转信号在表层 Ro 上有影子,
-  但 16 个 PET 可分析峰核均未形成闭合 SSH 等高线涡(0/16),另 13 个
-  因滤波有效域限制不可判定。
+  **表层核心加权 Ro 同极性 26/29**。在同一 16 个 PET 可分析旋转事件中,
+  **15/16** 保留同号表层–深层 Ro 对应,但均未被闭合 SSH 等高线涡包含
+  (**0/16**);另 13 个因滤波有效域限制不可判定。
 - McCoy 事件级字段与 lock 冻结计数逐值一致:
   center 9/56、center+velocity 6/56、any 19/56、any+velocity 11/56。
   PET 包含数与 McCoy 兼容数之间的交叉无变异可用(包含数全 0),
@@ -75,11 +78,12 @@ PET 全年检出 614 对象、64 轨迹,说明结果不是检测器空转。这�
 
 ## 五、解读与叙事位置
 
-- **“表层有旋转印记、闭合 SSH 目录却脱钩”的模式侧证据**:McCoy 2020
-  SCV 的定义特征之一是表层表达弱或被遮挡。本线同时看到 26/29 个旋转事件
-  保留同号表层 Ro、PET 可分析峰核却无一进入闭合 SSH 涡(0/31;rotation
-  子集 0/16),并且距最近目录涡中位 5.87R。这表明相关次表层旋转载体可以
-  留下表层涡度印记,却不满足传统闭合 SSH 目录的拓扑条件。
+- **“同号表层–深层 Ro 对应、闭合 SSH 目录却脱钩”的模式侧证据**:McCoy
+  2020 SCV 的定义特征之一是表层表达弱或被遮挡。本线在同一 16-event
+  rotation/PET-eligible 子集中看到 15/16 个事件保留同号表层–深层 Ro
+  对应,却无一进入闭合 SSH 涡(0/16);全部 rotation population 的背景值
+  是 26/29,严格 PET 分母为 31/56。该结果表明相关次表层旋转载体可以保留
+  同号表层动力响应,却不满足传统闭合 SSH 目录的拓扑条件。
 - 与 mechanism 线共同构成次表层组织证据:事件侧 McCoy-compatible
   信号相对背景富集(19/56),全球观测中 SCV 对 DO50 的关联最强
   (OR 20.2),而本线显示同类 OFES 深层事件在 PET 可分析域内未进入闭合
@@ -95,9 +99,8 @@ PET 全年检出 614 对象、64 轨迹,说明结果不是检测器空转。这�
 - 历史运行图:`plots/event_containment_and_contour_comparison.png`、
   `rotation_pet_expression.png`、三案例图与四工程日轮廓图。
 - 论文候选图由受版本控制的 `plot_ofes_surface_eddy_paper_figures.py` 从上述
-  审计输出生成;权威输出位于本 worktree 的
-  `plot_outputs/do/ofes_np30_ke/surface_eddy/paper_figures/`,并同步到整合图包:
-  - `F14_surface_containment.png`:可分析分母包含率 + 最近涡距离分布
-  - `F15_surface_null_two_sided.png`:双侧 null 森林图(两口径)
-  - `F16_surface_rotation_pet.png`:rotation×PET 三态交叉(0/16 eligible、
-    13 unassessable、surface Ro 同极性 26/29)
+  审计输出生成:
+  - `Figure6_surface_ssh_decoupling.png`:E000002 案例、同一 16-event
+    子集的 15/16 对 0/16 比较,以及 n=31 的两类 event-equal null 对比。
+    strict PET-eligible 为 31/56,rotation PET-eligible 为 16/29,
+    quality PET-eligible 为 58/161;最近距离直方图移出主图。
