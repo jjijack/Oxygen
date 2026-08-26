@@ -1,4 +1,11 @@
 # 处理与算法参数配置
+# version 1.24 变更：
+#   - 新增 OFES 二维/三维 ensemble trajectories、数据集专项 w 连续方程验证和严格事件总体推广，
+#     并沿既有路径诊断热盐指纹、McCoy-method-compatible 虚拟剖面及 matched-control 通风历史。
+#   - 正式 OFES 读取统一由 paths.yml 的 `./data/OFES_NP30` 入口控制；新增轨迹、示踪剂和通风
+#     诊断使用固定语义输出目录，并可由 notebook 直接调用或读取。
+#   - McCoy 阶段桥接覆盖当前严格事件总体；默认使用各阶段对象峰位置，并保留 fixed-peak 敏感性。
+#   - 固定垂向速度验证日期写入 `vertical_velocity_validation.dates`，作为正式验证请求的一部分。
 # version 1.23 变更：
 #   - 更正并扩展 OFES NP30 数据入口：按 MOM3 Arakawa B-grid 将 u/v 从角点共置到示踪物中心，
 #     保留 w 的层界深度，并统一深度坐标、变量单位和区域子集读取。
@@ -85,7 +92,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.23
+version: 1.24
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -248,9 +255,9 @@ ofes:
     w: "m s-1"
     eta: "m"
     pressur: "hPa"
-  vertical_velocity_positive: up  # MOM3 约定；正式启用 w 前仍需保留可复现的数据集专项验证
-  vertical_velocity_sign_basis: "MOM3 convention; dataset-specific validation artifact required"
-  temporal_interpolation: piecewise_constant_unvalidated
+  vertical_velocity_positive: up  # MOM3 约定；三维轨迹另强制校验本数据集的连续方程结果
+  vertical_velocity_sign_basis: "MOM3 convention plus required dataset-specific B-grid continuity validation"
+  temporal_interpolation: linear_uv_w_validated  # u/v 于 tracer center、w 于层界；二维与三维均已过解析场、步长与可逆性验证
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
     u: u_vel
@@ -369,6 +376,154 @@ ofes:
     surface_profile_rossby_tolerance: 0.001
     figure_dpi: 180
     output_subdir: event_lifecycle
+  mccoy_virtual_argo:
+    worker_count: 16
+    sample_ring_fractions: [0.0, 0.35, 0.70]
+    sample_azimuth_count: 8
+    control_radii_km: [130.0, 155.0, 180.0, 205.0, 230.0]
+    control_azimuth_count: 16
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_spacing_km: 25.0
+    minimum_background_profiles: 61
+    pressure_min_dbar: 0.0
+    pressure_max_dbar: 1070.0
+    pressure_spacing_dbar: 10.0
+    smoothing_grid_spacing_dbar: 2.0
+    smoothing_bandwidth_dbar: 10.0
+    profile_min_unique_levels: 40
+    profile_min_pressure_max_dbar: 700.0
+    profile_max_pressure_min_dbar: 100.0
+    shallow_resolution_max_dbar: 65.0
+    deep_resolution_max_dbar: 105.0
+    iqr_multiplier: 1.5
+    initial_minimum_spice_exceedance_levels: 2
+    n2_density_tolerance_kg_m3: 0.2
+    minimum_peak_spiciness_kg_m3: 0.10
+    gaussian_r2_min: 0.5
+    gaussian_nrmse_max: 0.5
+    gaussian_h_min_dbar: 50.0
+    gaussian_h_max_dbar: 850.0
+    gaussian_h_step_dbar: 10.0
+    gaussian_amplitude_factors: [0.8, 1.2, 0.05]
+    gaussian_center_shift_factors: [-0.2, 0.2, 0.05]
+    lens_height_min_dbar: 150.0
+    lens_height_max_dbar: 1200.0
+    lens_shallow_limit_min_dbar: 100.0
+    equator_latitude_min_deg: 5.0
+    direct_velocity_smoothing_sigma_pixels: 1.5
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    figure_dpi: 180
+    output_subdir: mccoy_virtual_argo
+    stage_bridge_output_subdir: mccoy_virtual_argo_stage_bridge
+  vertical_velocity_validation:
+    dates: ["2003-01-04", "2003-01-22", "2003-01-26", "2003-04-14", "2003-06-04"]
+    lon_bounds: [142.0, 153.0]
+    lat_bounds: [32.0, 39.0]
+    depth_bounds_m: [250.0, 900.0]
+    minimum_finite_fraction: 0.99
+    correlation_min: 0.99
+    regression_slope_min: 0.95
+    regression_slope_max: 1.05
+    normalized_rmse_max: 0.12
+    opposite_sign_normalized_rmse_min: 1.50
+    figure_dpi: 180
+    output_subdir: vertical_velocity_validation
+  trajectory_2d:
+    temporal_interpolation: linear
+    rk4_dt_seconds: 3600
+    sensitivity_dt_seconds: [1800, 3600, 7200]
+    reversibility_days: [1, 3, 5]
+    reversibility_median_error_max_km: 5.0
+    reversibility_q90_error_max_km: 10.0
+    timestep_endpoint_median_spread_max_km: 10.0
+    analytic_translation_error_max_km: 0.01
+    analytic_rotation_error_max_km: 0.01
+    domain_margin_km: 700.0
+    minimum_active_fraction: 0.75
+    ensemble_ring_fractions: [0.0, 0.35, 0.70]
+    ensemble_azimuth_count: 8
+    adjacent_depth_levels: 1
+    figure_dpi: 180
+    output_subdir: trajectory_2d
+  trajectory_3d:
+    temporal_interpolation: linear
+    rk4_dt_seconds: 3600
+    sensitivity_dt_seconds: [1800, 3600, 7200]
+    reversibility_days: [1, 3, 5]
+    reversibility_median_error_max_km: 5.0
+    reversibility_q90_error_max_km: 10.0
+    reversibility_median_depth_error_max_m: 10.0
+    reversibility_q90_depth_error_max_m: 25.0
+    timestep_endpoint_median_spread_max_km: 10.0
+    timestep_endpoint_median_depth_spread_max_m: 10.0
+    analytic_translation_error_max_km: 0.01
+    analytic_vertical_error_max_m: 0.10
+    domain_margin_km: 700.0
+    minimum_active_fraction: 0.75
+    ensemble_ring_fractions: [0.0, 0.35, 0.70]
+    ensemble_azimuth_count: 8
+    adjacent_depth_levels: 1
+    headline_vertical_alignment_median_max_m: 150.0
+    headline_downward_displacement_min_m: 100.0
+    figure_dpi: 180
+    output_subdir: trajectory_3d
+  trajectory_3d_population:
+    worker_count: 16
+    minimum_integration_days: 1
+    observed_depth_change_min_m: 25.0
+    particle_depth_change_min_m: 25.0
+    vertical_alignment_median_max_m: 150.0
+    representative_parity_atol: 1.0e-9
+    figure_dpi: 180
+    output_subdir: trajectory_3d_population
+  trajectory_tracers:
+    worker_count: 16
+    integration_labels: ["forward_observed_start_to_peak", "backward_peak_to_start"]
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_load_margin_km: 50.0
+    background_min_valid_columns: 100
+    minimum_active_fraction: 0.75
+    minimum_valid_particle_fraction: 0.75
+    same_sigma_do_abs_min_umol_kg: 10.0
+    same_sigma_theta_abs_min_deg_c: 0.10
+    same_sigma_salinity_abs_min: 0.02
+    same_sigma_spiciness0_abs_min: 0.05
+    fingerprint_persistence_fraction_min: 0.75
+    normalized_time_bin_count: 11
+    figure_dpi: 180
+    output_subdir: trajectory_tracers
+  trajectory_ventilation:
+    worker_count: 16
+    io_concurrency: 4
+    maximum_backtrack_days: 90
+    reporting_horizons_days: [30, 60, 90]
+    integration_dt_seconds: 3600
+    domain_margin_km: 700.0
+    minimum_active_fraction: 0.75
+    mld_reference_depth_m: 10.0
+    mld_density_threshold_kg_m3: 0.03
+    near_mld_tolerance_m: 25.0
+    outcrop_density_tolerance_kg_m3: 0.03
+    control_inner_radius_km: 120.0
+    control_outer_radius_km: 240.0
+    control_radius_step_km: 25.0
+    control_azimuth_count: 32
+    control_depth_scale_m: 50.0
+    control_depth_max_difference_m: 150.0
+    control_sigma0_scale_kg_m3: 0.05
+    control_sigma0_max_difference_kg_m3: 0.15
+    control_same_sign_do_max_umol_kg: 10.0
+    control_same_sign_spiciness0_max: 0.05
+    kinematic_smoothing_sigma_pixels: 1.0
+    kinematic_ro_scale: 0.10
+    kinematic_strain_scale_s_1: 1.0e-5
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    figure_dpi: 180
+    output_subdir: trajectory_ventilation
   event_evolution:
     map_radius_km: 350.0
     map_quiver_stride: 12

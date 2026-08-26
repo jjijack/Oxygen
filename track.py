@@ -14,6 +14,7 @@ import pickle
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
+import scipy
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter, label as ndimage_label
 from scipy.sparse import coo_matrix
@@ -25,6 +26,11 @@ from scipy.optimize import least_squares, linear_sum_assignment
 import copy
 import gsw
 from collections import defaultdict
+from contextlib import contextmanager
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    as_completed as futures_as_completed,
+)
 import multiprocessing
 import h5py
 import time as tm
@@ -118,10 +124,18 @@ _mld_clim_root = Path(
     _PATHS_CFG.get('paths', {}).get('mld_clim_root', './data/mld_clim')
 )
 _ofes_root = Path(
-    _PATHS_CFG.get('paths', {}).get('ofes_root', './data/OFES_NP30')
+    _PATHS_CFG.get('paths', {}).get(
+        'ofes_root', './data/OFES_NP30'
+    )
 )
 _mccoy_scv_csv = Path(
     _PATHS_CFG.get('paths', {}).get('mccoy_scv_csv', './data/mccoy2020_scv/SCVs.csv')
+)
+_mccoy_scv_source_archive = Path(
+    _PATHS_CFG.get('paths', {}).get(
+        'mccoy_scv_source_archive',
+        './data/mccoy2020_scv/ArgoSCVs-v1.3.zip',
+    )
 )
 _OFES_CFG = _PROC_CFG.get('ofes', {})
 
@@ -36103,9 +36117,12 @@ def load_ofes_snapshot(
     返回:
         - dict: 含 date/lon/lat/depth、请求变量和 metadata；u/v 与示踪物数组维度为 (depth, lat, lon)，w 为 (depth_w, lat, lon)。
 
+    输出:
+        - 无文件输出；仅返回内存中的快照与坐标/单位 provenance。
+
     说明:
         - JAMSTEC OFES 公开数据页将 DODS 垂向坐标的 mbar 说明为通用错误 metadata，并非本次交付的专项确认；结合交付层位，本入口按 z-level 深度（m）解释其数值。
-        - `w` 按 MOM3 约定记录为向上为正，但尚缺可复现的数据集专项验证；本函数只负责读取，不据此授权三维轨迹解释。
+        - `w` 按 MOM3 约定记录为向上为正；本函数只负责读取，三维轨迹另需消费 `validate_ofes_vertical_velocity` 通过后的完整 manifest。
         - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
     date_ts = pd.Timestamp(date).normalize()
@@ -36434,6 +36451,12 @@ def extract_ofes_profile(
 
     返回:
         - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
+
+    输出:
+        - 无文件输出；仅返回内存剖面表。
+
+    说明:
+        - 位置使用最近邻水平格点；`w` 因位于 `depth_w` 层界而不由本入口返回。
     """
     _ofes_validate_profile_point(snapshot, lon, lat)
     lat_arr = np.asarray(snapshot['lat'], dtype=float)
@@ -36471,6 +36494,13 @@ def extract_ofes_profile_interp(
 
     返回:
         - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
+
+    输出:
+        - 无文件输出；仅返回内存剖面表。
+
+    说明:
+        - 任一请求变量的四角整列均为 NaN 时，整张表一致回退到最近邻剖面。
+        - `w` 因位于 `depth_w` 层界而不由本入口返回。
     """
     _ofes_validate_profile_point(snapshot, lon, lat)
     lat_arr = np.asarray(snapshot['lat'], dtype=float)
@@ -36537,6 +36567,9 @@ def detect_ofes_delta_do(
 
     返回:
         - pd.DataFrame: 每个剖面最多一个最强候选，含 depth 和 ΔDO 指标；空表表示无异常。
+
+    输出:
+        - 无文件输出；仅返回通用 detector 生成的内存候选表。
 
     说明:
         - DetectionConfig 的 `anomaly_*_depth` 字段在本入口直接按深度米解释。
@@ -36632,30 +36665,175 @@ def _ofes_fixed_depth_tendency(
     return np.column_stack([np.zeros_like(u), dlat, dlon])
 
 
+def _ofes_fixed_depth_tendency_time_linear(
+    pos: np.ndarray,
+    u_start: np.ndarray,
+    v_start: np.ndarray,
+    u_end: np.ndarray,
+    v_end: np.ndarray,
+    time_fraction: float,
+    depth: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """在线性日场时刻插值后返回固定深度粒子倾向。"""
+    alpha = float(time_fraction)
+    if not 0 <= alpha <= 1:
+        raise ValueError('time_fraction must lie in [0, 1].')
+    u_field = (1.0 - alpha) * u_start + alpha * u_end
+    v_field = (1.0 - alpha) * v_start + alpha * v_end
+    return _ofes_fixed_depth_tendency(
+        pos, u_field, v_field, depth, lat, lon
+    )
+
+
 def _ofes_rk4_fixed_depth_step(
     pos: np.ndarray,
-    u_field: np.ndarray,
-    v_field: np.ndarray,
+    u_start: np.ndarray,
+    v_start: np.ndarray,
+    u_end: np.ndarray,
+    v_end: np.ndarray,
     depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     dt: float,
+    time_fraction_start: float,
+    time_fraction_step: float,
 ) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
-    """执行一步固定深度 RK4，并返回用于越界判定的中间位置。"""
-    k1 = _ofes_fixed_depth_tendency(
-        pos, u_field, v_field, depth, lat, lon
+    """以线性日场时间插值执行一步固定深度 RK4。"""
+    alpha_1 = float(time_fraction_start)
+    alpha_half = alpha_1 + 0.5 * float(time_fraction_step)
+    alpha_4 = alpha_1 + float(time_fraction_step)
+    k1 = _ofes_fixed_depth_tendency_time_linear(
+        pos,
+        u_start,
+        v_start,
+        u_end,
+        v_end,
+        alpha_1,
+        depth,
+        lat,
+        lon,
     )
     pos2 = pos + 0.5 * dt * k1
-    k2 = _ofes_fixed_depth_tendency(
-        pos2, u_field, v_field, depth, lat, lon
+    k2 = _ofes_fixed_depth_tendency_time_linear(
+        pos2,
+        u_start,
+        v_start,
+        u_end,
+        v_end,
+        alpha_half,
+        depth,
+        lat,
+        lon,
     )
     pos3 = pos + 0.5 * dt * k2
-    k3 = _ofes_fixed_depth_tendency(
-        pos3, u_field, v_field, depth, lat, lon
+    k3 = _ofes_fixed_depth_tendency_time_linear(
+        pos3,
+        u_start,
+        v_start,
+        u_end,
+        v_end,
+        alpha_half,
+        depth,
+        lat,
+        lon,
     )
     pos4 = pos + dt * k3
-    k4 = _ofes_fixed_depth_tendency(
-        pos4, u_field, v_field, depth, lat, lon
+    k4 = _ofes_fixed_depth_tendency_time_linear(
+        pos4,
+        u_start,
+        v_start,
+        u_end,
+        v_end,
+        alpha_4,
+        depth,
+        lat,
+        lon,
+    )
+    new_pos = pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return new_pos, (pos2, pos3, pos4, new_pos)
+
+
+def _ofes_3d_tendency_time_linear(
+    pos: np.ndarray,
+    u_start: np.ndarray,
+    v_start: np.ndarray,
+    w_start: np.ndarray,
+    u_end: np.ndarray,
+    v_end: np.ndarray,
+    w_end: np.ndarray,
+    time_fraction: float,
+    depth: np.ndarray,
+    depth_w: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """在线性日场时刻返回三维粒子 [ddepth/dt, dlat/dt, dlon/dt]。"""
+    alpha = float(time_fraction)
+    if not 0 <= alpha <= 1:
+        raise ValueError('time_fraction must lie in [0, 1].')
+    u = (
+        (1.0 - alpha) * _ofes_interp3d(u_start, depth, lat, lon, pos)
+        + alpha * _ofes_interp3d(u_end, depth, lat, lon, pos)
+    )
+    v = (
+        (1.0 - alpha) * _ofes_interp3d(v_start, depth, lat, lon, pos)
+        + alpha * _ofes_interp3d(v_end, depth, lat, lon, pos)
+    )
+    w_up = (
+        (1.0 - alpha)
+        * _ofes_interp3d(w_start, depth_w, lat, lon, pos)
+        + alpha * _ofes_interp3d(w_end, depth_w, lat, lon, pos)
+    )
+    geo = approximate_degree_length(pos[:, 1])
+    dlat = v / geo['meters_per_degree_lat']
+    dlon = u / geo['meters_per_degree_lon']
+    return np.column_stack([-w_up, dlat, dlon])
+
+
+def _ofes_rk4_3d_step(
+    pos: np.ndarray,
+    u_start: np.ndarray,
+    v_start: np.ndarray,
+    w_start: np.ndarray,
+    u_end: np.ndarray,
+    v_end: np.ndarray,
+    w_end: np.ndarray,
+    depth: np.ndarray,
+    depth_w: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    dt: float,
+    time_fraction_start: float,
+    time_fraction_step: float,
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """以线性日场时间插值执行一步 u/v/w 三维 RK4。"""
+    alpha_1 = float(time_fraction_start)
+    alpha_half = alpha_1 + 0.5 * float(time_fraction_step)
+    alpha_4 = alpha_1 + float(time_fraction_step)
+    arguments = (
+        u_start,
+        v_start,
+        w_start,
+        u_end,
+        v_end,
+        w_end,
+    )
+    k1 = _ofes_3d_tendency_time_linear(
+        pos, *arguments, alpha_1, depth, depth_w, lat, lon
+    )
+    pos2 = pos + 0.5 * dt * k1
+    k2 = _ofes_3d_tendency_time_linear(
+        pos2, *arguments, alpha_half, depth, depth_w, lat, lon
+    )
+    pos3 = pos + 0.5 * dt * k2
+    k3 = _ofes_3d_tendency_time_linear(
+        pos3, *arguments, alpha_half, depth, depth_w, lat, lon
+    )
+    pos4 = pos + dt * k3
+    k4 = _ofes_3d_tendency_time_linear(
+        pos4, *arguments, alpha_4, depth, depth_w, lat, lon
     )
     new_pos = pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
     return new_pos, (pos2, pos3, pos4, new_pos)
@@ -36666,13 +36844,19 @@ def _ofes_positions_in_bounds(
     depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
+    depth_w: np.ndarray | None = None,
 ) -> np.ndarray:
     """返回有限且位于当前区域插值网格内的粒子掩码。"""
     finite = np.all(np.isfinite(pos), axis=1)
+    depth_min = float(depth[0])
+    depth_max = float(depth[-1])
+    if depth_w is not None:
+        depth_min = max(depth_min, float(depth_w[0]))
+        depth_max = min(depth_max, float(depth_w[-1]))
     return (
         finite
-        & (pos[:, 0] >= depth[0])
-        & (pos[:, 0] <= depth[-1])
+        & (pos[:, 0] >= depth_min)
+        & (pos[:, 0] <= depth_max)
         & (pos[:, 1] >= lat[0])
         & (pos[:, 1] <= lat[-1])
         & (pos[:, 2] >= lon[0])
@@ -36685,34 +36869,44 @@ def advect_ofes_particles(
     particles: np.ndarray,
     backward: bool = False,
     dt_seconds: float | None = None,
+    temporal_interpolation: str = 'linear',
     vertical_mode: str = 'fixed_depth',
 ) -> dict:
-    """用 OFES 日均水平速度做固定深度的二维 RK4 粒子诊断。
+    """用 OFES 线性时间插值日均速度做二维或三维 RK4 粒子诊断。
 
     该入口严格保留各个积分时刻，并为每个粒子记录 active、invalid 或 escaped
-    状态。失败粒子从失败时刻起位置记为 NaN，不再伪装成静止粒子。当前只允许
-    `fixed_depth`；三维 z/w 耦合尚未通过验证门槛。
+    状态。失败粒子从失败时刻起位置记为 NaN，不再伪装成静止粒子。
+    `three_dimensional` 模式仅在每个快照都携带已通过数据集
+    `w` 连续方程验证标记时启用。
 
     参数:
         - snapshots (dict[str, dict] | list[dict]): 按日期排序的 OFES 快照集合。
         - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [depth, lat, lon]。
         - backward (bool): True 时从最后一个快照向前积分，默认 False。
         - dt_seconds (float | None): 最大积分步长（秒）；None 时从 processing.yml 读取，末步自动缩短以精确落在下个快照时刻。
-        - vertical_mode (str): 垂向处理；当前仅支持 'fixed_depth'。
+        - temporal_interpolation (str): 相邻日场的时间插值；当前正式支持 'linear'。
+        - vertical_mode (str): 垂向处理；支持 'fixed_depth' 或需验证标记的 'three_dimensional'。
 
     返回:
         - dict: 含 times、positions、status、final_status、failure_time、coordinate_columns 和 metadata；positions 形状为 (time, particle, 3)。
 
+    输出:
+        - 无文件输出；仅返回完整时间轴上的粒子状态与位置数组。
+
     说明:
-        - 每个相邻日场之间仍使用积分方向起点的速度场，属于未验证的分段恒定时间近似；metadata 会显式记录。
-        - `w` 的数据集专项符号验证和日均三维速度时间插值尚未完成，因此本入口不使用 `w`。
-        - 该结果适合作为固定深度水平输运诊断，不构成三维水团来源证明。
+        - RK4 四个 stage 均按实际 stage 时刻在线性插值后的相邻日场中取速度；正反向使用同一连续时间场。
+        - 三维模式直接在 `depth_w` 层界插值 `w`；`w` 向上为正、深度向下为正，因此 `d(depth)/dt=-w`。
+        - 数值通过不自动构成水团来源证明；仍需与异常核演化及 patch continuity 分开核验。
     """
-    if vertical_mode != 'fixed_depth':
-        raise NotImplementedError(
-            'Only vertical_mode="fixed_depth" is enabled. Three-dimensional '
-            'OFES trajectories remain disabled until w sign/coupling and daily '
-            'u/v/w interpolation are validated.'
+    if vertical_mode not in ('fixed_depth', 'three_dimensional'):
+        raise ValueError(
+            'vertical_mode must be "fixed_depth" or '
+            '"three_dimensional".'
+        )
+    if temporal_interpolation != 'linear':
+        raise ValueError(
+            'temporal_interpolation must be "linear" for the validated '
+            'OFES trajectory paths.'
         )
     if dt_seconds is None:
         dt_seconds = float(_OFES_CFG.get('rk4_dt_seconds', 3600))
@@ -36749,13 +36943,37 @@ def advect_ofes_particles(
     first_depth = np.asarray(first['depth'], dtype=float)
     first_lat = np.asarray(first['lat'], dtype=float)
     first_lon = np.asarray(first['lon'], dtype=float)
+    first_depth_w = None
+    if vertical_mode == 'three_dimensional':
+        validation_passed = all(
+            snapshot.get('metadata', {}).get('w_validation_passed')
+            is True
+            for snapshot in snap_list
+        )
+        if not validation_passed:
+            raise RuntimeError(
+                'Three-dimensional OFES trajectories require every '
+                'snapshot to carry passed w validation metadata.'
+            )
+        if any(
+            'w' not in snapshot or 'depth_w' not in snapshot
+            for snapshot in snap_list
+        ):
+            raise ValueError(
+                'Three-dimensional OFES snapshots require w and depth_w.'
+            )
+        first_depth_w = np.asarray(first['depth_w'], dtype=float)
     status = np.full(pos.shape[0], 'active', dtype='<U8')
     finite_initial = np.all(np.isfinite(pos), axis=1)
     status[~finite_initial] = 'invalid'
     status[
         finite_initial
         & ~_ofes_positions_in_bounds(
-            pos, first_depth, first_lat, first_lon
+            pos,
+            first_depth,
+            first_lat,
+            first_lon,
+            first_depth_w,
         )
     ] = 'escaped'
 
@@ -36769,41 +36987,109 @@ def advect_ofes_particles(
 
     for idx in range(len(snap_list) - 1):
         snap = snap_list[idx]
-        u_field = np.asarray(snap['u'], dtype=float)
-        v_field = np.asarray(snap['v'], dtype=float)
+        next_snap = snap_list[idx + 1]
+        u_field = np.asarray(snap['u'])
+        v_field = np.asarray(snap['v'])
+        u_next = np.asarray(next_snap['u'])
+        v_next = np.asarray(next_snap['v'])
         depth = np.asarray(snap['depth'], dtype=float)
         lat = np.asarray(snap['lat'], dtype=float)
         lon = np.asarray(snap['lon'], dtype=float)
         expected_shape = (depth.size, lat.size, lon.size)
-        if u_field.shape != expected_shape or v_field.shape != expected_shape:
+        if any(
+            field.shape != expected_shape
+            for field in (u_field, v_field, u_next, v_next)
+        ):
             raise ValueError(
-                f'OFES u/v shape must equal depth/lat/lon shape '
-                f'{expected_shape}; got u={u_field.shape}, v={v_field.shape}.'
+                'OFES adjacent u/v fields must share depth/lat/lon shape '
+                f'{expected_shape}.'
             )
+        for coordinate in ('depth', 'lat', 'lon'):
+            if not np.array_equal(
+                np.asarray(snap[coordinate], dtype=float),
+                np.asarray(next_snap[coordinate], dtype=float),
+            ):
+                raise ValueError(
+                    'OFES adjacent snapshots must use identical '
+                    f'{coordinate} coordinates.'
+                )
+        w_field = None
+        w_next = None
+        depth_w = None
+        if vertical_mode == 'three_dimensional':
+            depth_w = np.asarray(snap['depth_w'], dtype=float)
+            w_field = np.asarray(snap['w'])
+            w_next = np.asarray(next_snap['w'])
+            expected_w_shape = (depth_w.size, lat.size, lon.size)
+            if (
+                w_field.shape != expected_w_shape
+                or w_next.shape != expected_w_shape
+            ):
+                raise ValueError(
+                    'OFES adjacent w fields must share depth_w/lat/lon '
+                    f'shape {expected_w_shape}.'
+                )
+            if not np.array_equal(
+                depth_w,
+                np.asarray(next_snap['depth_w'], dtype=float),
+            ):
+                raise ValueError(
+                    'OFES adjacent snapshots must use identical depth_w '
+                    'coordinates.'
+                )
 
         current_time = snap_times[idx]
         target_time = snap_times[idx + 1]
+        interval_seconds = abs(
+            (target_time - current_time).total_seconds()
+        )
         direction = 1.0 if target_time > current_time else -1.0
         while current_time != target_time:
             remaining = abs((target_time - current_time).total_seconds())
             is_final_step = remaining <= dt_seconds
-            step_seconds = direction * (
+            step_magnitude = (
                 remaining if is_final_step else dt_seconds
             )
+            step_seconds = direction * step_magnitude
+            elapsed_seconds = interval_seconds - remaining
+            time_fraction_start = elapsed_seconds / interval_seconds
+            time_fraction_step = step_magnitude / interval_seconds
             active_idx = np.flatnonzero(status == 'active')
             if active_idx.size:
                 active_pos = pos[active_idx]
-                new_pos, stages = _ofes_rk4_fixed_depth_step(
-                    active_pos,
-                    u_field,
-                    v_field,
-                    depth,
-                    lat,
-                    lon,
-                    step_seconds,
-                )
+                if vertical_mode == 'fixed_depth':
+                    new_pos, stages = _ofes_rk4_fixed_depth_step(
+                        active_pos,
+                        u_field,
+                        v_field,
+                        u_next,
+                        v_next,
+                        depth,
+                        lat,
+                        lon,
+                        step_seconds,
+                        time_fraction_start,
+                        time_fraction_step,
+                    )
+                else:
+                    new_pos, stages = _ofes_rk4_3d_step(
+                        active_pos,
+                        u_field,
+                        v_field,
+                        w_field,
+                        u_next,
+                        v_next,
+                        w_next,
+                        depth,
+                        depth_w,
+                        lat,
+                        lon,
+                        step_seconds,
+                        time_fraction_start,
+                        time_fraction_step,
+                    )
                 new_inside = _ofes_positions_in_bounds(
-                    new_pos, depth, lat, lon
+                    new_pos, depth, lat, lon, depth_w
                 )
                 stage_escaped = np.zeros(active_idx.size, dtype=bool)
                 for stage in stages:
@@ -36811,7 +37097,7 @@ def advect_ofes_particles(
                     stage_escaped |= (
                         stage_finite
                         & ~_ofes_positions_in_bounds(
-                            stage, depth, lat, lon
+                            stage, depth, lat, lon, depth_w
                         )
                     )
 
@@ -36852,18 +37138,15 @@ def advect_ofes_particles(
             'depth_units': str(
                 first.get('metadata', {}).get('depth_units', 'm')
             ),
-            'temporal_interpolation': str(
-                _OFES_CFG.get(
-                    'temporal_interpolation',
-                    'piecewise_constant_unvalidated',
-                )
+            'temporal_interpolation': temporal_interpolation,
+            'w_used': vertical_mode == 'three_dimensional',
+            'w_validation_passed': (
+                True if vertical_mode == 'three_dimensional' else None
             ),
-            'w_used': False,
-            'unresolved_validation': (
-                'daily_velocity_interpolation',
-                'vertical_velocity_sign_and_coupling',
-                'three_dimensional_vertical_motion',
+            'w_positive_direction': (
+                'up' if vertical_mode == 'three_dimensional' else None
             ),
+            'particle_depth_positive_direction': 'down',
         },
     }
 
@@ -36889,6 +37172,12 @@ def plot_ofes_snapshot_quick(
 
     返回:
         - plt.Figure | None: show_fig=False 时返回 Figure。
+
+    输出:
+        - show_fig=True 时显示水平切片；本函数不写入图件文件。
+
+    说明:
+        - 三维变量按最近垂向层展示；该图仅用于数据快检，不替代正式诊断图。
     """
     if variable not in snapshot:
         raise KeyError(f'Variable {variable!r} is absent from the OFES snapshot.')
@@ -37655,7 +37944,7 @@ def scan_ofes_delta_do_day(
         - dict: 含稀疏 peak `pixels`、`objects`、扫描 `metadata` 以及 lon/lat/depth 坐标。
 
     输出:
-        - 不写文件；年度 catalog 驱动负责将返回表原子写入带签名的逐日 fragments。
+        - 不写文件；年度 catalog 驱动负责将返回表原子写入固定目录中的逐日 fragments。
 
     说明:
         - 每个水平列只保留 observation detector 定义下 ΔDO 最大的候选。
@@ -37975,6 +38264,113 @@ def _ofes_analysis_output_dir(
     return target
 
 
+def _ofes_existing_manifest(
+    manifest_path: str | Path,
+    request: dict | None = None,
+) -> dict | None:
+    """读取已完成的 OFES manifest，并检查请求字段和输出文件。"""
+    path = Path(manifest_path)
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    if request is not None:
+        stored_request = manifest.get('request')
+        if stored_request is None:
+            return None
+        if not _ofes_requests_equal(stored_request, request):
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+    if manifest.get('status') != 'complete':
+        return None
+    outputs = manifest.get('outputs') or {}
+    if not outputs:
+        return None
+    missing = [
+        key for key, value in outputs.items()
+        if key != 'source_inventory'
+        and (not value or not Path(value).exists())
+    ]
+    if missing:
+        return None
+    return manifest
+
+
+_OFES_NONSCIENTIFIC_REQUEST_KEYS = frozenset(
+    {
+        'worker_count',
+        'io_concurrency',
+        'tile_day_workers',
+        'tile_worker_count',
+        'figure_dpi',
+        'output_subdir',
+        'stage_bridge_output_subdir',
+    }
+)
+
+
+def _ofes_material_settings(settings: Mapping[str, Any]) -> dict:
+    """返回用于结果复用比较的科学配置，不含执行和输出选项。"""
+    return {
+        str(key): value
+        for key, value in settings.items()
+        if str(key) not in _OFES_NONSCIENTIFIC_REQUEST_KEYS
+    }
+
+
+def _ofes_load_completed_outputs(
+    analysis_name: str,
+    *,
+    output_dir: str | Path | None,
+    parquet_keys: tuple[str, ...],
+    json_keys: tuple[str, ...],
+) -> dict:
+    """读取一个已完成 OFES 分析的主要表格、摘要和 manifest。"""
+    run_dir = _ofes_analysis_output_path(analysis_name, output_dir)
+    manifest_path = run_dir / 'manifest.json'
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f'OFES {analysis_name} output is not available: {run_dir}. '
+            'Run the corresponding producer first.'
+        )
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('status') != 'complete':
+        status = manifest.get('status', 'unknown')
+        raise RuntimeError(
+            f'OFES {analysis_name} output is not complete '
+            f'(status={status}). Run the corresponding producer first.'
+        )
+    outputs = manifest.get('outputs') or {}
+    required_keys = tuple(dict.fromkeys((*parquet_keys, *json_keys)))
+    missing = [
+        key for key in required_keys
+        if not outputs.get(key) or not Path(outputs[key]).exists()
+    ]
+    if missing:
+        names = sorted(set(missing))
+        raise FileNotFoundError(
+            f'OFES {analysis_name} output is incomplete; missing: '
+            f'{", ".join(names)}. Run the corresponding producer again.'
+        )
+    result = {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'output_paths': {
+            key: Path(value) for key, value in outputs.items()
+        },
+    }
+    for key in parquet_keys:
+        result[key] = pd.read_parquet(outputs[key])
+    for key in json_keys:
+        result[key] = json.loads(
+            Path(outputs[key]).read_text(encoding='utf-8')
+        )
+    if 'figure' in outputs:
+        result['figure_path'] = Path(outputs['figure'])
+    return result
+
+
 def _ofes_load_fixed_outputs(
     analysis_name: str,
     *,
@@ -38028,6 +38424,7 @@ def _ofes_load_fixed_outputs(
             result['figure_path'] = next(iter(result['figure_paths'].values()))
     return result
 
+
 def _ofes_assert_fragment_request(
     frame: pd.DataFrame,
     event_id: str,
@@ -38053,6 +38450,59 @@ def _ofes_assert_fragment_request(
             )
     return True
 
+
+def _ofes_assert_summary_request(
+    summary: dict,
+    event_id: str | None,
+    *,
+    start_date: pd.Timestamp | None = None,
+    peak_date: pd.Timestamp | None = None,
+) -> bool:
+    """检查事件 summary 的事件编号和可读日期请求。"""
+    if event_id is not None and str(summary.get('event_id')) != str(event_id):
+        raise RuntimeError(
+            'Existing output was created for a different request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    for key, expected in (
+        ('start_date', start_date),
+        ('peak_date', peak_date),
+    ):
+        if expected is None:
+            continue
+        stored = summary.get(key)
+        if stored is None or pd.Timestamp(stored).normalize() != pd.Timestamp(
+            expected
+        ).normalize():
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+    return True
+
+
+def _ofes_finalize_figure(
+    figure,
+    output_path: str | Path | None,
+    figure_dpi: int,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """按 OFES 绘图入口的统一开关保存、显示并关闭图形。"""
+    output = None
+    if save_fig:
+        if output_path is None:
+            raise ValueError('output_path is required when save_fig=True.')
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(
+            output, dpi=int(figure_dpi), bbox_inches='tight'
+        )
+    if show_fig:
+        plt.show()
+    plt.close(figure)
+    return output
 
 
 def _ofes_common_mask_audit_day(
@@ -39483,7 +39933,6 @@ def build_ofes_delta_do_event_catalog(
         'daily_objects': linked_objects,
         'event_catalog': event_catalog,
     }
-
 
 
 def _ofes_event_diagnostic_settings(
@@ -42929,7 +43378,6 @@ def generalize_ofes_deep_events(
     }
 
 
-
 def _ofes_event_onset_settings(
     overrides: dict | None = None,
 ) -> dict:
@@ -43681,7 +44129,6 @@ def _ofes_build_onset_map_field(
     return metadata
 
 
-
 def _ofes_summarize_event_onset(
     diagnostics: pd.DataFrame,
     selected: pd.DataFrame,
@@ -44386,7 +44833,6 @@ def diagnose_ofes_event_onset_regimes(
     }
 
 
-
 def _ofes_centroid_velocity_day(
     date: str | pd.Timestamp,
     centroid_lon: float,
@@ -45055,8 +45501,9 @@ def _ofes_event_patch_settings(
     """解析并校验 OFES water-mass patch 连续性配置。"""
     raw = dict(_OFES_CFG.get('event_patch', {}) or {})
     if overrides:
-        allowed = set(raw) | {'representative_event_ids'}
-        unknown = sorted(set(overrides) - allowed)
+        unknown = sorted(
+            set(overrides) - (set(raw) | {'representative_event_ids'})
+        )
         if unknown:
             raise KeyError(
                 f'Unknown OFES event_patch override keys: {unknown}.'
@@ -45064,8 +45511,7 @@ def _ofes_event_patch_settings(
         raw.update(overrides)
     settings = {
         'representative_event_ids': tuple(
-            str(value)
-            for value in raw.get('representative_event_ids', ())
+            str(value) for value in raw.get('representative_event_ids', ())
         ),
         'map_radius_km': float(raw.get('map_radius_km', 180.0)),
         'do_contrast_min_umol_kg': float(
@@ -45474,7 +45920,6 @@ def _ofes_build_patch_day(
     return metadata
 
 
-
 def _ofes_patch_transition_metrics(
     daily: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -45682,7 +46127,7 @@ def _ofes_patch_summary(
     transitions: pd.DataFrame,
     settings: dict,
 ) -> tuple[pd.DataFrame, dict]:
-    """汇总三事件 patch 连续性并预注册判定 E000002 轨迹解释门。"""
+    """汇总显式选择事件的 patch 连续性并生成轨迹解释门。"""
     records = []
     for event_id, group in daily.groupby('event_id', sort=False):
         event_transitions = transitions.loc[
@@ -45789,8 +46234,8 @@ def _ofes_patch_summary(
             'A connected Eulerian fingerprint patch is not a material parcel.',
             'Resolved horizontal flow omits diffusion, mixing, vertical '
             'motion, and unresolved submesoscale tendencies.',
-            'E000176 and E000239 remain controls and cannot replace the '
-            'blind headline event as the trajectory-interpretation trigger.',
+            'The caller-selected headline and contrast events are not '
+            'interchangeable without rerunning the explicit selection.',
         ],
     }
     return summary, payload
@@ -45802,7 +46247,7 @@ def _plot_ofes_patch_continuity(
     output_path: str | Path,
     figure_dpi: int,
 ) -> Path:
-    """绘制三类代表事件的 fingerprint patch 质心演化。"""
+    """绘制显式选择事件的 fingerprint patch 质心演化。"""
     figure, axes = plt.subplots(
         1,
         len(summary),
@@ -45970,7 +46415,6 @@ def diagnose_ofes_water_mass_patch_continuity(
         'trajectory_interpretation_gate': gate,
         'figure_path': figure_path,
     }
-
 
 
 def _ofes_event_lifecycle_settings(
@@ -47000,6 +47444,10957 @@ def diagnose_ofes_event_lifecycle(
     }
 
 
+def _ofes_mccoy_virtual_argo_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 McCoy-source virtual-Argo 配置。"""
+    raw = dict(_OFES_CFG.get('mccoy_virtual_argo', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - (set(raw) | {'event_ids'}))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES mccoy_virtual_argo override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'event_ids': tuple(str(value) for value in raw.get('event_ids', ())),
+        'sample_ring_fractions': tuple(
+            float(value)
+            for value in raw.get('sample_ring_fractions', (0.0, 0.35, 0.70))
+        ),
+        'sample_azimuth_count': int(raw.get('sample_azimuth_count', 8)),
+        'control_radii_km': tuple(
+            float(value)
+            for value in raw.get(
+                'control_radii_km', (130.0, 155.0, 180.0, 205.0, 230.0)
+            )
+        ),
+        'control_azimuth_count': int(raw.get('control_azimuth_count', 16)),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_spacing_km': float(
+            raw.get('background_spacing_km', 25.0)
+        ),
+        'minimum_background_profiles': int(
+            raw.get('minimum_background_profiles', 61)
+        ),
+        'pressure_min_dbar': float(raw.get('pressure_min_dbar', 0.0)),
+        'pressure_max_dbar': float(raw.get('pressure_max_dbar', 1070.0)),
+        'pressure_spacing_dbar': float(
+            raw.get('pressure_spacing_dbar', 10.0)
+        ),
+        'smoothing_grid_spacing_dbar': float(
+            raw.get('smoothing_grid_spacing_dbar', 2.0)
+        ),
+        'smoothing_bandwidth_dbar': float(
+            raw.get('smoothing_bandwidth_dbar', 10.0)
+        ),
+        'profile_min_unique_levels': int(
+            raw.get('profile_min_unique_levels', 40)
+        ),
+        'profile_min_pressure_max_dbar': float(
+            raw.get('profile_min_pressure_max_dbar', 700.0)
+        ),
+        'profile_max_pressure_min_dbar': float(
+            raw.get('profile_max_pressure_min_dbar', 100.0)
+        ),
+        'shallow_resolution_max_dbar': float(
+            raw.get('shallow_resolution_max_dbar', 65.0)
+        ),
+        'deep_resolution_max_dbar': float(
+            raw.get('deep_resolution_max_dbar', 105.0)
+        ),
+        'iqr_multiplier': float(raw.get('iqr_multiplier', 1.5)),
+        'initial_minimum_spice_exceedance_levels': int(
+            raw.get('initial_minimum_spice_exceedance_levels', 2)
+        ),
+        'n2_density_tolerance_kg_m3': float(
+            raw.get('n2_density_tolerance_kg_m3', 0.2)
+        ),
+        'minimum_peak_spiciness_kg_m3': float(
+            raw.get('minimum_peak_spiciness_kg_m3', 0.10)
+        ),
+        'gaussian_r2_min': float(raw.get('gaussian_r2_min', 0.5)),
+        'gaussian_nrmse_max': float(raw.get('gaussian_nrmse_max', 0.5)),
+        'gaussian_h_min_dbar': float(
+            raw.get('gaussian_h_min_dbar', 50.0)
+        ),
+        'gaussian_h_max_dbar': float(
+            raw.get('gaussian_h_max_dbar', 850.0)
+        ),
+        'gaussian_h_step_dbar': float(
+            raw.get('gaussian_h_step_dbar', 10.0)
+        ),
+        'gaussian_amplitude_factors': tuple(
+            float(value)
+            for value in raw.get(
+                'gaussian_amplitude_factors', (0.8, 1.2, 0.05)
+            )
+        ),
+        'gaussian_center_shift_factors': tuple(
+            float(value)
+            for value in raw.get(
+                'gaussian_center_shift_factors', (-0.2, 0.2, 0.05)
+            )
+        ),
+        'lens_height_min_dbar': float(
+            raw.get('lens_height_min_dbar', 150.0)
+        ),
+        'lens_height_max_dbar': float(
+            raw.get('lens_height_max_dbar', 1200.0)
+        ),
+        'lens_shallow_limit_min_dbar': float(
+            raw.get('lens_shallow_limit_min_dbar', 100.0)
+        ),
+        'equator_latitude_min_deg': float(
+            raw.get('equator_latitude_min_deg', 5.0)
+        ),
+        'direct_velocity_smoothing_sigma_pixels': float(
+            raw.get('direct_velocity_smoothing_sigma_pixels', 1.5)
+        ),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'mccoy_virtual_argo')
+        ),
+        'stage_bridge_output_subdir': str(
+            raw.get(
+                'stage_bridge_output_subdir',
+                'mccoy_virtual_argo_stage_bridge',
+            )
+        ),
+    }
+    positive_keys = (
+        'worker_count', 'sample_azimuth_count', 'control_azimuth_count',
+        'background_inner_radius_km', 'background_outer_radius_km',
+        'background_spacing_km',
+        'minimum_background_profiles', 'pressure_spacing_dbar',
+        'smoothing_grid_spacing_dbar', 'smoothing_bandwidth_dbar',
+        'profile_min_unique_levels', 'profile_min_pressure_max_dbar',
+        'profile_max_pressure_min_dbar', 'shallow_resolution_max_dbar',
+        'deep_resolution_max_dbar', 'iqr_multiplier',
+        'initial_minimum_spice_exceedance_levels',
+        'n2_density_tolerance_kg_m3', 'minimum_peak_spiciness_kg_m3',
+        'gaussian_r2_min', 'gaussian_nrmse_max',
+        'gaussian_h_min_dbar', 'gaussian_h_max_dbar',
+        'gaussian_h_step_dbar', 'lens_height_min_dbar',
+        'lens_height_max_dbar', 'lens_shallow_limit_min_dbar',
+        'equator_latitude_min_deg',
+        'direct_velocity_smoothing_sigma_pixels', 'bootstrap_replicates',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError('OFES McCoy virtual-Argo settings must be positive.')
+    if (
+        not settings['sample_ring_fractions']
+        or settings['sample_ring_fractions'][0] != 0.0
+        or any(value < 0 for value in settings['sample_ring_fractions'])
+    ):
+        raise ValueError(
+            'OFES McCoy sample rings must begin at zero and be non-negative.'
+        )
+    if (
+        not settings['control_radii_km']
+        or min(settings['control_radii_km'])
+        < settings['background_inner_radius_km']
+        or max(settings['control_radii_km'])
+        > settings['background_outer_radius_km']
+    ):
+        raise ValueError(
+            'OFES McCoy control radii must remain inside the background annulus.'
+        )
+    if not np.allclose(
+        np.diff(settings['control_radii_km']),
+        settings['background_spacing_km'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            'OFES McCoy control radii must follow background_spacing_km.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+        or settings['pressure_max_dbar'] <= settings['pressure_min_dbar']
+        or settings['gaussian_h_max_dbar']
+        < settings['gaussian_h_min_dbar']
+        or settings['lens_height_max_dbar']
+        < settings['lens_height_min_dbar']
+    ):
+        raise ValueError('OFES McCoy ordered bounds are invalid.')
+    for key in ('gaussian_amplitude_factors', 'gaussian_center_shift_factors'):
+        start, stop, step = settings[key]
+        if step <= 0 or stop < start:
+            raise ValueError(f'OFES McCoy {key} range is invalid.')
+    if (
+        not settings['output_subdir'].strip()
+        or not settings['stage_bridge_output_subdir'].strip()
+    ):
+        raise ValueError('OFES McCoy output directories must not be empty.')
+    return settings
+
+
+def _ofes_offset_lon_lat(
+    lon: float,
+    lat: float,
+    radius_km: float,
+    azimuth_deg: float,
+) -> tuple[float, float]:
+    """沿球面大圆从中心按方位角与距离生成采样点。"""
+    angular = float(radius_km) / 6371.0088
+    bearing = np.deg2rad(float(azimuth_deg))
+    lat0 = np.deg2rad(float(lat))
+    lon0 = np.deg2rad(float(lon))
+    lat1 = np.arcsin(
+        np.sin(lat0) * np.cos(angular)
+        + np.cos(lat0) * np.sin(angular) * np.cos(bearing)
+    )
+    lon1 = lon0 + np.arctan2(
+        np.sin(bearing) * np.sin(angular) * np.cos(lat0),
+        np.cos(angular) - np.sin(lat0) * np.sin(lat1),
+    )
+    return float(np.rad2deg(lon1)), float(np.rad2deg(lat1))
+
+
+def _ofes_mccoy_sampling_points(
+    core_lon: float,
+    core_lat: float,
+    event_radius_km: float,
+    settings: dict,
+) -> pd.DataFrame:
+    """构建 17 条事件剖面与稀疏环带 control 的确定性位置。"""
+    records = []
+    sample_index = 0
+    for ring_index, fraction in enumerate(settings['sample_ring_fractions']):
+        if ring_index == 0:
+            azimuths = (0.0,)
+        else:
+            azimuths = np.linspace(
+                0.0,
+                360.0,
+                int(settings['sample_azimuth_count']),
+                endpoint=False,
+            )
+        for azimuth in azimuths:
+            radius = float(event_radius_km) * float(fraction)
+            lon, lat = _ofes_offset_lon_lat(
+                core_lon, core_lat, radius, float(azimuth)
+            )
+            records.append(
+                {
+                    'sample_id': f'event_{sample_index:03d}',
+                    'sample_role': 'event',
+                    'ring_fraction': float(fraction),
+                    'radius_km': radius,
+                    'azimuth_deg': float(azimuth),
+                    'sample_lon': lon,
+                    'sample_lat': lat,
+                }
+            )
+            sample_index += 1
+    control_index = 0
+    control_azimuths = np.linspace(
+        0.0,
+        360.0,
+        int(settings['control_azimuth_count']),
+        endpoint=False,
+    )
+    for ring_index, radius in enumerate(settings['control_radii_km']):
+        offset = (
+            0.5 * 360.0 / int(settings['control_azimuth_count'])
+            if ring_index % 2
+            else 0.0
+        )
+        for azimuth in control_azimuths + offset:
+            lon, lat = _ofes_offset_lon_lat(
+                core_lon, core_lat, float(radius), float(azimuth)
+            )
+            records.append(
+                {
+                    'sample_id': f'control_{control_index:03d}',
+                    'sample_role': 'background_control',
+                    'ring_fraction': np.nan,
+                    'radius_km': float(radius),
+                    'azimuth_deg': float(azimuth % 360.0),
+                    'sample_lon': lon,
+                    'sample_lat': lat,
+                }
+            )
+            control_index += 1
+    return pd.DataFrame(records)
+
+
+def _ofes_mccoy_kernel_smooth(
+    values: np.ndarray,
+    sigma_pixels: float,
+) -> np.ndarray:
+    """在规则压强网格上复现 ksr.m 的归一化高斯核回归。"""
+    data = np.asarray(values, dtype=float)
+    numerator = gaussian_filter(
+        data,
+        sigma=float(sigma_pixels),
+        mode='constant',
+        cval=0.0,
+        truncate=8.0,
+    )
+    denominator = gaussian_filter(
+        np.ones(data.shape, dtype=float),
+        sigma=float(sigma_pixels),
+        mode='constant',
+        cval=0.0,
+        truncate=8.0,
+    )
+    return numerator / denominator
+
+
+def _ofes_mccoy_profile_properties(
+    depth_m: np.ndarray,
+    potential_temperature: np.ndarray,
+    salinity: np.ndarray,
+    lon: float,
+    lat: float,
+    settings: dict,
+) -> dict:
+    """按 McCoy 10-dbar 网格与 10-dbar 核平滑派生单条 OFES 剖面。"""
+    depth = np.asarray(depth_m, dtype=float)
+    theta = np.asarray(potential_temperature, dtype=float)
+    salt = np.asarray(salinity, dtype=float)
+    pressure = np.asarray(gsw.p_from_z(-depth, float(lat)), dtype=float)
+    valid = (
+        np.isfinite(pressure)
+        & np.isfinite(theta)
+        & np.isfinite(salt)
+    )
+    pressure = pressure[valid]
+    theta = theta[valid]
+    salt = salt[valid]
+    order = np.argsort(pressure)
+    pressure = pressure[order]
+    theta = theta[order]
+    salt = salt[order]
+    pressure, unique_index = np.unique(pressure, return_index=True)
+    theta = theta[unique_index]
+    salt = salt[unique_index]
+    shallow_indices = np.flatnonzero(
+        (pressure > 100.0) & (pressure < 700.0)
+    )
+    below_indices = np.flatnonzero(
+        (pressure > 100.0) & (pressure < 1000.0)
+    )
+    deep_indices = np.flatnonzero(pressure > 1000.0)
+    pressure_gaps = np.diff(pressure)
+    shallow_gap = (
+        float(np.max(pressure_gaps[shallow_indices[:-1]]))
+        if shallow_indices.size > 1
+        else np.inf
+    )
+    below_gap = (
+        float(np.max(pressure_gaps[below_indices[:-1]]))
+        if below_indices.size > 1
+        else np.inf
+    )
+    deep_gap = (
+        float(np.max(pressure_gaps[deep_indices[:-1]]))
+        if deep_indices.size > 1
+        else 0.0
+    )
+    qc_reasons = []
+    if pressure.size < settings['profile_min_unique_levels']:
+        qc_reasons.append('fewer_than_minimum_unique_levels')
+    if pressure.size == 0 or float(np.max(pressure)) < settings[
+        'profile_min_pressure_max_dbar'
+    ]:
+        qc_reasons.append('profile_too_shallow')
+    if pressure.size == 0 or float(np.min(pressure)) > settings[
+        'profile_max_pressure_min_dbar'
+    ]:
+        qc_reasons.append('profile_lacks_shallow_data')
+    if shallow_gap > settings['shallow_resolution_max_dbar']:
+        qc_reasons.append('insufficient_100_700dbar_resolution')
+    if np.any(
+        pressure_gaps[below_indices[:-1]]
+        > settings['shallow_resolution_max_dbar']
+    ):
+        first_bad = int(
+            below_indices[:-1][np.flatnonzero(
+                pressure_gaps[below_indices[:-1]]
+                > settings['shallow_resolution_max_dbar']
+            )[0]]
+        )
+        pressure = pressure[:first_bad + 1]
+        theta = theta[:first_bad + 1]
+        salt = salt[:first_bad + 1]
+        pressure_gaps = np.diff(pressure)
+        shallow_indices = np.flatnonzero(
+            (pressure > 100.0) & (pressure < 700.0)
+        )
+        below_indices = np.flatnonzero(
+            (pressure > 100.0) & (pressure < 1000.0)
+        )
+        deep_indices = np.flatnonzero(pressure > 1000.0)
+        shallow_gap = (
+            float(np.max(pressure_gaps[shallow_indices[:-1]]))
+            if shallow_indices.size > 1
+            else np.inf
+        )
+        below_gap = (
+            float(np.max(pressure_gaps[below_indices[:-1]]))
+            if below_indices.size > 1
+            else np.inf
+        )
+        deep_gap = (
+            float(np.max(pressure_gaps[deep_indices[:-1]]))
+            if deep_indices.size > 1
+            else 0.0
+        )
+        if float(np.max(pressure)) < settings[
+            'profile_min_pressure_max_dbar'
+        ]:
+            qc_reasons.append('profile_too_shallow_after_resolution_cut')
+    if np.any(
+        pressure_gaps[deep_indices[:-1]]
+        > settings['deep_resolution_max_dbar']
+    ):
+        first_bad = int(
+            deep_indices[:-1][np.flatnonzero(
+                pressure_gaps[deep_indices[:-1]]
+                > settings['deep_resolution_max_dbar']
+            )[0]]
+        )
+        pressure = pressure[:first_bad + 1]
+        theta = theta[:first_bad + 1]
+        salt = salt[:first_bad + 1]
+        pressure_gaps = np.diff(pressure)
+        deep_indices = np.flatnonzero(pressure > 1000.0)
+        deep_gap = (
+            float(np.max(pressure_gaps[deep_indices[:-1]]))
+            if deep_indices.size > 1
+            else 0.0
+        )
+    if (
+        pressure.size < settings['profile_min_unique_levels']
+        and 'fewer_than_minimum_unique_levels' not in qc_reasons
+    ):
+        qc_reasons.append('fewer_than_minimum_unique_levels_after_resolution_cut')
+    pgrid = np.arange(
+        settings['pressure_min_dbar'],
+        settings['pressure_max_dbar'] + 0.1,
+        settings['pressure_spacing_dbar'],
+        dtype=float,
+    )
+    empty = np.full(pgrid.size, np.nan, dtype=float)
+    result = {
+        'pressure': pgrid,
+        'potential_temperature': empty.copy(),
+        'in_situ_temperature': empty.copy(),
+        'salinity': empty.copy(),
+        'sigma0': empty.copy(),
+        'spiciness0': empty.copy(),
+        'n2': empty.copy(),
+        'absolute_salinity': empty.copy(),
+        'conservative_temperature': empty.copy(),
+        'profile_qc_passed': False,
+        'profile_qc_status': ';'.join(qc_reasons) if qc_reasons else 'passed',
+        'source_unique_level_count': int(pressure.size),
+        'source_pressure_min_dbar': (
+            float(np.min(pressure)) if pressure.size else np.nan
+        ),
+        'source_pressure_max_dbar': (
+            float(np.max(pressure)) if pressure.size else np.nan
+        ),
+        'source_shallow_max_gap_dbar': shallow_gap,
+        'source_below1000_max_gap_dbar': below_gap,
+        'source_deep_max_gap_dbar': deep_gap,
+        'source_longitude_deg': float(lon),
+        'source_latitude_deg': float(lat),
+    }
+    if qc_reasons:
+        return result
+    source_sa = gsw.SA_from_SP(salt, pressure, float(lon), float(lat))
+    source_ct = gsw.CT_from_pt(source_sa, theta)
+    temperature = gsw.t_from_CT(source_sa, source_ct, pressure)
+    theta_grid = np.interp(
+        pgrid, pressure, theta, left=np.nan, right=np.nan
+    )
+    temperature_grid = np.interp(
+        pgrid, pressure, temperature, left=np.nan, right=np.nan
+    )
+    salt_grid = np.interp(
+        pgrid, pressure, salt, left=np.nan, right=np.nan
+    )
+    p2 = np.arange(
+        settings['pressure_min_dbar'],
+        settings['pressure_max_dbar'] + 0.1,
+        settings['smoothing_grid_spacing_dbar'],
+        dtype=float,
+    )
+    inside_profile = (p2 >= pressure[0]) & (p2 <= pressure[-1])
+    p2_inside = p2[inside_profile]
+    temperature2 = np.interp(p2_inside, pressure, temperature)
+    salt2 = np.interp(p2_inside, pressure, salt)
+    sigma_pixels = (
+        settings['smoothing_bandwidth_dbar']
+        / settings['smoothing_grid_spacing_dbar']
+    )
+    temperature_smooth2 = _ofes_mccoy_kernel_smooth(
+        temperature2, sigma_pixels
+    )
+    salt_smooth2 = _ofes_mccoy_kernel_smooth(salt2, sigma_pixels)
+    temperature_smooth = np.interp(
+        pgrid, p2_inside, temperature_smooth2, left=np.nan, right=np.nan
+    )
+    salt_smooth = np.interp(
+        pgrid, p2_inside, salt_smooth2, left=np.nan, right=np.nan
+    )
+    SA = gsw.SA_from_SP(salt_grid, pgrid, float(lon), float(lat))
+    CT = gsw.CT_from_pt(SA, theta_grid)
+    SA_smooth = gsw.SA_from_SP(
+        salt_smooth, pgrid, float(lon), float(lat)
+    )
+    CT_smooth = gsw.CT_from_t(
+        SA_smooth, temperature_smooth, pgrid
+    )
+    n2_mid, p_mid = gsw.Nsquared(
+        SA_smooth, CT_smooth, pgrid, lat=float(lat)
+    )
+    n2 = np.interp(pgrid, p_mid, n2_mid, left=np.nan, right=np.nan)
+    sigma0 = np.asarray(gsw.sigma0(SA, CT), dtype=float)
+    spiciness0 = np.asarray(gsw.spiciness0(SA, CT), dtype=float)
+    finite_sigma = np.isfinite(sigma0)
+    if finite_sigma.any() and not np.all(np.diff(sigma0[finite_sigma]) >= 0):
+        original = sigma0[finite_sigma].copy()
+        sorted_sigma = np.sort(original)
+        if float(np.max(np.abs(original - sorted_sigma))) > 0.1:
+            result['profile_qc_status'] = 'density_inversion_gt_0.1kg_m3'
+            return result
+        sigma0[finite_sigma] = sorted_sigma
+    common = (
+        np.isfinite(theta_grid)
+        & np.isfinite(temperature_grid)
+        & np.isfinite(salt_grid)
+        & np.isfinite(sigma0)
+        & np.isfinite(spiciness0)
+        & np.isfinite(n2)
+        & np.isfinite(SA)
+        & np.isfinite(CT)
+    )
+    for values in (
+        theta_grid, temperature_grid, salt_grid, sigma0, spiciness0,
+        n2, SA, CT,
+    ):
+        values[~common] = np.nan
+    result.update(
+        {
+            'potential_temperature': theta_grid,
+            'in_situ_temperature': np.asarray(
+                temperature_grid, dtype=float
+            ),
+            'salinity': salt_grid,
+            'sigma0': sigma0,
+            'spiciness0': spiciness0,
+            'n2': n2,
+            'absolute_salinity': SA,
+            'conservative_temperature': CT,
+            'profile_qc_passed': True,
+            'profile_qc_status': 'passed',
+        }
+    )
+    return result
+
+
+def _ofes_mccoy_interp_density(
+    density: np.ndarray,
+    values: np.ndarray,
+    target_density: np.ndarray,
+) -> np.ndarray:
+    """在单调唯一的 sigma0 坐标上线性插值且禁止外推。"""
+    density_arr = np.asarray(density, dtype=float)
+    values_arr = np.asarray(values, dtype=float)
+    target = np.asarray(target_density, dtype=float)
+    valid = np.isfinite(density_arr) & np.isfinite(values_arr)
+    out = np.full(target.shape, np.nan, dtype=float)
+    if np.count_nonzero(valid) < 2:
+        return out
+    dens, index = np.unique(density_arr[valid], return_index=True)
+    vals = values_arr[valid][index]
+    finite_target = np.isfinite(target)
+    inside = finite_target & (target >= dens[0]) & (target <= dens[-1])
+    out[inside] = np.interp(target[inside], dens, vals)
+    return out
+
+
+def _ofes_mccoy_reference(
+    profiles: list[dict],
+    lon: float,
+    lat: float,
+) -> dict:
+    """以同日稀疏 control 的逐压中位构建 OFES-native 背景剖面。"""
+    good = [profile for profile in profiles if profile['profile_qc_passed']]
+    if not good:
+        raise RuntimeError('OFES McCoy controls contain no valid profiles.')
+    pressure = good[0]['pressure']
+    temperature_stack = np.stack(
+        [profile['in_situ_temperature'] for profile in good]
+    )
+    salt_stack = np.stack([profile['salinity'] for profile in good])
+    temperature = np.full(pressure.shape, np.nan, dtype=float)
+    salt = np.full(pressure.shape, np.nan, dtype=float)
+    temperature_valid = np.any(
+        np.isfinite(temperature_stack), axis=0
+    )
+    salt_valid = np.any(np.isfinite(salt_stack), axis=0)
+    temperature[temperature_valid] = np.nanmedian(
+        temperature_stack[:, temperature_valid], axis=0
+    )
+    salt[salt_valid] = np.nanmedian(salt_stack[:, salt_valid], axis=0)
+    for profile_values in (temperature, salt):
+        finite = np.flatnonzero(np.isfinite(profile_values))
+        if finite.size and finite[0] > 0 and pressure[0] == 0.0:
+            profile_values[0] = profile_values[finite[0]]
+    SA = gsw.SA_from_SP(salt, pressure, float(lon), float(lat))
+    CT = gsw.CT_from_t(SA, temperature, pressure)
+    theta = gsw.pt0_from_t(SA, temperature, pressure)
+    n2_mid, p_mid = gsw.Nsquared(SA, CT, pressure, lat=float(lat))
+    n2 = np.interp(pressure, p_mid, n2_mid, left=np.nan, right=np.nan)
+    return {
+        'pressure': pressure,
+        'potential_temperature': theta,
+        'in_situ_temperature': np.asarray(temperature, dtype=float),
+        'salinity': salt,
+        'sigma0': np.asarray(gsw.sigma0(SA, CT), dtype=float),
+        'spiciness0': np.asarray(gsw.spiciness0(SA, CT), dtype=float),
+        'n2': np.asarray(n2, dtype=float),
+        'absolute_salinity': np.asarray(SA, dtype=float),
+        'conservative_temperature': np.asarray(CT, dtype=float),
+    }
+
+
+def _ofes_mccoy_anomalies(
+    profile: dict,
+    reference: dict,
+) -> dict:
+    """复现 McCoy 沿目标剖面等密度面定义的 T/S/spice/N2 异常。"""
+    target_sigma = profile['sigma0']
+    reference_common = np.logical_and.reduce(
+        [
+            np.isfinite(reference[key])
+            for key in (
+                'sigma0', 'in_situ_temperature', 'salinity',
+                'spiciness0', 'n2',
+            )
+        ]
+    )
+    reference_sigma = np.where(
+        reference_common, reference['sigma0'], np.nan
+    )
+    anomalies = {}
+    for source_key, output_key in (
+        ('in_situ_temperature', 'temperature_anomaly'),
+        ('salinity', 'salinity_anomaly'),
+        ('spiciness0', 'spiciness_anomaly'),
+        ('n2', 'n2_anomaly'),
+    ):
+        reference_on_density = _ofes_mccoy_interp_density(
+            reference_sigma,
+            np.where(reference_common, reference[source_key], np.nan),
+            target_sigma,
+        )
+        anomalies[output_key] = (
+            np.asarray(profile[source_key], dtype=float)
+            - reference_on_density
+        )
+    return anomalies
+
+
+def _ofes_mccoy_iqr_on_profile(
+    target_profile: dict,
+    control_profiles: list[dict],
+    reference: dict,
+    settings: dict,
+) -> dict:
+    """沿目标 sigma0 从目标加 control 异常池估计 Q1/Q3/IQR。"""
+    target_sigma = target_profile['sigma0']
+    spice_columns = []
+    n2_columns = []
+    nearby_profiles = list(control_profiles)
+    if not any(
+        control is target_profile for control in nearby_profiles
+    ):
+        nearby_profiles.append(target_profile)
+    for control in nearby_profiles:
+        if not control['profile_qc_passed']:
+            continue
+        anomalies = _ofes_mccoy_anomalies(control, reference)
+        spice_columns.append(
+            _ofes_mccoy_interp_density(
+                control['sigma0'],
+                anomalies['spiciness_anomaly'],
+                target_sigma,
+            )
+        )
+        n2_columns.append(
+            _ofes_mccoy_interp_density(
+                control['sigma0'], anomalies['n2_anomaly'], target_sigma
+            )
+        )
+    if not spice_columns:
+        empty = np.full(target_sigma.shape, np.nan, dtype=float)
+        return {
+            'spice_q25': empty.copy(), 'spice_q75': empty.copy(),
+            'spice_iqr': empty.copy(), 'n2_q25': empty.copy(),
+            'n2_q75': empty.copy(), 'n2_iqr': empty.copy(),
+            'sample_count': np.zeros(target_sigma.shape, dtype=np.int16),
+        }
+    spice = np.stack(spice_columns, axis=1)
+    n2 = np.stack(n2_columns, axis=1)
+    spice_sample_count = np.count_nonzero(np.isfinite(spice), axis=1)
+    n2_sample_count = np.count_nonzero(np.isfinite(n2), axis=1)
+    spice_enough = spice_sample_count >= settings[
+        'minimum_background_profiles'
+    ]
+    n2_enough = n2_sample_count >= settings[
+        'minimum_background_profiles'
+    ]
+    spice_q25 = np.full(target_sigma.shape, np.nan, dtype=float)
+    spice_q75 = np.full(target_sigma.shape, np.nan, dtype=float)
+    n2_q25 = np.full(target_sigma.shape, np.nan, dtype=float)
+    n2_q75 = np.full(target_sigma.shape, np.nan, dtype=float)
+    for level in np.flatnonzero(spice_enough):
+        spice_values = spice[level, np.isfinite(spice[level])]
+        spice_q25[level], spice_q75[level] = np.percentile(
+            spice_values, (25, 75)
+        )
+    for level in np.flatnonzero(n2_enough):
+        n2_values = n2[level, np.isfinite(n2[level])]
+        n2_q25[level], n2_q75[level] = np.percentile(
+            n2_values, (25, 75)
+        )
+    return {
+        'spice_q25': spice_q25,
+        'spice_q75': spice_q75,
+        'spice_iqr': spice_q75 - spice_q25,
+        'n2_q25': n2_q25,
+        'n2_q75': n2_q75,
+        'n2_iqr': n2_q75 - n2_q25,
+        'sample_count': np.minimum(spice_sample_count, n2_sample_count),
+    }
+
+
+def _ofes_mccoy_matlab_range(values: tuple[float, float, float]) -> np.ndarray:
+    """按 MATLAB start:step:stop 语义构造包含终点的浮点范围。"""
+    start, stop, step = values
+    count = int(np.floor((stop - start) / step + 0.5))
+    return start + step * np.arange(count + 1, dtype=float)
+
+
+def _ofes_mccoy_round_10(value: float) -> float:
+    """复现 MATLAB 对正压强 round(p/10)*10 的 half-up 取整。"""
+    return float(np.floor(float(value) / 10.0 + 0.5) * 10.0)
+
+
+def _ofes_mccoy_gaussian_fit(
+    profile: dict,
+    anomalies: dict,
+    thresholds: dict,
+    pycnocline_density: float,
+    scv_type: str,
+    settings: dict,
+) -> dict:
+    """逐项移植 fit_gaussian.m 的离散搜索与六个拒绝门。"""
+    failed = {
+        'gaussian_passed': False,
+        'gaussian_failure': 'unresolved',
+        'gaussian_r2': np.nan,
+        'gaussian_nrmse': np.nan,
+        'gaussian_amplitude': np.nan,
+        'gaussian_h_parameter_dbar': np.nan,
+        'gaussian_peak_pressure_dbar': np.nan,
+        'gaussian_shallow_pressure_dbar': np.nan,
+        'gaussian_deep_pressure_dbar': np.nan,
+        'gaussian_core_shallow_pressure_dbar': np.nan,
+        'gaussian_core_deep_pressure_dbar': np.nan,
+        'gaussian_peak_density': np.nan,
+    }
+    pressure = profile['pressure']
+    density = profile['sigma0']
+    spice = np.asarray(anomalies['spiciness_anomaly'], dtype=float)
+    n2_anomaly = np.asarray(anomalies['n2_anomaly'], dtype=float)
+    sign = 1.0 if scv_type == 'spicy' else -1.0
+    transformed_spice = sign * spice
+    spice_threshold = (
+        thresholds['spice_q75']
+        if scv_type == 'spicy'
+        else -thresholds['spice_q25']
+    )
+    spice_exceed = transformed_spice - (
+        spice_threshold
+        + settings['iqr_multiplier'] * thresholds['spice_iqr']
+    )
+    n2_exceed = (
+        thresholds['n2_q25']
+        - settings['iqr_multiplier'] * thresholds['n2_iqr']
+        - n2_anomaly
+    )
+    below = (
+        np.isfinite(density)
+        & (density >= float(pycnocline_density))
+        & np.isfinite(transformed_spice)
+    )
+    indices = np.flatnonzero(below)
+    if indices.size < 3:
+        failed['gaussian_failure'] = 'no_data_below_pycnocline'
+        return failed
+    local = transformed_spice[indices]
+    peak_local = np.flatnonzero(
+        (local[1:-1] > local[:-2]) & (local[1:-1] > local[2:])
+    ) + 1
+    if peak_local.size == 0:
+        failed['gaussian_failure'] = 'no_spiciness_peak'
+        return failed
+    candidates = []
+    for local_index in peak_local:
+        index = int(indices[local_index])
+        density_near = (
+            below
+            & (np.abs(density - density[index])
+               <= settings['n2_density_tolerance_kg_m3'])
+        )
+        if (
+            np.isfinite(spice_exceed[index])
+            and spice_exceed[index] > 0
+            and transformed_spice[index]
+            > settings['minimum_peak_spiciness_kg_m3']
+            and np.any(n2_exceed[density_near] > 0)
+        ):
+            candidates.append(index)
+    if not candidates:
+        failed['gaussian_failure'] = 'no_matching_spice_n2_peak'
+        return failed
+    peak_index = max(candidates, key=lambda index: transformed_spice[index])
+    peak_pressure = float(pressure[peak_index])
+    base_amplitude = float(transformed_spice[peak_index])
+    h_values = np.arange(
+        settings['gaussian_h_min_dbar'],
+        settings['gaussian_h_max_dbar'] + 0.1,
+        settings['gaussian_h_step_dbar'],
+    )
+    amplitude_factors = _ofes_mccoy_matlab_range(
+        settings['gaussian_amplitude_factors']
+    )
+    center_factors = _ofes_mccoy_matlab_range(
+        settings['gaussian_center_shift_factors']
+    )
+    best = None
+    for h_value in h_values:
+        half_extent = 2.0 * np.sqrt(h_value**2 / 2.0)
+        full_height = 2.0 * half_extent
+        for amplitude_factor in amplitude_factors:
+            amplitude = base_amplitude * float(amplitude_factor)
+            for center_factor in center_factors:
+                center = peak_pressure + float(center_factor) * full_height
+                shallow = _ofes_mccoy_round_10(center - half_extent)
+                deep = _ofes_mccoy_round_10(center + half_extent)
+                fit_mask = (
+                    (pressure >= shallow)
+                    & (pressure <= deep)
+                    & np.isfinite(transformed_spice)
+                )
+                if np.count_nonzero(fit_mask) < 3:
+                    continue
+                model = amplitude * np.exp(
+                    -((pressure - center) ** 2) / (h_value**2)
+                )
+                observed = transformed_spice[fit_mask]
+                predicted = model[fit_mask]
+                observed_range = float(np.max(observed) - np.min(observed))
+                if observed_range <= 0:
+                    continue
+                correlation = np.corrcoef(observed, predicted)[0, 1]
+                r2 = float(correlation**2) if np.isfinite(correlation) else np.nan
+                rmse = float(np.sqrt(np.mean((observed - predicted) ** 2)))
+                nrmse = rmse / observed_range
+                if (
+                    not np.isfinite(r2)
+                    or r2 < settings['gaussian_r2_min']
+                    or nrmse > settings['gaussian_nrmse_max']
+                ):
+                    continue
+                loss = float(np.sum((observed - predicted) ** 2))
+                candidate = (
+                    loss, r2, nrmse, amplitude, h_value, center,
+                    shallow, deep,
+                )
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+    if best is None:
+        failed['gaussian_failure'] = 'fit_quality'
+        return failed
+    _, r2, nrmse, amplitude, h_value, center, shallow, deep = best
+    core_half_extent = np.sqrt(h_value**2 / 2.0)
+    core_shallow = _ofes_mccoy_round_10(center - core_half_extent)
+    core_deep = _ofes_mccoy_round_10(center + core_half_extent)
+    height = deep - shallow
+    if (
+        height < settings['lens_height_min_dbar']
+        or height > settings['lens_height_max_dbar']
+        or shallow < settings['lens_shallow_limit_min_dbar']
+    ):
+        failed['gaussian_failure'] = 'lens_extent'
+        return failed
+    finite_pressure = pressure[np.isfinite(spice)]
+    if (
+        finite_pressure.size == 0
+        or float(np.min(finite_pressure)) > shallow
+        or float(np.max(finite_pressure)) < deep
+    ):
+        failed['gaussian_failure'] = 'missing_lens_limits'
+        return failed
+    density_core_shallow = np.interp(core_shallow, pressure, density)
+    density_core_deep = np.interp(core_deep, pressure, density)
+    core_density_mask = (
+        np.isfinite(density)
+        & (density >= min(density_core_shallow, density_core_deep))
+        & (density <= max(density_core_shallow, density_core_deep))
+    )
+    if (
+        not np.any(n2_exceed[core_density_mask] > 0)
+        or float(np.nansum(n2_anomaly[core_density_mask])) > 0
+    ):
+        failed['gaussian_failure'] = 'no_weak_n2_core'
+        return failed
+    return {
+        'gaussian_passed': True,
+        'gaussian_failure': 'passed',
+        'gaussian_r2': r2,
+        'gaussian_nrmse': nrmse,
+        'gaussian_amplitude': sign * amplitude,
+        'gaussian_h_parameter_dbar': float(h_value),
+        'gaussian_peak_pressure_dbar': float(center),
+        'gaussian_shallow_pressure_dbar': float(shallow),
+        'gaussian_deep_pressure_dbar': float(deep),
+        'gaussian_core_shallow_pressure_dbar': float(core_shallow),
+        'gaussian_core_deep_pressure_dbar': float(core_deep),
+        'gaussian_peak_density': float(density[peak_index]),
+    }
+
+
+def _ofes_mccoy_dynamic_height_gate(
+    profile: dict,
+    reference: dict,
+    gaussian: dict,
+) -> dict:
+    """移植 get_*_scvs.m 的去 BC1 动力高度内峰判据。"""
+    result = {
+        'dynamic_height_passed': False,
+        'dynamic_height_failure': 'unresolved',
+        'dynamic_height_peak_m2_s2': np.nan,
+        'dynamic_height_bc1_alpha': np.nan,
+    }
+    try:
+        pressure = profile['pressure']
+        finite = (
+            np.isfinite(profile['absolute_salinity'])
+            & np.isfinite(profile['conservative_temperature'])
+            & np.isfinite(reference['absolute_salinity'])
+            & np.isfinite(reference['conservative_temperature'])
+        )
+        if np.count_nonzero(finite) < 10:
+            result['dynamic_height_failure'] = 'too_few_common_levels'
+            return result
+        pf = pressure[finite]
+        reference_pressure = float(np.max(pf))
+        dynamic_anomaly = (
+            gsw.geo_strf_dyn_height(
+                profile['absolute_salinity'][finite],
+                profile['conservative_temperature'][finite],
+                pf,
+                reference_pressure,
+            )
+            - gsw.geo_strf_dyn_height(
+                reference['absolute_salinity'][finite],
+                reference['conservative_temperature'][finite],
+                pf,
+                reference_pressure,
+            )
+        )
+        mode_mask = np.isfinite(reference['n2'])
+        if np.count_nonzero(mode_mask) < 5:
+            result['dynamic_height_failure'] = 'reference_n2_unavailable'
+            return result
+        _, pmodes, _, mode_pressure = _dynamic_modes(
+            reference['n2'][mode_mask], pressure[mode_mask]
+        )
+        bc1 = np.interp(
+            pf,
+            mode_pressure,
+            pmodes[:, 0],
+            left=np.nan,
+            right=np.nan,
+        )
+        common = np.isfinite(dynamic_anomaly) & np.isfinite(bc1)
+        if np.count_nonzero(common) < 10:
+            result['dynamic_height_failure'] = 'bc1_overlap_too_shallow'
+            return result
+        pf_common = pf[common]
+        dynamic_common = dynamic_anomaly[common]
+        bc1_common = bc1[common]
+        shallow = gaussian['gaussian_shallow_pressure_dbar']
+        deep = gaussian['gaussian_deep_pressure_dbar']
+        sigma = profile['sigma0']
+        finite_sigma = np.flatnonzero(np.isfinite(sigma))
+        mixed_layer_pressure = 0.0
+        if finite_sigma.size:
+            mixed = np.flatnonzero(
+                np.isfinite(sigma)
+                & (sigma > sigma[finite_sigma[0]] + 0.03)
+            )
+            if mixed.size:
+                mixed_layer_pressure = float(pressure[mixed[0]])
+        keep = (
+            ~((pf_common > shallow) & (pf_common < deep))
+            & (pf_common >= mixed_layer_pressure)
+        )
+        if np.count_nonzero(keep) < 3:
+            result['dynamic_height_failure'] = 'bc1_fit_too_few_levels'
+            return result
+        xo = bc1_common[keep]
+        xf = dynamic_common[keep]
+        design = xo - xo[-1]
+        target = xf - xf[-1]
+        denominator = float(np.dot(design, design))
+        alpha = (
+            float(np.clip(np.dot(design, target) / denominator, -1.0, 1.0))
+            if denominator > 0
+            else 0.0
+        )
+        residual = dynamic_common - (
+            alpha * bc1_common
+            + (dynamic_common[-1] - alpha * bc1_common[-1])
+        )
+        core = (pf_common >= shallow) & (pf_common <= deep)
+        if not np.any(core):
+            result['dynamic_height_failure'] = 'empty_lens_band'
+            return result
+        low = float(residual[np.argmin(np.abs(pf_common - shallow))])
+        high = float(residual[np.argmin(np.abs(pf_common - deep))])
+        peak = float(np.nanmax(residual[core]))
+        passed = bool(np.isfinite(peak) and peak > low and peak > high)
+        result.update(
+            {
+                'dynamic_height_passed': passed,
+                'dynamic_height_failure': (
+                    'passed' if passed else 'no_internal_maximum'
+                ),
+                'dynamic_height_peak_m2_s2': peak,
+                'dynamic_height_bc1_alpha': alpha,
+            }
+        )
+        return result
+    except Exception as error:
+        result['dynamic_height_failure'] = (
+            f'{type(error).__name__}:{error}'
+        )
+        return result
+
+
+def _ofes_mccoy_profile_classification(
+    profile: dict,
+    reference: dict,
+    control_profiles: list[dict],
+    settings: dict,
+) -> dict:
+    """对一条 OFES 虚拟剖面执行 McCoy individual-SCV 完整门链。"""
+    base = {
+        'profile_qc_passed': bool(profile['profile_qc_passed']),
+        'profile_qc_status': str(profile['profile_qc_status']),
+        'background_max_sample_count': 0,
+        'background_qualified_level_count': 0,
+        'background_iqr_passed': False,
+        'profile_offset_qc_passed': False,
+        'localized_spice_anomaly_passed': False,
+        'initial_candidate_passed': False,
+        'scv_type': None,
+        'pycnocline_density': np.nan,
+        'peak_spiciness_anomaly': np.nan,
+        'peak_n2_anomaly_s_2': np.nan,
+        'gaussian_passed': False,
+        'gaussian_failure': 'not_reached',
+        'gaussian_r2': np.nan,
+        'gaussian_nrmse': np.nan,
+        'gaussian_amplitude': np.nan,
+        'gaussian_h_parameter_dbar': np.nan,
+        'gaussian_peak_pressure_dbar': np.nan,
+        'gaussian_shallow_pressure_dbar': np.nan,
+        'gaussian_deep_pressure_dbar': np.nan,
+        'gaussian_core_shallow_pressure_dbar': np.nan,
+        'gaussian_core_deep_pressure_dbar': np.nan,
+        'gaussian_peak_density': np.nan,
+        'dynamic_height_passed': False,
+        'dynamic_height_failure': 'not_reached',
+        'dynamic_height_peak_m2_s2': np.nan,
+        'dynamic_height_bc1_alpha': np.nan,
+        'mccoy_profile_compatible': False,
+        'mccoy_failure_stage': 'profile_qc',
+    }
+    if not profile['profile_qc_passed']:
+        return base
+    if abs(float(profile['source_latitude_deg'])) < settings[
+        'equator_latitude_min_deg'
+    ]:
+        base['mccoy_failure_stage'] = 'equatorial'
+        return base
+    anomalies = _ofes_mccoy_anomalies(profile, reference)
+    thresholds = _ofes_mccoy_iqr_on_profile(
+        profile, control_profiles, reference, settings
+    )
+    finite_counts = thresholds['sample_count'][
+        np.isfinite(profile['sigma0'])
+    ]
+    base['background_max_sample_count'] = (
+        int(np.max(finite_counts)) if finite_counts.size else 0
+    )
+    enough = thresholds['sample_count'] >= settings[
+        'minimum_background_profiles'
+    ]
+    base['background_qualified_level_count'] = int(
+        np.count_nonzero(enough)
+    )
+    base['background_iqr_passed'] = bool(
+        np.count_nonzero(enough) >= 3
+    )
+    if not base['background_iqr_passed']:
+        base['mccoy_failure_stage'] = 'background_iqr'
+        return base
+    reference_n2 = reference['n2']
+    finite_n2 = np.flatnonzero(np.isfinite(reference_n2))
+    if finite_n2.size == 0:
+        base['mccoy_failure_stage'] = 'pycnocline'
+        return base
+    pycnocline_index = int(
+        finite_n2[np.nanargmax(reference_n2[finite_n2])]
+    )
+    pycnocline_index = min(pycnocline_index + 1, len(reference_n2) - 1)
+    pycnocline_density = float(reference['sigma0'][pycnocline_index])
+    base['pycnocline_density'] = pycnocline_density
+    below = (
+        np.isfinite(profile['sigma0'])
+        & (profile['sigma0'] >= pycnocline_density)
+    )
+    offset_passed = True
+    for anomaly_key in (
+        'temperature_anomaly', 'salinity_anomaly', 'spiciness_anomaly'
+    ):
+        values = anomalies[anomaly_key][below]
+        denominator = values.size
+        positive = np.count_nonzero(values > 0)
+        negative = np.count_nonzero(values < 0)
+        positive_fraction = (
+            float(positive / denominator) if denominator else 1.0
+        )
+        negative_fraction = (
+            float(negative / denominator) if denominator else 1.0
+        )
+        if (
+            denominator == 0
+            or positive == 0
+            or negative == 0
+            or positive_fraction > 0.9
+            or negative_fraction > 0.9
+        ):
+            offset_passed = False
+            break
+    base['profile_offset_qc_passed'] = offset_passed
+    if not offset_passed:
+        base['mccoy_failure_stage'] = 'profile_offset_qc'
+        return base
+    spice = anomalies['spiciness_anomaly']
+    n2_anomaly = anomalies['n2_anomaly']
+    multiplier = settings['iqr_multiplier']
+    localized_high = spice - (
+        thresholds['spice_q75'] + thresholds['spice_iqr']
+    )
+    localized_low = spice - (
+        thresholds['spice_q25'] - thresholds['spice_iqr']
+    )
+    localized_valid = np.isfinite(localized_high) & np.isfinite(localized_low)
+    localized_exceedance = (
+        (localized_high[localized_valid] > 0)
+        | (localized_low[localized_valid] < 0)
+    )
+    localized_indices = np.flatnonzero(localized_exceedance)
+    localized_passed = not (
+        localized_indices.size
+        and localized_indices[0] == 0
+        and not np.any(np.diff(localized_indices) > 1)
+    )
+    base['localized_spice_anomaly_passed'] = localized_passed
+    if not localized_passed:
+        base['mccoy_failure_stage'] = 'surface_connected_spice_anomaly'
+        return base
+    spicy_exceed = spice - (
+        thresholds['spice_q75'] + multiplier * thresholds['spice_iqr']
+    )
+    minty_exceed = (
+        thresholds['spice_q25'] - multiplier * thresholds['spice_iqr']
+        - spice
+    )
+    n2_exceed = (
+        thresholds['n2_q25'] - multiplier * thresholds['n2_iqr']
+        - n2_anomaly
+    )
+    candidate_types = []
+    for scv_type, spice_exceed in (
+        ('spicy', spicy_exceed), ('minty', minty_exceed)
+    ):
+        spice_indices = np.flatnonzero(below & (spice_exceed > 0))
+        n2_indices = np.flatnonzero(below & (n2_exceed > 0))
+        if (
+            spice_indices.size
+            < settings['initial_minimum_spice_exceedance_levels']
+            or n2_indices.size == 0
+        ):
+            continue
+        distance = np.abs(
+            profile['sigma0'][spice_indices, None]
+            - profile['sigma0'][n2_indices][None, :]
+        )
+        if np.any(distance <= settings['n2_density_tolerance_kg_m3']):
+            candidate_types.append(scv_type)
+    base['initial_candidate_passed'] = bool(candidate_types)
+    if not candidate_types:
+        base['mccoy_failure_stage'] = 'initial_spice_n2_candidate'
+        return base
+    fits = []
+    for scv_type in candidate_types:
+        fit = _ofes_mccoy_gaussian_fit(
+            profile,
+            anomalies,
+            thresholds,
+            pycnocline_density,
+            scv_type,
+            settings,
+        )
+        if fit['gaussian_passed']:
+            fits.append((scv_type, fit))
+    if not fits:
+        base['mccoy_failure_stage'] = 'gaussian'
+        return {**base, **_ofes_mccoy_gaussian_fit(
+            profile,
+            anomalies,
+            thresholds,
+            pycnocline_density,
+            candidate_types[0],
+            settings,
+        )}
+    scv_type, gaussian = min(
+        fits, key=lambda item: item[1]['gaussian_nrmse']
+    )
+    dynamic = _ofes_mccoy_dynamic_height_gate(
+        profile, reference, gaussian
+    )
+    pressure = profile['pressure']
+    core_index = int(
+        np.argmin(
+            np.abs(
+                pressure - gaussian['gaussian_peak_pressure_dbar']
+            )
+        )
+    )
+    base.update(
+        {
+            'scv_type': scv_type,
+            'peak_spiciness_anomaly': float(spice[core_index]),
+            'peak_n2_anomaly_s_2': float(n2_anomaly[core_index]),
+            'mccoy_profile_compatible': bool(
+                gaussian['gaussian_passed']
+                and dynamic['dynamic_height_passed']
+            ),
+            'mccoy_failure_stage': (
+                'passed'
+                if dynamic['dynamic_height_passed']
+                else 'dynamic_height'
+            ),
+        }
+    )
+    return {**base, **gaussian, **dynamic}
+
+
+def _ofes_mccoy_event_worker(arguments: dict) -> tuple[pd.DataFrame, dict]:
+    """处理一个事件阶段的虚拟剖面、control 与直接速度确认。"""
+    request = dict(arguments['request'])
+    settings = dict(arguments['settings'])
+    event_id = str(request['event_id'])
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['peak_lon'])
+    core_lat = float(request['peak_lat'])
+    event_radius = float(request['event_peak_equivalent_radius_km'])
+    points = _ofes_mccoy_sampling_points(
+        core_lon, core_lat, event_radius, settings
+    )
+    # Per-stage daily radii can exceed the peak-day radius.  The load window
+    # covers the outermost 0.70R intercept before interpolation.
+    load_radius = max(
+        float(settings['background_outer_radius_km']) + 30.0,
+        0.70 * float(event_radius) + 30.0,
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(date)
+    domain_lon = (float(full_lon[0]), float(full_lon[-1]))
+    domain_lat = (float(full_lat[0]), float(full_lat[-1]))
+    in_domain = (
+        points['sample_lon'].between(
+            domain_lon[0] - 1e-6, domain_lon[1] + 1e-6
+        )
+        & points['sample_lat'].between(
+            domain_lat[0] - 1e-6, domain_lat[1] + 1e-6
+        )
+    )
+    off_domain_event = int(
+        ((~in_domain) & (points['sample_role'] == 'event')).sum()
+    )
+    off_domain_control = int(
+        ((~in_domain) & (points['sample_role'] == 'background_control')).sum()
+    )
+    points = points.loc[in_domain].reset_index(drop=True)
+    scale = approximate_degree_length(core_lat)
+    lon_half = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lon'])
+    )
+    lat_half = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half, core_lon + lon_half),
+        lat_bounds=(core_lat - lat_half, core_lat + lat_half),
+    )
+    profiles = []
+    for point in points.itertuples(index=False):
+        profile_table = extract_ofes_profile_interp(
+            snapshot,
+            float(point.sample_lon),
+            float(point.sample_lat),
+            variables=['temp', 'salinity'],
+        )
+        profiles.append(
+            _ofes_mccoy_profile_properties(
+                profile_table['Depth'].to_numpy(dtype=float),
+                profile_table['temp'].to_numpy(dtype=float),
+                profile_table['salinity'].to_numpy(dtype=float),
+                float(point.sample_lon),
+                float(point.sample_lat),
+                settings,
+            )
+        )
+    control_profiles = [
+        profile
+        for point, profile in zip(points.itertuples(index=False), profiles)
+        if point.sample_role == 'background_control'
+    ]
+    valid_control_count = sum(
+        profile['profile_qc_passed'] for profile in control_profiles
+    )
+    required_controls = (
+        int(settings['minimum_background_profiles']) - off_domain_control
+    )
+    if valid_control_count < required_controls:
+        raise RuntimeError(
+            f'{event_id} has only {valid_control_count} valid McCoy '
+            f'controls (required {required_controls} after dropping '
+            f'{off_domain_control} off-domain).'
+        )
+    reference = _ofes_mccoy_reference(
+        control_profiles, core_lon, core_lat
+    )
+    kinematic_cache = {}
+    records = []
+    for point, profile in zip(points.itertuples(index=False), profiles):
+        classification = _ofes_mccoy_profile_classification(
+            profile, reference, control_profiles, settings
+        )
+        peak_pressure = classification.get(
+            'gaussian_peak_pressure_dbar', np.nan
+        )
+        peak_depth = (
+            float(-gsw.z_from_p(peak_pressure, float(point.sample_lat)))
+            if np.isfinite(peak_pressure)
+            else np.nan
+        )
+        direct = {
+            'direct_velocity_depth_m': peak_depth,
+            'direct_rossby_number': np.nan,
+            'direct_normalized_strain': np.nan,
+            'direct_anticyclonic_rotation_confirmed': False,
+            'velocity_confirmed_mccoy_compatible': False,
+        }
+        if classification['mccoy_profile_compatible']:
+            depth_index = int(
+                np.argmin(
+                    np.abs(
+                        np.asarray(snapshot['depth'], dtype=float)
+                        - peak_depth
+                    )
+                )
+            )
+            if depth_index not in kinematic_cache:
+                kinematic_cache[depth_index] = (
+                    _ofes_fixed_depth_kinematic_fields(
+                        snapshot,
+                        float(snapshot['depth'][depth_index]),
+                        settings['direct_velocity_smoothing_sigma_pixels'],
+                    )
+                )
+            kinematics = _ofes_kinematics_at_point(
+                kinematic_cache[depth_index],
+                snapshot['lon'],
+                snapshot['lat'],
+                float(point.sample_lon),
+                float(point.sample_lat),
+            )
+            confirmed = bool(
+                np.isfinite(kinematics['rossby_number'])
+                and np.isfinite(kinematics['normalized_strain'])
+                and kinematics['rossby_number'] < 0
+                and abs(kinematics['rossby_number'])
+                > kinematics['normalized_strain']
+            )
+            direct.update(
+                {
+                    'direct_velocity_depth_m': float(
+                        kinematics['kinematic_depth_m']
+                    ),
+                    'direct_rossby_number': float(
+                        kinematics['rossby_number']
+                    ),
+                    'direct_normalized_strain': float(
+                        kinematics['normalized_strain']
+                    ),
+                    'direct_anticyclonic_rotation_confirmed': confirmed,
+                    'velocity_confirmed_mccoy_compatible': confirmed,
+                }
+            )
+        records.append(
+            {
+                'event_id': event_id,
+                'stage': str(request.get('stage', 'peak')),
+                'event_order': int(request['event_order']),
+                'date': date,
+                'event_peak_lon': core_lon,
+                'event_peak_lat': core_lat,
+                'event_peak_depth_m': float(request['peak_depth_at_max']),
+                'event_reference_depth_m': float(
+                    request['reference_depth_m']
+                ),
+                'event_equivalent_radius_km': event_radius,
+                'sample_id': str(point.sample_id),
+                'sample_role': str(point.sample_role),
+                'ring_fraction': float(point.ring_fraction),
+                'radius_km': float(point.radius_km),
+                'azimuth_deg': float(point.azimuth_deg),
+                'sample_lon': float(point.sample_lon),
+                'sample_lat': float(point.sample_lat),
+                'valid_control_profile_count': int(valid_control_count),
+                'off_domain_dropped_event_count': int(off_domain_event),
+                'off_domain_dropped_control_count': int(off_domain_control),
+                **classification,
+                **direct,
+            }
+        )
+    event_frame = pd.DataFrame(records)
+    audit = {
+        'event_id': event_id,
+        'stage': str(request.get('stage', 'peak')),
+        'date': date,
+        'event_profile_count': int(
+            (event_frame['sample_role'] == 'event').sum()
+        ),
+        'control_profile_count': int(
+            (event_frame['sample_role'] == 'background_control').sum()
+        ),
+        'valid_control_profile_count': int(valid_control_count),
+        'off_domain_dropped_event_count': int(off_domain_event),
+        'off_domain_dropped_control_count': int(off_domain_control),
+        'reference_pressure_max_dbar': float(
+            np.nanmax(reference['pressure'][
+                np.isfinite(reference['in_situ_temperature'])
+            ])
+        ),
+    }
+    return event_frame, audit
+
+
+def _ofes_mccoy_event_summary(
+    profiles: pd.DataFrame,
+    lifecycle_summary: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总 profile-compatible、velocity-confirmed 与既有持续性三层。"""
+    records = []
+    for event_id, group in profiles.groupby('event_id', sort=False):
+        event_profiles = group.loc[group['sample_role'] == 'event']
+        controls = group.loc[group['sample_role'] == 'background_control']
+        center = event_profiles.loc[
+            np.isclose(event_profiles['radius_km'], 0.0)
+        ]
+        if len(center) != 1:
+            raise RuntimeError(
+                f'OFES McCoy {event_id} does not have one center profile.'
+            )
+        records.append(
+            {
+                'event_order': int(group['event_order'].iloc[0]),
+                'event_id': str(event_id),
+                'event_profile_count': int(len(event_profiles)),
+                'control_profile_count': int(len(controls)),
+                'center_profile_mccoy_compatible': bool(
+                    center['mccoy_profile_compatible'].iloc[0]
+                ),
+                'any_event_profile_mccoy_compatible': bool(
+                    event_profiles['mccoy_profile_compatible'].any()
+                ),
+                'event_profile_mccoy_compatible_fraction': float(
+                    event_profiles['mccoy_profile_compatible'].mean()
+                ),
+                'center_profile_velocity_confirmed': bool(
+                    center['velocity_confirmed_mccoy_compatible'].iloc[0]
+                ),
+                'any_event_profile_velocity_confirmed': bool(
+                    event_profiles[
+                        'velocity_confirmed_mccoy_compatible'
+                    ].any()
+                ),
+                'event_profile_velocity_confirmed_fraction': float(
+                    event_profiles[
+                        'velocity_confirmed_mccoy_compatible'
+                    ].mean()
+                ),
+                'background_control_mccoy_compatible_fraction': float(
+                    controls['mccoy_profile_compatible'].mean()
+                ),
+                'center_scv_type': center['scv_type'].iloc[0],
+                'center_gaussian_peak_pressure_dbar': float(
+                    center['gaussian_peak_pressure_dbar'].iloc[0]
+                ),
+                'center_direct_rossby_number': float(
+                    center['direct_rossby_number'].iloc[0]
+                ),
+            }
+        )
+    summary = pd.DataFrame(records).merge(
+        lifecycle_summary,
+        on=['event_order', 'event_id'],
+        how='left',
+        validate='one_to_one',
+    ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+    if summary['scv_compatible'].isna().any():
+        raise RuntimeError('OFES McCoy summary failed to join lifecycle labels.')
+    event_profile_counts = summary['event_profile_count'].unique()
+    control_profile_counts = summary['control_profile_count'].unique()
+    if event_profile_counts.size != 1 or control_profile_counts.size != 1:
+        raise RuntimeError('OFES McCoy sampling counts vary across events.')
+    profiles_per_event = int(event_profile_counts[0])
+    controls_per_event = int(control_profile_counts[0])
+    from scipy.stats import fisher_exact
+    event_profiles = profiles.loc[profiles['sample_role'] == 'event']
+    controls = profiles.loc[profiles['sample_role'] == 'background_control']
+    event_pass = int(event_profiles['mccoy_profile_compatible'].sum())
+    control_pass = int(controls['mccoy_profile_compatible'].sum())
+    odds_ratio, p_value = fisher_exact(
+        [
+            [event_pass, len(event_profiles) - event_pass],
+            [control_pass, len(controls) - control_pass],
+        ]
+    )
+    paired = profiles.groupby(['event_id', 'sample_role'])[
+        'mccoy_profile_compatible'
+    ].mean().unstack('sample_role')
+    paired_difference = (
+        paired['event'] - paired['background_control']
+    ).to_numpy(dtype=float)
+    paired_wilcoxon = scipy.stats.wilcoxon(
+        paired_difference,
+        alternative='greater',
+        zero_method='wilcox',
+    )
+    rng = np.random.default_rng(int(settings['random_seed']))
+    bootstrap_index = rng.integers(
+        0,
+        len(paired_difference),
+        size=(int(settings['bootstrap_replicates']), len(paired_difference)),
+    )
+    bootstrap_mean = paired_difference[bootstrap_index].mean(axis=1)
+    bootstrap_ci = np.quantile(bootstrap_mean, (0.025, 0.975))
+    counts = {
+        'strict_event_count': int(len(summary)),
+        'persistent_anticyclonic_rotational_carrier_count': int(
+            summary[
+                'persistent_anticyclonic_rotational_carrier'
+            ].sum()
+        ),
+        'existing_persistent_ofes_scv_compatible_count': int(
+            summary['scv_compatible'].sum()
+        ),
+        'center_profile_mccoy_compatible_count': int(
+            summary['center_profile_mccoy_compatible'].sum()
+        ),
+        'any_event_profile_mccoy_compatible_count': int(
+            summary['any_event_profile_mccoy_compatible'].sum()
+        ),
+        'center_profile_velocity_confirmed_count': int(
+            summary['center_profile_velocity_confirmed'].sum()
+        ),
+        'any_event_profile_velocity_confirmed_count': int(
+            summary['any_event_profile_velocity_confirmed'].sum()
+        ),
+        'event_virtual_profile_count': int(len(event_profiles)),
+        'event_virtual_profile_mccoy_compatible_count': event_pass,
+        'background_control_profile_count': int(len(controls)),
+        'background_control_mccoy_compatible_count': control_pass,
+        'event_vs_control_profile_odds_ratio': float(odds_ratio),
+        'event_vs_control_profile_fisher_p': float(p_value),
+        'event_equal_mean_profile_pass_fraction': float(
+            paired['event'].mean()
+        ),
+        'event_equal_mean_control_pass_fraction': float(
+            paired['background_control'].mean()
+        ),
+        'event_equal_mean_pass_fraction_difference': float(
+            np.mean(paired_difference)
+        ),
+        'event_equal_mean_difference_bootstrap95': [
+            float(bootstrap_ci[0]), float(bootstrap_ci[1])
+        ],
+        'event_equal_paired_wilcoxon_statistic': float(
+            paired_wilcoxon.statistic
+        ),
+        'event_equal_paired_wilcoxon_p': float(paired_wilcoxon.pvalue),
+        'bootstrap_replicates': int(settings['bootstrap_replicates']),
+        'random_seed': int(settings['random_seed']),
+        'center_profile_failure_stage_counts': {
+            str(key): int(value)
+            for key, value in profiles.loc[
+                (profiles['sample_role'] == 'event')
+                & np.isclose(profiles['radius_km'], 0.0),
+                'mccoy_failure_stage',
+            ].value_counts().items()
+        },
+        'event_profile_failure_stage_counts': {
+            str(key): int(value)
+            for key, value in event_profiles[
+                'mccoy_failure_stage'
+            ].value_counts().items()
+        },
+        'center_profile_by_existing_scv_crosstab': {
+            f'existing_{int(existing)}_center_{int(center)}': int(count)
+            for (existing, center), count in summary.groupby(
+                ['scv_compatible', 'center_profile_mccoy_compatible']
+            ).size().items()
+        },
+        'center_profile_by_persistent_anticyclonic_crosstab': {
+            f'persistent_{int(persistent)}_center_{int(center)}': int(count)
+            for (persistent, center), count in summary.groupby(
+                [
+                    'persistent_anticyclonic_rotational_carrier',
+                    'center_profile_mccoy_compatible',
+                ]
+            ).size().items()
+        },
+        'center_profile_by_peak_rotation_crosstab': {
+            f'peak_rotation_{int(rotation)}_center_{int(center)}': int(count)
+            for (rotation, center), count in summary.groupby(
+                [
+                    'population_peak_rotation_dominated',
+                    'center_profile_mccoy_compatible',
+                ]
+            ).size().items()
+        },
+        'interpretation': (
+            'McCoy profile compatibility, direct OFES velocity confirmation, '
+            'and the existing five-day OFES persistence gate are reported as '
+            'separate evidence layers; neither is post-hoc relaxed.'
+        ),
+        'method_limit': (
+            'The public McCoy profile gates are ported, but the primary OFES '
+            'run uses a same-day sparse OFES annulus instead of the RG '
+            'climatology plus multi-year Argo IQR pool; results are therefore '
+            'McCoy-method-compatible rather than catalog-equivalent detections.'
+        ),
+        'source_parity': {
+            'ported_gates': (
+                'profile resolution QC; 2-dbar kernel smoothing and 10-dbar '
+                'property grid; along-isopycnal T/S/spiciness/N2 anomalies; '
+                'target-inclusive Tukey IQR pool; subsurface spice-N2 '
+                'coincidence; discrete Gaussian fit and weak-N2 core; '
+                '|latitude| >= 5 degrees; BC1-removed dynamic-height '
+                'internal maximum'
+            ),
+            'ofes_substitutions': (
+                'same-day OFES annulus median replaces monthly RG climatology; '
+                f'target plus {controls_per_event} deterministic OFES controls '
+                'replaces the '
+                'multi-year Argo pool within 2 degrees and +/-45 calendar '
+                f'days; delivered {settings["pressure_min_dbar"]:g}-'
+                f'{settings["pressure_max_dbar"]:g} dbar replaces the '
+                'original 0-2000 dbar grid'
+            ),
+            'intentional_extensions': (
+                f'{profiles_per_event} deterministic virtual-Argo intercepts '
+                'and direct OFES '
+                'u/v rotation confirmation are reported separately from the '
+                'ported single-profile gate'
+            ),
+            'not_ported': (
+                'Argo cycle/grey-list QC and consecutive-cast time-series '
+                'grouping do not apply to the OFES peak-day experiment'
+            ),
+            'source_bug_policy': (
+                'the intended greater-than-60 per-density IQR support rule is '
+                'enforced; the literal get_IQR_data.m equality-expression '
+                'no-op and column-loop indexing error are not reproduced'
+            ),
+        },
+        'scientific_summary': {
+            'center_profile_layer': (
+                f'{int(summary["center_profile_mccoy_compatible"].sum())}/'
+                f'{len(summary)} event centers pass the ported McCoy '
+                'individual-profile gate; '
+                f'{int(summary["center_profile_velocity_confirmed"].sum())}/'
+                f'{len(summary)} also have a direct OFES anticyclonic '
+                'rotation-dominated core at the diagnosed depth.'
+            ),
+            'intercept_layer': (
+                f'{int(summary["any_event_profile_mccoy_compatible"].sum())}/'
+                f'{len(summary)} events are intercepted by at least one of '
+                f'{profiles_per_event} deterministic virtual profiles; '
+                f'{int(summary["any_event_profile_velocity_confirmed"].sum())}/'
+                f'{len(summary)} also pass the direct OFES velocity '
+                'confirmation at an intercepted profile.'
+            ),
+            'relationship_to_existing_proxy': (
+                'The existing five-day OFES proxy remains '
+                f'{int(summary["scv_compatible"].sum())}/{len(summary)}. '
+                f'{int((summary["scv_compatible"] & summary["center_profile_mccoy_compatible"]).sum())} '
+                'of those pass the McCoy center-profile gate; the axes '
+                'measure peak-day hydrographic/dynamic-height shape versus '
+                'multi-day resolved rotational persistence and are not a '
+                'nested funnel.'
+            ),
+            'primary_enrichment_result': (
+                'Event-equal virtual-profile pass fractions exceed their '
+                'same-event annular controls by '
+                f'{float(np.mean(paired_difference)):.3f} on average '
+                f'(bootstrap 95% interval {float(bootstrap_ci[0]):.3f}-'
+                f'{float(bootstrap_ci[1]):.3f}; one-sided paired Wilcoxon '
+                f'p={float(paired_wilcoxon.pvalue):.3g}).'
+            ),
+            'claim_limit': (
+                'The result supports SCV-like thermohaline and '
+                'dynamic-height structure as a reproducible event-associated '
+                'subset, not SCV dominance, catalog-equivalent '
+                'detections, or causal formation by vortices.'
+            ),
+        },
+        'inference_limit': (
+            'Virtual profiles within one event are spatially dependent; the '
+            'event-equal paired contrast is primary, while the pooled-profile '
+            'Fisher test is retained only as a descriptive sensitivity.'
+        ),
+    }
+    return summary, counts
+
+
+def _plot_ofes_mccoy_virtual_argo(
+    profiles: pd.DataFrame,
+    summary: pd.DataFrame,
+    analysis: dict,
+    output_path: str | Path,
+    figure_dpi: int,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 McCoy 虚拟剖面三层计数、采样概率与旧判据交叉表。"""
+    figure, axes = plt.subplots(2, 2, figsize=(14.0, 10.0))
+    labels = [
+        'Persistent anti-\ncyclonic carrier',
+        'McCoy center\nprofile',
+        'Center + direct\nOFES velocity',
+        'Existing 5-day\nOFES proxy',
+    ]
+    values = [
+        analysis['persistent_anticyclonic_rotational_carrier_count'],
+        analysis['center_profile_mccoy_compatible_count'],
+        analysis['center_profile_velocity_confirmed_count'],
+        analysis['existing_persistent_ofes_scv_compatible_count'],
+    ]
+    axes[0, 0].bar(
+        labels,
+        values,
+        color=['#64748b', '#2563eb', '#dc2626', '#7c3aed'],
+    )
+    axes[0, 0].set_ylabel(f'Events (out of {len(summary)})')
+    axes[0, 0].set_title('Separate evidence layers (not a nested funnel)')
+    for index, value in enumerate(values):
+        axes[0, 0].text(index, value + 0.5, str(value), ha='center')
+    event_profiles = profiles.loc[profiles['sample_role'] == 'event'].copy()
+    ring = event_profiles.groupby('ring_fraction').agg(
+        profile_fraction=('mccoy_profile_compatible', 'mean'),
+        velocity_fraction=('velocity_confirmed_mccoy_compatible', 'mean'),
+    ).reset_index()
+    axes[0, 1].plot(
+        ring['ring_fraction'], ring['profile_fraction'], marker='o',
+        label='McCoy profile gate',
+    )
+    axes[0, 1].plot(
+        ring['ring_fraction'], ring['velocity_fraction'], marker='s',
+        label='+ direct OFES velocity',
+    )
+    axes[0, 1].set_xlabel('Sampling radius / event equivalent radius')
+    axes[0, 1].set_ylabel('Virtual-profile pass fraction')
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].set_title('Virtual-Argo intercept sensitivity')
+    axes[0, 1].legend()
+    ordered = summary.sort_values(
+        'event_profile_mccoy_compatible_fraction', ascending=False
+    )
+    axes[1, 0].bar(
+        np.arange(len(ordered)),
+        ordered['event_profile_mccoy_compatible_fraction'],
+        color=np.where(ordered['scv_compatible'], '#7c3aed', '#94a3b8'),
+    )
+    axes[1, 0].set_xlabel('Events ordered by virtual-profile pass fraction')
+    axes[1, 0].set_ylabel('Pass fraction across 17 event profiles')
+    axes[1, 0].set_ylim(0, 1)
+    axes[1, 0].set_title('Purple marks the existing 5-day OFES subset')
+    cross = pd.crosstab(
+        summary['scv_compatible'],
+        summary['center_profile_mccoy_compatible'],
+    ).reindex(index=[False, True], columns=[False, True], fill_value=0)
+    image_handle = axes[1, 1].imshow(cross.to_numpy(), cmap='Blues')
+    for row in range(2):
+        for column in range(2):
+            axes[1, 1].text(
+                column, row, int(cross.iloc[row, column]),
+                ha='center', va='center', fontsize=15,
+            )
+    axes[1, 1].set_xticks([0, 1], ['No', 'Yes'])
+    axes[1, 1].set_yticks([0, 1], ['No', 'Yes'])
+    axes[1, 1].set_xlabel('McCoy center-profile compatible')
+    axes[1, 1].set_ylabel('Existing 5-day OFES proxy')
+    axes[1, 1].set_title('The two gates are deliberately not equated')
+    figure.colorbar(image_handle, ax=axes[1, 1], label='Events')
+    for axis in axes.flat:
+        axis.grid(alpha=0.2)
+    figure.suptitle(
+        'OFES virtual-Argo reproduction of McCoy et al. (2020) profile gates'
+    )
+    figure.tight_layout()
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        figure_dpi,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_mccoy_virtual_argo(
+    lifecycle_run_dir: str | Path | None = None,
+    *,
+    mccoy_overrides: dict | None = None,
+    source_archive_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """在当前严格 OFES 事件总体上复现 McCoy individual-SCV 剖面门链。
+
+    入口只取每个事件的峰值日，在异常核心、0.35R 与 0.70R 放置 17 条虚拟
+    Argo 剖面，并以 120--240 km 稀疏 control 环带构建 OFES-native 背景；
+    IQR 邻域按源码口径包含目标剖面自身一次。
+    单剖面依次执行 McCoy 公开源码的 10-dbar 处理、等密度面异常、Tukey
+    IQR、spice--N2 共位、高斯形态、弱层结核心和去第一斜压模动力高度内峰；
+    通过后再用原生 OFES u/v 检验核深是否为反气旋 rotation-dominated。
+
+    参数:
+        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用固定的 `event_lifecycle` 目录。
+        - mccoy_overrides (dict | None): 临时覆盖 `ofes.mccoy_virtual_argo` 配置。
+        - source_archive_path (str | Path | None): McCoy v1.3 源码 zip；None 使用 paths 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `mccoy_virtual_argo` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、profile/event/audit 表、analysis summary、图件路径及是否复用完成运行。
+
+    输出:
+        - `<run_dir>/events/*.parquet`、`virtual_profile_diagnostics.parquet`、`event_summary.parquet`、`event_audit.parquet`、`analysis_summary.json`、`mccoy_virtual_argo.png`、`source_inventory.parquet` 与 `manifest.json`。
+
+    说明:
+        - McCoy 源码归档由 paths.yml 指定；输出目录不包含运行标签。
+        - OFES 仅交付至约 1077 m，且主运行用模式自身稀疏环带代替 RG 气候态与多年 Argo IQR 池，因此正式名称是 McCoy-method-compatible，而非 McCoy-catalog-equivalent。
+        - 现有 `scv_compatible` 五日连续动力代理不被修改；三层结果并列，不能因新方法命中更多事件而后验放宽旧判据。
+    """
+    lifecycle_root = (
+        Path(lifecycle_run_dir)
+        if lifecycle_run_dir is not None
+        else _ofes_analysis_output_dir('event_lifecycle')
+    )
+    lifecycle_required = (
+        'lifecycle_daily_diagnostics.parquet',
+        'lifecycle_event_summary.parquet',
+    )
+    missing_lifecycle = [
+        name for name in lifecycle_required
+        if not (lifecycle_root / name).exists()
+    ]
+    if missing_lifecycle:
+        raise FileNotFoundError(
+            f'OFES McCoy lifecycle inputs are missing: {missing_lifecycle}.'
+        )
+    settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
+    source_path = Path(
+        source_archive_path
+        if source_archive_path is not None
+        else _mccoy_scv_source_archive
+    )
+    daily = pd.read_parquet(
+        lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+    )
+    lifecycle_summary = pd.read_parquet(
+        lifecycle_root / 'lifecycle_event_summary.parquet'
+    )
+    requests = daily.loc[daily['is_event_peak_day']].copy()
+    if settings['event_ids']:
+        requests = requests.loc[
+            requests['event_id'].astype(str).isin(settings['event_ids'])
+        ]
+        lifecycle_summary = lifecycle_summary.loc[
+            lifecycle_summary['event_id'].astype(str).isin(
+                settings['event_ids']
+            )
+        ]
+    requests = requests.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    lifecycle_summary = lifecycle_summary.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    if (
+        requests.empty
+        or len(requests) != len(lifecycle_summary)
+        or requests['event_id'].duplicated().any()
+    ):
+        raise RuntimeError('OFES McCoy peak-day event requests are invalid.')
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+        'event_ids': [str(value) for value in requests['event_id']],
+        'dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['date']
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'profile_diagnostics': pd.read_parquet(
+                outputs['profile_diagnostics']
+            ),
+            'event_summary': pd.read_parquet(
+                outputs['event_summary']
+            ),
+            'event_audit': pd.read_parquet(
+                outputs['event_audit']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f'McCoy source archive not found: {source_path}'
+        )
+    inventory_records = []
+    for date in sorted(requests['date'].unique()):
+        for variable in ('temp', 'salinity', 'u', 'v'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            inventory_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path.resolve()),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    source_inventory = pd.DataFrame(inventory_records)
+    manifest = {
+        'analysis': 'mccoy_virtual_argo',
+        'method': 'mccoy_2020_source_gates_ofes_native_background',
+        'request': request,
+        'settings': settings,
+        'mccoy_source_archive': str(source_path.resolve()),
+        'request_count': int(len(requests)),
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    profile_frames = []
+    audit_records = []
+    completed = 0
+    try:
+        pending = []
+        for row in requests.itertuples(index=False):
+            fragment_path = events_dir / f'{row.event_id}.parquet'
+            if fragment_path.exists():
+                fragment = pd.read_parquet(fragment_path)
+                if _ofes_mccoy_fragment_reusable(
+                    fragment, str(row.event_id), pd.Timestamp(row.date)
+                ):
+                    profile_frames.append(fragment)
+                    audit_records.append(
+                        {
+                            'event_id': str(row.event_id),
+                            'date': pd.Timestamp(row.date).normalize(),
+                            'event_profile_count': int(
+                                (fragment['sample_role'] == 'event').sum()
+                            ),
+                            'control_profile_count': int(
+                                (fragment['sample_role']
+                                 == 'background_control').sum()
+                            ),
+                            'valid_control_profile_count': int(
+                                fragment['valid_control_profile_count'].iloc[0]
+                            ),
+                            'reference_pressure_max_dbar': settings[
+                                'pressure_max_dbar'
+                            ],
+                            'fragment_reused': True,
+                        }
+                    )
+                    completed += 1
+                    continue
+            pending.append(
+                {
+                    'request': row._asdict(),
+                    'settings': settings,
+                    'fragment_path': fragment_path,
+                }
+            )
+        if pending:
+            workers = min(int(settings['worker_count']), len(pending))
+            if workers == 1:
+                iterator = (
+                    (argument, _ofes_mccoy_event_worker(argument))
+                    for argument in pending
+                )
+                for argument, (fragment, audit) in iterator:
+                    _atomic_write_parquet(
+                        fragment, argument['fragment_path']
+                    )
+                    audit['fragment_reused'] = False
+                    profile_frames.append(fragment)
+                    audit_records.append(audit)
+                    completed += 1
+                    print(
+                        f'[OFES McCoy] {completed}/{len(requests)}',
+                        flush=True,
+                    )
+            else:
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _ofes_mccoy_event_worker, argument
+                        ): argument
+                        for argument in pending
+                    }
+                    for future in futures_as_completed(futures):
+                        argument = futures[future]
+                        fragment, audit = future.result()
+                        _atomic_write_parquet(
+                            fragment, argument['fragment_path']
+                        )
+                        audit['fragment_reused'] = False
+                        profile_frames.append(fragment)
+                        audit_records.append(audit)
+                        completed += 1
+                        print(
+                            f'[OFES McCoy] {completed}/{len(requests)}',
+                            flush=True,
+                        )
+                        manifest['completed_events'] = completed
+                        manifest['updated_at_utc'] = pd.Timestamp.now(
+                            tz='UTC'
+                        ).isoformat()
+                        _ofes_atomic_write_json(manifest, manifest_path)
+        profiles = pd.concat(profile_frames, ignore_index=True).sort_values(
+            ['event_order', 'sample_role', 'sample_id'], kind='mergesort'
+        ).reset_index(drop=True)
+        event_audit = pd.DataFrame(audit_records).sort_values(
+            'event_id', kind='mergesort'
+        ).reset_index(drop=True)
+        event_summary, analysis_summary = _ofes_mccoy_event_summary(
+            profiles, lifecycle_summary, settings
+        )
+        profile_path = run_dir / 'virtual_profile_diagnostics.parquet'
+        event_path = run_dir / 'event_summary.parquet'
+        audit_path = run_dir / 'event_audit.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'mccoy_virtual_argo.png'
+        _atomic_write_parquet(profiles, profile_path)
+        _atomic_write_parquet(event_summary, event_path)
+        _atomic_write_parquet(event_audit, audit_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_mccoy_virtual_argo(
+            profiles,
+            event_summary,
+            analysis_summary,
+            figure_path,
+            settings['figure_dpi'],
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': int(len(event_summary)),
+                'profile_row_count': int(len(profiles)),
+                'outputs': {
+                    'profile_diagnostics': str(profile_path.resolve()),
+                    'event_summary': str(event_path.resolve()),
+                    'event_audit': str(audit_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(
+                        (run_dir / 'source_inventory.parquet').resolve()
+                    ),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'profile_diagnostics': profiles,
+        'event_summary': event_summary,
+        'event_audit': event_audit,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_mccoy_fragment_reusable(
+    frame: pd.DataFrame,
+    event_id: str,
+    date: pd.Timestamp,
+) -> bool:
+    """检查峰值 McCoy fragment 的请求和核心诊断列。"""
+    required = {
+        'event_id',
+        'date',
+        'sample_role',
+        'mccoy_profile_compatible',
+        'velocity_confirmed_mccoy_compatible',
+    }
+    if not required.issubset(frame.columns):
+        return False
+    return _ofes_assert_fragment_request(frame, event_id, date)
+
+
+def _ofes_mccoy_stage_fragment_reusable(
+    fragment_path: str | Path,
+    request: dict,
+) -> bool:
+    """检查一个 McCoy 阶段 fragment 的请求和基本列结构。"""
+    path = Path(fragment_path)
+    if not path.exists():
+        return False
+    frame = pd.read_parquet(path)
+    required = {
+        'event_id',
+        'stage',
+        'date',
+        'event_peak_lon',
+        'event_peak_lat',
+        'event_reference_depth_m',
+        'event_equivalent_radius_km',
+        'sample_role',
+        'mccoy_profile_compatible',
+        'velocity_confirmed_mccoy_compatible',
+    }
+    if frame.empty or not required.issubset(frame.columns):
+        return False
+    if set(frame['event_id'].astype(str)) != {str(request['event_id'])}:
+        raise RuntimeError(
+            'Existing McCoy stage output has a different event request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    if set(frame['stage'].astype(str)) != {str(request['stage'])}:
+        raise RuntimeError(
+            'Existing McCoy stage output has a different stage request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    dates = pd.to_datetime(frame['date']).dt.normalize()
+    if set(dates) != {pd.Timestamp(request['date']).normalize()}:
+        raise RuntimeError(
+            'Existing McCoy stage output has a different date request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    first = frame.iloc[0]
+    for column, expected in (
+        ('event_peak_lon', request['peak_lon']),
+        ('event_peak_lat', request['peak_lat']),
+        ('event_reference_depth_m', request['reference_depth_m']),
+        (
+            'event_equivalent_radius_km',
+            request['event_peak_equivalent_radius_km'],
+        ),
+    ):
+        if not np.isclose(
+            float(first[column]),
+            float(expected),
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise RuntimeError(
+                'Existing McCoy stage output has a different geometry '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+    return True
+
+
+def _ofes_mccoy_stage_fragment_stats(
+    fragment: pd.DataFrame,
+    request: dict,
+    *,
+    fragment_reused: bool,
+) -> dict:
+    """汇总一个 McCoy 阶段 fragment 的事件/对照通过率。"""
+    event_rows = fragment.loc[fragment['sample_role'] == 'event']
+    control_rows = fragment.loc[
+        fragment['sample_role'] == 'background_control'
+    ]
+    return {
+        'event_id': str(request['event_id']),
+        'event_order': int(request['event_order']),
+        'stage': str(request['stage']),
+        'date': pd.Timestamp(request['date']).normalize(),
+        'event_profile_count': int(len(event_rows)),
+        'event_compatible_count': int(
+            event_rows['mccoy_profile_compatible'].sum()
+        ),
+        'event_velocity_confirmed_count': int(
+            event_rows['velocity_confirmed_mccoy_compatible'].sum()
+        ),
+        'event_compatible_fraction': float(
+            event_rows['mccoy_profile_compatible'].mean()
+        ) if len(event_rows) else np.nan,
+        'control_profile_count': int(len(control_rows)),
+        'control_pass_fraction': float(
+            control_rows['mccoy_profile_compatible'].mean()
+        ) if len(control_rows) else np.nan,
+        'off_domain_dropped_event_count': int(
+            fragment['off_domain_dropped_event_count'].max()
+        ) if 'off_domain_dropped_event_count' in fragment.columns else 0,
+        'off_domain_dropped_control_count': int(
+            fragment['off_domain_dropped_control_count'].max()
+        ) if 'off_domain_dropped_control_count' in fragment.columns else 0,
+        'fragment_reused': bool(fragment_reused),
+    }
+
+
+def _ofes_mccoy_stage_summary(
+    stage_diagnostics: pd.DataFrame,
+    footprint_mode: str,
+    peak_summary: pd.DataFrame | None = None,
+) -> dict:
+    """按事件汇总 McCoy start/peak/last 阶段统计和峰值一致性。"""
+    if stage_diagnostics.empty:
+        raise RuntimeError('OFES McCoy stage diagnostics are empty.')
+    expected_stages = ('start', 'peak', 'last')
+    unexpected_stages = sorted(
+        set(stage_diagnostics['stage'].astype(str)) - set(expected_stages)
+    )
+    if unexpected_stages:
+        raise RuntimeError(
+            f'OFES McCoy stage diagnostics contain unknown stages: '
+            f'{unexpected_stages}'
+        )
+    stage_counts = stage_diagnostics.groupby('event_id')['stage'].agg(
+        unique='nunique', total='size'
+    )
+    if not (
+        stage_counts['unique'].eq(len(expected_stages))
+        & stage_counts['total'].eq(len(expected_stages))
+    ).all():
+        raise RuntimeError(
+            'OFES McCoy stage diagnostics require one start, peak, and '
+            'last row per event.'
+        )
+    stage_summary = {}
+    for stage in expected_stages:
+        rows = stage_diagnostics.loc[
+            stage_diagnostics['stage'] == stage
+        ]
+        stage_summary[stage] = {
+            'event_count': int(len(rows)),
+            'events_with_any_compatible': int(
+                (rows['event_compatible_count'] > 0).sum()
+            ),
+            'mean_event_compatible_fraction': float(
+                rows['event_compatible_fraction'].mean()
+            ),
+            'mean_control_pass_fraction': float(
+                rows['control_pass_fraction'].mean()
+            ),
+            'off_domain_dropped_event_count': int(
+                rows['off_domain_dropped_event_count'].sum()
+            ),
+            'off_domain_dropped_control_count': int(
+                rows['off_domain_dropped_control_count'].sum()
+            ),
+        }
+    wide = stage_diagnostics.pivot(
+        index='event_id', columns='stage', values='event_compatible_fraction'
+    ).reindex(columns=expected_stages)
+    paired = wide[['start', 'last']].dropna()
+    paired_stats = {
+        'n': int(len(paired)),
+        'start_median': float(paired['start'].median()),
+        'last_median': float(paired['last'].median()),
+        'median_difference_last_minus_start': float(
+            paired['last'].median() - paired['start'].median()
+        ),
+    }
+    if len(paired) >= 2:
+        differences = (
+            paired['last'] - paired['start']
+        ).to_numpy(dtype=float)
+        paired_stats['wilcoxon_p'] = float(
+            scipy.stats.wilcoxon(
+                differences,
+                alternative='two-sided',
+                zero_method='wilcox',
+            ).pvalue
+        ) if np.count_nonzero(differences != 0) else 1.0
+    else:
+        paired_stats['wilcoxon_p'] = None
+    peak_consistency = {
+        'available': False,
+        'n_compared': 0,
+        'mismatch_count': None,
+    }
+    if peak_summary is not None:
+        required = {
+            'event_id', 'any_event_profile_mccoy_compatible'
+        }
+        if required.issubset(peak_summary.columns):
+            expected = peak_summary.copy()
+            expected['event_id'] = expected['event_id'].astype(str)
+            observed = stage_diagnostics.loc[
+                stage_diagnostics['stage'] == 'peak',
+                ['event_id', 'event_compatible_count'],
+            ].copy()
+            observed['event_id'] = observed['event_id'].astype(str)
+            compared = observed.merge(
+                expected[['event_id', 'any_event_profile_mccoy_compatible']],
+                on='event_id',
+                how='inner',
+                validate='one_to_one',
+            )
+            peak_consistency = {
+                'available': True,
+                'n_compared': int(len(compared)),
+                'mismatch_count': int(
+                    (
+                        compared['event_compatible_count'].gt(0)
+                        != compared[
+                            'any_event_profile_mccoy_compatible'
+                        ].astype(bool)
+                    ).sum()
+                ),
+            }
+    return {
+        'event_count': int(stage_diagnostics['event_id'].nunique()),
+        'request_count': int(len(stage_diagnostics)),
+        'footprint_mode': str(footprint_mode),
+        'stage_summary': stage_summary,
+        'paired_start_last': paired_stats,
+        'peak_consistency_with_peak_run': peak_consistency,
+        'interpretation': (
+            'Stage-wise McCoy profile compatibility describes the evolution '
+            'of hydrographic profile shape at start, peak, and last observed '
+            'days. It is not a new SCV identity criterion.'
+        ),
+        'limits': [
+            'Per-stage footprints follow the daily object peak; fixed_peak '
+            'is an Eulerian sensitivity using the peak position at all stages.',
+            'The event is the statistical unit; virtual profiles within an '
+            'event are spatially dependent.',
+        ],
+    }
+
+
+def _plot_ofes_mccoy_stage_bridge(
+    stage_diagnostics: pd.DataFrame,
+    summary: dict,
+    output_path: str | Path,
+    figure_dpi: int,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 McCoy 阶段通过率和 start-to-last 事件轨迹。"""
+    stages = ('start', 'peak', 'last')
+    figure, axes = plt.subplots(1, 2, figsize=(13.0, 5.2))
+    means = [
+        summary['stage_summary'][stage]['mean_event_compatible_fraction']
+        for stage in stages
+    ]
+    axes[0].bar(stages, means, color=['#94a3b8', '#2563eb', '#7c3aed'])
+    axes[0].set_ylim(0, 1)
+    axes[0].set_ylabel('Mean event-profile compatible fraction')
+    axes[0].set_title('McCoy profile compatibility by stage')
+    for event_id, group in stage_diagnostics.groupby('event_id', sort=True):
+        ordered = group.set_index('stage').reindex(stages)
+        axes[1].plot(
+            stages,
+            ordered['event_compatible_fraction'],
+            marker='o',
+            alpha=0.45,
+            linewidth=1.0,
+        )
+    axes[1].set_ylim(0, 1)
+    axes[1].set_ylabel('Event-profile compatible fraction')
+    axes[1].set_title('Event-wise stage trajectories')
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    figure.suptitle(
+        f'OFES McCoy stage bridge ({summary["event_count"]} events)'
+    )
+    figure.tight_layout()
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        figure_dpi,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def _ofes_mccoy_stage_source_inventory(
+    requests: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录 McCoy 阶段 bridge 消费的逐日 OFES 文件身份。"""
+    records = []
+    for date in sorted(pd.to_datetime(requests['date']).dt.normalize().unique()):
+        for variable in ('temp', 'salinity', 'u', 'v'):
+            path = _ofes_file_path(variable, pd.Timestamp(date))
+            stat = path.stat()
+            records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'variable': variable,
+                    'source_file': str(path.resolve()),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def run_ofes_mccoy_virtual_argo_stage_bridge(
+    lifecycle_run_dir: str | Path | None = None,
+    *,
+    event_ids: list[str] | tuple[str, ...] | None = None,
+    footprint_mode: str = 'per_stage',
+    mccoy_overrides: dict | None = None,
+    source_archive_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """比较严格事件在 start/peak/last 三阶段的 McCoy profile 形态。
+
+    默认对 lifecycle 输出中的全部严格事件分别使用各阶段逐日对象峰位置
+    运行同一套 McCoy profile gates；`fixed_peak` 敏感性把三个阶段统一到
+    peak 日位置，只改变日期。统计单位是事件，阶段结果是机制诊断，不是
+    新的 SCV 身份判据。
+
+    参数:
+        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用固定正式目录。
+        - event_ids (list[str] | tuple[str, ...] | None): 可选的显式事件子集；None 使用全部严格事件。
+        - footprint_mode (str): `per_stage` 或 `fixed_peak`，默认 `per_stage`。
+        - mccoy_overrides (dict | None): 临时覆盖 McCoy 配置。
+        - source_archive_path (str | Path | None): McCoy 源码归档；None 使用 paths 配置。
+        - output_dir (str | Path | None): 输出目录；None 使用固定正式目录。
+
+    返回:
+        - dict: 含阶段诊断表、汇总、manifest、图件路径和是否复用完成运行。
+
+    输出:
+        - `fragments/`、`stage_diagnostics.parquet`、`summary.json`、`source_inventory.parquet`、`mccoy_stage_bridge.png` 和 `manifest.json`。
+
+    说明:
+        - 不使用运行标签、代码/config/hash 拒绝门或锁文件；完整结果按请求结构复用，缺失或不完整 fragment 自动重算。
+        - DO 不参与 McCoy profile 的 rotation/strain 分类；峰值运行的一致性只作报告项。
+    """
+    lifecycle_root = (
+        Path(lifecycle_run_dir)
+        if lifecycle_run_dir is not None
+        else _ofes_analysis_output_dir('event_lifecycle')
+    )
+    daily_path = lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+    summary_path = lifecycle_root / 'lifecycle_event_summary.parquet'
+    if not daily_path.exists() or not summary_path.exists():
+        raise FileNotFoundError(
+            'OFES McCoy stage bridge requires lifecycle daily and event '
+            'summary outputs.'
+        )
+    if footprint_mode not in ('per_stage', 'fixed_peak'):
+        raise ValueError("footprint_mode must be 'per_stage' or 'fixed_peak'.")
+    settings = _ofes_mccoy_virtual_argo_settings(mccoy_overrides)
+    source_path = Path(
+        source_archive_path
+        if source_archive_path is not None
+        else _mccoy_scv_source_archive
+    )
+    daily = pd.read_parquet(daily_path).copy()
+    lifecycle_summary = pd.read_parquet(summary_path).copy()
+    required = {
+        'event_id', 'event_order', 'date', 'peak_lon', 'peak_lat',
+        'event_peak_equivalent_radius_km', 'peak_depth_at_max',
+        'reference_depth_m', 'is_event_peak_day',
+    }
+    missing = sorted(required - set(daily.columns))
+    if missing:
+        raise KeyError(
+            f'OFES lifecycle daily output lacks McCoy stage columns: {missing}'
+        )
+    daily['event_id'] = daily['event_id'].astype(str)
+    daily['date'] = pd.to_datetime(daily['date']).dt.normalize()
+    available_ids = set(daily['event_id'])
+    summary_ids = set(lifecycle_summary['event_id'].astype(str))
+    configured_ids = tuple(settings.get('event_ids', ()))
+    selected_ids = (
+        [str(value) for value in event_ids]
+        if event_ids is not None
+        else list(configured_ids) if configured_ids else sorted(available_ids)
+    )
+    if not selected_ids or len(set(selected_ids)) != len(selected_ids):
+        raise ValueError('McCoy stage event_ids must be non-empty and unique.')
+    missing_ids = sorted(set(selected_ids) - available_ids)
+    if missing_ids:
+        raise RuntimeError(
+            f'OFES McCoy stage events are absent from lifecycle output: '
+            f'{missing_ids[:5]}'
+        )
+    missing_summary_ids = sorted(set(selected_ids) - summary_ids)
+    if missing_summary_ids:
+        raise RuntimeError(
+            'OFES McCoy stage events are absent from lifecycle summary: '
+            f'{missing_summary_ids[:5]}'
+        )
+    request_rows = []
+    stage_order = {'start': 0, 'peak': 1, 'last': 2}
+    for event_id in selected_ids:
+        group = daily.loc[daily['event_id'] == event_id].sort_values(
+            'date', kind='mergesort'
+        )
+        peak_rows = group.loc[group['is_event_peak_day'].astype(bool)]
+        if len(peak_rows) != 1:
+            raise RuntimeError(
+                f'OFES McCoy stage event {event_id} needs one peak day; '
+                f'found {len(peak_rows)}.'
+            )
+        peak_row = peak_rows.iloc[0]
+        for stage, row in (
+            ('start', group.iloc[0]),
+            ('peak', peak_row),
+            ('last', group.iloc[-1]),
+        ):
+            request = row.to_dict()
+            request['stage'] = stage
+            request['event_id'] = event_id
+            if footprint_mode == 'fixed_peak':
+                request['peak_lon'] = float(peak_row['peak_lon'])
+                request['peak_lat'] = float(peak_row['peak_lat'])
+            request_rows.append(request)
+    requests = pd.DataFrame(request_rows).sort_values(
+        ['event_order', 'stage'],
+        key=lambda values: values.map(stage_order) if values.name == 'stage' else values,
+        kind='mergesort',
+    ).reset_index(drop=True)
+    run_dir = _ofes_analysis_output_dir(
+        str(settings.get(
+            'stage_bridge_output_subdir', 'mccoy_virtual_argo_stage_bridge'
+        )),
+        output_dir,
+    )
+    fragments_dir = run_dir / 'fragments'
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request_payload = {
+        'settings': _ofes_material_settings(settings),
+        'event_ids': selected_ids,
+        'footprint_mode': footprint_mode,
+        'stages': [
+            {
+                'event_id': str(row.event_id),
+                'stage': str(row.stage),
+                'date': pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                'core_lon': float(row.peak_lon),
+                'core_lat': float(row.peak_lat),
+                'footprint_radius_km': float(
+                    row.event_peak_equivalent_radius_km
+                ),
+                'peak_depth_m': float(row.peak_depth_at_max),
+                'reference_depth_m': float(row.reference_depth_m),
+            }
+            for row in requests.itertuples(index=False)
+        ],
+    }
+    previous = _ofes_existing_manifest(manifest_path, request_payload)
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'stage_diagnostics': pd.read_parquet(
+                outputs['stage_diagnostics']
+            ),
+            'summary': json.loads(
+                Path(outputs['summary']).read_text(encoding='utf-8')
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f'McCoy source archive not found: {source_path}'
+        )
+    source_inventory = _ofes_mccoy_stage_source_inventory(requests)
+    manifest = {
+        'analysis': 'mccoy_virtual_argo_stage_bridge',
+        'request': request_payload,
+        'settings': settings,
+        'mccoy_source_archive': str(source_path.resolve()),
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_requests': 0,
+        'total_requests': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(source_inventory, run_dir / 'source_inventory.parquet')
+    diagnostics = []
+    completed = 0
+    pending = []
+    try:
+        for row in requests.to_dict(orient='records'):
+            fragment_path = fragments_dir / (
+                f"{row['event_id']}_{row['stage']}_"
+                f"{pd.Timestamp(row['date']):%Y%m%d}.parquet"
+            )
+            if _ofes_mccoy_stage_fragment_reusable(fragment_path, row):
+                fragment = pd.read_parquet(fragment_path)
+                diagnostics.append(
+                    _ofes_mccoy_stage_fragment_stats(
+                        fragment, row, fragment_reused=True
+                    )
+                )
+                completed += 1
+                continue
+            pending.append(
+                {
+                    'request': row,
+                    'settings': settings,
+                    'fragment_path': fragment_path,
+                }
+            )
+        workers = min(int(settings['worker_count']), len(pending))
+        if workers == 1:
+            results = [
+                (task, _ofes_mccoy_event_worker(task)) for task in pending
+            ]
+        elif workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_ofes_mccoy_event_worker, task): task
+                    for task in pending
+                }
+                results = [
+                    (task, future.result())
+                    for future, task in (
+                        (future, futures[future])
+                        for future in futures_as_completed(futures)
+                    )
+                ]
+        else:
+            results = []
+        for task, (fragment, _audit) in results:
+            _atomic_write_parquet(fragment, task['fragment_path'])
+            diagnostics.append(
+                _ofes_mccoy_stage_fragment_stats(
+                    fragment, task['request'], fragment_reused=False
+                )
+            )
+            completed += 1
+            manifest['completed_requests'] = completed
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+        stage_diagnostics = pd.DataFrame(diagnostics).sort_values(
+            ['event_order', 'stage'],
+            key=lambda values: values.map(stage_order) if values.name == 'stage' else values,
+            kind='mergesort',
+        ).reset_index(drop=True)
+        peak_summary = None
+        peak_path = _ofes_analysis_output_path('mccoy_virtual_argo') / 'event_summary.parquet'
+        if peak_path.exists():
+            peak_summary = pd.read_parquet(peak_path)
+        summary = _ofes_mccoy_stage_summary(
+            stage_diagnostics, footprint_mode, peak_summary
+        )
+        output_paths = {
+            'stage_diagnostics': run_dir / 'stage_diagnostics.parquet',
+            'summary': run_dir / 'summary.json',
+            'figure': run_dir / 'mccoy_stage_bridge.png',
+            'source_inventory': run_dir / 'source_inventory.parquet',
+        }
+        _atomic_write_parquet(
+            stage_diagnostics, output_paths['stage_diagnostics']
+        )
+        _ofes_atomic_write_json(summary, output_paths['summary'])
+        _plot_ofes_mccoy_stage_bridge(
+            stage_diagnostics,
+            summary,
+            output_paths['figure'],
+            int(settings.get('figure_dpi', 180)),
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'completed_requests': int(len(requests)),
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'outputs': {
+                    key: str(path.resolve())
+                    for key, path in output_paths.items()
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_requests': completed,
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'stage_diagnostics': stage_diagnostics,
+        'summary': summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_vertical_velocity_validation_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 垂向速度数据集专项验证配置。"""
+    raw = dict(
+        _OFES_CFG.get('vertical_velocity_validation', {}) or {}
+    )
+    if overrides:
+        unknown = sorted(set(overrides) - (set(raw) | {'dates'}))
+        if unknown:
+            raise KeyError(
+                'Unknown OFES vertical_velocity_validation override '
+                f'keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'dates': tuple(
+            pd.Timestamp(value).normalize()
+            for value in raw.get('dates', ())
+        ),
+        'lon_bounds': tuple(
+            float(value)
+            for value in raw.get('lon_bounds', (142.0, 153.0))
+        ),
+        'lat_bounds': tuple(
+            float(value)
+            for value in raw.get('lat_bounds', (32.0, 39.0))
+        ),
+        'depth_bounds_m': tuple(
+            float(value)
+            for value in raw.get('depth_bounds_m', (250.0, 900.0))
+        ),
+        'minimum_finite_fraction': float(
+            raw.get('minimum_finite_fraction', 0.99)
+        ),
+        'correlation_min': float(raw.get('correlation_min', 0.99)),
+        'regression_slope_min': float(
+            raw.get('regression_slope_min', 0.95)
+        ),
+        'regression_slope_max': float(
+            raw.get('regression_slope_max', 1.05)
+        ),
+        'normalized_rmse_max': float(
+            raw.get('normalized_rmse_max', 0.12)
+        ),
+        'opposite_sign_normalized_rmse_min': float(
+            raw.get('opposite_sign_normalized_rmse_min', 1.50)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get(
+                'output_subdir', 'vertical_velocity_validation'
+            )
+        ),
+    }
+    if not settings['dates'] or len(set(settings['dates'])) != len(
+        settings['dates']
+    ):
+        raise ValueError(
+            'OFES vertical-velocity validation dates must be unique.'
+        )
+    for key in ('lon_bounds', 'lat_bounds', 'depth_bounds_m'):
+        values = settings[key]
+        if (
+            len(values) != 2
+            or not np.all(np.isfinite(values))
+            or values[0] >= values[1]
+        ):
+            raise ValueError(
+                f'OFES vertical-velocity {key} must be increasing.'
+            )
+    fractions = (
+        settings['minimum_finite_fraction'],
+        settings['correlation_min'],
+    )
+    if any(
+        not np.isfinite(value) or not 0 < value <= 1
+        for value in fractions
+    ):
+        raise ValueError(
+            'OFES vertical-velocity fraction/correlation gates must lie '
+            'in (0, 1].'
+        )
+    positive = (
+        settings['regression_slope_min'],
+        settings['regression_slope_max'],
+        settings['normalized_rmse_max'],
+        settings['opposite_sign_normalized_rmse_min'],
+        settings['figure_dpi'],
+    )
+    if any(not np.isfinite(value) or value <= 0 for value in positive):
+        raise ValueError(
+            'OFES vertical-velocity validation gates must be positive.'
+        )
+    if (
+        settings['regression_slope_min']
+        >= settings['regression_slope_max']
+    ):
+        raise ValueError(
+            'OFES vertical-velocity slope bounds must be increasing.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES vertical-velocity output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_vertical_velocity_source_inventory(
+    settings: dict,
+) -> pd.DataFrame:
+    """记录垂向速度专项验证的逐日 u/v/w 文件身份。"""
+    records = []
+    for date in settings['dates']:
+        for variable in ('u', 'v', 'w'):
+            path = _ofes_file_path(variable, date)
+            stat = path.stat()
+            records.append(
+                {
+                    'date': pd.Timestamp(date).normalize(),
+                    'variable': variable,
+                    'source_file': str(path.resolve()),
+                    'size_bytes': int(stat.st_size),
+                    'mtime_ns': int(stat.st_mtime_ns),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_vertical_velocity_fragment_reusable(
+    fragment_path: str | Path,
+    date: pd.Timestamp,
+) -> pd.DataFrame | None:
+    """读取并检查一个垂向速度验证日期 fragment。"""
+    path = Path(fragment_path)
+    if not path.exists():
+        return None
+    frame = pd.read_parquet(path)
+    required = {
+        'date',
+        'passed',
+        'finite_cell_count',
+        'finite_fraction',
+        'correlation',
+        'regression_slope_through_origin',
+        'normalized_rmse',
+        'opposite_sign_normalized_rmse',
+    }
+    if frame.empty or not required.issubset(frame.columns):
+        return None
+    dates = set(pd.to_datetime(frame['date']).dt.normalize().unique())
+    expected = pd.Timestamp(date).normalize()
+    if dates != {expected}:
+        raise RuntimeError(
+            'Existing output was created for a different request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    return frame
+
+
+def _ofes_vertical_velocity_continuity_day(
+    date: pd.Timestamp,
+    settings: dict,
+) -> dict:
+    """在原生 B-grid 面速度上审计单日水平散度与 w 层界差分。"""
+    date_ts = pd.Timestamp(date).normalize()
+    tracer_lon, tracer_lat, tracer_depth, _, _ = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    lon_slice = _ofes_contiguous_slice(
+        tracer_lon,
+        settings['lon_bounds'],
+        'longitude',
+        longitude=True,
+    )
+    lat_slice = _ofes_contiguous_slice(
+        tracer_lat, settings['lat_bounds'], 'latitude'
+    )
+    depth_slice = _ofes_contiguous_slice(
+        tracer_depth, settings['depth_bounds_m'], 'depth'
+    )
+    if depth_slice.start == 0:
+        raise ValueError(
+            'OFES continuity validation requires a w interface above the '
+            'shallowest audited tracer layer.'
+        )
+    corner_lon_slice = slice(lon_slice.start, lon_slice.stop + 1)
+    corner_lat_slice = slice(lat_slice.start, lat_slice.stop + 1)
+    scale = float(_OFES_CFG.get('variable_scale', {}).get('w', 0.01))
+    velocity_scale = float(
+        _OFES_CFG.get('variable_scale', {}).get('u', 0.01)
+    )
+    if not np.isclose(
+        velocity_scale,
+        float(_OFES_CFG.get('variable_scale', {}).get('v', 0.01)),
+    ):
+        raise ValueError('OFES u/v unit scales differ unexpectedly.')
+
+    with Dataset(str(_ofes_file_path('u', date_ts)), 'r') as dataset:
+        corner_lon = np.asarray(
+            dataset.variables['lon'][corner_lon_slice], dtype=float
+        )
+        corner_lat = np.asarray(
+            dataset.variables['lat'][corner_lat_slice], dtype=float
+        )
+        u = _ofes_subset_to_float32(
+            dataset.variables['u'],
+            (0, depth_slice, corner_lat_slice, corner_lon_slice),
+        ).astype(float) * velocity_scale
+    with Dataset(str(_ofes_file_path('v', date_ts)), 'r') as dataset:
+        v_corner_lon = np.asarray(
+            dataset.variables['lon'][corner_lon_slice], dtype=float
+        )
+        v_corner_lat = np.asarray(
+            dataset.variables['lat'][corner_lat_slice], dtype=float
+        )
+        _ofes_assert_coordinate_match(
+            v_corner_lon, corner_lon, 'u/v corner longitude'
+        )
+        _ofes_assert_coordinate_match(
+            v_corner_lat, corner_lat, 'u/v corner latitude'
+        )
+        v = _ofes_subset_to_float32(
+            dataset.variables['v'],
+            (0, depth_slice, corner_lat_slice, corner_lon_slice),
+        ).astype(float) * velocity_scale
+    with Dataset(str(_ofes_file_path('w', date_ts)), 'r') as dataset:
+        w_lon = np.asarray(
+            dataset.variables['lon'][lon_slice], dtype=float
+        )
+        w_lat = np.asarray(
+            dataset.variables['lat'][lat_slice], dtype=float
+        )
+        depth_w = np.asarray(dataset.variables['lev'][:], dtype=float) * float(
+            _OFES_CFG.get('depth_scale', 1.0)
+        )
+        w_lower = _ofes_subset_to_float32(
+            dataset.variables['w'],
+            (0, depth_slice, lat_slice, lon_slice),
+        ).astype(float) * scale
+        upper_slice = slice(depth_slice.start - 1, depth_slice.stop - 1)
+        w_upper = _ofes_subset_to_float32(
+            dataset.variables['w'],
+            (0, upper_slice, lat_slice, lon_slice),
+        ).astype(float) * scale
+
+    lon = tracer_lon[lon_slice]
+    lat = tracer_lat[lat_slice]
+    depth = tracer_depth[depth_slice]
+    lower_interface = depth_w[depth_slice]
+    upper_interface = depth_w[upper_slice]
+    coordinate_errors = {
+        'w_lon_max_abs_error_deg': _ofes_assert_coordinate_match(
+            w_lon, lon, 'w/tracer longitude'
+        ),
+        'w_lat_max_abs_error_deg': _ofes_assert_coordinate_match(
+            w_lat, lat, 'w/tracer latitude'
+        ),
+        'u_v_lon_midpoint_max_abs_error_deg': (
+            _ofes_assert_coordinate_match(
+                0.5 * (corner_lon[:-1] + corner_lon[1:]),
+                lon,
+                'B-grid longitude midpoint',
+            )
+        ),
+        'u_v_lat_midpoint_max_abs_error_deg': (
+            _ofes_assert_coordinate_match(
+                0.5 * (corner_lat[:-1] + corner_lat[1:]),
+                lat,
+                'B-grid latitude midpoint',
+            )
+        ),
+    }
+    if not np.all(
+        (upper_interface < depth) & (depth < lower_interface)
+    ):
+        raise RuntimeError(
+            'OFES tracer depths are not bracketed by adjacent w interfaces.'
+        )
+    layer_thickness = lower_interface - upper_interface
+    if np.any(layer_thickness <= 0):
+        raise RuntimeError('OFES w interface depths are not increasing.')
+
+    eastward_east = 0.5 * (u[:, :-1, 1:] + u[:, 1:, 1:])
+    eastward_west = 0.5 * (u[:, :-1, :-1] + u[:, 1:, :-1])
+    northward_north = 0.5 * (v[:, 1:, :-1] + v[:, 1:, 1:])
+    northward_south = 0.5 * (v[:, :-1, :-1] + v[:, :-1, 1:])
+    earth_radius_m = 6371000.0
+    lon_width_rad = np.diff(np.deg2rad(corner_lon))[None, None, :]
+    corner_lat_rad = np.deg2rad(corner_lat)
+    lat_width_rad = np.diff(corner_lat_rad)[None, :, None]
+    center_cosine = np.cos(np.deg2rad(lat))[None, :, None]
+    horizontal_divergence = (
+        (eastward_east - eastward_west)
+        / (earth_radius_m * center_cosine * lon_width_rad)
+        + (
+            northward_north
+            * np.cos(corner_lat_rad[1:])[None, :, None]
+            - northward_south
+            * np.cos(corner_lat_rad[:-1])[None, :, None]
+        )
+        / (earth_radius_m * center_cosine * lat_width_rad)
+    )
+    vertical_shear = (w_lower - w_upper) / layer_thickness[:, None, None]
+    finite = np.isfinite(horizontal_divergence) & np.isfinite(vertical_shear)
+    horizontal = horizontal_divergence[finite]
+    vertical = vertical_shear[finite]
+    if horizontal.size < 2:
+        raise RuntimeError(
+            f'OFES continuity validation has too few finite cells on '
+            f'{date_ts:%Y-%m-%d}.'
+        )
+    horizontal_rms = float(np.sqrt(np.mean(horizontal ** 2)))
+    if not np.isfinite(horizontal_rms) or horizontal_rms <= 0:
+        raise RuntimeError('OFES horizontal-divergence RMS is not positive.')
+    correlation = float(np.corrcoef(horizontal, vertical)[0, 1])
+    regression_slope = float(
+        np.dot(horizontal, vertical) / np.dot(horizontal, horizontal)
+    )
+    normalized_rmse = float(
+        np.sqrt(np.mean((horizontal - vertical) ** 2)) / horizontal_rms
+    )
+    opposite_sign_normalized_rmse = float(
+        np.sqrt(np.mean((horizontal + vertical) ** 2)) / horizontal_rms
+    )
+    finite_fraction = float(horizontal.size / horizontal_divergence.size)
+    passed = bool(
+        finite_fraction >= settings['minimum_finite_fraction']
+        and correlation >= settings['correlation_min']
+        and settings['regression_slope_min']
+        <= regression_slope
+        <= settings['regression_slope_max']
+        and normalized_rmse <= settings['normalized_rmse_max']
+        and opposite_sign_normalized_rmse
+        >= settings['opposite_sign_normalized_rmse_min']
+    )
+    return {
+        'date': date_ts,
+        'finite_cell_count': int(horizontal.size),
+        'total_cell_count': int(horizontal_divergence.size),
+        'finite_fraction': finite_fraction,
+        'correlation': correlation,
+        'regression_slope_through_origin': regression_slope,
+        'normalized_rmse': normalized_rmse,
+        'opposite_sign_normalized_rmse': (
+            opposite_sign_normalized_rmse
+        ),
+        'horizontal_divergence_rms_s_1': horizontal_rms,
+        'maximum_abs_horizontal_divergence_s_1': float(
+            np.max(np.abs(horizontal))
+        ),
+        'maximum_abs_vertical_difference_s_1': float(
+            np.max(np.abs(vertical))
+        ),
+        'audited_depth_level_count': int(depth.size),
+        'minimum_audited_depth_m': float(depth.min()),
+        'maximum_audited_depth_m': float(depth.max()),
+        'minimum_layer_thickness_m': float(layer_thickness.min()),
+        'maximum_layer_thickness_m': float(layer_thickness.max()),
+        **coordinate_errors,
+        'continuity_equation': (
+            'div_h(u,v) = d(w_up)/d(depth_down)'
+        ),
+        'native_velocity_units': 'cm s-1',
+        'validated_velocity_units': 'm s-1',
+        'validated_w_positive_direction': 'up',
+        'particle_depth_tendency': 'd(depth_down)/dt = -w_up',
+        'passed': passed,
+    }
+
+
+def _plot_ofes_vertical_velocity_validation(
+    daily: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制逐日连续方程与反号对照验证指标。"""
+    labels = pd.to_datetime(daily['date']).dt.strftime('%m-%d')
+    x = np.arange(len(daily))
+    figure, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
+    panels = (
+        (
+            'correlation',
+            settings['correlation_min'],
+            'Correlation',
+            'minimum',
+        ),
+        (
+            'regression_slope_through_origin',
+            1.0,
+            'Through-origin slope',
+            'reference',
+        ),
+        (
+            'normalized_rmse',
+            settings['normalized_rmse_max'],
+            'Normalized RMSE',
+            'maximum',
+        ),
+        (
+            'opposite_sign_normalized_rmse',
+            settings['opposite_sign_normalized_rmse_min'],
+            'Opposite-sign normalized RMSE',
+            'minimum',
+        ),
+    )
+    for axis, (column, threshold, title, label) in zip(
+        axes.flat, panels
+    ):
+        axis.plot(x, daily[column], marker='o', color='#2563eb')
+        axis.axhline(
+            threshold,
+            color='#dc2626',
+            linestyle='--',
+            linewidth=1.2,
+            label=f'{label}: {threshold:g}',
+        )
+        if column == 'regression_slope_through_origin':
+            axis.axhspan(
+                settings['regression_slope_min'],
+                settings['regression_slope_max'],
+                color='#16a34a',
+                alpha=0.08,
+                label=(
+                    'accepted: '
+                    f"{settings['regression_slope_min']:g}–"
+                    f"{settings['regression_slope_max']:g}"
+                ),
+            )
+        axis.set_xticks(x, labels, rotation=30)
+        axis.set_title(title)
+        axis.grid(alpha=0.2)
+        axis.legend(frameon=False, fontsize=9)
+    figure.suptitle(
+        'OFES vertical velocity: B-grid continuity validation',
+        fontsize=15,
+    )
+    figure.tight_layout()
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        settings['figure_dpi'],
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def validate_ofes_vertical_velocity(
+    *,
+    validation_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """验证 OFES `w` 的单位、正方向、层界位置与 B-grid 连续方程。
+
+    workflow 直接在原生 MOM3 B-grid 上将 u/v 平均到网格单元东西/
+    南北边界，以球面通量形式求水平散度，再与相邻下层界 `w`
+    差分比较。在向下为正的深度坐标中，向上为正的 `w` 应满足
+    `div_h(u,v) = d(w_up)/d(depth_down)`；反号误差是预注册负对照。
+
+    参数:
+        - validation_overrides (dict | None): 临时覆盖 `ofes.vertical_velocity_validation` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 时写入 OFES 共享输出树。
+    返回:
+        - dict: 含 run_dir、manifest、daily_metrics、analysis_summary、figure_path 和 reused_complete_run。
+
+    输出:
+        - `<run_dir>/dates/*.parquet`、`daily_metrics.parquet`、`analysis_summary.json`、`source_inventory.parquet`、`vertical_velocity_validation.png` 和 `manifest.json`。
+
+    说明:
+        - 完成的验证结果写入固定目录，三维轨迹入口直接读取该目录。
+        - 本审计同时检查 tracer center 是否位于相邻 `w` 层界之间，不把层界速度静默冒充为层中心速度。
+    """
+    settings = _ofes_vertical_velocity_validation_settings(
+        validation_overrides
+    )
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'daily_metrics': pd.read_parquet(outputs['daily_metrics']),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_inventory = _ofes_vertical_velocity_source_inventory(settings)
+    manifest = {
+        'analysis': 'vertical_velocity_validation',
+        'request': request,
+        'settings': settings,
+        'status': 'running',
+        'validation_passed': False,
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_dates': 0,
+        'total_dates': int(len(settings['dates'])),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    inventory_path = run_dir / 'source_inventory.parquet'
+    _atomic_write_parquet(source_inventory, inventory_path)
+    fragments_dir = run_dir / 'dates'
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    completed = 0
+    try:
+        daily_records = []
+        for date in settings['dates']:
+            fragment_path = fragments_dir / (
+                f'{pd.Timestamp(date):%Y%m%d}.parquet'
+            )
+            fragment = _ofes_vertical_velocity_fragment_reusable(
+                fragment_path, pd.Timestamp(date)
+            )
+            if fragment is None:
+                fragment = pd.DataFrame([
+                    _ofes_vertical_velocity_continuity_day(
+                        pd.Timestamp(date), settings
+                    )
+                ])
+                _atomic_write_parquet(fragment, fragment_path)
+            daily_records.append(fragment.iloc[0].to_dict())
+            completed += 1
+            manifest['completed_dates'] = completed
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+        daily = pd.DataFrame(daily_records).sort_values(
+            'date', kind='mergesort'
+        ).reset_index(drop=True)
+        validation_passed = bool(daily['passed'].all())
+        analysis_summary = {
+            'validation_passed': validation_passed,
+            'validated_date_count': completed,
+            'total_finite_cell_count': int(
+                daily['finite_cell_count'].sum()
+            ),
+            'minimum_finite_fraction': float(
+                daily['finite_fraction'].min()
+            ),
+            'minimum_correlation': float(daily['correlation'].min()),
+            'regression_slope_range': [
+                float(
+                    daily['regression_slope_through_origin'].min()
+                ),
+                float(
+                    daily['regression_slope_through_origin'].max()
+                ),
+            ],
+            'maximum_normalized_rmse': float(
+                daily['normalized_rmse'].max()
+            ),
+            'minimum_opposite_sign_normalized_rmse': float(
+                daily['opposite_sign_normalized_rmse'].min()
+            ),
+            'validated_native_units': 'cm s-1',
+            'validated_output_units': 'm s-1',
+            'validated_w_positive_direction': 'up',
+            'particle_depth_coordinate_positive': 'down',
+            'particle_vertical_tendency': 'd(depth)/dt = -w',
+            'w_vertical_location': 'lower_interface',
+            'continuity_equation': (
+                'div_h(u,v) = d(w_up)/d(depth_down)'
+            ),
+            'opposite_sign_control': (
+                'div_h(u,v) = -d(w_up)/d(depth_down)'
+            ),
+        }
+        if not validation_passed:
+            raise RuntimeError(
+                'OFES vertical velocity failed one or more pre-registered '
+                'continuity gates.'
+            )
+        daily_path = run_dir / 'daily_metrics.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'vertical_velocity_validation.png'
+        _atomic_write_parquet(daily, daily_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_vertical_velocity_validation(
+            daily, figure_path, settings
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'validation_passed': True,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_dates': completed,
+                'outputs': {
+                    'daily_metrics': str(daily_path.resolve()),
+                    'analysis_summary': str(analysis_path.resolve()),
+                    'figure': str(figure_path.resolve()),
+                    'source_inventory': str(inventory_path.resolve()),
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'validation_passed': False,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_dates': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_metrics': daily,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_trajectory_2d_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 二维固定深度 ensemble trajectory 配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_2d', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - (set(raw) | {'event_ids'}))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_2d override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'event_ids': tuple(
+            str(value) for value in raw.get('event_ids', ())
+        ),
+        'temporal_interpolation': str(
+            raw.get('temporal_interpolation', 'linear')
+        ),
+        'rk4_dt_seconds': float(raw.get('rk4_dt_seconds', 3600)),
+        'sensitivity_dt_seconds': tuple(
+            float(value)
+            for value in raw.get(
+                'sensitivity_dt_seconds', (1800, 3600, 7200)
+            )
+        ),
+        'reversibility_days': tuple(
+            int(value)
+            for value in raw.get('reversibility_days', (1, 3, 5))
+        ),
+        'reversibility_median_error_max_km': float(
+            raw.get('reversibility_median_error_max_km', 5.0)
+        ),
+        'reversibility_q90_error_max_km': float(
+            raw.get('reversibility_q90_error_max_km', 10.0)
+        ),
+        'timestep_endpoint_median_spread_max_km': float(
+            raw.get('timestep_endpoint_median_spread_max_km', 10.0)
+        ),
+        'analytic_translation_error_max_km': float(
+            raw.get('analytic_translation_error_max_km', 0.01)
+        ),
+        'analytic_rotation_error_max_km': float(
+            raw.get('analytic_rotation_error_max_km', 0.01)
+        ),
+        'domain_margin_km': float(raw.get('domain_margin_km', 350.0)),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'ensemble_ring_fractions': tuple(
+            float(value)
+            for value in raw.get(
+                'ensemble_ring_fractions', (0.0, 0.35, 0.70)
+            )
+        ),
+        'ensemble_azimuth_count': int(
+            raw.get('ensemble_azimuth_count', 8)
+        ),
+        'adjacent_depth_levels': int(
+            raw.get('adjacent_depth_levels', 1)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_2d')
+        ),
+    }
+    if len(settings['event_ids']) != 3 or len(set(settings['event_ids'])) != 3:
+        raise ValueError(
+            'OFES trajectory_2d requires three distinct representative events.'
+        )
+    if settings['temporal_interpolation'] != 'linear':
+        raise ValueError(
+            'OFES trajectory_2d temporal_interpolation must be linear.'
+        )
+    positive_keys = (
+        'rk4_dt_seconds',
+        'reversibility_median_error_max_km',
+        'reversibility_q90_error_max_km',
+        'timestep_endpoint_median_spread_max_km',
+        'analytic_translation_error_max_km',
+        'analytic_rotation_error_max_km',
+        'domain_margin_km',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES trajectory_2d positive thresholds must be finite.'
+        )
+    if (
+        not settings['sensitivity_dt_seconds']
+        or any(
+            not np.isfinite(value) or value <= 0
+            for value in settings['sensitivity_dt_seconds']
+        )
+        or settings['rk4_dt_seconds']
+        not in settings['sensitivity_dt_seconds']
+    ):
+        raise ValueError(
+            'OFES trajectory timestep sensitivity must include the base dt.'
+        )
+    if (
+        not settings['reversibility_days']
+        or any(value <= 0 for value in settings['reversibility_days'])
+    ):
+        raise ValueError(
+            'OFES trajectory reversibility_days must be positive.'
+        )
+    fractions = settings['ensemble_ring_fractions']
+    if (
+        not fractions
+        or fractions[0] != 0
+        or any(not np.isfinite(value) or value < 0 for value in fractions)
+        or len(set(fractions)) != len(fractions)
+    ):
+        raise ValueError(
+            'OFES trajectory ring fractions must be unique and start at zero.'
+        )
+    if (
+        settings['ensemble_azimuth_count'] < 4
+        or settings['adjacent_depth_levels'] < 0
+    ):
+        raise ValueError(
+            'OFES trajectory ensemble geometry is invalid.'
+        )
+    active_fraction = settings['minimum_active_fraction']
+    if not np.isfinite(active_fraction) or not 0 < active_fraction <= 1:
+        raise ValueError(
+            'OFES trajectory minimum_active_fraction must lie in (0, 1].'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_seed_ensemble(
+    peak_date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth_m: float,
+    equivalent_radius_km: float,
+    settings: dict,
+) -> tuple[np.ndarray, pd.DataFrame, tuple[float, ...]]:
+    """在峰值核心、两个半径环和相邻深度层构建确定性 ensemble。"""
+    delivered_depth = np.asarray(
+        _ofes_tracer_coordinates(pd.Timestamp(peak_date))[2],
+        dtype=float,
+    )
+    center_index = int(
+        np.argmin(np.abs(delivered_depth - float(reference_depth_m)))
+    )
+    adjacent = int(settings['adjacent_depth_levels'])
+    indices = np.arange(
+        max(0, center_index - adjacent),
+        min(delivered_depth.size, center_index + adjacent + 1),
+    )
+    selected_depth = tuple(float(delivered_depth[index]) for index in indices)
+    scale = approximate_degree_length(float(core_lat))
+    records = []
+    positions = []
+    particle_index = 0
+    for depth_index, depth_m in enumerate(selected_depth):
+        for ring_index, ring_fraction in enumerate(
+            settings['ensemble_ring_fractions']
+        ):
+            azimuths = (
+                (0.0,)
+                if ring_fraction == 0
+                else tuple(
+                    np.linspace(
+                        0,
+                        360,
+                        int(settings['ensemble_azimuth_count']),
+                        endpoint=False,
+                    )
+                )
+            )
+            radius_km = float(equivalent_radius_km) * ring_fraction
+            for azimuth_deg in azimuths:
+                angle = np.deg2rad(float(azimuth_deg))
+                east_m = radius_km * 1000.0 * np.cos(angle)
+                north_m = radius_km * 1000.0 * np.sin(angle)
+                lon = float(core_lon) + east_m / float(
+                    scale['meters_per_degree_lon']
+                )
+                lat = float(core_lat) + north_m / float(
+                    scale['meters_per_degree_lat']
+                )
+                positions.append((depth_m, lat, lon))
+                records.append(
+                    {
+                        'particle_index': particle_index,
+                        'particle_id': (
+                            f'z{depth_index:+d}_r{ring_index}_'
+                            f'a{int(round(azimuth_deg)):03d}'
+                        ),
+                        'depth_m': depth_m,
+                        'depth_offset_index': int(
+                            indices[depth_index] - center_index
+                        ),
+                        'ring_index': ring_index,
+                        'ring_fraction': ring_fraction,
+                        'radius_km': radius_km,
+                        'azimuth_deg': float(azimuth_deg),
+                        'seed_lon': lon,
+                        'seed_lat': lat,
+                    }
+                )
+                particle_index += 1
+    return (
+        np.asarray(positions, dtype=float),
+        pd.DataFrame(records),
+        selected_depth,
+    )
+
+
+def _ofes_trajectory_synthetic_snapshot(
+    date: str,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    depth: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+) -> dict:
+    """构建仅供确定性解析场验证使用的 OFES-like 快照。"""
+    return {
+        'date': pd.Timestamp(date),
+        'lon': np.asarray(lon, dtype=float),
+        'lat': np.asarray(lat, dtype=float),
+        'depth': np.asarray(depth, dtype=float),
+        'u': np.asarray(u, dtype=float),
+        'v': np.asarray(v, dtype=float),
+        'metadata': {'depth_units': 'm'},
+    }
+
+
+def _validate_ofes_fixed_depth_trajectory_integrator(
+    settings: dict,
+) -> dict:
+    """用线性加速平移和固体旋转解析场验证 RK4 内核。"""
+    lon = np.linspace(140.0, 144.0, 81)
+    lat = np.linspace(30.0, 34.0, 81)
+    depth = np.array([490.0, 500.0, 510.0])
+    shape = (depth.size, lat.size, lon.size)
+    translation = [
+        _ofes_trajectory_synthetic_snapshot(
+            '2003-01-01',
+            lon,
+            lat,
+            depth,
+            np.zeros(shape),
+            np.zeros(shape),
+        ),
+        _ofes_trajectory_synthetic_snapshot(
+            '2003-01-02',
+            lon,
+            lat,
+            depth,
+            np.full(shape, 0.2),
+            np.full(shape, 0.1),
+        ),
+    ]
+    seed = np.array([[500.0, 32.0, 142.0]])
+    translated = advect_ofes_particles(
+        translation,
+        seed,
+        dt_seconds=settings['rk4_dt_seconds'],
+        temporal_interpolation='linear',
+    )
+    translated_endpoint = translated['positions'][-1, 0]
+    translated_distance_km = float(
+        adaptive_distance_m(
+            seed[0, 2],
+            seed[0, 1],
+            translated_endpoint[2],
+            translated_endpoint[1],
+        )
+    ) / 1000.0
+    expected_translation_km = (
+        np.hypot(0.1, 0.05) * 86400.0 / 1000.0
+    )
+    translation_error_km = abs(
+        translated_distance_km - expected_translation_km
+    )
+    reversed_translation = advect_ofes_particles(
+        translation,
+        translated_endpoint[None, :],
+        backward=True,
+        dt_seconds=settings['rk4_dt_seconds'],
+        temporal_interpolation='linear',
+    )
+    translation_roundtrip_error_km = float(
+        adaptive_distance_m(
+            seed[0, 2],
+            seed[0, 1],
+            reversed_translation['positions'][-1, 0, 2],
+            reversed_translation['positions'][-1, 0, 1],
+        )
+    ) / 1000.0
+
+    center_lon = 142.0
+    center_lat = 32.0
+    scale = approximate_degree_length(center_lat)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    x_m = (lon_grid - center_lon) * float(
+        scale['meters_per_degree_lon']
+    )
+    y_m = (lat_grid - center_lat) * float(
+        scale['meters_per_degree_lat']
+    )
+    rotation_angle = 0.2
+    angular_velocity = rotation_angle / 86400.0
+    u_2d = -angular_velocity * y_m
+    v_2d = angular_velocity * x_m
+    rotation_u = np.broadcast_to(u_2d, shape).copy()
+    rotation_v = np.broadcast_to(v_2d, shape).copy()
+    rotation = [
+        _ofes_trajectory_synthetic_snapshot(
+            date,
+            lon,
+            lat,
+            depth,
+            rotation_u,
+            rotation_v,
+        )
+        for date in ('2003-01-01', '2003-01-02')
+    ]
+    radius_m = 20000.0
+    rotation_seed = np.array(
+        [
+            [
+                500.0,
+                center_lat,
+                center_lon
+                + radius_m / float(scale['meters_per_degree_lon']),
+            ]
+        ]
+    )
+    rotated = advect_ofes_particles(
+        rotation,
+        rotation_seed,
+        dt_seconds=settings['rk4_dt_seconds'],
+        temporal_interpolation='linear',
+    )
+    expected_rotation_lon = center_lon + (
+        radius_m
+        * np.cos(rotation_angle)
+        / float(scale['meters_per_degree_lon'])
+    )
+    expected_rotation_lat = center_lat + (
+        radius_m
+        * np.sin(rotation_angle)
+        / float(scale['meters_per_degree_lat'])
+    )
+    rotation_error_km = float(
+        adaptive_distance_m(
+            rotated['positions'][-1, 0, 2],
+            rotated['positions'][-1, 0, 1],
+            expected_rotation_lon,
+            expected_rotation_lat,
+        )
+    ) / 1000.0
+    depth_drift_m = float(
+        max(
+            np.nanmax(np.abs(translated['positions'][..., 0] - 500.0)),
+            np.nanmax(np.abs(rotated['positions'][..., 0] - 500.0)),
+        )
+    )
+    passed = bool(
+        translation_error_km
+        <= settings['analytic_translation_error_max_km']
+        and translation_roundtrip_error_km
+        <= settings['analytic_translation_error_max_km']
+        and rotation_error_km
+        <= settings['analytic_rotation_error_max_km']
+        and depth_drift_m <= 1e-10
+        and translated['final_status'][0] == 'active'
+        and rotated['final_status'][0] == 'active'
+    )
+    payload = {
+        'passed': passed,
+        'temporal_interpolation': 'linear',
+        'translation_expected_distance_km': expected_translation_km,
+        'translation_actual_distance_km': translated_distance_km,
+        'translation_error_km': translation_error_km,
+        'translation_roundtrip_error_km': (
+            translation_roundtrip_error_km
+        ),
+        'solid_body_rotation_angle_rad': rotation_angle,
+        'solid_body_rotation_error_km': rotation_error_km,
+        'maximum_fixed_depth_drift_m': depth_drift_m,
+        'thresholds': {
+            'translation_error_max_km': settings[
+                'analytic_translation_error_max_km'
+            ],
+            'rotation_error_max_km': settings[
+                'analytic_rotation_error_max_km'
+            ],
+        },
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES fixed-depth analytic trajectory validation failed: {payload}'
+        )
+    return payload
+
+
+def _ofes_trajectory_result_frame(
+    result: dict,
+    particle_metadata: pd.DataFrame,
+    event_id: str,
+    integration_label: str,
+    dt_seconds: float,
+) -> pd.DataFrame:
+    """把 trajectory tensor 展开为带粒子元数据的长表。"""
+    times = pd.to_datetime(result['times'])
+    position = np.asarray(result['positions'], dtype=float)
+    status = np.asarray(result['status']).astype(str)
+    time_count, particle_count, _ = position.shape
+    if particle_count != len(particle_metadata):
+        raise RuntimeError(
+            'OFES trajectory particle metadata length mismatch.'
+        )
+    frame = pd.DataFrame(
+        {
+            'event_id': str(event_id),
+            'integration_label': str(integration_label),
+            'dt_seconds': float(dt_seconds),
+            'time': np.repeat(times.to_numpy(), particle_count),
+            'time_index': np.repeat(
+                np.arange(time_count, dtype=np.int32), particle_count
+            ),
+            'particle_index': np.tile(
+                np.arange(particle_count, dtype=np.int16), time_count
+            ),
+            'depth_m': position[..., 0].reshape(-1),
+            'lat': position[..., 1].reshape(-1),
+            'lon': position[..., 2].reshape(-1),
+            'status': status.reshape(-1),
+        }
+    )
+    return frame.merge(
+        particle_metadata,
+        on='particle_index',
+        how='left',
+        validate='many_to_one',
+        suffixes=('', '_seed'),
+    )
+
+
+def _ofes_trajectory_event_requests(
+    onset_run_dir: str | Path,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """读取调用方显式选择的事件及 start-to-peak observed-object 路径。"""
+    onset_root = Path(onset_run_dir)
+    selected_path = onset_root / 'selected_regimes.parquet'
+    if not selected_path.exists():
+        raise FileNotFoundError(
+            f'OFES trajectory onset selection is missing: {selected_path}'
+        )
+    selected = pd.read_parquet(selected_path)
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    daily_objects['date'] = pd.to_datetime(
+        daily_objects['date']
+    ).dt.normalize()
+    records = []
+    tracks = []
+    for event_order, event_id in enumerate(settings['event_ids'], start=1):
+        event_rows = selected.loc[
+            selected['event_id'].astype(str) == str(event_id)
+        ]
+        if len(event_rows) != 1:
+            raise RuntimeError(
+                f'OFES trajectory expected one onset selection for '
+                f'{event_id}, found {len(event_rows)}.'
+            )
+        event = event_rows.iloc[0]
+        start_date = pd.Timestamp(event['start_date']).normalize()
+        peak_date = pd.Timestamp(event['peak_date']).normalize()
+        event_track = daily_objects.loc[
+            (daily_objects['threshold'] == 50.0)
+            & (daily_objects['event_id'].astype(str) == str(event_id))
+            & (daily_objects['date'] >= start_date)
+            & (daily_objects['date'] <= peak_date)
+        ].sort_values('date', kind='mergesort').copy()
+        if event_track.empty:
+            raise RuntimeError(
+                f'OFES trajectory observed track is empty for {event_id}.'
+            )
+        start_rows = event_track.loc[event_track['date'] == start_date]
+        peak_rows = event_track.loc[
+            event_track['daily_object_key'].astype(str)
+            == str(event['peak_daily_object_key'])
+        ]
+        if len(start_rows) != 1 or len(peak_rows) != 1:
+            raise RuntimeError(
+                f'OFES trajectory start/peak object is ambiguous for {event_id}.'
+            )
+        start = start_rows.iloc[0]
+        peak = peak_rows.iloc[0]
+        records.append(
+            {
+                'event_order': event_order,
+                'event_id': str(event_id),
+                'regime_label': str(event['regime_label']),
+                'selection_criterion': str(event['selection_criterion']),
+                'start_date': start_date,
+                'peak_date': peak_date,
+                'integration_days': int((peak_date - start_date).days),
+                'observed_object_days': int(len(event_track)),
+                'start_core_lon': float(start['peak_lon']),
+                'start_core_lat': float(start['peak_lat']),
+                'peak_core_lon': float(peak['peak_lon']),
+                'peak_core_lat': float(peak['peak_lat']),
+                'reference_depth_m': float(event['reference_depth_m']),
+                'start_reference_depth_m': float(
+                    start['peak_depth_at_max']
+                ),
+                'peak_reference_depth_m': float(
+                    peak['peak_depth_at_max']
+                ),
+                'start_equivalent_radius_km': float(
+                    start['equivalent_radius_km']
+                ),
+                'peak_equivalent_radius_km': float(
+                    event['daily_peak_equivalent_radius_km']
+                ),
+                'observed_lon_min': float(event_track['peak_lon'].min()),
+                'observed_lon_max': float(event_track['peak_lon'].max()),
+                'observed_lat_min': float(event_track['peak_lat'].min()),
+                'observed_lat_max': float(event_track['peak_lat'].max()),
+            }
+        )
+        event_track.insert(0, 'trajectory_event_order', event_order)
+        tracks.append(event_track)
+    requests = pd.DataFrame(records)
+    if requests['integration_days'].le(0).any():
+        raise RuntimeError(
+            'OFES trajectory events must span at least one start-to-peak day.'
+        )
+    return requests, pd.concat(tracks, ignore_index=True)
+
+
+def _ofes_trajectory_source_inventory(
+    requests: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录 start-to-peak 逐日 u/v 输入文件身份。"""
+    records = []
+    for request in requests.itertuples(index=False):
+        for date in pd.date_range(request.start_date, request.peak_date):
+            for variable in ('u', 'v'):
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                records.append(
+                    {
+                        'event_id': str(request.event_id),
+                        'date': pd.Timestamp(date).normalize(),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    return pd.DataFrame(records)
+
+
+def _ofes_load_trajectory_snapshots(
+    request: dict,
+    selected_depths: tuple[float, ...],
+    settings: dict,
+) -> list[dict]:
+    """加载覆盖 observed track 和固定外扩边界的逐日三层速度场。"""
+    center_lat = 0.5 * (
+        float(request['observed_lat_min'])
+        + float(request['observed_lat_max'])
+    )
+    scale = approximate_degree_length(center_lat)
+    margin_m = float(settings['domain_margin_km']) * 1000.0
+    lon_margin = margin_m / float(scale['meters_per_degree_lon'])
+    lat_margin = margin_m / float(scale['meters_per_degree_lat'])
+    lon_bounds = (
+        float(request['observed_lon_min']) - lon_margin,
+        float(request['observed_lon_max']) + lon_margin,
+    )
+    lat_bounds = (
+        float(request['observed_lat_min']) - lat_margin,
+        float(request['observed_lat_max']) + lat_margin,
+    )
+    snapshots = []
+    for date in pd.date_range(request['start_date'], request['peak_date']):
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['u', 'v'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=(min(selected_depths), max(selected_depths)),
+        )
+        loaded_depth = tuple(
+            float(value) for value in np.asarray(snapshot['depth'])
+        )
+        if loaded_depth != tuple(selected_depths):
+            raise RuntimeError(
+                'OFES trajectory loaded depth levels differ from seeds: '
+                f'{loaded_depth} != {selected_depths}.'
+            )
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _ofes_trajectory_horizontal_distance_km(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> np.ndarray:
+    """返回两组 [depth, lat, lon] 位置的逐粒子水平距离。"""
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    finite = (
+        np.all(np.isfinite(first), axis=1)
+        & np.all(np.isfinite(second), axis=1)
+    )
+    distance = np.full(first.shape[0], np.nan, dtype=float)
+    distance[finite] = np.asarray(
+        adaptive_distance_m(
+            first[finite, 2],
+            first[finite, 1],
+            second[finite, 2],
+            second[finite, 1],
+        ),
+        dtype=float,
+    ) / 1000.0
+    return distance
+
+
+def _ofes_trajectory_timestep_spread(
+    endpoints: dict[float, np.ndarray],
+) -> dict:
+    """汇总多步长 backward endpoint 的逐粒子最大两两间距。"""
+    dt_values = sorted(endpoints)
+    pair_distances = []
+    for first_index, first_dt in enumerate(dt_values[:-1]):
+        for second_dt in dt_values[first_index + 1:]:
+            pair_distances.append(
+                _ofes_trajectory_horizontal_distance_km(
+                    endpoints[first_dt], endpoints[second_dt]
+                )
+            )
+    if not pair_distances:
+        raise RuntimeError(
+            'OFES trajectory timestep sensitivity needs at least two dt values.'
+        )
+    pair_matrix = np.column_stack(pair_distances)
+    fully_finite = np.all(np.isfinite(pair_matrix), axis=1)
+    maximum = np.full(pair_matrix.shape[0], np.nan, dtype=float)
+    maximum[fully_finite] = np.max(pair_matrix[fully_finite], axis=1)
+    finite = maximum[np.isfinite(maximum)]
+    return {
+        'common_active_particle_count': int(finite.size),
+        'particle_count': int(maximum.size),
+        'median_endpoint_spread_km': (
+            float(np.median(finite)) if finite.size else np.nan
+        ),
+        'q90_endpoint_spread_km': (
+            float(np.quantile(finite, 0.9)) if finite.size else np.nan
+        ),
+        'maximum_endpoint_spread_km': (
+            float(np.max(finite)) if finite.size else np.nan
+        ),
+    }
+
+
+def _ofes_trajectory_endpoint_sensitivity(
+    particle_metadata: pd.DataFrame,
+    endpoint_distance_km: np.ndarray,
+    final_status: np.ndarray,
+    event_id: str,
+    integration_label: str,
+) -> pd.DataFrame:
+    """按深度层与 release ring 汇总到 observed target 的端点距离。"""
+    frame = particle_metadata.copy()
+    frame['endpoint_distance_km'] = np.asarray(
+        endpoint_distance_km, dtype=float
+    )
+    frame['active'] = (
+        np.asarray(final_status).astype(str) == 'active'
+    ) & np.isfinite(frame['endpoint_distance_km'].to_numpy(dtype=float))
+    records = []
+    axes = (
+        ('depth_offset_index', 'depth_level'),
+        ('ring_fraction', 'release_ring'),
+    )
+    for column, axis_label in axes:
+        for value, group in frame.groupby(column, sort=True):
+            finite = group.loc[
+                group['active'], 'endpoint_distance_km'
+            ].to_numpy(dtype=float)
+            records.append(
+                {
+                    'event_id': str(event_id),
+                    'integration_label': str(integration_label),
+                    'sensitivity_axis': axis_label,
+                    'axis_value': float(value),
+                    'particle_count': int(len(group)),
+                    'active_particle_count': int(finite.size),
+                    'active_fraction': float(finite.size / len(group)),
+                    'median_endpoint_distance_km': (
+                        float(np.median(finite))
+                        if finite.size else np.nan
+                    ),
+                    'q90_endpoint_distance_km': (
+                        float(np.quantile(finite, 0.9))
+                        if finite.size else np.nan
+                    ),
+                    'minimum_endpoint_distance_km': (
+                        float(np.min(finite)) if finite.size else np.nan
+                    ),
+                    'maximum_endpoint_distance_km': (
+                        float(np.max(finite)) if finite.size else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_trajectory_observed_alignment(
+    result: dict,
+    observed_track: pd.DataFrame,
+    event_id: str,
+    integration_label: str,
+) -> pd.DataFrame:
+    """比较指定 ensemble 质心与同日 ΔDO object 峰值核心。"""
+    times = pd.to_datetime(result['times'])
+    records = []
+    for row in observed_track.itertuples(index=False):
+        indices = np.flatnonzero(times == pd.Timestamp(row.date))
+        if indices.size != 1:
+            continue
+        index = int(indices[0])
+        active = result['status'][index].astype(str) == 'active'
+        positions = result['positions'][index, active]
+        if positions.size:
+            centroid_lon = float(np.mean(positions[:, 2]))
+            centroid_lat = float(np.mean(positions[:, 1]))
+            centroid_depth_m = float(np.mean(positions[:, 0]))
+            distance_km = float(
+                adaptive_distance_m(
+                    centroid_lon,
+                    centroid_lat,
+                    float(row.peak_lon),
+                    float(row.peak_lat),
+                )
+            ) / 1000.0
+            depth_error_m = abs(
+                centroid_depth_m - float(row.peak_depth_at_max)
+            )
+        else:
+            centroid_lon = centroid_lat = centroid_depth_m = np.nan
+            distance_km = depth_error_m = np.nan
+        records.append(
+            {
+                'event_id': str(event_id),
+                'integration_label': str(integration_label),
+                'date': pd.Timestamp(row.date).normalize(),
+                'active_particle_count': int(np.count_nonzero(active)),
+                'ensemble_centroid_lon': centroid_lon,
+                'ensemble_centroid_lat': centroid_lat,
+                'ensemble_centroid_depth_m': centroid_depth_m,
+                'observed_core_lon': float(row.peak_lon),
+                'observed_core_lat': float(row.peak_lat),
+                'observed_core_depth_m': float(row.peak_depth_at_max),
+                'centroid_to_observed_core_km': distance_km,
+                'centroid_to_observed_core_depth_error_m': depth_error_m,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_run_trajectory_event(
+    request: dict,
+    observed_track: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """运行单事件 ensemble、步长敏感性和 1/3/5-day 可逆性。"""
+    seeds, particle_metadata, selected_depths = (
+        _ofes_trajectory_seed_ensemble(
+            request['peak_date'],
+            request['peak_core_lon'],
+            request['peak_core_lat'],
+            request['reference_depth_m'],
+            request['peak_equivalent_radius_km'],
+            settings,
+        )
+    )
+    snapshots = _ofes_load_trajectory_snapshots(
+        request, selected_depths, settings
+    )
+    start_seeds, start_particle_metadata, start_depths = (
+        _ofes_trajectory_seed_ensemble(
+            request['start_date'],
+            request['start_core_lon'],
+            request['start_core_lat'],
+            request['reference_depth_m'],
+            request['peak_equivalent_radius_km'],
+            settings,
+        )
+    )
+    if start_depths != selected_depths:
+        raise RuntimeError(
+            'OFES trajectory start and peak releases use different z-levels.'
+        )
+    base_dt = float(settings['rk4_dt_seconds'])
+    backward = advect_ofes_particles(
+        snapshots,
+        seeds,
+        backward=True,
+        dt_seconds=base_dt,
+        temporal_interpolation='linear',
+    )
+    backtracked = backward['positions'][-1]
+    forward_replay = advect_ofes_particles(
+        snapshots,
+        backtracked,
+        backward=False,
+        dt_seconds=base_dt,
+        temporal_interpolation='linear',
+    )
+    replayed = forward_replay['positions'][-1]
+    forward_observed_start = advect_ofes_particles(
+        snapshots,
+        start_seeds,
+        backward=False,
+        dt_seconds=base_dt,
+        temporal_interpolation='linear',
+    )
+    forward_observed_endpoint = forward_observed_start['positions'][-1]
+    roundtrip_error = _ofes_trajectory_horizontal_distance_km(
+        seeds, replayed
+    )
+    active = (
+        backward['final_status'].astype(str) == 'active'
+    ) & (forward_replay['final_status'].astype(str) == 'active')
+    active_fraction = float(np.mean(active))
+    observed_start_active = (
+        forward_observed_start['final_status'].astype(str) == 'active'
+    )
+    observed_start_active_fraction = float(
+        np.mean(observed_start_active)
+    )
+
+    endpoints = {base_dt: backtracked}
+    for dt_seconds in settings['sensitivity_dt_seconds']:
+        dt_seconds = float(dt_seconds)
+        if dt_seconds == base_dt:
+            continue
+        sensitivity = advect_ofes_particles(
+            snapshots,
+            seeds,
+            backward=True,
+            dt_seconds=dt_seconds,
+            temporal_interpolation='linear',
+        )
+        endpoints[dt_seconds] = sensitivity['positions'][-1]
+    timestep = _ofes_trajectory_timestep_spread(endpoints)
+    timestep_passed = bool(
+        timestep['common_active_particle_count'] > 0
+        and timestep['median_endpoint_spread_km']
+        <= settings['timestep_endpoint_median_spread_max_km']
+    )
+
+    reversibility_records = []
+    integration_days = int(request['integration_days'])
+    for duration_days in settings['reversibility_days']:
+        duration_days = int(duration_days)
+        if duration_days > integration_days:
+            reversibility_records.append(
+                {
+                    'event_id': str(request['event_id']),
+                    'duration_days': duration_days,
+                    'applicable': False,
+                    'active_particle_count': 0,
+                    'median_roundtrip_error_km': np.nan,
+                    'q90_roundtrip_error_km': np.nan,
+                    'maximum_roundtrip_error_km': np.nan,
+                    'passed': np.nan,
+                }
+            )
+            continue
+        subset = snapshots[-(duration_days + 1):]
+        reverse = advect_ofes_particles(
+            subset,
+            seeds,
+            backward=True,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+        )
+        replay = advect_ofes_particles(
+            subset,
+            reverse['positions'][-1],
+            backward=False,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+        )
+        error = _ofes_trajectory_horizontal_distance_km(
+            seeds, replay['positions'][-1]
+        )
+        finite = error[np.isfinite(error)]
+        median_error = float(np.median(finite)) if finite.size else np.nan
+        q90_error = (
+            float(np.quantile(finite, 0.9)) if finite.size else np.nan
+        )
+        maximum_error = float(np.max(finite)) if finite.size else np.nan
+        passed = bool(
+            finite.size / len(seeds) >= settings['minimum_active_fraction']
+            and median_error
+            <= settings['reversibility_median_error_max_km']
+            and q90_error
+            <= settings['reversibility_q90_error_max_km']
+        )
+        reversibility_records.append(
+            {
+                'event_id': str(request['event_id']),
+                'duration_days': duration_days,
+                'applicable': True,
+                'active_particle_count': int(finite.size),
+                'median_roundtrip_error_km': median_error,
+                'q90_roundtrip_error_km': q90_error,
+                'maximum_roundtrip_error_km': maximum_error,
+                'passed': passed,
+            }
+        )
+    reversibility = pd.DataFrame(reversibility_records)
+    applicable_reversibility = reversibility.loc[
+        reversibility['applicable']
+    ]
+    reversibility_passed = bool(
+        len(applicable_reversibility)
+        and applicable_reversibility['passed'].astype(bool).all()
+    )
+    alignment = pd.concat(
+        [
+            _ofes_trajectory_observed_alignment(
+                backward,
+                observed_track,
+                str(request['event_id']),
+                'backward_peak_to_start',
+            ),
+            _ofes_trajectory_observed_alignment(
+                forward_observed_start,
+                observed_track,
+                str(request['event_id']),
+                'forward_observed_start_to_peak',
+            ),
+        ],
+        ignore_index=True,
+    )
+    start_reference = np.column_stack(
+        [
+            backtracked[:, 0],
+            np.full(len(backtracked), float(request['start_core_lat'])),
+            np.full(len(backtracked), float(request['start_core_lon'])),
+        ]
+    )
+    start_distance = _ofes_trajectory_horizontal_distance_km(
+        backtracked, start_reference
+    )
+    peak_reference = np.column_stack(
+        [
+            forward_observed_endpoint[:, 0],
+            np.full(
+                len(forward_observed_endpoint),
+                float(request['peak_core_lat']),
+            ),
+            np.full(
+                len(forward_observed_endpoint),
+                float(request['peak_core_lon']),
+            ),
+        ]
+    )
+    forward_peak_distance = _ofes_trajectory_horizontal_distance_km(
+        forward_observed_endpoint, peak_reference
+    )
+    finite_roundtrip = roundtrip_error[np.isfinite(roundtrip_error)]
+    finite_start = start_distance[np.isfinite(start_distance)]
+    finite_forward_peak = forward_peak_distance[
+        np.isfinite(forward_peak_distance)
+    ]
+    endpoint_sensitivity = pd.concat(
+        [
+            _ofes_trajectory_endpoint_sensitivity(
+                particle_metadata,
+                start_distance,
+                backward['final_status'],
+                str(request['event_id']),
+                'backward_peak_to_observed_start',
+            ),
+            _ofes_trajectory_endpoint_sensitivity(
+                start_particle_metadata,
+                forward_peak_distance,
+                forward_observed_start['final_status'],
+                str(request['event_id']),
+                'forward_observed_start_to_peak',
+            ),
+        ],
+        ignore_index=True,
+    )
+    backward_alignment = alignment.loc[
+        alignment['integration_label'] == 'backward_peak_to_start'
+    ]
+    forward_alignment = alignment.loc[
+        alignment['integration_label']
+        == 'forward_observed_start_to_peak'
+    ]
+    event_passed = bool(
+        active_fraction >= settings['minimum_active_fraction']
+        and observed_start_active_fraction
+        >= settings['minimum_active_fraction']
+        and timestep_passed
+        and reversibility_passed
+    )
+    summary = {
+        **request,
+        'particle_count': int(len(seeds)),
+        'selected_depths_m': list(selected_depths),
+        'active_roundtrip_particle_count': int(np.count_nonzero(active)),
+        'active_roundtrip_fraction': active_fraction,
+        'forward_observed_start_active_particle_count': int(
+            np.count_nonzero(observed_start_active)
+        ),
+        'forward_observed_start_active_fraction': (
+            observed_start_active_fraction
+        ),
+        'full_interval_roundtrip_median_error_km': (
+            float(np.median(finite_roundtrip))
+            if finite_roundtrip.size else np.nan
+        ),
+        'full_interval_roundtrip_q90_error_km': (
+            float(np.quantile(finite_roundtrip, 0.9))
+            if finite_roundtrip.size else np.nan
+        ),
+        'backtracked_source_to_observed_start_median_km': (
+            float(np.median(finite_start)) if finite_start.size else np.nan
+        ),
+        'backtracked_source_to_observed_start_q90_km': (
+            float(np.quantile(finite_start, 0.9))
+            if finite_start.size else np.nan
+        ),
+        'forward_start_to_observed_peak_median_km': (
+            float(np.median(finite_forward_peak))
+            if finite_forward_peak.size else np.nan
+        ),
+        'forward_start_to_observed_peak_q90_km': (
+            float(np.quantile(finite_forward_peak, 0.9))
+            if finite_forward_peak.size else np.nan
+        ),
+        'observed_alignment_day_count_per_direction': int(
+            len(backward_alignment)
+        ),
+        'backward_ensemble_to_observed_core_median_km': (
+            float(
+                backward_alignment[
+                    'centroid_to_observed_core_km'
+                ].median()
+            )
+            if len(backward_alignment) else np.nan
+        ),
+        'forward_ensemble_to_observed_core_median_km': (
+            float(
+                forward_alignment[
+                    'centroid_to_observed_core_km'
+                ].median()
+            )
+            if len(forward_alignment) else np.nan
+        ),
+        **timestep,
+        'timestep_sensitivity_passed': timestep_passed,
+        'reversibility_passed': reversibility_passed,
+        'event_validation_passed': event_passed,
+    }
+    trajectories = pd.concat(
+        [
+            _ofes_trajectory_result_frame(
+                backward,
+                particle_metadata,
+                str(request['event_id']),
+                'backward_peak_to_start',
+                base_dt,
+            ),
+            _ofes_trajectory_result_frame(
+                forward_replay,
+                particle_metadata,
+                str(request['event_id']),
+                'forward_replay_start_to_peak',
+                base_dt,
+            ),
+            _ofes_trajectory_result_frame(
+                forward_observed_start,
+                start_particle_metadata,
+                str(request['event_id']),
+                'forward_observed_start_to_peak',
+                base_dt,
+            ),
+        ],
+        ignore_index=True,
+    )
+    return {
+        'summary': summary,
+        'trajectories': trajectories,
+        'particle_metadata': pd.concat(
+            [
+                particle_metadata.assign(
+                    event_id=str(request['event_id']),
+                    release_label='peak',
+                ),
+                start_particle_metadata.assign(
+                    event_id=str(request['event_id']),
+                    release_label='observed_start',
+                ),
+            ],
+            ignore_index=True,
+        ),
+        'reversibility': reversibility,
+        'observed_alignment': alignment,
+        'endpoint_sensitivity': endpoint_sensitivity,
+    }
+
+
+def _ofes_trajectory_2d_fragment_reusable(
+    paths: dict[str, Path],
+    event_id: str,
+    start_date: pd.Timestamp,
+    peak_date: pd.Timestamp,
+) -> tuple[bool, dict | None]:
+    """检查二维 trajectory fragment 的请求和核心列结构。"""
+    required = {
+        'summary',
+        'trajectories',
+        'particle_metadata',
+        'reversibility',
+        'endpoint_sensitivity',
+        'observed_alignment',
+    }
+    if (
+        not required.issubset(paths)
+        or not all(paths[key].exists() for key in required)
+    ):
+        return False, None
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    _ofes_assert_summary_request(
+        stored,
+        event_id,
+        start_date=start_date,
+        peak_date=peak_date,
+    )
+    table_columns = {
+        'trajectories': {
+            'event_id', 'time', 'particle_index', 'depth_m', 'lat', 'lon',
+            'status', 'integration_label',
+        },
+        'particle_metadata': {'particle_index', 'particle_id'},
+        'reversibility': {'event_id', 'duration_days'},
+        'endpoint_sensitivity': {'event_id'},
+        'observed_alignment': {'event_id'},
+    }
+    for key, columns in table_columns.items():
+        frame = pd.read_parquet(paths[key])
+        if frame.empty or not columns.issubset(frame.columns):
+            return False, None
+    return bool(stored.get('event_validation_passed') is not None), stored
+
+
+def _plot_ofes_fixed_depth_trajectory_ensembles(
+    trajectories: pd.DataFrame,
+    observed_alignment: pd.DataFrame,
+    observed_tracks: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制显式选择事件的 backward ensemble、质心与 observed-object 路径。"""
+    events = event_summary.sort_values('event_order', kind='mergesort')
+    figure, axes = plt.subplots(
+        1,
+        len(events),
+        figsize=(18, 5.8),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for axis, event in zip(axes[0], events.itertuples(index=False)):
+        event_id = str(event.event_id)
+        backward = trajectories.loc[
+            (trajectories['event_id'] == event_id)
+            & (
+                trajectories['integration_label']
+                == 'backward_peak_to_start'
+            )
+        ]
+        for _, particle in backward.groupby('particle_index', sort=False):
+            active = particle.loc[particle['status'] == 'active']
+            axis.plot(
+                active['lon'],
+                active['lat'],
+                color='#7b61a8',
+                linewidth=0.55,
+                alpha=0.20,
+            )
+        forward = trajectories.loc[
+            (trajectories['event_id'] == event_id)
+            & (
+                trajectories['integration_label']
+                == 'forward_observed_start_to_peak'
+            )
+        ]
+        for _, particle in forward.groupby('particle_index', sort=False):
+            active = particle.loc[particle['status'] == 'active']
+            axis.plot(
+                active['lon'],
+                active['lat'],
+                color='#4c78a8',
+                linewidth=0.5,
+                alpha=0.13,
+            )
+        track = observed_tracks.loc[
+            observed_tracks['event_id'].astype(str) == event_id
+        ].sort_values('date', kind='mergesort')
+        axis.plot(
+            track['peak_lon'],
+            track['peak_lat'],
+            color='#111827',
+            linewidth=1.8,
+            marker='o',
+            markersize=3,
+            label='Observed ΔDO core',
+        )
+        alignment = observed_alignment.loc[
+            (observed_alignment['event_id'] == event_id)
+            & (
+                observed_alignment['integration_label']
+                == 'backward_peak_to_start'
+            )
+        ].sort_values('date', kind='mergesort')
+        axis.plot(
+            alignment['ensemble_centroid_lon'],
+            alignment['ensemble_centroid_lat'],
+            color='#d95f59',
+            linewidth=2.0,
+            marker='s',
+            markersize=3,
+            label='Backward ensemble centroid',
+        )
+        forward_alignment = observed_alignment.loc[
+            (observed_alignment['event_id'] == event_id)
+            & (
+                observed_alignment['integration_label']
+                == 'forward_observed_start_to_peak'
+            )
+        ].sort_values('date', kind='mergesort')
+        axis.plot(
+            forward_alignment['ensemble_centroid_lon'],
+            forward_alignment['ensemble_centroid_lat'],
+            color='#4c78a8',
+            linewidth=2.0,
+            marker='^',
+            markersize=3,
+            label='Forward start-release centroid',
+        )
+        axis.scatter(
+            [event.peak_core_lon],
+            [event.peak_core_lat],
+            marker='*',
+            s=95,
+            color='#f2cf5b',
+            edgecolor='#111827',
+            linewidth=0.7,
+            zorder=5,
+            label='Peak release',
+        )
+        axis.set_title(
+            f'{event_id.replace("OFES_DO50_", "")}\n'
+            f'{event.regime_label}; '
+            f'{event.active_roundtrip_fraction:.0%} active'
+        )
+        axis.set_xlabel('Longitude')
+        axis.set_ylabel('Latitude')
+        axis.grid(alpha=0.2)
+        axis.set_aspect('equal', adjustable='datalim')
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(
+        handles,
+        labels,
+        loc='outside lower center',
+        ncol=4,
+        frameon=False,
+    )
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        figure_dpi,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_fixed_depth_trajectory_ensembles(
+    onset_run_dir: str | Path | None = None,
+    patch_run_dir: str | Path | None = None,
+    *,
+    trajectory_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """运行并验证显式选择事件的二维固定深度 ensemble trajectory。
+
+    workflow 先用线性加速平移与固体旋转解析场验证 RK4，再对调用方选择的事件
+    从峰值回溯至事件 start、从 observed start 独立正向积分至 peak，并把回溯
+    端点正向重放作为纯数值可逆性检查。每个事件固定使用
+    核心加两个半径环、三个相邻 z-level，同时报告
+    1800/3600/7200 s 步长敏感性和可用的 1/3/5-day 可逆性。
+
+    参数:
+        - onset_run_dir (str | Path | None): onset 运行目录；None 使用固定 `event_onset` 输出。
+        - patch_run_dir (str | Path | None): patch continuity 运行目录；None 使用固定 `event_patch` 输出。
+        - trajectory_overrides (dict | None): 临时覆盖 `ofes.trajectory_2d` 配置；其中
+          `event_ids` 由 notebook setup cell 显式提供。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_2d` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、解析场验证、逐事件摘要、trajectory 长表、可逆性、端点敏感性、observed alignment、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`analytic_validation.json`、`event_summary.parquet`、`trajectories.parquet`、`reversibility.parquet`、`endpoint_sensitivity.parquet`、`observed_alignment.parquet`、`analysis_summary.json`、`trajectory_ensembles.png` 与 `manifest.json`。
+
+    说明:
+        - 轨迹执行不受 patch gate 阻止；调用方选择的 patch gate 只控制来源路径措辞。
+        - 所有粒子深度保持不变，`w` 未使用；结果是解析水平输运诊断，不是三维水团来源证明。
+    """
+    onset_root = (
+        Path(onset_run_dir)
+        if onset_run_dir is not None
+        else _ofes_analysis_output_dir('event_onset')
+    )
+    patch_root = (
+        Path(patch_run_dir)
+        if patch_run_dir is not None
+        else _ofes_analysis_output_dir('event_patch')
+    )
+    settings = _ofes_trajectory_2d_settings(trajectory_overrides)
+    requests, observed_tracks = _ofes_trajectory_event_requests(
+        onset_root, settings
+    )
+    patch_gate_path = patch_root / 'trajectory_interpretation_gate.json'
+    if not patch_gate_path.exists():
+        raise FileNotFoundError(
+            f'OFES trajectory patch gate is missing: {patch_gate_path}'
+        )
+    patch_gate = json.loads(patch_gate_path.read_text(encoding='utf-8'))
+    if patch_gate.get('headline_event_id') != settings['event_ids'][0]:
+        raise RuntimeError(
+            'OFES trajectory headline event differs from the patch gate.'
+        )
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+        'event_ids': [str(value) for value in requests['event_id']],
+        'start_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['start_date']
+        ],
+        'peak_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['peak_date']
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'analytic_validation': json.loads(
+                Path(outputs['analytic_validation']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'event_summary': pd.read_parquet(outputs['event_summary']),
+            'trajectories': pd.read_parquet(outputs['trajectories']),
+            'reversibility': pd.read_parquet(outputs['reversibility']),
+            'endpoint_sensitivity': pd.read_parquet(
+                outputs['endpoint_sensitivity']
+            ),
+            'observed_alignment': pd.read_parquet(
+                outputs['observed_alignment']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_inventory = _ofes_trajectory_source_inventory(requests)
+    manifest = {
+        'analysis': 'trajectory_2d',
+        'request': request,
+        'settings': settings,
+        'headline_patch_gate_passed': bool(
+            patch_gate.get('headline_candidate_pathway_gate_passed', False)
+        ),
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(
+        observed_tracks, run_dir / 'observed_object_tracks.parquet'
+    )
+    completed = 0
+    try:
+        analytic_validation = (
+            _validate_ofes_fixed_depth_trajectory_integrator(settings)
+        )
+        analytic_path = run_dir / 'analytic_validation.json'
+        _ofes_atomic_write_json(analytic_validation, analytic_path)
+        results = []
+        for request in requests.to_dict(orient='records'):
+            event_id = str(request['event_id'])
+            event_dir = events_dir / event_id
+            event_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = event_dir / 'summary.json'
+            trajectories_path = event_dir / 'trajectories.parquet'
+            particle_path = event_dir / 'particle_metadata.parquet'
+            reversibility_path = event_dir / 'reversibility.parquet'
+            sensitivity_path = event_dir / 'endpoint_sensitivity.parquet'
+            alignment_path = event_dir / 'observed_alignment.parquet'
+            reusable, stored_summary = _ofes_trajectory_2d_fragment_reusable(
+                {
+                    'summary': summary_path,
+                    'trajectories': trajectories_path,
+                    'particle_metadata': particle_path,
+                    'reversibility': reversibility_path,
+                    'endpoint_sensitivity': sensitivity_path,
+                    'observed_alignment': alignment_path,
+                },
+                event_id,
+                pd.Timestamp(request['start_date']),
+                pd.Timestamp(request['peak_date']),
+            )
+            if reusable:
+                result = {
+                    'summary': stored_summary,
+                    'trajectories': pd.read_parquet(trajectories_path),
+                    'particle_metadata': pd.read_parquet(particle_path),
+                    'reversibility': pd.read_parquet(reversibility_path),
+                    'endpoint_sensitivity': pd.read_parquet(
+                        sensitivity_path
+                    ),
+                    'observed_alignment': pd.read_parquet(alignment_path),
+                }
+            else:
+                observed = observed_tracks.loc[
+                    observed_tracks['event_id'].astype(str) == event_id
+                ]
+                result = _ofes_run_trajectory_event(
+                    request, observed, settings
+                )
+                _ofes_atomic_write_json(result['summary'], summary_path)
+                _atomic_write_parquet(
+                    result['trajectories'], trajectories_path
+                )
+                _atomic_write_parquet(
+                    result['particle_metadata'], particle_path
+                )
+                _atomic_write_parquet(
+                    result['reversibility'], reversibility_path
+                )
+                _atomic_write_parquet(
+                    result['endpoint_sensitivity'], sensitivity_path
+                )
+                _atomic_write_parquet(
+                    result['observed_alignment'], alignment_path
+                )
+            results.append(result)
+            completed += 1
+            print(
+                f'[OFES trajectory 2D] {completed}/{len(requests)} '
+                f'{event_id}',
+                flush=True,
+            )
+            manifest['completed_events'] = completed
+            manifest['updated_at_utc'] = pd.Timestamp.now(
+                tz='UTC'
+            ).isoformat()
+            _ofes_atomic_write_json(manifest, manifest_path)
+        event_summary = pd.DataFrame(
+            [result['summary'] for result in results]
+        ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+        trajectories = pd.concat(
+            [result['trajectories'] for result in results],
+            ignore_index=True,
+        )
+        reversibility = pd.concat(
+            [result['reversibility'] for result in results],
+            ignore_index=True,
+        )
+        endpoint_sensitivity = pd.concat(
+            [result['endpoint_sensitivity'] for result in results],
+            ignore_index=True,
+        )
+        observed_alignment = pd.concat(
+            [result['observed_alignment'] for result in results],
+            ignore_index=True,
+        )
+        headline = event_summary.loc[
+            event_summary['event_id'] == settings['event_ids'][0]
+        ].iloc[0]
+        headline_durations = set(
+            reversibility.loc[
+                (reversibility['event_id'] == settings['event_ids'][0])
+                & reversibility['applicable'],
+                'duration_days',
+            ].astype(int)
+        )
+        required_durations = set(settings['reversibility_days'])
+        all_validation_passed = bool(
+            analytic_validation['passed']
+            and event_summary['event_validation_passed'].astype(bool).all()
+            and required_durations.issubset(headline_durations)
+        )
+        if not all_validation_passed:
+            raise RuntimeError(
+                'OFES fixed-depth production trajectory validation failed.'
+            )
+        source_interpretation_unlocked = bool(
+            patch_gate['headline_candidate_pathway_gate_passed']
+        )
+        headline_sensitivity = endpoint_sensitivity.loc[
+            endpoint_sensitivity['event_id'] == settings['event_ids'][0]
+        ]
+        sensitivity_ranges = []
+        for (
+            integration_label,
+            sensitivity_axis,
+        ), group in headline_sensitivity.groupby(
+            ['integration_label', 'sensitivity_axis'], sort=True
+        ):
+            values = group[
+                'median_endpoint_distance_km'
+            ].to_numpy(dtype=float)
+            sensitivity_ranges.append(
+                {
+                    'integration_label': str(integration_label),
+                    'sensitivity_axis': str(sensitivity_axis),
+                    'group_count': int(len(group)),
+                    'minimum_group_median_km': float(np.nanmin(values)),
+                    'maximum_group_median_km': float(np.nanmax(values)),
+                }
+            )
+        analysis_summary = {
+            'all_validation_passed': all_validation_passed,
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'event_validation_passed_count': int(
+                event_summary['event_validation_passed'].sum()
+            ),
+            'event_count': int(len(event_summary)),
+            'headline_event_id': str(headline['event_id']),
+            'headline_active_roundtrip_fraction': float(
+                headline['active_roundtrip_fraction']
+            ),
+            'headline_timestep_median_endpoint_spread_km': float(
+                headline['median_endpoint_spread_km']
+            ),
+            'headline_full_interval_roundtrip_median_error_km': float(
+                headline['full_interval_roundtrip_median_error_km']
+            ),
+            'headline_backtracked_source_to_observed_start_median_km': float(
+                headline[
+                    'backtracked_source_to_observed_start_median_km'
+                ]
+            ),
+            'headline_forward_start_to_observed_peak_median_km': float(
+                headline['forward_start_to_observed_peak_median_km']
+            ),
+            'headline_backward_ensemble_to_observed_core_median_km': float(
+                headline[
+                    'backward_ensemble_to_observed_core_median_km'
+                ]
+            ),
+            'headline_forward_ensemble_to_observed_core_median_km': float(
+                headline[
+                    'forward_ensemble_to_observed_core_median_km'
+                ]
+            ),
+            'headline_endpoint_sensitivity_ranges': sensitivity_ranges,
+            'headline_patch_interpretation_gate_passed': (
+                source_interpretation_unlocked
+            ),
+            'trajectory_source_interpretation_unlocked': (
+                source_interpretation_unlocked
+            ),
+            'execution_policy': (
+                'Validated trajectories execute regardless of the patch '
+                'gate; the gate alone controls source-pathway promotion.'
+            ),
+            'interpretation': (
+                'Horizontal pathway diagnostics are numerically validated, '
+                'but the failed headline patch-continuity gate prevents a '
+                'material-source claim.'
+                if not source_interpretation_unlocked
+                else
+                'The predeclared headline patch and numerical trajectory '
+                'gates both pass; pathway interpretation is unlocked with '
+                'fixed-depth and mixing caveats.'
+            ),
+            'limits': [
+                'Particles remain on delivered z-levels and do not use w.',
+                'Resolved advection omits vertical motion, mixing, diffusion, '
+                'and unresolved submesoscale transport.',
+                'The caller-selected patch and trajectory gates must be '
+                'interpreted together; changing the selected events requires '
+                'rerunning both workflows.',
+            ],
+        }
+        event_summary_path = run_dir / 'event_summary.parquet'
+        trajectories_path = run_dir / 'trajectories.parquet'
+        reversibility_path = run_dir / 'reversibility.parquet'
+        sensitivity_path = run_dir / 'endpoint_sensitivity.parquet'
+        alignment_path = run_dir / 'observed_alignment.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'trajectory_ensembles.png'
+        _atomic_write_parquet(event_summary, event_summary_path)
+        _atomic_write_parquet(trajectories, trajectories_path)
+        _atomic_write_parquet(reversibility, reversibility_path)
+        _atomic_write_parquet(endpoint_sensitivity, sensitivity_path)
+        _atomic_write_parquet(observed_alignment, alignment_path)
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_fixed_depth_trajectory_ensembles(
+            trajectories,
+            observed_alignment,
+            observed_tracks,
+            event_summary,
+            figure_path,
+            settings['figure_dpi'],
+        )
+        outputs = {
+            'analytic_validation': str(analytic_path.resolve()),
+            'event_summary': str(event_summary_path.resolve()),
+            'trajectories': str(trajectories_path.resolve()),
+            'reversibility': str(reversibility_path.resolve()),
+            'endpoint_sensitivity': str(sensitivity_path.resolve()),
+            'observed_alignment': str(alignment_path.resolve()),
+            'analysis_summary': str(analysis_path.resolve()),
+            'figure': str(figure_path.resolve()),
+            'source_inventory': str(
+                (run_dir / 'source_inventory.parquet').resolve()
+            ),
+            'observed_object_tracks': str(
+                (run_dir / 'observed_object_tracks.parquet').resolve()
+            ),
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': int(len(event_summary)),
+                'all_validation_passed': all_validation_passed,
+                'trajectory_source_interpretation_unlocked': (
+                    source_interpretation_unlocked
+                ),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'analytic_validation': analytic_validation,
+        'event_summary': event_summary,
+        'trajectories': trajectories,
+        'reversibility': reversibility,
+        'endpoint_sensitivity': endpoint_sensitivity,
+        'observed_alignment': observed_alignment,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_trajectory_3d_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 三维 ensemble trajectory 配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_3d', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - (set(raw) | {'event_ids'}))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_3d override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'event_ids': tuple(
+            str(value) for value in raw.get('event_ids', ())
+        ),
+        'temporal_interpolation': str(
+            raw.get('temporal_interpolation', 'linear')
+        ),
+        'rk4_dt_seconds': float(raw.get('rk4_dt_seconds', 3600)),
+        'sensitivity_dt_seconds': tuple(
+            float(value)
+            for value in raw.get(
+                'sensitivity_dt_seconds', (1800, 3600, 7200)
+            )
+        ),
+        'reversibility_days': tuple(
+            int(value)
+            for value in raw.get('reversibility_days', (1, 3, 5))
+        ),
+        'reversibility_median_error_max_km': float(
+            raw.get('reversibility_median_error_max_km', 5.0)
+        ),
+        'reversibility_q90_error_max_km': float(
+            raw.get('reversibility_q90_error_max_km', 10.0)
+        ),
+        'reversibility_median_depth_error_max_m': float(
+            raw.get('reversibility_median_depth_error_max_m', 10.0)
+        ),
+        'reversibility_q90_depth_error_max_m': float(
+            raw.get('reversibility_q90_depth_error_max_m', 25.0)
+        ),
+        'timestep_endpoint_median_spread_max_km': float(
+            raw.get('timestep_endpoint_median_spread_max_km', 10.0)
+        ),
+        'timestep_endpoint_median_depth_spread_max_m': float(
+            raw.get(
+                'timestep_endpoint_median_depth_spread_max_m', 10.0
+            )
+        ),
+        'analytic_translation_error_max_km': float(
+            raw.get('analytic_translation_error_max_km', 0.01)
+        ),
+        'analytic_vertical_error_max_m': float(
+            raw.get('analytic_vertical_error_max_m', 0.10)
+        ),
+        'domain_margin_km': float(raw.get('domain_margin_km', 700.0)),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'ensemble_ring_fractions': tuple(
+            float(value)
+            for value in raw.get(
+                'ensemble_ring_fractions', (0.0, 0.35, 0.70)
+            )
+        ),
+        'ensemble_azimuth_count': int(
+            raw.get('ensemble_azimuth_count', 8)
+        ),
+        'adjacent_depth_levels': int(
+            raw.get('adjacent_depth_levels', 1)
+        ),
+        'headline_vertical_alignment_median_max_m': float(
+            raw.get('headline_vertical_alignment_median_max_m', 150.0)
+        ),
+        'headline_downward_displacement_min_m': float(
+            raw.get('headline_downward_displacement_min_m', 100.0)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_3d')
+        ),
+    }
+    if len(settings['event_ids']) != 3 or len(set(settings['event_ids'])) != 3:
+        raise ValueError(
+            'OFES trajectory_3d requires three distinct representative events.'
+        )
+    if settings['temporal_interpolation'] != 'linear':
+        raise ValueError(
+            'OFES trajectory_3d temporal_interpolation must be linear.'
+        )
+    positive_keys = (
+        'rk4_dt_seconds',
+        'reversibility_median_error_max_km',
+        'reversibility_q90_error_max_km',
+        'reversibility_median_depth_error_max_m',
+        'reversibility_q90_depth_error_max_m',
+        'timestep_endpoint_median_spread_max_km',
+        'timestep_endpoint_median_depth_spread_max_m',
+        'analytic_translation_error_max_km',
+        'analytic_vertical_error_max_m',
+        'domain_margin_km',
+        'headline_vertical_alignment_median_max_m',
+        'headline_downward_displacement_min_m',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES trajectory_3d positive thresholds must be finite.'
+        )
+    if (
+        not settings['sensitivity_dt_seconds']
+        or any(
+            not np.isfinite(value) or value <= 0
+            for value in settings['sensitivity_dt_seconds']
+        )
+        or settings['rk4_dt_seconds']
+        not in settings['sensitivity_dt_seconds']
+    ):
+        raise ValueError(
+            'OFES trajectory_3d timestep sensitivity must include base dt.'
+        )
+    if (
+        not settings['reversibility_days']
+        or any(value <= 0 for value in settings['reversibility_days'])
+    ):
+        raise ValueError(
+            'OFES trajectory_3d reversibility_days must be positive.'
+        )
+    fractions = settings['ensemble_ring_fractions']
+    if (
+        not fractions
+        or fractions[0] != 0
+        or any(not np.isfinite(value) or value < 0 for value in fractions)
+        or len(set(fractions)) != len(fractions)
+    ):
+        raise ValueError(
+            'OFES trajectory_3d ring fractions must be unique and start at zero.'
+        )
+    if (
+        settings['ensemble_azimuth_count'] < 4
+        or settings['adjacent_depth_levels'] < 0
+    ):
+        raise ValueError('OFES trajectory_3d ensemble geometry is invalid.')
+    active_fraction = settings['minimum_active_fraction']
+    if not np.isfinite(active_fraction) or not 0 < active_fraction <= 1:
+        raise ValueError(
+            'OFES trajectory_3d minimum_active_fraction must lie in (0, 1].'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory_3d output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_3d_population_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 三维 trajectory 总体推广配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_3d_population', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                'Unknown OFES trajectory_3d_population override keys: '
+                f'{unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'minimum_integration_days': int(
+            raw.get('minimum_integration_days', 1)
+        ),
+        'observed_depth_change_min_m': float(
+            raw.get('observed_depth_change_min_m', 25.0)
+        ),
+        'particle_depth_change_min_m': float(
+            raw.get('particle_depth_change_min_m', 25.0)
+        ),
+        'vertical_alignment_median_max_m': float(
+            raw.get('vertical_alignment_median_max_m', 150.0)
+        ),
+        'representative_parity_atol': float(
+            raw.get('representative_parity_atol', 1e-9)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_3d_population')
+        ),
+    }
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['minimum_integration_days'] <= 0
+    ):
+        raise ValueError(
+            'OFES trajectory population worker/day counts are invalid.'
+        )
+    for key in (
+        'observed_depth_change_min_m',
+        'particle_depth_change_min_m',
+        'vertical_alignment_median_max_m',
+        'figure_dpi',
+    ):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(
+                'OFES trajectory population thresholds must be finite '
+                'and positive.'
+            )
+    if (
+        not np.isfinite(settings['representative_parity_atol'])
+        or settings['representative_parity_atol'] < 0
+    ):
+        raise ValueError(
+            'OFES representative_parity_atol must be finite and nonnegative.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory population output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_3d_synthetic_snapshot(
+    date: str,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    depth: np.ndarray,
+    depth_w: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    w: np.ndarray,
+) -> dict:
+    """构建携带 w validation 标记的 OFES-like 三维解析场快照。"""
+    return {
+        'date': pd.Timestamp(date),
+        'lon': np.asarray(lon, dtype=float),
+        'lat': np.asarray(lat, dtype=float),
+        'depth': np.asarray(depth, dtype=float),
+        'depth_w': np.asarray(depth_w, dtype=float),
+        'u': np.asarray(u, dtype=float),
+        'v': np.asarray(v, dtype=float),
+        'w': np.asarray(w, dtype=float),
+        'metadata': {
+            'depth_units': 'm',
+            'w_validation_passed': True,
+        },
+    }
+
+
+def _validate_ofes_3d_trajectory_integrator(settings: dict) -> dict:
+    """用时变平移和垂向速度解析场验证三维 RK4 及反向积分。"""
+    lon = np.linspace(140.0, 144.0, 41)
+    lat = np.linspace(30.0, 34.0, 41)
+    depth = np.linspace(100.0, 900.0, 17)
+    depth_w = np.linspace(80.0, 920.0, 18)
+    uv_shape = (depth.size, lat.size, lon.size)
+    w_shape = (depth_w.size, lat.size, lon.size)
+    snapshots = [
+        _ofes_trajectory_3d_synthetic_snapshot(
+            '2003-01-01',
+            lon,
+            lat,
+            depth,
+            depth_w,
+            np.zeros(uv_shape),
+            np.zeros(uv_shape),
+            np.zeros(w_shape),
+        ),
+        _ofes_trajectory_3d_synthetic_snapshot(
+            '2003-01-02',
+            lon,
+            lat,
+            depth,
+            depth_w,
+            np.full(uv_shape, 0.2),
+            np.full(uv_shape, 0.1),
+            np.full(w_shape, -0.002),
+        ),
+    ]
+    seed = np.array([[500.0, 32.0, 142.0]])
+    forward = advect_ofes_particles(
+        snapshots,
+        seed,
+        dt_seconds=settings['rk4_dt_seconds'],
+        temporal_interpolation='linear',
+        vertical_mode='three_dimensional',
+    )
+    endpoint = forward['positions'][-1, 0]
+    expected_horizontal_km = np.hypot(0.1, 0.05) * 86400.0 / 1000.0
+    actual_horizontal_km = float(
+        adaptive_distance_m(
+            seed[0, 2],
+            seed[0, 1],
+            endpoint[2],
+            endpoint[1],
+        )
+    ) / 1000.0
+    expected_depth_m = 500.0 + 0.001 * 86400.0
+    horizontal_error_km = abs(
+        actual_horizontal_km - expected_horizontal_km
+    )
+    vertical_error_m = abs(float(endpoint[0]) - expected_depth_m)
+    backward = advect_ofes_particles(
+        snapshots,
+        endpoint[None, :],
+        backward=True,
+        dt_seconds=settings['rk4_dt_seconds'],
+        temporal_interpolation='linear',
+        vertical_mode='three_dimensional',
+    )
+    roundtrip = backward['positions'][-1, 0]
+    roundtrip_horizontal_error_km = float(
+        adaptive_distance_m(
+            seed[0, 2], seed[0, 1], roundtrip[2], roundtrip[1]
+        )
+    ) / 1000.0
+    roundtrip_vertical_error_m = abs(float(roundtrip[0]) - seed[0, 0])
+    missing_gate_rejected = False
+    unvalidated = [dict(snapshot) for snapshot in snapshots]
+    unvalidated[0] = {
+        **unvalidated[0],
+        'metadata': {'depth_units': 'm'},
+    }
+    try:
+        advect_ofes_particles(
+            unvalidated,
+            seed,
+            vertical_mode='three_dimensional',
+        )
+    except RuntimeError:
+        missing_gate_rejected = True
+    passed = bool(
+        horizontal_error_km
+        <= settings['analytic_translation_error_max_km']
+        and vertical_error_m <= settings['analytic_vertical_error_max_m']
+        and roundtrip_horizontal_error_km
+        <= settings['analytic_translation_error_max_km']
+        and roundtrip_vertical_error_m
+        <= settings['analytic_vertical_error_max_m']
+        and missing_gate_rejected
+        and forward['final_status'][0] == 'active'
+        and backward['final_status'][0] == 'active'
+    )
+    payload = {
+        'passed': passed,
+        'temporal_interpolation': 'linear',
+        'w_positive_direction': 'up',
+        'particle_depth_positive_direction': 'down',
+        'expected_horizontal_distance_km': expected_horizontal_km,
+        'actual_horizontal_distance_km': actual_horizontal_km,
+        'horizontal_error_km': horizontal_error_km,
+        'expected_endpoint_depth_m': expected_depth_m,
+        'actual_endpoint_depth_m': float(endpoint[0]),
+        'vertical_error_m': vertical_error_m,
+        'roundtrip_horizontal_error_km': roundtrip_horizontal_error_km,
+        'roundtrip_vertical_error_m': roundtrip_vertical_error_m,
+        'unvalidated_snapshot_rejected': missing_gate_rejected,
+        'thresholds': {
+            'horizontal_error_max_km': settings[
+                'analytic_translation_error_max_km'
+            ],
+            'vertical_error_max_m': settings[
+                'analytic_vertical_error_max_m'
+            ],
+        },
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES 3-D analytic trajectory validation failed: {payload}'
+        )
+    return payload
+
+
+def _ofes_trajectory_3d_source_inventory(
+    requests: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录 start-to-peak 逐日 u/v/w 三维轨迹输入文件身份。"""
+    records = []
+    for request in requests.itertuples(index=False):
+        for date in pd.date_range(request.start_date, request.peak_date):
+            for variable in ('u', 'v', 'w'):
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                records.append(
+                    {
+                        'event_id': str(request.event_id),
+                        'date': pd.Timestamp(date).normalize(),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    return pd.DataFrame(records)
+
+
+def _ofes_load_trajectory_3d_snapshots(
+    request: dict,
+    settings: dict,
+) -> list[dict]:
+    """加载覆盖 observed track、完整交付深度域的逐日 u/v/w 场。"""
+    center_lat = 0.5 * (
+        float(request['observed_lat_min'])
+        + float(request['observed_lat_max'])
+    )
+    scale = approximate_degree_length(center_lat)
+    margin_m = float(settings['domain_margin_km']) * 1000.0
+    lon_margin = margin_m / float(scale['meters_per_degree_lon'])
+    lat_margin = margin_m / float(scale['meters_per_degree_lat'])
+    lon_bounds = (
+        float(request['observed_lon_min']) - lon_margin,
+        float(request['observed_lon_max']) + lon_margin,
+    )
+    lat_bounds = (
+        float(request['observed_lat_min']) - lat_margin,
+        float(request['observed_lat_max']) + lat_margin,
+    )
+    snapshots = []
+    for date in pd.date_range(request['start_date'], request['peak_date']):
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['u', 'v', 'w'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=None,
+        )
+        snapshot['metadata']['w_validation_passed'] = True
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _ofes_trajectory_3d_timestep_spread(
+    endpoints: dict[float, np.ndarray],
+) -> dict:
+    """汇总多步长三维 backward endpoint 的水平与垂向最大两两差。"""
+    dt_values = sorted(endpoints)
+    horizontal = []
+    vertical = []
+    for first_index, first_dt in enumerate(dt_values[:-1]):
+        for second_dt in dt_values[first_index + 1:]:
+            first = endpoints[first_dt]
+            second = endpoints[second_dt]
+            horizontal.append(
+                _ofes_trajectory_horizontal_distance_km(first, second)
+            )
+            depth_error = np.abs(first[:, 0] - second[:, 0])
+            depth_error[
+                ~(
+                    np.all(np.isfinite(first), axis=1)
+                    & np.all(np.isfinite(second), axis=1)
+                )
+            ] = np.nan
+            vertical.append(depth_error)
+    if not horizontal:
+        raise RuntimeError(
+            'OFES trajectory_3d timestep sensitivity needs two dt values.'
+        )
+    horizontal_matrix = np.column_stack(horizontal)
+    vertical_matrix = np.column_stack(vertical)
+    fully_finite = np.all(np.isfinite(horizontal_matrix), axis=1) & np.all(
+        np.isfinite(vertical_matrix), axis=1
+    )
+    horizontal_maximum = np.full(len(fully_finite), np.nan)
+    vertical_maximum = np.full(len(fully_finite), np.nan)
+    horizontal_maximum[fully_finite] = np.max(
+        horizontal_matrix[fully_finite], axis=1
+    )
+    vertical_maximum[fully_finite] = np.max(
+        vertical_matrix[fully_finite], axis=1
+    )
+    finite_horizontal = horizontal_maximum[fully_finite]
+    finite_vertical = vertical_maximum[fully_finite]
+    return {
+        'common_active_particle_count': int(np.count_nonzero(fully_finite)),
+        'particle_count': int(len(fully_finite)),
+        'median_endpoint_spread_km': (
+            float(np.median(finite_horizontal))
+            if finite_horizontal.size else np.nan
+        ),
+        'q90_endpoint_spread_km': (
+            float(np.quantile(finite_horizontal, 0.9))
+            if finite_horizontal.size else np.nan
+        ),
+        'maximum_endpoint_spread_km': (
+            float(np.max(finite_horizontal))
+            if finite_horizontal.size else np.nan
+        ),
+        'median_endpoint_depth_spread_m': (
+            float(np.median(finite_vertical))
+            if finite_vertical.size else np.nan
+        ),
+        'q90_endpoint_depth_spread_m': (
+            float(np.quantile(finite_vertical, 0.9))
+            if finite_vertical.size else np.nan
+        ),
+        'maximum_endpoint_depth_spread_m': (
+            float(np.max(finite_vertical))
+            if finite_vertical.size else np.nan
+        ),
+    }
+
+
+def _ofes_trajectory_3d_endpoint_metrics(
+    endpoint: np.ndarray,
+    target_lon: float,
+    target_lat: float,
+    target_depth_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """返回粒子端点相对三维目标的水平距离与绝对深度差。"""
+    target = np.column_stack(
+        [
+            np.full(len(endpoint), float(target_depth_m)),
+            np.full(len(endpoint), float(target_lat)),
+            np.full(len(endpoint), float(target_lon)),
+        ]
+    )
+    horizontal = _ofes_trajectory_horizontal_distance_km(
+        endpoint, target
+    )
+    vertical = np.abs(endpoint[:, 0] - float(target_depth_m))
+    vertical[~np.all(np.isfinite(endpoint), axis=1)] = np.nan
+    return horizontal, vertical
+
+
+def _ofes_trajectory_3d_release_sensitivity(
+    particle_metadata: pd.DataFrame,
+    result: dict,
+    target_lon: float,
+    target_lat: float,
+    target_depth_m: float,
+    event_id: str,
+    integration_label: str,
+) -> pd.DataFrame:
+    """按 release ring 与初始层汇总三维位移及目标误差。"""
+    initial = np.asarray(result['positions'][0], dtype=float)
+    endpoint = np.asarray(result['positions'][-1], dtype=float)
+    horizontal, vertical = _ofes_trajectory_3d_endpoint_metrics(
+        endpoint, target_lon, target_lat, target_depth_m
+    )
+    frame = particle_metadata.copy()
+    frame['active'] = (
+        np.asarray(result['final_status']).astype(str) == 'active'
+    )
+    frame['depth_displacement_m'] = endpoint[:, 0] - initial[:, 0]
+    frame['endpoint_horizontal_error_km'] = horizontal
+    frame['endpoint_depth_error_m'] = vertical
+    records = []
+    for column, axis_label in (
+        ('ring_fraction', 'release_ring'),
+        ('depth_offset_index', 'initial_depth_level'),
+    ):
+        for value, group in frame.groupby(column, sort=True):
+            active = group.loc[group['active']].copy()
+            displacement = active['depth_displacement_m'].to_numpy(
+                dtype=float
+            )
+            horizontal_error = active[
+                'endpoint_horizontal_error_km'
+            ].to_numpy(dtype=float)
+            depth_error = active['endpoint_depth_error_m'].to_numpy(
+                dtype=float
+            )
+            records.append(
+                {
+                    'event_id': str(event_id),
+                    'integration_label': str(integration_label),
+                    'sensitivity_axis': axis_label,
+                    'axis_value': float(value),
+                    'particle_count': int(len(group)),
+                    'active_particle_count': int(len(active)),
+                    'active_fraction': float(len(active) / len(group)),
+                    'median_depth_displacement_m': (
+                        float(np.median(displacement))
+                        if displacement.size else np.nan
+                    ),
+                    'minimum_depth_displacement_m': (
+                        float(np.min(displacement))
+                        if displacement.size else np.nan
+                    ),
+                    'maximum_depth_displacement_m': (
+                        float(np.max(displacement))
+                        if displacement.size else np.nan
+                    ),
+                    'downward_displacement_fraction': (
+                        float(np.mean(displacement > 0))
+                        if displacement.size else np.nan
+                    ),
+                    'median_endpoint_horizontal_error_km': (
+                        float(np.median(horizontal_error))
+                        if horizontal_error.size else np.nan
+                    ),
+                    'median_endpoint_depth_error_m': (
+                        float(np.median(depth_error))
+                        if depth_error.size else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_run_trajectory_3d_event(
+    request: dict,
+    observed_track: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """运行单事件三维 ensemble、步长敏感性和可逆性。"""
+    peak_seeds, peak_metadata, peak_depths = (
+        _ofes_trajectory_seed_ensemble(
+            request['peak_date'],
+            request['peak_core_lon'],
+            request['peak_core_lat'],
+            request['peak_reference_depth_m'],
+            request['peak_equivalent_radius_km'],
+            settings,
+        )
+    )
+    start_seeds, start_metadata, start_depths = (
+        _ofes_trajectory_seed_ensemble(
+            request['start_date'],
+            request['start_core_lon'],
+            request['start_core_lat'],
+            request['start_reference_depth_m'],
+            request['start_equivalent_radius_km'],
+            settings,
+        )
+    )
+    if len(start_seeds) != len(peak_seeds):
+        raise RuntimeError(
+            'OFES trajectory_3d start/peak ensembles differ in size.'
+        )
+    snapshots = _ofes_load_trajectory_3d_snapshots(request, settings)
+    base_dt = float(settings['rk4_dt_seconds'])
+    integration = {
+        'backward_peak_to_start': advect_ofes_particles(
+            snapshots,
+            peak_seeds,
+            backward=True,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+            vertical_mode='three_dimensional',
+        ),
+        'forward_observed_start_to_peak': advect_ofes_particles(
+            snapshots,
+            start_seeds,
+            backward=False,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+            vertical_mode='three_dimensional',
+        ),
+    }
+    matched_controls = {
+        'backward_same_seed_fixed_depth_control': advect_ofes_particles(
+            snapshots,
+            peak_seeds,
+            backward=True,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+            vertical_mode='fixed_depth',
+        ),
+        'forward_same_seed_fixed_depth_control': advect_ofes_particles(
+            snapshots,
+            start_seeds,
+            backward=False,
+            dt_seconds=base_dt,
+            temporal_interpolation='linear',
+            vertical_mode='fixed_depth',
+        ),
+    }
+    backward_endpoint = integration[
+        'backward_peak_to_start'
+    ]['positions'][-1]
+    forward_replay = advect_ofes_particles(
+        snapshots,
+        backward_endpoint,
+        backward=False,
+        dt_seconds=base_dt,
+        temporal_interpolation='linear',
+        vertical_mode='three_dimensional',
+    )
+    integration['forward_replay_start_to_peak'] = forward_replay
+    forward_endpoint = integration[
+        'forward_observed_start_to_peak'
+    ]['positions'][-1]
+
+    timestep_endpoints = {base_dt: backward_endpoint}
+    for dt_seconds in settings['sensitivity_dt_seconds']:
+        dt_seconds = float(dt_seconds)
+        if dt_seconds == base_dt:
+            continue
+        sensitivity = advect_ofes_particles(
+            snapshots,
+            peak_seeds,
+            backward=True,
+            dt_seconds=dt_seconds,
+            temporal_interpolation='linear',
+            vertical_mode='three_dimensional',
+        )
+        timestep_endpoints[dt_seconds] = sensitivity['positions'][-1]
+    timestep = _ofes_trajectory_3d_timestep_spread(timestep_endpoints)
+    timestep_passed = bool(
+        timestep['common_active_particle_count'] / len(peak_seeds)
+        >= settings['minimum_active_fraction']
+        and timestep['median_endpoint_spread_km']
+        <= settings['timestep_endpoint_median_spread_max_km']
+        and timestep['median_endpoint_depth_spread_m']
+        <= settings['timestep_endpoint_median_depth_spread_max_m']
+    )
+
+    reversibility_records = []
+    for duration_days in settings['reversibility_days']:
+        duration_days = int(duration_days)
+        if duration_days > int(request['integration_days']):
+            reversibility_records.append(
+                {
+                    'event_id': str(request['event_id']),
+                    'duration_days': duration_days,
+                    'applicable': False,
+                    'active_particle_count': 0,
+                    'median_roundtrip_error_km': np.nan,
+                    'q90_roundtrip_error_km': np.nan,
+                    'median_roundtrip_depth_error_m': np.nan,
+                    'q90_roundtrip_depth_error_m': np.nan,
+                    'passed': np.nan,
+                }
+            )
+            continue
+        subset = snapshots[-(duration_days + 1):]
+        reverse = advect_ofes_particles(
+            subset,
+            peak_seeds,
+            backward=True,
+            dt_seconds=base_dt,
+            vertical_mode='three_dimensional',
+        )
+        replay = advect_ofes_particles(
+            subset,
+            reverse['positions'][-1],
+            backward=False,
+            dt_seconds=base_dt,
+            vertical_mode='three_dimensional',
+        )
+        horizontal = _ofes_trajectory_horizontal_distance_km(
+            peak_seeds, replay['positions'][-1]
+        )
+        vertical = np.abs(
+            peak_seeds[:, 0] - replay['positions'][-1, :, 0]
+        )
+        finite = np.isfinite(horizontal) & np.isfinite(vertical)
+        horizontal_finite = horizontal[finite]
+        vertical_finite = vertical[finite]
+        median_horizontal = (
+            float(np.median(horizontal_finite))
+            if horizontal_finite.size else np.nan
+        )
+        q90_horizontal = (
+            float(np.quantile(horizontal_finite, 0.9))
+            if horizontal_finite.size else np.nan
+        )
+        median_vertical = (
+            float(np.median(vertical_finite))
+            if vertical_finite.size else np.nan
+        )
+        q90_vertical = (
+            float(np.quantile(vertical_finite, 0.9))
+            if vertical_finite.size else np.nan
+        )
+        passed = bool(
+            np.mean(finite) >= settings['minimum_active_fraction']
+            and median_horizontal
+            <= settings['reversibility_median_error_max_km']
+            and q90_horizontal
+            <= settings['reversibility_q90_error_max_km']
+            and median_vertical
+            <= settings['reversibility_median_depth_error_max_m']
+            and q90_vertical
+            <= settings['reversibility_q90_depth_error_max_m']
+        )
+        reversibility_records.append(
+            {
+                'event_id': str(request['event_id']),
+                'duration_days': duration_days,
+                'applicable': True,
+                'active_particle_count': int(np.count_nonzero(finite)),
+                'median_roundtrip_error_km': median_horizontal,
+                'q90_roundtrip_error_km': q90_horizontal,
+                'median_roundtrip_depth_error_m': median_vertical,
+                'q90_roundtrip_depth_error_m': q90_vertical,
+                'passed': passed,
+            }
+        )
+    reversibility = pd.DataFrame(reversibility_records)
+    applicable = reversibility.loc[reversibility['applicable']]
+    reversibility_passed = bool(
+        len(applicable) and applicable['passed'].astype(bool).all()
+    )
+
+    alignments = pd.concat(
+        [
+            _ofes_trajectory_observed_alignment(
+                integration['backward_peak_to_start'],
+                observed_track,
+                str(request['event_id']),
+                'backward_peak_to_start',
+            ),
+            _ofes_trajectory_observed_alignment(
+                integration['forward_observed_start_to_peak'],
+                observed_track,
+                str(request['event_id']),
+                'forward_observed_start_to_peak',
+            ),
+            _ofes_trajectory_observed_alignment(
+                matched_controls[
+                    'backward_same_seed_fixed_depth_control'
+                ],
+                observed_track,
+                str(request['event_id']),
+                'backward_same_seed_fixed_depth_control',
+            ),
+            _ofes_trajectory_observed_alignment(
+                matched_controls[
+                    'forward_same_seed_fixed_depth_control'
+                ],
+                observed_track,
+                str(request['event_id']),
+                'forward_same_seed_fixed_depth_control',
+            ),
+        ],
+        ignore_index=True,
+    )
+    start_horizontal, start_vertical = _ofes_trajectory_3d_endpoint_metrics(
+        backward_endpoint,
+        request['start_core_lon'],
+        request['start_core_lat'],
+        request['start_reference_depth_m'],
+    )
+    peak_horizontal, peak_vertical = _ofes_trajectory_3d_endpoint_metrics(
+        forward_endpoint,
+        request['peak_core_lon'],
+        request['peak_core_lat'],
+        request['peak_reference_depth_m'],
+    )
+    replay_horizontal = _ofes_trajectory_horizontal_distance_km(
+        peak_seeds, forward_replay['positions'][-1]
+    )
+    replay_vertical = np.abs(
+        peak_seeds[:, 0] - forward_replay['positions'][-1, :, 0]
+    )
+    backward_active = (
+        integration['backward_peak_to_start']['final_status'].astype(str)
+        == 'active'
+    )
+    forward_active = (
+        integration['forward_observed_start_to_peak'][
+            'final_status'
+        ].astype(str)
+        == 'active'
+    )
+    replay_active = (
+        forward_replay['final_status'].astype(str) == 'active'
+    )
+    active_roundtrip = backward_active & replay_active
+    backward_alignment = alignments.loc[
+        alignments['integration_label'] == 'backward_peak_to_start'
+    ]
+    forward_alignment = alignments.loc[
+        alignments['integration_label']
+        == 'forward_observed_start_to_peak'
+    ]
+    matched_backward_alignment = alignments.loc[
+        alignments['integration_label']
+        == 'backward_same_seed_fixed_depth_control'
+    ]
+    matched_forward_alignment = alignments.loc[
+        alignments['integration_label']
+        == 'forward_same_seed_fixed_depth_control'
+    ]
+    forward_displacement = (
+        forward_endpoint[:, 0] - start_seeds[:, 0]
+    )
+    event_passed = bool(
+        np.mean(backward_active) >= settings['minimum_active_fraction']
+        and np.mean(forward_active) >= settings['minimum_active_fraction']
+        and np.mean(active_roundtrip) >= settings['minimum_active_fraction']
+        and timestep_passed
+        and reversibility_passed
+    )
+    summary = {
+        **request,
+        'particle_count': int(len(peak_seeds)),
+        'peak_release_depths_m': list(peak_depths),
+        'start_release_depths_m': list(start_depths),
+        'backward_active_fraction': float(np.mean(backward_active)),
+        'forward_observed_start_active_fraction': float(
+            np.mean(forward_active)
+        ),
+        'active_roundtrip_fraction': float(np.mean(active_roundtrip)),
+        'full_interval_roundtrip_median_error_km': float(
+            np.nanmedian(replay_horizontal)
+        ),
+        'full_interval_roundtrip_median_depth_error_m': float(
+            np.nanmedian(replay_vertical)
+        ),
+        'backtracked_source_to_observed_start_median_km': float(
+            np.nanmedian(start_horizontal)
+        ),
+        'backtracked_source_to_observed_start_median_depth_error_m': float(
+            np.nanmedian(start_vertical)
+        ),
+        'forward_start_to_observed_peak_median_km': float(
+            np.nanmedian(peak_horizontal)
+        ),
+        'forward_start_to_observed_peak_median_depth_error_m': float(
+            np.nanmedian(peak_vertical)
+        ),
+        'backward_ensemble_to_observed_core_median_km': float(
+            backward_alignment['centroid_to_observed_core_km'].median()
+        ),
+        'backward_ensemble_to_observed_core_median_depth_error_m': float(
+            backward_alignment[
+                'centroid_to_observed_core_depth_error_m'
+            ].median()
+        ),
+        'forward_ensemble_to_observed_core_median_km': float(
+            forward_alignment['centroid_to_observed_core_km'].median()
+        ),
+        'forward_ensemble_to_observed_core_median_depth_error_m': float(
+            forward_alignment[
+                'centroid_to_observed_core_depth_error_m'
+            ].median()
+        ),
+        'forward_ensemble_centroid_depth_change_m': float(
+            forward_alignment.sort_values('date')[
+                'ensemble_centroid_depth_m'
+            ].iloc[-1]
+            - forward_alignment.sort_values('date')[
+                'ensemble_centroid_depth_m'
+            ].iloc[0]
+        ),
+        'forward_particle_downward_displacement_fraction': float(
+            np.mean(forward_displacement[np.isfinite(forward_displacement)] > 0)
+        ),
+        'observed_core_depth_change_m': float(
+            observed_track.sort_values('date')['peak_depth_at_max'].iloc[-1]
+            - observed_track.sort_values('date')['peak_depth_at_max'].iloc[0]
+        ),
+        'matched_fixed_depth_backward_core_median_km': float(
+            matched_backward_alignment[
+                'centroid_to_observed_core_km'
+            ].median()
+        ),
+        'matched_fixed_depth_forward_core_median_km': float(
+            matched_forward_alignment[
+                'centroid_to_observed_core_km'
+            ].median()
+        ),
+        'matched_fixed_depth_forward_core_median_depth_error_m': float(
+            matched_forward_alignment[
+                'centroid_to_observed_core_depth_error_m'
+            ].median()
+        ),
+        'three_dimensional_minus_matched_fixed_depth_forward_core_km': float(
+            forward_alignment['centroid_to_observed_core_km'].median()
+            - matched_forward_alignment[
+                'centroid_to_observed_core_km'
+            ].median()
+        ),
+        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m': (
+            float(
+                forward_alignment[
+                    'centroid_to_observed_core_depth_error_m'
+                ].median()
+                - matched_forward_alignment[
+                    'centroid_to_observed_core_depth_error_m'
+                ].median()
+            )
+        ),
+        **timestep,
+        'timestep_sensitivity_passed': timestep_passed,
+        'reversibility_passed': reversibility_passed,
+        'event_validation_passed': event_passed,
+    }
+    trajectories = pd.concat(
+        [
+            _ofes_trajectory_result_frame(
+                result,
+                peak_metadata
+                if label
+                not in (
+                    'forward_observed_start_to_peak',
+                    'forward_same_seed_fixed_depth_control',
+                )
+                else start_metadata,
+                str(request['event_id']),
+                label,
+                base_dt,
+            )
+            for label, result in {**integration, **matched_controls}.items()
+        ],
+        ignore_index=True,
+    )
+    particle_metadata = pd.concat(
+        [
+            peak_metadata.assign(
+                event_id=str(request['event_id']), release_label='peak'
+            ),
+            start_metadata.assign(
+                event_id=str(request['event_id']),
+                release_label='observed_start',
+            ),
+        ],
+        ignore_index=True,
+    )
+    release_sensitivity = pd.concat(
+        [
+            _ofes_trajectory_3d_release_sensitivity(
+                peak_metadata,
+                integration['backward_peak_to_start'],
+                request['start_core_lon'],
+                request['start_core_lat'],
+                request['start_reference_depth_m'],
+                str(request['event_id']),
+                'backward_peak_to_start',
+            ),
+            _ofes_trajectory_3d_release_sensitivity(
+                start_metadata,
+                integration['forward_observed_start_to_peak'],
+                request['peak_core_lon'],
+                request['peak_core_lat'],
+                request['peak_reference_depth_m'],
+                str(request['event_id']),
+                'forward_observed_start_to_peak',
+            ),
+        ],
+        ignore_index=True,
+    )
+    return {
+        'summary': summary,
+        'trajectories': trajectories,
+        'particle_metadata': particle_metadata,
+        'reversibility': reversibility,
+        'observed_alignment': alignments,
+        'release_sensitivity': release_sensitivity,
+    }
+
+
+def _plot_ofes_3d_trajectory_ensembles(
+    trajectories: pd.DataFrame,
+    observed_alignment: pd.DataFrame,
+    observed_tracks: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制显式选择事件的三维 ensemble 水平路径与深度-时间对照。"""
+    events = event_summary.sort_values('event_order', kind='mergesort')
+    figure, axes = plt.subplots(
+        2,
+        len(events),
+        figsize=(18, 10),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for column, event in enumerate(events.itertuples(index=False)):
+        event_id = str(event.event_id)
+        axis_map = axes[0, column]
+        axis_depth = axes[1, column]
+        for label, color in (
+            ('backward_peak_to_start', '#7b61a8'),
+            ('forward_observed_start_to_peak', '#4c78a8'),
+        ):
+            group = trajectories.loc[
+                (trajectories['event_id'] == event_id)
+                & (trajectories['integration_label'] == label)
+            ]
+            for _, particle in group.groupby('particle_index', sort=False):
+                active = particle.loc[particle['status'] == 'active']
+                axis_map.plot(
+                    active['lon'],
+                    active['lat'],
+                    color=color,
+                    linewidth=0.5,
+                    alpha=0.14,
+                )
+                axis_depth.plot(
+                    active['time'],
+                    active['depth_m'],
+                    color=color,
+                    linewidth=0.45,
+                    alpha=0.10,
+                )
+        track = observed_tracks.loc[
+            observed_tracks['event_id'].astype(str) == event_id
+        ].sort_values('date', kind='mergesort')
+        axis_map.plot(
+            track['peak_lon'],
+            track['peak_lat'],
+            color='#111827',
+            linewidth=1.8,
+            marker='o',
+            markersize=3,
+            label='ΔDO core',
+        )
+        axis_depth.plot(
+            track['date'],
+            track['peak_depth_at_max'],
+            color='#111827',
+            linewidth=2.0,
+            marker='o',
+            markersize=3,
+            label='ΔDO peak depth',
+        )
+        for label, color, legend in (
+            ('backward_peak_to_start', '#d95f59', 'Backward centroid'),
+            (
+                'forward_observed_start_to_peak',
+                '#2563eb',
+                'Forward centroid',
+            ),
+        ):
+            alignment = observed_alignment.loc[
+                (observed_alignment['event_id'] == event_id)
+                & (observed_alignment['integration_label'] == label)
+            ].sort_values('date', kind='mergesort')
+            axis_map.plot(
+                alignment['ensemble_centroid_lon'],
+                alignment['ensemble_centroid_lat'],
+                color=color,
+                linewidth=2.0,
+                marker='s',
+                markersize=3,
+                label=legend,
+            )
+            axis_depth.plot(
+                alignment['date'],
+                alignment['ensemble_centroid_depth_m'],
+                color=color,
+                linewidth=2.0,
+                marker='s',
+                markersize=3,
+                label=legend,
+            )
+        axis_map.set_title(
+            f'{event_id.replace("OFES_DO50_", "")}\n'
+            f'{event.regime_label}; '
+            f'{event.active_roundtrip_fraction:.0%} minimum active'
+        )
+        axis_map.set_xlabel('Longitude')
+        axis_map.set_ylabel('Latitude')
+        axis_map.grid(alpha=0.2)
+        axis_map.set_aspect('equal', adjustable='datalim')
+        axis_depth.invert_yaxis()
+        axis_depth.set_xlabel('Date')
+        axis_depth.set_ylabel('Depth (m)')
+        axis_depth.grid(alpha=0.2)
+        axis_depth.tick_params(axis='x', rotation=30)
+    map_handles, map_labels = axes[0, 0].get_legend_handles_labels()
+    depth_handles, depth_labels = axes[1, 0].get_legend_handles_labels()
+    figure.legend(
+        map_handles + depth_handles,
+        map_labels + depth_labels,
+        loc='outside lower center',
+        ncol=5,
+        frameon=False,
+    )
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        figure_dpi,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_3d_trajectory_ensembles(
+    onset_run_dir: str | Path | None = None,
+    patch_run_dir: str | Path | None = None,
+    w_validation_run_dir: str | Path | None = None,
+    trajectory_2d_run_dir: str | Path | None = None,
+    *,
+    trajectory_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """运行显式选择事件的 u/v/w 三维 ensemble trajectory。
+
+        workflow 首先验证 `w` 连续方程结果与三维 RK4 解析场，
+    再在完整交付深度域中对调用方选择的事件做 peak-to-start 回溯、
+    observed-start-to-peak 正向追踪、回放可逆性和
+    1800/3600/7200 s 步长敏感性。输出同时与已完成二维运行及逐日
+    ΔDO 核的水平位置、峰值深度分开对照。
+
+    参数:
+        - onset_run_dir (str | Path | None): onset 运行目录；None 使用固定 `event_onset` 输出。
+        - patch_run_dir (str | Path | None): patch continuity 运行目录；None 使用固定 `event_patch` 输出。
+        - w_validation_run_dir (str | Path | None): `w` 验证目录；None 使用固定 `vertical_velocity_validation` 输出。
+        - trajectory_2d_run_dir (str | Path | None): 二维固定深度对照目录；None 使用固定 `trajectory_2d` 输出。
+        - trajectory_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d` 配置；其中
+          `event_ids` 由 notebook setup cell 显式提供。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_3d` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、解析场验证、逐事件摘要、trajectory 长表、可逆性、observed alignment、release 敏感性、二维对照、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`analytic_validation.json`、`event_summary.parquet`、`trajectories.parquet`、`reversibility.parquet`、`observed_alignment.parquet`、`comparison_to_2d.parquet`、`release_sensitivity.parquet`、`analysis_summary.json`、`trajectory_3d_ensembles.png` 与 `manifest.json`。
+
+    说明:
+        - 三维路径必须消费通过连续方程门槛的 `w` 验证结果；单靠 MOM3 文档约定不会解锁。
+        - 原 patch continuity 失败时，三维路径可作 resolved-pathway 证据，仍不解锁强水团来源或严格 SCV 身份措辞。
+    """
+    onset_root = (
+        Path(onset_run_dir)
+        if onset_run_dir is not None
+        else _ofes_analysis_output_dir('event_onset')
+    )
+    patch_root = (
+        Path(patch_run_dir)
+        if patch_run_dir is not None
+        else _ofes_analysis_output_dir('event_patch')
+    )
+    validation_root = (
+        Path(w_validation_run_dir)
+        if w_validation_run_dir is not None
+        else _ofes_analysis_output_dir('vertical_velocity_validation')
+    )
+    two_dimensional_root = (
+        Path(trajectory_2d_run_dir)
+        if trajectory_2d_run_dir is not None
+        else _ofes_analysis_output_dir('trajectory_2d')
+    )
+    settings = _ofes_trajectory_3d_settings(trajectory_overrides)
+    requests, observed_tracks = _ofes_trajectory_event_requests(
+        onset_root, settings
+    )
+    validation_summary_path = validation_root / 'analysis_summary.json'
+    validation_summary = json.loads(
+        validation_summary_path.read_text(encoding='utf-8')
+    )
+    if validation_summary.get('validation_passed') is not True:
+        raise RuntimeError(
+            'OFES trajectory_3d requires a complete, passed w validation.'
+        )
+    patch_gate_path = patch_root / 'trajectory_interpretation_gate.json'
+    patch_gate = json.loads(patch_gate_path.read_text(encoding='utf-8'))
+    two_dimensional_summary = pd.read_parquet(
+        two_dimensional_root / 'event_summary.parquet'
+    )
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+        'event_ids': [str(value) for value in requests['event_id']],
+        'start_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['start_date']
+        ],
+        'peak_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['peak_date']
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'analytic_validation': json.loads(
+                Path(outputs['analytic_validation']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'event_summary': pd.read_parquet(outputs['event_summary']),
+            'trajectories': pd.read_parquet(outputs['trajectories']),
+            'reversibility': pd.read_parquet(outputs['reversibility']),
+            'observed_alignment': pd.read_parquet(
+                outputs['observed_alignment']
+            ),
+            'comparison_to_2d': pd.read_parquet(outputs['comparison_to_2d']),
+            'release_sensitivity': pd.read_parquet(
+                outputs['release_sensitivity']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_inventory = _ofes_trajectory_3d_source_inventory(requests)
+    manifest = {
+        'analysis': 'trajectory_3d',
+        'request': request,
+        'settings': settings,
+        'w_validation_passed': True,
+        'patch_gate_passed': bool(
+            patch_gate.get('headline_candidate_pathway_gate_passed', False)
+        ),
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(
+        observed_tracks, run_dir / 'observed_object_tracks.parquet'
+    )
+    completed = 0
+    try:
+        analytic_validation = _validate_ofes_3d_trajectory_integrator(
+            settings
+        )
+        analytic_path = run_dir / 'analytic_validation.json'
+        _ofes_atomic_write_json(analytic_validation, analytic_path)
+        results = []
+        for request in requests.to_dict(orient='records'):
+            event_id = str(request['event_id'])
+            event_dir = events_dir / event_id
+            event_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = event_dir / 'summary.json'
+            trajectories_path = event_dir / 'trajectories.parquet'
+            particle_path = event_dir / 'particle_metadata.parquet'
+            reversibility_path = event_dir / 'reversibility.parquet'
+            alignment_path = event_dir / 'observed_alignment.parquet'
+            release_sensitivity_path = (
+                event_dir / 'release_sensitivity.parquet'
+            )
+            reusable = False
+            if all(
+                path.exists()
+                for path in (
+                    summary_path,
+                    trajectories_path,
+                    particle_path,
+                    reversibility_path,
+                    alignment_path,
+                    release_sensitivity_path,
+                )
+            ):
+                stored = json.loads(summary_path.read_text(encoding='utf-8'))
+                _ofes_assert_summary_request(
+                    stored,
+                    event_id,
+                    start_date=pd.Timestamp(request['start_date']),
+                    peak_date=pd.Timestamp(request['peak_date']),
+                )
+                reusable = bool(len(pd.read_parquet(trajectories_path)))
+            if reusable:
+                result = {
+                    'summary': stored,
+                    'trajectories': pd.read_parquet(trajectories_path),
+                    'particle_metadata': pd.read_parquet(particle_path),
+                    'reversibility': pd.read_parquet(reversibility_path),
+                    'observed_alignment': pd.read_parquet(alignment_path),
+                    'release_sensitivity': pd.read_parquet(
+                        release_sensitivity_path
+                    ),
+                }
+            else:
+                observed_track = observed_tracks.loc[
+                    observed_tracks['event_id'].astype(str) == event_id
+                ]
+                result = _ofes_run_trajectory_3d_event(
+                    request,
+                    observed_track,
+                    settings,
+                )
+                _ofes_atomic_write_json(result['summary'], summary_path)
+                _atomic_write_parquet(
+                    result['trajectories'], trajectories_path
+                )
+                _atomic_write_parquet(
+                    result['particle_metadata'], particle_path
+                )
+                _atomic_write_parquet(
+                    result['reversibility'], reversibility_path
+                )
+                _atomic_write_parquet(
+                    result['observed_alignment'], alignment_path
+                )
+                _atomic_write_parquet(
+                    result['release_sensitivity'],
+                    release_sensitivity_path,
+                )
+            results.append(result)
+            completed += 1
+            manifest.update(
+                {
+                    'completed_events': completed,
+                    'updated_at_utc': pd.Timestamp.now(
+                        tz='UTC'
+                    ).isoformat(),
+                }
+            )
+            _ofes_atomic_write_json(manifest, manifest_path)
+        event_summary = pd.DataFrame(
+            [result['summary'] for result in results]
+        ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+        trajectories = pd.concat(
+            [result['trajectories'] for result in results],
+            ignore_index=True,
+        )
+        reversibility = pd.concat(
+            [result['reversibility'] for result in results],
+            ignore_index=True,
+        )
+        observed_alignment = pd.concat(
+            [result['observed_alignment'] for result in results],
+            ignore_index=True,
+        )
+        release_sensitivity = pd.concat(
+            [result['release_sensitivity'] for result in results],
+            ignore_index=True,
+        )
+        comparison_columns = (
+            'backtracked_source_to_observed_start_median_km',
+            'forward_start_to_observed_peak_median_km',
+            'backward_ensemble_to_observed_core_median_km',
+            'forward_ensemble_to_observed_core_median_km',
+        )
+        comparison_to_2d = event_summary[
+            ['event_id', *comparison_columns]
+        ].merge(
+            two_dimensional_summary[['event_id', *comparison_columns]],
+            on='event_id',
+            how='left',
+            validate='one_to_one',
+            suffixes=('_3d', '_2d'),
+        )
+        for column in comparison_columns:
+            comparison_to_2d[f'{column}_change_3d_minus_2d'] = (
+                comparison_to_2d[f'{column}_3d']
+                - comparison_to_2d[f'{column}_2d']
+            )
+        all_validation_passed = bool(
+            analytic_validation['passed']
+            and event_summary['event_validation_passed'].all()
+        )
+        headline = event_summary.iloc[0]
+        headline_vertical_alignment_passed = bool(
+            headline[
+                'forward_ensemble_to_observed_core_median_depth_error_m'
+            ]
+            <= settings['headline_vertical_alignment_median_max_m']
+        )
+        headline_downward_pathway_passed = bool(
+            headline['forward_ensemble_centroid_depth_change_m']
+            >= settings['headline_downward_displacement_min_m']
+        )
+        patch_source_gate_passed = bool(
+            patch_gate.get('trajectory_interpretation_unlocked', False)
+        )
+        resolved_3d_pathway_supported = bool(
+            all_validation_passed
+            and headline_vertical_alignment_passed
+            and headline_downward_pathway_passed
+        )
+        analysis_summary = {
+            'all_validation_passed': all_validation_passed,
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'event_validation_passed_count': int(
+                event_summary['event_validation_passed'].sum()
+            ),
+            'event_count': int(len(event_summary)),
+            'headline_event_id': str(headline['event_id']),
+            'headline_forward_depth_change_m': float(
+                headline['forward_ensemble_centroid_depth_change_m']
+            ),
+            'headline_forward_particle_downward_fraction': float(
+                headline[
+                    'forward_particle_downward_displacement_fraction'
+                ]
+            ),
+            'headline_observed_core_depth_change_m': float(
+                headline['observed_core_depth_change_m']
+            ),
+            'headline_forward_vertical_alignment_median_error_m': float(
+                headline[
+                    'forward_ensemble_to_observed_core_median_depth_error_m'
+                ]
+            ),
+            'headline_vertical_alignment_passed': (
+                headline_vertical_alignment_passed
+            ),
+            'headline_downward_pathway_passed': (
+                headline_downward_pathway_passed
+            ),
+            'headline_matched_fixed_depth_forward_core_median_km': float(
+                headline['matched_fixed_depth_forward_core_median_km']
+            ),
+            'headline_three_dimensional_minus_matched_fixed_depth_forward_core_km': (
+                float(
+                    headline[
+                        'three_dimensional_minus_matched_fixed_depth_forward_core_km'
+                    ]
+                )
+            ),
+            'headline_three_dimensional_minus_matched_fixed_depth_forward_depth_error_m': (
+                float(
+                    headline[
+                        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m'
+                    ]
+                )
+            ),
+            'resolved_3d_pathway_supported': (
+                resolved_3d_pathway_supported
+            ),
+            'headline_patch_interpretation_gate_passed': (
+                patch_source_gate_passed
+            ),
+            'material_source_interpretation_unlocked': bool(
+                resolved_3d_pathway_supported and patch_source_gate_passed
+            ),
+            'vertical_velocity_validation_passed': True,
+            'interpretation': (
+                'The validated u/v/w ensemble resolves a downward pathway '
+                'consistent with the headline anomaly-core depth evolution; '
+                'the independent patch gate still controls any material-source '
+                'claim.'
+                if resolved_3d_pathway_supported
+                else
+                'The validated u/v/w ensemble does not meet every predeclared '
+                'headline vertical-pathway gate; retain it as a sensitivity '
+                'diagnostic rather than pathway evidence.'
+            ),
+            'limits': [
+                'Daily-mean resolved velocity omits unresolved mixing, '
+                'diffusion, and submesoscale transport.',
+                'Particle/core agreement tests a resolved pathway but does '
+                'not establish strict SCV identity.',
+                'The caller-selected patch gate remains separate from the '
+                'resolved-pathway gate.',
+            ],
+        }
+        event_path = run_dir / 'event_summary.parquet'
+        trajectories_path = run_dir / 'trajectories.parquet'
+        reversibility_path = run_dir / 'reversibility.parquet'
+        alignment_path = run_dir / 'observed_alignment.parquet'
+        comparison_path = run_dir / 'comparison_to_2d.parquet'
+        release_sensitivity_path = run_dir / 'release_sensitivity.parquet'
+        analysis_path = run_dir / 'analysis_summary.json'
+        figure_path = run_dir / 'trajectory_3d_ensembles.png'
+        _atomic_write_parquet(event_summary, event_path)
+        _atomic_write_parquet(trajectories, trajectories_path)
+        _atomic_write_parquet(reversibility, reversibility_path)
+        _atomic_write_parquet(observed_alignment, alignment_path)
+        _atomic_write_parquet(comparison_to_2d, comparison_path)
+        _atomic_write_parquet(
+            release_sensitivity, release_sensitivity_path
+        )
+        _ofes_atomic_write_json(analysis_summary, analysis_path)
+        _plot_ofes_3d_trajectory_ensembles(
+            trajectories,
+            observed_alignment,
+            observed_tracks,
+            event_summary,
+            figure_path,
+            settings['figure_dpi'],
+        )
+        outputs = {
+            'analytic_validation': str(analytic_path.resolve()),
+            'event_summary': str(event_path.resolve()),
+            'trajectories': str(trajectories_path.resolve()),
+            'reversibility': str(reversibility_path.resolve()),
+            'observed_alignment': str(alignment_path.resolve()),
+            'comparison_to_2d': str(comparison_path.resolve()),
+            'release_sensitivity': str(
+                release_sensitivity_path.resolve()
+            ),
+            'analysis_summary': str(analysis_path.resolve()),
+            'figure': str(figure_path.resolve()),
+            'source_inventory': str(
+                (run_dir / 'source_inventory.parquet').resolve()
+            ),
+            'observed_object_tracks': str(
+                (run_dir / 'observed_object_tracks.parquet').resolve()
+            ),
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': int(len(event_summary)),
+                'all_validation_passed': all_validation_passed,
+                'resolved_3d_pathway_supported': (
+                    resolved_3d_pathway_supported
+                ),
+                'material_source_interpretation_unlocked': bool(
+                    resolved_3d_pathway_supported
+                    and patch_source_gate_passed
+                ),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'analytic_validation': analytic_validation,
+        'event_summary': event_summary,
+        'trajectories': trajectories,
+        'reversibility': reversibility,
+        'observed_alignment': observed_alignment,
+        'comparison_to_2d': comparison_to_2d,
+        'release_sensitivity': release_sensitivity,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_trajectory_3d_population_requests(
+    population_run_dir: str | Path,
+    population_settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """从当前通过总体诊断的事件构建严格 start-to-peak 请求。"""
+    population_root = Path(population_run_dir)
+    diagnostics_path = population_root / 'population_peak_diagnostics.parquet'
+    if not diagnostics_path.exists():
+        raise FileNotFoundError(
+            f'OFES trajectory population diagnostics are missing: {diagnostics_path}'
+        )
+    population = pd.read_parquet(diagnostics_path).sort_values(
+        'population_event_index', kind='mergesort'
+    ).reset_index(drop=True)
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    daily_objects['date'] = pd.to_datetime(
+        daily_objects['date']
+    ).dt.normalize()
+    eligibility_records = []
+    request_records = []
+    observed_tracks = []
+    minimum_days = int(population_settings['minimum_integration_days'])
+    for event in population.itertuples(index=False):
+        event_id = str(event.event_id)
+        start_date = pd.Timestamp(event.start_date).normalize()
+        peak_date = pd.Timestamp(event.peak_date).normalize()
+        integration_days = int((peak_date - start_date).days)
+        background_complete = bool(
+            event.background_annulus_within_delivery_window
+        )
+        population_passed = bool(event.population_diagnostic_passed)
+        if not population_passed or not background_complete:
+            eligibility_status = 'excluded_delivery_edge'
+        elif integration_days < minimum_days:
+            eligibility_status = 'excluded_no_time_expansion'
+        else:
+            eligibility_status = 'eligible'
+        eligibility_records.append(
+            {
+                'population_event_index': int(event.population_event_index),
+                'event_id': event_id,
+                'start_date': start_date,
+                'peak_date': peak_date,
+                'integration_days': integration_days,
+                'population_diagnostic_passed': population_passed,
+                'background_annulus_within_delivery_window': (
+                    background_complete
+                ),
+                'trajectory_population_eligible': bool(
+                    eligibility_status == 'eligible'
+                ),
+                'trajectory_population_status': eligibility_status,
+            }
+        )
+        if eligibility_status != 'eligible':
+            continue
+        event_track = daily_objects.loc[
+            (daily_objects['threshold'] == 50.0)
+            & (daily_objects['event_id'].astype(str) == event_id)
+            & (daily_objects['date'] >= start_date)
+            & (daily_objects['date'] <= peak_date)
+        ].sort_values('date', kind='mergesort').copy()
+        start_rows = event_track.loc[event_track['date'] == start_date]
+        peak_rows = event_track.loc[
+            event_track['daily_object_key'].astype(str)
+            == str(event.peak_daily_object_key)
+        ]
+        if len(start_rows) != 1 or len(peak_rows) != 1:
+            raise RuntimeError(
+                'OFES trajectory population start/peak object is ambiguous '
+                f'for {event_id}: start={len(start_rows)}, peak={len(peak_rows)}.'
+            )
+        start = start_rows.iloc[0]
+        peak = peak_rows.iloc[0]
+        request_records.append(
+            {
+                'event_order': int(event.population_event_index),
+                'event_id': event_id,
+                'regime_label': str(event.kinematic_regime),
+                'selection_criterion': (
+                    'population_background_complete_and_time_expanded'
+                ),
+                'start_date': start_date,
+                'peak_date': peak_date,
+                'integration_days': integration_days,
+                'observed_object_days': int(len(event_track)),
+                'start_core_lon': float(start['peak_lon']),
+                'start_core_lat': float(start['peak_lat']),
+                'peak_core_lon': float(peak['peak_lon']),
+                'peak_core_lat': float(peak['peak_lat']),
+                'reference_depth_m': float(event.reference_depth_m),
+                'start_reference_depth_m': float(
+                    start['peak_depth_at_max']
+                ),
+                'peak_reference_depth_m': float(
+                    peak['peak_depth_at_max']
+                ),
+                'start_equivalent_radius_km': float(
+                    start['equivalent_radius_km']
+                ),
+                'peak_equivalent_radius_km': float(
+                    event.daily_peak_equivalent_radius_km
+                ),
+                'observed_lon_min': float(event_track['peak_lon'].min()),
+                'observed_lon_max': float(event_track['peak_lon'].max()),
+                'observed_lat_min': float(event_track['peak_lat'].min()),
+                'observed_lat_max': float(event_track['peak_lat'].max()),
+            }
+        )
+        event_track.insert(
+            0, 'trajectory_event_order', int(event.population_event_index)
+        )
+        observed_tracks.append(event_track)
+    requests = pd.DataFrame(request_records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    eligibility = pd.DataFrame(eligibility_records).sort_values(
+        'population_event_index', kind='mergesort'
+    ).reset_index(drop=True)
+    if requests.empty or not observed_tracks:
+        raise RuntimeError('OFES trajectory population has no eligible events.')
+    if not requests['integration_days'].ge(minimum_days).all():
+        raise RuntimeError(
+            'OFES trajectory population contains a short integration request.'
+        )
+    return (
+        requests,
+        pd.concat(observed_tracks, ignore_index=True),
+        eligibility,
+    )
+
+
+def _ofes_trajectory_3d_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回单事件三维 trajectory fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'trajectories': event_dir / 'trajectories.parquet',
+        'particle_metadata': event_dir / 'particle_metadata.parquet',
+        'reversibility': event_dir / 'reversibility.parquet',
+        'observed_alignment': event_dir / 'observed_alignment.parquet',
+        'release_sensitivity': event_dir / 'release_sensitivity.parquet',
+    }
+
+
+def _ofes_trajectory_3d_fragment_reusable(
+    paths: dict[str, Path],
+    event_id: str | None = None,
+    start_date: pd.Timestamp | None = None,
+    peak_date: pd.Timestamp | None = None,
+) -> bool:
+    """判定单事件 fragment 是否完整。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    _ofes_assert_summary_request(
+        stored,
+        event_id,
+        start_date=start_date,
+        peak_date=peak_date,
+    )
+    table_columns = {
+        'trajectories': {
+            'event_id', 'time', 'particle_index', 'depth_m', 'lat', 'lon',
+            'status', 'integration_label',
+        },
+        'particle_metadata': {'particle_index', 'particle_id'},
+        'reversibility': {'event_id'},
+        'observed_alignment': {'event_id'},
+        'release_sensitivity': {'event_id'},
+    }
+    for key, columns in table_columns.items():
+        frame = pd.read_parquet(paths[key])
+        if frame.empty or not columns.issubset(frame.columns):
+            return False
+    return bool(stored.get('event_validation_passed') is not None)
+
+
+def _ofes_run_trajectory_3d_population_worker(payload: dict) -> dict:
+    """在独立进程运行并原子写入一个事件 fragment。"""
+    request = dict(payload['request'])
+    event_id = str(request['event_id'])
+    paths = _ofes_trajectory_3d_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    result = _ofes_run_trajectory_3d_event(
+        request,
+        payload['observed_track'],
+        payload['trajectory_settings'],
+    )
+    _ofes_atomic_write_json(result['summary'], paths['summary'])
+    for key in (
+        'trajectories',
+        'particle_metadata',
+        'reversibility',
+        'observed_alignment',
+        'release_sensitivity',
+    ):
+        _atomic_write_parquet(result[key], paths[key])
+    return {
+        'event_id': event_id,
+        'event_order': int(request['event_order']),
+        'integration_days': int(request['integration_days']),
+    }
+
+
+def _ofes_load_trajectory_3d_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的三维 trajectory fragment。"""
+    paths = _ofes_trajectory_3d_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        **{
+            key: pd.read_parquet(paths[key])
+            for key in (
+                'trajectories',
+                'particle_metadata',
+                'reversibility',
+                'observed_alignment',
+                'release_sensitivity',
+            )
+        },
+    }
+
+
+def _ofes_trajectory_3d_representative_parity(
+    event_summary: pd.DataFrame,
+    representative_run_dir: str | Path,
+    absolute_tolerance: float,
+) -> tuple[pd.DataFrame, dict]:
+    """核对总体运行与已验证三事件运行的逐值一致性。"""
+    representative_root = Path(representative_run_dir)
+    representative_path = representative_root / 'event_summary.parquet'
+    if not representative_path.exists():
+        raise FileNotFoundError(
+            f'OFES representative trajectory summary is missing: {representative_path}'
+        )
+    representative = pd.read_parquet(
+        representative_path
+    )
+    metrics = (
+        'backward_active_fraction',
+        'forward_observed_start_active_fraction',
+        'active_roundtrip_fraction',
+        'full_interval_roundtrip_median_error_km',
+        'full_interval_roundtrip_median_depth_error_m',
+        'backtracked_source_to_observed_start_median_km',
+        'backtracked_source_to_observed_start_median_depth_error_m',
+        'forward_start_to_observed_peak_median_km',
+        'forward_start_to_observed_peak_median_depth_error_m',
+        'backward_ensemble_to_observed_core_median_km',
+        'backward_ensemble_to_observed_core_median_depth_error_m',
+        'forward_ensemble_to_observed_core_median_km',
+        'forward_ensemble_to_observed_core_median_depth_error_m',
+        'forward_ensemble_centroid_depth_change_m',
+        'forward_particle_downward_displacement_fraction',
+        'observed_core_depth_change_m',
+        'matched_fixed_depth_forward_core_median_km',
+        'matched_fixed_depth_forward_core_median_depth_error_m',
+        'three_dimensional_minus_matched_fixed_depth_forward_core_km',
+        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m',
+        'median_endpoint_spread_km',
+        'median_endpoint_depth_spread_m',
+    )
+    merged = representative[['event_id', *metrics]].merge(
+        event_summary[['event_id', *metrics]],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+        suffixes=('_representative', '_population'),
+    )
+    records = []
+    for row in merged.itertuples(index=False):
+        for metric in metrics:
+            representative_value = float(
+                getattr(row, f'{metric}_representative')
+            )
+            population_value = float(
+                getattr(row, f'{metric}_population')
+            )
+            records.append(
+                {
+                    'event_id': str(row.event_id),
+                    'metric': metric,
+                    'representative_value': representative_value,
+                    'population_value': population_value,
+                    'absolute_difference': abs(
+                        representative_value - population_value
+                    ),
+                }
+            )
+    parity = pd.DataFrame(records)
+    passed = bool(
+        parity['absolute_difference'].notna().all()
+        and parity['absolute_difference'].le(absolute_tolerance).all()
+    )
+    summary = {
+        'passed': passed,
+        'representative_event_count': int(len(merged)),
+        'metric_count_per_event': int(len(metrics)),
+        'maximum_absolute_difference': float(
+            parity['absolute_difference'].max()
+        ),
+        'absolute_tolerance': float(absolute_tolerance),
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES representative trajectory parity failed: {summary}'
+        )
+    return parity, summary
+
+
+def _ofes_trajectory_3d_population_classification(
+    event_summary: pd.DataFrame,
+    population: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """用预注册位移与对齐门槛对总体三维路径分类。"""
+    population_columns = (
+        'event_id',
+        'deep_sensitivity_rank_within_threshold',
+        'kinematic_regime',
+        'rotation_dominated',
+        'negative_subsurface_rossby_number',
+        'surface_weak_or_reversed_rotation',
+        'water_mass_dominated',
+    )
+    classified = event_summary.merge(
+        population[list(population_columns)],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+        suffixes=('', '_population'),
+    )
+    observed_threshold = float(settings['observed_depth_change_min_m'])
+    particle_threshold = float(settings['particle_depth_change_min_m'])
+    observed_change = classified['observed_core_depth_change_m'].to_numpy(
+        dtype=float
+    )
+    particle_change = classified[
+        'forward_ensemble_centroid_depth_change_m'
+    ].to_numpy(dtype=float)
+    classified['observed_vertical_motion'] = np.select(
+        [observed_change >= observed_threshold,
+         observed_change <= -observed_threshold],
+        ['downward', 'upward'],
+        default='weak_or_unresolved',
+    )
+    classified['particle_vertical_motion'] = np.select(
+        [particle_change >= particle_threshold,
+         particle_change <= -particle_threshold],
+        ['downward', 'upward'],
+        default='weak_or_unresolved',
+    )
+    classified['direction_evaluable'] = (
+        classified['observed_vertical_motion'] != 'weak_or_unresolved'
+    ) & (
+        classified['particle_vertical_motion'] != 'weak_or_unresolved'
+    )
+    classified['vertical_direction_matched'] = (
+        classified['direction_evaluable']
+        & (
+            classified['observed_vertical_motion']
+            == classified['particle_vertical_motion']
+        )
+    )
+    classified['vertical_alignment_passed'] = classified[
+        'forward_ensemble_to_observed_core_median_depth_error_m'
+    ].le(settings['vertical_alignment_median_max_m'])
+    classified['resolved_vertical_pathway_supported'] = (
+        classified['event_validation_passed'].astype(bool)
+        & classified['vertical_direction_matched']
+        & classified['vertical_alignment_passed']
+    )
+    classified['resolved_downward_pathway_supported'] = (
+        classified['resolved_vertical_pathway_supported']
+        & (classified['observed_vertical_motion'] == 'downward')
+    )
+    classified['resolved_upward_pathway_supported'] = (
+        classified['resolved_vertical_pathway_supported']
+        & (classified['observed_vertical_motion'] == 'upward')
+    )
+    classified['three_dimensional_vertical_alignment_improved'] = classified[
+        'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m'
+    ].lt(0)
+    return classified.sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_trajectory_3d_population_group_summary(
+    classified: pd.DataFrame,
+) -> dict:
+    """汇总一个总体或机制子集的三维路径比例。"""
+    count = int(len(classified))
+    evaluable = classified.loc[classified['direction_evaluable']]
+    return {
+        'event_count': count,
+        'event_validation_passed_count': int(
+            classified['event_validation_passed'].sum()
+        ),
+        'direction_evaluable_count': int(len(evaluable)),
+        'vertical_direction_matched_count': int(
+            evaluable['vertical_direction_matched'].sum()
+        ),
+        'vertical_direction_matched_fraction': (
+            float(evaluable['vertical_direction_matched'].mean())
+            if len(evaluable) else None
+        ),
+        'resolved_vertical_pathway_count': int(
+            classified['resolved_vertical_pathway_supported'].sum()
+        ),
+        'resolved_downward_pathway_count': int(
+            classified['resolved_downward_pathway_supported'].sum()
+        ),
+        'resolved_upward_pathway_count': int(
+            classified['resolved_upward_pathway_supported'].sum()
+        ),
+        'three_dimensional_vertical_alignment_improved_count': int(
+            classified[
+                'three_dimensional_vertical_alignment_improved'
+            ].sum()
+        ),
+        'three_dimensional_vertical_alignment_improved_fraction': (
+            float(
+                classified[
+                    'three_dimensional_vertical_alignment_improved'
+                ].mean()
+            )
+            if count else None
+        ),
+    }
+
+
+def _ofes_trajectory_tracer_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 三维轨迹多示踪剂配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_tracers', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_tracers override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'integration_labels': tuple(
+            str(value)
+            for value in raw.get(
+                'integration_labels',
+                (
+                    'forward_observed_start_to_peak',
+                    'backward_peak_to_start',
+                ),
+            )
+        ),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_load_margin_km': float(
+            raw.get('background_load_margin_km', 50.0)
+        ),
+        'background_min_valid_columns': int(
+            raw.get('background_min_valid_columns', 100)
+        ),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'minimum_valid_particle_fraction': float(
+            raw.get('minimum_valid_particle_fraction', 0.75)
+        ),
+        'same_sigma_do_abs_min_umol_kg': float(
+            raw.get('same_sigma_do_abs_min_umol_kg', 10.0)
+        ),
+        'same_sigma_theta_abs_min_deg_c': float(
+            raw.get('same_sigma_theta_abs_min_deg_c', 0.10)
+        ),
+        'same_sigma_salinity_abs_min': float(
+            raw.get('same_sigma_salinity_abs_min', 0.02)
+        ),
+        'same_sigma_spiciness0_abs_min': float(
+            raw.get('same_sigma_spiciness0_abs_min', 0.05)
+        ),
+        'fingerprint_persistence_fraction_min': float(
+            raw.get('fingerprint_persistence_fraction_min', 0.75)
+        ),
+        'normalized_time_bin_count': int(
+            raw.get('normalized_time_bin_count', 11)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_tracers')
+        ),
+    }
+    expected_labels = {
+        'forward_observed_start_to_peak',
+        'backward_peak_to_start',
+    }
+    if (
+        not settings['integration_labels']
+        or len(set(settings['integration_labels']))
+        != len(settings['integration_labels'])
+        or not set(settings['integration_labels']).issubset(expected_labels)
+    ):
+        raise ValueError(
+            'OFES trajectory tracer integration labels are invalid.'
+        )
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['background_min_valid_columns'] <= 0
+        or settings['normalized_time_bin_count'] < 3
+    ):
+        raise ValueError(
+            'OFES trajectory tracer worker/background counts are invalid.'
+        )
+    positive_keys = (
+        'background_inner_radius_km',
+        'background_outer_radius_km',
+        'background_load_margin_km',
+        'same_sigma_do_abs_min_umol_kg',
+        'same_sigma_theta_abs_min_deg_c',
+        'same_sigma_salinity_abs_min',
+        'same_sigma_spiciness0_abs_min',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES trajectory tracer radii, thresholds, and DPI must be '
+            'finite and positive.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES trajectory tracer background radii must be ordered.'
+        )
+    for key in (
+        'minimum_active_fraction',
+        'minimum_valid_particle_fraction',
+        'fingerprint_persistence_fraction_min',
+    ):
+        if not 0 < settings[key] <= 1:
+            raise ValueError(
+                f'OFES trajectory tracer {key} must lie in (0, 1].'
+            )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES trajectory tracer output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_trajectory_tracer_daily_positions(
+    trajectories: pd.DataFrame,
+    integration_label: str,
+) -> pd.DataFrame:
+    """从逐小时轨迹中抽取每个模式日的粒子位置。"""
+    selected = trajectories.loc[
+        trajectories['integration_label'].astype(str)
+        == str(integration_label)
+    ].copy()
+    if selected.empty:
+        raise RuntimeError(
+            f'No OFES trajectory rows for {integration_label}.'
+        )
+    selected['time'] = pd.to_datetime(selected['time'])
+    selected['date'] = selected['time'].dt.normalize()
+    exact = selected.loc[selected['time'] == selected['date']].copy()
+    expected_dates = pd.date_range(
+        selected['date'].min(), selected['date'].max()
+    )
+    if (
+        len(exact) != len(expected_dates) * selected['particle_index'].nunique()
+        or exact.duplicated(['date', 'particle_index']).any()
+    ):
+        raise RuntimeError(
+            'OFES trajectory tracer sampling requires one midnight row per '
+            'particle and model day.'
+        )
+    columns = (
+        'event_id',
+        'integration_label',
+        'date',
+        'particle_index',
+        'particle_id',
+        'depth_m',
+        'lat',
+        'lon',
+        'status',
+        'ring_fraction',
+        'depth_offset_index',
+    )
+    return exact[list(columns)].sort_values(
+        ['date', 'particle_index'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_trajectory_tracer_source_inventory(
+    event_ids: list[str],
+    daily_positions: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录轨迹示踪剂分析消费的逐日 OFES 文件身份。"""
+    records = []
+    for event_id in event_ids:
+        dates = pd.to_datetime(
+            daily_positions.loc[
+                daily_positions['event_id'].astype(str) == str(event_id),
+                'date',
+            ]
+        ).dt.normalize().drop_duplicates()
+        for date in dates:
+            for variable in ('do2', 'temp', 'salinity'):
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                records.append(
+                    {
+                        'event_id': str(event_id),
+                        'date': pd.Timestamp(date),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    return pd.DataFrame(records)
+
+
+def _ofes_trajectory_tracer_background(
+    snapshot: dict,
+    center_lon: float,
+    center_lat: float,
+    settings: dict,
+) -> dict:
+    """计算一个事件日120–240 km背景环带的多示踪剂剖面。"""
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(center_lon),
+            float(center_lat),
+        ),
+        dtype=float,
+    ) / 1000.0
+    mask = (
+        distance_km >= settings['background_inner_radius_km']
+    ) & (
+        distance_km <= settings['background_outer_radius_km']
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    profiles = {
+        'do2': _ofes_masked_median_profiles(snapshot['do2'], mask),
+        'theta': _ofes_masked_median_profiles(snapshot['temp'], mask),
+        'salinity': _ofes_masked_median_profiles(
+            snapshot['salinity'], mask
+        ),
+    }
+    sigma0 = _ofes_sigma0_profile(
+        depth,
+        profiles['salinity'],
+        profiles['theta'],
+        float(center_lon),
+        float(center_lat),
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(snapshot['date'])
+    )
+    delivery_edge_distance_km = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(center_lon),
+            np.asarray(center_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    finite_columns = int(
+        np.count_nonzero(
+            mask
+            & np.isfinite(snapshot['do2'][0])
+            & np.isfinite(snapshot['temp'][0])
+            & np.isfinite(snapshot['salinity'][0])
+        )
+    )
+    return {
+        'depth': depth,
+        'profiles': profiles,
+        'sigma0': sigma0,
+        'annulus_grid_columns': int(np.count_nonzero(mask)),
+        'valid_columns': finite_columns,
+        'delivery_edge_distance_km': delivery_edge_distance_km,
+        'annulus_within_delivery_window': bool(
+            delivery_edge_distance_km
+            >= settings['background_outer_radius_km']
+        ),
+    }
+
+
+def _ofes_sample_trajectory_tracer_day(
+    day_positions: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """采样一个事件路径日的粒子多示踪剂及局地背景异常。"""
+    event_id = str(day_positions['event_id'].iloc[0])
+    integration_label = str(day_positions['integration_label'].iloc[0])
+    date = pd.Timestamp(day_positions['date'].iloc[0]).normalize()
+    active = day_positions.loc[
+        day_positions['status'].astype(str) == 'active'
+    ].copy()
+    particle_count = int(len(day_positions))
+    active_fraction = float(len(active) / particle_count)
+    if active.empty:
+        raise RuntimeError(
+            f'OFES trajectory tracer day has no active particles: '
+            f'{event_id} {date:%Y-%m-%d} {integration_label}.'
+        )
+    center_lon = float(active['lon'].median())
+    center_lat = float(active['lat'].median())
+    load_radius_km = (
+        settings['background_outer_radius_km']
+        + settings['background_load_margin_km']
+    )
+    scale = approximate_degree_length(center_lat)
+    lon_margin = (
+        load_radius_km * 1000.0 / scale['meters_per_degree_lon']
+    )
+    lat_margin = (
+        load_radius_km * 1000.0 / scale['meters_per_degree_lat']
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity'],
+        lon_bounds=(center_lon - lon_margin, center_lon + lon_margin),
+        lat_bounds=(center_lat - lat_margin, center_lat + lat_margin),
+        depth_bounds=None,
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    points = active[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+    do2 = _ofes_interp3d(snapshot['do2'], depth, lat, lon, points)
+    theta = _ofes_interp3d(snapshot['temp'], depth, lat, lon, points)
+    salinity = _ofes_interp3d(
+        snapshot['salinity'], depth, lat, lon, points
+    )
+    pressure = gsw.p_from_z(-points[:, 0], points[:, 1])
+    absolute_salinity = gsw.SA_from_SP(
+        salinity, pressure, points[:, 2], points[:, 1]
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    sigma0 = np.asarray(
+        gsw.sigma0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    spiciness0 = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    background = _ofes_trajectory_tracer_background(
+        snapshot, center_lon, center_lat, settings
+    )
+    records = []
+    for row_index, particle in enumerate(active.itertuples(index=False)):
+        background_fixed = {
+            key: _ofes_profile_value_at_depth(
+                background['depth'], values, float(particle.depth_m)
+            )
+            for key, values in background['profiles'].items()
+        }
+        background_same_sigma = _ofes_density_crossing_near_depth(
+            background['depth'],
+            background['sigma0'],
+            float(sigma0[row_index]),
+            float(particle.depth_m),
+            background['profiles'],
+        )
+        background_fixed_thermo = _ofes_point_thermodynamics(
+            float(particle.depth_m),
+            background_fixed['salinity'],
+            background_fixed['theta'],
+            background_fixed['do2'],
+            center_lon,
+            center_lat,
+        )
+        background_sigma_thermo = _ofes_point_thermodynamics(
+            float(background_same_sigma['depth']),
+            float(background_same_sigma['salinity']),
+            float(background_same_sigma['theta']),
+            float(background_same_sigma['do2']),
+            center_lon,
+            center_lat,
+        )
+        values = {
+            'do2': float(do2[row_index]),
+            'theta': float(theta[row_index]),
+            'salinity': float(salinity[row_index]),
+            'sigma0': float(sigma0[row_index]),
+            'spiciness0': float(spiciness0[row_index]),
+        }
+        records.append(
+            {
+                'event_id': event_id,
+                'integration_label': integration_label,
+                'date': date,
+                'particle_index': int(particle.particle_index),
+                'particle_id': str(particle.particle_id),
+                'depth_m': float(particle.depth_m),
+                'lat': float(particle.lat),
+                'lon': float(particle.lon),
+                'ring_fraction': float(particle.ring_fraction),
+                'depth_offset_index': int(particle.depth_offset_index),
+                **values,
+                'background_do2_fixed': float(background_fixed['do2']),
+                'background_theta_fixed': float(background_fixed['theta']),
+                'background_salinity_fixed': float(
+                    background_fixed['salinity']
+                ),
+                'background_sigma0_fixed': float(
+                    background_fixed_thermo['sigma0']
+                ),
+                'background_spiciness0_fixed': float(
+                    background_fixed_thermo['spiciness0']
+                ),
+                'background_same_sigma_depth_m': float(
+                    background_same_sigma['depth']
+                ),
+                'background_do2_same_sigma': float(
+                    background_same_sigma['do2']
+                ),
+                'background_theta_same_sigma': float(
+                    background_same_sigma['theta']
+                ),
+                'background_salinity_same_sigma': float(
+                    background_same_sigma['salinity']
+                ),
+                'background_spiciness0_same_sigma': float(
+                    background_sigma_thermo['spiciness0']
+                ),
+                'fixed_depth_do_contrast': float(
+                    values['do2'] - background_fixed['do2']
+                ),
+                'fixed_depth_theta_contrast': float(
+                    values['theta'] - background_fixed['theta']
+                ),
+                'fixed_depth_salinity_contrast': float(
+                    values['salinity'] - background_fixed['salinity']
+                ),
+                'fixed_depth_sigma0_contrast': float(
+                    values['sigma0'] - background_fixed_thermo['sigma0']
+                ),
+                'fixed_depth_spiciness0_contrast': float(
+                    values['spiciness0']
+                    - background_fixed_thermo['spiciness0']
+                ),
+                'same_sigma_do_contrast': float(
+                    values['do2'] - background_same_sigma['do2']
+                ),
+                'same_sigma_theta_contrast': float(
+                    values['theta'] - background_same_sigma['theta']
+                ),
+                'same_sigma_salinity_contrast': float(
+                    values['salinity']
+                    - background_same_sigma['salinity']
+                ),
+                'same_sigma_spiciness0_contrast': float(
+                    values['spiciness0']
+                    - background_sigma_thermo['spiciness0']
+                ),
+            }
+        )
+    samples = pd.DataFrame(records)
+    required = (
+        'do2',
+        'theta',
+        'salinity',
+        'sigma0',
+        'spiciness0',
+        'fixed_depth_do_contrast',
+        'fixed_depth_theta_contrast',
+        'fixed_depth_salinity_contrast',
+        'fixed_depth_sigma0_contrast',
+        'fixed_depth_spiciness0_contrast',
+        'same_sigma_do_contrast',
+        'same_sigma_theta_contrast',
+        'same_sigma_salinity_contrast',
+        'same_sigma_spiciness0_contrast',
+    )
+    valid = samples[list(required)].notna().all(axis=1)
+    day_summary = {
+        'event_id': event_id,
+        'integration_label': integration_label,
+        'date': date,
+        'particle_count': particle_count,
+        'active_particle_count': int(len(active)),
+        'active_fraction': active_fraction,
+        'valid_particle_count': int(valid.sum()),
+        'valid_particle_fraction': float(valid.sum() / particle_count),
+        'ensemble_centroid_lon': center_lon,
+        'ensemble_centroid_lat': center_lat,
+        'ensemble_centroid_depth_m': float(active['depth_m'].median()),
+        'background_annulus_grid_columns': int(
+            background['annulus_grid_columns']
+        ),
+        'background_valid_columns': int(background['valid_columns']),
+        'delivery_edge_distance_km': float(
+            background['delivery_edge_distance_km']
+        ),
+        'background_annulus_within_delivery_window': bool(
+            background['annulus_within_delivery_window']
+        ),
+        'daily_diagnostic_passed': bool(
+            active_fraction >= settings['minimum_active_fraction']
+            and valid.sum() / particle_count
+            >= settings['minimum_valid_particle_fraction']
+            and background['valid_columns']
+            >= settings['background_min_valid_columns']
+            and background['annulus_within_delivery_window']
+        ),
+    }
+    for column in required:
+        finite = samples.loc[valid, column].to_numpy(dtype=float)
+        day_summary[f'median_{column}'] = (
+            float(np.median(finite)) if finite.size else np.nan
+        )
+        day_summary[f'q25_{column}'] = (
+            float(np.quantile(finite, 0.25)) if finite.size else np.nan
+        )
+        day_summary[f'q75_{column}'] = (
+            float(np.quantile(finite, 0.75)) if finite.size else np.nan
+        )
+    return samples, day_summary
+
+
+def _ofes_trajectory_tracer_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回一个事件多示踪剂 fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'particle_samples': event_dir / 'particle_samples.parquet',
+        'daily_summary': event_dir / 'daily_summary.parquet',
+        'event_summary': event_dir / 'event_summary.parquet',
+    }
+
+
+def _ofes_trajectory_tracer_fragment_reusable(
+    paths: dict[str, Path],
+    event_id: str | None = None,
+    start_date: pd.Timestamp | None = None,
+    peak_date: pd.Timestamp | None = None,
+) -> bool:
+    """判定一个事件多示踪剂 fragment 是否完整。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    _ofes_assert_summary_request(stored, event_id)
+    if start_date is not None or peak_date is not None:
+        daily = pd.read_parquet(paths['daily_summary'])
+        if daily.empty or 'date' not in daily.columns:
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+        dates = pd.to_datetime(daily['date']).dt.normalize()
+        if start_date is not None and dates.min() != pd.Timestamp(
+            start_date
+        ).normalize():
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+        if peak_date is not None and dates.max() != pd.Timestamp(
+            peak_date
+        ).normalize():
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+    table_columns = {
+        'particle_samples': {
+            'event_id', 'integration_label', 'date', 'particle_index',
+            'depth_m', 'lat', 'lon',
+        },
+        'daily_summary': {
+            'event_id', 'integration_label', 'date',
+            'daily_diagnostic_passed',
+        },
+        'event_summary': {
+            'event_id', 'integration_label', 'all_days_passed',
+        },
+    }
+    for key, columns in table_columns.items():
+        frame = pd.read_parquet(paths[key])
+        if frame.empty or not columns.issubset(frame.columns):
+            return False
+    return bool(stored.get('all_daily_diagnostics_passed') is not None)
+
+
+def _ofes_trajectory_tracer_event_summary(
+    daily_summary: pd.DataFrame,
+    peak_fingerprint: dict,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总一个事件两向轨迹的多示踪剂指纹保持率。"""
+    metrics = {
+        'do': ('same_sigma_do_contrast', 'water_mass_do_contrast'),
+        'theta': ('same_sigma_theta_contrast', 'same_sigma_theta_contrast'),
+        'salinity': (
+            'same_sigma_salinity_contrast',
+            'same_sigma_salinity_contrast',
+        ),
+        'spiciness0': (
+            'same_sigma_spiciness0_contrast',
+            'same_sigma_spiciness0_contrast',
+        ),
+    }
+    thresholds = {
+        'do': settings['same_sigma_do_abs_min_umol_kg'],
+        'theta': settings['same_sigma_theta_abs_min_deg_c'],
+        'salinity': settings['same_sigma_salinity_abs_min'],
+        'spiciness0': settings['same_sigma_spiciness0_abs_min'],
+    }
+    records = []
+    for label, group in daily_summary.groupby(
+        'integration_label', sort=True
+    ):
+        ordered = group.sort_values('date', kind='mergesort')
+        record = {
+            'event_id': str(ordered['event_id'].iloc[0]),
+            'integration_label': str(label),
+            'day_count': int(len(ordered)),
+            'passed_day_count': int(
+                ordered['daily_diagnostic_passed'].sum()
+            ),
+            'all_days_passed': bool(
+                ordered['daily_diagnostic_passed'].all()
+            ),
+        }
+        for name, (daily_column, peak_column) in metrics.items():
+            peak_value = float(peak_fingerprint[peak_column])
+            peak_sign = int(np.sign(peak_value))
+            values = ordered[f'median_{daily_column}'].to_numpy(
+                dtype=float
+            )
+            value_sign = np.zeros(values.shape, dtype=int)
+            finite_values = np.isfinite(values)
+            value_sign[finite_values] = np.sign(
+                values[finite_values]
+            ).astype(int)
+            qualifying = (
+                finite_values
+                & ordered['daily_diagnostic_passed'].to_numpy(dtype=bool)
+                & (value_sign == peak_sign)
+                & (np.abs(values) >= thresholds[name])
+            )
+            fraction = float(np.mean(qualifying))
+            passed = bool(
+                peak_sign != 0
+                and abs(peak_value) >= thresholds[name]
+                and fraction
+                >= settings['fingerprint_persistence_fraction_min']
+            )
+            record[f'peak_{name}_contrast'] = peak_value
+            record[f'{name}_fingerprint_day_fraction'] = fraction
+            record[f'{name}_fingerprint_persistent'] = passed
+        record['thermohaline_fingerprint_persistent'] = bool(
+            record['theta_fingerprint_persistent']
+            and record['salinity_fingerprint_persistent']
+            and record['spiciness0_fingerprint_persistent']
+        )
+        record['joint_do_thermohaline_fingerprint_persistent'] = bool(
+            record['do_fingerprint_persistent']
+            and record['thermohaline_fingerprint_persistent']
+        )
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def _ofes_run_trajectory_tracer_event_worker(payload: dict) -> dict:
+    """在独立进程采样并原子写入一个事件的路径多示踪剂。"""
+    event_id = str(payload['event_id'])
+    paths = _ofes_trajectory_tracer_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    positions = payload['daily_positions'].copy()
+    settings = payload['settings']
+    sample_frames = []
+    daily_records = []
+    for (_, _), day in positions.groupby(
+        ['integration_label', 'date'], sort=True
+    ):
+        samples, summary = _ofes_sample_trajectory_tracer_day(
+            day, settings
+        )
+        sample_frames.append(samples)
+        daily_records.append(summary)
+    particle_samples = pd.concat(sample_frames, ignore_index=True)
+    daily_summary = pd.DataFrame(daily_records).sort_values(
+        ['integration_label', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    event_summary = _ofes_trajectory_tracer_event_summary(
+        daily_summary, payload['peak_fingerprint'], settings
+    )
+    summary = {
+        'event_id': event_id,
+        'integration_count': int(len(event_summary)),
+        'day_count': int(len(daily_summary)),
+        'particle_sample_count': int(len(particle_samples)),
+        'all_daily_diagnostics_passed': bool(
+            daily_summary['daily_diagnostic_passed'].all()
+        ),
+    }
+    _ofes_atomic_write_json(summary, paths['summary'])
+    _atomic_write_parquet(particle_samples, paths['particle_samples'])
+    _atomic_write_parquet(daily_summary, paths['daily_summary'])
+    _atomic_write_parquet(event_summary, paths['event_summary'])
+    return {
+        'event_id': event_id,
+        'day_count': int(len(daily_summary)),
+    }
+
+
+def _ofes_load_trajectory_tracer_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的路径多示踪剂 fragment。"""
+    paths = _ofes_trajectory_tracer_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        'particle_samples': pd.read_parquet(paths['particle_samples']),
+        'daily_summary': pd.read_parquet(paths['daily_summary']),
+        'event_summary': pd.read_parquet(paths['event_summary']),
+    }
+
+
+def _ofes_trajectory_tracer_group_summary(
+    event_summary: pd.DataFrame,
+) -> dict:
+    """汇总一个多示踪剂轨迹总体或机制子集。"""
+    forward = event_summary.loc[
+        event_summary['integration_label']
+        == 'forward_observed_start_to_peak'
+    ]
+    count = int(len(forward))
+    summary = {
+        'event_count': int(forward['event_id'].nunique()),
+        'all_days_passed_count': int(forward['all_days_passed'].sum()),
+        'do_fingerprint_persistent_count': int(
+            forward['do_fingerprint_persistent'].sum()
+        ),
+        'theta_fingerprint_persistent_count': int(
+            forward['theta_fingerprint_persistent'].sum()
+        ),
+        'salinity_fingerprint_persistent_count': int(
+            forward['salinity_fingerprint_persistent'].sum()
+        ),
+        'spiciness0_fingerprint_persistent_count': int(
+            forward['spiciness0_fingerprint_persistent'].sum()
+        ),
+        'thermohaline_fingerprint_persistent_count': int(
+            forward['thermohaline_fingerprint_persistent'].sum()
+        ),
+        'joint_do_thermohaline_fingerprint_persistent_count': int(
+            forward[
+                'joint_do_thermohaline_fingerprint_persistent'
+            ].sum()
+        ),
+    }
+    for key, value in tuple(summary.items()):
+        if key.endswith('_count') and key != 'event_count':
+            summary[key.removesuffix('_count') + '_fraction'] = (
+                float(value / count) if count else None
+            )
+    return summary
+
+
+def _plot_ofes_trajectory_tracers(
+    daily_summary: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制正向路径的逐日多示踪剂中位异常与总体保持率。"""
+    forward = daily_summary.loc[
+        daily_summary['integration_label']
+        == 'forward_observed_start_to_peak'
+    ].copy()
+    if 'kinematic_regime' not in forward.columns:
+        forward = forward.merge(
+            event_summary[
+                ['event_id', 'integration_label', 'kinematic_regime']
+            ].drop_duplicates(),
+            on=['event_id', 'integration_label'],
+            how='left',
+            validate='many_to_one',
+        )
+    metrics = (
+        ('same_sigma_do_contrast', 'DO anomaly', r'$\mu$mol kg$^{-1}$'),
+        ('same_sigma_theta_contrast', 'Potential temperature anomaly', '°C'),
+        ('same_sigma_salinity_contrast', 'Salinity anomaly', 'psu'),
+        ('same_sigma_spiciness0_contrast', 'Spiciness anomaly', 'kg m$^{-3}$'),
+    )
+    figure, axes = plt.subplots(
+        2, 2, figsize=(13, 9), constrained_layout=True
+    )
+    colors = {
+        'rotation_dominated': '#4c78a8',
+        'strain_dominated': '#e45756',
+    }
+    for axis, (column, title, unit) in zip(axes.flat, metrics):
+        value_column = f'median_{column}'
+        bin_count = int(settings['normalized_time_bin_count'])
+        time_bin = np.rint(
+            forward['normalized_event_time'].to_numpy(dtype=float)
+            * (bin_count - 1)
+        ) / (bin_count - 1)
+        event_binned = (
+            forward.assign(normalized_time_bin=time_bin)
+            .groupby(
+                ['event_id', 'kinematic_regime', 'normalized_time_bin'],
+                as_index=False,
+            )[value_column]
+            .median()
+        )
+        for regime, group in event_binned.groupby(
+            'kinematic_regime', sort=True
+        ):
+            grouped = group.groupby('normalized_time_bin')[value_column]
+            x = np.asarray(sorted(grouped.groups), dtype=float)
+            median = grouped.median().reindex(x).to_numpy(dtype=float)
+            q25 = grouped.quantile(0.25).reindex(x).to_numpy(dtype=float)
+            q75 = grouped.quantile(0.75).reindex(x).to_numpy(dtype=float)
+            color = colors.get(str(regime), '#6b7280')
+            axis.plot(
+                x, median, color=color, linewidth=2.0,
+                label=str(regime).replace('_', ' '),
+            )
+            axis.fill_between(x, q25, q75, color=color, alpha=0.18)
+        axis.axhline(0, color='#111827', linewidth=0.8, linestyle='--')
+        axis.set_title(title)
+        axis.set_xlabel('Normalized start-to-peak time')
+        axis.set_ylabel(unit)
+        axis.grid(alpha=0.2)
+    axes[0, 0].legend(frameon=False)
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        settings['figure_dpi'],
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_3d_trajectory_tracers(
+    trajectory_population_run_dir: str | Path | None = None,
+    population_run_dir: str | Path | None = None,
+    *,
+    tracer_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """在既有 OFES 三维轨迹上并行诊断 DO、温盐与 spiciness 水团指纹。
+
+    workflow 不重新积分 `u/v/w`，而是从已验证的三维 trajectory 长表抽取逐日粒子位置，
+    采样同日 `do2`、位温和盐度，派生 TEOS-10 sigma0 与 spiciness0。每个粒子同时相对
+    120–240 km 局地背景计算固定深度和同密度面异常，避免把单纯 heave 当成水团指纹。
+
+    参数:
+        - trajectory_population_run_dir (str | Path | None): 三维轨迹总体目录；None 使用固定 `trajectory_3d_population` 输出。
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - tracer_overrides (dict | None): 临时覆盖 `ofes.trajectory_tracers` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_tracers` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、逐粒子示踪剂、逐日与逐事件摘要、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`particle_tracer_samples.parquet`、`daily_tracer_summary.parquet`、`event_tracer_summary.parquet`、`analysis_summary.json`、`trajectory_tracers.png` 与 `manifest.json`。
+
+    说明:
+        - 温度、盐度和spiciness来自同一T-S状态，属于相关的水团指纹，不作为三份独立证据计数。
+        - 沿粒子路径保持同号异常支持载体一致性，但仍不能单独证明通风地点或严格material source。
+    """
+    trajectory_root = (
+        Path(trajectory_population_run_dir)
+        if trajectory_population_run_dir is not None
+        else _ofes_analysis_output_dir('trajectory_3d_population')
+    )
+    population_root = (
+        Path(population_run_dir)
+        if population_run_dir is not None
+        else _ofes_analysis_output_dir('event_population')
+    )
+    settings = _ofes_trajectory_tracer_settings(tracer_overrides)
+    trajectories = pd.read_parquet(trajectory_root / 'trajectories.parquet')
+    labels = set(settings['integration_labels'])
+    trajectories = trajectories.loc[
+        trajectories['integration_label'].astype(str).isin(labels)
+    ].copy()
+    daily_positions = pd.concat(
+        [
+            _ofes_trajectory_tracer_daily_positions(group, str(label))
+            for (_, label), group in trajectories.groupby(
+                ['event_id', 'integration_label'], sort=True
+            )
+        ],
+        ignore_index=True,
+    )
+    population = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    peak_columns = (
+        'event_id',
+        'kinematic_regime',
+        'water_mass_do_contrast',
+        'same_sigma_theta_contrast',
+        'same_sigma_salinity_contrast',
+        'same_sigma_spiciness0_contrast',
+    )
+    peak_fingerprints = population[list(peak_columns)].copy()
+    event_ids = sorted(
+        daily_positions['event_id'].astype(str).unique().tolist()
+    )
+    event_dates = (
+        daily_positions.assign(
+            event_id=daily_positions['event_id'].astype(str),
+            _date=pd.to_datetime(daily_positions['date']).dt.normalize()
+        )
+        .groupby('event_id')['_date']
+        .agg(['min', 'max'])
+    )
+    missing = sorted(
+        set(event_ids) - set(peak_fingerprints['event_id'].astype(str))
+    )
+    if missing:
+        raise RuntimeError(
+            f'OFES trajectory tracers lack peak fingerprints: {missing}.'
+        )
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+        'event_ids': [str(value) for value in event_ids],
+        'start_dates': [
+            event_dates.loc[event_id, 'min'].strftime('%Y-%m-%d')
+            for event_id in event_ids
+        ],
+        'peak_dates': [
+            event_dates.loc[event_id, 'max'].strftime('%Y-%m-%d')
+            for event_id in event_ids
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'particle_tracer_samples': pd.read_parquet(
+                outputs['particle_tracer_samples']
+            ),
+            'daily_tracer_summary': pd.read_parquet(
+                outputs['daily_tracer_summary']
+            ),
+            'event_tracer_summary': pd.read_parquet(
+                outputs['event_tracer_summary']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_inventory = _ofes_trajectory_tracer_source_inventory(
+        event_ids, daily_positions
+    )
+    manifest = {
+        'analysis': 'trajectory_tracers',
+        'request': request,
+        'settings': settings,
+        'event_ids': event_ids,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(event_ids)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    completed = 0
+    try:
+        pending = []
+        for event_id in event_ids:
+            paths = _ofes_trajectory_tracer_fragment_paths(
+                events_dir, event_id
+            )
+            if _ofes_trajectory_tracer_fragment_reusable(
+                paths,
+                event_id,
+                start_date=event_dates.loc[event_id, 'min'],
+                peak_date=event_dates.loc[event_id, 'max'],
+            ):
+                completed += 1
+                continue
+            fingerprint = peak_fingerprints.loc[
+                peak_fingerprints['event_id'].astype(str) == event_id
+            ]
+            pending.append(
+                {
+                    'event_id': event_id,
+                    'daily_positions': daily_positions.loc[
+                        daily_positions['event_id'].astype(str) == event_id
+                    ].copy(),
+                    'peak_fingerprint': fingerprint.iloc[0].to_dict(),
+                    'settings': settings,
+                    'events_dir': str(events_dir.resolve()),
+                }
+            )
+        pending.sort(
+            key=lambda task: task['daily_positions']['date'].nunique(),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory tracers] '
+            f'events={len(event_ids)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={settings["worker_count"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=int(settings['worker_count']),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_trajectory_tracer_event_worker, task
+                    ): str(task['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory tracers] '
+                        f'{completed}/{len(event_ids)} complete: '
+                        f'{event_id} ({result["day_count"]} rows)',
+                        flush=True,
+                    )
+        fragments = [
+            _ofes_load_trajectory_tracer_fragment(events_dir, event_id)
+            for event_id in event_ids
+        ]
+        particle_samples = pd.concat(
+            [fragment['particle_samples'] for fragment in fragments],
+            ignore_index=True,
+        )
+        daily_summary = pd.concat(
+            [fragment['daily_summary'] for fragment in fragments],
+            ignore_index=True,
+        )
+        event_summary = pd.concat(
+            [fragment['event_summary'] for fragment in fragments],
+            ignore_index=True,
+        ).merge(
+            peak_fingerprints[['event_id', 'kinematic_regime']],
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        event_summary = event_summary.merge(
+            pd.read_parquet(
+                trajectory_root / 'population_classification.parquet'
+            )[
+                [
+                    'event_id',
+                    'event_validation_passed',
+                    'resolved_vertical_pathway_supported',
+                    'resolved_downward_pathway_supported',
+                ]
+            ],
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        group_summary = {
+            str(regime): _ofes_trajectory_tracer_group_summary(group)
+            for regime, group in event_summary.groupby(
+                'kinematic_regime', sort=True
+            )
+        }
+        all_summary = _ofes_trajectory_tracer_group_summary(event_summary)
+        forward = event_summary.loc[
+            event_summary['integration_label']
+            == 'forward_observed_start_to_peak'
+        ]
+        resolved_down = forward.loc[
+            forward['resolved_downward_pathway_supported'].astype(bool)
+        ]
+        analysis_summary = {
+            'event_count': int(len(event_ids)),
+            'integration_count': int(len(event_summary)),
+            'sampled_event_day_count': int(len(daily_summary)),
+            'particle_sample_count': int(len(particle_samples)),
+            'worker_count': int(settings['worker_count']),
+            'all_events_forward': all_summary,
+            'by_kinematic_regime': group_summary,
+            'resolved_downward_forward': (
+                _ofes_trajectory_tracer_group_summary(resolved_down)
+            ),
+            'temperature_salinity_spiciness_independence_note': (
+                'Temperature, salinity, and spiciness0 describe one '
+                'thermohaline state and are not counted as independent '
+                'lines of evidence.'
+            ),
+            'interpretation': (
+                'Persistent same-isopycnal thermohaline anomalies along '
+                'validated trajectories support a coherent water-mass '
+                'carrier interpretation; failure indicates deformation, '
+                'mixing, background changes, or trajectory/core mismatch.'
+            ),
+            'limits': [
+                'The analysis samples daily model tracer snapshots along '
+                'resolved paths and does not close tracer tendency budgets.',
+                'A persistent fingerprint supports carrier consistency but '
+                'does not locate the original air-sea ventilation site.',
+                'DO is affected by solubility and biology, while temperature, '
+                'salinity, and spiciness are mutually dependent.',
+            ],
+        }
+        daily_summary = daily_summary.merge(
+            event_summary[
+                ['event_id', 'integration_label', 'kinematic_regime']
+            ],
+            on=['event_id', 'integration_label'],
+            how='left',
+            validate='many_to_one',
+        )
+        daily_summary['normalized_event_time'] = daily_summary.groupby(
+            ['event_id', 'integration_label'], sort=False
+        ).cumcount() / daily_summary.groupby(
+            ['event_id', 'integration_label'], sort=False
+        )['date'].transform(lambda values: max(1, len(values) - 1))
+        output_paths = {
+            'particle_tracer_samples': (
+                run_dir / 'particle_tracer_samples.parquet'
+            ),
+            'daily_tracer_summary': run_dir / 'daily_tracer_summary.parquet',
+            'event_tracer_summary': run_dir / 'event_tracer_summary.parquet',
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_tracers.png',
+            'source_inventory': run_dir / 'source_inventory.parquet',
+        }
+        _atomic_write_parquet(
+            particle_samples, output_paths['particle_tracer_samples']
+        )
+        _atomic_write_parquet(
+            daily_summary, output_paths['daily_tracer_summary']
+        )
+        _atomic_write_parquet(
+            event_summary, output_paths['event_tracer_summary']
+        )
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_trajectory_tracers(
+            daily_summary, event_summary, output_paths['figure'], settings
+        )
+        outputs = {
+            key: str(path.resolve()) for key, path in output_paths.items()
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': int(len(event_ids)),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'particle_tracer_samples': particle_samples,
+        'daily_tracer_summary': daily_summary,
+        'event_tracer_summary': event_summary,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
+def _plot_ofes_3d_trajectory_population(
+    classified: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制观测异常核与三维 ensemble 的总体垂向对照。"""
+    figure, axes = plt.subplots(
+        1, 2, figsize=(13, 5.5), constrained_layout=True
+    )
+    colors = {
+        'rotation_dominated': '#4c78a8',
+        'strain_dominated': '#e45756',
+    }
+    for regime, group in classified.groupby('kinematic_regime', sort=True):
+        label = str(regime).replace('_', ' ')
+        color = colors.get(str(regime), '#6b7280')
+        axes[0].scatter(
+            group['observed_core_depth_change_m'],
+            group['forward_ensemble_centroid_depth_change_m'],
+            s=42,
+            alpha=0.78,
+            color=color,
+            edgecolor='white',
+            linewidth=0.5,
+            label=f'{label} (n={len(group)})',
+        )
+        axes[1].scatter(
+            group['observed_core_depth_change_m'],
+            group[
+                'three_dimensional_minus_matched_fixed_depth_forward_depth_error_m'
+            ],
+            s=42,
+            alpha=0.78,
+            color=color,
+            edgecolor='white',
+            linewidth=0.5,
+        )
+    finite_values = np.concatenate(
+        [
+            classified['observed_core_depth_change_m'].to_numpy(dtype=float),
+            classified[
+                'forward_ensemble_centroid_depth_change_m'
+            ].to_numpy(dtype=float),
+        ]
+    )
+    finite_values = finite_values[np.isfinite(finite_values)]
+    span = float(np.max(np.abs(finite_values))) if finite_values.size else 1.0
+    span = max(50.0, 1.08 * span)
+    axes[0].plot([-span, span], [-span, span], '--', color='#111827')
+    axes[0].axhline(0, color='#9ca3af', linewidth=0.8)
+    axes[0].axvline(0, color='#9ca3af', linewidth=0.8)
+    axes[0].set_xlim(-span, span)
+    axes[0].set_ylim(-span, span)
+    axes[0].set_aspect('equal', adjustable='box')
+    axes[0].set_xlabel('Observed ΔDO-core depth change (m)')
+    axes[0].set_ylabel('3-D ensemble centroid depth change (m)')
+    axes[0].set_title('Resolved vertical direction')
+    axes[0].legend(frameon=False)
+    axes[1].axhline(0, color='#111827', linestyle='--')
+    axes[1].axvline(0, color='#9ca3af', linewidth=0.8)
+    axes[1].set_xlabel('Observed ΔDO-core depth change (m)')
+    axes[1].set_ylabel('3-D minus fixed-depth error (m)')
+    axes[1].set_title('Value added by resolved w')
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        settings['figure_dpi'],
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_3d_trajectory_population(
+    population_run_dir: str | Path | None = None,
+    w_validation_run_dir: str | Path | None = None,
+    representative_3d_run_dir: str | Path | None = None,
+    *,
+    trajectory_overrides: dict | None = None,
+    population_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """并行推广 OFES u/v/w 三维 ensemble trajectory 至严格事件总体。
+
+    workflow 沿用代表三事件的粒子几何、日场线性时间插值、
+    完整交付垂向域、步长/可逆性门槛及同起点固定深度对照。
+    事件之间使用 spawn 独立进程并行，事件内 51 粒子保持向量化；
+    每个事件单独落盘，以便在固定结果目录中断点续跑。
+
+    参数:
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - w_validation_run_dir (str | Path | None): `w` 验证目录；None 使用固定 `vertical_velocity_validation` 输出。
+        - representative_3d_run_dir (str | Path | None): 三事件三维运行目录；None 使用固定 `trajectory_3d` 输出。
+        - trajectory_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d` 配置；其中
+          `event_ids` 沿用 notebook setup cell 的显式代表事件选择。
+        - population_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d_population` 配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_3d_population` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、eligibility、逐事件摘要、路径长表、总体分类、代表事件复现审计、analysis summary 和图件路径。
+
+    输出:
+        - `<run_dir>/events/<event_id>/*.parquet`、`event_eligibility.parquet`、`event_summary.parquet`、`trajectories.parquet`、`observed_alignment.parquet`、`release_sensitivity.parquet`、`population_classification.parquet`、`representative_parity.parquet`、`analysis_summary.json`、`trajectory_3d_population.png` 与 `manifest.json`。
+
+    说明:
+        - 严格比例只使用 population 背景环带完整且 start-to-peak 至少一天的事件。
+        - 观测异常核深度变化与粒子变化同号仍只是 resolved-pathway 一致性，不证明 material source 或严格 SCV 身份。
+    """
+    population_root = (
+        Path(population_run_dir)
+        if population_run_dir is not None
+        else _ofes_analysis_output_dir('event_population')
+    )
+    validation_root = (
+        Path(w_validation_run_dir)
+        if w_validation_run_dir is not None
+        else _ofes_analysis_output_dir('vertical_velocity_validation')
+    )
+    representative_root = (
+        Path(representative_3d_run_dir)
+        if representative_3d_run_dir is not None
+        else _ofes_analysis_output_dir('trajectory_3d')
+    )
+    trajectory_settings = _ofes_trajectory_3d_settings(
+        trajectory_overrides
+    )
+    population_settings = _ofes_trajectory_3d_population_settings(
+        population_overrides
+    )
+    requests, observed_tracks, eligibility = (
+        _ofes_trajectory_3d_population_requests(
+            population_root, population_settings
+        )
+    )
+    validation_summary = json.loads(
+        (validation_root / 'analysis_summary.json').read_text(encoding='utf-8')
+    )
+    if validation_summary.get('validation_passed') is not True:
+        raise RuntimeError(
+            'OFES trajectory population requires complete passed w validation.'
+        )
+    population = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    run_dir = _ofes_analysis_output_dir(
+        population_settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'trajectory_settings': _ofes_material_settings(
+            trajectory_settings
+        ),
+        'population_settings': _ofes_material_settings(
+            population_settings
+        ),
+        'event_ids': [str(value) for value in requests['event_id']],
+        'start_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['start_date']
+        ],
+        'peak_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in requests['peak_date']
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'event_eligibility': pd.read_parquet(
+                outputs['event_eligibility']
+            ),
+            'event_summary': pd.read_parquet(outputs['event_summary']),
+            'trajectories': pd.read_parquet(outputs['trajectories']),
+            'observed_alignment': pd.read_parquet(
+                outputs['observed_alignment']
+            ),
+            'release_sensitivity': pd.read_parquet(
+                outputs['release_sensitivity']
+            ),
+            'population_classification': pd.read_parquet(
+                outputs['population_classification']
+            ),
+            'representative_parity': pd.read_parquet(
+                outputs['representative_parity']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_inventory = _ofes_trajectory_3d_source_inventory(requests)
+    manifest = {
+        'analysis': 'trajectory_3d_population',
+        'request': request,
+        'trajectory_settings': trajectory_settings,
+        'population_settings': population_settings,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'worker_count': int(population_settings['worker_count']),
+        'completed_events': 0,
+        'total_events': int(len(requests)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(eligibility, run_dir / 'event_eligibility.parquet')
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(
+        observed_tracks, run_dir / 'observed_object_tracks.parquet'
+    )
+    completed = 0
+    try:
+        analytic_validation = _validate_ofes_3d_trajectory_integrator(
+            trajectory_settings
+        )
+        analytic_path = run_dir / 'analytic_validation.json'
+        _ofes_atomic_write_json(analytic_validation, analytic_path)
+        pending = []
+        for request in requests.to_dict(orient='records'):
+            paths = _ofes_trajectory_3d_fragment_paths(
+                events_dir, str(request['event_id'])
+            )
+            reusable = _ofes_trajectory_3d_fragment_reusable(
+                paths,
+                str(request['event_id']),
+                start_date=pd.Timestamp(request['start_date']),
+                peak_date=pd.Timestamp(request['peak_date']),
+            )
+            if reusable:
+                completed += 1
+            else:
+                observed_track = observed_tracks.loc[
+                    observed_tracks['event_id'].astype(str)
+                    == str(request['event_id'])
+                ].copy()
+                pending.append(
+                    {
+                        'request': request,
+                        'observed_track': observed_track,
+                        'trajectory_settings': trajectory_settings,
+                        'events_dir': str(events_dir.resolve()),
+                    }
+                )
+        pending.sort(
+            key=lambda task: int(task['request']['integration_days']),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory population] '
+            f'events={len(requests)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={population_settings["worker_count"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=int(population_settings['worker_count']),
+                mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_trajectory_3d_population_worker, task
+                    ): str(task['request']['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory population] '
+                        f'{completed}/{len(requests)} complete: '
+                        f'{result["event_id"]} '
+                        f'({result["integration_days"]} d)',
+                        flush=True,
+                    )
+        results = [
+            _ofes_load_trajectory_3d_fragment(
+                events_dir, str(event_id)
+            )
+            for event_id in requests['event_id']
+        ]
+        event_summary = pd.DataFrame(
+            [result['summary'] for result in results]
+        ).sort_values('event_order', kind='mergesort').reset_index(drop=True)
+        for column in ('start_date', 'peak_date'):
+            event_summary[column] = pd.to_datetime(
+                event_summary[column]
+            ).dt.normalize()
+        trajectories = pd.concat(
+            [result['trajectories'] for result in results],
+            ignore_index=True,
+        )
+        particle_metadata = pd.concat(
+            [result['particle_metadata'] for result in results],
+            ignore_index=True,
+        )
+        reversibility = pd.concat(
+            [result['reversibility'] for result in results],
+            ignore_index=True,
+        )
+        observed_alignment = pd.concat(
+            [result['observed_alignment'] for result in results],
+            ignore_index=True,
+        )
+        release_sensitivity = pd.concat(
+            [result['release_sensitivity'] for result in results],
+            ignore_index=True,
+        )
+        parity, parity_summary = (
+            _ofes_trajectory_3d_representative_parity(
+                event_summary,
+                representative_root,
+                population_settings['representative_parity_atol'],
+            )
+        )
+        classified = _ofes_trajectory_3d_population_classification(
+            event_summary, population, population_settings
+        )
+        groups = {
+            str(regime): _ofes_trajectory_3d_population_group_summary(group)
+            for regime, group in classified.groupby(
+                'kinematic_regime', sort=True
+            )
+        }
+        analysis_summary = {
+            'strict_population_event_count': int(
+                eligibility['population_diagnostic_passed'].sum()
+            ),
+            'trajectory_eligible_event_count': int(len(classified)),
+            'excluded_no_time_expansion_count': int(
+                (
+                    eligibility['trajectory_population_status']
+                    == 'excluded_no_time_expansion'
+                ).sum()
+            ),
+            'excluded_delivery_edge_count': int(
+                (
+                    eligibility['trajectory_population_status']
+                    == 'excluded_delivery_edge'
+                ).sum()
+            ),
+            'integration_day_sum': int(
+                classified['integration_days'].sum()
+            ),
+            'worker_count': int(population_settings['worker_count']),
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'representative_parity': parity_summary,
+            'all_events': _ofes_trajectory_3d_population_group_summary(
+                classified
+            ),
+            'by_kinematic_regime': groups,
+            'interpretation': (
+                'Population trajectories quantify how often resolved '
+                'daily-mean u/v/w reproduces the sign and magnitude class '
+                'of anomaly-core vertical evolution. Direction agreement '
+                'is pathway consistency, not material-source proof.'
+            ),
+            'limits': [
+                'Daily-mean resolved velocity omits unresolved mixing, '
+                'diffusion, and submesoscale transport.',
+                'The detector can shift between evolving anomaly maxima, so '
+                'core-depth change is not a material-particle observation.',
+                'Rotation-dominated association does not by itself establish '
+                'strict SCV identity or causation.',
+                'Delivery-edge and zero-duration events remain visible in '
+                'eligibility but are excluded from inference denominators.',
+            ],
+        }
+        output_paths = {
+            'event_eligibility': run_dir / 'event_eligibility.parquet',
+            'event_summary': run_dir / 'event_summary.parquet',
+            'trajectories': run_dir / 'trajectories.parquet',
+            'particle_metadata': run_dir / 'particle_metadata.parquet',
+            'reversibility': run_dir / 'reversibility.parquet',
+            'observed_alignment': run_dir / 'observed_alignment.parquet',
+            'release_sensitivity': run_dir / 'release_sensitivity.parquet',
+            'population_classification': (
+                run_dir / 'population_classification.parquet'
+            ),
+            'representative_parity': (
+                run_dir / 'representative_parity.parquet'
+            ),
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_3d_population.png',
+            'analytic_validation': analytic_path,
+            'source_inventory': run_dir / 'source_inventory.parquet',
+            'observed_object_tracks': (
+                run_dir / 'observed_object_tracks.parquet'
+            ),
+        }
+        for key, frame in (
+            ('event_summary', event_summary),
+            ('trajectories', trajectories),
+            ('particle_metadata', particle_metadata),
+            ('reversibility', reversibility),
+            ('observed_alignment', observed_alignment),
+            ('release_sensitivity', release_sensitivity),
+            ('population_classification', classified),
+            ('representative_parity', parity),
+        ):
+            _atomic_write_parquet(frame, output_paths[key])
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_3d_trajectory_population(
+            classified, output_paths['figure'], population_settings
+        )
+        outputs = {
+            key: str(path.resolve()) for key, path in output_paths.items()
+        }
+        manifest.update(
+            {
+                'status': 'complete',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': int(len(classified)),
+                'representative_parity_passed': bool(
+                    parity_summary['passed']
+                ),
+                'outputs': outputs,
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+                'completed_events': completed,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'event_eligibility': eligibility,
+        'event_summary': event_summary,
+        'trajectories': trajectories,
+        'observed_alignment': observed_alignment,
+        'release_sensitivity': release_sensitivity,
+        'population_classification': classified,
+        'representative_parity': parity,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
+def _ofes_trajectory_ventilation_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES MLD/outcrop 回溯与配对对照配置。"""
+    raw = dict(_OFES_CFG.get('trajectory_ventilation', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES trajectory_ventilation override keys: '
+                f'{unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'io_concurrency': int(raw.get('io_concurrency', 4)),
+        'maximum_backtrack_days': int(
+            raw.get('maximum_backtrack_days', 90)
+        ),
+        'reporting_horizons_days': tuple(
+            int(value)
+            for value in raw.get(
+                'reporting_horizons_days', (30, 60, 90)
+            )
+        ),
+        'integration_dt_seconds': float(
+            raw.get('integration_dt_seconds', 3600)
+        ),
+        'domain_margin_km': float(raw.get('domain_margin_km', 700.0)),
+        'minimum_active_fraction': float(
+            raw.get('minimum_active_fraction', 0.75)
+        ),
+        'mld_reference_depth_m': float(
+            raw.get('mld_reference_depth_m', 10.0)
+        ),
+        'mld_density_threshold_kg_m3': float(
+            raw.get('mld_density_threshold_kg_m3', 0.03)
+        ),
+        'near_mld_tolerance_m': float(
+            raw.get('near_mld_tolerance_m', 25.0)
+        ),
+        'outcrop_density_tolerance_kg_m3': float(
+            raw.get('outcrop_density_tolerance_kg_m3', 0.03)
+        ),
+        'control_inner_radius_km': float(
+            raw.get('control_inner_radius_km', 120.0)
+        ),
+        'control_outer_radius_km': float(
+            raw.get('control_outer_radius_km', 240.0)
+        ),
+        'control_radius_step_km': float(
+            raw.get('control_radius_step_km', 25.0)
+        ),
+        'control_azimuth_count': int(
+            raw.get('control_azimuth_count', 32)
+        ),
+        'control_depth_scale_m': float(
+            raw.get('control_depth_scale_m', 50.0)
+        ),
+        'control_depth_max_difference_m': float(
+            raw.get('control_depth_max_difference_m', 150.0)
+        ),
+        'control_sigma0_scale_kg_m3': float(
+            raw.get('control_sigma0_scale_kg_m3', 0.05)
+        ),
+        'control_sigma0_max_difference_kg_m3': float(
+            raw.get('control_sigma0_max_difference_kg_m3', 0.15)
+        ),
+        'control_same_sign_do_max_umol_kg': float(
+            raw.get('control_same_sign_do_max_umol_kg', 10.0)
+        ),
+        'control_same_sign_spiciness0_max': float(
+            raw.get('control_same_sign_spiciness0_max', 0.05)
+        ),
+        'kinematic_smoothing_sigma_pixels': float(
+            raw.get('kinematic_smoothing_sigma_pixels', 1.0)
+        ),
+        'kinematic_ro_scale': float(
+            raw.get('kinematic_ro_scale', 0.10)
+        ),
+        'kinematic_strain_scale_s_1': float(
+            raw.get('kinematic_strain_scale_s_1', 1.0e-5)
+        ),
+        'bootstrap_replicates': int(
+            raw.get('bootstrap_replicates', 10000)
+        ),
+        'random_seed': int(raw.get('random_seed', 20260729)),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'trajectory_ventilation')
+        ),
+    }
+    positive = (
+        'maximum_backtrack_days',
+        'integration_dt_seconds',
+        'domain_margin_km',
+        'mld_reference_depth_m',
+        'mld_density_threshold_kg_m3',
+        'control_inner_radius_km',
+        'control_outer_radius_km',
+        'control_radius_step_km',
+        'control_azimuth_count',
+        'control_depth_scale_m',
+        'control_depth_max_difference_m',
+        'control_sigma0_scale_kg_m3',
+        'control_sigma0_max_difference_kg_m3',
+        'control_same_sign_do_max_umol_kg',
+        'control_same_sign_spiciness0_max',
+        'kinematic_ro_scale',
+        'kinematic_strain_scale_s_1',
+        'bootstrap_replicates',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation positive settings are invalid.'
+        )
+    if (
+        settings['worker_count'] <= 0
+        or settings['worker_count'] > (os.cpu_count() or 1)
+        or settings['io_concurrency'] <= 0
+        or settings['io_concurrency'] > settings['worker_count']
+        or not 0 < settings['minimum_active_fraction'] <= 1
+        or settings['near_mld_tolerance_m'] < 0
+        or settings['outcrop_density_tolerance_kg_m3'] < 0
+        or settings['kinematic_smoothing_sigma_pixels'] < 0
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation worker/fraction/tolerance '
+            'settings are invalid.'
+        )
+    horizons = settings['reporting_horizons_days']
+    if (
+        not horizons
+        or tuple(sorted(set(horizons))) != horizons
+        or horizons[-1] > settings['maximum_backtrack_days']
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation horizons must be unique, ordered, '
+            'and no longer than maximum_backtrack_days.'
+        )
+    if (
+        settings['control_outer_radius_km']
+        <= settings['control_inner_radius_km']
+        or settings['control_azimuth_count'] < 8
+        or not settings['output_subdir'].strip()
+    ):
+        raise ValueError(
+            'OFES trajectory ventilation control geometry/output is invalid.'
+        )
+    return settings
+
+
+def _ofes_trajectory_fixed_bounds(
+    positions: np.ndarray,
+    margin_km: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """从释放位置与固定距离留白构建事件积分域。"""
+    finite = np.all(np.isfinite(positions), axis=1)
+    if not np.any(finite):
+        raise ValueError('OFES trajectory bounds require finite positions.')
+    subset = np.asarray(positions[finite], dtype=float)
+    center_lat = float(np.median(subset[:, 1]))
+    scale = approximate_degree_length(center_lat)
+    margin_m = float(margin_km) * 1000.0
+    lon_margin = margin_m / float(scale['meters_per_degree_lon'])
+    lat_margin = margin_m / float(scale['meters_per_degree_lat'])
+    return (
+        (
+            float(np.min(subset[:, 2]) - lon_margin),
+            float(np.max(subset[:, 2]) + lon_margin),
+        ),
+        (
+            float(np.min(subset[:, 1]) - lat_margin),
+            float(np.max(subset[:, 1]) + lat_margin),
+        ),
+    )
+
+
+_OFES_VENTILATION_IO_GATE = None
+
+
+def _ofes_initialize_ventilation_worker(io_gate) -> None:
+    """在 spawn worker 内安装共享的 OFES NetCDF I/O 闸门。"""
+    global _OFES_VENTILATION_IO_GATE
+    _OFES_VENTILATION_IO_GATE = io_gate
+
+
+@contextmanager
+def _ofes_ventilation_io_gate(io_gate):
+    """限制并行事件同时进入 OFES NetCDF 读取区段的数量。"""
+    if io_gate is None:
+        yield
+        return
+    io_gate.acquire()
+    try:
+        yield
+    finally:
+        io_gate.release()
+
+
+def _ofes_ventilation_profile_samples(
+    snapshot: dict,
+    lon_points: np.ndarray,
+    lat_points: np.ndarray,
+) -> dict:
+    """在任意水平点插值完整 T/S/DO 剖面并派生 sigma0/spice。"""
+    lon_points = np.asarray(lon_points, dtype=float)
+    lat_points = np.asarray(lat_points, dtype=float)
+    if lon_points.shape != lat_points.shape or lon_points.ndim != 1:
+        raise ValueError('OFES profile sample lon/lat must be matching 1-D.')
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    count = int(lon_points.size)
+    points = np.column_stack(
+        [
+            np.tile(depth, count),
+            np.repeat(lat_points, depth.size),
+            np.repeat(lon_points, depth.size),
+        ]
+    )
+    values = {}
+    for source, target in (
+        ('temp', 'theta'),
+        ('salinity', 'salinity'),
+        ('do2', 'do2'),
+    ):
+        if source in snapshot:
+            values[target] = _ofes_interp3d(
+                snapshot[source],
+                depth,
+                np.asarray(snapshot['lat'], dtype=float),
+                np.asarray(snapshot['lon'], dtype=float),
+                points,
+            ).reshape(count, depth.size)
+    if 'theta' not in values or 'salinity' not in values:
+        raise ValueError('OFES ventilation profiles require temp and salinity.')
+    pressure = gsw.p_from_z(
+        -np.broadcast_to(depth, (count, depth.size)),
+        np.broadcast_to(lat_points[:, None], (count, depth.size)),
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        values['salinity'],
+        pressure,
+        np.broadcast_to(lon_points[:, None], (count, depth.size)),
+        np.broadcast_to(lat_points[:, None], (count, depth.size)),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, values['theta']
+    )
+    values['sigma0'] = np.asarray(
+        gsw.sigma0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    values['spiciness0'] = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    values['depth'] = depth
+    return values
+
+
+def _ofes_mld_contact_from_profile(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    particle_depth_m: float,
+    target_sigma0: float,
+    settings: dict,
+) -> dict:
+    """从单剖面分别判定实际 MLD 接触与等密度面出露机会。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    sigma_arr = np.asarray(sigma0, dtype=float)
+    finite = np.isfinite(depth_arr) & np.isfinite(sigma_arr)
+    if np.count_nonzero(finite) < 3:
+        return {
+            'mld_diagnostic_valid': False,
+            'mld_m': np.nan,
+            'mld_capped_at_delivery_bottom': False,
+            'particle_sigma0': np.nan,
+            'depth_minus_mld_m': np.nan,
+            'direct_mld_contact': False,
+            'near_mld_contact': False,
+            'isopycnal_outcrop_opportunity': False,
+        }
+    d = depth_arr[finite]
+    sigma = sigma_arr[finite]
+    reference_index = int(
+        np.argmin(
+            np.abs(d - settings['mld_reference_depth_m'])
+        )
+    )
+    threshold_reached = bool(
+        np.any(
+            (d > d[reference_index])
+            & (
+                sigma - sigma[reference_index]
+                >= settings['mld_density_threshold_kg_m3']
+            )
+        )
+    )
+    mld = _mld_from_sigma(
+        d,
+        sigma,
+        settings['mld_density_threshold_kg_m3'],
+        settings['mld_reference_depth_m'],
+    )
+    particle_sigma0 = _ofes_profile_value_at_depth(
+        d, sigma, float(particle_depth_m)
+    )
+    mixed = np.isfinite(sigma) & (d <= float(mld))
+    tolerance = settings['outcrop_density_tolerance_kg_m3']
+    outcrop = bool(
+        np.isfinite(target_sigma0)
+        and np.any(mixed)
+        and float(target_sigma0)
+        >= float(np.nanmin(sigma[mixed]) - tolerance)
+        and float(target_sigma0)
+        <= float(np.nanmax(sigma[mixed]) + tolerance)
+    )
+    clearance = float(particle_depth_m) - float(mld)
+    return {
+        'mld_diagnostic_valid': bool(
+            np.isfinite(mld) and np.isfinite(particle_sigma0)
+        ),
+        'mld_m': float(mld),
+        'mld_capped_at_delivery_bottom': bool(not threshold_reached),
+        'particle_sigma0': float(particle_sigma0),
+        'depth_minus_mld_m': clearance,
+        'direct_mld_contact': bool(clearance <= 0),
+        'near_mld_contact': bool(
+            clearance <= settings['near_mld_tolerance_m']
+        ),
+        'isopycnal_outcrop_opportunity': outcrop,
+    }
+
+
+def _ofes_ventilation_candidate_geometry(
+    core_lon: float,
+    core_lat: float,
+    settings: dict,
+) -> pd.DataFrame:
+    """在预注册环带构造确定性配对对照候选位置。"""
+    radii = np.arange(
+        settings['control_inner_radius_km'],
+        settings['control_outer_radius_km'] + 1e-9,
+        settings['control_radius_step_km'],
+    )
+    if radii[-1] < settings['control_outer_radius_km'] - 1e-9:
+        radii = np.append(radii, settings['control_outer_radius_km'])
+    azimuths = np.linspace(
+        0.0,
+        360.0,
+        int(settings['control_azimuth_count']),
+        endpoint=False,
+    )
+    scale = approximate_degree_length(float(core_lat))
+    records = []
+    candidate_index = 0
+    for radius in radii:
+        for azimuth in azimuths:
+            angle = np.deg2rad(float(azimuth))
+            records.append(
+                {
+                    'candidate_index': candidate_index,
+                    'radius_km': float(radius),
+                    'azimuth_deg': float(azimuth),
+                    'lon': float(
+                        core_lon
+                        + radius * 1000.0 * np.cos(angle)
+                        / float(scale['meters_per_degree_lon'])
+                    ),
+                    'lat': float(
+                        core_lat
+                        + radius * 1000.0 * np.sin(angle)
+                        / float(scale['meters_per_degree_lat'])
+                    ),
+                }
+            )
+            candidate_index += 1
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_interp2d(
+    snapshot: dict,
+    field: np.ndarray,
+    lon_points: np.ndarray,
+    lat_points: np.ndarray,
+) -> np.ndarray:
+    """从规则 OFES 水平网格线性插值二维场。"""
+    interpolator = RegularGridInterpolator(
+        (
+            np.asarray(snapshot['lat'], dtype=float),
+            np.asarray(snapshot['lon'], dtype=float),
+        ),
+        np.asarray(field, dtype=float),
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    values = np.asarray(
+        interpolator(
+            np.column_stack(
+                [
+                    np.asarray(lat_points, dtype=float),
+                    np.asarray(lon_points, dtype=float),
+                ]
+            )
+        ),
+        dtype=float,
+    )
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        grid_lon = np.asarray(snapshot['lon'], dtype=float)
+        grid_lat = np.asarray(snapshot['lat'], dtype=float)
+        field_arr = np.asarray(field, dtype=float)
+        missing_indices = np.flatnonzero(missing)
+        for index in missing_indices:
+            column = int(
+                np.argmin(
+                    np.abs(
+                        _minimal_lon_diff_deg(
+                            grid_lon, float(lon_points[index])
+                        )
+                    )
+                )
+            )
+            row = int(
+                np.argmin(np.abs(grid_lat - float(lat_points[index])))
+            )
+            values[index] = float(field_arr[row, column])
+    return values
+
+
+def _ofes_ventilation_controls(
+    event: dict,
+    anomaly_positions: np.ndarray,
+    anomaly_metadata: pd.DataFrame,
+    settings: dict,
+    io_gate=None,
+) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """为异常粒子选择水文匹配与动力也匹配的两组对照。"""
+    peak_date = pd.Timestamp(event['peak_date']).normalize()
+    core_lon = float(event['daily_peak_lon'])
+    core_lat = float(event['daily_peak_lat'])
+    load_radius = settings['control_outer_radius_km'] + 50.0
+    scale = approximate_degree_length(core_lat)
+    lon_margin = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lon'])
+    )
+    lat_margin = (
+        load_radius * 1000.0 / float(scale['meters_per_degree_lat'])
+    )
+    with _ofes_ventilation_io_gate(io_gate):
+        snapshot = load_ofes_snapshot(
+            peak_date,
+            variables=['do2', 'temp', 'salinity', 'u', 'v'],
+            lon_bounds=(core_lon - lon_margin, core_lon + lon_margin),
+            lat_bounds=(core_lat - lat_margin, core_lat + lat_margin),
+            depth_bounds=None,
+        )
+    candidates = _ofes_ventilation_candidate_geometry(
+        core_lon, core_lat, settings
+    )
+    candidate_profiles = _ofes_ventilation_profile_samples(
+        snapshot,
+        candidates['lon'].to_numpy(dtype=float),
+        candidates['lat'].to_numpy(dtype=float),
+    )
+    anomaly_profiles = _ofes_ventilation_profile_samples(
+        snapshot,
+        anomaly_positions[:, 2],
+        anomaly_positions[:, 1],
+    )
+    background = _ofes_trajectory_tracer_background(
+        snapshot,
+        core_lon,
+        core_lat,
+        {
+            'background_inner_radius_km': settings[
+                'control_inner_radius_km'
+            ],
+            'background_outer_radius_km': settings[
+                'control_outer_radius_km'
+            ],
+        },
+    )
+    output_positions = []
+    output_records = []
+    audit_records = []
+    next_index = int(len(anomaly_metadata))
+    peak_do_sign = int(np.sign(float(event['water_mass_do_contrast'])))
+    peak_spice_sign = int(
+        np.sign(float(event['same_sigma_spiciness0_contrast']))
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    kinematics_by_level: dict[int, dict] = {}
+    for depth_m, anomaly_group in anomaly_metadata.groupby(
+        'depth_m', sort=True
+    ):
+        anomaly_indices = anomaly_group.index.to_numpy(dtype=int)
+        candidate_count = len(candidates)
+        anomaly_sigma = np.asarray(
+            [
+                _ofes_profile_value_at_depth(
+                    depth,
+                    anomaly_profiles['sigma0'][index],
+                    float(depth_m),
+                )
+                for index in anomaly_indices
+            ],
+            dtype=float,
+        )
+        row_count = len(anomaly_indices)
+        candidate_depth = np.full(
+            (row_count, candidate_count), np.nan
+        )
+        candidate_sigma = np.full_like(candidate_depth, np.nan)
+        do_contrast = np.full_like(candidate_depth, np.nan)
+        spice_contrast = np.full_like(candidate_depth, np.nan)
+        for local_row, target_sigma in enumerate(anomaly_sigma):
+            background_crossing = _ofes_density_crossing_near_depth(
+                background['depth'],
+                background['sigma0'],
+                float(target_sigma),
+                float(depth_m),
+                background['profiles'],
+            )
+            background_thermo = _ofes_point_thermodynamics(
+                float(background_crossing['depth']),
+                float(background_crossing['salinity']),
+                float(background_crossing['theta']),
+                float(background_crossing['do2']),
+                core_lon,
+                core_lat,
+            )
+            for candidate_index in range(candidate_count):
+                crossing = _ofes_density_crossing_near_depth(
+                    depth,
+                    candidate_profiles['sigma0'][candidate_index],
+                    float(target_sigma),
+                    float(depth_m),
+                    {
+                        'do2': candidate_profiles['do2'][candidate_index],
+                        'theta': candidate_profiles['theta'][candidate_index],
+                        'salinity': candidate_profiles['salinity'][
+                            candidate_index
+                        ],
+                    },
+                )
+                candidate_depth[local_row, candidate_index] = float(
+                    crossing['depth']
+                )
+                candidate_thermo = _ofes_point_thermodynamics(
+                    float(crossing['depth']),
+                    float(crossing['salinity']),
+                    float(crossing['theta']),
+                    float(crossing['do2']),
+                    float(candidates.iloc[candidate_index]['lon']),
+                    float(candidates.iloc[candidate_index]['lat']),
+                )
+                candidate_sigma[local_row, candidate_index] = float(
+                    candidate_thermo['sigma0']
+                )
+                do_contrast[local_row, candidate_index] = float(
+                    crossing['do2'] - background_crossing['do2']
+                )
+                spice_contrast[local_row, candidate_index] = float(
+                    candidate_thermo['spiciness0']
+                    - background_thermo['spiciness0']
+                )
+        strong_same_do = (
+            np.sign(do_contrast) == peak_do_sign
+        ) & (
+            np.abs(do_contrast)
+            >= settings['control_same_sign_do_max_umol_kg']
+        )
+        strong_same_spice = (
+            np.sign(spice_contrast) == peak_spice_sign
+        ) & (
+            np.abs(spice_contrast)
+            >= settings['control_same_sign_spiciness0_max']
+        )
+        depth_difference = np.abs(candidate_depth - float(depth_m))
+        ordinary = (
+            np.isfinite(candidate_sigma)
+            & np.isfinite(do_contrast)
+            & np.isfinite(spice_contrast)
+            & (depth_difference <= settings['control_depth_max_difference_m'])
+            & ~(strong_same_do & strong_same_spice)
+        )
+        anomaly_level_index = int(
+            np.argmin(np.abs(depth - float(depth_m)))
+        )
+        if anomaly_level_index not in kinematics_by_level:
+            kinematics_by_level[anomaly_level_index] = (
+                _ofes_fixed_depth_kinematic_fields(
+                    snapshot,
+                    float(depth[anomaly_level_index]),
+                    settings['kinematic_smoothing_sigma_pixels'],
+                )
+            )
+        kinematics = kinematics_by_level[anomaly_level_index]
+        anomaly_ro = _ofes_ventilation_interp2d(
+            snapshot,
+            kinematics['rossby_number'],
+            anomaly_positions[anomaly_indices, 2],
+            anomaly_positions[anomaly_indices, 1],
+        )
+        anomaly_strain = _ofes_ventilation_interp2d(
+            snapshot,
+            kinematics['total_strain'],
+            anomaly_positions[anomaly_indices, 2],
+            anomaly_positions[anomaly_indices, 1],
+        )
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_sigma0'
+        ] = anomaly_sigma
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_rossby_number'
+        ] = anomaly_ro
+        anomaly_metadata.loc[
+            anomaly_indices, 'seed_total_strain_s_1'
+        ] = anomaly_strain
+        candidate_ro = np.full_like(candidate_depth, np.nan)
+        candidate_strain = np.full_like(candidate_depth, np.nan)
+        nearest_level = np.full(candidate_depth.shape, -1, dtype=int)
+        finite_depth = np.isfinite(candidate_depth)
+        nearest_level[finite_depth] = np.argmin(
+            np.abs(
+                depth[:, None]
+                - candidate_depth[finite_depth][None, :]
+            ),
+            axis=0,
+        )
+        for level_index in np.unique(nearest_level[nearest_level >= 0]):
+            if int(level_index) not in kinematics_by_level:
+                kinematics_by_level[int(level_index)] = (
+                    _ofes_fixed_depth_kinematic_fields(
+                        snapshot,
+                        float(depth[level_index]),
+                        settings['kinematic_smoothing_sigma_pixels'],
+                    )
+                )
+            level_kinematics = kinematics_by_level[int(level_index)]
+            level_ro = _ofes_ventilation_interp2d(
+                snapshot,
+                level_kinematics['rossby_number'],
+                candidates['lon'].to_numpy(dtype=float),
+                candidates['lat'].to_numpy(dtype=float),
+            )
+            level_strain = _ofes_ventilation_interp2d(
+                snapshot,
+                level_kinematics['total_strain'],
+                candidates['lon'].to_numpy(dtype=float),
+                candidates['lat'].to_numpy(dtype=float),
+            )
+            matching = nearest_level == int(level_index)
+            candidate_ro[matching] = np.broadcast_to(
+                level_ro, candidate_ro.shape
+            )[matching]
+            candidate_strain[matching] = np.broadcast_to(
+                level_strain, candidate_strain.shape
+            )[matching]
+        hydro_cost = np.sqrt(
+            (
+                (anomaly_sigma[:, None] - candidate_sigma)
+                / settings['control_sigma0_scale_kg_m3']
+            )**2
+            + (
+                depth_difference / settings['control_depth_scale_m']
+            )**2
+        )
+        hydro_cost[~ordinary] = np.inf
+        kinematic_cost = np.sqrt(
+            hydro_cost**2
+            + (
+                (anomaly_ro[:, None] - candidate_ro)
+                / settings['kinematic_ro_scale']
+            )**2
+            + (
+                (
+                    anomaly_strain[:, None]
+                    - candidate_strain
+                )
+                / settings['kinematic_strain_scale_s_1']
+            )**2
+        )
+        kinematic_cost[~np.isfinite(kinematic_cost)] = np.inf
+        for control_group, cost in (
+            ('hydrographic_control', hydro_cost),
+            ('kinematic_control', kinematic_cost),
+        ):
+            if (
+                np.count_nonzero(np.any(np.isfinite(cost), axis=0))
+                < len(anomaly_indices)
+                or np.any(~np.any(np.isfinite(cost), axis=1))
+            ):
+                raise RuntimeError(
+                    f'Insufficient ordinary matched controls for '
+                    f'{event["event_id"]} at {depth_m:g} m.'
+                )
+            try:
+                rows, columns = linear_sum_assignment(cost)
+            except ValueError as error:
+                raise RuntimeError(
+                    f'OFES matched-control cost matrix failed for '
+                    f'{event["event_id"]} {control_group}: {error}'
+                ) from error
+            if len(rows) != len(anomaly_indices) or not np.all(
+                np.isfinite(cost[rows, columns])
+            ):
+                raise RuntimeError(
+                    f'OFES matched-control assignment failed for '
+                    f'{event["event_id"]} {control_group}.'
+                )
+            if np.any(
+                np.abs(
+                    anomaly_sigma[rows] - candidate_sigma[rows, columns]
+                )
+                > settings['control_sigma0_max_difference_kg_m3']
+            ):
+                raise RuntimeError(
+                    f'OFES matched-control sigma0 tolerance failed for '
+                    f'{event["event_id"]} {control_group}.'
+                )
+            for local_row, candidate_index in zip(rows, columns):
+                anomaly_index = int(anomaly_indices[local_row])
+                anomaly = anomaly_metadata.loc[anomaly_index]
+                candidate = candidates.iloc[int(candidate_index)]
+                matched_depth = float(
+                    candidate_depth[local_row, candidate_index]
+                )
+                output_positions.append(
+                    (
+                        matched_depth,
+                        float(candidate['lat']),
+                        float(candidate['lon']),
+                    )
+                )
+                output_records.append(
+                    {
+                        'particle_index': next_index,
+                        'particle_id': (
+                            f'{control_group}_{anomaly.particle_id}'
+                        ),
+                        'particle_group': control_group,
+                        'pair_id': str(anomaly.particle_id),
+                        'depth_m': matched_depth,
+                        'depth_offset_index': int(
+                            anomaly.depth_offset_index
+                        ),
+                        'ring_fraction': float(anomaly.ring_fraction),
+                        'seed_lon': float(candidate['lon']),
+                        'seed_lat': float(candidate['lat']),
+                        'seed_sigma0': float(
+                            candidate_sigma[local_row, candidate_index]
+                        ),
+                        'seed_rossby_number': float(
+                            candidate_ro[local_row, candidate_index]
+                        ),
+                        'seed_total_strain_s_1': float(
+                            candidate_strain[local_row, candidate_index]
+                        ),
+                    }
+                )
+                audit_records.append(
+                    {
+                        'event_id': str(event['event_id']),
+                        'particle_group': control_group,
+                        'pair_id': str(anomaly.particle_id),
+                        'depth_m': float(depth_m),
+                        'control_seed_depth_m': matched_depth,
+                        'absolute_depth_difference_m': float(
+                            abs(matched_depth - float(depth_m))
+                        ),
+                        'candidate_index': int(candidate.candidate_index),
+                        'candidate_radius_km': float(candidate.radius_km),
+                        'candidate_azimuth_deg': float(
+                            candidate.azimuth_deg
+                        ),
+                        'absolute_sigma0_difference': float(
+                            abs(
+                                anomaly_sigma[local_row]
+                                - candidate_sigma[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'absolute_rossby_difference': float(
+                            abs(
+                                anomaly_ro[local_row]
+                                - candidate_ro[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'absolute_strain_difference_s_1': float(
+                            abs(
+                                anomaly_strain[local_row]
+                                - candidate_strain[
+                                    local_row, candidate_index
+                                ]
+                            )
+                        ),
+                        'candidate_same_sigma_do_contrast': float(
+                            do_contrast[local_row, candidate_index]
+                        ),
+                        'candidate_same_sigma_spiciness0_contrast': float(
+                            spice_contrast[local_row, candidate_index]
+                        ),
+                        'match_cost': float(cost[local_row, candidate_index]),
+                        'ordinary_fingerprint_gate_passed': bool(
+                            ordinary[local_row, candidate_index]
+                        ),
+                    }
+                )
+                next_index += 1
+    control_positions = np.asarray(output_positions, dtype=float)
+    control_metadata = pd.DataFrame(output_records)
+    if control_metadata.duplicated(
+        ['particle_group', 'pair_id']
+    ).any():
+        raise RuntimeError('OFES matched controls are not one-to-one.')
+    return (
+        control_positions,
+        control_metadata,
+        pd.DataFrame(audit_records),
+        anomaly_metadata,
+    )
+
+
+def _ofes_ventilation_sample_day(
+    event_id: str,
+    date: pd.Timestamp,
+    positions: np.ndarray,
+    status: np.ndarray,
+    particle_metadata: pd.DataFrame,
+    settings: dict,
+    io_gate=None,
+) -> pd.DataFrame:
+    """在一个回溯日诊断每粒子 MLD 接触与出露机会。"""
+    active = np.asarray(status).astype(str) == 'active'
+    records = []
+    diagnostics: dict[int, dict] = {}
+    if np.any(active):
+        active_position = np.asarray(positions[active], dtype=float)
+        center_lat = float(np.nanmedian(active_position[:, 1]))
+        scale = approximate_degree_length(center_lat)
+        lon_margin = 20_000.0 / float(scale['meters_per_degree_lon'])
+        lat_margin = 20_000.0 / float(scale['meters_per_degree_lat'])
+        with _ofes_ventilation_io_gate(io_gate):
+            snapshot = load_ofes_snapshot(
+                date,
+                variables=['temp', 'salinity'],
+                lon_bounds=(
+                    float(np.nanmin(active_position[:, 2]) - lon_margin),
+                    float(np.nanmax(active_position[:, 2]) + lon_margin),
+                ),
+                lat_bounds=(
+                    float(np.nanmin(active_position[:, 1]) - lat_margin),
+                    float(np.nanmax(active_position[:, 1]) + lat_margin),
+                ),
+                depth_bounds=None,
+            )
+        profiles = _ofes_ventilation_profile_samples(
+            snapshot,
+            active_position[:, 2],
+            active_position[:, 1],
+        )
+        for local_index, particle_index in enumerate(np.flatnonzero(active)):
+            metadata = particle_metadata.iloc[int(particle_index)]
+            diagnostics[int(particle_index)] = (
+                _ofes_mld_contact_from_profile(
+                    profiles['depth'],
+                    profiles['sigma0'][local_index],
+                    float(active_position[local_index, 0]),
+                    float(metadata['seed_sigma0']),
+                    settings,
+                )
+            )
+    for particle_index, metadata in particle_metadata.iterrows():
+        diagnostic = diagnostics.get(
+            int(particle_index),
+            {
+                'mld_diagnostic_valid': False,
+                'mld_m': np.nan,
+                'mld_capped_at_delivery_bottom': False,
+                'particle_sigma0': np.nan,
+                'depth_minus_mld_m': np.nan,
+                'direct_mld_contact': False,
+                'near_mld_contact': False,
+                'isopycnal_outcrop_opportunity': False,
+            },
+        )
+        records.append(
+            {
+                'event_id': str(event_id),
+                'date': pd.Timestamp(date).normalize(),
+                'particle_index': int(particle_index),
+                'particle_id': str(metadata['particle_id']),
+                'particle_group': str(metadata['particle_group']),
+                'pair_id': str(metadata['pair_id']),
+                'status': str(status[int(particle_index)]),
+                'depth_m': float(positions[int(particle_index), 0]),
+                'lat': float(positions[int(particle_index), 1]),
+                'lon': float(positions[int(particle_index), 2]),
+                'seed_sigma0': float(metadata['seed_sigma0']),
+                **diagnostic,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_velocity_snapshot(
+    date: pd.Timestamp,
+    lon_bounds: tuple[float, float],
+    lat_bounds: tuple[float, float],
+    io_gate=None,
+) -> dict:
+    """加载一个已通过专项 w 门控的通风回溯速度快照。"""
+    with _ofes_ventilation_io_gate(io_gate):
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['u', 'v', 'w'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=None,
+        )
+    snapshot['metadata']['w_validation_passed'] = True
+    return snapshot
+
+
+def _ofes_ventilation_horizon_summary(
+    daily: pd.DataFrame,
+    peak_date: pd.Timestamp,
+    available_backtrack_days: int,
+    settings: dict,
+) -> pd.DataFrame:
+    """按预注册 30/60/90 天窗口汇总事件等权通风指标。"""
+    frame = daily.copy()
+    frame['lookback_days'] = (
+        pd.Timestamp(peak_date).normalize()
+        - pd.to_datetime(frame['date']).dt.normalize()
+    ).dt.days.astype(int)
+    records = []
+    for horizon in settings['reporting_horizons_days']:
+        window = frame.loc[frame['lookback_days'] <= int(horizon)].copy()
+        for particle_group, group in window.groupby(
+            'particle_group', sort=True
+        ):
+            boundary_lookback = min(
+                int(horizon), int(available_backtrack_days)
+            )
+            boundary = group.loc[
+                group['lookback_days'] == boundary_lookback
+            ]
+            boundary_active_ids = boundary.loc[
+                boundary['status'].astype(str) == 'active',
+                'particle_id',
+            ].astype(str)
+            valid_day_count = group.groupby('particle_id')[
+                'mld_diagnostic_valid'
+            ].sum()
+            expected_day_count = int(boundary_lookback + 1)
+            valid_ids = valid_day_count.index[
+                valid_day_count == expected_day_count
+            ].astype(str)
+            complete_ids = pd.Index(boundary_active_ids).intersection(
+                pd.Index(valid_ids)
+            )
+            complete = group.loc[
+                group['particle_id'].astype(str).isin(complete_ids)
+            ].copy()
+            initial_count = int(group['particle_id'].nunique())
+            complete_count = int(len(complete_ids))
+            per_particle = complete.groupby('particle_id').agg(
+                ever_direct_mld_contact=('direct_mld_contact', 'max'),
+                ever_near_mld_contact=('near_mld_contact', 'max'),
+                ever_outcrop_opportunity=(
+                    'isopycnal_outcrop_opportunity', 'max'
+                ),
+                direct_contact_days=('direct_mld_contact', 'sum'),
+                near_contact_days=('near_mld_contact', 'sum'),
+                outcrop_opportunity_days=(
+                    'isopycnal_outcrop_opportunity', 'sum'
+                ),
+                minimum_depth_minus_mld_m=('depth_minus_mld_m', 'min'),
+            )
+            most_recent = (
+                complete.loc[complete['direct_mld_contact']]
+                .groupby('particle_id')['lookback_days']
+                .min()
+            )
+            records.append(
+                {
+                    'event_id': str(frame['event_id'].iloc[0]),
+                    'particle_group': str(particle_group),
+                    'horizon_days': int(horizon),
+                    'available_backtrack_days': int(
+                        available_backtrack_days
+                    ),
+                    'full_horizon_observed': bool(
+                        available_backtrack_days >= int(horizon)
+                    ),
+                    'initial_particle_count': initial_count,
+                    'complete_particle_count': complete_count,
+                    'complete_particle_fraction': float(
+                        complete_count / initial_count
+                    ) if initial_count else np.nan,
+                    'diagnostic_passed': bool(
+                        available_backtrack_days >= int(horizon)
+                        and initial_count > 0
+                        and complete_count / initial_count
+                        >= settings['minimum_active_fraction']
+                    ),
+                    'ever_direct_mld_contact_fraction': float(
+                        per_particle['ever_direct_mld_contact'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'ever_near_mld_contact_fraction': float(
+                        per_particle['ever_near_mld_contact'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'ever_outcrop_opportunity_fraction': float(
+                        per_particle['ever_outcrop_opportunity'].mean()
+                    ) if len(per_particle) else np.nan,
+                    'median_direct_contact_days': float(
+                        per_particle['direct_contact_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_near_contact_days': float(
+                        per_particle['near_contact_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_outcrop_opportunity_days': float(
+                        per_particle['outcrop_opportunity_days'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_minimum_depth_minus_mld_m': float(
+                        per_particle['minimum_depth_minus_mld_m'].median()
+                    ) if len(per_particle) else np.nan,
+                    'median_most_recent_direct_contact_lookback_days': float(
+                        most_recent.median()
+                    ) if len(most_recent) else np.nan,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _ofes_ventilation_fragment_paths(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict[str, Path]:
+    """返回单事件通风回溯 fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        'event_dir': event_dir,
+        'summary': event_dir / 'summary.json',
+        'particle_metadata': event_dir / 'particle_metadata.parquet',
+        'control_audit': event_dir / 'control_audit.parquet',
+        'daily_diagnostics': event_dir / 'daily_diagnostics.parquet',
+        'horizon_summary': event_dir / 'horizon_summary.parquet',
+    }
+
+
+def _ofes_ventilation_fragment_reusable(
+    paths: dict[str, Path],
+    event_id: str | None = None,
+    peak_date: pd.Timestamp | None = None,
+) -> bool:
+    """判定通风回溯 fragment 是否完整。"""
+    required = [path for key, path in paths.items() if key != 'event_dir']
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths['summary'].read_text(encoding='utf-8'))
+    _ofes_assert_summary_request(
+        stored,
+        event_id,
+        peak_date=peak_date,
+    )
+    table_columns = {
+        'particle_metadata': {'particle_index', 'particle_group', 'depth_m'},
+        'control_audit': {'event_id', 'particle_group', 'pair_id'},
+        'daily_diagnostics': {
+            'event_id', 'date', 'particle_index', 'mld_diagnostic_valid',
+        },
+        'horizon_summary': {
+            'event_id', 'horizon_days', 'particle_group',
+            'diagnostic_passed',
+        },
+    }
+    for key, columns in table_columns.items():
+        frame = pd.read_parquet(paths[key])
+        if frame.empty or not columns.issubset(frame.columns):
+            return False
+    return bool(
+        stored.get('event_id')
+        and 'available_backtrack_days' in stored
+        and 'particle_count' in stored
+    )
+
+
+def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
+    """流式回溯一个事件的异常/对照粒子并原子落盘。"""
+    event = dict(payload['event'])
+    event_id = str(event['event_id'])
+    settings = payload['settings']
+    io_gate = _OFES_VENTILATION_IO_GATE
+    paths = _ofes_ventilation_fragment_paths(
+        payload['events_dir'], event_id
+    )
+    paths['event_dir'].mkdir(parents=True, exist_ok=True)
+    trajectory_settings = payload['trajectory_settings']
+    anomaly_positions, anomaly_metadata, _ = (
+        _ofes_trajectory_seed_ensemble(
+            event['peak_date'],
+            float(event['daily_peak_lon']),
+            float(event['daily_peak_lat']),
+            float(event['reference_depth_m']),
+            float(event['daily_peak_equivalent_radius_km']),
+            trajectory_settings,
+        )
+    )
+    anomaly_metadata['particle_group'] = 'anomaly'
+    anomaly_metadata['pair_id'] = anomaly_metadata['particle_id'].astype(str)
+    (
+        control_positions,
+        control_metadata,
+        control_audit,
+        anomaly_metadata,
+    ) = _ofes_ventilation_controls(
+        event,
+        anomaly_positions,
+        anomaly_metadata,
+        settings,
+        io_gate,
+    )
+    particle_metadata = pd.concat(
+        [
+            anomaly_metadata,
+            control_metadata,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    particle_metadata['particle_index'] = np.arange(
+        len(particle_metadata), dtype=int
+    )
+    positions = np.vstack([anomaly_positions, control_positions])
+    if len(positions) != len(particle_metadata):
+        raise RuntimeError('OFES ventilation particle metadata mismatch.')
+    status = np.full(len(positions), 'active', dtype='<U8')
+    lon_bounds, lat_bounds = _ofes_trajectory_fixed_bounds(
+        positions, settings['domain_margin_km']
+    )
+    peak_date = pd.Timestamp(event['peak_date']).normalize()
+    data_start = pd.Timestamp(payload['data_start_date']).normalize()
+    requested_start = peak_date - pd.Timedelta(
+        days=settings['maximum_backtrack_days']
+    )
+    start_date = max(data_start, requested_start)
+    available_days = int((peak_date - start_date).days)
+    daily_frames = [
+        _ofes_ventilation_sample_day(
+            event_id,
+            peak_date,
+            positions,
+            status,
+            particle_metadata,
+            settings,
+            io_gate,
+        )
+    ]
+    current_snapshot = _ofes_ventilation_velocity_snapshot(
+        peak_date,
+        lon_bounds,
+        lat_bounds,
+        io_gate,
+    )
+    current_date = peak_date
+    while current_date > start_date:
+        previous_date = current_date - pd.Timedelta(days=1)
+        previous_snapshot = _ofes_ventilation_velocity_snapshot(
+            previous_date,
+            lon_bounds,
+            lat_bounds,
+            io_gate,
+        )
+        active_index = np.flatnonzero(status == 'active')
+        if active_index.size:
+            result = advect_ofes_particles(
+                [previous_snapshot, current_snapshot],
+                positions[active_index],
+                backward=True,
+                dt_seconds=settings['integration_dt_seconds'],
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            positions[active_index] = np.asarray(
+                result['positions'][-1], dtype=float
+            )
+            status[active_index] = np.asarray(
+                result['final_status']
+            ).astype(str)
+        daily_frames.append(
+            _ofes_ventilation_sample_day(
+                event_id,
+                previous_date,
+                positions,
+                status,
+                particle_metadata,
+                settings,
+                io_gate,
+            )
+        )
+        current_snapshot = previous_snapshot
+        current_date = previous_date
+    daily = pd.concat(daily_frames, ignore_index=True)
+    horizon = _ofes_ventilation_horizon_summary(
+        daily,
+        peak_date,
+        available_days,
+        settings,
+    )
+    summary = {
+        'event_id': event_id,
+        'peak_date': peak_date,
+        'backtrack_start_date': start_date,
+        'available_backtrack_days': available_days,
+        'left_censored_at_data_start': bool(
+            requested_start < data_start
+        ),
+        'particle_count': int(len(particle_metadata)),
+        'particle_count_by_group': {
+            str(key): int(value)
+            for key, value in particle_metadata.groupby(
+                'particle_group'
+            ).size().items()
+        },
+        'minimum_final_active_fraction': float(
+            horizon.loc[
+                horizon['horizon_days']
+                == min(
+                    available_days,
+                    settings['reporting_horizons_days'][-1],
+                ),
+                'complete_particle_fraction',
+            ].min()
+        ) if available_days in settings['reporting_horizons_days'] else float(
+            daily.loc[daily['date'] == start_date]
+            .groupby('particle_group')['status']
+            .apply(lambda values: (values == 'active').mean())
+            .min()
+        ),
+    }
+    _ofes_atomic_write_json(summary, paths['summary'])
+    _atomic_write_parquet(particle_metadata, paths['particle_metadata'])
+    _atomic_write_parquet(control_audit, paths['control_audit'])
+    _atomic_write_parquet(daily, paths['daily_diagnostics'])
+    _atomic_write_parquet(horizon, paths['horizon_summary'])
+    return {
+        'event_id': event_id,
+        'available_backtrack_days': available_days,
+    }
+
+
+def _ofes_load_ventilation_fragment(
+    events_dir: str | Path,
+    event_id: str,
+) -> dict:
+    """读取一个已完成的通风回溯 fragment。"""
+    paths = _ofes_ventilation_fragment_paths(events_dir, event_id)
+    return {
+        'summary': json.loads(
+            paths['summary'].read_text(encoding='utf-8')
+        ),
+        **{
+            key: pd.read_parquet(paths[key])
+            for key in (
+                'particle_metadata',
+                'control_audit',
+                'daily_diagnostics',
+                'horizon_summary',
+            )
+        },
+    }
+
+
+def _ofes_ventilation_group_comparison(
+    horizon_summary: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """以事件为统计单位比较异常与两组配对对照。"""
+    metrics = (
+        'ever_direct_mld_contact_fraction',
+        'ever_near_mld_contact_fraction',
+        'ever_outcrop_opportunity_fraction',
+    )
+    records = []
+    summary = {}
+    rng = np.random.default_rng(settings['random_seed'])
+    for horizon in settings['reporting_horizons_days']:
+        subset = horizon_summary.loc[
+            (horizon_summary['horizon_days'] == int(horizon))
+            & horizon_summary['diagnostic_passed']
+        ].copy()
+        wide = subset.pivot(
+            index='event_id',
+            columns='particle_group',
+            values=list(metrics),
+        )
+        horizon_payload = {}
+        for control_group in (
+            'hydrographic_control', 'kinematic_control'
+        ):
+            group_payload = {}
+            for metric in metrics:
+                if (
+                    (metric, 'anomaly') not in wide
+                    or (metric, control_group) not in wide
+                ):
+                    difference = np.asarray([], dtype=float)
+                else:
+                    pair = wide[
+                        [(metric, 'anomaly'), (metric, control_group)]
+                    ].dropna()
+                    difference = (
+                        pair[(metric, 'anomaly')]
+                        - pair[(metric, control_group)]
+                    ).to_numpy(dtype=float)
+                if difference.size:
+                    bootstrap = difference[
+                        rng.integers(
+                            0,
+                            difference.size,
+                            size=(
+                                settings['bootstrap_replicates'],
+                                difference.size,
+                            ),
+                        )
+                    ].mean(axis=1)
+                    interval = np.quantile(bootstrap, (0.025, 0.975))
+                    if np.allclose(difference, 0):
+                        statistic = 0.0
+                        p_value = 1.0
+                    else:
+                        test = scipy.stats.wilcoxon(
+                            difference,
+                            alternative='two-sided',
+                            zero_method='pratt',
+                        )
+                        statistic = float(test.statistic)
+                        p_value = float(test.pvalue)
+                else:
+                    interval = (np.nan, np.nan)
+                    statistic = np.nan
+                    p_value = np.nan
+                record = {
+                    'horizon_days': int(horizon),
+                    'control_group': control_group,
+                    'metric': metric,
+                    'event_count': int(difference.size),
+                    'event_equal_mean_difference': float(
+                        np.mean(difference)
+                    ) if difference.size else np.nan,
+                    'event_equal_median_difference': float(
+                        np.median(difference)
+                    ) if difference.size else np.nan,
+                    'bootstrap95_low': float(interval[0]),
+                    'bootstrap95_high': float(interval[1]),
+                    'paired_wilcoxon_statistic': statistic,
+                    'paired_wilcoxon_p': p_value,
+                }
+                records.append(record)
+                group_payload[metric] = record
+            horizon_payload[control_group] = group_payload
+        summary[str(horizon)] = horizon_payload
+    return pd.DataFrame(records), summary
+
+
+def _plot_ofes_trajectory_ventilation(
+    horizon_summary: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制异常与配对对照的事件等权通风历史图。"""
+    metrics = (
+        ('ever_direct_mld_contact_fraction', 'Direct MLD contact'),
+        ('ever_near_mld_contact_fraction', 'Within 25 m of MLD'),
+        ('ever_outcrop_opportunity_fraction', 'Isopycnal outcrop opportunity'),
+    )
+    groups = (
+        ('anomaly', '#d62728'),
+        ('hydrographic_control', '#4c78a8'),
+        ('kinematic_control', '#72b7b2'),
+    )
+    figure, axes = plt.subplots(
+        1, 3, figsize=(15, 4.8), constrained_layout=True
+    )
+    for axis, (metric, title) in zip(axes, metrics):
+        for group, color in groups:
+            rows = horizon_summary.loc[
+                (horizon_summary['particle_group'] == group)
+                & horizon_summary['diagnostic_passed']
+            ]
+            values = rows.groupby('horizon_days')[metric]
+            x = np.asarray(sorted(values.groups), dtype=float)
+            median = values.median().reindex(x).to_numpy(dtype=float)
+            q25 = values.quantile(0.25).reindex(x).to_numpy(dtype=float)
+            q75 = values.quantile(0.75).reindex(x).to_numpy(dtype=float)
+            axis.plot(
+                x,
+                median,
+                marker='o',
+                linewidth=2.0,
+                color=color,
+                label=group.replace('_', ' '),
+            )
+            axis.fill_between(x, q25, q75, color=color, alpha=0.16)
+        axis.set_title(title)
+        axis.set_xlabel('Backtrack horizon (days)')
+        axis.set_ylabel('Fraction of complete particles')
+        axis.set_ylim(-0.03, 1.03)
+        axis.grid(alpha=0.2)
+    axes[0].legend(frameon=False, fontsize=9)
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        settings['figure_dpi'],
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def _validate_ofes_ventilation_diagnostics(settings: dict) -> dict:
+    """用解析密度剖面验证 MLD 插值与两类接触语义。"""
+    depth = np.asarray([2.5, 10.0, 20.0, 40.0, 80.0])
+    sigma0 = np.asarray([25.0, 25.0, 25.01, 25.03, 25.10])
+    direct = _ofes_mld_contact_from_profile(
+        depth, sigma0, 30.0, 25.02, settings
+    )
+    deep = _ofes_mld_contact_from_profile(
+        depth, sigma0, 60.0, 25.08, settings
+    )
+    passed = bool(
+        abs(direct['mld_m'] - 40.0) <= 1.0e-10
+        and direct['direct_mld_contact']
+        and direct['isopycnal_outcrop_opportunity']
+        and not deep['direct_mld_contact']
+        and not deep['isopycnal_outcrop_opportunity']
+    )
+    payload = {
+        'passed': passed,
+        'expected_mld_m': 40.0,
+        'actual_mld_m': float(direct['mld_m']),
+        'direct_contact_case_passed': bool(
+            direct['direct_mld_contact']
+        ),
+        'outcrop_opportunity_case_passed': bool(
+            direct['isopycnal_outcrop_opportunity']
+        ),
+        'deep_noncontact_case_passed': bool(
+            not deep['direct_mld_contact']
+        ),
+        'dense_nonoutcrop_case_passed': bool(
+            not deep['isopycnal_outcrop_opportunity']
+        ),
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES ventilation analytic validation failed: {payload}'
+        )
+    return payload
+
+
+def run_ofes_3d_trajectory_ventilation(
+    population_run_dir: str | Path | None = None,
+    w_validation_run_dir: str | Path | None = None,
+    trajectory_population_run_dir: str | Path | None = None,
+    *,
+    ventilation_overrides: dict | None = None,
+    trajectory_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """回溯 OFES 异常与配对背景粒子的 MLD 接触史和出露机会。
+
+    workflow 在每个严格 DO50 事件的峰值日释放异常 ensemble 粒子，并在
+    120–240 km 环带为每个粒子分别选择同深度/近 sigma0 的普通水团对照和进一步
+    匹配 Ro/strain 的敏感性对照。三组粒子使用已门控的逐日 u/v/w 向后积分最多
+    90 天；逐日密度阈值 MLD 的实际接触和释放 sigma0 在当前位置的出露机会分开统计。
+
+    参数:
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - w_validation_run_dir (str | Path | None): 垂向速度验证目录；None 使用固定 `vertical_velocity_validation` 输出。
+        - trajectory_population_run_dir (str | Path | None): 三维轨迹总体目录；None 使用固定 `trajectory_3d_population` 输出。
+        - ventilation_overrides (dict | None): 临时覆盖 `ofes.trajectory_ventilation` 配置。
+        - trajectory_overrides (dict | None): 临时覆盖已验证的粒子释放几何配置。
+        - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_ventilation` 目录。
+    返回:
+        - dict: 含 run_dir、manifest、逐日诊断、事件×窗口摘要、配对审计、总体比较、analysis summary和图件路径。
+
+    输出:
+        - 固定输出目录下的 `events/<event_id>/*.parquet`、`daily_ventilation_diagnostics.parquet`、`event_horizon_summary.parquet`、`control_match_audit.parquet`、`group_comparison.parquet`、`analysis_summary.json`、`trajectory_ventilation.png` 与 `manifest.json`。
+
+    说明:
+        - direct MLD contact 要求粒子深度不深于同日同点 MLD；25 m near-contact 仅作敏感性。
+        - outcrop opportunity 只表示粒子峰值 sigma0 落入当前位置混合层密度范围，不等同于粒子实际通风。
+        - 对照不匹配异常水团指纹；主对照故意不匹配旋转，Ro/strain匹配只作次级敏感性。
+        - 30/60/90 天比例只纳入窗口完整且组内存活率达门槛的事件，年初事件显式左删失。
+    """
+    population_root = (
+        Path(population_run_dir)
+        if population_run_dir is not None
+        else _ofes_analysis_output_dir('event_population')
+    )
+    validation_root = (
+        Path(w_validation_run_dir)
+        if w_validation_run_dir is not None
+        else _ofes_analysis_output_dir('vertical_velocity_validation')
+    )
+    trajectory_root = (
+        Path(trajectory_population_run_dir)
+        if trajectory_population_run_dir is not None
+        else _ofes_analysis_output_dir('trajectory_3d_population')
+    )
+    settings = _ofes_trajectory_ventilation_settings(
+        ventilation_overrides
+    )
+    trajectory_settings = _ofes_trajectory_3d_settings(
+        trajectory_overrides
+    )
+    validation_summary = json.loads(
+        (validation_root / 'analysis_summary.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if validation_summary.get('validation_passed') is not True:
+        raise RuntimeError(
+            'OFES ventilation requires a complete passed w validation.'
+        )
+    population = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    events = population.loc[
+        population['population_diagnostic_passed']
+    ].copy()
+    events['peak_date'] = pd.to_datetime(events['peak_date']).dt.normalize()
+    events = events.sort_values(
+        ['peak_date', 'event_id'], kind='mergesort'
+    ).reset_index(drop=True)
+    if events.empty:
+        raise RuntimeError('OFES ventilation found no strict events.')
+    catalog_summary = json.loads(
+        (_ofes_analysis_output_dir('event_catalog') / 'catalog_summary.json')
+        .read_text(encoding='utf-8')
+    )
+    data_start_date = pd.Timestamp(catalog_summary['start_date']).normalize()
+    classification = pd.read_parquet(
+        trajectory_root / 'population_classification.parquet'
+    )
+    classification_columns = (
+        'event_id',
+        'resolved_vertical_pathway_supported',
+        'resolved_downward_pathway_supported',
+        'resolved_upward_pathway_supported',
+        'vertical_direction_matched',
+    )
+    event_context = events[
+        [
+            'event_id',
+            'peak_date',
+            'kinematic_regime',
+            'rotation_dominated',
+            'negative_subsurface_rossby_number',
+            'water_mass_dominated',
+        ]
+    ].merge(
+        classification[list(classification_columns)],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    run_dir = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = run_dir / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / 'manifest.json'
+    request = {
+        'settings': _ofes_material_settings(settings),
+        'trajectory_settings': _ofes_material_settings(
+            trajectory_settings
+        ),
+        'event_ids': [str(value) for value in events['event_id']],
+        'peak_dates': [
+            pd.Timestamp(value).strftime('%Y-%m-%d')
+            for value in events['peak_date']
+        ],
+    }
+    previous = _ofes_existing_manifest(
+        manifest_path, request
+    )
+    if previous is not None:
+        outputs = previous['outputs']
+        return {
+            'run_dir': run_dir,
+            'manifest': previous,
+            'daily_diagnostics': pd.read_parquet(
+                outputs['daily_diagnostics']
+            ),
+            'horizon_summary': pd.read_parquet(outputs['horizon_summary']),
+            'control_audit': pd.read_parquet(outputs['control_audit']),
+            'particle_metadata': pd.read_parquet(
+                outputs['particle_metadata']
+            ),
+            'group_comparison': pd.read_parquet(
+                outputs['group_comparison']
+            ),
+            'analysis_summary': json.loads(
+                Path(outputs['analysis_summary']).read_text(
+                    encoding='utf-8'
+                )
+            ),
+            'figure_path': Path(outputs['figure']),
+            'reused_complete_run': True,
+        }
+    source_records = []
+    for event in events.itertuples(index=False):
+        start = max(
+            data_start_date,
+            pd.Timestamp(event.peak_date)
+            - pd.Timedelta(days=settings['maximum_backtrack_days']),
+        )
+        for date in pd.date_range(start, event.peak_date):
+            variables = ['u', 'v', 'w', 'temp', 'salinity']
+            if date == pd.Timestamp(event.peak_date):
+                variables.append('do2')
+            for variable in variables:
+                path = _ofes_file_path(variable, date)
+                stat = path.stat()
+                source_records.append(
+                    {
+                        'event_id': str(event.event_id),
+                        'date': pd.Timestamp(date).normalize(),
+                        'variable': variable,
+                        'source_file': str(path.resolve()),
+                        'size_bytes': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns),
+                    }
+                )
+    source_inventory = pd.DataFrame(source_records)
+    manifest = {
+        'analysis': 'trajectory_ventilation',
+        'request': request,
+        'settings': settings,
+        'trajectory_settings': trajectory_settings,
+        'status': 'running',
+        'created_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+        'completed_events': 0,
+        'total_events': int(len(events)),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    _atomic_write_parquet(
+        source_inventory, run_dir / 'source_inventory.parquet'
+    )
+    _atomic_write_parquet(event_context, run_dir / 'event_context.parquet')
+    analytic_validation = _validate_ofes_ventilation_diagnostics(settings)
+    analytic_path = run_dir / 'analytic_validation.json'
+    _ofes_atomic_write_json(analytic_validation, analytic_path)
+    completed = 0
+    try:
+        pending = []
+        for event in events.to_dict(orient='records'):
+            paths = _ofes_ventilation_fragment_paths(
+                events_dir, str(event['event_id'])
+            )
+            if _ofes_ventilation_fragment_reusable(
+                paths,
+                str(event['event_id']),
+                peak_date=pd.Timestamp(event['peak_date']),
+            ):
+                completed += 1
+            else:
+                pending.append(
+                    {
+                        'event': event,
+                        'settings': settings,
+                        'trajectory_settings': trajectory_settings,
+                        'data_start_date': data_start_date,
+                        'events_dir': str(events_dir.resolve()),
+                    }
+                )
+        pending.sort(
+            key=lambda item: pd.Timestamp(item['event']['peak_date']),
+            reverse=True,
+        )
+        manifest['completed_events'] = completed
+        _ofes_atomic_write_json(manifest, manifest_path)
+        print(
+            '[OFES trajectory ventilation] '
+            f'events={len(events)}, reusable={completed}, '
+            f'pending={len(pending)}, workers={settings["worker_count"]}, '
+            f'io_concurrency={settings["io_concurrency"]}',
+            flush=True,
+        )
+        if pending:
+            spawn_context = multiprocessing.get_context('spawn')
+            io_gate = spawn_context.BoundedSemaphore(
+                int(settings['io_concurrency'])
+            )
+            with ProcessPoolExecutor(
+                max_workers=int(settings['worker_count']),
+                mp_context=spawn_context,
+                initializer=_ofes_initialize_ventilation_worker,
+                initargs=(io_gate,),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _ofes_run_ventilation_event_worker, task
+                    ): str(task['event']['event_id'])
+                    for task in pending
+                }
+                for future in futures_as_completed(futures):
+                    event_id = futures[future]
+                    result = future.result()
+                    completed += 1
+                    manifest.update(
+                        {
+                            'completed_events': completed,
+                            'last_completed_event': event_id,
+                            'updated_at_utc': pd.Timestamp.now(
+                                tz='UTC'
+                            ).isoformat(),
+                        }
+                    )
+                    _ofes_atomic_write_json(manifest, manifest_path)
+                    print(
+                        '[OFES trajectory ventilation] '
+                        f'{completed}/{len(events)} complete: '
+                        f'{result["event_id"]} '
+                        f'({result["available_backtrack_days"]} d)',
+                        flush=True,
+                    )
+        fragments = [
+            _ofes_load_ventilation_fragment(events_dir, event_id)
+            for event_id in events['event_id'].astype(str)
+        ]
+        daily = pd.concat(
+            [item['daily_diagnostics'] for item in fragments],
+            ignore_index=True,
+        )
+        horizon = pd.concat(
+            [item['horizon_summary'] for item in fragments],
+            ignore_index=True,
+        ).merge(
+            event_context.drop(columns='peak_date'),
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        control_audit = pd.concat(
+            [item['control_audit'] for item in fragments],
+            ignore_index=True,
+        )
+        particle_metadata = pd.concat(
+            [
+                item['particle_metadata'].assign(
+                    event_id=str(event_id)
+                )
+                for event_id, item in zip(
+                    events['event_id'].astype(str), fragments
+                )
+            ],
+            ignore_index=True,
+        )
+        event_summary = pd.DataFrame(
+            [item['summary'] for item in fragments]
+        )
+        comparison_frames = []
+        comparison_payload = {}
+        comparison_subsets = {
+            'all_events': horizon,
+            **{
+                f'kinematic_{regime}': group
+                for regime, group in horizon.groupby(
+                    'kinematic_regime', dropna=True, sort=True
+                )
+            },
+            'resolved_vertical_pathway': horizon.loc[
+                horizon['resolved_vertical_pathway_supported'].eq(True)
+            ],
+        }
+        for subset_name, subset in comparison_subsets.items():
+            frame, subset_payload = _ofes_ventilation_group_comparison(
+                subset, settings
+            )
+            frame.insert(0, 'analysis_subset', subset_name)
+            comparison_frames.append(frame)
+            comparison_payload[subset_name] = subset_payload
+        comparison = pd.concat(comparison_frames, ignore_index=True)
+        full_window_counts = {}
+        complete_pair_counts = {}
+        for horizon_days in settings['reporting_horizons_days']:
+            window = horizon.loc[
+                horizon['horizon_days'] == horizon_days
+            ]
+            passed_by_event = window.groupby('event_id').agg(
+                group_count=('particle_group', 'nunique'),
+                all_groups_passed=('diagnostic_passed', 'all'),
+            )
+            full_window_counts[str(horizon_days)] = int(
+                (
+                    (passed_by_event['group_count'] == 3)
+                    & passed_by_event['all_groups_passed']
+                ).sum()
+            )
+            hydrographic_complete_ids = set(
+                window.loc[
+                    (window['particle_group'] == 'hydrographic_control')
+                    & window['diagnostic_passed'],
+                    'event_id',
+                ].astype(str)
+            )
+            kinematic_complete_ids = set(
+                window.loc[
+                    (window['particle_group'] == 'kinematic_control')
+                    & window['diagnostic_passed'],
+                    'event_id',
+                ].astype(str)
+            )
+            requested_count = int(len(events))
+            complete_pair_counts[str(horizon_days)] = {
+                'hydrographic_complete_pair_count': int(
+                    len(hydrographic_complete_ids)
+                ),
+                'kinematic_complete_pair_count': int(
+                    len(kinematic_complete_ids)
+                ),
+                'requested_event_count': requested_count,
+            }
+            complete_pair_counts[str(horizon_days)][
+                'hydrographic_unmatched_or_window_limited_count'
+            ] = requested_count - complete_pair_counts[str(horizon_days)][
+                'hydrographic_complete_pair_count'
+            ]
+            complete_pair_counts[str(horizon_days)][
+                'kinematic_unmatched_or_window_limited_count'
+            ] = requested_count - complete_pair_counts[str(horizon_days)][
+                'kinematic_complete_pair_count'
+            ]
+        requested_event_ids = set(events['event_id'].astype(str))
+        completed_event_ids = set(event_summary['event_id'].astype(str))
+        analysis_summary = {
+            'requested_event_count': int(len(requested_event_ids)),
+            'completed_event_count': int(len(completed_event_ids)),
+            'requested_not_completed_event_ids': sorted(
+                requested_event_ids - completed_event_ids
+            ),
+            'completed_not_requested_event_ids': sorted(
+                completed_event_ids - requested_event_ids
+            ),
+            'strict_population_event_count': int(len(events)),
+            'particle_count_per_event': int(
+                event_summary['particle_count'].iloc[0]
+            ),
+            'full_window_event_counts': full_window_counts,
+            'complete_pair_counts_by_horizon': complete_pair_counts,
+            'left_censored_event_count': int(
+                event_summary['left_censored_at_data_start'].sum()
+            ),
+            'analytic_validation_passed': bool(
+                analytic_validation['passed']
+            ),
+            'all_events_and_subsets': comparison_payload,
+            'control_match_quality': {
+                str(group): {
+                    'pair_count': int(len(values)),
+                    'median_absolute_sigma0_difference': float(
+                        values['absolute_sigma0_difference'].median()
+                    ),
+                    'q90_absolute_sigma0_difference': float(
+                        values['absolute_sigma0_difference'].quantile(0.9)
+                    ),
+                    'median_absolute_rossby_difference': float(
+                        values['absolute_rossby_difference'].median()
+                    ),
+                    'median_absolute_strain_difference_s_1': float(
+                        values['absolute_strain_difference_s_1'].median()
+                    ),
+                    'all_ordinary_fingerprint_gate_passed': bool(
+                        values['ordinary_fingerprint_gate_passed'].all()
+                    ),
+                }
+                for group, values in control_audit.groupby(
+                    'particle_group', sort=True
+                )
+            },
+            'interpretation': (
+                'Anomaly-minus-control differences test whether deep DO '
+                'event trajectories encounter the diagnosed mixed layer '
+                'or local isopycnal-outcrop opportunities more often than '
+                'same-day matched background trajectories.'
+            ),
+            'limits': [
+                'An outcrop opportunity is a local hydrographic condition, '
+                'not direct proof that the deep particle was ventilated.',
+                'Resolved daily-mean advection omits submesoscale transport, '
+                'mixing, and diffusion.',
+                'Particles escaping the delivered domain reduce complete '
+                'ensemble fractions and are not treated as non-contact.',
+                'Early-year events are left-censored and excluded from '
+                'windows that predate the 2003 delivery.',
+                'An observed-core versus particle-path mismatch cannot '
+                'identify a material source even if backward particles '
+                'encounter the MLD.',
+            ],
+        }
+        output_paths = {
+            'daily_diagnostics': (
+                run_dir / 'daily_ventilation_diagnostics.parquet'
+            ),
+            'horizon_summary': run_dir / 'event_horizon_summary.parquet',
+            'control_audit': run_dir / 'control_match_audit.parquet',
+            'particle_metadata': run_dir / 'particle_metadata.parquet',
+            'event_summary': run_dir / 'event_summary.parquet',
+            'group_comparison': run_dir / 'group_comparison.parquet',
+            'analysis_summary': run_dir / 'analysis_summary.json',
+            'figure': run_dir / 'trajectory_ventilation.png',
+            'source_inventory': run_dir / 'source_inventory.parquet',
+            'event_context': run_dir / 'event_context.parquet',
+            'analytic_validation': analytic_path,
+        }
+        for key, frame in (
+            ('daily_diagnostics', daily),
+            ('horizon_summary', horizon),
+            ('control_audit', control_audit),
+            ('particle_metadata', particle_metadata),
+            ('event_summary', event_summary),
+            ('group_comparison', comparison),
+        ):
+            _atomic_write_parquet(frame, output_paths[key])
+        _ofes_atomic_write_json(
+            analysis_summary, output_paths['analysis_summary']
+        )
+        _plot_ofes_trajectory_ventilation(
+            horizon,
+            output_paths['figure'],
+            settings,
+        )
+        manifest.update(
+            {
+                'status': 'complete',
+                'completed_events': int(len(events)),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'outputs': {
+                    key: str(path.resolve())
+                    for key, path in output_paths.items()
+                },
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                'status': 'failed',
+                'completed_events': completed,
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        'run_dir': run_dir,
+        'manifest': manifest,
+        'daily_diagnostics': daily,
+        'horizon_summary': horizon,
+        'control_audit': control_audit,
+        'particle_metadata': particle_metadata,
+        'group_comparison': comparison,
+        'analysis_summary': analysis_summary,
+        'figure_path': output_paths['figure'],
+        'reused_complete_run': False,
+    }
+
+
 def _ofes_daily_water_mass_settings(
     overrides: dict | None = None,
 ) -> dict:
@@ -47789,8 +59184,7 @@ def _ofes_event_evolution_settings(
     """解析并校验 OFES event 演化与 Hosoda benchmark 配置。"""
     raw = dict(_OFES_CFG.get('event_evolution', {}) or {})
     if overrides:
-        allowed = set(raw) | {'hosoda_dates'}
-        unknown = sorted(set(overrides) - allowed)
+        unknown = sorted(set(overrides) - (set(raw) | {'hosoda_dates'}))
         if unknown:
             raise KeyError(
                 f'Unknown OFES event_evolution override keys: {unknown}.'
@@ -48393,7 +59787,6 @@ def _ofes_build_context_field(
     return metadata
 
 
-
 def _ofes_build_hosoda_field(
     date: str | pd.Timestamp,
     settings: dict,
@@ -48568,7 +59961,6 @@ def _ofes_build_hosoda_field(
         **cache_arrays,
     )
     return metadata
-
 
 
 def _ofes_save_figure(
@@ -49773,6 +61165,7 @@ def build_ofes_event_evolution_diagnostics(
         'figure_paths': figure_paths,
     }
 
+
 def load_ofes_event_catalog(
     *,
     output_dir: str | Path | None = None,
@@ -49806,6 +61199,7 @@ def load_ofes_event_catalog(
             'summary': 'catalog_summary.json',
         },
     )
+
 
 def load_ofes_event_diagnostics(
     *,
@@ -49842,6 +61236,7 @@ def load_ofes_event_diagnostics(
         json_paths={'analysis_summary': 'analysis_summary.json'},
     )
 
+
 def load_ofes_event_population(
     *,
     output_dir: str | Path | None = None,
@@ -49872,6 +61267,7 @@ def load_ofes_event_population(
         json_paths={'summary': 'population_summary.json'},
         figure_paths={'figure': 'population_phase_space.png'},
     )
+
 
 def load_ofes_event_onset(
     *,
@@ -49909,6 +61305,7 @@ def load_ofes_event_onset(
         },
     )
 
+
 def load_ofes_event_flow_consistency(
     *,
     output_dir: str | Path | None = None,
@@ -49939,6 +61336,7 @@ def load_ofes_event_flow_consistency(
         json_paths={'analysis_summary': 'analysis_summary.json'},
         figure_paths={'figure': 'event_flow_consistency.png'},
     )
+
 
 def load_ofes_event_patch_continuity(
     *,
@@ -49971,6 +61369,7 @@ def load_ofes_event_patch_continuity(
         json_paths={'trajectory_interpretation_gate': 'trajectory_interpretation_gate.json'},
         figure_paths={'figure': 'patch_continuity.png'},
     )
+
 
 def load_ofes_event_lifecycle(
     *,
@@ -50006,6 +61405,7 @@ def load_ofes_event_lifecycle(
         },
         figure_paths={'figure': 'event_lifecycle.png'},
     )
+
 
 def load_ofes_event_evolution(
     *,
@@ -50070,6 +61470,633 @@ def load_ofes_event_evolution(
     }
 
 
+def load_ofes_vertical_velocity_validation(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 垂向速度连续方程验证结果。
+
+    本函数只读取固定输出目录中的 manifest、逐日指标和分析摘要，不访问 OFES
+    NetCDF，也不会启动新的验证计算。
+
+    参数:
+        - output_dir (str | Path | None): 验证结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 run_dir、manifest、daily_metrics、analysis_summary、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 结果不存在或缺少 manifest/主要产物时直接报告生产步骤，而不是创建目录或重新计算。
+    """
+    return _ofes_load_completed_outputs(
+        'vertical_velocity_validation',
+        output_dir=output_dir,
+        parquet_keys=('daily_metrics',),
+        json_keys=('analysis_summary',),
+    )
+
+
+def load_ofes_fixed_depth_trajectory_ensembles(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 固定深度二维轨迹 ensemble 结果。
+
+    本函数只读取正式轨迹产物，供统计和绘图函数重复消费，不重新积分粒子。
+
+    参数:
+        - output_dir (str | Path | None): 二维轨迹结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含逐事件摘要、轨迹、可逆性、敏感性、observed alignment、观测对象轨迹、manifest 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 结果不完整时指出缺失产物；临时试验应传入独立 output_dir。
+    """
+    return _ofes_load_completed_outputs(
+        'trajectory_2d',
+        output_dir=output_dir,
+        parquet_keys=(
+            'event_summary',
+            'trajectories',
+            'reversibility',
+            'endpoint_sensitivity',
+            'observed_alignment',
+            'observed_object_tracks',
+        ),
+        json_keys=('analytic_validation', 'analysis_summary'),
+    )
+
+
+def load_ofes_3d_trajectory_ensembles(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 代表事件三维轨迹 ensemble 结果。
+
+    本函数只读取正式三维轨迹表和摘要，绘图或重新分组不会触发 OFES 读取。
+
+    参数:
+        - output_dir (str | Path | None): 三维代表轨迹结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含逐事件摘要、轨迹、可逆性、observed alignment、二维对照、敏感性、manifest 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 不执行积分；删除正式输出后需重新调用生产函数。
+    """
+    return _ofes_load_completed_outputs(
+        'trajectory_3d',
+        output_dir=output_dir,
+        parquet_keys=(
+            'event_summary',
+            'trajectories',
+            'reversibility',
+            'observed_alignment',
+            'comparison_to_2d',
+            'release_sensitivity',
+            'observed_object_tracks',
+        ),
+        json_keys=('analytic_validation', 'analysis_summary'),
+    )
+
+
+def load_ofes_3d_trajectory_population(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 三维轨迹总体结果。
+
+    本函数读取事件资格、轨迹汇总、总体分类和代表事件 parity，不重新运行总体轨迹。
+
+    参数:
+        - output_dir (str | Path | None): 三维轨迹总体结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含资格表、事件摘要、轨迹、总体分类、parity、分析摘要、manifest 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 该 loader 的返回值可直接交给 `plot_ofes_3d_trajectory_population`。
+    """
+    return _ofes_load_completed_outputs(
+        'trajectory_3d_population',
+        output_dir=output_dir,
+        parquet_keys=(
+            'event_eligibility',
+            'event_summary',
+            'trajectories',
+            'observed_alignment',
+            'release_sensitivity',
+            'population_classification',
+            'representative_parity',
+        ),
+        json_keys=('analytic_validation', 'analysis_summary'),
+    )
+
+
+def load_ofes_trajectory_tracers(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 轨迹 DO、温盐和 spiciness 指纹结果。
+
+    本函数只读取轨迹位置上的示踪剂样本和汇总表，不重新采样 OFES 快照。
+
+    参数:
+        - output_dir (str | Path | None): 轨迹示踪剂结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含粒子样本、逐日摘要、逐事件摘要、分析摘要、manifest 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 温度、盐度和 spiciness 仍作为同一水团状态的相关响应读取和展示。
+    """
+    return _ofes_load_completed_outputs(
+        'trajectory_tracers',
+        output_dir=output_dir,
+        parquet_keys=(
+            'particle_tracer_samples',
+            'daily_tracer_summary',
+            'event_tracer_summary',
+        ),
+        json_keys=('analysis_summary',),
+    )
+
+
+def load_ofes_mccoy_virtual_argo(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES McCoy-compatible virtual-Argo 结果。
+
+    本函数只读取虚拟剖面、事件汇总和审计表，不重新读取 McCoy 源码或 OFES NetCDF。
+
+    参数:
+        - output_dir (str | Path | None): McCoy virtual-Argo 结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 profile/event/audit 表、分析摘要、manifest、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 返回结果表达的是 McCoy-method-compatible profile evidence，不改变已有 SCV 判据。
+    """
+    return _ofes_load_completed_outputs(
+        'mccoy_virtual_argo',
+        output_dir=output_dir,
+        parquet_keys=(
+            'profile_diagnostics',
+            'event_summary',
+            'event_audit',
+        ),
+        json_keys=('analysis_summary',),
+    )
+
+
+def load_ofes_mccoy_stage_bridge(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES McCoy start/peak/last 阶段诊断。
+
+    本函数只读取阶段统计和汇总，不重新读取 McCoy 源码或 OFES NetCDF。
+
+    参数:
+        - output_dir (str | Path | None): 阶段 bridge 结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 stage_diagnostics、summary、manifest、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 阶段统计以事件为单位，per-stage 和 fixed-peak 的选择记录在 manifest 中。
+    """
+    return _ofes_load_completed_outputs(
+        'mccoy_virtual_argo_stage_bridge',
+        output_dir=output_dir,
+        parquet_keys=('stage_diagnostics',),
+        json_keys=('summary',),
+    )
+
+
+def load_ofes_trajectory_ventilation(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取已完成的 OFES 轨迹通风历史结果。
+
+    本函数只读取逐日通风、时间窗口、对照匹配和总体比较产物，不重新回溯粒子。
+
+    参数:
+        - output_dir (str | Path | None): 轨迹通风结果目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含逐日诊断、窗口摘要、对照审计、粒子元数据、总体比较、分析摘要、manifest 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - `outcrop opportunity` 与实际 MLD contact 在读取和绘图中保持为两个不同指标。
+    """
+    return _ofes_load_completed_outputs(
+        'trajectory_ventilation',
+        output_dir=output_dir,
+        parquet_keys=(
+            'daily_diagnostics',
+            'horizon_summary',
+            'control_audit',
+            'particle_metadata',
+            'group_comparison',
+        ),
+        json_keys=('analytic_validation', 'analysis_summary'),
+    )
+
+
+def _ofes_plot_result(
+    result: dict | None,
+    loader,
+    output_dir: str | Path | None,
+) -> tuple[dict, Path]:
+    """准备公开 OFES plot wrapper 的结果字典和目标图件路径。"""
+    payload = loader(output_dir=output_dir) if result is None else result
+    if not isinstance(payload, dict) or 'run_dir' not in payload:
+        raise TypeError('result must be a producer or loader result dict.')
+    if output_dir is not None:
+        run_dir = Path(output_dir)
+    else:
+        run_dir = Path(payload['run_dir'])
+    figure_path = payload.get('figure_path')
+    if figure_path is None:
+        raise KeyError('The OFES result does not declare a figure path.')
+    return payload, Path(figure_path) if output_dir is None else (
+        run_dir / Path(figure_path).name
+    )
+
+
+def _ofes_result_frame(result: dict, key: str) -> pd.DataFrame:
+    """从生产或 loader 返回值中取得一个 parquet 数据表。"""
+    frame = result.get(key)
+    if isinstance(frame, pd.DataFrame):
+        return frame
+    paths = result.get('output_paths') or result.get('manifest', {}).get(
+        'outputs', {}
+    )
+    if key not in paths:
+        raise KeyError(f'OFES result does not contain required table: {key}.')
+    return pd.read_parquet(paths[key])
+
+
+def _ofes_result_settings(result: dict, *names: str) -> dict:
+    """从结果 manifest 中取绘图所需的已记录参数。"""
+    manifest = result.get('manifest', {})
+    for name in names:
+        settings = manifest.get(name)
+        if isinstance(settings, dict):
+            return settings
+    return {}
+
+
+def plot_ofes_vertical_velocity_validation(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制已加载的 OFES 垂向速度连续方程验证结果。
+
+    函数只消费 loader 或生产函数返回的数据，不访问 OFES NetCDF。
+
+    参数:
+        - result (dict | None): `load_ofes_vertical_velocity_validation` 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 覆盖结果中的固定图件路径。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `vertical_velocity_validation.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_vertical_velocity_validation, output_dir
+    )
+    settings = _ofes_result_settings(payload, 'settings')
+    return _plot_ofes_vertical_velocity_validation(
+        _ofes_result_frame(payload, 'daily_metrics'),
+        figure_path,
+        settings,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_fixed_depth_trajectory_ensembles(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制固定深度二维轨迹 ensemble 与观测对象路径。
+
+    函数只消费正式轨迹表，重复调用不会重新积分粒子。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `trajectory_ensembles.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_fixed_depth_trajectory_ensembles, output_dir
+    )
+    return _plot_ofes_fixed_depth_trajectory_ensembles(
+        _ofes_result_frame(payload, 'trajectories'),
+        _ofes_result_frame(payload, 'observed_alignment'),
+        _ofes_result_frame(payload, 'observed_object_tracks'),
+        _ofes_result_frame(payload, 'event_summary'),
+        figure_path,
+        int(_ofes_result_settings(payload, 'settings').get('figure_dpi', 180)),
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_3d_trajectory_ensembles(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制代表事件三维轨迹 ensemble、观测路径和二维对照。
+
+    函数只消费已完成的三维 trajectory 产物，不重新积分粒子。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `trajectory_3d_ensembles.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_3d_trajectory_ensembles, output_dir
+    )
+    return _plot_ofes_3d_trajectory_ensembles(
+        _ofes_result_frame(payload, 'trajectories'),
+        _ofes_result_frame(payload, 'observed_alignment'),
+        _ofes_result_frame(payload, 'observed_object_tracks'),
+        _ofes_result_frame(payload, 'event_summary'),
+        figure_path,
+        int(_ofes_result_settings(payload, 'settings').get('figure_dpi', 180)),
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_3d_trajectory_population(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES 三维轨迹总体的垂向路径比较。
+
+    函数只消费总体分类表，不重新运行代表事件或总体轨迹。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `trajectory_3d_population.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_3d_trajectory_population, output_dir
+    )
+    settings = _ofes_result_settings(payload, 'population_settings', 'settings')
+    return _plot_ofes_3d_trajectory_population(
+        _ofes_result_frame(payload, 'population_classification'),
+        figure_path,
+        settings,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_trajectory_tracers(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES 轨迹上的 DO、温盐和 spiciness 指纹保持率。
+
+    函数只消费逐日和逐事件示踪剂汇总，不重新采样或积分轨迹。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `trajectory_tracers.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_trajectory_tracers, output_dir
+    )
+    settings = {
+        **_ofes_trajectory_tracer_settings(),
+        **_ofes_result_settings(payload, 'settings'),
+    }
+    return _plot_ofes_trajectory_tracers(
+        _ofes_result_frame(payload, 'daily_tracer_summary'),
+        _ofes_result_frame(payload, 'event_tracer_summary'),
+        figure_path,
+        settings,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_mccoy_virtual_argo(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES McCoy-compatible virtual-Argo 的证据层和交叉表。
+
+    函数只消费虚拟剖面结果，不重新计算 McCoy profile gates。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `mccoy_virtual_argo.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_mccoy_virtual_argo, output_dir
+    )
+    settings = _ofes_result_settings(payload, 'settings')
+    return _plot_ofes_mccoy_virtual_argo(
+        _ofes_result_frame(payload, 'profile_diagnostics'),
+        _ofes_result_frame(payload, 'event_summary'),
+        payload['analysis_summary'],
+        figure_path,
+        int(settings.get('figure_dpi', 180)),
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_mccoy_stage_bridge(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES McCoy start/peak/last 阶段通过率。
+
+    函数只消费 loader 返回的阶段统计，不重新计算 McCoy profile gates。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `mccoy_stage_bridge.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_mccoy_stage_bridge, output_dir
+    )
+    settings = _ofes_result_settings(payload, 'settings')
+    return _plot_ofes_mccoy_stage_bridge(
+        _ofes_result_frame(payload, 'stage_diagnostics'),
+        payload['summary'],
+        figure_path,
+        int(settings.get('figure_dpi', 180)),
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def plot_ofes_trajectory_ventilation(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES 轨迹通风历史的 MLD contact、outcrop 和总体比较。
+
+    函数只消费 loader 返回的通风表，不重新回溯三维粒子。
+
+    参数:
+        - result (dict | None): loader 或生产函数返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `trajectory_ventilation.png`（save_fig=True）。
+
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    payload, figure_path = _ofes_plot_result(
+        result, load_ofes_trajectory_ventilation, output_dir
+    )
+    settings = _ofes_result_settings(payload, 'settings')
+    return _plot_ofes_trajectory_ventilation(
+        _ofes_result_frame(payload, 'horizon_summary'),
+        figure_path,
+        settings,
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
 def load_ofes_quality_event_diagnostics(
     *,
     output_dir: str | Path | None = None,

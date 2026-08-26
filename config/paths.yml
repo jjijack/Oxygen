@@ -1,4 +1,7 @@
 # 数据路径配置
+# version 1.9 变更：
+#   - 新增 mccoy_scv_source_archive，将 OFES 虚拟 Argo 复现运行绑定到 McCoy et al. (2020)
+#     公开 MATLAB 源码归档的实际文件身份。
 # version 1.8 变更：
 #   - 新增 mccoy_scv_csv：McCoy et al. (2020) 全球 Argo SCV 检测目录 CSV 路径，供 GLORYS 漏检检验
 #     （screen_mccoy_scvs_against_glorys / glorys_reproduces_mccoy_scv）读取已确认 SCV 核位。
@@ -18,7 +21,7 @@
 # version 1.1 变更：
 #   - 新增 meta_root (META 3.x 数据根目录)
 #   - 新增 META_tracks_root (导出结果根目录；默认 ./META_tracks)
-version: 1.8
+version: 1.9
 paths:
   argo_origin: ./Argo_origin
   argo_intermediate: ./Argo_data_tmp
@@ -35,3 +38,4 @@ paths:
   mld_clim_root: ./data/mld_clim
   ofes_root: ./data/OFES_NP30
   mccoy_scv_csv: ./data/mccoy2020_scv/SCVs.csv
+  mccoy_scv_source_archive: ./data/mccoy2020_scv/ArgoSCVs-v1.3.zip
