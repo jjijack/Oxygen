@@ -1,4 +1,4 @@
-"""Render the six-panel OFES manuscript figure package from completed results.
+"""Render the OFES manuscript Figures 1–5 from completed results.
 
 This module only assembles existing parquet/JSON products. It does not read
 the OFES NetCDF fields, rerun event detection, or define new scientific
@@ -31,6 +31,21 @@ PURPLE = "#7b61a8"
 ORANGE = "#d95f59"
 INK = "#111827"
 GRAY = "#9ca3af"
+FIGURE_WIDTH_IN = 7.1
+PANEL_LABEL_SIZE = 9.5
+
+plt.rcParams.update(
+    {
+        "font.size": 8.0,
+        "axes.titlesize": 8.6,
+        "axes.labelsize": 8.0,
+        "xtick.labelsize": 7.5,
+        "ytick.labelsize": 7.5,
+        "legend.fontsize": 7.5,
+        "figure.titlesize": 10.2,
+        "lines.linewidth": 1.0,
+    }
+)
 
 # The two frames are deliberately kept distinct in the KE concentration
 # panel: the KE frame is the descriptive regional window, while the OFES
@@ -67,9 +82,45 @@ def _style_axes(axes: Any) -> None:
         axis.spines["right"].set_visible(False)
 
 
-def _save(fig: Any, output_dir: Path, name: str, dpi: int) -> Path:
+def _add_panel_labels(axes: Any) -> None:
+    """Add standard manuscript panel labels in axes coordinates."""
+
+    for label, axis in zip("abcdefghijklmnopqrstuvwxyz", np.ravel(axes)):
+        axis.text(
+            -0.08,
+            1.03,
+            label,
+            transform=axis.transAxes,
+            fontsize=PANEL_LABEL_SIZE,
+            fontweight="bold",
+            ha="left",
+            va="bottom",
+            clip_on=False,
+            zorder=20,
+        )
+
+
+def _save(
+    fig: Any,
+    output_dir: Path,
+    name: str,
+    dpi: int,
+    bottom: float = 0.22,
+    top: float = 0.88,
+    left: float = 0.12,
+    wspace: float | None = None,
+    hspace: float | None = None,
+) -> Path:
     path = output_dir / name
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    # Keep the requested physical width exact. The margins are reserved in the
+    # figure canvas so outside panel labels are not recovered by tight cropping.
+    kwargs = {"left": left, "right": 0.985, "top": top, "bottom": bottom}
+    if wspace is not None:
+        kwargs["wspace"] = wspace
+    if hspace is not None:
+        kwargs["hspace"] = hspace
+    fig.subplots_adjust(**kwargs)
+    fig.savefig(path, dpi=dpi, facecolor="white", edgecolor="none")
     plt.close(fig)
     return path
 
@@ -175,8 +226,19 @@ def _plot_figure1(
         ("threshold_umol_kg", "group", "odds_ratio_vs_all_argo", "odds_ratio_ci_low", "odds_ratio_ci_high"),
         "SCV threshold sweep",
     )
-    scv = sweep.loc[sweep["group"].eq("DO-evaluable McCoy SCVs")].sort_values("threshold_umol_kg")
-    meta = sweep.loc[sweep["group"].eq("META-matched DO-evaluable Argo")].sort_values("threshold_umol_kg")
+    threshold_order = [50, 35, 20]
+    scv = (
+        sweep.loc[sweep["group"].eq("DO-evaluable McCoy SCVs")]
+        .set_index("threshold_umol_kg")
+        .loc[threshold_order]
+        .reset_index()
+    )
+    meta = (
+        sweep.loc[sweep["group"].eq("META-matched DO-evaluable Argo")]
+        .set_index("threshold_umol_kg")
+        .loc[threshold_order]
+        .reset_index()
+    )
     if len(scv) != 3 or len(meta) != 3:
         raise ValueError("The formal OR table must contain three SCV and META rows")
 
@@ -184,12 +246,11 @@ def _plot_figure1(
         "DO50 carriers": RED,
         "DO35–50 carriers": ORANGE,
         "DO20–35 carriers": PURPLE,
-        "below DO20": "#d9dee7",
+        "below DO20": "#c7cfdb",
     }
     fig, axes = plt.subplots(
-        1, 3, figsize=(17.2, 5.3),
-        gridspec_kw={"width_ratios": (1.25, 0.95, 0.9)},
-        constrained_layout=True,
+        1, 3, figsize=(FIGURE_WIDTH_IN, 2.75),
+        gridspec_kw={"width_ratios": (1.30, 1.02, 0.98)},
     )
 
     # Panel a: mutually exclusive global categories.
@@ -198,15 +259,14 @@ def _plot_figure1(
         rows = categories.loc[categories["category"].eq(label)]
         axes[0].scatter(
             rows["lon"], rows["lat"], s=15 if "below" in label else 24,
-            color=color, alpha=0.8 if "below" not in label else 0.45,
-            linewidths=0, label=label,
+            color=color, alpha=0.82 if "below" not in label else 0.62,
+            linewidths=0, label=f"{label}, n={len(rows)}",
         )
     axes[0].set_xlim(-180, 180)
     axes[0].set_ylim(-70, 70)
     axes[0].set_xlabel("Longitude (°)")
     axes[0].set_ylabel("Latitude (°)")
     axes[0].set_title("244 DO-evaluable McCoy SCVs")
-    axes[0].legend(frameon=False, fontsize=7.5, loc="lower left")
     axes[0].add_patch(
         Rectangle(
             (KE_BOUNDS[0], KE_BOUNDS[2]),
@@ -217,7 +277,7 @@ def _plot_figure1(
             linewidth=1.4,
         )
     )
-    axes[0].text(141, 46, "KE frame", fontsize=8, color=INK)
+    axes[0].text(141, 46, "KE frame", fontsize=7.5, color=INK)
 
     # Panel b: ORs are read directly from the formal threshold sweep.
     y = np.arange(3)[::-1]
@@ -239,8 +299,7 @@ def _plot_figure1(
     axes[1].set_xscale("log")
     axes[1].set_yticks(y + 0.08, ["DO50", "DO35", "DO20"])
     axes[1].set_xlabel("Odds ratio versus all DO-evaluable Argo")
-    axes[1].set_title("Among the tested eddy classes")
-    axes[1].legend(frameon=False, fontsize=8)
+    axes[1].set_title("Threshold-dependent\nodds ratios")
 
     # Panel c: the KE concentration is descriptive, not a regional probability test.
     ke = categories.loc[
@@ -280,30 +339,29 @@ def _plot_figure1(
     axes[2].set_ylim(23, 47)
     axes[2].set_xlabel("Longitude (°)")
     axes[2].set_ylabel("Latitude (°)")
-    axes[2].set_title("KE concentration and OFES domain")
-    axes[2].legend(
+    axes[2].set_title("KE concentration\nand OFES domain")
+    fig.legend(
         handles=[
-            Line2D(
-                [], [], color=INK, linewidth=1.4,
-                label="KE frame: 140–180°E, 25–45°N",
-            ),
-            Line2D(
-                [], [], color=BLUE, linewidth=1.4, linestyle="--",
-                label="OFES domain: 140–170°E, 25–45°N",
-            ),
+            Line2D([], [], marker="o", linestyle="none", color=color, label=f"{label}, n={len(categories.loc[categories['category'].eq(label)])}")
+            for label, color in colors.items()
+        ]
+        + [
+            Line2D([], [], marker="o", linestyle="none", color=RED, label="McCoy SCV"),
+            Line2D([], [], marker="s", linestyle="none", color=TEAL, label="META"),
+            Line2D([], [], color=INK, linewidth=1.4, label="KE frame"),
+            Line2D([], [], color=BLUE, linewidth=1.4, linestyle="--", label="OFES domain"),
         ],
-        loc="upper left",
-        fontsize=7.0,
-        framealpha=0.9,
-    )
-    axes[2].text(
-        0.03, 0.04, "16 of 17 DO50 carriers\noccurred in the Kuroshio Extension",
-        transform=axes[2].transAxes, fontsize=8.5, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.86, "edgecolor": "none"},
+        loc="lower center",
+        bbox_to_anchor=(0.55, 0.02),
+        ncol=4,
+        frameon=False,
+        fontsize=7.5,
+        handletextpad=0.3,
+        columnspacing=0.8,
     )
     _style_axes(axes)
-    fig.suptitle("Global DO-evaluable SCV association and its KE concentration", fontsize=14)
-    return _save(fig, output_dir, "Figure1_global_scv_ke.png", dpi)
+    _add_panel_labels(axes)
+    return _save(fig, output_dir, "Figure1_global_scv_ke.png", dpi, bottom=0.31)
 
 
 def _water_mass_fraction(summary: pd.DataFrame) -> pd.Series:
@@ -361,44 +419,68 @@ def _plot_figure2(
     ):
         raise ValueError("McCoy event-compatible count disagrees with the audit JSON")
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.4, 10.0), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(FIGURE_WIDTH_IN, 5.75))
     ax = axes[0, 0]
     ax.scatter(
         quality_summary.loc[~strict, "peak_water_mass_do_contrast"],
         quality_summary.loc[~strict, "peak_heave_do_contribution"],
-        s=17, color=GRAY, alpha=0.45, label="quality events",
+        s=17, color=GRAY, alpha=0.45, label="other quality events (n=105)",
     )
     ax.scatter(
         quality_summary.loc[strict, "peak_water_mass_do_contrast"],
         quality_summary.loc[strict, "peak_heave_do_contribution"],
-        s=27, color=RED, alpha=0.8, label="strict DO50 events",
+        s=27, color=RED, alpha=0.8, label="strict DO50 events (n=56)",
     )
+    x_limits = ax.get_xlim()
+    y_limits = ax.get_ylim()
+    boundary_x = np.linspace(x_limits[0], x_limits[1], 400)
+    ax.fill_between(
+        boundary_x,
+        -np.abs(boundary_x),
+        np.abs(boundary_x),
+        color=RED,
+        alpha=0.045,
+        zorder=-1,
+    )
+    ax.plot(boundary_x, boundary_x, color=GRAY, linestyle="--", linewidth=0.9)
+    ax.plot(boundary_x, -boundary_x, color=GRAY, linestyle="--", linewidth=0.9)
+    ax.set_xlim(x_limits)
+    ax.set_ylim(y_limits)
     ax.axhline(0, color=INK, linewidth=0.8)
     ax.axvline(0, color=INK, linewidth=0.8)
     ax.set_xlabel("Peak water-mass DO contrast (µmol kg⁻¹)")
     ax.set_ylabel("Peak heave DO contribution (µmol kg⁻¹)")
-    ax.set_title("Quality-event decomposition")
-    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.set_title("Water-mass versus heave DO contrast")
 
     ax = axes[0, 1]
     finite_quality = quality_fraction.dropna()
     finite_strict = strict_fraction.dropna()
-    ax.hist(finite_quality, bins=np.linspace(0, 1, 18), color=GRAY, alpha=0.55, label="quality (161)")
-    ax.hist(finite_strict, bins=np.linspace(0, 1, 18), color=RED, alpha=0.62, label="strict (56)")
-    ax.axvline(float(strict_fraction.median()), color=RED, linestyle="--", linewidth=1.4)
-    ax.axvline(float(quality_fraction.median()), color=INK, linestyle=":", linewidth=1.4)
+    ax.hist(
+        finite_quality,
+        bins=np.linspace(0, 1, 18),
+        color=GRAY,
+        alpha=0.55,
+        label="quality catalogue (n=161; includes strict)",
+    )
+    ax.hist(
+        finite_strict,
+        bins=np.linspace(0, 1, 18),
+        color=RED,
+        alpha=0.62,
+        label="strict DO50 subset (n=56)",
+    )
     ax.set_xlabel("Absolute water-mass contribution fraction")
     ax.set_ylabel("Events")
     ax.set_xlim(0, 1)
-    ax.set_title("Water-mass contribution dominates")
-    ax.text(
-        0.03, 0.96,
-        f"strict median {strict_fraction.median():.1%}; {strict_dominated}/56 dominated\n"
-        f"quality median {quality_fraction.median():.1%}; {quality_dominated}/161 dominated",
-        transform=ax.transAxes, va="top", fontsize=8.5,
-        bbox={"facecolor": "white", "alpha": 0.86, "edgecolor": "none"},
+    ax.set_title("Water-mass contribution fraction")
+    ax.axvline(
+        float(strict_fraction.median()), color=RED, linestyle="--", linewidth=1.4,
+        label=f"strict median ({strict_fraction.median():.1%})",
     )
-    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.axvline(
+        float(quality_fraction.median()), color=INK, linestyle=":", linewidth=1.4,
+        label=f"quality median ({quality_fraction.median():.1%})",
+    )
 
     ax = axes[1, 0]
     ax.scatter(
@@ -409,18 +491,13 @@ def _plot_figure2(
     ax.scatter(
         quality_summary.loc[strict, "peak_same_sigma_theta_contrast"],
         quality_summary.loc[strict, "peak_same_sigma_salinity_contrast"],
-        s=27, color=PURPLE, alpha=0.8,
+        s=27, color=RED, alpha=0.8,
     )
     ax.axhline(0, color=INK, linewidth=0.8)
     ax.axvline(0, color=INK, linewidth=0.8)
     ax.set_xlabel("Same-σ₀ θ contrast (°C)")
-    ax.set_ylabel("Same-σ₀ salinity contrast")
-    ax.set_title("Joint thermohaline state (θ–S)")
-    ax.text(
-        0.03, 0.04, "θ and S jointly express one thermohaline state;\nnot three independent tests",
-        transform=ax.transAxes, fontsize=8.5, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.86, "edgecolor": "none"},
-    )
+    ax.set_ylabel("Same-σ₀ salinity contrast (psu)")
+    ax.set_title("Same-σ₀ thermohaline contrasts")
 
     ax = axes[1, 1]
     order = np.argsort(event_fraction - control_fraction)
@@ -431,28 +508,32 @@ def _plot_figure2(
         )
     ax.scatter(control_fraction[order], np.arange(len(order)), color=BLUE, s=16, label="same-event control")
     ax.scatter(event_fraction[order], np.arange(len(order)), color=RED, s=16, label="event core")
-    mean = float(mccoy_audit["event_equal_mean_pass_fraction_difference"])
-    low, high = (float(x) for x in mccoy_audit["event_equal_mean_difference_bootstrap95"])
     ax.axvline(0, color=INK, linestyle="--", linewidth=0.8)
-    ax.axvline(mean, color=RED, linewidth=2, alpha=0.7)
     ax.set_yticks([])
     ax.set_xlabel("McCoy-compatible profile fraction")
-    ax.set_title("Event-core enrichment in McCoy-compatible profiles")
-    ax.text(
-        0.03, 0.04,
-        f"19/56 events have ≥1 compatible profile\nΔ event-equal = {mean:.3f} [{low:.3f}, {high:.3f}]\n"
-        f"one-sided p={mccoy_audit['event_equal_paired_wilcoxon_p']:.2g}; "
-        f"two-sided p={2 * float(mccoy_audit['event_equal_paired_wilcoxon_p']):.2g}",
-        transform=ax.transAxes, fontsize=8.5, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
+    ax.set_title("McCoy-compatible profile fractions")
+    fig.legend(
+        handles=[
+            Line2D([], [], marker="o", linestyle="none", color=GRAY, label="other quality events (n=105)"),
+            Line2D([], [], marker="o", linestyle="none", color=RED, label="strict DO50 events (n=56)"),
+            Line2D([], [], color=GRAY, linewidth=7, alpha=0.55, label="quality catalogue (n=161)"),
+            Line2D([], [], color=RED, linewidth=7, alpha=0.62, label="strict DO50 subset (n=56)"),
+            Line2D([], [], color=RED, linestyle="--", label=f"strict median ({strict_fraction.median():.1%})"),
+            Line2D([], [], color=INK, linestyle=":", label=f"quality median ({quality_fraction.median():.1%})"),
+            Line2D([], [], marker="o", linestyle="none", color=BLUE, label="same-event control"),
+            Line2D([], [], marker="o", linestyle="none", color=RED, label="event core"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.52, 0.98),
+        ncol=4,
+        frameon=False,
+        fontsize=7.5,
+        handletextpad=0.3,
+        columnspacing=0.8,
     )
-    ax.legend(frameon=False, fontsize=8, loc="upper right")
     _style_axes(axes)
-    fig.suptitle(
-        "OFES oxygen-anomaly cores are enriched in McCoy-compatible profile signatures",
-        fontsize=14,
-    )
-    return _save(fig, output_dir, "Figure2_ofes_water_mass_mccoy.png", dpi)
+    _add_panel_labels(axes)
+    return _save(fig, output_dir, "Figure2_ofes_water_mass_mccoy.png", dpi, top=0.75, hspace=0.85)
 
 
 def _plot_figure3(
@@ -460,7 +541,6 @@ def _plot_figure3(
     trajectory: pd.DataFrame,
     transition: pd.DataFrame,
     walong: pd.DataFrame,
-    strict_count: int,
     output_dir: Path,
     dpi: int,
 ) -> Path:
@@ -495,9 +575,9 @@ def _plot_figure3(
         & ventilation_group["horizon_days"].eq(30)
     ].copy()
     metrics = {
-        "ever_direct_mld_contact_fraction": "direct MLD contact",
-        "ever_near_mld_contact_fraction": "within 25 m of MLD",
-        "ever_outcrop_opportunity_fraction": "isopycnal outcrop opportunity",
+        "ever_direct_mld_contact_fraction": "direct MLD",
+        "ever_near_mld_contact_fraction": "near MLD",
+        "ever_outcrop_opportunity_fraction": "outcrop",
     }
     rows = rows.loc[rows["metric"].isin(metrics)]
     if set(rows["control_group"]) != {"hydrographic_control", "kinematic_control"}:
@@ -525,11 +605,13 @@ def _plot_figure3(
         raise ValueError("w_along subset is incomplete")
     if not np.isclose(float(core.mean()), 4.8095, atol=0.02):
         raise ValueError("Formal w_along daily-mean value changed")
+    w_along_downward = int(core.gt(0).sum())
+    if w_along_downward != 13:
+        raise ValueError("Frozen downward w_along count changed")
 
     fig, axes = plt.subplots(
-        1, 2, figsize=(15.2, 6.0),
-        gridspec_kw={"width_ratios": (1.2, 0.9)},
-        constrained_layout=True,
+        1, 2, figsize=(FIGURE_WIDTH_IN, 3.25),
+        gridspec_kw={"width_ratios": (1.9, 0.9)},
     )
     ax = axes[0]
     colors = {"hydrographic_control": BLUE, "kinematic_control": TEAL}
@@ -556,61 +638,88 @@ def _plot_figure3(
             )
     ax.axvline(0, color=INK, linestyle="--", linewidth=1)
     ax.set_yticks(np.arange(3), list(metrics.values()))
+    ax.set_ylim(-0.28, 2.68)
     ax.set_xlabel("Event-equal anomaly − control fraction")
-    ax.set_title("Event-equal ventilation contrasts in the\ntrajectory-complete paired subset")
-    ax.legend(frameon=False, fontsize=8, loc="lower right")
-    ax.text(
-        0.03, 0.03,
-        "Each event is contrasted first, then weighted equally.\n"
-        "Metrics are correlated; controls share most anomaly events.\n"
-        "The six points are not six independent tests.",
-        transform=ax.transAxes, fontsize=8.3, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
+    ax.set_title("30-day event-equal ventilation contrasts")
+    fig.legend(
+        handles=[
+            Line2D([], [], marker="o", linestyle="none", color=BLUE, label="hydrographic control (n=28)"),
+            Line2D([], [], marker="o", linestyle="none", color=TEAL, label="kinematic control (n=27)"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.55, 0.98),
+        ncol=2,
+        frameon=False,
+        fontsize=7.5,
+        handletextpad=0.3,
+        columnspacing=0.8,
     )
 
     ax = axes[1]
-    box_specs = [
+    light_gray = "#d1d5db"
+    composition_rows = [
         (
-            "Displacement-classifiable",
-            f"{len(direction)}/{strict_count}",
-            f"{downward} downward · {upward} upward",
-            BLUE,
+            "Displacement classification\nn=56",
+            [("downward", downward), ("upward", upward), ("unclassified", 32)],
         ),
         (
-            "Strict resolved pathways",
-            str(len(resolved)),
-            f"{resolved_down} downward · {resolved_up} upward",
-            RED,
+            "Strict resolved pathways\nn=18",
+            [("downward", resolved_down), ("upward", resolved_up)],
         ),
         (
-            "w_along subset",
-            "n=19",
-            f"daily mean +{core.mean():.1f} m d⁻¹ · nominal p=0.040",
-            PURPLE,
+            "$w_{\\mathrm{along}}$ subset\nn=19",
+            [("downward", w_along_downward), ("negative $w_{\\mathrm{along}}$", 6)],
         ),
     ]
-    ax.set_xlim(0, 1)
-    ax.set_ylim(-0.5, len(box_specs) - 0.5)
-    ax.axis("off")
-    for idx, (title, count, detail, color) in enumerate(box_specs):
-        y = len(box_specs) - idx - 1
-        ax.add_patch(
-            Rectangle(
-                (0.04, y - 0.34), 0.92, 0.68,
-                facecolor=color, alpha=0.12, edgecolor=color, linewidth=1.4,
+    category_colors = {"downward": RED, "upward": BLUE, "unclassified": light_gray, "negative $w_{\\mathrm{along}}$": light_gray}
+    y_positions = np.arange(len(composition_rows))[::-1]
+    ax.set_xlim(0, 1.90)
+    ax.set_ylim(-0.5, 2.6)
+    for y, (row_label, components) in zip(y_positions, composition_rows):
+        total = sum(count for _, count in components)
+        if total <= 0:
+            raise ValueError(f"Invalid direction composition for {row_label}")
+        ax.text(0.0, y + 0.30, row_label, ha="left", va="bottom", fontsize=6.8)
+        left = 0.0
+        for category, count in components:
+            width = count / total
+            ax.barh(
+                y, width, left=left, height=0.42,
+                color=category_colors[category], edgecolor="white", linewidth=0.7,
             )
-        )
-        ax.text(0.08, y + 0.08, title, fontsize=10, weight="bold", color=color)
-        ax.text(0.08, y - 0.12, f"{count}   {detail}", fontsize=9.4, color=INK)
-    ax.text(
-        0.04, -0.48,
-        "Related but non-independent pathway diagnostics with distinct eligibility criteria.\n"
-        "The w_along p value is nominal and exploratory; boxes are not additive or strictly nested.",
-        fontsize=8.3, va="top",
+            text_color = "white" if category in {"downward", "upward"} else INK
+            ax.text(left + width / 2, y, str(count), ha="center", va="center", fontsize=7.5, color=text_color, weight="bold")
+            left += width
+        if row_label.startswith("$w_"):
+            ax.text(
+                1.02, y, f"+{core.mean():.1f} m d⁻¹\npositive =\ndownward",
+                ha="left", va="center", fontsize=6.0, color=INK,
+            )
+    ax.set_yticks([])
+    ax.set_xticks([0, 0.5, 1.0], ["0", "50%", "100%"])
+    ax.set_xlabel("Complete row")
+    ax.grid(axis="x", alpha=0.2, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    fig.legend(
+        handles=[
+            Line2D([], [], marker="s", linestyle="none", markersize=7, color=RED, label="downward"),
+            Line2D([], [], marker="s", linestyle="none", markersize=7, color=BLUE, label="upward"),
+            Line2D([], [], marker="s", linestyle="none", markersize=7, color=light_gray, label="unclassified / other"),
+        ],
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.72, 0.04),
+        ncol=3,
+        fontsize=6.8,
+        handletextpad=0.25,
+        columnspacing=0.55,
     )
+    ax.set_title("Direction-resolved pathways", loc="right", pad=4, fontsize=7.8)
     _style_axes(axes[:1])
-    fig.suptitle("OFES ventilation history and resolved downward pathways", fontsize=14)
-    return _save(fig, output_dir, "Figure3_ventilation_downward.png", dpi)
+    _add_panel_labels(axes)
+    return _save(fig, output_dir, "Figure3_ventilation_downward.png", dpi, top=0.75, bottom=0.28, left=0.18, wspace=0.30)
 
 
 def _contiguous_spans(dates: pd.Series, mask: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -643,9 +752,12 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
         "E000073 ventilation daily diagnostics",
     )
     data = ventilation_event.copy()
+    if "event_id" in data.columns:
+        data = data.loc[data["event_id"].eq("OFES_DO50_E000073")].copy()
     data["date"] = pd.to_datetime(data["date"])
     data = data.sort_values(["particle_group", "particle_id", "date"]).reset_index(drop=True)
     groups = {"anomaly": RED, "hydrographic_control": BLUE}
+    group_labels = {"anomaly": "anomaly", "hydrographic_control": "hydrographic control"}
     if set(groups) - set(data["particle_group"]):
         raise ValueError("E000073 case is missing an anomaly or hydrographic-control ensemble")
     rep_ids = {
@@ -674,7 +786,7 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
     if (initial_days, direct_count) != (13, 20):
         raise ValueError("E000073 MLD contact counts changed")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14.4, 10.0), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(FIGURE_WIDTH_IN, 5.8))
     peak_date = pd.to_datetime(anomaly_rep["date"]).max()
 
     # a. Horizontal ensemble trajectories, with one representative particle emphasized.
@@ -685,20 +797,18 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
             particle = particle.sort_values("date")
             ax.plot(particle["lon"], particle["lat"], color=color, alpha=0.08, linewidth=0.45)
         rep = reps[group]
-        ax.plot(rep["lon"], rep["lat"], color=color, linewidth=2.2, label=f"{group} representative")
+        ax.plot(
+            rep["lon"],
+            rep["lat"],
+            color=color,
+            linewidth=2.2,
+            label=group_labels[group],
+        )
         ax.scatter(rep["lon"].iloc[0], rep["lat"].iloc[0], color=color, s=30, marker="o")
         ax.scatter(rep["lon"].iloc[-1], rep["lat"].iloc[-1], color=color, s=55, marker="*", zorder=4)
     ax.set_xlabel("Longitude (°)")
     ax.set_ylabel("Latitude (°)")
-    ax.set_title("E000073 horizontal reconstructed histories")
-    ax.legend(frameon=False, fontsize=8)
-    ax.text(
-        0.03, 0.03,
-        "Trajectories were initialized at the event peak and integrated backward;\n"
-        "reconstructed histories are displayed in chronological order.",
-        transform=ax.transAxes, fontsize=8.2, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
-    )
+    ax.set_title("Horizontal trajectories")
 
     # b. Depth and MLD timeline with the exact contact intervals.
     ax = axes[0, 1]
@@ -709,34 +819,45 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
         )
         summary.columns = ["median", "q25", "q75"]
         dates = pd.to_datetime(summary.index)
-        ax.plot(dates, summary["median"], color=color, linewidth=2, label=f"{group} depth median")
+        ax.plot(
+            dates,
+            summary["median"],
+            color=color,
+            linewidth=2,
+            label=f"{group_labels[group]} depth",
+        )
         ax.fill_between(dates, summary["q25"], summary["q75"], color=color, alpha=0.14)
-    mld = data.loc[data["particle_group"].eq("anomaly")].groupby("date")["mld_m"].agg(
-        ["median", lambda x: x.quantile(0.25), lambda x: x.quantile(0.75)]
-    )
-    mld.columns = ["median", "q25", "q75"]
-    mld_dates = pd.to_datetime(mld.index)
-    ax.plot(mld_dates, mld["median"], color=INK, linestyle="--", linewidth=1.5, label="anomaly MLD median")
-    ax.fill_between(mld_dates, mld["q25"], mld["q75"], color=INK, alpha=0.08)
+    for group, color, linestyle in (
+        ("anomaly", INK, "--"),
+        ("hydrographic_control", BLUE, ":"),
+    ):
+        mld = data.loc[data["particle_group"].eq(group)].groupby("date")["mld_m"].agg(
+            ["median", lambda x: x.quantile(0.25), lambda x: x.quantile(0.75)]
+        )
+        mld.columns = ["median", "q25", "q75"]
+        mld_dates = pd.to_datetime(mld.index)
+        ax.plot(
+            mld_dates,
+            mld["median"],
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.4,
+            label=f"{group_labels[group]}-path MLD",
+        )
+        ax.fill_between(mld_dates, mld["q25"], mld["q75"], color=color, alpha=0.06)
     for start, end in direct_spans:
         ax.axvspan(start, end + pd.Timedelta(days=1), color=RED, alpha=0.10)
-    ax.axvline(pd.Timestamp("2003-02-07"), color=ORANGE, linestyle=":", linewidth=1.3)
-    ax.text(
-        pd.Timestamp("2003-02-07"), 0.93, "final detachment", rotation=90,
-        fontsize=8, va="top", transform=ax.get_xaxis_transform(),
-    )
     ax.invert_yaxis()
     ax.set_ylabel("Depth (m; positive downward)")
-    ax.set_title("Depth, mixed-layer depth, and direct contact")
-    ax.legend(frameon=False, fontsize=7.5, loc="upper left")
+    ax.set_title("Depth / MLD", loc="right", pad=4)
     ax.text(
-        0.03, 0.03,
-        f"Initial continuous contact: {initial_days} d (Jan 1–13)\n"
-        f"Cumulative direct contact: {direct_count} d\n"
-        "Re-encounters: Jan 26 and Feb 1–6\n"
-        f"Hydrographic control: {direct_days} of {len(control_rep)} trajectory days with direct MLD contact",
-        transform=ax.transAxes, fontsize=8.1, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "none"},
+        0.02,
+        1.09,
+        "MLD contact: 13 d initial; 20 d total",
+        transform=ax.transAxes,
+        fontsize=7.5,
+        va="bottom",
+        clip_on=False,
     )
 
     # c. Density histories.
@@ -748,21 +869,19 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
         )
         summary.columns = ["median", "q25", "q75"]
         dates = pd.to_datetime(summary.index)
-        ax.plot(dates, summary["median"], color=color, linewidth=2, label=f"{group} σ₀ median")
+        ax.plot(
+            dates,
+            summary["median"],
+            color=color,
+            linewidth=2,
+            label=f"{group_labels[group]} σ₀ median",
+        )
         ax.fill_between(dates, summary["q25"], summary["q75"], color=color, alpha=0.14)
         rep = reps[group]
         ax.plot(rep["date"], rep["particle_sigma0"], color=color, linewidth=1.0, alpha=0.75)
     ax.axvline(peak_date, color=INK, linestyle="--", linewidth=1, label="event peak")
     ax.set_ylabel("σ₀ (kg m⁻³)")
-    ax.set_title("Density-matched trajectories under event-peak conditions")
-    ax.legend(frameon=False, fontsize=7.5, loc="upper left")
-    ax.text(
-        0.03, 0.03,
-        "The controls match the event-peak condition; their earliest reconstructed\n"
-        "positions are not a common natural release date or depth.",
-        transform=ax.transAxes, fontsize=8.2, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
-    )
+    ax.set_title("Density histories")
 
     # d. Density-depth phase space.
     ax = axes[1, 1]
@@ -771,7 +890,13 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
         summary = group_data.groupby("date").agg(
             sigma=("particle_sigma0", "median"), depth=("depth_m", "median")
         )
-        ax.plot(summary["sigma"], summary["depth"], color=color, linewidth=2, label=f"{group} ensemble median")
+        ax.plot(
+            summary["sigma"],
+            summary["depth"],
+            color=color,
+            linewidth=2,
+            label=f"{group_labels[group]} ensemble median",
+        )
         rep = reps[group]
         ax.plot(rep["particle_sigma0"], rep["depth_m"], color=color, linewidth=1.1, alpha=0.75)
         ax.scatter(rep["particle_sigma0"].iloc[0], rep["depth_m"].iloc[0], color=color, s=30)
@@ -780,27 +905,36 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
     ax.set_xlabel("σ₀ (kg m⁻³)")
     ax.set_ylabel("Depth (m; positive downward)")
     ax.set_title("Density–depth phase space")
-    ax.legend(frameon=False, fontsize=7.5, loc="upper left")
-    ax.text(
-        0.03, 0.03,
-        "Anomaly earliest reconstructed depth: "
-        f"{anomaly_rep['depth_m'].iloc[0]:.0f} m\n"
-        "Control earliest reconstructed depth: "
-        f"{control_rep['depth_m'].iloc[0]:.0f} m\n"
-        "Event-peak matched condition is at the common endpoint.",
-        transform=ax.transAxes, fontsize=8.2, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
+    fig.legend(
+        handles=[
+            Line2D([], [], color=RED, linewidth=2.2, label="anomaly"),
+            Line2D([], [], color=BLUE, linewidth=2.2, label="control"),
+            Line2D([], [], marker="o", color=INK, linestyle="none", markersize=4, label="earliest position"),
+            Line2D([], [], marker="*", color=INK, linestyle="none", markersize=7, label="event peak"),
+            Line2D([], [], color=RED, linewidth=2.0, label="anomaly depth"),
+            Line2D([], [], color=BLUE, linewidth=2.0, label="control depth"),
+            Line2D([], [], color=INK, linestyle="--", linewidth=1.4, label="anomaly-path MLD"),
+            Line2D([], [], color=BLUE, linestyle=":", linewidth=1.4, label="control-path MLD"),
+            Line2D([], [], color=RED, linewidth=2.0, label="anomaly σ₀ median"),
+            Line2D([], [], color=BLUE, linewidth=2.0, label="control σ₀ median"),
+            Line2D([], [], color=RED, linewidth=2.0, label="anomaly ensemble median"),
+            Line2D([], [], color=BLUE, linewidth=2.0, label="control ensemble median"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.52, 0.98),
+        ncol=4,
+        frameon=False,
+        fontsize=7.5,
+        handletextpad=0.3,
+        columnspacing=0.8,
     )
     for axis in (axes[0, 1], axes[1, 0]):
         axis.xaxis.set_major_locator(mdates.AutoDateLocator())
         axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
         axis.tick_params(axis="x", rotation=35)
     _style_axes(axes)
-    fig.suptitle(
-        "E000073: contrasting ventilation histories under a matched event-peak condition",
-        fontsize=14,
-    )
-    return _save(fig, output_dir, "Figure4_E000073_case.png", dpi)
+    _add_panel_labels(axes)
+    return _save(fig, output_dir, "Figure4_E000073_case.png", dpi, top=0.68, bottom=0.22, hspace=0.55)
 
 
 def _plot_figure5(
@@ -847,54 +981,40 @@ def _plot_figure5(
     fixed = fixed_water_audit["carrier_retention"]["wm_normalized_decay_slope"]
     moving = moving_water_audit["carrier_retention"]["wm_normalized_decay_slope"]
     forest_rows = [
-        ("ΔDO proxy / fixed site", primary),
-        ("water mass / fixed site", fixed),
-        ("water mass / moving core", moving),
+        (r"$\frac{\Delta\mathrm{DO\ proxy}}{\mathrm{fixed\ site}}$", primary),
+        (r"$\frac{\mathrm{water\ mass}}{\mathrm{fixed\ site}}$", fixed),
+        (r"$\frac{\mathrm{water\ mass}}{\mathrm{moving\ core}}$", moving),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16.0, 5.7), constrained_layout=True)
+    fig, axes = plt.subplots(
+        1, 3,
+        figsize=(FIGURE_WIDTH_IN, 3.15),
+        gridspec_kw={"width_ratios": (1.0, 0.95, 1.15)},
+    )
     ax = axes[0]
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
     boxes = [
         (0.05, 0.08, 0.90, 0.84, "56 strict events", INK),
-        (0.16, 0.20, 0.68, 0.60, f"{carrier} persistent anticyclonic\nrotational carriers", RED),
+        (0.16, 0.20, 0.68, 0.60, f"{carrier} persistent carriers", RED),
         (0.28, 0.32, 0.44, 0.36, f"{scv} SCV-compatible", PURPLE),
-        (0.38, 0.40, 0.24, 0.20, f"{obscured} surface-obscured\nSCV-compatible", TEAL),
+        (0.38, 0.40, 0.24, 0.20, f"{obscured} obscured SCV", TEAL),
     ]
     for index, (x, y, width, height, label, color) in enumerate(boxes):
         ax.add_patch(Rectangle((x, y), width, height, fill=False, edgecolor=color, linewidth=2.0))
-        if index == 0:
-            text_x, text_y, horizontal, vertical, fontsize = (
-                x + 0.025, y + height + 0.015, "left", "bottom", 9.0
-            )
-        else:
-            # Put each label in the gap immediately above its frame. This
-            # keeps nested borders visible instead of letting long labels
-            # run through the inner boxes.
-            text_x, text_y, horizontal, vertical, fontsize = (
-                x + 0.01, y + height + 0.012, "left", "bottom", 8.0 if index < 3 else 7.2
-            )
         ax.text(
-            text_x,
-            text_y,
+            x + 0.015,
+            y + height - 0.025,
             label,
-            ha=horizontal,
-            va=vertical,
-            fontsize=fontsize,
+            ha="left",
+            va="top",
+            fontsize=7.5,
             color=color,
-            bbox={"facecolor": "white", "alpha": 0.86, "edgecolor": "none", "pad": 1.2},
+            clip_on=False,
         )
-    ax.text(
-        0.06, -0.08,
-        "Nested definitions: 6/6 are within the 27 carriers;\n"
-        "1/1 is within the six SCV-compatible events.\n"
-        "These are containment relations, not independent tests.",
-        fontsize=8.3, va="bottom",
-    )
     ax.set_ylim(-0.12, 1)
-    ax.set_title("Rotational organization hierarchy")
+    ax.set_title("Hierarchy", loc="right")
 
     ax = axes[1]
     stages = ["start", "peak", "last"]
@@ -905,14 +1025,7 @@ def _plot_figure5(
     ax.set_xticks(np.arange(3), ["start", "peak", "last"])
     ax.set_ylim(0, 24)
     ax.set_ylabel("Events with ≥1 compatible profile")
-    ax.set_title("McCoy-compatible profile expression by stage")
-    ax.text(
-        0.03, 0.03,
-        "McCoy-compatible profile expression is most concentrated\n"
-        "at the anomaly peak. Fixed-peak sensitivity is supplementary.",
-        transform=ax.transAxes, fontsize=8.3, va="bottom",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
-    )
+    ax.set_title("McCoy stage counts", loc="right")
 
     ax = axes[2]
     y = np.arange(len(forest_rows))[::-1]
@@ -926,19 +1039,13 @@ def _plot_figure5(
         ax.text(high + 0.004, yi, f"{mean:+.3f}", va="center", fontsize=8.5)
     ax.axvline(0, color=INK, linestyle="--", linewidth=1)
     ax.set_yticks(y, [row[0] for row in forest_rows])
-    ax.set_xlabel("Carrier − non-carrier median decay-slope difference")
-    ax.set_xlim(-0.06, 0.42)
-    ax.set_title("Retention across reference frames")
-    ax.text(
-        0.03, 0.76,
-        "Direction is consistent with a slower decay for carriers,\n"
-        "but the tendency is statistically limited (CIs and MW tests remain in the report).",
-        transform=ax.transAxes, fontsize=8.2, va="top",
-        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none"},
-    )
+    ax.set_xlabel("Median decay-slope difference")
+    ax.set_xlim(-0.06, 0.50)
+    ax.set_title("Decay-slope contrasts")
+    ax.tick_params(axis="y", labelsize=8.5, pad=6)
     _style_axes(axes[1:])
-    fig.suptitle("Rotational organization and finite water-mass retention", fontsize=14)
-    return _save(fig, output_dir, "Figure5_rotational_organization.png", dpi)
+    _add_panel_labels(axes)
+    return _save(fig, output_dir, "Figure5_rotational_organization.png", dpi, left=0.06, wspace=0.48)
 
 
 def render_manuscript_figures(
@@ -953,7 +1060,7 @@ def render_manuscript_figures(
     stage_diagnostics: Path,
     trajectory_ventilation_event: Path,
     output_dir: Path,
-    dpi: int = 260,
+    dpi: int = 600,
 ) -> list[Path]:
     """Render Figures 1–5 from explicit formal result products."""
 
@@ -976,11 +1083,10 @@ def render_manuscript_figures(
     transition_summary = _read_json(transition_audit)
     fixed_summary = _read_json(fixed_water_audit)
     moving_summary = _read_json(moving_water_audit)
-    strict_count = len(mccoy_event)
     return [
         _plot_figure1(thresholds, sweep, output_dir, dpi),
         _plot_figure2(quality, mccoy_event, mccoy_summary, output_dir, dpi),
-        _plot_figure3(ventilation_group, trajectory, transition, walong, strict_count, output_dir, dpi),
+        _plot_figure3(ventilation_group, trajectory, transition, walong, output_dir, dpi),
         _plot_figure4(ventilation_event, output_dir, dpi),
         _plot_figure5(
             lifecycle, stage, retention, transition_summary,
@@ -1002,7 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stage-diagnostics", required=True, type=Path)
     parser.add_argument("--trajectory-ventilation-event", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--dpi", type=int, default=260)
+    parser.add_argument("--dpi", type=int, default=600)
     args = parser.parse_args(argv)
     for path in render_manuscript_figures(
         args.tables_root,
