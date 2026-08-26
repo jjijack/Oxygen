@@ -18,6 +18,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 import numpy as np
 import pandas as pd
@@ -29,6 +31,12 @@ PURPLE = "#7b61a8"
 ORANGE = "#d95f59"
 INK = "#111827"
 GRAY = "#9ca3af"
+
+# The two frames are deliberately kept distinct in the KE concentration
+# panel: the KE frame is the descriptive regional window, while the OFES
+# frame is the model delivery domain used by the process diagnostics.
+KE_BOUNDS = (140.0, 180.0, 25.0, 45.0)
+OFES_BOUNDS = (140.0, 170.0, 25.0, 45.0)
 
 
 def _require_columns(frame: pd.DataFrame, columns: Sequence[str], label: str) -> None:
@@ -64,6 +72,53 @@ def _save(fig: Any, output_dir: Path, name: str, dpi: int) -> Path:
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def _coastline_segments() -> list[np.ndarray]:
+    """Read a cached Natural Earth coastline without downloading data."""
+
+    try:
+        import cartopy
+        import shapefile
+    except ImportError:
+        return []
+    coastline = (
+        Path(cartopy.config["data_dir"])
+        / "shapefiles"
+        / "natural_earth"
+        / "physical"
+        / "ne_110m_coastline.shp"
+    )
+    if not coastline.exists():
+        return []
+    segments: list[np.ndarray] = []
+    for shape in shapefile.Reader(str(coastline)).shapes():
+        points = np.asarray(shape.points, dtype=float)
+        starts = list(shape.parts) + [len(points)]
+        for start, end in zip(starts[:-1], starts[1:]):
+            part = points[start:end]
+            if len(part) < 2:
+                continue
+            # Avoid drawing a spurious line across the map at the dateline.
+            breaks = np.flatnonzero(np.abs(np.diff(part[:, 0])) > 180.0) + 1
+            segments.extend(chunk for chunk in np.split(part, breaks) if len(chunk) >= 2)
+    return segments
+
+
+def _add_coastlines(axis: Any) -> None:
+    """Overlay cached coastlines when the plotting environment provides them."""
+
+    segments = _coastline_segments()
+    if segments:
+        axis.add_collection(
+            LineCollection(
+                segments,
+                colors="#94a3b8",
+                linewidths=0.45,
+                alpha=0.9,
+                zorder=1,
+            )
+        )
 
 
 def _global_categories(thresholds: pd.DataFrame) -> pd.DataFrame:
@@ -138,6 +193,7 @@ def _plot_figure1(
     )
 
     # Panel a: mutually exclusive global categories.
+    _add_coastlines(axes[0])
     for label, color in colors.items():
         rows = categories.loc[categories["category"].eq(label)]
         axes[0].scatter(
@@ -151,8 +207,17 @@ def _plot_figure1(
     axes[0].set_ylabel("Latitude (°)")
     axes[0].set_title("244 DO-evaluable McCoy SCVs")
     axes[0].legend(frameon=False, fontsize=7.5, loc="lower left")
-    axes[0].add_patch(Rectangle((140, 25), 40, 20, fill=False, edgecolor=INK, linewidth=1.4))
-    axes[0].text(141, 46, "KE", fontsize=8, color=INK)
+    axes[0].add_patch(
+        Rectangle(
+            (KE_BOUNDS[0], KE_BOUNDS[2]),
+            KE_BOUNDS[1] - KE_BOUNDS[0],
+            KE_BOUNDS[3] - KE_BOUNDS[2],
+            fill=False,
+            edgecolor=INK,
+            linewidth=1.4,
+        )
+    )
+    axes[0].text(141, 46, "KE frame", fontsize=8, color=INK)
 
     # Panel b: ORs are read directly from the formal threshold sweep.
     y = np.arange(3)[::-1]
@@ -179,7 +244,8 @@ def _plot_figure1(
 
     # Panel c: the KE concentration is descriptive, not a regional probability test.
     ke = categories.loc[
-        categories["lon"].between(140, 180) & categories["lat"].between(25, 45)
+        categories["lon"].between(KE_BOUNDS[0], KE_BOUNDS[1])
+        & categories["lat"].between(KE_BOUNDS[2], KE_BOUNDS[3])
     ]
     if int((categories["category"] == "DO50 carriers").sum()) != 17 or int(
         (ke["category"] == "DO50 carriers").sum()
@@ -188,14 +254,48 @@ def _plot_figure1(
     for label, color in colors.items():
         rows = ke.loc[ke["category"].eq(label)]
         axes[2].scatter(rows["lon"], rows["lat"], s=26, color=color, alpha=0.85, label=label)
-    axes[2].add_patch(Rectangle((140, 25), 40, 20, fill=False, edgecolor=INK, linewidth=1.4))
-    axes[2].add_patch(Rectangle((140, 30), 35, 12, fill=False, edgecolor=BLUE, linewidth=1.4, linestyle="--"))
-    axes[2].text(141, 40.8, "OFES analysis area", fontsize=8, color=BLUE)
+    _add_coastlines(axes[2])
+    axes[2].add_patch(
+        Rectangle(
+            (KE_BOUNDS[0], KE_BOUNDS[2]),
+            KE_BOUNDS[1] - KE_BOUNDS[0],
+            KE_BOUNDS[3] - KE_BOUNDS[2],
+            fill=False,
+            edgecolor=INK,
+            linewidth=1.4,
+        )
+    )
+    axes[2].add_patch(
+        Rectangle(
+            (OFES_BOUNDS[0], OFES_BOUNDS[2]),
+            OFES_BOUNDS[1] - OFES_BOUNDS[0],
+            OFES_BOUNDS[3] - OFES_BOUNDS[2],
+            fill=False,
+            edgecolor=BLUE,
+            linewidth=1.4,
+            linestyle="--",
+        )
+    )
     axes[2].set_xlim(138, 181)
     axes[2].set_ylim(23, 47)
     axes[2].set_xlabel("Longitude (°)")
     axes[2].set_ylabel("Latitude (°)")
     axes[2].set_title("KE concentration and OFES domain")
+    axes[2].legend(
+        handles=[
+            Line2D(
+                [], [], color=INK, linewidth=1.4,
+                label="KE frame: 140–180°E, 25–45°N",
+            ),
+            Line2D(
+                [], [], color=BLUE, linewidth=1.4, linestyle="--",
+                label="OFES domain: 140–170°E, 25–45°N",
+            ),
+        ],
+        loc="upper left",
+        fontsize=7.0,
+        framealpha=0.9,
+    )
     axes[2].text(
         0.03, 0.04, "16 of 17 DO50 carriers\noccurred in the Kuroshio Extension",
         transform=axes[2].transAxes, fontsize=8.5, va="bottom",
@@ -763,9 +863,29 @@ def _plot_figure5(
         (0.28, 0.32, 0.44, 0.36, f"{scv} SCV-compatible", PURPLE),
         (0.38, 0.40, 0.24, 0.20, f"{obscured} surface-obscured\nSCV-compatible", TEAL),
     ]
-    for x, y, width, height, label, color in boxes:
+    for index, (x, y, width, height, label, color) in enumerate(boxes):
         ax.add_patch(Rectangle((x, y), width, height, fill=False, edgecolor=color, linewidth=2.0))
-        ax.text(x + width / 2, y + height - 0.06, label, ha="center", va="top", fontsize=9.2, color=color)
+        if index == 0:
+            text_x, text_y, horizontal, vertical, fontsize = (
+                x + 0.025, y + height + 0.015, "left", "bottom", 9.0
+            )
+        else:
+            # Put each label in the gap immediately above its frame. This
+            # keeps nested borders visible instead of letting long labels
+            # run through the inner boxes.
+            text_x, text_y, horizontal, vertical, fontsize = (
+                x + 0.01, y + height + 0.012, "left", "bottom", 8.0 if index < 3 else 7.2
+            )
+        ax.text(
+            text_x,
+            text_y,
+            label,
+            ha=horizontal,
+            va=vertical,
+            fontsize=fontsize,
+            color=color,
+            bbox={"facecolor": "white", "alpha": 0.86, "edgecolor": "none", "pad": 1.2},
+        )
     ax.text(
         0.06, -0.08,
         "Nested definitions: 6/6 are within the 27 carriers;\n"
@@ -810,7 +930,7 @@ def _plot_figure5(
     ax.set_xlim(-0.06, 0.42)
     ax.set_title("Retention across reference frames")
     ax.text(
-        0.03, 0.92,
+        0.03, 0.76,
         "Direction is consistent with a slower decay for carriers,\n"
         "but the tendency is statistically limited (CIs and MW tests remain in the report).",
         transform=ax.transAxes, fontsize=8.2, va="top",

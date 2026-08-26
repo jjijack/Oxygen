@@ -152,8 +152,9 @@ surface-obscured SCV 计数柱，虚线=28 的半数参考）、**旋转日分�
 统一称为 DO-evaluable McCoy SCVs，四类分别为 DO50 17、DO35–50 22、
 DO20–35 28、below DO20 177；类别互斥且总和为 244，DO50/DO35+/DO20+
 分别为 17/39/67。OR 直接读取正式 sweep（5.86、13.01、20.22；META
-约 1.1–1.2）。KE 面板标注 16 of 17 DO50 carriers occurred in the
-Kuroshio Extension，表示空间集中性，不是区域背景概率检验。
+约 1.1–1.2）。KE 面板同时标出 KE frame（140–180°E, 25–45°N）与
+OFES domain（140–170°E, 25–45°N），并标注 16 of 17 DO50 carriers
+occurred in the Kuroshio Extension；这表示空间集中性，不是区域背景概率检验。
 
 ### Figure2_ofes_water_mass_mccoy.png（OFES 水团与 McCoy 证据）
 四面板依次显示 161 quality events 的 water-mass/heave 分解、绝对水团贡献
