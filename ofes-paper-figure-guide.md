@@ -1,8 +1,8 @@
 # OFES 机制图库阅读指南
 
-配合 `ofes_figures_preview/` 使用。目录 01–06 为过程与验证产物，07 为最新论文候选图，
-08–10 分别保存报告/冻结协议、核心表格和运行 provenance。全部图的冻结数字以各
-`analysis_summary.json` / 正式报告为准，图中标注与之一致。
+配合 `ofes_figures_preview/` 使用。目录 01–06 为过程与验证产物，07 为投稿主图，
+08 为旧版候选图参考，09–10 分别保存核心表格和运行 provenance。全部图的冻结数字
+以各 `analysis_summary.json` / 正式报告为准，图中标注与之一致。
 
 grid-SCV S5 背景敏感性已完成；它是每 5 日系统抽样敏感性，不冒充 365 日年度 null。
 
@@ -142,7 +142,63 @@ surface-obscured SCV 计数柱，虚线=28 的半数参考）、**旋转日分�
 
 ---
 
-## 07_new_paper_figures —— 论文候选
+## 07_manuscript_figures —— 论文主图
+
+最终主图由 plot_ofes_manuscript_figures.py 从已完成的 parquet/JSON 产物重组；
+脚本只负责读取、统计已有结果和绘图，不重新运行 OFES。
+
+### Figure1_global_scv_ke.png（全球 SCV 与 KE 集中）
+三面板保留互斥的全球地图、log-x OR forest 和 KE/OFES 分析区。244 个对象
+统一称为 DO-evaluable McCoy SCVs，四类分别为 DO50 17、DO35–50 22、
+DO20–35 28、below DO20 177；类别互斥且总和为 244，DO50/DO35+/DO20+
+分别为 17/39/67。OR 直接读取正式 sweep（5.86、13.01、20.22；META
+约 1.1–1.2）。KE 面板标注 16 of 17 DO50 carriers occurred in the
+Kuroshio Extension，表示空间集中性，不是区域背景概率检验。
+
+### Figure2_ofes_water_mass_mccoy.png（OFES 水团与 McCoy 证据）
+四面板依次显示 161 quality events 的 water-mass/heave 分解、绝对水团贡献
+分数、联合 θ–S 状态和 event-core McCoy enrichment。56 strict events 高亮；
+水团贡献分数中位数为 86.2%（54/56 dominated）和 78.2%（138/161 dominated）。
+McCoy 面板使用 19/56、事件等权差 0.144、bootstrap 95% CI [0.076, 0.221]，
+并同时标注单侧与透明双侧 p。θ 与 S 是一个联合热盐状态的两个坐标，不是三条
+独立证据；标题限定为 OFES anomaly cores 的 conditional enrichment。
+
+### Figure3_ventilation_downward.png（通风史与向下路径）
+左侧是正式 30-day trajectory-complete paired subset 的三项 event-equal
+ventilation contrasts（direct、within 25 m、isopycnal outcrop），分别读取
+hydrographic n=28 与 kinematic n=27 的 CI/p。每个事件先作 anomaly−control，
+再事件等权；三个指标相关，六个点不是六次独立验证。右侧三个并列诊断框各自
+保留分母：displacement-classifiable 24/56（21 down、3 up），strict
+resolved pathways 18（15 down、3 up），以及 w_along n=19、daily mean
+主要值 +4.8 m d⁻¹、nominal p=0.040。它们是 related but non-independent
+diagnostics with distinct eligibility criteria，不是漏斗或可相加计数。
+
+### Figure4_E000073_case.png（E000073 配对路径案例）
+四面板展示 anomaly 与 hydrographic-control ensembles 的中位线/IQR 以及代表
+粒子。轨迹在事件峰值条件下初始化并向后积分，但按自然时间顺序显示：
+Trajectories were initialized at the event peak and integrated backward;
+reconstructed histories are displayed in chronological order。最早端称
+earliest reconstructed position/depth within the integration window，不称
+release/start/source。E000073 初始连续 direct contact 为 13 d、累计为 20 d；
+Jan 26 与 Feb 1–6 是 intermittent re-encounters，Feb 7 以后才是 final
+detachment and major descent。hydrographic control 的正式含义是 0 of 51
+trajectory days with direct MLD contact，不是 51 个 control 粒子。
+
+### Figure5_rotational_organization.png（反气旋组织与有限 retention）
+三面板使用 nested hierarchy（56 strict → 27 persistent anticyclonic
+rotational carriers → 6 SCV-compatible → 1 surface-obscured SCV-compatible）、
+per-stage McCoy expression（start/peak/last = 10/56、19/56、9/56）和三种
+retention reference frames。6/6 与 1/1 是定义内包含关系，不是独立证据；
+peak 的 19/56 只能表述为 McCoy-compatible profile expression is most
+concentrated at the anomaly peak。三种 carrier−non-carrier decay-slope
+差异方向一致，但主文口径为 consistent but statistically limited tendency
+toward slower decay，不宣称显著性或因果。
+
+Figure 6 的 surface-eddy 说明与正式数值位于 ofes-surface-eddy-results-report.md；
+它使用同一 16-event 分母呈现 15/16 same-sign surface–deep Ro correspondence
+对 0/16 closed-SSH containment。
+
+## 08_legacy_paper_candidates —— 旧版参考图（不作为主图）
 
 ### F1_enrichment_main.png（富集主图）
 左：事件核心 vs 同天背景的 McCoy 兼容率均值柱 + 逐事件配对灰线；右：事件等权均值差
