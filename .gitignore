@@ -9,6 +9,7 @@
 *.txt
 *.mat
 *.zarr
+*.json
 
 Argo_addFloat/
 Argo_data/

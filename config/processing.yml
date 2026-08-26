@@ -1,4 +1,14 @@
 # 处理与算法参数配置
+# version 1.23 变更：
+#   - 更正并扩展 OFES NP30 数据入口：按 MOM3 Arakawa B-grid 将 u/v 从角点共置到示踪物中心，
+#     保留 w 的层界深度，并统一深度坐标、变量单位和区域子集读取。
+#   - 新增年度向量化 ΔDO20/35/50 event catalog 及 detector parity、掩码和跨日链接门槛。
+#   - 新增客观事件的等密度水团/heave/动力与负对照、总体、onset/formation、同密度 patch、
+#     全生命周期 SCV-compatible 代理和 Hosoda benchmark/事件演化诊断。
+#   - 新增固定语义输出目录；各分析直接写入正式表格、JSON 和图件，并支持逐日缓存续跑。
+#   - 代表事件和 Hosoda benchmark 日期改由调用方显式传入；配置仅保留算法参数与阈值。
+#   - 新增全 quality-eligible 事件的正式诊断入口，事件集合由当前 catalog 自然派生。
+#   - 新增统一的 fixed-site/moving-core 逐日 water-mass/heave producer、请求表和轻量读取参数。
 # version 1.22 变更：
 #   - processing 新增 scv_matched_control，集中管理 McCoy SCV 与 non-catalogued BGC-Argo
 #     空间、时间、EKE 和垂向覆盖匹配，以及 platform-cluster bootstrap 参数。
@@ -75,7 +85,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.22
+version: 1.23
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -206,7 +216,41 @@ processing:
     random_seed: 42               # bootstrap 随机种子
 
 ofes:
-  velocity_scale: 0.01            # cm/s → m/s
+  horizontal_grid: arakawa_b      # MOM3 B-grid：u/v 同处角点，均需四角平均到示踪物中心
+  depth_scale: 1.0                # JAMSTEC 公开页说明 DODS 的 mbar 为通用错误 attribute；结合交付层位按 z-level 深度（m）解释
+  depth_units: m
+  source_vertical_units_attribute: millibar
+  source_vertical_units_note: "general false-unit warning for public OFES DODS output; delivered z-level coordinate interpreted as depth in metres"
+  variable_scale:                 # 原生值 → 对外值
+    do2: 1.0
+    temp: 1.0
+    salinity: 1.0
+    u: 0.01
+    v: 0.01
+    w: 0.01
+    eta: 0.01
+    pressur: 1.0
+  native_units:
+    do2: "umol kg-1"
+    temp: "degC potential temperature"
+    salinity: "PSS-78"
+    u: "cm s-1"
+    v: "cm s-1"
+    w: "cm s-1"
+    eta: "cm"
+    pressur: "hPa"
+  output_units:
+    do2: "umol kg-1"
+    temp: "degC potential temperature"
+    salinity: "PSS-78"
+    u: "m s-1"
+    v: "m s-1"
+    w: "m s-1"
+    eta: "m"
+    pressur: "hPa"
+  vertical_velocity_positive: up  # MOM3 约定；正式启用 w 前仍需保留可复现的数据集专项验证
+  vertical_velocity_sign_basis: "MOM3 convention; dataset-specific validation artifact required"
+  temporal_interpolation: piecewise_constant_unvalidated
   file_pattern: "{var}.{mm}.{dd}.{yyyy}.nc"
   var_subdir:                     # 变量名 → 子目录名（完整数据集按变量分目录；未列出者用变量名）
     u: u_vel
@@ -215,8 +259,128 @@ ofes:
   tracer_vars: [do2, temp, salinity]
   velocity_vars: [u, v, w]
   surface_vars: [eta, pressur]
+  variable_semantics:
+    eta: sea_surface_height
+    pressur: surface_air_pressure
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
-  rk4_max_substeps: 24            # 单日内最大亚步数（dt × max = 1 天）
+  delta_do_catalog:
+    thresholds: [20.0, 35.0, 50.0]
+    candidate_depth_min_m: 300.0
+    candidate_depth_max_m: 1000.0
+    latitude_chunk_size: 100
+    parity_dates: ["2003-01-01", "2003-04-05", "2003-07-01", "2003-10-01"]
+    parity_lon_bounds: [142.0, 150.0]
+    parity_lat_bounds: [32.0, 39.0]
+    parity_random_profiles: 300
+    parity_top_profiles: 200
+    parity_seed: 20260730
+    object_connectivity: 8
+    object_depth_tolerance_m: 100.0
+    min_object_pixels: 12
+    event_max_missing_days: 1
+    event_max_centroid_distance_km: 80.0
+    event_max_depth_difference_m: 100.0
+    event_bbox_padding_pixels: 6
+    event_gap_cost_per_missing_day: 0.25
+    min_ranked_event_days: 3
+    rank_area_reference_km2: 500.0
+    rank_thickness_reference_m: 100.0
+    rank_duration_reference_days: 5.0
+    output_region_slug: ofes_np30_ke
+  event_diagnostics:
+    candidate_threshold: 50.0
+    candidate_count: 5
+    maximum_sampled_event_days: 31
+    deep_depth_min_m: 500.0
+    deep_depth_max_m: 900.0
+    background_inner_radius_km: 120.0
+    background_outer_radius_km: 240.0
+    background_load_margin_km: 50.0
+    background_min_valid_columns: 100
+    velocity_smoothing_sigma_pixels: 1.5
+    negative_control_distance_min_km: 300.0
+    negative_control_distance_max_km: 700.0
+    negative_control_latitude_tolerance_deg: 3.0
+    negative_control_do20_exclusion_radius_km: 100.0
+    negative_control_grid_stride: 5
+    control_match_sigma0_scale: 0.05
+    control_match_theta_scale_deg_c: 1.0
+    control_match_salinity_scale: 0.10
+    control_match_do_scale_umol_kg: 10.0
+    control_match_vorticity_scale: 0.20
+    control_match_strain_scale: 0.20
+    context_days: 10
+    output_subdir: event_diagnostics
+  daily_water_mass:
+    worker_count: 16
+    output_subdir: daily_water_mass
+    geometry_modes: [fixed_site, moving_core]
+  event_population:
+    candidate_threshold: 50.0
+    heave_important_absolute_fraction_min: 0.3333333333333333
+    surface_search_radius_km: 50.0
+    surface_weight_scale_factor: 1.0
+    surface_weight_support_factor: 2.0
+    surface_attenuation_ratio_max: 0.5
+    figure_dpi: 180
+    output_subdir: event_population
+  event_onset:
+    pre_start_days: 5
+    minimum_start_to_peak_observed_days: 2
+    require_full_background_annulus: true
+    deep_entry_depth_min_m: 500.0
+    frontogenesis_load_radius_km: 100.0
+    core_summary_radius_km: 30.0
+    core_min_valid_columns: 100
+    density_smoothing_sigma_pixels: 1.5
+    minimum_density_gradient_kg_m4: 1.0e-8
+    map_radius_km: 180.0
+    map_min_finite_fraction: 0.50
+    map_quiver_stride: 12
+    figure_dpi: 180
+    output_subdir: event_onset
+  event_patch:
+    map_radius_km: 180.0
+    do_contrast_min_umol_kg: 50.0
+    spiciness_peak_fraction_min: 0.5
+    minimum_consecutive_days: 5
+    centroid_transition_pass_fraction_min: 0.75
+    centroid_error_floor_km: 30.0
+    translated_mask_median_iou_min: 0.20
+    median_direction_cosine_min: 0.80
+    positive_direction_fraction_min: 0.75
+    median_speed_ratio_min: 0.5
+    median_speed_ratio_max: 2.0
+    figure_dpi: 180
+    output_subdir: event_patch
+  event_lifecycle:
+    persistent_day_fraction_min: 0.75
+    intermittent_day_fraction_min: 0.25
+    minimum_lag_pairs: 7
+    maximum_lag_days: 5
+    maximum_lag_duration_fraction: 0.3333333333333333
+    lag_correlation_min: 0.5
+    lag_improvement_over_zero_min: 0.1
+    minimum_classified_lag_days: 2
+    scv_rotation_day_fraction_min: 0.5
+    scv_anticyclonic_rotation_fraction_min: 0.75
+    scv_subsurface_max_depth_min_m: 200.0
+    scv_minimum_consecutive_days: 5
+    surface_profile_rossby_tolerance: 0.001
+    figure_dpi: 180
+    output_subdir: event_lifecycle
+  event_evolution:
+    map_radius_km: 350.0
+    map_quiver_stride: 12
+    map_min_finite_fraction: 0.50
+    figure_dpi: 180
+    hosoda_lon_bounds: [142.0, 150.0]
+    hosoda_lat_bounds: [32.0, 39.0]
+    hosoda_do_sigma0: 26.5
+    hosoda_do_reference_depth_m: 500.0
+    hosoda_salinity_sigma0: 26.7
+    hosoda_salinity_reference_depth_m: 600.0
+    output_subdir: event_evolution
 
 plot:
   basemap_colors:

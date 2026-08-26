@@ -15,11 +15,13 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
 import glob
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as ndimage_label
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from scipy.stats import pearsonr, spearmanr
 from scipy.linalg import eig
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, linear_sum_assignment
 import copy
 import gsw
 from collections import defaultdict
@@ -41,6 +43,7 @@ import traceback
 import json, pyarrow as pa, pyarrow.parquet as pq
 import math
 import hashlib
+from typing import Any, Mapping
 import zarr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -35977,107 +35980,439 @@ def _ofes_file_path(var: str, date: str | pd.Timestamp) -> Path:
     return _ofes_root / subdir / fname
 
 
+def _ofes_contiguous_slice(
+    values: np.ndarray,
+    bounds: tuple[float, float] | None,
+    name: str,
+    *,
+    longitude: bool = False,
+) -> slice:
+    """把坐标范围转换为连续 netCDF slice，避免先读整场再做布尔筛选。"""
+    coords = np.asarray(values, dtype=float)
+    if coords.ndim != 1 or coords.size == 0 or not np.all(np.diff(coords) > 0):
+        raise ValueError(f'OFES {name} coordinate must be a non-empty increasing 1-D array.')
+    if bounds is None:
+        return slice(0, coords.size)
+    if len(bounds) != 2 or not np.all(np.isfinite(bounds)):
+        raise ValueError(f'{name}_bounds must contain two finite values.')
+
+    lower, upper = (float(bounds[0]), float(bounds[1]))
+    if longitude:
+        mask = _region_lon_mask(coords, lower, upper)
+    else:
+        if lower > upper:
+            raise ValueError(f'{name}_bounds must be ordered from low to high.')
+        mask = (coords >= lower) & (coords <= upper)
+
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        raise ValueError(
+            f'Requested OFES {name} bounds {bounds} do not overlap '
+            f'[{coords[0]:g}, {coords[-1]:g}].'
+        )
+    if indices.size > 1 and not np.all(np.diff(indices) == 1):
+        raise ValueError(
+            f'OFES {name} bounds {bounds} form a non-contiguous window; '
+            'split dateline-crossing requests into two regional reads.'
+        )
+    return slice(int(indices[0]), int(indices[-1]) + 1)
+
+
+def _ofes_assert_coordinate_match(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    label: str,
+    *,
+    atol: float = 2e-6,
+) -> float:
+    """断言两个 OFES 坐标完全同形且数值在指定绝对误差内，并返回最大误差。"""
+    actual_arr = np.asarray(actual, dtype=float)
+    expected_arr = np.asarray(expected, dtype=float)
+    if actual_arr.shape != expected_arr.shape:
+        raise ValueError(
+            f'OFES {label} coordinate shape mismatch: '
+            f'{actual_arr.shape} != {expected_arr.shape}.'
+        )
+    max_error = float(np.max(np.abs(actual_arr - expected_arr))) if actual_arr.size else 0.0
+    if not np.allclose(actual_arr, expected_arr, rtol=0.0, atol=atol):
+        raise ValueError(
+            f'OFES {label} coordinate mismatch after colocation '
+            f'(max abs error={max_error:.3e}).'
+        )
+    return max_error
+
+
+def _ofes_tracer_coordinates(
+    date: pd.Timestamp,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, Path]:
+    """读取小型一维示踪物坐标，不读取任何三维变量。"""
+    tracer_candidates = list(
+        _OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity'])
+    )
+    reference_path = next(
+        (
+            _ofes_file_path(var, date)
+            for var in tracer_candidates
+            if _ofes_file_path(var, date).exists()
+        ),
+        None,
+    )
+    if reference_path is None:
+        raise FileNotFoundError(
+            f'No OFES tracer reference file found for {date:%Y-%m-%d}.'
+        )
+
+    with Dataset(str(reference_path), 'r') as nc:
+        lon = np.asarray(nc.variables['lon'][:], dtype=float)
+        lat = np.asarray(nc.variables['lat'][:], dtype=float)
+        depth_native = np.asarray(nc.variables['lev'][:], dtype=float)
+        depth_attr_units = str(getattr(nc.variables['lev'], 'units', 'unknown'))
+
+    depth_scale = float(_OFES_CFG.get('depth_scale', 1.0))
+    depth = depth_native * depth_scale
+    return lon, lat, depth, depth_attr_units, reference_path
+
+
+def _ofes_subset_to_float32(variable, indexer: tuple) -> np.ndarray:
+    """按 netCDF indexer 直接读取子集，并把掩码值转换为 float32 NaN。"""
+    subset = variable[indexer]
+    return np.asarray(np.ma.filled(subset, np.nan), dtype=np.float32)
+
+
 def load_ofes_snapshot(
     date: str | pd.Timestamp,
     variables: list[str] | None = None,
-    depth_max: float | None = None,
+    lon_bounds: tuple[float, float] | None = None,
+    lat_bounds: tuple[float, float] | None = None,
+    depth_bounds: tuple[float, float] | None = None,
 ) -> dict:
-    """加载一天的 OFES NP30 数据并将所有变量统一到示踪物网格。
+    """按日期和区域加载 OFES NP30 快照，并校正 MOM3 B-grid 坐标。
 
-    Arakawa-C 交错处理：u/v 在 (601×901) 网格上，半格插值到 (600×900) 示踪物格点；
-    w 的 lev 位于层界面，线性插值到示踪物层中心。速度单位从 cm/s 转换为 m/s。
+    函数先读取一维坐标并构造 netCDF slice，再物化所请求的变量子集。`u` 和 `v`
+    同处 B-grid 角点，均由四个角点平均到示踪物中心；`w` 保留交付层界深度
+    `depth_w`，不再静默插值到示踪物层中心。变量单位按 `processing.yml`
+    集中转换，原生与输出单位均记录在 `metadata`。
 
     参数:
         - date (str | pd.Timestamp): 日期，格式 'YYYY-MM-DD' 或 Timestamp。
         - variables (list[str] | None): 需要加载的变量名列表；None 时加载 do2/temp/salinity/u/v/w。
-        - depth_max (float | None): 截断深度（m）；None 时加载全部 75 层。
+        - lon_bounds (tuple[float, float] | None): 经度窗口；None 时读取全部已交付经度。
+        - lat_bounds (tuple[float, float] | None): 纬度窗口；None 时读取全部已交付纬度。
+        - depth_bounds (tuple[float, float] | None): 深度窗口（m）；None 时读取全部层。
 
     返回:
-        - dict: 键含 'lat', 'lon', 'lev', 'date' 及各变量名 → numpy 3-D 数组 (lev, lat, lon)。
+        - dict: 含 date/lon/lat/depth、请求变量和 metadata；u/v 与示踪物数组维度为 (depth, lat, lon)，w 为 (depth_w, lat, lon)。
+
+    说明:
+        - JAMSTEC OFES 公开数据页将 DODS 垂向坐标的 mbar 说明为通用错误 metadata，并非本次交付的专项确认；结合交付层位，本入口按 z-level 深度（m）解释其数值。
+        - `w` 按 MOM3 约定记录为向上为正，但尚缺可复现的数据集专项验证；本函数只负责读取，不据此授权三维轨迹解释。
+        - 经度窗口必须能映射为一个连续 slice；跨日界线窗口应拆成两次区域读取。
     """
+    date_ts = pd.Timestamp(date).normalize()
     if variables is None:
         variables = list(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
         variables += list(_OFES_CFG.get('velocity_vars', ['u', 'v', 'w']))
+    variables = list(dict.fromkeys(variables))
+    if not variables:
+        raise ValueError('variables must contain at least one OFES variable name.')
 
-    tracer_vars = set(_OFES_CFG.get('tracer_vars', ['do2', 'temp', 'salinity']))
-    vel_scale = float(_OFES_CFG.get('velocity_scale', 0.01))
+    lon_all, lat_all, depth_all, depth_attr_units, reference_path = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    lon_slice = _ofes_contiguous_slice(
+        lon_all, lon_bounds, 'longitude', longitude=True
+    )
+    lat_slice = _ofes_contiguous_slice(lat_all, lat_bounds, 'latitude')
+    depth_slice = _ofes_contiguous_slice(
+        depth_all, depth_bounds, 'depth'
+    )
+    lon = lon_all[lon_slice]
+    lat = lat_all[lat_slice]
+    depth = depth_all[depth_slice]
 
-    result: dict = {'date': pd.Timestamp(date)}
-    tracer_coords_set = False
+    variable_scale = _OFES_CFG.get('variable_scale', {})
+    native_units_cfg = _OFES_CFG.get('native_units', {})
+    output_units_cfg = _OFES_CFG.get('output_units', {})
+    variable_semantics_cfg = _OFES_CFG.get('variable_semantics', {})
+    metadata: dict = {
+        'horizontal_grid': str(_OFES_CFG.get('horizontal_grid', 'arakawa_b')),
+        'horizontal_location': 'tracer_center',
+        'depth_units': str(_OFES_CFG.get('depth_units', 'm')),
+        'source_vertical_units_attribute': depth_attr_units,
+        'source_vertical_units_note': str(
+            _OFES_CFG.get(
+                'source_vertical_units_note',
+                'general false-unit warning for public OFES DODS output; '
+                'delivered z-level coordinate interpreted as depth in metres',
+            )
+        ),
+        'depth_semantics': 'delivered OFES z-level depth below sea surface',
+        'vertical_velocity_positive': str(
+            _OFES_CFG.get('vertical_velocity_positive', 'up')
+        ),
+        'vertical_velocity_sign_basis': str(
+            _OFES_CFG.get(
+                'vertical_velocity_sign_basis',
+                'MOM3 convention; dataset-specific validation required',
+            )
+        ),
+        'w_vertical_location': 'lower_interface',
+        'reference_file': str(reference_path),
+        'variable_dims': {},
+        'native_units': {},
+        'output_units': {},
+        'variable_semantics': {},
+        'unit_scales': {},
+        'source_shapes': {},
+        'loaded_shapes': {},
+        'read_slices': {},
+        'coordinate_max_abs_error': {},
+    }
+    result: dict = {
+        'date': date_ts,
+        'lon': lon,
+        'lat': lat,
+        'depth': depth,
+    }
 
     for var in variables:
-        fpath = _ofes_file_path(var, date)
+        fpath = _ofes_file_path(var, date_ts)
         if not fpath.exists():
             raise FileNotFoundError(f"OFES file not found: {fpath}")
-        nc = Dataset(str(fpath), 'r')
-        raw = np.ma.filled(nc.variables[var][0], np.nan).astype(np.float32)
 
-        if not tracer_coords_set and var in tracer_vars:
-            lat_t = np.asarray(nc.variables['lat'][:])
-            lon_t = np.asarray(nc.variables['lon'][:])
-            lev_t = np.asarray(nc.variables['lev'][:])
-            if depth_max is not None:
-                lev_mask = lev_t <= depth_max
-                lev_t = lev_t[lev_mask]
-            result['lat'] = lat_t
-            result['lon'] = lon_t
-            result['lev'] = lev_t
-            tracer_coords_set = True
-        nc.close()
+        with Dataset(str(fpath), 'r') as nc:
+            if var not in nc.variables:
+                raise KeyError(f'Variable {var!r} is absent from {fpath}.')
+            nc_var = nc.variables[var]
+            metadata['source_shapes'][var] = tuple(int(v) for v in nc_var.shape)
+            if 'time' in nc.variables:
+                time_units = str(getattr(nc.variables['time'], 'units', ''))
+                if time_units and date_ts.strftime('%Y-%m-%d') not in time_units:
+                    raise ValueError(
+                        f'OFES file time metadata does not match requested date: '
+                        f'{fpath} ({time_units!r}).'
+                    )
 
-        if raw.ndim == 2:
-            result[var] = raw.astype(np.float32)
-            continue
+            if var in ('u', 'v'):
+                depth_var = (
+                    np.asarray(nc.variables['lev'][depth_slice], dtype=float)
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
+                )
+                _ofes_assert_coordinate_match(
+                    depth_var, depth, f'{var} depth'
+                )
+                corner_lat_slice = slice(lat_slice.start, lat_slice.stop + 1)
+                corner_lon_slice = slice(lon_slice.start, lon_slice.stop + 1)
+                corner_lat = np.asarray(
+                    nc.variables['lat'][corner_lat_slice], dtype=float
+                )
+                corner_lon = np.asarray(
+                    nc.variables['lon'][corner_lon_slice], dtype=float
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var,
+                    (0, depth_slice, corner_lat_slice, corner_lon_slice),
+                )
+                expected_corner_shape = (
+                    depth.size, lat.size + 1, lon.size + 1
+                )
+                if raw.shape != expected_corner_shape:
+                    raise ValueError(
+                        f'OFES {var} B-grid subset shape {raw.shape} does not '
+                        f'match expected corner shape {expected_corner_shape}.'
+                    )
+                collocated = 0.25 * (
+                    raw[:, :-1, :-1]
+                    + raw[:, :-1, 1:]
+                    + raw[:, 1:, :-1]
+                    + raw[:, 1:, 1:]
+                )
+                metadata['coordinate_max_abs_error'][f'{var}_lon'] = (
+                    _ofes_assert_coordinate_match(
+                        0.5 * (corner_lon[:-1] + corner_lon[1:]),
+                        lon,
+                        f'{var} longitude',
+                    )
+                )
+                metadata['coordinate_max_abs_error'][f'{var}_lat'] = (
+                    _ofes_assert_coordinate_match(
+                        0.5 * (corner_lat[:-1] + corner_lat[1:]),
+                        lat,
+                        f'{var} latitude',
+                    )
+                )
+                raw = collocated
+                metadata['variable_dims'][var] = (
+                    'depth', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'depth': (depth_slice.start, depth_slice.stop),
+                    'lat_corner': (
+                        corner_lat_slice.start, corner_lat_slice.stop
+                    ),
+                    'lon_corner': (
+                        corner_lon_slice.start, corner_lon_slice.stop
+                    ),
+                }
+            elif var == 'w':
+                depth_w_all = (
+                    np.asarray(nc.variables['lev'][:], dtype=float)
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
+                )
+                depth_w_slice = _ofes_contiguous_slice(
+                    depth_w_all, depth_bounds, 'w depth'
+                )
+                depth_w = depth_w_all[depth_w_slice]
+                if 'depth_w' in result:
+                    _ofes_assert_coordinate_match(
+                        result['depth_w'], depth_w, 'w depth'
+                    )
+                else:
+                    result['depth_w'] = depth_w
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    'w latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    'w longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, depth_w_slice, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = (
+                    'depth_w', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'depth_w': (
+                        depth_w_slice.start, depth_w_slice.stop
+                    ),
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            elif nc_var.ndim == 4:
+                depth_var = (
+                    np.asarray(nc.variables['lev'][depth_slice], dtype=float)
+                    * float(_OFES_CFG.get('depth_scale', 1.0))
+                )
+                _ofes_assert_coordinate_match(
+                    depth_var, depth, f'{var} depth'
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    f'{var} latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    f'{var} longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, depth_slice, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = (
+                    'depth', 'lat', 'lon'
+                )
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'depth': (depth_slice.start, depth_slice.stop),
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            elif nc_var.ndim == 3:
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lat'][lat_slice], dtype=float),
+                    lat,
+                    f'{var} latitude',
+                )
+                _ofes_assert_coordinate_match(
+                    np.asarray(nc.variables['lon'][lon_slice], dtype=float),
+                    lon,
+                    f'{var} longitude',
+                )
+                raw = _ofes_subset_to_float32(
+                    nc_var, (0, lat_slice, lon_slice)
+                )
+                metadata['variable_dims'][var] = ('lat', 'lon')
+                metadata['read_slices'][var] = {
+                    'time': 0,
+                    'lat': (lat_slice.start, lat_slice.stop),
+                    'lon': (lon_slice.start, lon_slice.stop),
+                }
+            else:
+                raise ValueError(
+                    f'Unsupported OFES variable dimensions for {var}: '
+                    f'{nc_var.dimensions}.'
+                )
 
-        if var in ('u', 'v'):
-            raw = 0.5 * (raw[:, :-1, :-1] + (
-                raw[:, :-1, 1:] if var == 'u' else raw[:, 1:, :-1]
-            ))
-            raw = raw * vel_scale
+            file_units = getattr(nc_var, 'units', None)
 
-        if var == 'w':
-            nc_w = Dataset(str(fpath), 'r')
-            lev_w = np.asarray(nc_w.variables['lev'][:])
-            nc_w.close()
-            lev_t_ref = result.get('lev', None)
-            if lev_t_ref is None:
-                fpath_t = _ofes_file_path('do2', date)
-                if fpath_t.exists():
-                    nc_t = Dataset(str(fpath_t), 'r')
-                    lev_t_ref = np.asarray(nc_t.variables['lev'][:])
-                    nc_t.close()
-            if lev_t_ref is not None:
-                interped = np.empty((len(lev_t_ref), raw.shape[1], raw.shape[2]), dtype=np.float32)
-                for j in range(raw.shape[1]):
-                    for k in range(raw.shape[2]):
-                        interped[:, j, k] = np.interp(lev_t_ref, lev_w, raw[:, j, k])
-                raw = interped
-            raw = raw * vel_scale
+        scale = float(variable_scale.get(var, 1.0))
+        result[var] = np.asarray(raw * scale, dtype=np.float32)
+        metadata['unit_scales'][var] = scale
+        metadata['native_units'][var] = str(
+            native_units_cfg.get(var, file_units or 'unknown')
+        )
+        metadata['output_units'][var] = str(
+            output_units_cfg.get(var, file_units or 'unknown')
+        )
+        if var in variable_semantics_cfg:
+            metadata['variable_semantics'][var] = str(
+                variable_semantics_cfg[var]
+            )
+        metadata['loaded_shapes'][var] = tuple(
+            int(v) for v in result[var].shape
+        )
 
-        if depth_max is not None and 'lev' in result and raw.ndim == 3:
-            nlev = len(result['lev'])
-            raw = raw[:nlev]
-
-        result[var] = raw.astype(np.float32)
-
-    if not tracer_coords_set:
-        tracer_ref = _ofes_file_path('do2', date)
-        if not tracer_ref.exists():
-            tracer_ref = _ofes_file_path('temp', date)
-        if tracer_ref.exists():
-            nc0 = Dataset(str(tracer_ref), 'r')
-        else:
-            nc0 = Dataset(str(_ofes_file_path(variables[0], date)), 'r')
-        result['lat'] = np.asarray(nc0.variables['lat'][:])
-        result['lon'] = np.asarray(nc0.variables['lon'][:])
-        if 'lev' in nc0.variables:
-            lev_vals = np.asarray(nc0.variables['lev'][:])
-            if depth_max is not None:
-                lev_vals = lev_vals[lev_vals <= depth_max]
-            result['lev'] = lev_vals
-        nc0.close()
+    result['metadata'] = metadata
 
     return result
+
+
+def _ofes_profile_variables(
+    snapshot: dict,
+    variables: list[str] | None,
+) -> list[str]:
+    """解析与示踪物 depth 网格同位、可合并成单张剖面表的变量。"""
+    variable_dims = snapshot.get('metadata', {}).get('variable_dims', {})
+    if variables is None:
+        return [
+            var
+            for var, dims in variable_dims.items()
+            if tuple(dims) == ('depth', 'lat', 'lon')
+        ]
+
+    selected = list(dict.fromkeys(variables))
+    for var in selected:
+        if var not in snapshot:
+            raise KeyError(f'Variable {var!r} is absent from the OFES snapshot.')
+        dims = tuple(variable_dims.get(var, ()))
+        if dims != ('depth', 'lat', 'lon'):
+            raise ValueError(
+                f'Variable {var!r} uses coordinates {dims}; only variables on '
+                '(depth, lat, lon) can share this profile table.'
+            )
+    return selected
+
+
+def _ofes_validate_profile_point(snapshot: dict, lon: float, lat: float) -> None:
+    """拒绝落在已加载区域之外的剖面请求，避免边界静默夹取。"""
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    if not (
+        lon_arr[0] <= float(lon) <= lon_arr[-1]
+        and lat_arr[0] <= float(lat) <= lat_arr[-1]
+    ):
+        raise ValueError(
+            f'Requested point ({lon:g}, {lat:g}) lies outside loaded OFES '
+            f'window lon=[{lon_arr[0]:g}, {lon_arr[-1]:g}], '
+            f'lat=[{lat_arr[0]:g}, {lat_arr[-1]:g}].'
+        )
 
 
 def extract_ofes_profile(
@@ -36086,33 +36421,33 @@ def extract_ofes_profile(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """从 OFES 快照中提取指定经纬度的垂向剖面（最近邻）。
+    """从 OFES 快照中提取指定经纬度的定深剖面（最近邻）。
+
+    仅合并已经位于 `(depth, lat, lon)` 示踪物网格的变量。`w` 保留在
+    `depth_w` 层界面上，不能由本入口静默混入中心层剖面。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - lon (float): 经度。
         - lat (float): 纬度。
-        - variables (list[str] | None): 变量名列表；None 时提取快照中所有 3-D 变量。
+        - variables (list[str] | None): 变量名列表；None 时提取所有中心层 3-D 变量。
 
     返回:
-        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
     """
-    lat_arr = snapshot['lat']
-    lon_arr = snapshot['lon']
-    lev_arr = snapshot['lev']
+    _ofes_validate_profile_point(snapshot, lon, lat)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    depth_arr = np.asarray(snapshot['depth'], dtype=float)
 
     j = int(np.argmin(np.abs(lat_arr - lat)))
     i = int(np.argmin(np.abs(lon_arr - lon)))
+    selected = _ofes_profile_variables(snapshot, variables)
 
-    if variables is None:
-        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
-                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
-
-    records = {'Depth': lev_arr.copy()}
-    for var in variables:
+    records = {'Depth': depth_arr.copy()}
+    for var in selected:
         arr = snapshot[var]
-        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
-            records[var] = arr[:, j, i].copy()
+        records[var] = arr[:, j, i].copy()
 
     return pd.DataFrame(records)
 
@@ -36123,20 +36458,27 @@ def extract_ofes_profile_interp(
     lat: float,
     variables: list[str] | None = None,
 ) -> pd.DataFrame:
-    """双线性插值版——在水平网格上做双线性插值，垂向不插值。
+    """从 OFES 快照中提取指定经纬度的定深剖面（水平双线性插值）。
+
+    垂向保留交付示踪物 depth 层；若任一请求变量的四角整列均为陆地 NaN，
+    整张表回退到最近邻剖面。`w` 的层界面 depth 不在此处插值。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - lon (float): 经度。
         - lat (float): 纬度。
-        - variables (list[str] | None): 变量名列表。
+        - variables (list[str] | None): 位于示踪物 depth 网格的变量名列表；None 时自动选择。
 
     返回:
-        - pd.DataFrame: 含 Depth 列及各变量列的剖面表。
+        - pd.DataFrame: 含 Depth 列及各变量列的剖面表，Depth 单位见 snapshot metadata。
     """
-    lat_arr = snapshot['lat']
-    lon_arr = snapshot['lon']
-    lev_arr = snapshot['lev']
+    _ofes_validate_profile_point(snapshot, lon, lat)
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    depth_arr = np.asarray(snapshot['depth'], dtype=float)
+    selected = _ofes_profile_variables(snapshot, variables)
+    if lat_arr.size < 2 or lon_arr.size < 2:
+        return extract_ofes_profile(snapshot, lon, lat, selected)
 
     j = np.searchsorted(lat_arr, lat) - 1
     i = np.searchsorted(lon_arr, lon) - 1
@@ -36153,23 +36495,22 @@ def extract_ofes_profile_interp(
     w10 = dy * (1 - dx)
     w11 = dy * dx
 
-    if variables is None:
-        variables = [k for k in snapshot if k not in ('lat', 'lon', 'lev', 'date')
-                     and isinstance(snapshot[k], np.ndarray) and snapshot[k].ndim == 3]
-
-    records = {'Depth': lev_arr.copy()}
+    records = {'Depth': depth_arr.copy()}
     any_all_nan = False
-    for var in variables:
+    for var in selected:
         arr = snapshot[var]
-        if arr.ndim == 3 and arr.shape[0] == len(lev_arr):
-            col = (w00 * arr[:, j, i] + w01 * arr[:, j, i + 1]
-                   + w10 * arr[:, j + 1, i] + w11 * arr[:, j + 1, i + 1])
-            records[var] = col.astype(np.float32)
-            if np.all(np.isnan(col)):
-                any_all_nan = True
+        col = (
+            w00 * arr[:, j, i]
+            + w01 * arr[:, j, i + 1]
+            + w10 * arr[:, j + 1, i]
+            + w11 * arr[:, j + 1, i + 1]
+        )
+        records[var] = col.astype(np.float32)
+        if np.all(np.isnan(col)):
+            any_all_nan = True
 
     if any_all_nan:
-        return extract_ofes_profile(snapshot, lon, lat, variables)
+        return extract_ofes_profile(snapshot, lon, lat, selected)
 
     return pd.DataFrame(records)
 
@@ -36181,7 +36522,11 @@ def detect_ofes_delta_do(
     detection_config: DetectionConfig | None = None,
     interp: bool = True,
 ) -> pd.DataFrame:
-    """在 OFES 虚拟剖面上运行 ΔDO 检测（复用 calculate_delta_do）。
+    """在 OFES 定深虚拟剖面上运行 ΔDO 检测。
+
+    本入口直接复用 `calculate_delta_do` 作为单剖面真值实现，并显式把
+    `Depth` 传为剖面坐标。OFES 的 `temp` 是位温，送入通用 detector 前
+    先按纬度把深度转换为海水压力，再用 TEOS-10 转为原位温度；返回候选坐标命名为 `depth`。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典（需含 do2/temp/salinity）。
@@ -36191,13 +36536,43 @@ def detect_ofes_delta_do(
         - interp (bool): True 时用双线性插值取剖面，False 时用最近邻。
 
     返回:
-        - pd.DataFrame: calculate_delta_do 的结果表（空表 = 无异常）。
+        - pd.DataFrame: 每个剖面最多一个最强候选，含 depth 和 ΔDO 指标；空表表示无异常。
+
+    说明:
+        - DetectionConfig 的 `anomaly_*_depth` 字段在本入口直接按深度米解释。
+        - 返回的 delta_temperature 基于转换后的原位温度；快照中的 `temp` 本身仍保留 OFES 原生位温。
     """
     extract_fn = extract_ofes_profile_interp if interp else extract_ofes_profile
     prof = extract_fn(snapshot, lon, lat, variables=['do2', 'temp', 'salinity'])
 
-    col_map = {'do2': 'DO', 'temp': 'Temperature', 'salinity': 'Salinity'}
+    col_map = {
+        'do2': 'DO',
+        'temp': 'Potential_temperature',
+        'salinity': 'Salinity',
+    }
     prof = prof.rename(columns=col_map)
+    depth_values = prof['Depth'].to_numpy(dtype=float)
+    seawater_pressure = gsw.p_from_z(
+        -depth_values,
+        np.full_like(depth_values, float(lat)),
+    )
+    salinity_values = prof['Salinity'].to_numpy(dtype=float)
+    potential_temperature = prof['Potential_temperature'].to_numpy(dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_values,
+        seawater_pressure,
+        np.full_like(depth_values, float(lon)),
+        np.full_like(depth_values, float(lat)),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity,
+        potential_temperature,
+    )
+    prof['Temperature'] = gsw.t_from_CT(
+        absolute_salinity,
+        conservative_temperature,
+        seawater_pressure,
+    )
 
     prof['Profile_number'] = 0
     prof['Longitude'] = lon
@@ -36206,51 +36581,103 @@ def detect_ofes_delta_do(
     prof['Month'] = snapshot['date'].month
     prof['Day'] = snapshot['date'].day
 
-    cfg = detection_config or make_detection_config()
-    result = calculate_delta_do(prof, detection_config=cfg, verbose=False)
-    return _keep_best_anomaly_per_profile(result, cfg)
+    cfg = _resolve_detection_config(detection_config)
+    result = calculate_delta_do(
+        prof,
+        detection_config=cfg,
+        depth_col='Depth',
+        verbose=False,
+    )
+    result = _keep_best_anomaly_per_profile(result, cfg).rename(
+        columns={'depth': 'depth'}
+    )
+    result.attrs['depth_units'] = snapshot.get('metadata', {}).get(
+        'depth_units', 'm'
+    )
+    result.attrs['temperature_basis'] = (
+        'in_situ_from_ofes_potential_temperature'
+    )
+    return result
 
 
 def _ofes_interp3d(
     field: np.ndarray,
-    lev: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     pts: np.ndarray,
 ) -> np.ndarray:
-    """三线性插值——对 (N,3) 点阵 [depth, lat, lon] 返回插值值。"""
+    """对 (N,3) 点阵 [depth, lat, lon] 做三线性插值。"""
     interp_fn = RegularGridInterpolator(
-        (lev, lat, lon), field,
+        (depth, lat, lon), field,
         method='linear', bounds_error=False, fill_value=np.nan,
     )
     return interp_fn(pts)
 
 
-def _rk4_step(
+def _ofes_fixed_depth_tendency(
     pos: np.ndarray,
     u_field: np.ndarray,
     v_field: np.ndarray,
-    w_field: np.ndarray,
-    lev: np.ndarray,
+    depth: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """返回固定深度粒子的 [0, dlat/dt, dlon/dt]。"""
+    u = _ofes_interp3d(u_field, depth, lat, lon, pos)
+    v = _ofes_interp3d(v_field, depth, lat, lon, pos)
+    geo = approximate_degree_length(pos[:, 1])
+    dlat = v / geo['meters_per_degree_lat']
+    dlon = u / geo['meters_per_degree_lon']
+    return np.column_stack([np.zeros_like(u), dlat, dlon])
+
+
+def _ofes_rk4_fixed_depth_step(
+    pos: np.ndarray,
+    u_field: np.ndarray,
+    v_field: np.ndarray,
+    depth: np.ndarray,
     lat: np.ndarray,
     lon: np.ndarray,
     dt: float,
-) -> np.ndarray:
-    """单步 RK4 积分——pos 为 (N,3) [depth, lat, lon]，dt 秒，速度 m/s。"""
-    def vel_at(p):
-        u = _ofes_interp3d(u_field, lev, lat, lon, p)
-        v = _ofes_interp3d(v_field, lev, lat, lon, p)
-        w = _ofes_interp3d(w_field, lev, lat, lon, p)
-        geo = approximate_degree_length(p[:, 1])
-        dlat = v / geo['meters_per_degree_lat']
-        dlon = u / geo['meters_per_degree_lon']
-        return np.column_stack([w, dlat, dlon])
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """执行一步固定深度 RK4，并返回用于越界判定的中间位置。"""
+    k1 = _ofes_fixed_depth_tendency(
+        pos, u_field, v_field, depth, lat, lon
+    )
+    pos2 = pos + 0.5 * dt * k1
+    k2 = _ofes_fixed_depth_tendency(
+        pos2, u_field, v_field, depth, lat, lon
+    )
+    pos3 = pos + 0.5 * dt * k2
+    k3 = _ofes_fixed_depth_tendency(
+        pos3, u_field, v_field, depth, lat, lon
+    )
+    pos4 = pos + dt * k3
+    k4 = _ofes_fixed_depth_tendency(
+        pos4, u_field, v_field, depth, lat, lon
+    )
+    new_pos = pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return new_pos, (pos2, pos3, pos4, new_pos)
 
-    k1 = vel_at(pos)
-    k2 = vel_at(pos + 0.5 * dt * k1)
-    k3 = vel_at(pos + 0.5 * dt * k2)
-    k4 = vel_at(pos + dt * k3)
-    return pos + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+def _ofes_positions_in_bounds(
+    pos: np.ndarray,
+    depth: np.ndarray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> np.ndarray:
+    """返回有限且位于当前区域插值网格内的粒子掩码。"""
+    finite = np.all(np.isfinite(pos), axis=1)
+    return (
+        finite
+        & (pos[:, 0] >= depth[0])
+        & (pos[:, 0] <= depth[-1])
+        & (pos[:, 1] >= lat[0])
+        & (pos[:, 1] <= lat[-1])
+        & (pos[:, 2] >= lon[0])
+        & (pos[:, 2] <= lon[-1])
+    )
 
 
 def advect_ofes_particles(
@@ -36258,58 +36685,187 @@ def advect_ofes_particles(
     particles: np.ndarray,
     backward: bool = False,
     dt_seconds: float | None = None,
-) -> list[np.ndarray]:
-    """用 OFES 速度场做离线 RK4 粒子追踪（正向或反向）。
+    vertical_mode: str = 'fixed_depth',
+) -> dict:
+    """用 OFES 日均水平速度做固定深度的二维 RK4 粒子诊断。
+
+    该入口严格保留各个积分时刻，并为每个粒子记录 active、invalid 或 escaped
+    状态。失败粒子从失败时刻起位置记为 NaN，不再伪装成静止粒子。当前只允许
+    `fixed_depth`；三维 z/w 耦合尚未通过验证门槛。
 
     参数:
         - snapshots (dict[str, dict] | list[dict]): 按日期排序的 OFES 快照集合。
-            字典形式 {date_str: snapshot_dict}；列表形式 [snapshot_dict, ...]（需含 'date' 键）。
-            每个快照需含 u/v/w 及 lat/lon/lev。
         - particles (np.ndarray): 初始粒子位置 (N, 3)，列顺序 [depth, lat, lon]。
-        - backward (bool): True 时反向追踪（dt 取负）。
-        - dt_seconds (float | None): 积分步长（秒）；None 时从 processing.yml 读取。
+        - backward (bool): True 时从最后一个快照向前积分，默认 False。
+        - dt_seconds (float | None): 最大积分步长（秒）；None 时从 processing.yml 读取，末步自动缩短以精确落在下个快照时刻。
+        - vertical_mode (str): 垂向处理；当前仅支持 'fixed_depth'。
 
     返回:
-        - list[np.ndarray]: 逐步粒子轨迹列表，trajectory[0] = 初始位置，之后每步一帧。
+        - dict: 含 times、positions、status、final_status、failure_time、coordinate_columns 和 metadata；positions 形状为 (time, particle, 3)。
 
     说明:
-        两天快照之间假设速度场恒定（取时间较近的那天）。
-        单天内按 dt 亚步进多次 RK4。粒子越界后位置保持不变（NaN 速度 → 停留）。
+        - 每个相邻日场之间仍使用积分方向起点的速度场，属于未验证的分段恒定时间近似；metadata 会显式记录。
+        - `w` 的数据集专项符号验证和日均三维速度时间插值尚未完成，因此本入口不使用 `w`。
+        - 该结果适合作为固定深度水平输运诊断，不构成三维水团来源证明。
     """
+    if vertical_mode != 'fixed_depth':
+        raise NotImplementedError(
+            'Only vertical_mode="fixed_depth" is enabled. Three-dimensional '
+            'OFES trajectories remain disabled until w sign/coupling and daily '
+            'u/v/w interpolation are validated.'
+        )
     if dt_seconds is None:
         dt_seconds = float(_OFES_CFG.get('rk4_dt_seconds', 3600))
+    dt_seconds = float(dt_seconds)
+    if not np.isfinite(dt_seconds) or dt_seconds <= 0:
+        raise ValueError('dt_seconds must be a finite positive number.')
 
     if isinstance(snapshots, dict):
-        snap_list = [snapshots[k] for k in sorted(snapshots.keys())]
+        snap_list = list(snapshots.values())
     else:
-        snap_list = sorted(snapshots, key=lambda s: s['date'])
+        snap_list = list(snapshots)
+    if len(snap_list) < 2:
+        raise ValueError('At least two OFES snapshots are required.')
+    snap_list = sorted(snap_list, key=lambda s: pd.Timestamp(s['date']))
+    snap_times = [pd.Timestamp(snap['date']) for snap in snap_list]
+    if any(
+        later <= earlier
+        for earlier, later in zip(snap_times[:-1], snap_times[1:])
+    ):
+        raise ValueError('OFES snapshot dates must be unique and increasing.')
 
     if backward:
         snap_list = list(reversed(snap_list))
-        dt_seconds = -dt_seconds
+        snap_times = list(reversed(snap_times))
 
-    max_substeps = int(_OFES_CFG.get('rk4_max_substeps', 24))
+    pos = np.asarray(particles, dtype=np.float64).copy()
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(
+            'particles must have shape (N, 3) with columns '
+            '[depth, lat, lon].'
+        )
 
-    pos = particles.copy().astype(np.float64)
-    trajectory = [pos.copy()]
+    first = snap_list[0]
+    first_depth = np.asarray(first['depth'], dtype=float)
+    first_lat = np.asarray(first['lat'], dtype=float)
+    first_lon = np.asarray(first['lon'], dtype=float)
+    status = np.full(pos.shape[0], 'active', dtype='<U8')
+    finite_initial = np.all(np.isfinite(pos), axis=1)
+    status[~finite_initial] = 'invalid'
+    status[
+        finite_initial
+        & ~_ofes_positions_in_bounds(
+            pos, first_depth, first_lat, first_lon
+        )
+    ] = 'escaped'
+
+    failure_time = np.full(pos.shape[0], np.datetime64('NaT'), dtype='datetime64[ns]')
+    initial_failed = status != 'active'
+    failure_time[initial_failed] = np.datetime64(snap_times[0].to_datetime64())
+    pos[initial_failed] = np.nan
+    positions = [pos.copy()]
+    statuses = [status.copy()]
+    times = [snap_times[0]]
 
     for idx in range(len(snap_list) - 1):
         snap = snap_list[idx]
-        u_f = snap['u']
-        v_f = snap['v']
-        w_f = snap['w']
-        lev = snap['lev'].astype(np.float64)
-        lat = snap['lat'].astype(np.float64)
-        lon = snap['lon'].astype(np.float64)
+        u_field = np.asarray(snap['u'], dtype=float)
+        v_field = np.asarray(snap['v'], dtype=float)
+        depth = np.asarray(snap['depth'], dtype=float)
+        lat = np.asarray(snap['lat'], dtype=float)
+        lon = np.asarray(snap['lon'], dtype=float)
+        expected_shape = (depth.size, lat.size, lon.size)
+        if u_field.shape != expected_shape or v_field.shape != expected_shape:
+            raise ValueError(
+                f'OFES u/v shape must equal depth/lat/lon shape '
+                f'{expected_shape}; got u={u_field.shape}, v={v_field.shape}.'
+            )
 
-        for _ in range(max_substeps):
-            new_pos = _rk4_step(pos, u_f, v_f, w_f, lev, lat, lon, dt_seconds)
-            valid = np.all(np.isfinite(new_pos), axis=1)
-            pos[valid] = new_pos[valid]
+        current_time = snap_times[idx]
+        target_time = snap_times[idx + 1]
+        direction = 1.0 if target_time > current_time else -1.0
+        while current_time != target_time:
+            remaining = abs((target_time - current_time).total_seconds())
+            is_final_step = remaining <= dt_seconds
+            step_seconds = direction * (
+                remaining if is_final_step else dt_seconds
+            )
+            active_idx = np.flatnonzero(status == 'active')
+            if active_idx.size:
+                active_pos = pos[active_idx]
+                new_pos, stages = _ofes_rk4_fixed_depth_step(
+                    active_pos,
+                    u_field,
+                    v_field,
+                    depth,
+                    lat,
+                    lon,
+                    step_seconds,
+                )
+                new_inside = _ofes_positions_in_bounds(
+                    new_pos, depth, lat, lon
+                )
+                stage_escaped = np.zeros(active_idx.size, dtype=bool)
+                for stage in stages:
+                    stage_finite = np.all(np.isfinite(stage), axis=1)
+                    stage_escaped |= (
+                        stage_finite
+                        & ~_ofes_positions_in_bounds(
+                            stage, depth, lat, lon
+                        )
+                    )
 
-        trajectory.append(pos.copy())
+                escaped_local = (~new_inside) & stage_escaped
+                invalid_local = (~new_inside) & ~stage_escaped
+                valid_local = new_inside
+                pos[active_idx[valid_local]] = new_pos[valid_local]
+                status[active_idx[escaped_local]] = 'escaped'
+                status[active_idx[invalid_local]] = 'invalid'
+                failed_local = escaped_local | invalid_local
+                pos[active_idx[failed_local]] = np.nan
 
-    return trajectory
+            current_time = (
+                target_time
+                if is_final_step
+                else current_time + pd.to_timedelta(step_seconds, unit='s')
+            )
+            newly_failed = (status != 'active') & np.isnat(failure_time)
+            failure_time[newly_failed] = np.datetime64(
+                current_time.to_datetime64()
+            )
+            times.append(current_time)
+            positions.append(pos.copy())
+            statuses.append(status.copy())
+
+    return {
+        'times': np.asarray(
+            [time.to_datetime64() for time in times],
+            dtype='datetime64[ns]',
+        ),
+        'positions': np.stack(positions),
+        'status': np.stack(statuses),
+        'final_status': status.copy(),
+        'failure_time': failure_time,
+        'coordinate_columns': ('depth', 'lat', 'lon'),
+        'metadata': {
+            'vertical_mode': vertical_mode,
+            'depth_units': str(
+                first.get('metadata', {}).get('depth_units', 'm')
+            ),
+            'temporal_interpolation': str(
+                _OFES_CFG.get(
+                    'temporal_interpolation',
+                    'piecewise_constant_unvalidated',
+                )
+            ),
+            'w_used': False,
+            'unresolved_validation': (
+                'daily_velocity_interpolation',
+                'vertical_velocity_sign_and_coupling',
+                'three_dimensional_vertical_motion',
+            ),
+        },
+    }
 
 
 def plot_ofes_snapshot_quick(
@@ -36319,21 +36875,45 @@ def plot_ofes_snapshot_quick(
     ax=None,
     show_fig: bool = True,
 ) -> plt.Figure | None:
-    """OFES 快照水平切片快速可视化。
+    """快速绘制 OFES 定深或表面变量的水平切片。
+
+    三维变量按其 metadata 选择 `depth` 或 `depth_w` 最近层；二维表面变量
+    直接绘制。色标使用 loader 记录的输出单位。
 
     参数:
         - snapshot (dict): load_ofes_snapshot 返回的字典。
         - variable (str): 绘制的变量名。
-        - depth (float): 深度（m），取最近层。
-        - ax: 可选 matplotlib Axes（需为 GeoAxes）。
+        - depth (float): 三维变量的目标深度（m），取最近层，默认 200.0。
+        - ax (matplotlib.axes.Axes | None): 可选 GeoAxes。
         - show_fig (bool): 是否显示图形。
 
     返回:
         - plt.Figure | None: show_fig=False 时返回 Figure。
     """
-    lev = snapshot['lev']
-    k = int(np.argmin(np.abs(lev - depth)))
-    data = snapshot[variable][k]
+    if variable not in snapshot:
+        raise KeyError(f'Variable {variable!r} is absent from the OFES snapshot.')
+    variable_dims = tuple(
+        snapshot.get('metadata', {})
+        .get('variable_dims', {})
+        .get(variable, ())
+    )
+    if variable_dims == ('depth', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['depth'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - depth)))
+        data = snapshot[variable][k]
+        vertical_title = f'depth={vertical_coord[k]:.1f} m'
+    elif variable_dims == ('depth_w', 'lat', 'lon'):
+        vertical_coord = np.asarray(snapshot['depth_w'], dtype=float)
+        k = int(np.argmin(np.abs(vertical_coord - depth)))
+        data = snapshot[variable][k]
+        vertical_title = f'interface depth={vertical_coord[k]:.1f} m'
+    elif variable_dims == ('lat', 'lon'):
+        data = snapshot[variable]
+        vertical_title = 'surface'
+    else:
+        raise ValueError(
+            f'Unsupported coordinate layout for {variable!r}: {variable_dims}.'
+        )
     lat = snapshot['lat']
     lon = snapshot['lon']
 
@@ -36351,10 +36931,13371 @@ def plot_ofes_snapshot_quick(
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=_BASEMAP_COLORS['grid'], alpha=0.6)
     gl.top_labels = False
     gl.right_labels = False
-    ax.set_title(f"OFES {variable}  depth={lev[k]:.1f}m  {snapshot['date'].strftime('%Y-%m-%d')}")
-    fig.colorbar(im, ax=ax, shrink=0.7)
+    ax.set_title(
+        f"OFES {variable}  {vertical_title}  "
+        f"{snapshot['date'].strftime('%Y-%m-%d')}"
+    )
+    units = (
+        snapshot.get('metadata', {})
+        .get('output_units', {})
+        .get(variable, 'unknown')
+    )
+    fig.colorbar(im, ax=ax, shrink=0.7, label=units)
 
     if show_fig:
         plt.show()
         return None
     return fig
+
+
+def _ofes_delta_do_catalog_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES ΔDO event catalog 配置。"""
+    raw = dict(_OFES_CFG.get('delta_do_catalog', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES delta_do_catalog override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    thresholds = tuple(
+        sorted({float(value) for value in raw.get(
+            'thresholds', (20.0, 35.0, 50.0)
+        )})
+    )
+    if not thresholds or any(
+        not np.isfinite(value) or value <= 0 for value in thresholds
+    ):
+        raise ValueError(
+            'OFES delta_do_catalog thresholds must be finite positive values.'
+        )
+
+    settings = {
+        'thresholds': thresholds,
+        'candidate_depth_min_m': float(
+            raw.get('candidate_depth_min_m', 300.0)
+        ),
+        'candidate_depth_max_m': float(
+            raw.get('candidate_depth_max_m', 1000.0)
+        ),
+        'latitude_chunk_size': int(raw.get('latitude_chunk_size', 100)),
+        'parity_dates': tuple(str(value) for value in raw.get(
+            'parity_dates',
+            ('2003-01-01', '2003-04-05', '2003-07-01', '2003-10-01'),
+        )),
+        'parity_lon_bounds': tuple(float(value) for value in raw.get(
+            'parity_lon_bounds', (142.0, 150.0)
+        )),
+        'parity_lat_bounds': tuple(float(value) for value in raw.get(
+            'parity_lat_bounds', (32.0, 39.0)
+        )),
+        'parity_random_profiles': int(
+            raw.get('parity_random_profiles', 300)
+        ),
+        'parity_top_profiles': int(raw.get('parity_top_profiles', 200)),
+        'parity_seed': int(raw.get('parity_seed', 20260730)),
+        'object_connectivity': int(raw.get('object_connectivity', 8)),
+        'object_depth_tolerance_m': float(
+            raw.get('object_depth_tolerance_m', 100.0)
+        ),
+        'min_object_pixels': int(raw.get('min_object_pixels', 12)),
+        'event_max_missing_days': int(
+            raw.get('event_max_missing_days', 1)
+        ),
+        'event_max_centroid_distance_km': float(
+            raw.get('event_max_centroid_distance_km', 80.0)
+        ),
+        'event_max_depth_difference_m': float(
+            raw.get('event_max_depth_difference_m', 100.0)
+        ),
+        'event_bbox_padding_pixels': int(
+            raw.get('event_bbox_padding_pixels', 6)
+        ),
+        'event_gap_cost_per_missing_day': float(
+            raw.get('event_gap_cost_per_missing_day', 0.25)
+        ),
+        'min_ranked_event_days': int(
+            raw.get('min_ranked_event_days', 3)
+        ),
+        'rank_area_reference_km2': float(
+            raw.get('rank_area_reference_km2', 500.0)
+        ),
+        'rank_thickness_reference_m': float(
+            raw.get('rank_thickness_reference_m', 100.0)
+        ),
+        'rank_duration_reference_days': float(
+            raw.get('rank_duration_reference_days', 5.0)
+        ),
+        'output_region_slug': str(
+            raw.get('output_region_slug', 'ofes_np30_ke')
+        ),
+    }
+    if (
+        settings['candidate_depth_min_m'] < 0
+        or settings['candidate_depth_max_m']
+        <= settings['candidate_depth_min_m']
+    ):
+        raise ValueError(
+            'OFES catalog candidate depth bounds must be ordered and '
+            'non-negative.'
+        )
+    if settings['latitude_chunk_size'] <= 0:
+        raise ValueError('OFES catalog latitude_chunk_size must be positive.')
+    if settings['object_connectivity'] not in (4, 8):
+        raise ValueError('OFES object_connectivity must be 4 or 8.')
+    positive_keys = (
+        'object_depth_tolerance_m',
+        'min_object_pixels',
+        'event_max_centroid_distance_km',
+        'event_max_depth_difference_m',
+        'min_ranked_event_days',
+        'rank_area_reference_km2',
+        'rank_thickness_reference_m',
+        'rank_duration_reference_days',
+    )
+    if any(settings[key] <= 0 for key in positive_keys):
+        raise ValueError(
+            'OFES catalog object, event, and ranking scales must be positive.'
+        )
+    if (
+        settings['event_max_missing_days'] < 0
+        or settings['event_bbox_padding_pixels'] < 0
+        or settings['event_gap_cost_per_missing_day'] < 0
+    ):
+        raise ValueError(
+            'OFES event gap, bbox padding, and gap cost settings must '
+            'be non-negative.'
+        )
+    return settings
+
+
+def _ofes_vectorized_do_peaks(
+    do_values: np.ndarray,
+    depth: np.ndarray,
+    detection_config: DetectionConfig,
+    *,
+    valid_mask: np.ndarray | None = None,
+    minimum_delta: float = 20.0,
+) -> dict:
+    """按唯一有效层模式分组，向量化复现 DO 单剖面峰值判据。"""
+    if detection_config.method != 'do':
+        raise ValueError('The OFES vectorized scanner supports DO mode only.')
+    if (
+        detection_config.salinity_threshold > 0
+        or detection_config.temperature_threshold > 0
+    ):
+        raise ValueError(
+            'The OFES DO-only scanner requires disabled salinity and '
+            'temperature filters.'
+        )
+
+    values = np.asarray(do_values, dtype=np.float64)
+    depth_arr = np.asarray(depth, dtype=np.float64)
+    if values.ndim != 3 or depth_arr.ndim != 1:
+        raise ValueError(
+            'do_values must have shape (depth, lat, lon) and depth '
+            'must be one-dimensional.'
+        )
+    if values.shape[0] != depth_arr.size:
+        raise ValueError(
+            f'OFES DO depth axis mismatch: {values.shape[0]} != '
+            f'{depth_arr.size}.'
+        )
+    if not np.all(np.diff(depth_arr) > 0):
+        raise ValueError('OFES depth coordinate must be strictly increasing.')
+
+    horizontal_shape = values.shape[1:]
+    flat = values.reshape(values.shape[0], -1)
+    if valid_mask is None:
+        valid = np.ones(flat.shape, dtype=bool)
+    else:
+        supplied = np.asarray(valid_mask, dtype=bool)
+        if supplied.shape != values.shape:
+            raise ValueError(
+                f'valid_mask shape {supplied.shape} does not match '
+                f'do_values shape {values.shape}.'
+            )
+        valid = supplied.reshape(flat.shape).copy()
+
+    near_zero_threshold = float(detection_config.do_near_zero_threshold)
+    near_zero = np.isfinite(flat) & (flat <= near_zero_threshold)
+    near_zero_count = np.count_nonzero(near_zero, axis=0)
+    max_near_zero = detection_config.do_near_zero_max_count
+    if max_near_zero is None or int(max_near_zero) < 0:
+        rejected = np.zeros(flat.shape[1], dtype=bool)
+    else:
+        rejected = near_zero_count > int(max_near_zero)
+    valid &= np.isfinite(flat) & (flat > near_zero_threshold)
+
+    packed = np.packbits(valid.T, axis=1)
+    _, inverse = np.unique(packed, axis=0, return_inverse=True)
+    best_delta = np.full(flat.shape[1], np.nan, dtype=np.float64)
+    best_depth = np.full(flat.shape[1], np.nan, dtype=np.float64)
+    best_level = np.full(flat.shape[1], -1, dtype=np.int16)
+    candidate_count = np.zeros(flat.shape[1], dtype=np.int16)
+    valid_level_count = np.count_nonzero(valid, axis=0).astype(np.int16)
+    thickness = np.full(flat.shape[1], np.nan, dtype=np.float64)
+
+    depth_min = float(detection_config.anomaly_min_depth)
+    depth_max = float(detection_config.anomaly_max_depth)
+    half_window = float(detection_config.depth_interval)
+
+    for pattern_id in range(int(inverse.max()) + 1):
+        columns = np.flatnonzero((inverse == pattern_id) & ~rejected)
+        if columns.size == 0:
+            continue
+        levels = np.flatnonzero(valid[:, columns[0]])
+        if levels.size < 5:
+            continue
+
+        pattern_depth = depth_arr[levels]
+        pattern_values = flat[np.ix_(levels, columns)]
+        slopes = np.gradient(
+            pattern_values, pattern_depth, axis=0
+        )
+        candidates = np.zeros(pattern_values.shape, dtype=bool)
+        candidates[1:-1] = (
+            (slopes[:-2] > 0)
+            & (slopes[2:] < 0)
+        )
+        if depth_min > 0:
+            candidates &= pattern_depth[:, None] >= depth_min
+        if depth_max > 0:
+            candidates &= pattern_depth[:, None] <= depth_max
+
+        deltas = np.full(pattern_values.shape, np.nan, dtype=np.float64)
+        endpoint_indices: dict[int, tuple[int, int]] = {}
+        for local_index, target_depth in enumerate(pattern_depth):
+            if depth_min > 0 and target_depth < depth_min:
+                continue
+            if depth_max > 0 and target_depth > depth_max:
+                continue
+            lower = int(np.searchsorted(
+                pattern_depth,
+                max(0.0, target_depth - half_window),
+                side='left',
+            ))
+            upper = int(np.searchsorted(
+                pattern_depth,
+                target_depth + half_window,
+                side='right',
+            ) - 1)
+            if lower >= upper:
+                continue
+            endpoint_indices[local_index] = (lower, upper)
+            fraction = (
+                (target_depth - pattern_depth[lower])
+                / (pattern_depth[upper] - pattern_depth[lower])
+            )
+            reference = (
+                pattern_values[lower]
+                + fraction
+                * (pattern_values[upper] - pattern_values[lower])
+            )
+            delta = pattern_values[local_index] - reference
+            deltas[local_index] = np.where(
+                candidates[local_index], delta, np.nan
+            )
+
+        finite = np.isfinite(deltas)
+        candidate_count[columns] = np.count_nonzero(
+            finite, axis=0
+        ).astype(np.int16)
+        if not np.any(finite):
+            continue
+        score = np.where(finite, deltas, -np.inf)
+        local_best = np.argmax(score, axis=0)
+        has_candidate = np.any(finite, axis=0)
+        selected_positions = np.flatnonzero(has_candidate)
+        selected_columns = columns[has_candidate]
+        selected_local = local_best[has_candidate]
+        selected_delta = deltas[
+            selected_local, selected_positions
+        ]
+        best_delta[selected_columns] = selected_delta
+        best_depth[selected_columns] = pattern_depth[selected_local]
+        best_level[selected_columns] = levels[selected_local]
+
+        qualifying_positions = np.flatnonzero(
+            has_candidate
+            & (
+                deltas[local_best, np.arange(columns.size)]
+                >= float(minimum_delta)
+            )
+        )
+        for position in qualifying_positions:
+            local_index = int(local_best[position])
+            endpoint = endpoint_indices.get(local_index)
+            if endpoint is None:
+                continue
+            lower, upper = endpoint
+            peak_delta = float(deltas[local_index, position])
+            segment_depth = pattern_depth[lower:upper + 1]
+            segment_values = pattern_values[
+                lower:upper + 1, position
+            ]
+            fraction = (
+                (segment_depth - pattern_depth[lower])
+                / (pattern_depth[upper] - pattern_depth[lower])
+            )
+            reference = (
+                pattern_values[lower, position]
+                + fraction
+                * (
+                    pattern_values[upper, position]
+                    - pattern_values[lower, position]
+                )
+            )
+            above_half = (
+                segment_values - reference
+            ) >= (0.5 * peak_delta)
+            peak_in_segment = local_index - lower
+            if not above_half[peak_in_segment]:
+                continue
+            start = peak_in_segment
+            stop = peak_in_segment
+            while start > 0 and above_half[start - 1]:
+                start -= 1
+            while stop + 1 < above_half.size and above_half[stop + 1]:
+                stop += 1
+
+            if start > 0:
+                upper_edge = 0.5 * (
+                    segment_depth[start - 1]
+                    + segment_depth[start]
+                )
+            else:
+                upper_edge = segment_depth[start]
+            if stop + 1 < segment_depth.size:
+                lower_edge = 0.5 * (
+                    segment_depth[stop]
+                    + segment_depth[stop + 1]
+                )
+            else:
+                lower_edge = segment_depth[stop]
+            thickness[columns[position]] = max(
+                0.0, float(lower_edge - upper_edge)
+            )
+
+    result = {
+        'delta_do': best_delta.reshape(horizontal_shape).astype(np.float32),
+        'peak_depth': best_depth.reshape(
+            horizontal_shape
+        ).astype(np.float32),
+        'peak_level_index': best_level.reshape(horizontal_shape),
+        'half_amplitude_thickness_m': thickness.reshape(
+            horizontal_shape
+        ).astype(np.float32),
+        'candidate_count': candidate_count.reshape(horizontal_shape),
+        'valid_level_count': valid_level_count.reshape(horizontal_shape),
+        'rejected_near_zero': rejected.reshape(horizontal_shape),
+    }
+    return result
+
+
+def _ofes_threshold_tag(threshold: float) -> str:
+    """返回稳定的 DO threshold 列名/对象键标签。"""
+    return f'do{_format_detection_value(float(threshold))}'
+
+
+def _ofes_depth_aware_components(
+    rows: np.ndarray,
+    columns: np.ndarray,
+    depth: np.ndarray,
+    grid_shape: tuple[int, int],
+    *,
+    depth_tolerance: float,
+    connectivity: int,
+) -> tuple[int, np.ndarray]:
+    """连接水平相邻且峰值 depth 足够接近的稀疏异常像元。"""
+    rows_arr = np.asarray(rows, dtype=np.int32)
+    columns_arr = np.asarray(columns, dtype=np.int32)
+    depth_arr = np.asarray(depth, dtype=float)
+    if not (
+        rows_arr.shape == columns_arr.shape == depth_arr.shape
+    ):
+        raise ValueError(
+            'OFES object rows, columns, and depth must share one shape.'
+        )
+    node_count = rows_arr.size
+    if node_count == 0:
+        return 0, np.empty(0, dtype=np.int32)
+    if (
+        np.any(rows_arr < 0)
+        or np.any(rows_arr >= grid_shape[0])
+        or np.any(columns_arr < 0)
+        or np.any(columns_arr >= grid_shape[1])
+    ):
+        raise ValueError('OFES object pixel indices lie outside the scan grid.')
+
+    node_grid = np.full(grid_shape, -1, dtype=np.int32)
+    depth_grid = np.full(grid_shape, np.nan, dtype=np.float32)
+    node_grid[rows_arr, columns_arr] = np.arange(
+        node_count, dtype=np.int32
+    )
+    depth_grid[rows_arr, columns_arr] = depth_arr
+
+    offsets = [(0, 1), (1, 0)]
+    if connectivity == 8:
+        offsets += [(1, -1), (1, 1)]
+    edge_left = [np.arange(node_count, dtype=np.int32)]
+    edge_right = [np.arange(node_count, dtype=np.int32)]
+    nrows, ncolumns = grid_shape
+    for row_offset, column_offset in offsets:
+        source_rows = slice(
+            max(0, -row_offset),
+            min(nrows, nrows - row_offset),
+        )
+        target_rows = slice(
+            max(0, row_offset),
+            min(nrows, nrows + row_offset),
+        )
+        source_columns = slice(
+            max(0, -column_offset),
+            min(ncolumns, ncolumns - column_offset),
+        )
+        target_columns = slice(
+            max(0, column_offset),
+            min(ncolumns, ncolumns + column_offset),
+        )
+        left = node_grid[source_rows, source_columns]
+        right = node_grid[target_rows, target_columns]
+        left_depth = depth_grid[source_rows, source_columns]
+        right_depth = depth_grid[target_rows, target_columns]
+        connected = (
+            (left >= 0)
+            & (right >= 0)
+            & np.isfinite(left_depth)
+            & np.isfinite(right_depth)
+            & (
+                np.abs(left_depth - right_depth)
+                <= float(depth_tolerance)
+            )
+        )
+        if np.any(connected):
+            edge_left.append(left[connected])
+            edge_right.append(right[connected])
+
+    left_nodes = np.concatenate(edge_left)
+    right_nodes = np.concatenate(edge_right)
+    graph = coo_matrix(
+        (
+            np.ones(left_nodes.size, dtype=np.uint8),
+            (left_nodes, right_nodes),
+        ),
+        shape=(node_count, node_count),
+    ).tocsr()
+    component_count, labels = connected_components(
+        graph, directed=False, return_labels=True
+    )
+    return int(component_count), labels.astype(np.int32)
+
+
+def _ofes_grid_cell_area_km2(
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """计算规则经纬网格每个中心点所代表的近似面积。"""
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    if lon_arr.size < 2 or lat_arr.size < 2:
+        raise ValueError(
+            'At least two OFES longitude and latitude points are required.'
+        )
+    lon_width = np.abs(np.gradient(lon_arr))
+    lat_width = np.abs(np.gradient(lat_arr))
+    scale = approximate_degree_length(lat_arr)
+    meridional = (
+        lat_width * np.asarray(scale['meters_per_degree_lat'], dtype=float)
+    )
+    zonal = (
+        lon_width[None, :]
+        * np.asarray(
+            scale['meters_per_degree_lon'], dtype=float
+        )[:, None]
+    )
+    return (meridional[:, None] * zonal) / 1e6
+
+
+def _ofes_empty_peak_pixels() -> pd.DataFrame:
+    """返回带稳定 schema 的空 OFES peak-pixel 表。"""
+    return pd.DataFrame(
+        {
+            'date': pd.Series(dtype='datetime64[ns]'),
+            'lat_index': pd.Series(dtype='int16'),
+            'lon_index': pd.Series(dtype='int16'),
+            'source_lat_index': pd.Series(dtype='int16'),
+            'source_lon_index': pd.Series(dtype='int16'),
+            'lat': pd.Series(dtype='float32'),
+            'lon': pd.Series(dtype='float32'),
+            'delta_do': pd.Series(dtype='float32'),
+            'peak_depth': pd.Series(dtype='float32'),
+            'peak_level_index': pd.Series(dtype='int16'),
+            'half_amplitude_thickness_m': pd.Series(dtype='float32'),
+            'candidate_count': pd.Series(dtype='int16'),
+            'valid_level_count': pd.Series(dtype='int16'),
+        }
+    )
+
+
+def _ofes_empty_daily_objects() -> pd.DataFrame:
+    """返回带稳定 schema 的空 OFES daily-object 表。"""
+    return pd.DataFrame(
+        {
+            'date': pd.Series(dtype='datetime64[ns]'),
+            'threshold': pd.Series(dtype='float32'),
+            'threshold_tag': pd.Series(dtype='object'),
+            'daily_object_id': pd.Series(dtype='int32'),
+            'daily_object_key': pd.Series(dtype='object'),
+            'pixel_count': pd.Series(dtype='int32'),
+            'area_km2': pd.Series(dtype='float64'),
+            'equivalent_radius_km': pd.Series(dtype='float64'),
+            'centroid_lon': pd.Series(dtype='float64'),
+            'centroid_lat': pd.Series(dtype='float64'),
+            'lon_min': pd.Series(dtype='float64'),
+            'lon_max': pd.Series(dtype='float64'),
+            'lat_min': pd.Series(dtype='float64'),
+            'lat_max': pd.Series(dtype='float64'),
+            'row_min': pd.Series(dtype='int16'),
+            'row_max': pd.Series(dtype='int16'),
+            'column_min': pd.Series(dtype='int16'),
+            'column_max': pd.Series(dtype='int16'),
+            'delta_do_max': pd.Series(dtype='float64'),
+            'delta_do_mean': pd.Series(dtype='float64'),
+            'delta_do_p90': pd.Series(dtype='float64'),
+            'peak_lon': pd.Series(dtype='float64'),
+            'peak_lat': pd.Series(dtype='float64'),
+            'peak_depth_at_max': pd.Series(dtype='float64'),
+            'depth_mean': pd.Series(dtype='float64'),
+            'depth_min': pd.Series(dtype='float64'),
+            'depth_max': pd.Series(dtype='float64'),
+            'depth_span_m': pd.Series(dtype='float64'),
+            'thickness_median_m': pd.Series(dtype='float64'),
+            'thickness_max_m': pd.Series(dtype='float64'),
+        }
+    )
+
+
+def _ofes_build_daily_objects(
+    pixels: pd.DataFrame,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    date: pd.Timestamp,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """为每个 DO threshold 构建 depth-aware daily connected objects。"""
+    working = pixels.copy()
+    object_records: list[dict] = []
+    if working.empty:
+        for threshold in settings['thresholds']:
+            working[f'object_id_{_ofes_threshold_tag(threshold)}'] = (
+                pd.Series(dtype='int32')
+            )
+        return working, _ofes_empty_daily_objects()
+
+    rows = working['lat_index'].to_numpy(dtype=np.int32)
+    columns = working['lon_index'].to_numpy(dtype=np.int32)
+    delta = working['delta_do'].to_numpy(dtype=float)
+    peak_depth = working['peak_depth'].to_numpy(dtype=float)
+    thickness = working[
+        'half_amplitude_thickness_m'
+    ].to_numpy(dtype=float)
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    cell_area = _ofes_grid_cell_area_km2(lon_arr, lat_arr)
+
+    for threshold in settings['thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        object_column = f'object_id_{tag}'
+        assigned = np.full(len(working), -1, dtype=np.int32)
+        active_positions = np.flatnonzero(
+            np.isfinite(delta) & (delta >= float(threshold))
+        )
+        if active_positions.size == 0:
+            working[object_column] = assigned
+            continue
+
+        _, raw_labels = _ofes_depth_aware_components(
+            rows[active_positions],
+            columns[active_positions],
+            peak_depth[active_positions],
+            (lat_arr.size, lon_arr.size),
+            depth_tolerance=settings[
+                'object_depth_tolerance_m'
+            ],
+            connectivity=settings['object_connectivity'],
+        )
+        labels, counts = np.unique(raw_labels, return_counts=True)
+        kept_labels = labels[
+            counts >= int(settings['min_object_pixels'])
+        ]
+        for object_id, raw_label in enumerate(kept_labels, start=1):
+            member_local = np.flatnonzero(raw_labels == raw_label)
+            member_positions = active_positions[member_local]
+            assigned[member_positions] = object_id
+            member_rows = rows[member_positions]
+            member_columns = columns[member_positions]
+            member_area = cell_area[member_rows, member_columns]
+            member_lon = lon_arr[member_columns]
+            member_lat = lat_arr[member_rows]
+            member_delta = delta[member_positions]
+            member_depth = peak_depth[member_positions]
+            member_thickness = thickness[member_positions]
+            total_area = float(np.sum(member_area))
+            max_position = member_positions[
+                int(np.nanargmax(member_delta))
+            ]
+            if total_area > 0:
+                centroid_lon = float(np.average(
+                    member_lon, weights=member_area
+                ))
+                centroid_lat = float(np.average(
+                    member_lat, weights=member_area
+                ))
+            else:
+                centroid_lon = float(np.nanmean(member_lon))
+                centroid_lat = float(np.nanmean(member_lat))
+            object_records.append(
+                {
+                    'date': pd.Timestamp(date),
+                    'threshold': float(threshold),
+                    'threshold_tag': tag,
+                    'daily_object_id': int(object_id),
+                    'daily_object_key': (
+                        f'{pd.Timestamp(date):%Y%m%d}_'
+                        f'{tag.upper()}_{object_id:04d}'
+                    ),
+                    'pixel_count': int(member_positions.size),
+                    'area_km2': total_area,
+                    'equivalent_radius_km': float(
+                        np.sqrt(total_area / np.pi)
+                    ),
+                    'centroid_lon': centroid_lon,
+                    'centroid_lat': centroid_lat,
+                    'lon_min': float(np.min(member_lon)),
+                    'lon_max': float(np.max(member_lon)),
+                    'lat_min': float(np.min(member_lat)),
+                    'lat_max': float(np.max(member_lat)),
+                    'row_min': int(np.min(member_rows)),
+                    'row_max': int(np.max(member_rows)),
+                    'column_min': int(np.min(member_columns)),
+                    'column_max': int(np.max(member_columns)),
+                    'delta_do_max': float(np.nanmax(member_delta)),
+                    'delta_do_mean': float(np.nanmean(member_delta)),
+                    'delta_do_p90': float(
+                        np.nanpercentile(member_delta, 90)
+                    ),
+                    'peak_lon': float(
+                        lon_arr[columns[max_position]]
+                    ),
+                    'peak_lat': float(
+                        lat_arr[rows[max_position]]
+                    ),
+                    'peak_depth_at_max': float(
+                        peak_depth[max_position]
+                    ),
+                    'depth_mean': float(
+                        np.nanmean(member_depth)
+                    ),
+                    'depth_min': float(
+                        np.nanmin(member_depth)
+                    ),
+                    'depth_max': float(
+                        np.nanmax(member_depth)
+                    ),
+                    'depth_span_m': float(
+                        np.nanmax(member_depth)
+                        - np.nanmin(member_depth)
+                    ),
+                    'thickness_median_m': float(
+                        np.nanmedian(member_thickness)
+                    ),
+                    'thickness_max_m': float(
+                        np.nanmax(member_thickness)
+                    ),
+                }
+            )
+        working[object_column] = assigned
+
+    objects = (
+        pd.DataFrame(object_records)
+        if object_records
+        else _ofes_empty_daily_objects()
+    )
+    return working, objects
+
+
+def scan_ofes_delta_do_day(
+    date: str | pd.Timestamp,
+    *,
+    detection_config: DetectionConfig | None = None,
+    thresholds: tuple[float, ...] | list[float] | None = None,
+    lon_bounds: tuple[float, float] | None = None,
+    lat_bounds: tuple[float, float] | None = None,
+    catalog_overrides: dict | None = None,
+) -> dict:
+    """向量化扫描单日 OFES ΔDO peaks 并构建逐日异常对象。
+
+    本入口只读取 `do2`，按纬度块直接切片 NetCDF；DO/T/S 的共同海陆及
+    垂向掩码由年度 preflight 另行验证。峰值判据逐项复现
+    `calculate_delta_do` 的 DO 模式，并对 ΔDO20/35/50 共用一次计算。
+
+    参数:
+        - date (str | pd.Timestamp): 待扫描日期。
+        - detection_config (DetectionConfig | None): DO 检测配置；None 时使用 processing.yml 默认，并由 catalog 固定候选 depth 范围。
+        - thresholds (tuple[float, ...] | list[float] | None): 同时保留的 ΔDO 阈值；None 时使用 `ofes.delta_do_catalog.thresholds`。
+        - lon_bounds (tuple[float, float] | None): 可选连续经度窗口；None 读取交付区域全部经度。
+        - lat_bounds (tuple[float, float] | None): 可选纬度窗口；None 读取交付区域全部纬度。
+        - catalog_overrides (dict | None): 临时覆盖 catalog 配置，仅接受 processing.yml 已声明键。
+
+    返回:
+        - dict: 含稀疏 peak `pixels`、`objects`、扫描 `metadata` 以及 lon/lat/depth 坐标。
+
+    输出:
+        - 不写文件；年度 catalog 驱动负责将返回表原子写入带签名的逐日 fragments。
+
+    说明:
+        - 每个水平列只保留 observation detector 定义下 ΔDO 最大的候选。
+        - daily object 使用水平 4/8 邻接，并要求相邻像元 peak depth 差不超过配置容差。
+        - half-amplitude thickness 是局地端点参考线之上、峰值半振幅连续核的 depth 宽度。
+    """
+    settings = _ofes_delta_do_catalog_settings(catalog_overrides)
+    if thresholds is not None:
+        settings['thresholds'] = tuple(
+            sorted({float(value) for value in thresholds})
+        )
+        if not settings['thresholds']:
+            raise ValueError('thresholds must contain at least one value.')
+
+    base_config = detection_config or make_detection_config('do')
+    if base_config.method != 'do':
+        raise ValueError(
+            'scan_ofes_delta_do_day requires a DO DetectionConfig.'
+        )
+    cfg = make_detection_config(
+        base_config,
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_depth_min_m'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_depth_max_m'
+        ],
+    )
+    if cfg.salinity_threshold > 0 or cfg.temperature_threshold > 0:
+        raise ValueError(
+            'scan_ofes_delta_do_day does not support auxiliary T/S gates.'
+        )
+
+    started = tm.monotonic()
+    date_ts = pd.Timestamp(date).normalize()
+    (
+        lon_all,
+        lat_all,
+        depth,
+        depth_attr_units,
+        reference_path,
+    ) = _ofes_tracer_coordinates(date_ts)
+    lon_slice = _ofes_contiguous_slice(
+        lon_all, lon_bounds, 'longitude', longitude=True
+    )
+    lat_slice = _ofes_contiguous_slice(
+        lat_all, lat_bounds, 'latitude'
+    )
+    lon = lon_all[lon_slice]
+    lat = lat_all[lat_slice]
+    fpath = _ofes_file_path('do2', date_ts)
+    if not fpath.exists():
+        raise FileNotFoundError(f'OFES file not found: {fpath}')
+
+    pixel_frames: list[pd.DataFrame] = []
+    chunk_size = int(settings['latitude_chunk_size'])
+    scale = float(
+        _OFES_CFG.get('variable_scale', {}).get('do2', 1.0)
+    )
+    with Dataset(str(fpath), 'r') as dataset:
+        variable = dataset.variables['do2']
+        source_shape = tuple(int(value) for value in variable.shape)
+        for local_start in range(0, lat.size, chunk_size):
+            local_stop = min(local_start + chunk_size, lat.size)
+            source_lat_slice = slice(
+                lat_slice.start + local_start,
+                lat_slice.start + local_stop,
+            )
+            raw = _ofes_subset_to_float32(
+                variable,
+                (0, slice(0, depth.size), source_lat_slice, lon_slice),
+            )
+            values = np.asarray(raw * scale, dtype=np.float32)
+            peaks = _ofes_vectorized_do_peaks(
+                values,
+                depth,
+                cfg,
+                minimum_delta=min(settings['thresholds']),
+            )
+            active = (
+                np.isfinite(peaks['delta_do'])
+                & (
+                    peaks['delta_do']
+                    >= min(settings['thresholds'])
+                )
+            )
+            if not np.any(active):
+                continue
+            chunk_rows, chunk_columns = np.where(active)
+            local_rows = chunk_rows + local_start
+            source_rows = chunk_rows + source_lat_slice.start
+            source_columns = chunk_columns + lon_slice.start
+            pixel_frames.append(
+                pd.DataFrame(
+                    {
+                        'date': pd.Timestamp(date_ts),
+                        'lat_index': local_rows.astype(np.int16),
+                        'lon_index': chunk_columns.astype(np.int16),
+                        'source_lat_index': source_rows.astype(np.int16),
+                        'source_lon_index': source_columns.astype(np.int16),
+                        'lat': lat[local_rows].astype(np.float32),
+                        'lon': lon[chunk_columns].astype(np.float32),
+                        'delta_do': peaks['delta_do'][active],
+                        'peak_depth': peaks['peak_depth'][active],
+                        'peak_level_index': peaks[
+                            'peak_level_index'
+                        ][active],
+                        'half_amplitude_thickness_m': peaks[
+                            'half_amplitude_thickness_m'
+                        ][active],
+                        'candidate_count': peaks[
+                            'candidate_count'
+                        ][active],
+                        'valid_level_count': peaks[
+                            'valid_level_count'
+                        ][active],
+                    }
+                )
+            )
+
+    pixels = (
+        pd.concat(pixel_frames, ignore_index=True)
+        if pixel_frames
+        else _ofes_empty_peak_pixels()
+    )
+    pixels, objects = _ofes_build_daily_objects(
+        pixels, lon, lat, date_ts, settings
+    )
+    threshold_counts = {
+        _ofes_threshold_tag(threshold): int(
+            np.count_nonzero(
+                pixels['delta_do'].to_numpy(dtype=float)
+                >= float(threshold)
+            )
+        )
+        for threshold in settings['thresholds']
+    }
+    metadata = {
+        'date': date_ts.strftime('%Y-%m-%d'),
+        'source_file': str(fpath),
+        'reference_file': str(reference_path),
+        'source_shape': source_shape,
+        'loaded_shape': (
+            int(depth.size), int(lat.size), int(lon.size)
+        ),
+        'read_slices': {
+            'time': 0,
+            'depth': (0, int(depth.size)),
+            'lat': (int(lat_slice.start), int(lat_slice.stop)),
+            'lon': (int(lon_slice.start), int(lon_slice.stop)),
+        },
+        'depth_units': str(
+            _OFES_CFG.get('depth_units', 'm')
+        ),
+        'source_vertical_units_attribute': depth_attr_units,
+        'source_vertical_units_note': str(
+            _OFES_CFG.get(
+                'source_vertical_units_note',
+                'general false-unit warning for public OFES DODS output; '
+                'delivered z-level coordinate interpreted as depth in metres',
+            )
+        ),
+        'native_units': str(
+            _OFES_CFG.get('native_units', {}).get(
+                'do2', 'umol kg-1'
+            )
+        ),
+        'output_units': str(
+            _OFES_CFG.get('output_units', {}).get(
+                'do2', 'umol kg-1'
+            )
+        ),
+        'detector': {
+            'method': cfg.method,
+            'depth_interval': float(cfg.depth_interval),
+            'anomaly_min_depth': float(cfg.anomaly_min_depth),
+            'anomaly_max_depth': float(cfg.anomaly_max_depth),
+            'do_near_zero_threshold': float(
+                cfg.do_near_zero_threshold
+            ),
+            'do_near_zero_max_count': int(
+                cfg.do_near_zero_max_count
+            ),
+        },
+        'catalog_settings': settings,
+        'mask_basis': (
+            'finite do2 after the calculate_delta_do near-zero rule; '
+            'DO/T/S mask parity is a required annual preflight'
+        ),
+        'peak_pixel_counts': threshold_counts,
+        'daily_object_counts': {
+            _ofes_threshold_tag(threshold): int(np.count_nonzero(
+                objects['threshold'].to_numpy(dtype=float)
+                == float(threshold)
+            ))
+            for threshold in settings['thresholds']
+        },
+        'elapsed_seconds': float(tm.monotonic() - started),
+    }
+    return {
+        'date': date_ts,
+        'lon': lon,
+        'lat': lat,
+        'depth': depth,
+        'pixels': pixels,
+        'objects': objects,
+        'metadata': metadata,
+    }
+
+
+def _ofes_json_default(value):
+    """把 OFES 结果中的常见科学 Python 类型转为 JSON 类型。"""
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    raise TypeError(
+        f'Object of type {type(value).__name__} is not JSON serializable.'
+    )
+
+
+def _ofes_normalize_request_value(value):
+    """把请求中的科学 Python 类型归一化为可比较的内存结构。"""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _ofes_normalize_request_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_ofes_normalize_request_value(item) for item in value]
+    if isinstance(value, set):
+        normalized = [_ofes_normalize_request_value(item) for item in value]
+        return sorted(normalized, key=repr)
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return _ofes_normalize_request_value(value.item())
+    return value
+
+
+def _ofes_requests_equal(left, right) -> bool:
+    """比较两个已归一化的 OFES 生产请求。"""
+    return _ofes_normalize_request_value(left) == _ofes_normalize_request_value(right)
+
+
+def _ofes_atomic_write_json(
+    payload: dict,
+    path: str | Path,
+) -> Path:
+    """在目标目录内原子覆盖 OFES JSON 结果。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=_ofes_json_default,
+            )
+            + '\n',
+            encoding='utf-8',
+        )
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _ofes_analysis_output_path(
+    analysis_name: str,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """返回 OFES 分析的固定输出路径，但不创建目录。"""
+    if output_dir is not None:
+        target = Path(output_dir)
+    else:
+        region_slug = str(
+            _OFES_CFG.get('delta_do_catalog', {}).get(
+                'output_region_slug', 'ofes_np30_ke'
+            )
+        )
+        target = (
+            Path(plots_output_root)
+            / 'do'
+            / region_slug
+            / str(analysis_name)
+        )
+    return target
+
+
+def _ofes_analysis_output_dir(
+    analysis_name: str,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """返回并创建固定的 OFES 分析输出目录。"""
+    target = _ofes_analysis_output_path(analysis_name, output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _ofes_load_fixed_outputs(
+    analysis_name: str,
+    *,
+    output_dir: str | Path | None,
+    parquet_paths: dict[str, str],
+    json_paths: dict[str, str],
+    figure_paths: dict[str, str] | None = None,
+) -> dict:
+    """读取没有 manifest 的既有 OFES 固定产物。"""
+    run_dir = _ofes_analysis_output_path(analysis_name, output_dir)
+    paths = {
+        **{
+            key: run_dir / relative
+            for key, relative in parquet_paths.items()
+        },
+        **{
+            key: run_dir / relative
+            for key, relative in json_paths.items()
+        },
+        **{
+            key: run_dir / relative
+            for key, relative in (figure_paths or {}).items()
+        },
+    }
+    missing = [
+        key for key, path in paths.items()
+        if not path.exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'OFES {analysis_name} output is incomplete; missing: '
+            f'{", ".join(sorted(missing))}. '
+            'Run the corresponding producer first.'
+        )
+    result = {
+        'run_dir': run_dir,
+        'output_dir': run_dir,
+        'output_paths': paths,
+    }
+    for key in parquet_paths:
+        result[key] = pd.read_parquet(paths[key])
+    for key in json_paths:
+        result[key] = json.loads(
+            paths[key].read_text(encoding='utf-8')
+        )
+    if figure_paths:
+        result['figure_paths'] = {
+            key: paths[key] for key in figure_paths
+        }
+        if len(figure_paths) == 1:
+            result['figure_path'] = next(iter(result['figure_paths'].values()))
+    return result
+
+def _ofes_assert_fragment_request(
+    frame: pd.DataFrame,
+    event_id: str,
+    date: pd.Timestamp | None = None,
+) -> bool:
+    """检查事件 fragment 的人类可读请求字段是否仍与当前请求一致。"""
+    if frame.empty:
+        return False
+    event_values = set(frame['event_id'].astype(str).unique()) if (
+        'event_id' in frame.columns
+    ) else {str(event_id)}
+    if event_values != {str(event_id)}:
+        raise RuntimeError(
+            'Existing output was created for a different request. '
+            'Use another output_dir or remove the existing directory.'
+        )
+    if date is not None and 'date' in frame.columns:
+        dates = set(pd.to_datetime(frame['date']).dt.normalize().unique())
+        if dates != {pd.Timestamp(date).normalize()}:
+            raise RuntimeError(
+                'Existing output was created for a different request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+    return True
+
+
+
+def _ofes_common_mask_audit_day(
+    date: pd.Timestamp,
+    settings: dict,
+    detection_config: DetectionConfig,
+) -> dict:
+    """分纬度块审计单日 OFES DO/T/S 全域掩码与坐标一致性。"""
+    variables = ('do2', 'temp', 'salinity')
+    datasets = {
+        variable: Dataset(
+            str(_ofes_file_path(variable, date)), 'r'
+        )
+        for variable in variables
+    }
+    try:
+        reference = datasets['do2']
+        reference_lon = np.asarray(
+            reference.variables['lon'][:], dtype=float
+        )
+        reference_lat = np.asarray(
+            reference.variables['lat'][:], dtype=float
+        )
+        reference_depth = np.asarray(
+            reference.variables['lev'][:], dtype=float
+        )
+        coordinate_errors: dict[str, dict[str, float]] = {}
+        reference_shape = tuple(
+            int(value) for value in reference.variables['do2'].shape
+        )
+        for variable in variables:
+            dataset = datasets[variable]
+            variable_shape = tuple(
+                int(value)
+                for value in dataset.variables[variable].shape
+            )
+            if variable_shape != reference_shape:
+                raise ValueError(
+                    f'OFES {variable} shape {variable_shape} differs '
+                    f'from do2 shape {reference_shape} on '
+                    f'{date:%Y-%m-%d}.'
+                )
+            coordinate_errors[variable] = {
+                'lon_max_abs_error': _ofes_assert_coordinate_match(
+                    np.asarray(
+                        dataset.variables['lon'][:], dtype=float
+                    ),
+                    reference_lon,
+                    f'{variable} longitude',
+                ),
+                'lat_max_abs_error': _ofes_assert_coordinate_match(
+                    np.asarray(
+                        dataset.variables['lat'][:], dtype=float
+                    ),
+                    reference_lat,
+                    f'{variable} latitude',
+                ),
+                'depth_max_abs_error': (
+                    _ofes_assert_coordinate_match(
+                        np.asarray(
+                            dataset.variables['lev'][:],
+                            dtype=float,
+                        ),
+                        reference_depth,
+                        f'{variable} depth',
+                    )
+                ),
+            }
+
+        ndepth = reference_depth.size
+        nlat = reference_lat.size
+        nlon = reference_lon.size
+        level_index = np.arange(ndepth)[:, None, None]
+        mask_mismatch = {'temp': 0, 'salinity': 0}
+        checked_values = 0
+        near_zero_values = 0
+        rejected_near_zero_profiles = 0
+        noncontiguous_profiles = 0
+        valid_profiles = 0
+        count_histogram: dict[int, int] = {}
+        chunk_size = int(settings['latitude_chunk_size'])
+        near_zero_threshold = float(
+            detection_config.do_near_zero_threshold
+        )
+        max_near_zero = detection_config.do_near_zero_max_count
+
+        for start in range(0, nlat, chunk_size):
+            stop = min(start + chunk_size, nlat)
+            values: dict[str, np.ndarray] = {}
+            masks: dict[str, np.ndarray] = {}
+            for variable in variables:
+                data = _ofes_subset_to_float32(
+                    datasets[variable].variables[variable],
+                    (0, slice(None), slice(start, stop), slice(None)),
+                )
+                values[variable] = data
+                masks[variable] = np.isfinite(data)
+
+            do_mask = masks['do2']
+            for variable in ('temp', 'salinity'):
+                mask_mismatch[variable] += int(
+                    np.count_nonzero(
+                        do_mask != masks[variable]
+                    )
+                )
+            checked_values += int(do_mask.size)
+            near_zero = (
+                np.isfinite(values['do2'])
+                & (values['do2'] <= near_zero_threshold)
+            )
+            near_zero_values += int(np.count_nonzero(near_zero))
+            near_zero_count = np.count_nonzero(near_zero, axis=0)
+            if max_near_zero is not None and int(max_near_zero) >= 0:
+                rejected_near_zero_profiles += int(
+                    np.count_nonzero(
+                        near_zero_count > int(max_near_zero)
+                    )
+                )
+
+            valid = (
+                do_mask
+                & (values['do2'] > near_zero_threshold)
+            )
+            counts = np.count_nonzero(valid, axis=0)
+            expected_surface_contiguous = (
+                level_index < counts[None, :, :]
+            )
+            noncontiguous_profiles += int(
+                np.count_nonzero(
+                    np.any(
+                        valid != expected_surface_contiguous,
+                        axis=0,
+                    )
+                )
+            )
+            valid_profiles += int(np.count_nonzero(counts >= 5))
+            unique_counts, frequencies = np.unique(
+                counts, return_counts=True
+            )
+            for count, frequency in zip(
+                unique_counts, frequencies
+            ):
+                count_int = int(count)
+                count_histogram[count_int] = (
+                    count_histogram.get(count_int, 0)
+                    + int(frequency)
+                )
+
+        common_mask_passed = all(
+            count == 0 for count in mask_mismatch.values()
+        )
+        return {
+            'date': date.strftime('%Y-%m-%d'),
+            'source_files': {
+                variable: str(_ofes_file_path(variable, date))
+                for variable in variables
+            },
+            'source_shape': reference_shape,
+            'grid_profiles': int(nlat * nlon),
+            'valid_profiles': int(valid_profiles),
+            'mask_values_checked': int(checked_values),
+            'mask_mismatch_values': mask_mismatch,
+            'common_mask_passed': bool(common_mask_passed),
+            'near_zero_values': int(near_zero_values),
+            'rejected_near_zero_profiles': int(
+                rejected_near_zero_profiles
+            ),
+            'noncontiguous_profiles': int(
+                noncontiguous_profiles
+            ),
+            'unique_valid_level_counts': int(
+                len(count_histogram)
+            ),
+            'most_common_valid_level_counts': [
+                {
+                    'valid_level_count': int(count),
+                    'profile_count': int(frequency),
+                }
+                for count, frequency in sorted(
+                    count_histogram.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:10]
+            ],
+            'coordinate_max_abs_errors': coordinate_errors,
+        }
+    finally:
+        for dataset in datasets.values():
+            dataset.close()
+
+
+def _ofes_detector_parity_day(
+    date: pd.Timestamp,
+    settings: dict,
+    detection_config: DetectionConfig,
+) -> dict:
+    """抽样比较向量化 OFES detector 与 calculate_delta_do。"""
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity'],
+        lon_bounds=settings['parity_lon_bounds'],
+        lat_bounds=settings['parity_lat_bounds'],
+    )
+    common_valid = (
+        np.isfinite(snapshot['do2'])
+        & np.isfinite(snapshot['temp'])
+        & np.isfinite(snapshot['salinity'])
+    )
+    minimum_threshold = min(settings['thresholds'])
+    vector = _ofes_vectorized_do_peaks(
+        snapshot['do2'],
+        snapshot['depth'],
+        detection_config,
+        valid_mask=common_valid,
+        minimum_delta=minimum_threshold,
+    )
+
+    ocean_profiles = np.flatnonzero(
+        np.count_nonzero(common_valid, axis=0).ravel() >= 5
+    )
+    rng = np.random.default_rng(
+        int(settings['parity_seed'])
+        + int(date.strftime('%Y%j'))
+    )
+    random_count = min(
+        int(settings['parity_random_profiles']),
+        int(ocean_profiles.size),
+    )
+    random_sample = (
+        rng.choice(
+            ocean_profiles,
+            size=random_count,
+            replace=False,
+        )
+        if random_count
+        else np.empty(0, dtype=np.int64)
+    )
+    candidate_flat = np.flatnonzero(
+        np.isfinite(vector['delta_do'].ravel())
+        & (
+            vector['delta_do'].ravel()
+            >= float(minimum_threshold)
+        )
+    )
+    candidate_order = candidate_flat[
+        np.argsort(
+            vector['delta_do'].ravel()[candidate_flat]
+        )[::-1]
+    ]
+    top_sample = candidate_order[
+        :int(settings['parity_top_profiles'])
+    ]
+    sample = np.unique(
+        np.concatenate([random_sample, top_sample])
+    )
+    rows, columns = np.unravel_index(
+        sample, vector['delta_do'].shape
+    )
+
+    profile_count = int(sample.size)
+    depth_count = int(snapshot['depth'].size)
+    profile_table = pd.DataFrame(
+        {
+            'Profile_number': np.repeat(
+                np.arange(profile_count), depth_count
+            ),
+            'Depth': np.tile(
+                snapshot['depth'], profile_count
+            ),
+            'DO': (
+                snapshot['do2'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+            'Salinity': (
+                snapshot['salinity'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+            'Temperature': (
+                snapshot['temp'][:, rows, columns]
+                .T.reshape(-1)
+            ),
+        }
+    )
+    golden = calculate_delta_do(
+        profile_table,
+        detection_config=detection_config,
+        depth_col='Depth',
+        include_aou=False,
+        verbose=False,
+    )
+    golden = _keep_best_anomaly_per_profile(
+        golden, detection_config
+    )
+    if not golden.empty:
+        golden = golden.copy()
+        golden['Profile_number'] = pd.to_numeric(
+            golden['Profile_number'], errors='raise'
+        ).astype(int)
+        golden_by_profile = golden.set_index(
+            'Profile_number', verify_integrity=True
+        )
+    else:
+        golden_by_profile = pd.DataFrame()
+
+    sampled_delta = vector['delta_do'][rows, columns]
+    sampled_depth = vector['peak_depth'][rows, columns]
+    threshold_results: dict[str, dict] = {}
+    failure_examples: list[dict] = []
+    total_failure_count = 0
+    for threshold in settings['thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        vector_hit = (
+            np.isfinite(sampled_delta)
+            & (sampled_delta >= float(threshold))
+        )
+        golden_ids = (
+            set(
+                golden.loc[
+                    golden['delta_do'] >= float(threshold),
+                    'Profile_number',
+                ].astype(int)
+            )
+            if not golden.empty
+            else set()
+        )
+        golden_hit = np.asarray(
+            [
+                profile_number in golden_ids
+                for profile_number in range(profile_count)
+            ],
+            dtype=bool,
+        )
+        membership_mismatch = np.flatnonzero(
+            vector_hit != golden_hit
+        )
+        delta_mismatch: list[int] = []
+        depth_mismatch: list[int] = []
+        delta_errors: list[float] = []
+        depth_errors: list[float] = []
+        for profile_number in np.flatnonzero(
+            vector_hit & golden_hit
+        ):
+            golden_row = golden_by_profile.loc[
+                int(profile_number)
+            ]
+            delta_error = abs(
+                float(sampled_delta[profile_number])
+                - float(golden_row['delta_do'])
+            )
+            depth_error = abs(
+                float(sampled_depth[profile_number])
+                - float(golden_row['depth'])
+            )
+            delta_errors.append(delta_error)
+            depth_errors.append(depth_error)
+            if delta_error > 2e-5:
+                delta_mismatch.append(int(profile_number))
+            if depth_error > 1e-6:
+                depth_mismatch.append(int(profile_number))
+
+        failure_count = (
+            int(membership_mismatch.size)
+            + len(delta_mismatch)
+            + len(depth_mismatch)
+        )
+        total_failure_count += failure_count
+        threshold_results[tag] = {
+            'threshold': float(threshold),
+            'vector_hits': int(np.count_nonzero(vector_hit)),
+            'golden_hits': int(np.count_nonzero(golden_hit)),
+            'membership_mismatch_count': int(
+                membership_mismatch.size
+            ),
+            'delta_mismatch_count': int(len(delta_mismatch)),
+            'depth_mismatch_count': int(
+                len(depth_mismatch)
+            ),
+            'max_abs_delta_error': (
+                float(max(delta_errors)) if delta_errors else 0.0
+            ),
+            'max_abs_depth_error_m': (
+                float(max(depth_errors))
+                if depth_errors
+                else 0.0
+            ),
+            'passed': bool(failure_count == 0),
+        }
+        for kind, indices in (
+            ('membership', membership_mismatch),
+            ('delta', np.asarray(delta_mismatch, dtype=int)),
+            ('depth', np.asarray(
+                depth_mismatch, dtype=int
+            )),
+        ):
+            for profile_number in indices:
+                if len(failure_examples) >= 20:
+                    break
+                failure_examples.append(
+                    {
+                        'threshold_tag': tag,
+                        'kind': kind,
+                        'sample_profile_number': int(
+                            profile_number
+                        ),
+                        'lon': float(
+                            snapshot['lon'][
+                                columns[profile_number]
+                            ]
+                        ),
+                        'lat': float(
+                            snapshot['lat'][rows[profile_number]]
+                        ),
+                        'vector_delta_do': (
+                            float(sampled_delta[profile_number])
+                            if np.isfinite(
+                                sampled_delta[profile_number]
+                            )
+                            else None
+                        ),
+                        'vector_peak_depth': (
+                            float(
+                                sampled_depth[profile_number]
+                            )
+                            if np.isfinite(
+                                sampled_depth[profile_number]
+                            )
+                            else None
+                        ),
+                    }
+                )
+
+    return {
+        'date': date.strftime('%Y-%m-%d'),
+        'lon_bounds': list(settings['parity_lon_bounds']),
+        'lat_bounds': list(settings['parity_lat_bounds']),
+        'regional_shape': [
+            int(snapshot['depth'].size),
+            int(snapshot['lat'].size),
+            int(snapshot['lon'].size),
+        ],
+        'ocean_profiles': int(ocean_profiles.size),
+        'random_profiles_requested': int(
+            settings['parity_random_profiles']
+        ),
+        'random_profiles_sampled': int(random_count),
+        'top_candidate_profiles_requested': int(
+            settings['parity_top_profiles']
+        ),
+        'top_candidate_profiles_sampled': int(
+            top_sample.size
+        ),
+        'unique_profiles_compared': int(profile_count),
+        'thresholds': threshold_results,
+        'failure_count': int(total_failure_count),
+        'failure_examples': failure_examples,
+        'passed': bool(total_failure_count == 0),
+    }
+
+
+def validate_ofes_delta_do_vectorization(
+    *,
+    catalog_overrides: dict | None = None,
+    output_path: str | Path | None = None,
+    raise_on_failure: bool = True,
+) -> dict:
+    """验证 OFES 年度向量化 ΔDO 扫描器与 observation detector 等价。
+
+    对配置中的四个季节日期先分块审计全域 DO/T/S 坐标与有效值掩码，再在固定
+    黑潮延伸体窗口抽取随机海洋列和最强候选列，与 `calculate_delta_do`
+    逐廓线比较 DO20/35/50 的成员、振幅及 peak depth。
+
+    参数:
+        - catalog_overrides (dict | None): 临时覆盖已声明的 OFES catalog 配置。
+        - output_path (str | Path | None): 可选 JSON 报告路径；None 时只返回结果。
+        - raise_on_failure (bool): 任一掩码或 detector parity 失败时是否抛出 AssertionError，默认 True。
+
+    返回:
+        - dict: 含逐日全域 mask audit、逐阈值 detector parity、容差和总通过状态。
+
+    输出:
+        - `output_path` 指定的 JSON preflight 报告。
+
+    说明:
+        - 全年扫描只读 DO 的前提是四季全域 DO/T/S 掩码逐值相同；内部缺层不判失败，因为向量化实现按唯一有效层模式分组处理。
+        - parity 固定绝对容差为 ΔDO 2e-5 μmol kg⁻¹、depth 1e-6 m。
+    """
+    settings = _ofes_delta_do_catalog_settings(
+        catalog_overrides
+    )
+    detection_config = make_detection_config(
+        'do',
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_depth_min_m'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_depth_max_m'
+        ],
+    )
+    mask_audits: list[dict] = []
+    detector_parity: list[dict] = []
+    for date_text in settings['parity_dates']:
+        date = pd.Timestamp(date_text).normalize()
+        mask_audits.append(
+            _ofes_common_mask_audit_day(
+                date, settings, detection_config
+            )
+        )
+        detector_parity.append(
+            _ofes_detector_parity_day(
+                date, settings, detection_config
+            )
+        )
+
+    mask_passed = all(
+        audit['common_mask_passed'] for audit in mask_audits
+    )
+    parity_passed = all(
+        result['passed'] for result in detector_parity
+    )
+    report = {
+        'generated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'purpose': (
+            'preflight gate for the OFES annual DO-only vectorized '
+            'delta-DO catalog'
+        ),
+        'catalog_settings': settings,
+        'detector': {
+            'method': detection_config.method,
+            'do_threshold': float(
+                detection_config.do_threshold
+            ),
+            'depth_interval_m': float(
+                detection_config.depth_interval
+            ),
+            'candidate_depth_min_m': float(
+                detection_config.anomaly_min_depth
+            ),
+            'candidate_depth_max_m': float(
+                detection_config.anomaly_max_depth
+            ),
+            'do_near_zero_threshold': float(
+                detection_config.do_near_zero_threshold
+            ),
+            'do_near_zero_max_count': int(
+                detection_config.do_near_zero_max_count
+            ),
+        },
+        'tolerances': {
+            'delta_do_abs': 2e-5,
+            'depth_m_abs': 1e-6,
+        },
+        'mask_audits': mask_audits,
+        'detector_parity': detector_parity,
+        'mask_passed': bool(mask_passed),
+        'parity_passed': bool(parity_passed),
+        'passed': bool(mask_passed and parity_passed),
+    }
+    if output_path is not None:
+        _ofes_atomic_write_json(report, output_path)
+    if raise_on_failure and not report['passed']:
+        raise AssertionError(
+            'OFES annual scanner preflight failed; inspect mask and '
+            'detector parity details.'
+        )
+    return report
+
+
+def _ofes_link_daily_objects(
+    daily_objects: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """以一对一最小代价链接逐日 OFES 对象并汇总 event catalog。"""
+    working = daily_objects.copy()
+    required = {
+        'date',
+        'threshold',
+        'daily_object_key',
+        'centroid_lon',
+        'centroid_lat',
+        'row_min',
+        'row_max',
+        'column_min',
+        'column_max',
+        'depth_mean',
+        'delta_do_max',
+        'area_km2',
+        'thickness_max_m',
+    }
+    missing = sorted(required.difference(working.columns))
+    if missing:
+        raise ValueError(
+            f'OFES daily object table missing columns: {missing}.'
+        )
+    working['date'] = pd.to_datetime(working['date']).dt.normalize()
+    working = working.sort_values(
+        ['threshold', 'date', 'daily_object_id'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    working['event_id'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    working['event_day_index'] = np.zeros(
+        len(working), dtype=np.int16
+    )
+    working['predecessor_daily_object_key'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    working['link_gap_days'] = pd.Series(
+        [pd.NA] * len(working), dtype='Int16'
+    )
+    working['link_distance_km'] = np.nan
+    working['link_depth_difference_m'] = np.nan
+    working['link_cost'] = np.nan
+    working['link_status'] = pd.Series(
+        [None] * len(working), dtype='object'
+    )
+    if working.empty:
+        return working, pd.DataFrame()
+
+    maximum_gap_days = (
+        int(settings['event_max_missing_days']) + 1
+    )
+    maximum_distance_km = float(
+        settings['event_max_centroid_distance_km']
+    )
+    maximum_depth_difference = float(
+        settings['event_max_depth_difference_m']
+    )
+    padding_pixels = int(settings['event_bbox_padding_pixels'])
+    gap_cost = float(
+        settings['event_gap_cost_per_missing_day']
+    )
+
+    for threshold in sorted(
+        working['threshold'].dropna().unique()
+    ):
+        threshold_positions = np.flatnonzero(
+            working['threshold'].to_numpy(dtype=float)
+            == float(threshold)
+        )
+        threshold_dates = working.loc[
+            threshold_positions, 'date'
+        ]
+        active_tracks: dict[str, dict] = {}
+        next_event_number = 1
+        tag = _ofes_threshold_tag(float(threshold)).upper()
+
+        for date in sorted(threshold_dates.unique()):
+            date_ts = pd.Timestamp(date)
+            current_positions = threshold_positions[
+                (
+                    threshold_dates.to_numpy(
+                        dtype='datetime64[ns]'
+                    )
+                    == np.datetime64(date_ts)
+                )
+            ]
+            current_positions = np.asarray(
+                current_positions, dtype=np.int64
+            )
+            candidate_tracks: list[str] = []
+            candidate_gaps: list[int] = []
+            for event_id, state in active_tracks.items():
+                day_gap = int(
+                    (
+                        date_ts - pd.Timestamp(state['last_date'])
+                    ).days
+                )
+                if 1 <= day_gap <= maximum_gap_days:
+                    candidate_tracks.append(event_id)
+                    candidate_gaps.append(day_gap)
+
+            assigned_current: set[int] = set()
+            if candidate_tracks and current_positions.size:
+                cost = np.full(
+                    (
+                        len(candidate_tracks),
+                        current_positions.size,
+                    ),
+                    np.inf,
+                    dtype=float,
+                )
+                distance_matrix = np.full_like(cost, np.nan)
+                depth_matrix = np.full_like(cost, np.nan)
+                current_lon = working.loc[
+                    current_positions, 'centroid_lon'
+                ].to_numpy(dtype=float)
+                current_lat = working.loc[
+                    current_positions, 'centroid_lat'
+                ].to_numpy(dtype=float)
+                current_depth = working.loc[
+                    current_positions, 'depth_mean'
+                ].to_numpy(dtype=float)
+                current_row_min = working.loc[
+                    current_positions, 'row_min'
+                ].to_numpy(dtype=float)
+                current_row_max = working.loc[
+                    current_positions, 'row_max'
+                ].to_numpy(dtype=float)
+                current_column_min = working.loc[
+                    current_positions, 'column_min'
+                ].to_numpy(dtype=float)
+                current_column_max = working.loc[
+                    current_positions, 'column_max'
+                ].to_numpy(dtype=float)
+
+                for track_index, (
+                    event_id,
+                    day_gap,
+                ) in enumerate(
+                    zip(candidate_tracks, candidate_gaps)
+                ):
+                    previous_position = int(
+                        active_tracks[event_id]['last_position']
+                    )
+                    previous = working.loc[previous_position]
+                    distance = np.asarray(
+                        adaptive_distance_m(
+                            current_lon,
+                            current_lat,
+                            float(previous['centroid_lon']),
+                            float(previous['centroid_lat']),
+                        ),
+                        dtype=float,
+                    ) / 1000.0
+                    depth_difference = np.abs(
+                        current_depth
+                        - float(previous['depth_mean'])
+                    )
+                    padding = float(padding_pixels * day_gap)
+                    bbox_overlap = (
+                        (
+                            current_row_min
+                            <= float(previous['row_max']) + padding
+                        )
+                        & (
+                            current_row_max
+                            >= float(previous['row_min']) - padding
+                        )
+                        & (
+                            current_column_min
+                            <= (
+                                float(previous['column_max'])
+                                + padding
+                            )
+                        )
+                        & (
+                            current_column_max
+                            >= (
+                                float(previous['column_min'])
+                                - padding
+                            )
+                        )
+                    )
+                    distance_limit = (
+                        maximum_distance_km * day_gap
+                    )
+                    accepted = (
+                        np.isfinite(distance)
+                        & np.isfinite(depth_difference)
+                        & (distance <= distance_limit)
+                        & (
+                            depth_difference
+                            <= maximum_depth_difference
+                        )
+                        & bbox_overlap
+                    )
+                    distance_matrix[track_index] = distance
+                    depth_matrix[
+                        track_index
+                    ] = depth_difference
+                    cost[track_index, accepted] = (
+                        distance[accepted] / distance_limit
+                        + depth_difference[accepted]
+                        / maximum_depth_difference
+                        + gap_cost * (day_gap - 1)
+                    )
+
+                if np.any(np.isfinite(cost)):
+                    finite_cost = np.where(
+                        np.isfinite(cost), cost, 1e9
+                    )
+                    track_indices, current_indices = (
+                        linear_sum_assignment(finite_cost)
+                    )
+                    for track_index, current_index in zip(
+                        track_indices, current_indices
+                    ):
+                        if not np.isfinite(
+                            cost[track_index, current_index]
+                        ):
+                            continue
+                        event_id = candidate_tracks[track_index]
+                        position = int(
+                            current_positions[current_index]
+                        )
+                        day_gap = int(
+                            candidate_gaps[track_index]
+                        )
+                        previous_position = int(
+                            active_tracks[event_id][
+                                'last_position'
+                            ]
+                        )
+                        working.at[position, 'event_id'] = event_id
+                        working.at[
+                            position,
+                            'predecessor_daily_object_key',
+                        ] = working.at[
+                            previous_position,
+                            'daily_object_key',
+                        ]
+                        working.at[
+                            position, 'link_gap_days'
+                        ] = day_gap
+                        working.at[
+                            position, 'link_distance_km'
+                        ] = float(
+                            distance_matrix[
+                                track_index, current_index
+                            ]
+                        )
+                        working.at[
+                            position,
+                            'link_depth_difference_m',
+                        ] = float(
+                            depth_matrix[
+                                track_index, current_index
+                            ]
+                        )
+                        working.at[
+                            position, 'link_cost'
+                        ] = float(
+                            cost[track_index, current_index]
+                        )
+                        working.at[
+                            position, 'link_status'
+                        ] = (
+                            'matched_next_day'
+                            if day_gap == 1
+                            else 'matched_after_gap'
+                        )
+                        active_tracks[event_id] = {
+                            'last_position': position,
+                            'last_date': date_ts,
+                        }
+                        assigned_current.add(position)
+
+            for position in current_positions:
+                position = int(position)
+                if position in assigned_current:
+                    continue
+                event_id = (
+                    f'OFES_{tag}_E{next_event_number:06d}'
+                )
+                next_event_number += 1
+                working.at[position, 'event_id'] = event_id
+                working.at[position, 'link_status'] = 'seed'
+                active_tracks[event_id] = {
+                    'last_position': position,
+                    'last_date': date_ts,
+                }
+
+    working['event_day_index'] = (
+        working.groupby('event_id', sort=False).cumcount() + 1
+    ).astype(np.int16)
+
+    event_records: list[dict] = []
+    for event_id, group in working.groupby(
+        'event_id', sort=False
+    ):
+        group = group.sort_values('date', kind='mergesort')
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        start_date = pd.Timestamp(first['date'])
+        end_date = pd.Timestamp(last['date'])
+        span_days = int((end_date - start_date).days + 1)
+        observed_days = int(group['date'].nunique())
+        peak_index = group['delta_do_max'].astype(float).idxmax()
+        peak = group.loc[peak_index]
+        area = group['area_km2'].to_numpy(dtype=float)
+        if np.sum(area) > 0:
+            mean_centroid_lon = float(np.average(
+                group['centroid_lon'].to_numpy(dtype=float),
+                weights=area,
+            ))
+            mean_centroid_lat = float(np.average(
+                group['centroid_lat'].to_numpy(dtype=float),
+                weights=area,
+            ))
+        else:
+            mean_centroid_lon = float(
+                group['centroid_lon'].mean()
+            )
+            mean_centroid_lat = float(
+                group['centroid_lat'].mean()
+            )
+        link_distances = group[
+            'link_distance_km'
+        ].to_numpy(dtype=float)
+        track_length = float(
+            np.nansum(link_distances)
+        )
+        displacement = float(
+            great_circle_distance_m(
+                float(last['centroid_lon']),
+                float(last['centroid_lat']),
+                float(first['centroid_lon']),
+                float(first['centroid_lat']),
+            )
+            / 1000.0
+        )
+        thickness = group[
+            'thickness_max_m'
+        ].to_numpy(dtype=float)
+        finite_thickness = thickness[np.isfinite(thickness)]
+        maximum_thickness = (
+            float(np.max(finite_thickness))
+            if finite_thickness.size
+            else 0.0
+        )
+        median_thickness = (
+            float(np.median(finite_thickness))
+            if finite_thickness.size
+            else 0.0
+        )
+        event_records.append(
+            {
+                'event_id': str(event_id),
+                'threshold': float(first['threshold']),
+                'threshold_tag': str(first['threshold_tag']),
+                'start_date': start_date,
+                'end_date': end_date,
+                'span_days': span_days,
+                'observed_days': observed_days,
+                'missing_days': int(span_days - observed_days),
+                'persistence_fraction': float(
+                    observed_days / span_days
+                ),
+                'daily_object_count': int(len(group)),
+                'first_daily_object_key': str(
+                    first['daily_object_key']
+                ),
+                'last_daily_object_key': str(
+                    last['daily_object_key']
+                ),
+                'peak_daily_object_key': str(
+                    peak['daily_object_key']
+                ),
+                'peak_date': pd.Timestamp(peak['date']),
+                'delta_do_max': float(
+                    group['delta_do_max'].max()
+                ),
+                'delta_do_mean_of_daily_means': float(
+                    group['delta_do_mean'].mean()
+                ),
+                'area_km2_max': float(
+                    group['area_km2'].max()
+                ),
+                'area_km2_mean': float(
+                    group['area_km2'].mean()
+                ),
+                'equivalent_radius_km_max': float(
+                    group['equivalent_radius_km'].max()
+                ),
+                'thickness_max_m': maximum_thickness,
+                'thickness_median_of_daily_max_m': (
+                    median_thickness
+                ),
+                'depth_mean_m': float(
+                    group['depth_mean'].mean()
+                ),
+                'depth_min_m': float(
+                    group['depth_min'].min()
+                ),
+                'depth_max_m': float(
+                    group['depth_max'].max()
+                ),
+                'mean_centroid_lon': mean_centroid_lon,
+                'mean_centroid_lat': mean_centroid_lat,
+                'start_centroid_lon': float(
+                    first['centroid_lon']
+                ),
+                'start_centroid_lat': float(
+                    first['centroid_lat']
+                ),
+                'end_centroid_lon': float(
+                    last['centroid_lon']
+                ),
+                'end_centroid_lat': float(
+                    last['centroid_lat']
+                ),
+                'peak_lon': float(peak['peak_lon']),
+                'peak_lat': float(peak['peak_lat']),
+                'peak_depth_m': float(
+                    peak['peak_depth_at_max']
+                ),
+                'track_length_km': track_length,
+                'net_displacement_km': displacement,
+                'mean_observed_translation_km_per_day': (
+                    float(track_length / (observed_days - 1))
+                    if observed_days > 1
+                    else 0.0
+                ),
+                'maximum_link_gap_days': int(
+                    group['link_gap_days'].dropna().max()
+                )
+                if group['link_gap_days'].notna().any()
+                else 0,
+            }
+        )
+
+    events = pd.DataFrame(event_records)
+    minimum_days = int(settings['min_ranked_event_days'])
+    events['rank_eligible'] = (
+        events['observed_days'] >= minimum_days
+    )
+    events['rank_amplitude_component'] = np.log1p(
+        events['delta_do_max'] / events['threshold']
+    )
+    events['rank_area_component'] = np.log1p(
+        events['area_km2_max']
+        / float(settings['rank_area_reference_km2'])
+    )
+    events['rank_thickness_component'] = np.log1p(
+        events['thickness_max_m']
+        / float(settings['rank_thickness_reference_m'])
+    )
+    events['rank_duration_component'] = np.log1p(
+        events['observed_days']
+        / float(settings['rank_duration_reference_days'])
+    )
+    component_columns = [
+        'rank_amplitude_component',
+        'rank_area_component',
+        'rank_thickness_component',
+        'rank_duration_component',
+    ]
+    events['rank_score'] = events[component_columns].sum(axis=1)
+    events['rank_within_threshold'] = pd.Series(
+        [pd.NA] * len(events), dtype='Int32'
+    )
+    for threshold in sorted(events['threshold'].unique()):
+        eligible = events.loc[
+            (events['threshold'] == threshold)
+            & events['rank_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        for rank, index in enumerate(eligible.index, start=1):
+            events.at[index, 'rank_within_threshold'] = rank
+    events = events.sort_values(
+        [
+            'threshold',
+            'rank_eligible',
+            'rank_within_threshold',
+            'start_date',
+            'event_id',
+        ],
+        ascending=[True, False, True, True, True],
+        na_position='last',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    return working, events
+
+
+
+
+
+
+def build_ofes_delta_do_event_catalog(
+    start_date: str | pd.Timestamp = '2003-01-01',
+    end_date: str | pd.Timestamp = '2003-12-31',
+    *,
+    catalog_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+    validate_preflight: bool = True,
+) -> dict:
+    """扫描 OFES 日场并建立可续跑的 ΔDO20/35/50 event catalog。
+
+    运行先以固定四季日期执行掩码和 observation-detector parity gate；通过后
+    才逐日读取 DO、写入稀疏 peak pixels 与 depth-aware objects。跨日对象按
+    距离、peak depth、bbox 门槛进行一对一全局最小代价匹配，最后用预先
+    固定的振幅、面积、厚度和持续时间公式分阈值排名。
+
+    参数:
+        - start_date (str | pd.Timestamp): 扫描起始日期（闭区间），默认 2003-01-01。
+        - end_date (str | pd.Timestamp): 扫描结束日期（闭区间），默认 2003-12-31。
+        - catalog_overrides (dict | None): 临时覆盖已声明的 catalog 配置。
+        - output_dir (str | Path | None): 固定 catalog 输出目录；None 时使用标准 `plot_outputs/do/ofes_np30_ke/event_catalog/`。
+        - validate_preflight (bool): 是否运行四季全域 mask 与 detector parity gate，正式运行必须保持 True。
+
+    返回:
+        - dict: 含 output_dir、summary、preflight、逐日扫描摘要、已链接 daily_objects 与 event_catalog。
+
+    输出:
+        - `<output_dir>/days/peak_pixels_YYYYMMDD.parquet`、`daily_objects_YYYYMMDD.parquet` 与 `metadata_YYYYMMDD.json`。
+        - `<output_dir>/daily_objects.parquet`、`event_catalog.parquet`、`scan_summary.parquet`、`preflight.json` 与 `catalog_summary.json`。
+
+    说明:
+        - event 允许配置数目的缺日，位移门槛按实际日间隔线性放宽；Hungarian assignment 保证每个对象至多一个前驱和后继。
+        - rank_score = log1p(max ΔDO/threshold) + log1p(max area/area_ref) + log1p(max thickness/thickness_ref) + log1p(observed days/duration_ref)。
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError('end_date must be on or after start_date.')
+    dates = pd.date_range(start, end, freq='D')
+    settings = _ofes_delta_do_catalog_settings(
+        catalog_overrides
+    )
+    detection_config = make_detection_config(
+        'do',
+        do_threshold=min(settings['thresholds']),
+        anomaly_min_depth=settings[
+            'candidate_depth_min_m'
+        ],
+        anomaly_max_depth=settings[
+            'candidate_depth_max_m'
+        ],
+    )
+    output_path = _ofes_analysis_output_dir(
+        'event_catalog', output_dir
+    )
+    days_dir = output_path / 'days'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_path / 'catalog_summary.json'
+    if summary_path.exists():
+        existing_summary = json.loads(
+            summary_path.read_text(encoding='utf-8')
+        )
+        if existing_summary.get('status') == 'complete':
+            stored_dates = (
+                existing_summary.get('start_date'),
+                existing_summary.get('end_date'),
+            )
+            requested_dates = (
+                start.strftime('%Y-%m-%d'),
+                end.strftime('%Y-%m-%d'),
+            )
+            if stored_dates != requested_dates:
+                raise RuntimeError(
+                    'Existing output was created for a different date '
+                    'request. Use another output_dir or remove the '
+                    'existing directory.'
+                )
+            if not _ofes_requests_equal(
+                existing_summary.get('settings'), settings
+            ):
+                raise RuntimeError(
+                    'Existing output was created with different catalog '
+                    'settings. Use another output_dir or remove the '
+                    'existing directory.'
+                )
+    complete_outputs = [
+        summary_path,
+        output_path / 'preflight.json',
+        output_path / 'daily_objects.parquet',
+        output_path / 'event_catalog.parquet',
+        output_path / 'scan_summary.parquet',
+    ]
+    complete_outputs.extend(
+        path
+        for date in dates
+        for path in (
+            days_dir / f'peak_pixels_{pd.Timestamp(date):%Y%m%d}.parquet',
+            days_dir / f'daily_objects_{pd.Timestamp(date):%Y%m%d}.parquet',
+            days_dir / f'metadata_{pd.Timestamp(date):%Y%m%d}.json',
+        )
+    )
+    if all(path.exists() for path in complete_outputs):
+        existing_summary = json.loads(
+            summary_path.read_text(encoding='utf-8')
+        )
+        if existing_summary.get('status') == 'complete':
+            return load_ofes_event_catalog(output_dir=output_path)
+    summary = {
+        'analysis': 'event_catalog',
+        'status': 'running',
+        'generated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'start_date': start.strftime('%Y-%m-%d'),
+        'end_date': end.strftime('%Y-%m-%d'),
+        'total_days': int(len(dates)),
+        'completed_days': 0,
+        'settings': settings,
+        'detector': detection_config.__dict__,
+        'rank_formula': (
+            'log1p(max_delta_do/threshold) + '
+            'log1p(max_area_km2/area_reference_km2) + '
+            'log1p(max_thickness_m/thickness_reference_m) '
+            '+ log1p(observed_days/duration_reference_days)'
+        ),
+    }
+    _ofes_atomic_write_json(summary, summary_path)
+
+    preflight_path = output_path / 'preflight.json'
+    if validate_preflight:
+        preflight = validate_ofes_delta_do_vectorization(
+            catalog_overrides=catalog_overrides,
+            output_path=preflight_path,
+            raise_on_failure=True,
+        )
+    else:
+        preflight = {
+            'passed': None,
+            'status': 'skipped_by_caller',
+            'warning': (
+                'Formal annual OFES catalog runs require preflight.'
+            ),
+        }
+        _ofes_atomic_write_json(preflight, preflight_path)
+
+    reference_lon, reference_lat, reference_depth, _, _ = (
+        _ofes_tracer_coordinates(start)
+    )
+    object_frames: list[pd.DataFrame] = []
+    summary_records: list[dict] = []
+    completed_days = 0
+    try:
+        for day_number, date in enumerate(dates, start=1):
+            tag = pd.Timestamp(date).strftime('%Y%m%d')
+            pixel_path = (
+                days_dir / f'peak_pixels_{tag}.parquet'
+            )
+            object_path = (
+                days_dir / f'daily_objects_{tag}.parquet'
+            )
+            metadata_path = days_dir / f'metadata_{tag}.json'
+            reused = False
+            if (
+                pixel_path.exists()
+                and object_path.exists()
+                and metadata_path.exists()
+            ):
+                day_metadata = json.loads(
+                    metadata_path.read_text(encoding='utf-8')
+                )
+                if day_metadata.get('date') == pd.Timestamp(
+                    date
+                ).strftime('%Y-%m-%d'):
+                    day_pixels = pd.read_parquet(pixel_path)
+                    day_objects = pd.read_parquet(object_path)
+                    required_pixel_columns = {
+                        'date',
+                        'lat_index',
+                        'lon_index',
+                        'delta_do',
+                        'peak_depth',
+                    }
+                    required_object_columns = {
+                        'date',
+                        'threshold',
+                        'daily_object_key',
+                    }
+                    reused = (
+                        required_pixel_columns
+                        <= set(day_pixels.columns)
+                        and required_object_columns
+                        <= set(day_objects.columns)
+                    )
+
+            if not reused:
+                result = scan_ofes_delta_do_day(
+                    date,
+                    detection_config=detection_config,
+                    thresholds=settings['thresholds'],
+                    catalog_overrides=catalog_overrides,
+                )
+                if not (
+                    np.array_equal(result['lon'], reference_lon)
+                    and np.array_equal(result['lat'], reference_lat)
+                    and np.array_equal(result['depth'], reference_depth)
+                ):
+                    raise RuntimeError(
+                        'OFES coordinates changed within the catalog on '
+                        f'{pd.Timestamp(date):%Y-%m-%d}.'
+                    )
+                day_metadata = result['metadata']
+                day_objects = result['objects']
+                _atomic_write_parquet(
+                    result['pixels'], pixel_path
+                )
+                _atomic_write_parquet(
+                    day_objects, object_path
+                )
+                _ofes_atomic_write_json(
+                    day_metadata, metadata_path
+                )
+
+            object_frames.append(day_objects)
+            for threshold in settings['thresholds']:
+                threshold_tag = _ofes_threshold_tag(threshold)
+                summary_records.append(
+                    {
+                        'date': pd.Timestamp(date),
+                        'threshold': float(threshold),
+                        'threshold_tag': threshold_tag,
+                        'peak_pixel_count': int(
+                            day_metadata[
+                                'peak_pixel_counts'
+                            ][threshold_tag]
+                        ),
+                        'daily_object_count': int(
+                            day_metadata[
+                                'daily_object_counts'
+                            ][threshold_tag]
+                        ),
+                        'scan_elapsed_seconds': float(
+                            day_metadata['elapsed_seconds']
+                        ),
+                        'fragment_reused': bool(reused),
+                    }
+                )
+            completed_days = day_number
+            if (
+                day_number == 1
+                or day_number == len(dates)
+                or day_number % 10 == 0
+            ):
+                print(
+                    '[OFES catalog] '
+                    f'{day_number:03d}/{len(dates):03d} '
+                    f'{pd.Timestamp(date):%Y-%m-%d} '
+                    f'({"reused" if reused else "scanned"})'
+                )
+                summary['completed_days'] = int(completed_days)
+                summary['updated_at_utc'] = pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat()
+                _ofes_atomic_write_json(
+                    summary, summary_path
+                )
+
+        daily_objects = (
+            pd.concat(object_frames, ignore_index=True)
+            if object_frames
+            else _ofes_empty_daily_objects()
+        )
+        linked_objects, event_catalog = _ofes_link_daily_objects(
+            daily_objects, settings
+        )
+        scan_summary = pd.DataFrame(summary_records)
+        _atomic_write_parquet(
+            linked_objects, output_path / 'daily_objects.parquet'
+        )
+        _atomic_write_parquet(
+            event_catalog, output_path / 'event_catalog.parquet'
+        )
+        _atomic_write_parquet(
+            scan_summary, output_path / 'scan_summary.parquet'
+        )
+        eligible_counts = {
+            _ofes_threshold_tag(threshold): int(
+                np.count_nonzero(
+                    (
+                        event_catalog['threshold'].to_numpy(
+                            dtype=float
+                        )
+                        == float(threshold)
+                    )
+                    & event_catalog[
+                        'rank_eligible'
+                    ].to_numpy(dtype=bool)
+                )
+            )
+            for threshold in settings['thresholds']
+        }
+        summary.update(
+            {
+                'status': 'complete',
+                'completed_days': int(completed_days),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'daily_object_rows': int(
+                    len(linked_objects)
+                ),
+                'event_rows': int(len(event_catalog)),
+                'rank_eligible_event_counts': eligible_counts,
+                'outputs': {
+                    'preflight': str(preflight_path),
+                    'daily_objects': str(
+                        output_path / 'daily_objects.parquet'
+                    ),
+                    'event_catalog': str(
+                        output_path / 'event_catalog.parquet'
+                    ),
+                    'scan_summary': str(
+                        output_path / 'scan_summary.parquet'
+                    ),
+                    'day_fragments': str(days_dir),
+                },
+            }
+        )
+        _ofes_atomic_write_json(summary, summary_path)
+    except Exception as error:
+        summary.update(
+            {
+                'status': 'failed',
+                'completed_days': int(completed_days),
+                'updated_at_utc': pd.Timestamp.now(
+                    tz='UTC'
+                ).isoformat(),
+                'error_type': type(error).__name__,
+                'error': str(error),
+            }
+        )
+        _ofes_atomic_write_json(summary, summary_path)
+        raise
+
+    return {
+        'output_dir': output_path,
+        'summary': summary,
+        'preflight': preflight,
+        'scan_summary': scan_summary,
+        'daily_objects': linked_objects,
+        'event_catalog': event_catalog,
+    }
+
+
+
+def _ofes_event_diagnostic_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES event 水团诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_diagnostics', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_diagnostics override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    settings = {
+        'candidate_threshold': float(
+            raw.get('candidate_threshold', 50.0)
+        ),
+        'candidate_count': int(raw.get('candidate_count', 5)),
+        'maximum_sampled_event_days': int(
+            raw.get('maximum_sampled_event_days', 31)
+        ),
+        'deep_depth_min_m': float(
+            raw.get('deep_depth_min_m', 500.0)
+        ),
+        'deep_depth_max_m': float(
+            raw.get('deep_depth_max_m', 900.0)
+        ),
+        'background_inner_radius_km': float(
+            raw.get('background_inner_radius_km', 120.0)
+        ),
+        'background_outer_radius_km': float(
+            raw.get('background_outer_radius_km', 240.0)
+        ),
+        'background_load_margin_km': float(
+            raw.get('background_load_margin_km', 50.0)
+        ),
+        'background_min_valid_columns': int(
+            raw.get('background_min_valid_columns', 100)
+        ),
+        'velocity_smoothing_sigma_pixels': float(
+            raw.get('velocity_smoothing_sigma_pixels', 1.5)
+        ),
+        'negative_control_distance_min_km': float(
+            raw.get('negative_control_distance_min_km', 300.0)
+        ),
+        'negative_control_distance_max_km': float(
+            raw.get('negative_control_distance_max_km', 700.0)
+        ),
+        'negative_control_latitude_tolerance_deg': float(
+            raw.get(
+                'negative_control_latitude_tolerance_deg',
+                3.0,
+            )
+        ),
+        'negative_control_do20_exclusion_radius_km': float(
+            raw.get(
+                'negative_control_do20_exclusion_radius_km',
+                100.0,
+            )
+        ),
+        'negative_control_grid_stride': int(
+            raw.get('negative_control_grid_stride', 5)
+        ),
+        'control_match_sigma0_scale': float(
+            raw.get('control_match_sigma0_scale', 0.05)
+        ),
+        'control_match_theta_scale_deg_c': float(
+            raw.get('control_match_theta_scale_deg_c', 1.0)
+        ),
+        'control_match_salinity_scale': float(
+            raw.get('control_match_salinity_scale', 0.10)
+        ),
+        'control_match_do_scale_umol_kg': float(
+            raw.get('control_match_do_scale_umol_kg', 10.0)
+        ),
+        'control_match_vorticity_scale': float(
+            raw.get('control_match_vorticity_scale', 0.20)
+        ),
+        'control_match_strain_scale': float(
+            raw.get('control_match_strain_scale', 0.20)
+        ),
+        'context_days': int(raw.get('context_days', 10)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_diagnostics')
+        ),
+    }
+    positive_keys = (
+        'candidate_threshold',
+        'candidate_count',
+        'maximum_sampled_event_days',
+        'deep_depth_min_m',
+        'deep_depth_max_m',
+        'background_inner_radius_km',
+        'background_outer_radius_km',
+        'background_load_margin_km',
+        'background_min_valid_columns',
+        'velocity_smoothing_sigma_pixels',
+        'negative_control_distance_min_km',
+        'negative_control_distance_max_km',
+        'negative_control_latitude_tolerance_deg',
+        'negative_control_do20_exclusion_radius_km',
+        'negative_control_grid_stride',
+        'control_match_sigma0_scale',
+        'control_match_theta_scale_deg_c',
+        'control_match_salinity_scale',
+        'control_match_do_scale_umol_kg',
+        'control_match_vorticity_scale',
+        'control_match_strain_scale',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES event diagnostic counts, radii, and match scales '
+            'must be finite and positive.'
+        )
+    if (
+        settings['deep_depth_max_m']
+        <= settings['deep_depth_min_m']
+    ):
+        raise ValueError(
+            'OFES deep diagnostic depth bounds must be ordered.'
+        )
+    if (
+        settings['background_outer_radius_km']
+        <= settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES background annulus radii must be ordered.'
+        )
+    if (
+        settings['negative_control_distance_max_km']
+        <= settings['negative_control_distance_min_km']
+    ):
+        raise ValueError(
+            'OFES negative-control distance bounds must be ordered.'
+        )
+    if settings['maximum_sampled_event_days'] < 3:
+        raise ValueError(
+            'OFES maximum_sampled_event_days must be at least 3 '
+            'to retain event start, peak, and end.'
+        )
+    if settings['context_days'] < 0:
+        raise ValueError(
+            'OFES event diagnostic context_days must be non-negative.'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES event diagnostic output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_profile_value_at_depth(
+    depth: np.ndarray,
+    values: np.ndarray,
+    target_depth: float,
+) -> float:
+    """在有效且递增的深度剖面上线性插值单个值。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    values_arr = np.asarray(values, dtype=float)
+    valid = np.isfinite(depth_arr) & np.isfinite(values_arr)
+    if np.count_nonzero(valid) < 2:
+        return np.nan
+    x = depth_arr[valid]
+    y = values_arr[valid]
+    if (
+        float(target_depth) < float(x[0])
+        or float(target_depth) > float(x[-1])
+    ):
+        return np.nan
+    return float(np.interp(float(target_depth), x, y))
+
+
+def _ofes_sigma0_profile(
+    depth: np.ndarray,
+    salinity: np.ndarray,
+    potential_temperature: np.ndarray,
+    lon: float,
+    lat: float,
+) -> np.ndarray:
+    """从 OFES PSS-78 盐度和位温计算 TEOS-10 sigma0 剖面。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    seawater_pressure = gsw.p_from_z(-depth_arr, float(lat))
+    salinity_arr = np.asarray(salinity, dtype=float)
+    theta_arr = np.asarray(potential_temperature, dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_arr,
+        seawater_pressure,
+        float(lon),
+        float(lat),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta_arr
+    )
+    return np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+
+
+def _ofes_point_thermodynamics(
+    depth: float,
+    salinity: float,
+    potential_temperature: float,
+    oxygen: float,
+    lon: float,
+    lat: float,
+) -> dict:
+    """计算单点 TEOS-10 密度、spiciness 与 AOU 诊断。"""
+    values = (
+        depth,
+        salinity,
+        potential_temperature,
+        oxygen,
+        lon,
+        lat,
+    )
+    keys = (
+        'absolute_salinity',
+        'conservative_temperature',
+        'sigma0',
+        'spiciness0',
+        'oxygen_saturation',
+        'aou',
+    )
+    if not all(np.isfinite(value) for value in values):
+        return {key: np.nan for key in keys}
+    seawater_pressure = float(
+        gsw.p_from_z(-float(depth), float(lat))
+    )
+    absolute_salinity = float(
+        gsw.SA_from_SP(
+            float(salinity),
+            seawater_pressure,
+            float(lon),
+            float(lat),
+        )
+    )
+    conservative_temperature = float(
+        gsw.CT_from_pt(
+            absolute_salinity, float(potential_temperature)
+        )
+    )
+    sigma0 = float(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        )
+    )
+    spiciness0 = float(
+        gsw.spiciness0(
+            absolute_salinity, conservative_temperature
+        )
+    )
+    oxygen_saturation = float(
+        gsw.O2sol(
+            absolute_salinity,
+            conservative_temperature,
+            seawater_pressure,
+            float(lon),
+            float(lat),
+        )
+    )
+    return {
+        'absolute_salinity': absolute_salinity,
+        'conservative_temperature': conservative_temperature,
+        'sigma0': sigma0,
+        'spiciness0': spiciness0,
+        'oxygen_saturation': oxygen_saturation,
+        'aou': oxygen_saturation - float(oxygen),
+    }
+
+
+def _ofes_n2_at_depth(
+    depth: np.ndarray,
+    salinity: np.ndarray,
+    potential_temperature: np.ndarray,
+    lon: float,
+    lat: float,
+    target_depth: float,
+) -> float:
+    """在目标深度插值 TEOS-10 浮力频率平方。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    salinity_arr = np.asarray(salinity, dtype=float)
+    theta_arr = np.asarray(potential_temperature, dtype=float)
+    valid = (
+        np.isfinite(depth_arr)
+        & np.isfinite(salinity_arr)
+        & np.isfinite(theta_arr)
+    )
+    if np.count_nonzero(valid) < 3:
+        return np.nan
+    depth_valid = depth_arr[valid]
+    seawater_pressure = gsw.p_from_z(-depth_valid, float(lat))
+    absolute_salinity = gsw.SA_from_SP(
+        salinity_arr[valid],
+        seawater_pressure,
+        float(lon),
+        float(lat),
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta_arr[valid]
+    )
+    n2, pressure_mid = gsw.Nsquared(
+        absolute_salinity,
+        conservative_temperature,
+        seawater_pressure,
+        lat=float(lat),
+    )
+    depth_mid = -gsw.z_from_p(pressure_mid, float(lat))
+    finite = np.isfinite(n2) & np.isfinite(depth_mid)
+    return _ofes_profile_value_at_depth(
+        depth_mid[finite],
+        n2[finite],
+        float(target_depth),
+    )
+
+
+def _ofes_density_crossing_near_depth(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    target_sigma0: float,
+    reference_depth: float,
+    fields: dict[str, np.ndarray],
+) -> dict:
+    """返回离参考深度最近的 target-sigma0 线性交点。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    sigma_arr = np.asarray(sigma0, dtype=float)
+    result = {
+        'depth': np.nan,
+        'crossing_count': 0,
+        **{key: np.nan for key in fields},
+    }
+    if (
+        depth_arr.ndim != 1
+        or sigma_arr.shape != depth_arr.shape
+        or not np.isfinite(target_sigma0)
+    ):
+        return result
+    lower = sigma_arr[:-1] - float(target_sigma0)
+    upper = sigma_arr[1:] - float(target_sigma0)
+    valid = (
+        np.isfinite(depth_arr[:-1])
+        & np.isfinite(depth_arr[1:])
+        & np.isfinite(lower)
+        & np.isfinite(upper)
+        & (lower * upper <= 0)
+        & (sigma_arr[1:] != sigma_arr[:-1])
+    )
+    candidates = np.flatnonzero(valid)
+    result['crossing_count'] = int(candidates.size)
+    if candidates.size == 0:
+        return result
+    fraction = (
+        float(target_sigma0) - sigma_arr[candidates]
+    ) / (
+        sigma_arr[candidates + 1]
+        - sigma_arr[candidates]
+    )
+    crossing_depth = (
+        depth_arr[candidates]
+        + fraction
+        * (
+            depth_arr[candidates + 1]
+            - depth_arr[candidates]
+        )
+    )
+    choice = int(
+        np.argmin(
+            np.abs(
+                crossing_depth - float(reference_depth)
+            )
+        )
+    )
+    index = int(candidates[choice])
+    fraction_value = float(fraction[choice])
+    result['depth'] = float(crossing_depth[choice])
+    for key, values in fields.items():
+        values_arr = np.asarray(values, dtype=float)
+        if (
+            values_arr.shape == depth_arr.shape
+            and np.isfinite(values_arr[index])
+            and np.isfinite(values_arr[index + 1])
+        ):
+            result[key] = float(
+                values_arr[index]
+                + fraction_value
+                * (
+                    values_arr[index + 1]
+                    - values_arr[index]
+                )
+            )
+    return result
+
+
+def _ofes_masked_median_profiles(
+    values: np.ndarray,
+    horizontal_mask: np.ndarray,
+) -> np.ndarray:
+    """沿水平掩码返回逐层有限值中位数而不发出空层 warning。"""
+    array = np.asarray(values, dtype=float)
+    mask = np.asarray(horizontal_mask, dtype=bool)
+    if array.ndim != 3 or array.shape[1:] != mask.shape:
+        raise ValueError(
+            'OFES profile field and horizontal mask shapes do not match.'
+        )
+    selected = array[:, mask]
+    if selected.shape[1] == 0:
+        return np.full(array.shape[0], np.nan, dtype=float)
+    masked = np.ma.masked_invalid(selected)
+    return np.asarray(
+        np.ma.median(masked, axis=1).filled(np.nan),
+        dtype=float,
+    )
+
+
+def _ofes_nan_gaussian(
+    field: np.ndarray,
+    sigma_pixels: float,
+) -> np.ndarray:
+    """以有限值权重做 Gaussian 平滑并保留缺测支配区域。"""
+    values = np.asarray(field, dtype=float)
+    valid = np.isfinite(values)
+    numerator = gaussian_filter(
+        np.where(valid, values, 0.0),
+        sigma=float(sigma_pixels),
+        mode='nearest',
+    )
+    denominator = gaussian_filter(
+        valid.astype(float),
+        sigma=float(sigma_pixels),
+        mode='nearest',
+    )
+    smoothed = np.full(values.shape, np.nan, dtype=float)
+    np.divide(
+        numerator,
+        denominator,
+        out=smoothed,
+        where=denominator >= 0.5,
+    )
+    return smoothed
+
+
+def _ofes_fixed_depth_kinematic_fields(
+    snapshot: dict,
+    target_depth: float,
+    smoothing_sigma_pixels: float,
+) -> dict:
+    """计算最近交付深度层的平滑速度梯度与无量纲动力量。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    if depth.size == 0:
+        raise ValueError('OFES snapshot contains no depth level.')
+    level_index = int(
+        np.argmin(np.abs(depth - float(target_depth)))
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    u = _ofes_nan_gaussian(
+        snapshot['u'][level_index],
+        float(smoothing_sigma_pixels),
+    )
+    v = _ofes_nan_gaussian(
+        snapshot['v'][level_index],
+        float(smoothing_sigma_pixels),
+    )
+    scale = approximate_degree_length(lat)
+    meters_per_degree_lon = np.asarray(
+        scale['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    meters_per_degree_lat = np.asarray(
+        scale['meters_per_degree_lat'], dtype=float
+    )[:, None]
+    du_dx = np.gradient(u, lon, axis=1) / meters_per_degree_lon
+    dv_dx = np.gradient(v, lon, axis=1) / meters_per_degree_lon
+    du_dy = np.gradient(u, lat, axis=0) / meters_per_degree_lat
+    dv_dy = np.gradient(v, lat, axis=0) / meters_per_degree_lat
+    relative_vorticity = dv_dx - du_dy
+    normal_strain = du_dx - dv_dy
+    shear_strain = dv_dx + du_dy
+    total_strain = np.hypot(normal_strain, shear_strain)
+    okubo_weiss = total_strain**2 - relative_vorticity**2
+    coriolis = np.asarray(gsw.f(lat), dtype=float)[:, None]
+    rossby_number = np.full(relative_vorticity.shape, np.nan)
+    normalized_strain = np.full(total_strain.shape, np.nan)
+    normalized_okubo_weiss = np.full(
+        okubo_weiss.shape, np.nan
+    )
+    np.divide(
+        relative_vorticity,
+        coriolis,
+        out=rossby_number,
+        where=np.abs(coriolis) > 0,
+    )
+    np.divide(
+        total_strain,
+        np.abs(coriolis),
+        out=normalized_strain,
+        where=np.abs(coriolis) > 0,
+    )
+    np.divide(
+        okubo_weiss,
+        coriolis**2,
+        out=normalized_okubo_weiss,
+        where=np.abs(coriolis) > 0,
+    )
+    return {
+        'depth_m': float(depth[level_index]),
+        'level_index': int(level_index),
+        'u': u,
+        'v': v,
+        'relative_vorticity': relative_vorticity,
+        'normal_strain': normal_strain,
+        'shear_strain': shear_strain,
+        'total_strain': total_strain,
+        'okubo_weiss': okubo_weiss,
+        'coriolis': np.broadcast_to(
+            coriolis, relative_vorticity.shape
+        ),
+        'rossby_number': rossby_number,
+        'normalized_strain': normalized_strain,
+        'normalized_okubo_weiss': normalized_okubo_weiss,
+    }
+
+
+def _ofes_kinematics_at_point(
+    fields: dict,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    target_lon: float,
+    target_lat: float,
+) -> dict:
+    """从已计算的二维动力场提取最近网格点诊断。"""
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    column = int(
+        np.argmin(
+            np.abs(
+                _minimal_lon_diff_deg(
+                    lon_arr, float(target_lon)
+                )
+            )
+        )
+    )
+    row = int(np.argmin(np.abs(lat_arr - float(target_lat))))
+    u = float(fields['u'][row, column])
+    v = float(fields['v'][row, column])
+    return {
+        'kinematic_depth_m': float(
+            fields['depth_m']
+        ),
+        'u_m_s': u,
+        'v_m_s': v,
+        'speed_m_s': float(np.hypot(u, v)),
+        'relative_vorticity_s_1': float(
+            fields['relative_vorticity'][row, column]
+        ),
+        'normal_strain_s_1': float(
+            fields['normal_strain'][row, column]
+        ),
+        'shear_strain_s_1': float(
+            fields['shear_strain'][row, column]
+        ),
+        'total_strain_s_1': float(
+            fields['total_strain'][row, column]
+        ),
+        'okubo_weiss_s_2': float(
+            fields['okubo_weiss'][row, column]
+        ),
+        'coriolis_s_1': float(
+            fields['coriolis'][row, column]
+        ),
+        'rossby_number': float(
+            fields['rossby_number'][row, column]
+        ),
+        'normalized_strain': float(
+            fields['normalized_strain'][row, column]
+        ),
+        'normalized_okubo_weiss': float(
+            fields['normalized_okubo_weiss'][row, column]
+        ),
+    }
+
+
+def _ofes_unit_sphere_xyz(
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """把等形经纬数组转换为单位球三维坐标行。"""
+    lon_arr, lat_arr = np.broadcast_arrays(
+        np.asarray(lon, dtype=float),
+        np.asarray(lat, dtype=float),
+    )
+    lon_radians = np.radians(lon_arr.ravel())
+    lat_radians = np.radians(lat_arr.ravel())
+    cos_lat = np.cos(lat_radians)
+    return np.column_stack(
+        (
+            cos_lat * np.cos(lon_radians),
+            cos_lat * np.sin(lon_radians),
+            np.sin(lat_radians),
+        )
+    )
+
+
+def _ofes_quality_event_catalog(
+    catalog_dir: str | Path,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """标记交付边界截断并生成正式与深层敏感性排名。"""
+    root = Path(catalog_dir)
+    events = pd.read_parquet(root / 'event_catalog.parquet')
+    objects = pd.read_parquet(root / 'daily_objects.parquet')
+    if events.empty or objects.empty:
+        raise RuntimeError('The OFES event catalog is empty.')
+    lon, lat, depth, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(objects['date'].min())
+    )
+    edge_by_event = objects.assign(
+        touches_delivery_edge=(
+            (objects['row_min'] <= 0)
+            | (objects['row_max'] >= lat.size - 1)
+            | (objects['column_min'] <= 0)
+            | (objects['column_max'] >= lon.size - 1)
+        )
+    ).groupby('event_id', sort=False)[
+        'touches_delivery_edge'
+    ].any()
+    events = events.copy()
+    events['touches_delivery_edge'] = (
+        events['event_id'].map(edge_by_event).fillna(True)
+    ).astype(bool)
+    events['quality_eligible'] = (
+        events['rank_eligible']
+        & ~events['touches_delivery_edge']
+    )
+    events['quality_rank_within_threshold'] = pd.Series(
+        [pd.NA] * len(events), dtype='Int32'
+    )
+    for threshold in sorted(events['threshold'].unique()):
+        ranked = events.loc[
+            (events['threshold'] == threshold)
+            & events['quality_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        events.loc[
+            ranked.index, 'quality_rank_within_threshold'
+        ] = np.arange(1, len(ranked) + 1)
+
+    catalog_settings = _ofes_delta_do_catalog_settings()
+    candidate_depth = depth[
+        (
+            depth
+            >= float(
+                catalog_settings[
+                    'candidate_depth_min_m'
+                ]
+            )
+        )
+        & (
+            depth
+            <= float(
+                catalog_settings[
+                    'candidate_depth_max_m'
+                ]
+            )
+        )
+    ]
+    if candidate_depth.size == 0:
+        raise RuntimeError(
+            'The catalog depth window contains no delivered level.'
+        )
+    lower_search_level = float(candidate_depth[0])
+    upper_search_level = float(candidate_depth[-1])
+    events['peak_on_lower_search_level'] = np.isclose(
+        events['peak_depth_m'],
+        lower_search_level,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    events['peak_on_upper_search_level'] = np.isclose(
+        events['peak_depth_m'],
+        upper_search_level,
+        rtol=0.0,
+        atol=1e-6,
+    )
+    events['deep_sensitivity_eligible'] = (
+        events['quality_eligible']
+        & events['peak_depth_m'].between(
+            float(settings['deep_depth_min_m']),
+            float(settings['deep_depth_max_m']),
+        )
+    )
+    events[
+        'deep_sensitivity_rank_within_threshold'
+    ] = pd.Series([pd.NA] * len(events), dtype='Int32')
+    for threshold in sorted(events['threshold'].unique()):
+        ranked = events.loc[
+            (events['threshold'] == threshold)
+            & events['deep_sensitivity_eligible']
+        ].sort_values(
+            [
+                'rank_score',
+                'delta_do_max',
+                'observed_days',
+                'event_id',
+            ],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        events.loc[
+            ranked.index,
+            'deep_sensitivity_rank_within_threshold',
+        ] = np.arange(1, len(ranked) + 1)
+
+    selected = events.loc[
+        (
+            events['threshold']
+            == float(settings['candidate_threshold'])
+        )
+        & events['quality_eligible']
+    ].sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).head(int(settings['candidate_count']))
+    if len(selected) != int(settings['candidate_count']):
+        raise RuntimeError(
+            'The OFES catalog does not contain the requested number '
+            'of quality-eligible candidate events.'
+        )
+    threshold_events = events.loc[
+        events['threshold']
+        == float(settings['candidate_threshold'])
+    ]
+    ranked_threshold_events = threshold_events.loc[
+        threshold_events['rank_eligible']
+    ]
+    audit = {
+        'lower_search_level_m': lower_search_level,
+        'upper_search_level_m': upper_search_level,
+        'candidate_threshold': float(
+            settings['candidate_threshold']
+        ),
+        'raw_event_count': int(len(threshold_events)),
+        'rank_eligible_event_count': int(
+            len(ranked_threshold_events)
+        ),
+        'delivery_edge_truncated_count': int(
+            np.count_nonzero(
+                ranked_threshold_events[
+                    'touches_delivery_edge'
+                ]
+            )
+        ),
+        'quality_eligible_event_count': int(
+            np.count_nonzero(
+                ranked_threshold_events['quality_eligible']
+            )
+        ),
+        'lower_search_level_event_count': int(
+            np.count_nonzero(
+                ranked_threshold_events[
+                    'peak_on_lower_search_level'
+                ]
+            )
+        ),
+        'lower_search_level_event_fraction': float(
+            ranked_threshold_events[
+                'peak_on_lower_search_level'
+            ].mean()
+        ),
+        'deep_sensitivity_event_count': int(
+            np.count_nonzero(
+                threshold_events['deep_sensitivity_eligible']
+            )
+        ),
+        'selected_event_ids': selected[
+            'event_id'
+        ].astype(str).tolist(),
+    }
+    return events, objects, audit
+
+
+def _ofes_sample_event_objects(
+    group: pd.DataFrame,
+    peak_daily_object_key: str,
+    maximum_days: int,
+) -> pd.DataFrame:
+    """等间隔抽取长事件并强制保留首、峰、末对象。"""
+    ordered = group.sort_values(
+        'date', kind='mergesort'
+    ).reset_index(drop=True)
+    if ordered['date'].duplicated().any():
+        raise ValueError(
+            'An OFES event contains more than one object per date.'
+        )
+    if len(ordered) <= int(maximum_days):
+        result = ordered.copy()
+        result['diagnostic_sample_index'] = np.arange(
+            1, len(result) + 1, dtype=np.int16
+        )
+        return result
+    peak_positions = np.flatnonzero(
+        ordered['daily_object_key'].astype(str).to_numpy()
+        == str(peak_daily_object_key)
+    )
+    if peak_positions.size != 1:
+        raise ValueError(
+            'The OFES peak daily object key is absent or duplicated.'
+        )
+    peak_position = int(peak_positions[0])
+    selected = set(
+        np.linspace(
+            0, len(ordered) - 1, int(maximum_days)
+        ).round().astype(int)
+    )
+    required = {0, peak_position, len(ordered) - 1}
+    selected.update(required)
+    while len(selected) > int(maximum_days):
+        removable = sorted(selected - required)
+        if not removable:
+            raise RuntimeError(
+                'Unable to satisfy OFES event-day sampling limit.'
+            )
+        redundancy: list[tuple[int, int]] = []
+        for position in removable:
+            others = np.asarray(
+                sorted(selected - {position}), dtype=int
+            )
+            redundancy.append(
+                (
+                    int(np.min(np.abs(others - position))),
+                    int(position),
+                )
+            )
+        _, remove = min(redundancy)
+        selected.remove(remove)
+    result = ordered.iloc[
+        sorted(selected)
+    ].reset_index(drop=True)
+    result['diagnostic_sample_index'] = np.arange(
+        1, len(result) + 1, dtype=np.int16
+    )
+    return result
+
+
+def _ofes_delivery_edge_distance_km(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    lon_min: float,
+    lon_max: float,
+    lat_min: float,
+    lat_max: float,
+) -> np.ndarray:
+    """计算点到矩形交付窗口四边的最短大圆距离。"""
+    lon_arr, lat_arr = np.broadcast_arrays(
+        np.asarray(lon, dtype=float),
+        np.asarray(lat, dtype=float),
+    )
+    distances = (
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, float(lon_min), lat_arr
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, float(lon_max), lat_arr
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, lon_arr, float(lat_min)
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            great_circle_distance_m(
+                lon_arr, lat_arr, lon_arr, float(lat_max)
+            ),
+            dtype=float,
+        ),
+    )
+    return np.minimum.reduce(distances) / 1000.0
+
+
+def _ofes_diagnose_water_mass_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth: float,
+    settings: dict,
+    *,
+    target_sigma0_override: float | None = None,
+) -> dict:
+    """诊断单日 OFES 核心相对环带背景的水团与 heave 分量。
+
+    `target_sigma0_override` 用于 moving-core 几何：目标密度冻结为事件
+    peak 值，而 `reference_depth` 仅用于连续选择背景等密度面交点。
+    """
+    date_ts = pd.Timestamp(date).normalize()
+    outer_radius = float(
+        settings['background_outer_radius_km']
+    )
+    load_radius = (
+        outer_radius
+        + float(settings['background_load_margin_km'])
+    )
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(core_lon),
+                float(core_lat),
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    background_mask = (
+        distance_km
+        >= float(settings['background_inner_radius_km'])
+    ) & (distance_km <= outer_radius)
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(
+                _minimal_lon_diff_deg(lon, float(core_lon))
+            )
+        )
+    )
+    actual_lon = float(lon[column])
+    actual_lat = float(lat[row])
+    reference_level = int(
+        np.argmin(
+            np.abs(depth - float(reference_depth))
+        )
+    )
+    delivered_reference_depth = float(
+        depth[reference_level]
+    )
+    valid_reference = (
+        background_mask
+        & np.isfinite(snapshot['do2'][reference_level])
+        & np.isfinite(snapshot['temp'][reference_level])
+        & np.isfinite(snapshot['salinity'][reference_level])
+    )
+    background_valid_columns = int(
+        np.count_nonzero(valid_reference)
+    )
+    core_profiles = {
+        'do': np.asarray(
+            snapshot['do2'][:, row, column], dtype=float
+        ),
+        'theta': np.asarray(
+            snapshot['temp'][:, row, column], dtype=float
+        ),
+        'salinity': np.asarray(
+            snapshot['salinity'][:, row, column], dtype=float
+        ),
+    }
+    background_profiles = {
+        'do': _ofes_masked_median_profiles(
+            snapshot['do2'], background_mask
+        ),
+        'theta': _ofes_masked_median_profiles(
+            snapshot['temp'], background_mask
+        ),
+        'salinity': _ofes_masked_median_profiles(
+            snapshot['salinity'], background_mask
+        ),
+    }
+    core_sigma0 = _ofes_sigma0_profile(
+        depth,
+        core_profiles['salinity'],
+        core_profiles['theta'],
+        actual_lon,
+        actual_lat,
+    )
+    background_sigma0 = _ofes_sigma0_profile(
+        depth,
+        background_profiles['salinity'],
+        background_profiles['theta'],
+        actual_lon,
+        actual_lat,
+    )
+    core_fixed = {
+        key: _ofes_profile_value_at_depth(
+            depth, values, float(reference_depth)
+        )
+        for key, values in core_profiles.items()
+    }
+    background_fixed = {
+        key: _ofes_profile_value_at_depth(
+            depth, values, float(reference_depth)
+        )
+        for key, values in background_profiles.items()
+    }
+    target_sigma0 = (
+        float(target_sigma0_override)
+        if target_sigma0_override is not None
+        else _ofes_profile_value_at_depth(
+            depth, core_sigma0, float(reference_depth)
+        )
+    )
+    background_on_sigma = (
+        _ofes_density_crossing_near_depth(
+            depth,
+            background_sigma0,
+            target_sigma0,
+            float(reference_depth),
+            background_profiles,
+        )
+    )
+    core_thermodynamics = _ofes_point_thermodynamics(
+        float(reference_depth),
+        core_fixed['salinity'],
+        core_fixed['theta'],
+        core_fixed['do'],
+        actual_lon,
+        actual_lat,
+    )
+    background_fixed_thermodynamics = (
+        _ofes_point_thermodynamics(
+            float(reference_depth),
+            background_fixed['salinity'],
+            background_fixed['theta'],
+            background_fixed['do'],
+            actual_lon,
+            actual_lat,
+        )
+    )
+    background_sigma_thermodynamics = (
+        _ofes_point_thermodynamics(
+            float(background_on_sigma['depth']),
+            float(background_on_sigma['salinity']),
+            float(background_on_sigma['theta']),
+            float(background_on_sigma['do']),
+            actual_lon,
+            actual_lat,
+        )
+    )
+    core_n2 = _ofes_n2_at_depth(
+        depth,
+        core_profiles['salinity'],
+        core_profiles['theta'],
+        actual_lon,
+        actual_lat,
+        float(reference_depth),
+    )
+    background_n2 = _ofes_n2_at_depth(
+        depth,
+        background_profiles['salinity'],
+        background_profiles['theta'],
+        actual_lon,
+        actual_lat,
+        float(background_on_sigma['depth']),
+    )
+    fixed_depth_do_contrast = (
+        core_fixed['do'] - background_fixed['do']
+    )
+    water_mass_do_contrast = (
+        core_fixed['do'] - background_on_sigma['do']
+    )
+    heave_do_contribution = (
+        background_on_sigma['do'] - background_fixed['do']
+    )
+    closure_error = (
+        fixed_depth_do_contrast
+        - water_mass_do_contrast
+        - heave_do_contribution
+    )
+    n2_ratio = (
+        float(core_n2 / background_n2)
+        if (
+            np.isfinite(core_n2)
+            and np.isfinite(background_n2)
+            and background_n2 != 0
+        )
+        else np.nan
+    )
+    kinematic_fields = (
+        _ofes_fixed_depth_kinematic_fields(
+            snapshot,
+            float(reference_depth),
+            float(
+                settings[
+                    'velocity_smoothing_sigma_pixels'
+                ]
+            ),
+        )
+    )
+    kinematics = _ofes_kinematics_at_point(
+        kinematic_fields,
+        lon,
+        lat,
+        actual_lon,
+        actual_lat,
+    )
+    full_lon, full_lat, _, _, _ = (
+        _ofes_tracer_coordinates(date_ts)
+    )
+    delivery_edge_distance = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(actual_lon),
+            np.asarray(actual_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    core_grid_distance_m = float(
+        great_circle_distance_m(
+            actual_lon,
+            actual_lat,
+            float(core_lon),
+            float(core_lat),
+        )
+    )
+
+    failure_reasons: list[str] = []
+    if (
+        background_valid_columns
+        < int(settings['background_min_valid_columns'])
+    ):
+        failure_reasons.append('insufficient_background_columns')
+    if not np.isfinite(target_sigma0):
+        failure_reasons.append('missing_core_sigma0')
+    if not np.isfinite(background_on_sigma['depth']):
+        failure_reasons.append('missing_background_sigma_crossing')
+    required_metrics = (
+        fixed_depth_do_contrast,
+        water_mass_do_contrast,
+        heave_do_contribution,
+        closure_error,
+        core_thermodynamics['spiciness0'],
+        background_sigma_thermodynamics['spiciness0'],
+        core_thermodynamics['aou'],
+        background_sigma_thermodynamics['aou'],
+        core_n2,
+        background_n2,
+        kinematics['rossby_number'],
+        kinematics['normalized_strain'],
+        kinematics['normalized_okubo_weiss'],
+    )
+    if not all(np.isfinite(value) for value in required_metrics):
+        failure_reasons.append('nonfinite_required_metric')
+    if (
+        np.isfinite(closure_error)
+        and abs(float(closure_error)) > 1e-10
+    ):
+        failure_reasons.append('decomposition_closure_failure')
+
+    result = {
+        'date': date_ts,
+        'requested_core_lon': float(core_lon),
+        'requested_core_lat': float(core_lat),
+        'core_lon': actual_lon,
+        'core_lat': actual_lat,
+        'core_grid_distance_m': core_grid_distance_m,
+        'reference_depth_m': float(reference_depth),
+        'delivered_reference_depth_m': (
+            delivered_reference_depth
+        ),
+        'reference_depth_delivered_offset_m': float(
+            delivered_reference_depth - float(reference_depth)
+        ),
+        'background_inner_radius_km': float(
+            settings['background_inner_radius_km']
+        ),
+        'background_outer_radius_km': outer_radius,
+        'background_annulus_grid_columns': int(
+            np.count_nonzero(background_mask)
+        ),
+        'background_valid_columns': background_valid_columns,
+        'delivery_edge_distance_km': delivery_edge_distance,
+        'background_annulus_within_delivery_window': bool(
+            delivery_edge_distance >= outer_radius
+        ),
+        'target_sigma0': float(target_sigma0),
+        'background_sigma0_fixed': float(
+            background_fixed_thermodynamics['sigma0']
+        ),
+        'background_sigma_depth_m': float(
+            background_on_sigma['depth']
+        ),
+        'background_sigma_crossing_count': int(
+            background_on_sigma['crossing_count']
+        ),
+        'core_minus_background_isopycnal_depth_m': float(
+            float(reference_depth)
+            - float(background_on_sigma['depth'])
+        ),
+        'core_do_fixed': float(core_fixed['do']),
+        'background_do_fixed': float(
+            background_fixed['do']
+        ),
+        'background_do_same_sigma': float(
+            background_on_sigma['do']
+        ),
+        'fixed_depth_do_contrast': float(
+            fixed_depth_do_contrast
+        ),
+        'water_mass_do_contrast': float(
+            water_mass_do_contrast
+        ),
+        'heave_do_contribution': float(
+            heave_do_contribution
+        ),
+        'decomposition_closure_error': float(
+            closure_error
+        ),
+        'core_theta_fixed': float(core_fixed['theta']),
+        'background_theta_fixed': float(
+            background_fixed['theta']
+        ),
+        'background_theta_same_sigma': float(
+            background_on_sigma['theta']
+        ),
+        'same_sigma_theta_contrast': float(
+            core_fixed['theta']
+            - background_on_sigma['theta']
+        ),
+        'core_salinity_fixed': float(
+            core_fixed['salinity']
+        ),
+        'background_salinity_fixed': float(
+            background_fixed['salinity']
+        ),
+        'background_salinity_same_sigma': float(
+            background_on_sigma['salinity']
+        ),
+        'same_sigma_salinity_contrast': float(
+            core_fixed['salinity']
+            - background_on_sigma['salinity']
+        ),
+        'core_spiciness0': float(
+            core_thermodynamics['spiciness0']
+        ),
+        'background_spiciness0_same_sigma': float(
+            background_sigma_thermodynamics['spiciness0']
+        ),
+        'same_sigma_spiciness0_contrast': float(
+            core_thermodynamics['spiciness0']
+            - background_sigma_thermodynamics[
+                'spiciness0'
+            ]
+        ),
+        'core_aou_umol_kg': float(
+            core_thermodynamics['aou']
+        ),
+        'background_aou_same_sigma_umol_kg': float(
+            background_sigma_thermodynamics['aou']
+        ),
+        'same_sigma_aou_contrast': float(
+            core_thermodynamics['aou']
+            - background_sigma_thermodynamics['aou']
+        ),
+        'core_n2_s_2': float(core_n2),
+        'background_n2_same_sigma_s_2': float(
+            background_n2
+        ),
+        'n2_ratio_core_to_background': n2_ratio,
+        'diagnostic_passed': bool(not failure_reasons),
+        'diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(dict.fromkeys(failure_reasons))
+        ),
+    }
+    result.update(kinematics)
+    return result
+
+
+def _ofes_select_negative_control(
+    catalog_dir: str | Path,
+    peak_date: str | pd.Timestamp,
+    event_lon: float,
+    event_lat: float,
+    reference_depth: float,
+    event_peak_diagnostic: dict,
+    settings: dict,
+) -> dict:
+    """按预先声明的水团和动力距离选择同日无 DO20 负对照。"""
+    date_ts = pd.Timestamp(peak_date).normalize()
+    depth = _ofes_tracer_coordinates(date_ts)[2]
+    depth_level = int(
+        np.argmin(
+            np.abs(
+                np.asarray(depth, dtype=float)
+                - float(reference_depth)
+            )
+        )
+    )
+    delivered_depth = float(depth[depth_level])
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        depth_bounds=(delivered_depth, delivered_depth),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    event_distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(event_lon),
+                float(event_lat),
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    day_tag = date_ts.strftime('%Y%m%d')
+    peak_path = (
+        Path(catalog_dir)
+        / 'days'
+        / f'peak_pixels_{day_tag}.parquet'
+    )
+    catalog_thresholds = {
+        float(value)
+        for value in _ofes_delta_do_catalog_settings()[
+            'thresholds'
+        ]
+    }
+    if 20.0 not in catalog_thresholds:
+        raise RuntimeError(
+            'Negative-control selection requires a DO20 catalog.'
+        )
+    peaks = pd.read_parquet(
+        peak_path, columns=['lon', 'lat', 'delta_do']
+    )
+    peaks = peaks.loc[
+        peaks['delta_do'] >= 20.0
+    ]
+    if peaks.empty:
+        raise RuntimeError(
+            'The headline-event date contains no DO20 peak pixel.'
+        )
+    peak_xyz = _ofes_unit_sphere_xyz(
+        peaks['lon'].to_numpy(dtype=float),
+        peaks['lat'].to_numpy(dtype=float),
+    )
+    candidate_xyz = _ofes_unit_sphere_xyz(
+        lon_grid, lat_grid
+    )
+    nearest_peak_chord = cKDTree(peak_xyz).query(
+        candidate_xyz, k=1
+    )[0]
+    nearest_do20_distance_km = (
+        2.0
+        * 6371.0088
+        * np.arcsin(
+            np.clip(nearest_peak_chord / 2.0, 0.0, 1.0)
+        )
+    ).reshape(lon_grid.shape)
+
+    salinity = np.asarray(
+        snapshot['salinity'][0], dtype=float
+    )
+    theta = np.asarray(snapshot['temp'][0], dtype=float)
+    oxygen = np.asarray(snapshot['do2'][0], dtype=float)
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        delivered_depth,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    sigma0 = np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+    kinematic_fields = (
+        _ofes_fixed_depth_kinematic_fields(
+            snapshot,
+            delivered_depth,
+            float(
+                settings[
+                    'velocity_smoothing_sigma_pixels'
+                ]
+            ),
+        )
+    )
+    delivery_edge_distance_km = (
+        _ofes_delivery_edge_distance_km(
+            lon_grid,
+            lat_grid,
+            float(lon[0]),
+            float(lon[-1]),
+            float(lat[0]),
+            float(lat[-1]),
+        )
+    )
+    candidate = (
+        (
+            event_distance_km
+            >= float(
+                settings[
+                    'negative_control_distance_min_km'
+                ]
+            )
+        )
+        & (
+            event_distance_km
+            <= float(
+                settings[
+                    'negative_control_distance_max_km'
+                ]
+            )
+        )
+        & (
+            np.abs(lat_grid - float(event_lat))
+            <= float(
+                settings[
+                    'negative_control_latitude_tolerance_deg'
+                ]
+            )
+        )
+        & (
+            nearest_do20_distance_km
+            >= float(
+                settings[
+                    'negative_control_do20_exclusion_radius_km'
+                ]
+            )
+        )
+        & (
+            delivery_edge_distance_km
+            >= float(settings['background_outer_radius_km'])
+        )
+        & np.isfinite(sigma0)
+        & np.isfinite(theta)
+        & np.isfinite(salinity)
+        & np.isfinite(oxygen)
+        & np.isfinite(kinematic_fields['rossby_number'])
+        & np.isfinite(
+            kinematic_fields['normalized_strain']
+        )
+    )
+    stride = int(settings['negative_control_grid_stride'])
+    stride_mask = np.zeros(candidate.shape, dtype=bool)
+    stride_mask[::stride, ::stride] = True
+    candidate &= stride_mask
+
+    match_components = {
+        'match_sigma0_normalized': (
+            sigma0
+            - float(
+                event_peak_diagnostic[
+                    'background_sigma0_fixed'
+                ]
+            )
+        )
+        / float(settings['control_match_sigma0_scale']),
+        'match_theta_normalized': (
+            theta
+            - float(
+                event_peak_diagnostic[
+                    'background_theta_fixed'
+                ]
+            )
+        )
+        / float(
+            settings['control_match_theta_scale_deg_c']
+        ),
+        'match_salinity_normalized': (
+            salinity
+            - float(
+                event_peak_diagnostic[
+                    'background_salinity_fixed'
+                ]
+            )
+        )
+        / float(settings['control_match_salinity_scale']),
+        'match_do_normalized': (
+            oxygen
+            - float(
+                event_peak_diagnostic['background_do_fixed']
+            )
+        )
+        / float(
+            settings['control_match_do_scale_umol_kg']
+        ),
+        'match_vorticity_normalized': (
+            kinematic_fields['rossby_number']
+            - float(event_peak_diagnostic['rossby_number'])
+        )
+        / float(
+            settings['control_match_vorticity_scale']
+        ),
+        'match_strain_normalized': (
+            kinematic_fields['normalized_strain']
+            - float(
+                event_peak_diagnostic['normalized_strain']
+            )
+        )
+        / float(settings['control_match_strain_scale']),
+    }
+    match_score = np.sqrt(
+        sum(values**2 for values in match_components.values())
+    )
+    match_score[~candidate] = np.inf
+    if not np.any(np.isfinite(match_score)):
+        raise RuntimeError(
+            'No OFES negative-control candidate passed the '
+            'predeclared distance, DO20, and delivery-window gates.'
+        )
+    flat_index = int(np.argmin(match_score))
+    row, column = np.unravel_index(
+        flat_index, match_score.shape
+    )
+    result = {
+        'date': date_ts,
+        'lon': float(lon[column]),
+        'lat': float(lat[row]),
+        'reference_depth_m': delivered_depth,
+        'event_lon': float(event_lon),
+        'event_lat': float(event_lat),
+        'event_distance_km': float(
+            event_distance_km[row, column]
+        ),
+        'nearest_do20_peak_distance_km': float(
+            nearest_do20_distance_km[row, column]
+        ),
+        'delivery_edge_distance_km': float(
+            delivery_edge_distance_km[row, column]
+        ),
+        'candidate_count': int(np.count_nonzero(candidate)),
+        'match_score': float(match_score[row, column]),
+        'sigma0': float(sigma0[row, column]),
+        'theta': float(theta[row, column]),
+        'salinity': float(salinity[row, column]),
+        'do': float(oxygen[row, column]),
+        'rossby_number': float(
+            kinematic_fields['rossby_number'][row, column]
+        ),
+        'normalized_strain': float(
+            kinematic_fields['normalized_strain'][
+                row, column
+            ]
+        ),
+    }
+    for key, values in match_components.items():
+        result[key] = float(values[row, column])
+    return result
+
+
+def _ofes_event_diagnostic_summary(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+) -> pd.DataFrame:
+    """把逐日水团诊断汇总到预锁定候选事件。"""
+    records: list[dict] = []
+    for event in selected_events.itertuples(index=False):
+        group = daily_diagnostics.loc[
+            daily_diagnostics['event_id'] == event.event_id
+        ].sort_values('date', kind='mergesort')
+        peak_rows = group.loc[
+            group['daily_object_key']
+            == event.peak_daily_object_key
+        ]
+        if len(peak_rows) != 1:
+            raise RuntimeError(
+                f'Expected one peak diagnostic for {event.event_id}.'
+            )
+        peak = peak_rows.iloc[0]
+        passed = group.loc[group['diagnostic_passed']]
+        records.append(
+            {
+                'event_id': str(event.event_id),
+                'raw_rank_within_threshold': int(
+                    event.rank_within_threshold
+                ),
+                'quality_rank_within_threshold': int(
+                    event.quality_rank_within_threshold
+                ),
+                'start_date': pd.Timestamp(event.start_date),
+                'peak_date': pd.Timestamp(event.peak_date),
+                'end_date': pd.Timestamp(event.end_date),
+                'observed_days': int(event.observed_days),
+                'diagnosed_days': int(len(group)),
+                'passed_days': int(len(passed)),
+                'all_sampled_days_passed': bool(
+                    len(passed) == len(group)
+                ),
+                'peak_target_sigma0': float(
+                    peak['target_sigma0']
+                ),
+                'peak_fixed_depth_do_contrast': float(
+                    peak['fixed_depth_do_contrast']
+                ),
+                'peak_water_mass_do_contrast': float(
+                    peak['water_mass_do_contrast']
+                ),
+                'peak_heave_do_contribution': float(
+                    peak['heave_do_contribution']
+                ),
+                'peak_same_sigma_theta_contrast': float(
+                    peak['same_sigma_theta_contrast']
+                ),
+                'peak_same_sigma_salinity_contrast': float(
+                    peak['same_sigma_salinity_contrast']
+                ),
+                'peak_same_sigma_spiciness0_contrast': float(
+                    peak['same_sigma_spiciness0_contrast']
+                ),
+                'peak_same_sigma_aou_contrast': float(
+                    peak['same_sigma_aou_contrast']
+                ),
+                'peak_n2_ratio_core_to_background': float(
+                    peak['n2_ratio_core_to_background']
+                ),
+                'peak_rossby_number': float(
+                    peak['rossby_number']
+                ),
+                'peak_normalized_strain': float(
+                    peak['normalized_strain']
+                ),
+                'peak_normalized_okubo_weiss': float(
+                    peak['normalized_okubo_weiss']
+                ),
+                'median_fixed_depth_do_contrast': float(
+                    passed[
+                        'fixed_depth_do_contrast'
+                    ].median()
+                ),
+                'median_water_mass_do_contrast': float(
+                    passed['water_mass_do_contrast'].median()
+                ),
+                'median_heave_do_contribution': float(
+                    passed['heave_do_contribution'].median()
+                ),
+                'maximum_abs_decomposition_closure_error': (
+                    float(
+                        group[
+                            'decomposition_closure_error'
+                        ].abs().max()
+                    )
+                ),
+                'background_annulus_clipped_days': int(
+                    np.count_nonzero(
+                        ~group[
+                            'background_annulus_within_delivery_window'
+                        ]
+                    )
+                ),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+
+
+def diagnose_ofes_ranked_events(
+    catalog_dir: str | Path | None = None,
+    *,
+    diagnostic_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """诊断客观排名 OFES 事件的等密度水团、heave、动力量与负对照。
+
+    入口先从完整年度 catalog 排除触及 900 x 600 交付边界的截断事件，再按
+    原定 score 重排并固定 DO50 前五名。每个事件最多诊断 31 个观测日，核心
+    取逐日对象最大 ΔDO 列，参考层固定为事件峰值 depth；同日 120–240 km
+    环带给出精确的固定 depth DO = 同密度水团项 + heave 项分解。第一名
+    事件另按预声明的六维水团/动力距离选择一个无 DO20 的空间负对照。
+
+    参数:
+        - catalog_dir (str | Path | None): event catalog 目录；None 时读取固定正式目录。
+        - diagnostic_overrides (dict | None): 临时覆盖已声明的 event_diagnostics 配置。
+        - output_dir (str | Path | None): 诊断输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、总结、边界审计、质量 catalog、固定候选、逐日/事件诊断与负对照表。
+
+    输出:
+        - `<output_dir>/days/<event_id>_YYYYMMDD.parquet`。
+        - `<output_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet` 与 `analysis_summary.json`。
+
+    说明:
+        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–900 m 仅是另表敏感性排名。
+        - sigma0、spiciness0、氧饱和度与 N2 使用 TEOS-10；OFES temp 按交付位温解释。
+        - u/v 先在交付网格上以 1.5 像元 Gaussian 平滑，再计算相对涡度、总应变与 Okubo-Weiss。
+        - 负对照必须距事件 300–700 km、纬差不超过 3°、距任一 DO20 像元至少 100 km，且完整 240 km 环带留在交付窗口内。
+    """
+    catalog_root = (
+        Path(catalog_dir)
+        if catalog_dir is not None
+        else _ofes_analysis_output_dir('event_catalog')
+    )
+    settings = _ofes_event_diagnostic_settings(
+        diagnostic_overrides
+    )
+    catalog_thresholds = {
+        float(value)
+        for value in _ofes_delta_do_catalog_settings()[
+            'thresholds'
+        ]
+    }
+    if (
+        float(settings['candidate_threshold'])
+        not in catalog_thresholds
+    ):
+        raise ValueError(
+            'The diagnostic candidate threshold is absent from '
+            'the catalog.'
+        )
+    quality_events, linked_objects, quality_audit = (
+        _ofes_quality_event_catalog(
+            catalog_root, settings
+        )
+    )
+    selected_events = quality_events.loc[
+        (
+            quality_events['threshold']
+            == float(settings['candidate_threshold'])
+        )
+        & quality_events['quality_eligible']
+    ].sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).head(int(settings['candidate_count'])).copy()
+    selected_events['selected_candidate'] = True
+
+    sampled_frames: list[pd.DataFrame] = []
+    for event in selected_events.itertuples(index=False):
+        event_objects = linked_objects.loc[
+            linked_objects['event_id'] == event.event_id
+        ]
+        sampled = _ofes_sample_event_objects(
+            event_objects,
+            str(event.peak_daily_object_key),
+            int(settings['maximum_sampled_event_days']),
+        )
+        sampled['quality_rank_within_threshold'] = int(
+            event.quality_rank_within_threshold
+        )
+        sampled['raw_rank_within_threshold'] = int(
+            event.rank_within_threshold
+        )
+        sampled['event_peak_depth_m'] = float(
+            event.peak_depth_m
+        )
+        sampled['event_peak_daily_object_key'] = str(
+            event.peak_daily_object_key
+        )
+        sampled_frames.append(sampled)
+    sampled_objects = pd.concat(
+        sampled_frames, ignore_index=True
+    )
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    days_dir = output_path / 'days'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'quality_event_catalog.parquet',
+        output_path / 'selected_events.parquet',
+        output_path / 'deep_sensitivity_ranking.parquet',
+        output_path / 'daily_diagnostics.parquet',
+        output_path / 'event_diagnostic_summary.parquet',
+        output_path / 'negative_control.parquet',
+        output_path / 'negative_control_diagnostic.parquet',
+        output_path / 'analysis_summary.json',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_diagnostics(output_dir=output_path)
+        expected_events = [str(value) for value in selected_events['event_id']]
+        stored_events = [str(value) for value in loaded['selected_events']['event_id']]
+        if stored_events != expected_events:
+            raise RuntimeError(
+                'Existing output was created for a different event request. '
+                'Use another output_dir or remove the existing directory.'
+            )
+        expected_pairs = {
+            (
+                str(row.event_id),
+                pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+            )
+            for row in sampled_objects.itertuples(index=False)
+        }
+        stored_pairs = {
+            (
+                str(row.event_id),
+                pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+            )
+            for row in loaded['daily_diagnostics'].itertuples(index=False)
+        }
+        if stored_pairs != expected_pairs:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['summary'] = loaded['analysis_summary']
+        loaded['quality_audit'] = loaded['analysis_summary'].get(
+            'quality_audit'
+        )
+        loaded['reused_complete_run'] = True
+        return loaded
+    _atomic_write_parquet(
+        quality_events,
+        output_path / 'quality_event_catalog.parquet',
+    )
+    _atomic_write_parquet(
+        selected_events,
+        output_path / 'selected_events.parquet',
+    )
+    deep_ranking = quality_events.loc[
+        quality_events['deep_sensitivity_eligible']
+    ].sort_values(
+        [
+            'threshold',
+            'deep_sensitivity_rank_within_threshold',
+        ],
+        kind='mergesort',
+    )
+    _atomic_write_parquet(
+        deep_ranking,
+        output_path / 'deep_sensitivity_ranking.parquet',
+    )
+
+    daily_frames: list[pd.DataFrame] = []
+    completed_fragments = 0
+    for row in sampled_objects.itertuples(index=False):
+        date = pd.Timestamp(row.date).normalize()
+        fragment_path = (
+            days_dir
+            / (
+                f'{row.event_id}_'
+                f'{date:%Y%m%d}.parquet'
+            )
+        )
+        reused = False
+        if fragment_path.exists():
+            frame = pd.read_parquet(fragment_path)
+            if (
+                len(frame) == 1
+                and _ofes_assert_fragment_request(
+                    frame, str(row.event_id), date
+                )
+                and frame.iloc[0]['daily_object_key']
+                == row.daily_object_key
+            ):
+                reused = True
+        if not reused:
+            diagnosis = _ofes_diagnose_water_mass_day(
+                date,
+                float(row.peak_lon),
+                float(row.peak_lat),
+                float(row.event_peak_depth_m),
+                settings,
+            )
+            diagnosis.update(
+                {
+                    'event_id': str(row.event_id),
+                    'threshold': float(row.threshold),
+                    'raw_rank_within_threshold': int(
+                        row.raw_rank_within_threshold
+                    ),
+                    'quality_rank_within_threshold': int(
+                        row.quality_rank_within_threshold
+                    ),
+                    'daily_object_key': str(
+                        row.daily_object_key
+                    ),
+                    'diagnostic_sample_index': int(
+                        row.diagnostic_sample_index
+                    ),
+                    'event_day_index': int(
+                        row.event_day_index
+                    ),
+                    'event_peak_daily_object_key': str(
+                        row.event_peak_daily_object_key
+                    ),
+                    'catalog_delta_do': float(
+                        row.delta_do_max
+                    ),
+                    'daily_peak_depth_m': float(
+                        row.peak_depth_at_max
+                    ),
+                    'daily_object_area_km2': float(
+                        row.area_km2
+                    ),
+                    'daily_object_pixel_count': int(
+                        row.pixel_count
+                    ),
+                }
+            )
+            frame = pd.DataFrame([diagnosis])
+            _atomic_write_parquet(frame, fragment_path)
+        daily_frames.append(frame)
+        completed_fragments += 1
+        if (
+            completed_fragments == 1
+            or completed_fragments == len(sampled_objects)
+            or completed_fragments % 10 == 0
+        ):
+            print(
+                '[OFES diagnostics] '
+                f'{completed_fragments:03d}/'
+                f'{len(sampled_objects):03d} '
+                f'{row.event_id} {date:%Y-%m-%d} '
+                f'({"reused" if reused else "diagnosed"})'
+            )
+
+    daily_diagnostics = pd.concat(
+        daily_frames, ignore_index=True
+    )
+    daily_diagnostics = daily_diagnostics.sort_values(
+        [
+            'quality_rank_within_threshold',
+            'date',
+        ],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    event_summary = _ofes_event_diagnostic_summary(
+        selected_events, daily_diagnostics
+    )
+    _atomic_write_parquet(
+        daily_diagnostics,
+        output_path / 'daily_diagnostics.parquet',
+    )
+    _atomic_write_parquet(
+        event_summary,
+        output_path / 'event_diagnostic_summary.parquet',
+    )
+
+    headline_event = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).iloc[0]
+    headline_peak_rows = daily_diagnostics.loc[
+        daily_diagnostics['daily_object_key']
+        == headline_event['peak_daily_object_key']
+    ]
+    if len(headline_peak_rows) != 1:
+        raise RuntimeError(
+            'The headline event lacks exactly one peak diagnosis.'
+        )
+    headline_peak = headline_peak_rows.iloc[0]
+    if not bool(headline_peak['diagnostic_passed']):
+        raise RuntimeError(
+            'The headline peak failed the water-mass diagnostic '
+            'gate; the candidate is retained but a matched '
+            'negative control cannot be defined.'
+        )
+    negative_control = _ofes_select_negative_control(
+        catalog_root,
+        headline_event['peak_date'],
+        float(headline_event['peak_lon']),
+        float(headline_event['peak_lat']),
+        float(headline_event['peak_depth_m']),
+        headline_peak.to_dict(),
+        settings,
+    )
+    negative_control.update(
+        {
+            'control_id': (
+                f"{headline_event['event_id']}_CONTROL"
+            ),
+            'event_id': str(headline_event['event_id']),
+            'quality_rank_within_threshold': int(
+                headline_event[
+                    'quality_rank_within_threshold'
+                ]
+            ),
+        }
+    )
+    negative_control_frame = pd.DataFrame(
+        [negative_control]
+    )
+    control_diagnosis = _ofes_diagnose_water_mass_day(
+        negative_control['date'],
+        float(negative_control['lon']),
+        float(negative_control['lat']),
+        float(
+            negative_control[
+                'reference_depth_m'
+            ]
+        ),
+        settings,
+    )
+    control_diagnosis.update(
+        {
+            'control_id': negative_control['control_id'],
+            'event_id': str(headline_event['event_id']),
+            'role': 'matched_negative_control',
+        }
+    )
+    control_diagnostic_frame = pd.DataFrame(
+        [control_diagnosis]
+    )
+    _atomic_write_parquet(
+        negative_control_frame,
+        output_path / 'negative_control.parquet',
+    )
+    _atomic_write_parquet(
+        control_diagnostic_frame,
+        output_path / 'negative_control_diagnostic.parquet',
+    )
+
+    diagnostic_gate_passed = bool(
+        daily_diagnostics['diagnostic_passed'].all()
+        and control_diagnostic_frame[
+            'diagnostic_passed'
+        ].all()
+    )
+    summary = {
+        'generated_at_utc': pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat(),
+        'quality_audit': quality_audit,
+        'daily_diagnostic_rows': int(
+            len(daily_diagnostics)
+        ),
+        'selected_event_count': int(
+            len(selected_events)
+        ),
+        'diagnostic_gate_passed': diagnostic_gate_passed,
+        'failed_daily_diagnostic_count': int(
+            np.count_nonzero(
+                ~daily_diagnostics['diagnostic_passed']
+            )
+        ),
+        'negative_control_passed': bool(
+            control_diagnostic_frame.iloc[0][
+                'diagnostic_passed'
+            ]
+        ),
+    }
+    _ofes_atomic_write_json(
+        summary, output_path / 'analysis_summary.json'
+    )
+
+    return {
+        'output_dir': output_path,
+        'summary': summary,
+        'quality_audit': quality_audit,
+        'quality_event_catalog': quality_events,
+        'selected_events': selected_events,
+        'deep_sensitivity_ranking': deep_ranking,
+        'daily_diagnostics': daily_diagnostics,
+        'event_diagnostic_summary': event_summary,
+        'negative_control': negative_control_frame,
+        'negative_control_diagnostic': (
+            control_diagnostic_frame
+        ),
+    }
+
+
+def diagnose_ofes_quality_eligible_events(
+    catalog_dir: str | Path | None = None,
+    *,
+    diagnostic_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """运行当前 DO50 quality-eligible 事件的完整水团诊断 census。
+
+    该入口复用 `diagnose_ofes_ranked_events` 的逐日诊断和负对照实现，
+    但把候选集合从排名前几名扩展为当前 catalog 中全部 quality-eligible
+    的 DO50 事件。事件数量、日期范围和完成差集都从输入产物自然派生。
+
+    参数:
+        - catalog_dir (str | Path | None): event catalog 目录；None 使用固定正式目录。
+        - diagnostic_overrides (dict | None): 临时覆盖已声明的 event_diagnostics 参数。
+        - output_dir (str | Path | None): census 输出目录；None 使用固定 `quality_event_diagnostics` 目录。
+
+    返回:
+        - dict: 含完整 quality-event 表、逐日诊断、负对照、summary 和 output_dir。
+
+    输出:
+        - 固定输出目录中的 parquet 表和 `analysis_summary.json`；无原始 OFES 数据写入仓库。
+
+    说明:
+        - 这是当前 quality-eligible 集合的结果 census，不把本次事件数量写成永久运行门。
+        - peak-day 诊断沿用同一正式函数；水团、heave 和动力字段保持与排名入口一致。
+    """
+    catalog_root = (
+        Path(catalog_dir)
+        if catalog_dir is not None
+        else _ofes_analysis_output_dir('event_catalog')
+    )
+    settings = _ofes_event_diagnostic_settings(diagnostic_overrides)
+    quality_events, _, _ = _ofes_quality_event_catalog(
+        catalog_root, settings
+    )
+    eligible = quality_events.loc[
+        quality_events['threshold'].eq(float(settings['candidate_threshold']))
+        & quality_events['quality_eligible']
+    ]
+    if eligible.empty:
+        raise RuntimeError(
+            'OFES quality census found no current eligible events at the '
+            f'{settings["candidate_threshold"]:g} threshold.'
+        )
+    overrides = dict(diagnostic_overrides or {})
+    overrides['candidate_count'] = int(len(eligible))
+    result = diagnose_ofes_ranked_events(
+        catalog_dir=catalog_root,
+        diagnostic_overrides=overrides,
+        output_dir=(
+            output_dir
+            if output_dir is not None
+            else _ofes_analysis_output_path('quality_event_diagnostics')
+        ),
+    )
+    result['event_scope'] = 'quality_eligible'
+    result['summary']['event_scope'] = 'quality_eligible'
+    result['summary']['requested_event_count'] = int(len(eligible))
+    result['summary']['requested_date_range'] = [
+        pd.Timestamp(eligible['start_date'].min()).strftime('%Y-%m-%d'),
+        pd.Timestamp(eligible['end_date'].max()).strftime('%Y-%m-%d'),
+    ]
+    if 'analysis_summary' in result:
+        result['analysis_summary'] = result['summary']
+    _ofes_atomic_write_json(
+        result['summary'],
+        Path(result['output_dir']) / 'analysis_summary.json',
+    )
+    return result
+
+
+
+def _ofes_event_population_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 深层事件总体诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_population', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_population override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'candidate_threshold': float(
+            raw.get('candidate_threshold', 50.0)
+        ),
+        'heave_important_absolute_fraction_min': float(
+            raw.get('heave_important_absolute_fraction_min', 1 / 3)
+        ),
+        'surface_search_radius_km': float(
+            raw.get('surface_search_radius_km', 50.0)
+        ),
+        'surface_weight_scale_factor': float(
+            raw.get('surface_weight_scale_factor', 1.0)
+        ),
+        'surface_weight_support_factor': float(
+            raw.get('surface_weight_support_factor', 2.0)
+        ),
+        'surface_attenuation_ratio_max': float(
+            raw.get('surface_attenuation_ratio_max', 0.5)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_population')
+        ),
+    }
+    if (
+        not np.isfinite(settings['candidate_threshold'])
+        or settings['candidate_threshold'] <= 0
+    ):
+        raise ValueError(
+            'OFES population candidate_threshold must be positive.'
+        )
+    heave_fraction = settings[
+        'heave_important_absolute_fraction_min'
+    ]
+    if (
+        not np.isfinite(heave_fraction)
+        or not 0 < heave_fraction <= 0.5
+    ):
+        raise ValueError(
+            'OFES heave-important fraction must lie in (0, 0.5].'
+        )
+    ratio = settings['surface_attenuation_ratio_max']
+    if not np.isfinite(ratio) or not 0 < ratio < 1:
+        raise ValueError(
+            'OFES surface attenuation ratio must lie between 0 and 1.'
+        )
+    search_radius = settings['surface_search_radius_km']
+    if (
+        not np.isfinite(search_radius)
+        or search_radius <= 0
+        or search_radius
+        >= float(
+            _ofes_event_diagnostic_settings()[
+                'background_inner_radius_km'
+            ]
+        )
+    ):
+        raise ValueError(
+            'OFES surface search radius must be positive and smaller '
+            'than the diagnostic background inner radius.'
+        )
+    for key in (
+        'surface_weight_scale_factor',
+        'surface_weight_support_factor',
+    ):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(
+                f'OFES population {key} must be finite and positive.'
+            )
+    if settings['surface_weight_support_factor'] <= 1:
+        raise ValueError(
+            'OFES surface weight support factor must exceed 1.'
+        )
+    if settings['figure_dpi'] <= 0:
+        raise ValueError('OFES population figure_dpi must be positive.')
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES population output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_surface_expression_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    subsurface_rossby_number: float,
+    event_equivalent_radius_km: float,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> dict:
+    """诊断事件核心同日 SSH 异常与最上层速度梯度。"""
+    date_ts = pd.Timestamp(date).normalize()
+    outer_radius = float(
+        diagnostic_settings['background_outer_radius_km']
+    )
+    load_radius = (
+        outer_radius
+        + float(
+            diagnostic_settings['background_load_margin_km']
+        )
+    )
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    surface_depth = float(_ofes_tracer_coordinates(date_ts)[2][0])
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['eta', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+        depth_bounds=(surface_depth, surface_depth),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(core_lon),
+                float(core_lat),
+                force_great_circle=True,
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    background_mask = (
+        distance_km
+        >= float(diagnostic_settings['background_inner_radius_km'])
+    ) & (distance_km <= outer_radius)
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, float(core_lon)))
+        )
+    )
+    eta = np.asarray(snapshot['eta'], dtype=float)
+    eta_valid = background_mask & np.isfinite(eta)
+    valid_count = int(np.count_nonzero(eta_valid))
+    eta_background = (
+        float(np.median(eta[eta_valid]))
+        if valid_count
+        else np.nan
+    )
+    eta_core = float(eta[row, column])
+    kinematic_fields = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        surface_depth,
+        float(
+            diagnostic_settings['velocity_smoothing_sigma_pixels']
+        ),
+    )
+    kinematics = _ofes_kinematics_at_point(
+        kinematic_fields,
+        lon,
+        lat,
+        float(lon[column]),
+        float(lat[row]),
+    )
+    search_radius = float(
+        population_settings['surface_search_radius_km']
+    )
+    surface_rossby = np.asarray(
+        kinematic_fields['rossby_number'], dtype=float
+    )
+    local_mask = (
+        (distance_km <= search_radius)
+        & np.isfinite(surface_rossby)
+    )
+    subsurface_sign = np.sign(float(subsurface_rossby_number))
+    same_sign_mask = (
+        local_mask
+        & (surface_rossby * subsurface_sign > 0)
+    )
+    if np.count_nonzero(same_sign_mask):
+        candidate_rows, candidate_columns = np.nonzero(
+            same_sign_mask
+        )
+        candidate_values = np.abs(
+            surface_rossby[same_sign_mask]
+        )
+        choice = int(np.argmax(candidate_values))
+        nearby_row = int(candidate_rows[choice])
+        nearby_column = int(candidate_columns[choice])
+        nearby_abs_rossby = float(candidate_values[choice])
+        nearby_distance = float(
+            distance_km[nearby_row, nearby_column]
+        )
+    else:
+        nearby_abs_rossby = 0.0
+        nearby_distance = np.nan
+    if (
+        not np.isfinite(event_equivalent_radius_km)
+        or float(event_equivalent_radius_km) <= 0
+    ):
+        raise ValueError(
+            'OFES peak-event equivalent radius must be positive.'
+        )
+    weight_scale = (
+        float(event_equivalent_radius_km)
+        * float(population_settings['surface_weight_scale_factor'])
+    )
+    weight_support = (
+        weight_scale
+        * float(population_settings['surface_weight_support_factor'])
+    )
+    if weight_support >= float(
+        diagnostic_settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES surface core-weight support overlaps the background '
+            'annulus.'
+        )
+    weight_mask = (
+        (distance_km <= weight_support)
+        & np.isfinite(surface_rossby)
+    )
+    weights = np.exp(
+        -0.5 * (distance_km[weight_mask] / weight_scale) ** 2
+    )
+    weighted_surface_rossby = (
+        float(
+            np.sum(weights * surface_rossby[weight_mask])
+            / np.sum(weights)
+        )
+        if weights.size and float(np.sum(weights)) > 0
+        else np.nan
+    )
+    required = (
+        eta_core,
+        eta_background,
+        kinematics['rossby_number'],
+        kinematics['normalized_strain'],
+        kinematics['normalized_okubo_weiss'],
+        weighted_surface_rossby,
+    )
+    failure_reasons: list[str] = []
+    if valid_count < int(
+        diagnostic_settings['background_min_valid_columns']
+    ):
+        failure_reasons.append('insufficient_surface_background_columns')
+    if not all(np.isfinite(value) for value in required):
+        failure_reasons.append('nonfinite_surface_metric')
+    return {
+        'surface_depth_m': surface_depth,
+        'surface_eta_core_m': eta_core,
+        'surface_eta_background_median_m': eta_background,
+        'surface_eta_contrast_m': float(
+            eta_core - eta_background
+        ),
+        'surface_background_valid_columns': valid_count,
+        'surface_speed_m_s': float(kinematics['speed_m_s']),
+        'surface_relative_vorticity_s_1': float(
+            kinematics['relative_vorticity_s_1']
+        ),
+        'surface_rossby_number': float(
+            kinematics['rossby_number']
+        ),
+        'surface_normalized_strain': float(
+            kinematics['normalized_strain']
+        ),
+        'surface_normalized_okubo_weiss': float(
+            kinematics['normalized_okubo_weiss']
+        ),
+        'surface_search_radius_km': search_radius,
+        'surface_same_sign_abs_rossby_max': nearby_abs_rossby,
+        'surface_same_sign_abs_rossby_max_distance_km': (
+            nearby_distance
+        ),
+        'surface_weight_scale_km': weight_scale,
+        'surface_weight_support_km': weight_support,
+        'surface_core_weighted_rossby_number': (
+            weighted_surface_rossby
+        ),
+        'surface_diagnostic_passed': bool(not failure_reasons),
+        'surface_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(dict.fromkeys(failure_reasons))
+        ),
+    }
+
+
+def _ofes_add_surface_rotation_metrics(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """以 population 原口径添加深浅层旋转与表层表达分类。"""
+    result = diagnostics.copy()
+    result['absolute_subsurface_rossby_number'] = (
+        result['rossby_number'].abs()
+    )
+    result['absolute_surface_rossby_number'] = (
+        result['surface_rossby_number'].abs()
+    )
+    result['absolute_surface_core_weighted_rossby_number'] = (
+        result['surface_core_weighted_rossby_number'].abs()
+    )
+    result[
+        'surface_to_subsurface_colocated_rotation_ratio'
+    ] = np.divide(
+        result['absolute_surface_rossby_number'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result[
+        'surface_to_subsurface_nearby_rotation_ratio'
+    ] = np.divide(
+        result['surface_same_sign_abs_rossby_max'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result[
+        'surface_to_subsurface_core_weighted_rotation_ratio'
+    ] = np.divide(
+        result['absolute_surface_core_weighted_rossby_number'],
+        result['absolute_subsurface_rossby_number'],
+        out=np.full(len(result), np.nan, dtype=float),
+        where=(
+            result['absolute_subsurface_rossby_number']
+            .to_numpy(dtype=float)
+            > 0
+        ),
+    )
+    result['rotation_dominated'] = (
+        result['absolute_subsurface_rossby_number']
+        > result['normalized_strain']
+    )
+    result['kinematic_regime'] = np.select(
+        [
+            result['absolute_subsurface_rossby_number']
+            > result['normalized_strain'],
+            result['normalized_strain']
+            > result['absolute_subsurface_rossby_number'],
+        ],
+        ['rotation_dominated', 'strain_dominated'],
+        default='balanced',
+    )
+    result['negative_subsurface_rossby_number'] = (
+        result['rossby_number'] < 0
+    )
+    result['surface_core_rotation_polarity_match'] = (
+        result['surface_core_weighted_rossby_number']
+        * result['rossby_number']
+        > 0
+    )
+    result['surface_attenuated_rotation'] = (
+        result['rotation_dominated']
+        & result['surface_core_rotation_polarity_match']
+        & (
+            result[
+                'surface_to_subsurface_core_weighted_rotation_ratio'
+            ]
+            <= float(settings['surface_attenuation_ratio_max'])
+        )
+    )
+    result['surface_weak_or_reversed_rotation'] = (
+        result['rotation_dominated']
+        & (
+            ~result['surface_core_rotation_polarity_match']
+            | (
+                result[
+                    'surface_to_subsurface_core_weighted_rotation_ratio'
+                ]
+                <= float(settings['surface_attenuation_ratio_max'])
+            )
+        )
+    )
+    colocated_polarity_match = (
+        result['surface_rossby_number'] * result['rossby_number'] > 0
+    )
+    colocated_weak_or_reversed = (
+        result['rotation_dominated']
+        & (
+            ~colocated_polarity_match
+            | (
+                result[
+                    'surface_to_subsurface_colocated_rotation_ratio'
+                ]
+                <= float(settings['surface_attenuation_ratio_max'])
+            )
+        )
+    )
+    result['surface_colocated_rotation_polarity_match'] = (
+        colocated_polarity_match
+    )
+    result['surface_colocated_weak_or_reversed_rotation'] = (
+        colocated_weak_or_reversed
+    )
+    result['surface_spatial_offset_rotation'] = (
+        colocated_weak_or_reversed
+        & ~result['surface_weak_or_reversed_rotation']
+    )
+    return result
+
+
+def _ofes_add_population_metrics(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """为峰值诊断表添加连续比率和透明的运算分类。"""
+    result = diagnostics.copy()
+    water_mass_abs = result['water_mass_do_contrast'].abs()
+    heave_abs = result['heave_do_contribution'].abs()
+    contribution_total = water_mass_abs + heave_abs
+    result['water_mass_absolute_fraction'] = np.divide(
+        water_mass_abs,
+        contribution_total,
+        out=np.full(len(result), np.nan, dtype=float),
+        where=contribution_total.to_numpy(dtype=float) > 0,
+    )
+    result['heave_absolute_fraction'] = (
+        1.0 - result['water_mass_absolute_fraction']
+    )
+    result['water_mass_dominated'] = (
+        water_mass_abs > heave_abs
+    )
+    result['heave_important'] = (
+        result['heave_absolute_fraction']
+        >= float(
+            settings['heave_important_absolute_fraction_min']
+        )
+    )
+    result['contribution_regime'] = np.select(
+        [water_mass_abs > heave_abs, heave_abs > water_mass_abs],
+        ['water_mass_dominated', 'heave_dominated'],
+        default='balanced',
+    )
+    result['low_salinity_fingerprint'] = (
+        result['same_sigma_salinity_contrast'] < 0
+    )
+    result['low_aou_fingerprint'] = (
+        result['same_sigma_aou_contrast'] < 0
+    )
+    result['weak_n2_fingerprint'] = (
+        result['n2_ratio_core_to_background'] < 1
+    )
+    result['joint_water_mass_fingerprint'] = (
+        result['low_salinity_fingerprint']
+        & result['low_aou_fingerprint']
+        & result['weak_n2_fingerprint']
+    )
+    result = _ofes_add_surface_rotation_metrics(result, settings)
+    result['absolute_surface_eta_contrast_m'] = (
+        result['surface_eta_contrast_m'].abs()
+    )
+    result['population_diagnostic_passed'] = (
+        result['diagnostic_passed']
+        & result['surface_diagnostic_passed']
+        & result['background_annulus_within_delivery_window']
+    )
+    result['population_diagnostic_status'] = np.select(
+        [
+            ~result['diagnostic_passed'],
+            ~result['surface_diagnostic_passed'],
+            ~result['background_annulus_within_delivery_window'],
+        ],
+        [
+            'failed_subsurface_diagnostic',
+            'failed_surface_diagnostic',
+            'delivery_edge_clipped_background',
+        ],
+        default='passed',
+    )
+    return result
+
+
+def _ofes_population_boolean_summary(
+    values: pd.Series,
+) -> dict:
+    """返回布尔指标的计数、比例与 95% Wilson 区间。"""
+    clean = values.dropna().astype(bool)
+    total = int(len(clean))
+    successes = int(clean.sum())
+    if total == 0:
+        return {
+            'count': 0,
+            'total': 0,
+            'fraction': None,
+            'wilson95': [None, None],
+        }
+    proportion = successes / total
+    z_value = 1.959963984540054
+    denominator = 1 + z_value**2 / total
+    center = (
+        proportion + z_value**2 / (2 * total)
+    ) / denominator
+    half_width = (
+        z_value
+        * np.sqrt(
+            proportion * (1 - proportion) / total
+            + z_value**2 / (4 * total**2)
+        )
+        / denominator
+    )
+    return {
+        'count': successes,
+        'total': total,
+        'fraction': float(proportion),
+        'wilson95': [
+            float(center - half_width),
+            float(center + half_width),
+        ],
+    }
+
+
+def _ofes_population_summary(
+    diagnostics: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """汇总 OFES 深层事件总体的比例、分布和秩相关。"""
+    passed = diagnostics.loc[
+        diagnostics['population_diagnostic_passed']
+    ].copy()
+    rotation = passed.loc[passed['rotation_dominated']]
+    polarity_matched_rotation = rotation.loc[
+        rotation['surface_core_rotation_polarity_match']
+    ]
+    proportions = {
+        'water_mass_dominated': _ofes_population_boolean_summary(
+            passed['water_mass_dominated']
+        ),
+        'heave_important': _ofes_population_boolean_summary(
+            passed['heave_important']
+        ),
+        'low_salinity_fingerprint': _ofes_population_boolean_summary(
+            passed['low_salinity_fingerprint']
+        ),
+        'low_aou_fingerprint': _ofes_population_boolean_summary(
+            passed['low_aou_fingerprint']
+        ),
+        'weak_n2_fingerprint': _ofes_population_boolean_summary(
+            passed['weak_n2_fingerprint']
+        ),
+        'joint_water_mass_fingerprint': (
+            _ofes_population_boolean_summary(
+                passed['joint_water_mass_fingerprint']
+            )
+        ),
+        'rotation_dominated': _ofes_population_boolean_summary(
+            passed['rotation_dominated']
+        ),
+        'anticyclonic_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['negative_subsurface_rossby_number']
+            )
+        ),
+        'surface_polarity_matched_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['surface_core_rotation_polarity_match']
+            )
+        ),
+        'surface_attenuated_among_polarity_matched_rotation': (
+            _ofes_population_boolean_summary(
+                polarity_matched_rotation[
+                    'surface_attenuated_rotation'
+                ]
+            )
+        ),
+        'surface_weak_or_reversed_among_rotation_dominated': (
+            _ofes_population_boolean_summary(
+                rotation['surface_weak_or_reversed_rotation']
+            )
+        ),
+    }
+    quantile_columns = (
+        'water_mass_absolute_fraction',
+        'heave_absolute_fraction',
+        'same_sigma_salinity_contrast',
+        'same_sigma_aou_contrast',
+        'n2_ratio_core_to_background',
+        'absolute_subsurface_rossby_number',
+        'normalized_strain',
+        'surface_to_subsurface_colocated_rotation_ratio',
+        'surface_to_subsurface_core_weighted_rotation_ratio',
+        'surface_to_subsurface_nearby_rotation_ratio',
+        'surface_eta_contrast_m',
+    )
+    distributions: dict[str, dict] = {}
+    for column in quantile_columns:
+        values = pd.to_numeric(
+            passed[column], errors='coerce'
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        if values.empty:
+            distributions[column] = {
+                'count': 0,
+                'q25': None,
+                'median': None,
+                'q75': None,
+            }
+        else:
+            distributions[column] = {
+                'count': int(len(values)),
+                'q25': float(values.quantile(0.25)),
+                'median': float(values.median()),
+                'q75': float(values.quantile(0.75)),
+            }
+
+    correlation_pairs = {
+        'delta_do_vs_subsurface_abs_rossby': (
+            'delta_do_max',
+            'absolute_subsurface_rossby_number',
+        ),
+        'delta_do_vs_normalized_strain': (
+            'delta_do_max',
+            'normalized_strain',
+        ),
+        'delta_do_vs_surface_abs_rossby': (
+            'delta_do_max',
+            'absolute_surface_rossby_number',
+        ),
+        'delta_do_vs_nearby_surface_abs_rossby': (
+            'delta_do_max',
+            'surface_same_sign_abs_rossby_max',
+        ),
+        'delta_do_vs_core_weighted_surface_abs_rossby': (
+            'delta_do_max',
+            'absolute_surface_core_weighted_rossby_number',
+        ),
+        'subsurface_vs_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'absolute_surface_rossby_number',
+        ),
+        'subsurface_vs_nearby_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'surface_same_sign_abs_rossby_max',
+        ),
+        'subsurface_vs_core_weighted_surface_abs_rossby': (
+            'absolute_subsurface_rossby_number',
+            'absolute_surface_core_weighted_rossby_number',
+        ),
+    }
+    correlations: dict[str, dict] = {}
+    for label, (x_name, y_name) in correlation_pairs.items():
+        pair = passed[[x_name, y_name]].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if (
+            len(pair) < 3
+            or pair[x_name].nunique() < 2
+            or pair[y_name].nunique() < 2
+        ):
+            correlations[label] = {
+                'count': int(len(pair)),
+                'spearman_rho': None,
+                'p_value': None,
+            }
+            continue
+        rho, p_value = spearmanr(
+            pair[x_name].to_numpy(dtype=float),
+            pair[y_name].to_numpy(dtype=float),
+        )
+        correlations[label] = {
+            'count': int(len(pair)),
+            'spearman_rho': float(rho),
+            'p_value': float(p_value),
+        }
+    return {
+        'event_count': int(len(diagnostics)),
+        'passed_event_count': int(len(passed)),
+        'failed_event_count': int(
+            len(diagnostics) - len(passed)
+        ),
+        'diagnostic_status_counts': {
+            str(key): int(value)
+            for key, value in diagnostics[
+                'population_diagnostic_status'
+            ].value_counts(dropna=False).items()
+        },
+        'candidate_threshold': float(
+            settings['candidate_threshold']
+        ),
+        'surface_attenuation_ratio_max': float(
+            settings['surface_attenuation_ratio_max']
+        ),
+        'surface_search_radius_km': float(
+            settings['surface_search_radius_km']
+        ),
+        'surface_weight_scale_factor': float(
+            settings['surface_weight_scale_factor']
+        ),
+        'surface_weight_support_factor': float(
+            settings['surface_weight_support_factor']
+        ),
+        'heave_important_absolute_fraction_min': float(
+            settings['heave_important_absolute_fraction_min']
+        ),
+        'operational_definitions': {
+            'water_mass_dominated': (
+                '|water-mass contribution| > |heave contribution|'
+            ),
+            'heave_important': (
+                '|heave| / (|water mass| + |heave|) >= '
+                f'{settings["heave_important_absolute_fraction_min"]:g}'
+            ),
+            'rotation_dominated': (
+                '|subsurface Rossby number| > normalized strain'
+            ),
+            'surface_attenuated_rotation': (
+                'rotation dominated, core-weighted surface and '
+                'subsurface Ro have the same sign, and their absolute '
+                'ratio <= '
+                f'{settings["surface_attenuation_ratio_max"]:g}'
+            ),
+            'surface_core_weighting': (
+                'Gaussian scale = peak anomaly area-equivalent radius '
+                f'x {settings["surface_weight_scale_factor"]:g}; '
+                'support = scale '
+                f'x {settings["surface_weight_support_factor"]:g}'
+            ),
+            'nearby_maximum_caveat': (
+                f'maximum same-sign surface Ro within '
+                f'{settings["surface_search_radius_km"]:g} km is retained '
+                'only as a permissive upper-envelope sensitivity'
+            ),
+            'joint_water_mass_fingerprint': (
+                'same-sigma salinity < 0, AOU < 0, and N2 ratio < 1'
+            ),
+            'aou_independence_caveat': (
+                'AOU directly contains DO and is not independent of the '
+                'positive-DO event detector'
+            ),
+            'wilson_interval_caveat': (
+                'Wilson intervals are descriptive because independence '
+                'among linked or recurrent events has not been established'
+            ),
+        },
+        'proportions': proportions,
+        'distributions': distributions,
+        'correlations': correlations,
+    }
+
+
+def _plot_ofes_event_population(
+    diagnostics: pd.DataFrame,
+    summary: dict,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制水团、动力、表层衰减和 tracer fingerprint 总体图。"""
+    passed = diagnostics.loc[
+        diagnostics['population_diagnostic_passed']
+    ].copy()
+    if passed.empty:
+        raise RuntimeError(
+            'No passed OFES population diagnostics are available to plot.'
+        )
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 10.5))
+
+    ax = axes[0, 0]
+    scatter = ax.scatter(
+        passed['water_mass_do_contrast'],
+        passed['heave_do_contribution'],
+        c=passed['peak_depth_m'],
+        cmap='viridis',
+        s=42,
+        alpha=0.82,
+    )
+    limit = float(
+        np.nanmax(
+            np.abs(
+                passed[
+                    [
+                        'water_mass_do_contrast',
+                        'heave_do_contribution',
+                    ]
+                ].to_numpy(dtype=float)
+            )
+        )
+    )
+    line = np.linspace(-limit, limit, 200)
+    ax.plot(line, line, '--', color='0.55', linewidth=1)
+    ax.plot(line, -line, '--', color='0.55', linewidth=1)
+    ax.axhline(0, color='0.8', linewidth=0.8)
+    ax.axvline(0, color='0.8', linewidth=0.8)
+    ax.set_xlabel('Water-mass DO contribution (µmol kg⁻¹)')
+    ax.set_ylabel('Heave DO contribution (µmol kg⁻¹)')
+    water = summary['proportions']['water_mass_dominated']
+    ax.set_title(
+        'A  Peak decomposition  '
+        f'({water["count"]}/{water["total"]} water-mass dominated)'
+    )
+    fig.colorbar(scatter, ax=ax, label='Peak depth (m)')
+
+    ax = axes[0, 1]
+    colors = np.where(
+        passed['rossby_number'] < 0,
+        '#2563eb',
+        '#dc2626',
+    )
+    ax.scatter(
+        passed['absolute_subsurface_rossby_number'],
+        passed['normalized_strain'],
+        c=colors,
+        s=42,
+        alpha=0.82,
+    )
+    maximum = float(
+        np.nanmax(
+            passed[
+                [
+                    'absolute_subsurface_rossby_number',
+                    'normalized_strain',
+                ]
+            ].to_numpy(dtype=float)
+        )
+    )
+    ax.plot([0, maximum], [0, maximum], '--', color='0.4')
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Subsurface |Rossby number|')
+    ax.set_ylabel('Subsurface normalized strain')
+    rotation = summary['proportions']['rotation_dominated']
+    ax.set_title(
+        'B  Subsurface kinematics  '
+        f'({rotation["count"]}/{rotation["total"]} rotation dominated)'
+    )
+    ax.legend(
+        handles=[
+            Line2D(
+                [], [], marker='o', linestyle='', color='#2563eb',
+                label='anticyclonic'
+            ),
+            Line2D(
+                [], [], marker='o', linestyle='', color='#dc2626',
+                label='cyclonic'
+            ),
+        ],
+        frameon=False,
+    )
+
+    ax = axes[1, 0]
+    eta_cm = 100.0 * passed['surface_eta_contrast_m']
+    eta_norm = Normalize(
+        vmin=float(eta_cm.min()),
+        vmax=float(eta_cm.max()),
+    )
+    rotation_rows = passed['rotation_dominated']
+    polarity_match_rows = (
+        rotation_rows
+        & passed['surface_core_rotation_polarity_match']
+    )
+    reversed_rows = rotation_rows & ~polarity_match_rows
+    surface_scatter = ax.scatter(
+        passed.loc[
+            polarity_match_rows,
+            'absolute_subsurface_rossby_number',
+        ],
+        passed.loc[
+            polarity_match_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[polarity_match_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=42,
+        alpha=0.82,
+        edgecolors='black',
+        linewidths=0.5,
+        label='rotation; polarity matched',
+    )
+    ax.scatter(
+        passed.loc[
+            reversed_rows, 'absolute_subsurface_rossby_number'
+        ],
+        passed.loc[
+            reversed_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[reversed_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=48,
+        alpha=0.9,
+        marker='s',
+        edgecolors='#7e22ce',
+        linewidths=1.2,
+        label='rotation; polarity reversed',
+    )
+    ax.scatter(
+        passed.loc[
+            ~rotation_rows, 'absolute_subsurface_rossby_number'
+        ],
+        passed.loc[
+            ~rotation_rows,
+            'absolute_surface_core_weighted_rossby_number',
+        ],
+        c=eta_cm.loc[~rotation_rows],
+        cmap='coolwarm',
+        norm=eta_norm,
+        s=42,
+        alpha=0.82,
+        marker='x',
+        label='strain dominated',
+    )
+    maximum = float(
+        np.nanmax(
+            passed[
+                [
+                    'absolute_subsurface_rossby_number',
+                    'absolute_surface_core_weighted_rossby_number',
+                ]
+            ].to_numpy(dtype=float)
+        )
+    )
+    ratio = float(summary['surface_attenuation_ratio_max'])
+    ax.plot([0, maximum], [0, maximum], '--', color='0.4')
+    ax.plot(
+        [0, maximum],
+        [0, ratio * maximum],
+        ':',
+        color='0.4',
+    )
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Subsurface |Rossby number|')
+    ax.set_ylabel('Core-weighted surface |Rossby number|')
+    decoupled = summary['proportions'][
+        'surface_weak_or_reversed_among_rotation_dominated'
+    ]
+    ax.set_title(
+        'C  Core-centered surface expression  '
+        f'({decoupled["count"]}/{decoupled["total"]} weak/reversed)'
+    )
+    ax.legend(frameon=False)
+    fig.colorbar(
+        surface_scatter,
+        ax=ax,
+        label='Core-minus-annulus SSH (cm)',
+    )
+
+    ax = axes[1, 1]
+    fingerprint_scatter = ax.scatter(
+        passed['same_sigma_salinity_contrast'],
+        passed['same_sigma_aou_contrast'],
+        c=passed['n2_ratio_core_to_background'],
+        cmap='cividis',
+        s=42,
+        alpha=0.82,
+    )
+    ax.axhline(0, color='0.5', linewidth=1)
+    ax.axvline(0, color='0.5', linewidth=1)
+    ax.set_xlabel('Same-σ salinity contrast')
+    ax.set_ylabel('Same-σ AOU contrast (µmol kg⁻¹)')
+    fingerprint = summary['proportions'][
+        'joint_water_mass_fingerprint'
+    ]
+    ax.set_title(
+        'D  Joint water-mass fingerprint  '
+        f'({fingerprint["count"]}/{fingerprint["total"]} joint)'
+    )
+    fig.colorbar(
+        fingerprint_scatter,
+        ax=ax,
+        label='Core/background N² ratio',
+    )
+    fig.suptitle(
+        'OFES DO50 deep-event population at objective peak dates',
+        fontsize=16,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(target, dpi=int(dpi), bbox_inches='tight')
+    plt.close(fig)
+    return target
+
+
+
+
+def generalize_ofes_deep_events(
+    diagnostic_dir: str | Path | None = None,
+    *,
+    population_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """OFES DO50 深层事件的峰值水团、动力与表层表达总体诊断。
+
+    入口只消费固定目录中的候选诊断结果及其年度 catalog，
+    选择当前 catalog 中 DO50、500–900 m 且诊断通过的事件。每个事件仅在
+    catalog peak 日诊断一次，并将深层水团/heave 分解与同日 SSH
+    环带异常、最上层涡度/应变及 50 km 内同极性涡度峰值合并成
+    event-level scalars。
+
+    参数:
+        - diagnostic_dir (str | Path | None): event diagnostics 目录；None 时读取固定正式目录。
+        - population_overrides (dict | None): 临时覆盖已声明的 event_population 配置。
+        - output_dir (str | Path | None): 总体诊断输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含当前事件输入表、峰值诊断表、总结和图件路径。
+
+    输出:
+        - `<output_dir>/events/<event_id>.parquet`。
+        - `<output_dir>/population_events.parquet`、`population_peak_diagnostics.parquet`、`population_summary.json` 和 `population_phase_space.png`。
+
+    说明:
+        - water-mass dominated 只指峰值日分解中水团项绝对值大于 heave 项，不是因果归因。
+        - rotation/strain 以同量纲的 |Ro| 与 strain/|f| 直接比较；表层衰减使用半径内同极性最大 |Ro|，仍只是运算标签，不同于已证实的 surface-blind SCV。
+        - AOU 包含 DO，与正 DO 事件检测器不独立；联合 fingerprint 只作水团描述，不当作额外独立证据。
+        - 该节点不启动轨迹、聚类、frontogenesis 或混合层诊断；后续方法由总体结果选择。
+    """
+    diagnostic_root = (
+        Path(diagnostic_dir)
+        if diagnostic_dir is not None
+        else _ofes_analysis_output_dir('event_diagnostics')
+    )
+    settings = _ofes_event_population_settings(
+        population_overrides
+    )
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    diagnostic_summary = json.loads(
+        (diagnostic_root / 'analysis_summary.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if not diagnostic_summary['diagnostic_gate_passed']:
+        raise RuntimeError(
+            'OFES population diagnostics require the ranked-event '
+            'diagnostic gate to pass.'
+        )
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+
+    deep_events = pd.read_parquet(
+        diagnostic_root / 'deep_sensitivity_ranking.parquet'
+    )
+    deep_events = deep_events.loc[
+        np.isclose(
+            deep_events['threshold'].to_numpy(dtype=float),
+            float(settings['candidate_threshold']),
+        )
+        & deep_events['deep_sensitivity_eligible']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    if deep_events.empty:
+        raise RuntimeError(
+            'OFES deep population contains no current quality-eligible events.'
+        )
+    if deep_events['event_id'].duplicated().any():
+        raise RuntimeError('OFES deep population contains duplicate events.')
+    linked_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    peak_objects = linked_objects.loc[
+        linked_objects['daily_object_key'].isin(
+            deep_events['peak_daily_object_key']
+        )
+    ].copy()
+    if (
+        len(peak_objects) != len(deep_events)
+        or peak_objects['daily_object_key'].duplicated().any()
+    ):
+        raise RuntimeError(
+            'OFES deep events do not map one-to-one to peak daily objects.'
+        )
+    peak_objects = peak_objects.rename(
+        columns={
+            'date': 'diagnostic_date',
+            'peak_lon': 'daily_peak_lon',
+            'peak_lat': 'daily_peak_lat',
+            'peak_depth_at_max': 'daily_peak_depth_m',
+            'delta_do_max': 'daily_peak_delta_do',
+            'area_km2': 'daily_peak_area_km2',
+            'equivalent_radius_km': (
+                'daily_peak_equivalent_radius_km'
+            ),
+            'pixel_count': 'daily_peak_pixel_count',
+        }
+    )
+    requests = deep_events.merge(
+        peak_objects[
+            [
+                'event_id',
+                'daily_object_key',
+                'diagnostic_date',
+                'daily_peak_lon',
+                'daily_peak_lat',
+                'daily_peak_depth_m',
+                'daily_peak_delta_do',
+                'daily_peak_area_km2',
+                'daily_peak_equivalent_radius_km',
+                'daily_peak_pixel_count',
+            ]
+        ],
+        left_on=['event_id', 'peak_daily_object_key'],
+        right_on=['event_id', 'daily_object_key'],
+        how='left',
+        validate='one_to_one',
+    )
+    if requests['diagnostic_date'].isna().any():
+        raise RuntimeError(
+            'At least one OFES population event lacks a peak object.'
+        )
+    if not np.array_equal(
+        pd.to_datetime(requests['diagnostic_date'])
+        .dt.normalize()
+        .to_numpy(),
+        pd.to_datetime(requests['peak_date'])
+        .dt.normalize()
+        .to_numpy(),
+    ):
+        raise RuntimeError(
+            'OFES event peak dates do not match peak-object dates.'
+        )
+    requests['population_event_index'] = np.arange(
+        1, len(requests) + 1, dtype=np.int16
+    )
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    events_dir = output_path / 'events'
+    events_dir.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'population_events.parquet',
+        output_path / 'population_peak_diagnostics.parquet',
+        output_path / 'population_summary.json',
+        output_path / 'population_phase_space.png',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_population(output_dir=output_path)
+        expected_pairs = {
+            (
+                str(row.event_id),
+                pd.Timestamp(row.diagnostic_date).strftime('%Y-%m-%d'),
+            )
+            for row in requests.itertuples(index=False)
+        }
+        stored_pairs = {
+            (
+                str(row.event_id),
+                pd.Timestamp(row.diagnostic_date).strftime('%Y-%m-%d'),
+            )
+            for row in loaded['population_events'].itertuples(index=False)
+        }
+        if stored_pairs != expected_pairs:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['reused_complete_run'] = True
+        return loaded
+    _atomic_write_parquet(
+        requests, output_path / 'population_events.parquet'
+    )
+
+    frames: list[pd.DataFrame] = []
+    completed_fragments = 0
+    for event in requests.itertuples(index=False):
+        fragment_path = events_dir / f'{event.event_id}.parquet'
+        reused = False
+        if fragment_path.exists():
+            frame = pd.read_parquet(fragment_path)
+            if (
+                len(frame) == 1
+                and _ofes_assert_fragment_request(
+                    frame,
+                    str(event.event_id),
+                    pd.Timestamp(event.diagnostic_date),
+                )
+                and frame.iloc[0]['peak_daily_object_key']
+                == event.peak_daily_object_key
+            ):
+                reused = True
+        if not reused:
+            diagnosis = _ofes_diagnose_water_mass_day(
+                event.diagnostic_date,
+                float(event.daily_peak_lon),
+                float(event.daily_peak_lat),
+                float(event.peak_depth_m),
+                diagnostic_settings,
+            )
+            surface = _ofes_surface_expression_day(
+                event.diagnostic_date,
+                float(event.daily_peak_lon),
+                float(event.daily_peak_lat),
+                float(diagnosis['rossby_number']),
+                float(event.daily_peak_equivalent_radius_km),
+                diagnostic_settings,
+                settings,
+            )
+            record = event._asdict()
+            record.update(diagnosis)
+            record.update(surface)
+            frame = pd.DataFrame([record])
+            _atomic_write_parquet(frame, fragment_path)
+        frames.append(frame)
+        completed_fragments += 1
+        if (
+            completed_fragments == 1
+            or completed_fragments == len(requests)
+            or completed_fragments % 10 == 0
+        ):
+            print(
+                '[OFES population] '
+                f'{completed_fragments:02d}/{len(requests):02d} '
+                f'{event.event_id} '
+                f'({"reused" if reused else "diagnosed"})'
+            )
+
+    diagnostics = pd.concat(frames, ignore_index=True)
+    diagnostics = diagnostics.sort_values(
+        'population_event_index', kind='mergesort'
+    ).reset_index(drop=True)
+    diagnostics = _ofes_add_population_metrics(
+        diagnostics, settings
+    )
+    summary = _ofes_population_summary(diagnostics, settings)
+    diagnostic_path = (
+        output_path / 'population_peak_diagnostics.parquet'
+    )
+    summary_path = output_path / 'population_summary.json'
+    figure_path = output_path / 'population_phase_space.png'
+    _atomic_write_parquet(diagnostics, diagnostic_path)
+    _ofes_atomic_write_json(summary, summary_path)
+    _plot_ofes_event_population(
+        diagnostics,
+        summary,
+        figure_path,
+        int(settings['figure_dpi']),
+    )
+    return {
+        'output_dir': output_path,
+        'population_events': requests,
+        'population_peak_diagnostics': diagnostics,
+        'summary': summary,
+        'figure_path': figure_path,
+    }
+
+
+
+def _ofes_event_onset_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 事件机制分层与 onset 诊断配置。"""
+    raw = dict(_OFES_CFG.get('event_onset', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_onset override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'pre_start_days': int(raw.get('pre_start_days', 5)),
+        'minimum_start_to_peak_observed_days': int(
+            raw.get('minimum_start_to_peak_observed_days', 2)
+        ),
+        'require_full_background_annulus': bool(
+            raw.get('require_full_background_annulus', True)
+        ),
+        'deep_entry_depth_min_m': float(
+            raw.get('deep_entry_depth_min_m', 500.0)
+        ),
+        'frontogenesis_load_radius_km': float(
+            raw.get('frontogenesis_load_radius_km', 100.0)
+        ),
+        'core_summary_radius_km': float(
+            raw.get('core_summary_radius_km', 30.0)
+        ),
+        'core_min_valid_columns': int(
+            raw.get('core_min_valid_columns', 100)
+        ),
+        'density_smoothing_sigma_pixels': float(
+            raw.get('density_smoothing_sigma_pixels', 1.5)
+        ),
+        'minimum_density_gradient_kg_m4': float(
+            raw.get('minimum_density_gradient_kg_m4', 1e-8)
+        ),
+        'map_radius_km': float(
+            raw.get('map_radius_km', 180.0)
+        ),
+        'map_min_finite_fraction': float(
+            raw.get('map_min_finite_fraction', 0.50)
+        ),
+        'map_quiver_stride': int(
+            raw.get('map_quiver_stride', 12)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_onset')
+        ),
+    }
+    positive = (
+        'pre_start_days',
+        'minimum_start_to_peak_observed_days',
+        'deep_entry_depth_min_m',
+        'frontogenesis_load_radius_km',
+        'core_summary_radius_km',
+        'core_min_valid_columns',
+        'density_smoothing_sigma_pixels',
+        'minimum_density_gradient_kg_m4',
+        'map_radius_km',
+        'map_quiver_stride',
+        'figure_dpi',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES onset counts, scales, radii, depths, and figure '
+            'DPI must be finite and positive.'
+        )
+    if (
+        settings['core_summary_radius_km']
+        >= settings['frontogenesis_load_radius_km']
+    ):
+        raise ValueError(
+            'OFES onset core radius must be smaller than the '
+            'frontogenesis load radius.'
+        )
+    if settings['map_radius_km'] <= settings['core_summary_radius_km']:
+        raise ValueError(
+            'OFES onset map radius must exceed the core radius.'
+        )
+    if not 0 < settings['map_min_finite_fraction'] <= 1:
+        raise ValueError(
+            'OFES onset map_min_finite_fraction must lie in (0, 1].'
+        )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES onset output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_select_onset_regimes(
+    population_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+    settings: dict,
+    catalog_start: str | pd.Timestamp,
+    background_outer_radius_km: float,
+) -> pd.DataFrame:
+    """按排序与 onset 可诊断性选取总体、应变和表层弱旋转代表。"""
+    passed = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold',
+        kind='mergesort',
+    ).copy()
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        pd.Timestamp(catalog_start).normalize()
+    )
+    feasibility: list[dict] = []
+    for event in passed.itertuples(index=False):
+        start = pd.Timestamp(event.start_date).normalize()
+        peak = pd.Timestamp(event.peak_date).normalize()
+        group = daily_objects.loc[
+            (daily_objects['event_id'].astype(str) == str(event.event_id))
+            & (pd.to_datetime(daily_objects['date']) >= start)
+            & (pd.to_datetime(daily_objects['date']) <= peak)
+        ]
+        edge_distance = _ofes_delivery_edge_distance_km(
+            group['peak_lon'].to_numpy(dtype=float),
+            group['peak_lat'].to_numpy(dtype=float),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+        minimum_edge = (
+            float(np.min(edge_distance))
+            if edge_distance.size
+            else np.nan
+        )
+        enough_days = len(group) >= int(
+            settings['minimum_start_to_peak_observed_days']
+        )
+        full_annulus = bool(
+            np.isfinite(minimum_edge)
+            and minimum_edge >= float(background_outer_radius_km)
+        )
+        eligible = bool(
+            peak > start
+            and enough_days
+            and (
+                full_annulus
+                or not settings['require_full_background_annulus']
+            )
+        )
+        feasibility.append(
+            {
+                'event_id': str(event.event_id),
+                'onset_start_to_peak_observed_days': int(len(group)),
+                'onset_min_delivery_edge_distance_km': minimum_edge,
+                'onset_full_background_annulus': full_annulus,
+                'onset_selection_eligible': eligible,
+            }
+        )
+    passed = passed.merge(
+        pd.DataFrame(feasibility),
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    eligible = passed['onset_selection_eligible'].to_numpy(dtype=bool)
+    selectors = (
+        (
+            'headline',
+            'best_overall_deep_rank_with_onset_feasibility',
+            eligible,
+        ),
+        (
+            'strain_dominated',
+            'best_deep_rank_among_onset_feasible_strain_dominated',
+            (
+                eligible
+                & ~passed['rotation_dominated'].to_numpy(dtype=bool)
+            ),
+        ),
+        (
+            'surface_weak_rotation',
+            'best_deep_rank_among_onset_feasible_surface_weak_or_reversed_rotation',
+            (
+                eligible
+                & passed['rotation_dominated'].to_numpy(dtype=bool)
+                & passed[
+                    'surface_weak_or_reversed_rotation'
+                ].to_numpy(dtype=bool)
+            ),
+        ),
+    )
+    records: list[dict] = []
+    for order, (label, criterion, mask) in enumerate(
+        selectors, start=1
+    ):
+        candidates = passed.loc[mask]
+        if candidates.empty:
+            raise RuntimeError(
+                f'No OFES population event satisfies {criterion}.'
+            )
+        record = candidates.iloc[0].to_dict()
+        record.update(
+            {
+                'regime_order': int(order),
+                'regime_label': label,
+                'selection_criterion': criterion,
+            }
+        )
+        records.append(record)
+    selected = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    if selected['event_id'].duplicated().any():
+        raise RuntimeError(
+            'OFES onset selectors did not produce three distinct events.'
+        )
+    return selected
+
+
+def _ofes_onset_daily_requests(
+    selected: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+    settings: dict,
+    catalog_start: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """建立出现前逐日背景与 start-to-peak 已观测对象请求。"""
+    lower_date = pd.Timestamp(catalog_start).normalize()
+    records: list[dict] = []
+    for event in selected.itertuples(index=False):
+        event_id = str(event.event_id)
+        start = pd.Timestamp(event.start_date).normalize()
+        peak = pd.Timestamp(event.peak_date).normalize()
+        group = daily_objects.loc[
+            (daily_objects['event_id'].astype(str) == event_id)
+            & (pd.to_datetime(daily_objects['date']) >= start)
+            & (pd.to_datetime(daily_objects['date']) <= peak)
+        ].sort_values('date', kind='mergesort')
+        if group.empty:
+            raise RuntimeError(
+                f'No start-to-peak daily objects found for {event_id}.'
+            )
+        if group['date'].duplicated().any():
+            raise RuntimeError(
+                f'Multiple daily objects occur on one day for {event_id}.'
+            )
+        start_rows = group.loc[
+            pd.to_datetime(group['date']).dt.normalize() == start
+        ]
+        peak_rows = group.loc[
+            group['daily_object_key'].astype(str)
+            == str(event.peak_daily_object_key)
+        ]
+        deep_rows = group.loc[
+            group['peak_depth_at_max']
+            >= float(settings['deep_entry_depth_min_m'])
+        ]
+        if len(start_rows) != 1 or len(peak_rows) != 1 or deep_rows.empty:
+            raise RuntimeError(
+                f'OFES onset anchors are incomplete for {event_id}.'
+            )
+        start_row = start_rows.iloc[0]
+        deep_row = deep_rows.iloc[0]
+        deep_date = pd.Timestamp(deep_row['date']).normalize()
+        pre_start = max(
+            lower_date,
+            start - pd.Timedelta(days=int(settings['pre_start_days'])),
+        )
+        for date in pd.date_range(
+            pre_start,
+            start - pd.Timedelta(days=1),
+            freq='D',
+        ):
+            records.append(
+                {
+                    'regime_order': int(event.regime_order),
+                    'regime_label': str(event.regime_label),
+                    'selection_criterion': str(
+                        event.selection_criterion
+                    ),
+                    'event_id': event_id,
+                    'date': date.normalize(),
+                    'phase': 'pre_start',
+                    'day_relative_to_start': int((date - start).days),
+                    'daily_object_key': None,
+                    'position_basis': 'held_start_daily_peak_column',
+                    'requested_core_lon': float(start_row['peak_lon']),
+                    'requested_core_lat': float(start_row['peak_lat']),
+                    'reference_depth_m': float(event.peak_depth_m),
+                    'map_target_sigma0': float(event.target_sigma0),
+                    'catalog_delta_do_max': np.nan,
+                    'catalog_peak_depth_m': np.nan,
+                    'catalog_equivalent_radius_km': np.nan,
+                    'is_start': False,
+                    'is_deep_entry': False,
+                    'is_peak': False,
+                    'is_map_anchor': bool(
+                        date.normalize()
+                        == start - pd.Timedelta(days=1)
+                    ),
+                    'anchor_roles': (
+                        'pre_start'
+                        if date.normalize()
+                        == start - pd.Timedelta(days=1)
+                        else ''
+                    ),
+                }
+            )
+        for row in group.itertuples(index=False):
+            date = pd.Timestamp(row.date).normalize()
+            roles: list[str] = []
+            if date == start:
+                roles.append('start')
+            if date == deep_date:
+                roles.append('deep_entry')
+            if str(row.daily_object_key) == str(
+                event.peak_daily_object_key
+            ):
+                roles.append('peak')
+            records.append(
+                {
+                    'regime_order': int(event.regime_order),
+                    'regime_label': str(event.regime_label),
+                    'selection_criterion': str(
+                        event.selection_criterion
+                    ),
+                    'event_id': event_id,
+                    'date': date,
+                    'phase': 'detected',
+                    'day_relative_to_start': int((date - start).days),
+                    'daily_object_key': str(row.daily_object_key),
+                    'position_basis': 'daily_max_delta_do_column',
+                    'requested_core_lon': float(row.peak_lon),
+                    'requested_core_lat': float(row.peak_lat),
+                    'reference_depth_m': float(event.peak_depth_m),
+                    'map_target_sigma0': float(event.target_sigma0),
+                    'catalog_delta_do_max': float(row.delta_do_max),
+                    'catalog_peak_depth_m': float(
+                        row.peak_depth_at_max
+                    ),
+                    'catalog_equivalent_radius_km': float(
+                        row.equivalent_radius_km
+                    ),
+                    'is_start': bool(date == start),
+                    'is_deep_entry': bool(date == deep_date),
+                    'is_peak': bool(
+                        str(row.daily_object_key)
+                        == str(event.peak_daily_object_key)
+                    ),
+                    'is_map_anchor': bool(roles),
+                    'anchor_roles': '|'.join(roles),
+                }
+            )
+    requests = pd.DataFrame(records).sort_values(
+        ['regime_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    if requests.empty or requests.duplicated(
+        ['event_id', 'date']
+    ).any():
+        raise RuntimeError(
+            'OFES onset requests are empty or contain duplicate dates.'
+        )
+    requests.insert(
+        0,
+        'daily_request_key',
+        requests.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    requests.insert(
+        1,
+        'daily_request_index',
+        np.arange(1, len(requests) + 1, dtype=np.int16),
+    )
+    return requests
+
+
+def _ofes_fixed_depth_frontogenesis_fields(
+    snapshot: dict,
+    target_depth: float,
+    smoothing_sigma_pixels: float,
+    minimum_density_gradient_kg_m4: float,
+) -> dict:
+    """计算解析水平速度梯度造成的固定深度锋生率。
+
+    使用 F_h = -grad(sigma0)^T grad(u_h)^T grad(sigma0)，并以
+    |grad(sigma0)|^2 归一化为水平运动学造成的局地梯度增长率。
+    """
+    kinematics = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        float(target_depth),
+        float(smoothing_sigma_pixels),
+    )
+    level = int(kinematics['level_index'])
+    depth = float(kinematics['depth_m'])
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    pressure = np.asarray(
+        gsw.p_from_z(-depth, lat), dtype=float
+    )[:, None]
+    absolute_salinity = gsw.SA_from_SP(
+        np.asarray(snapshot['salinity'][level], dtype=float),
+        pressure,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity,
+        np.asarray(snapshot['temp'][level], dtype=float),
+    )
+    sigma0 = _ofes_nan_gaussian(
+        np.asarray(
+            gsw.sigma0(
+                absolute_salinity, conservative_temperature
+            ),
+            dtype=float,
+        ),
+        float(smoothing_sigma_pixels),
+    )
+    scale = approximate_degree_length(lat)
+    meters_per_degree_lon = np.asarray(
+        scale['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    meters_per_degree_lat = np.asarray(
+        scale['meters_per_degree_lat'], dtype=float
+    )[:, None]
+    u = np.asarray(kinematics['u'], dtype=float)
+    v = np.asarray(kinematics['v'], dtype=float)
+    du_dx = np.gradient(u, lon, axis=1) / meters_per_degree_lon
+    dv_dx = np.gradient(v, lon, axis=1) / meters_per_degree_lon
+    du_dy = np.gradient(u, lat, axis=0) / meters_per_degree_lat
+    dv_dy = np.gradient(v, lat, axis=0) / meters_per_degree_lat
+    density_gradient_x = (
+        np.gradient(sigma0, lon, axis=1) / meters_per_degree_lon
+    )
+    density_gradient_y = (
+        np.gradient(sigma0, lat, axis=0) / meters_per_degree_lat
+    )
+    density_gradient = np.hypot(
+        density_gradient_x, density_gradient_y
+    )
+    frontogenesis = -(
+        density_gradient_x**2 * du_dx
+        + density_gradient_x
+        * density_gradient_y
+        * (du_dy + dv_dx)
+        + density_gradient_y**2 * dv_dy
+    )
+    normalized = np.full(frontogenesis.shape, np.nan, dtype=float)
+    np.divide(
+        frontogenesis,
+        density_gradient**2,
+        out=normalized,
+        where=(
+            np.isfinite(frontogenesis)
+            & np.isfinite(density_gradient)
+            & (
+                density_gradient
+                >= float(minimum_density_gradient_kg_m4)
+            )
+        ),
+    )
+    divergence = du_dx + dv_dy
+    return {
+        **kinematics,
+        'sigma0': sigma0,
+        'density_gradient_x_kg_m4': density_gradient_x,
+        'density_gradient_y_kg_m4': density_gradient_y,
+        'density_gradient_kg_m4': density_gradient,
+        'horizontal_frontogenesis_kg2_m8_s': frontogenesis,
+        'normalized_frontogenesis_rate_s_1': normalized,
+        'horizontal_divergence_s_1': divergence,
+        'horizontal_convergence_s_1': -divergence,
+    }
+
+
+def _ofes_frontogenesis_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth: float,
+    settings: dict,
+) -> dict:
+    """提取核心点与 30 km 核心盘的水平锋生诊断。"""
+    date_ts = pd.Timestamp(date).normalize()
+    radius_km = float(settings['frontogenesis_load_radius_km'])
+    local_scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    available_depth = np.asarray(
+        _ofes_tracer_coordinates(date_ts)[2], dtype=float
+    )
+    delivered_depth = float(
+        available_depth[
+            np.argmin(np.abs(available_depth - float(reference_depth)))
+        ]
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+        depth_bounds=(delivered_depth, delivered_depth),
+    )
+    fields = _ofes_fixed_depth_frontogenesis_fields(
+        snapshot,
+        float(reference_depth),
+        float(settings['density_smoothing_sigma_pixels']),
+        float(settings['minimum_density_gradient_kg_m4']),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(core_lon),
+            float(core_lat),
+        ),
+        dtype=float,
+    ) / 1000.0
+    core_mask = (
+        distance_km <= float(settings['core_summary_radius_km'])
+    )
+    valid = (
+        core_mask
+        & np.isfinite(fields['density_gradient_kg_m4'])
+        & np.isfinite(fields['normalized_frontogenesis_rate_s_1'])
+        & np.isfinite(fields['horizontal_convergence_s_1'])
+    )
+    valid_count = int(np.count_nonzero(valid))
+    row = int(np.argmin(np.abs(lat - float(core_lat))))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, float(core_lon)))
+        )
+    )
+    failure_reasons: list[str] = []
+    if valid_count < int(settings['core_min_valid_columns']):
+        failure_reasons.append('insufficient_frontogenesis_core_columns')
+    point_values = (
+        fields['density_gradient_kg_m4'][row, column],
+        fields['normalized_frontogenesis_rate_s_1'][row, column],
+        fields['horizontal_convergence_s_1'][row, column],
+    )
+    if not all(np.isfinite(value) for value in point_values):
+        failure_reasons.append('nonfinite_frontogenesis_core_point')
+    return {
+        'frontogenesis_depth_m': float(fields['depth_m']),
+        'frontogenesis_core_radius_km': float(
+            settings['core_summary_radius_km']
+        ),
+        'frontogenesis_core_valid_columns': valid_count,
+        'core_density_gradient_kg_m4': float(
+            fields['density_gradient_kg_m4'][row, column]
+        ),
+        'core_normalized_frontogenesis_rate_s_1': float(
+            fields['normalized_frontogenesis_rate_s_1'][row, column]
+        ),
+        'core_horizontal_convergence_s_1': float(
+            fields['horizontal_convergence_s_1'][row, column]
+        ),
+        'disk_median_density_gradient_kg_m4': float(
+            np.nanmedian(fields['density_gradient_kg_m4'][valid])
+        ),
+        'disk_median_normalized_frontogenesis_rate_s_1': float(
+            np.nanmedian(
+                fields['normalized_frontogenesis_rate_s_1'][valid]
+            )
+        ),
+        'disk_frontogenetic_fraction': float(
+            np.mean(
+                fields['normalized_frontogenesis_rate_s_1'][valid] > 0
+            )
+        ),
+        'disk_median_horizontal_convergence_s_1': float(
+            np.nanmedian(fields['horizontal_convergence_s_1'][valid])
+        ),
+        'frontogenesis_diagnostic_passed': bool(not failure_reasons),
+        'frontogenesis_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+    }
+
+
+
+
+
+
+def _ofes_build_onset_map_field(
+    request: dict,
+    settings: dict,
+    cache_path: str | Path,
+) -> dict:
+    """构建或复用一个 onset anchor 的等密度面与固定深度场。"""
+    target = Path(cache_path)
+    expected = {
+        'daily_request_key': str(request['daily_request_key']),
+        'anchor_roles': str(request['anchor_roles']),
+    }
+    if target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            if all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            ):
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['map_field_cache_reused'] = True
+                metadata['map_field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half_width, core_lon + lon_half_width),
+        lat_bounds=(core_lat - lat_half_width, core_lat + lat_half_width),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(request['map_target_sigma0']),
+        float(request['reference_depth_m']),
+        {
+            'do': snapshot['do2'],
+            'salinity': snapshot['salinity'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    front = _ofes_fixed_depth_frontogenesis_fields(
+        snapshot,
+        float(request['reference_depth_m']),
+        float(settings['density_smoothing_sigma_pixels']),
+        float(settings['minimum_density_gradient_kg_m4']),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid, lat_grid, core_lon, core_lat
+        ),
+        dtype=float,
+    ) / 1000.0
+    circle = distance_km <= radius_km
+    finite = circle & np.isfinite(mapped['do'])
+    circle_count = int(np.count_nonzero(circle))
+    finite_count = int(np.count_nonzero(finite))
+    finite_fraction = (
+        float(finite_count / circle_count) if circle_count else 0.0
+    )
+    failure_reasons: list[str] = []
+    if finite_fraction < float(settings['map_min_finite_fraction']):
+        failure_reasons.append('insufficient_onset_map_finite_fraction')
+    masked = {
+        'isopycnal_do': mapped['do'],
+        'isopycnal_salinity': mapped['salinity'],
+        'isopycnal_depth': mapped['depth'],
+        'isopycnal_u': mapped['u'],
+        'isopycnal_v': mapped['v'],
+        'density_gradient': front['density_gradient_kg_m4'],
+        'frontogenesis_rate': (
+            front['normalized_frontogenesis_rate_s_1']
+        ),
+        'horizontal_convergence': (
+            front['horizontal_convergence_s_1']
+        ),
+        'rossby_number': front['rossby_number'],
+        'normalized_strain': front['normalized_strain'],
+    }
+    arrays = {
+        key: np.where(circle, value, np.nan).astype(np.float32)
+        for key, value in masked.items()
+    }
+    metadata = {
+        'map_date': date,
+        'map_radius_km': radius_km,
+        'map_circle_column_count': circle_count,
+        'map_finite_column_count': finite_count,
+        'map_finite_fraction': finite_fraction,
+        'map_target_sigma0': float(request['map_target_sigma0']),
+        'map_reference_depth_m': float(request['reference_depth_m']),
+        'map_frontogenesis_depth_m': float(front['depth_m']),
+        'map_diagnostic_passed': bool(not failure_reasons),
+        'map_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'map_field_cache_reused': False,
+        'map_field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        distance_km=distance_km.astype(np.float32),
+        crossing_count=np.where(
+            circle, mapped['crossing_count'], 0
+        ).astype(np.int16),
+        **arrays,
+    )
+    return metadata
+
+
+
+def _ofes_summarize_event_onset(
+    diagnostics: pd.DataFrame,
+    selected: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总三个客观代表的出现前、深层进入与峰值变化。"""
+    metric_names = (
+        'fixed_depth_do_contrast',
+        'water_mass_do_contrast',
+        'heave_do_contribution',
+        'rossby_number',
+        'normalized_strain',
+        'disk_median_density_gradient_kg_m4',
+        'disk_median_normalized_frontogenesis_rate_s_1',
+        'disk_frontogenetic_fraction',
+        'disk_median_horizontal_convergence_s_1',
+    )
+    records: list[dict] = []
+    for event in selected.itertuples(index=False):
+        group = diagnostics.loc[
+            diagnostics['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('date', kind='mergesort')
+        pre = group.loc[group['phase'] == 'pre_start']
+        start = group.loc[group['is_start']]
+        deep = group.loc[group['is_deep_entry']]
+        peak = group.loc[group['is_peak']]
+        if pre.empty or len(start) != 1 or len(deep) != 1 or len(peak) != 1:
+            raise RuntimeError(
+                f'OFES onset summary anchors are incomplete for '
+                f'{event.event_id}.'
+            )
+        record = {
+            'regime_order': int(event.regime_order),
+            'regime_label': str(event.regime_label),
+            'selection_criterion': str(event.selection_criterion),
+            'event_id': str(event.event_id),
+            'deep_sensitivity_rank_within_threshold': int(
+                event.deep_sensitivity_rank_within_threshold
+            ),
+            'start_date': pd.Timestamp(start.iloc[0]['date']),
+            'deep_entry_date': pd.Timestamp(deep.iloc[0]['date']),
+            'peak_date': pd.Timestamp(peak.iloc[0]['date']),
+            'start_to_deep_entry_days': int(
+                deep.iloc[0]['day_relative_to_start']
+            ),
+            'start_to_peak_days': int(
+                peak.iloc[0]['day_relative_to_start']
+            ),
+            'pre_start_day_count': int(len(pre)),
+            'diagnostic_day_count': int(len(group)),
+            'clipped_background_day_count': int(
+                (~group['background_annulus_within_delivery_window']).sum()
+            ),
+            'frontogenetic_detected_day_fraction': float(
+                np.mean(
+                    group.loc[
+                        group['phase'] == 'detected',
+                        'disk_median_normalized_frontogenesis_rate_s_1',
+                    ]
+                    > 0
+                )
+            ),
+        }
+        for metric in metric_names:
+            record[f'pre_start_median_{metric}'] = float(
+                np.nanmedian(pre[metric].to_numpy(dtype=float))
+            )
+            record[f'start_{metric}'] = float(start.iloc[0][metric])
+            record[f'deep_entry_{metric}'] = float(deep.iloc[0][metric])
+            record[f'peak_{metric}'] = float(peak.iloc[0][metric])
+        pre_gradient = record[
+            'pre_start_median_disk_median_density_gradient_kg_m4'
+        ]
+        record['deep_entry_density_gradient_ratio_to_pre_start'] = (
+            float(
+                record[
+                    'deep_entry_disk_median_density_gradient_kg_m4'
+                ]
+                / pre_gradient
+            )
+            if np.isfinite(pre_gradient) and pre_gradient > 0
+            else np.nan
+        )
+        record['deep_entry_water_mass_increase_from_pre_start'] = float(
+            record['deep_entry_water_mass_do_contrast']
+            - record['pre_start_median_water_mass_do_contrast']
+        )
+        records.append(record)
+    summary = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    payload = {
+        'selected_event_count': int(len(summary)),
+        'selection_records': summary[
+            [
+                'regime_label',
+                'selection_criterion',
+                'event_id',
+                'deep_sensitivity_rank_within_threshold',
+            ]
+        ].to_dict(orient='records'),
+        'event_records': summary.assign(
+            start_date=summary['start_date'].dt.strftime('%Y-%m-%d'),
+            deep_entry_date=summary[
+                'deep_entry_date'
+            ].dt.strftime('%Y-%m-%d'),
+            peak_date=summary['peak_date'].dt.strftime('%Y-%m-%d'),
+        ).to_dict(orient='records'),
+        'diagnostic_scope': (
+            'Fixed-depth horizontal density-gradient, convergence, '
+            'and resolved horizontal-advection frontogenesis are '
+            'compared with same-day water-mass/heave diagnostics.'
+        ),
+        'causal_limits': [
+            'Positive horizontal frontogenesis is not direct evidence '
+            'of vertical subduction.',
+            'Vertical-advection, diabatic, mixing, and unresolved '
+            'submesoscale terms are omitted.',
+            'Pre-start positions are held at the detector-defined '
+            'start column and are Eulerian context, not trajectories.',
+            'A clipped 120-240 km background annulus is retained only '
+            'when the minimum valid-column gate passes and is flagged.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_onset_timeseries(
+    diagnostics: pd.DataFrame,
+    selected: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制三个客观机制代表的 pre-start 至 peak 标量演化。"""
+    ordered = selected.sort_values(
+        'regime_order', kind='mergesort'
+    )
+    figure, axes = plt.subplots(
+        len(ordered),
+        3,
+        figsize=(16, 4.2 * len(ordered)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row_index, event in enumerate(
+        ordered.itertuples(index=False)
+    ):
+        group = diagnostics.loc[
+            diagnostics['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('day_relative_to_start', kind='mergesort')
+        x = group['day_relative_to_start'].to_numpy(dtype=float)
+        anchors = {
+            'start': 0.0,
+            'deep entry': float(
+                group.loc[
+                    group['is_deep_entry'], 'day_relative_to_start'
+                ].iloc[0]
+            ),
+            'peak': float(
+                group.loc[
+                    group['is_peak'], 'day_relative_to_start'
+                ].iloc[0]
+            ),
+        }
+        axis = axes[row_index, 0]
+        axis.plot(
+            x,
+            group['fixed_depth_do_contrast'],
+            color='#6b7280',
+            linewidth=1.6,
+            label='Fixed-depth contrast',
+        )
+        axis.plot(
+            x,
+            group['water_mass_do_contrast'],
+            color='#2563eb',
+            linewidth=2.0,
+            label='Same-isopycnal water mass',
+        )
+        axis.plot(
+            x,
+            group['heave_do_contribution'],
+            color='#d97706',
+            linewidth=1.6,
+            linestyle='--',
+            label='Heave',
+        )
+        axis.axhline(0, color='black', linewidth=0.6)
+        axis.set_ylabel(r'DO contrast ($\mu$mol kg$^{-1}$)')
+        axis.legend(loc='best', fontsize=8)
+        axis.set_title(
+            f'{event.regime_label}: {event.event_id}', loc='left'
+        )
+
+        axis = axes[row_index, 1]
+        axis.plot(
+            x,
+            group['rossby_number'].abs(),
+            color='#7c3aed',
+            linewidth=1.8,
+            label=r'$|Ro|$',
+        )
+        axis.plot(
+            x,
+            group['normalized_strain'],
+            color='#059669',
+            linewidth=1.8,
+            label=r'strain/$|f|$',
+        )
+        axis.set_ylabel('Normalized kinematics')
+        axis.legend(loc='best', fontsize=8)
+
+        axis = axes[row_index, 2]
+        axis.plot(
+            x,
+            group['disk_median_density_gradient_kg_m4'] * 1e6,
+            color='#111827',
+            linewidth=1.8,
+            label=r'$|\nabla_h\sigma_0|$',
+        )
+        axis.set_ylabel(
+            r'Density gradient ($10^{-6}$ kg m$^{-4}$)'
+        )
+        rate_axis = axis.twinx()
+        rate_axis.plot(
+            x,
+            group[
+                'disk_median_normalized_frontogenesis_rate_s_1'
+            ]
+            * 86400.0,
+            color='#dc2626',
+            linewidth=1.8,
+            label='Horizontal frontogenesis',
+        )
+        rate_axis.axhline(0, color='#dc2626', linewidth=0.5)
+        rate_axis.set_ylabel('Frontogenesis rate (day$^{-1}$)')
+        handles_a, labels_a = axis.get_legend_handles_labels()
+        handles_b, labels_b = rate_axis.get_legend_handles_labels()
+        axis.legend(
+            handles_a + handles_b,
+            labels_a + labels_b,
+            loc='best',
+            fontsize=8,
+        )
+        for column_axis in axes[row_index]:
+            column_axis.axvspan(
+                float(x.min()), 0.0, color='#e5e7eb', alpha=0.35
+            )
+            column_axis.axvline(0, color='black', linewidth=0.8)
+            if anchors['deep entry'] not in (0.0, anchors['peak']):
+                column_axis.axvline(
+                    anchors['deep entry'],
+                    color='#0ea5e9',
+                    linewidth=0.9,
+                    linestyle='--',
+                )
+            column_axis.axvline(
+                anchors['peak'],
+                color='#b91c1c',
+                linewidth=0.9,
+                linestyle=':',
+            )
+            column_axis.grid(alpha=0.2)
+            column_axis.set_xlabel('Days relative to event start')
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def _plot_ofes_event_onset_maps(
+    event: pd.Series,
+    map_table: pd.DataFrame,
+    output_path: str | Path,
+    quiver_stride: int,
+    figure_dpi: int,
+) -> Path:
+    """绘制单个代表事件 anchor 日的等密度面水团与锋生场。"""
+    rows = map_table.loc[
+        map_table['event_id'].astype(str) == str(event['event_id'])
+    ].sort_values('date', kind='mergesort')
+    if rows.empty:
+        raise RuntimeError(
+            f'No OFES onset maps found for {event["event_id"]}.'
+        )
+    caches: list[dict] = []
+    for row in rows.itertuples(index=False):
+        with np.load(row.map_field_cache_path, allow_pickle=False) as data:
+            caches.append(
+                {
+                    'row': row,
+                    **{
+                        key: np.asarray(data[key])
+                        for key in (
+                            'lon',
+                            'lat',
+                            'isopycnal_do',
+                            'isopycnal_salinity',
+                            'isopycnal_u',
+                            'isopycnal_v',
+                            'density_gradient',
+                            'frontogenesis_rate',
+                        )
+                    },
+                }
+            )
+    do_values = np.concatenate(
+        [item['isopycnal_do'][np.isfinite(item['isopycnal_do'])]
+         for item in caches]
+    )
+    salinity_values = np.concatenate(
+        [item['isopycnal_salinity'][
+            np.isfinite(item['isopycnal_salinity'])
+        ] for item in caches]
+    )
+    rate_values = np.concatenate(
+        [item['frontogenesis_rate'][
+            np.isfinite(item['frontogenesis_rate'])
+        ] * 86400.0 for item in caches]
+    )
+    gradient_values = np.concatenate(
+        [item['density_gradient'][
+            np.isfinite(item['density_gradient'])
+        ] * 1e6 for item in caches]
+    )
+    do_limits = np.nanpercentile(do_values, [2, 98])
+    salinity_levels = np.unique(
+        np.nanpercentile(salinity_values, [15, 35, 55, 75, 90])
+    )
+    rate_limit = float(np.nanpercentile(np.abs(rate_values), 98))
+    rate_limit = max(rate_limit, np.finfo(float).eps)
+    gradient_levels = np.unique(
+        np.nanpercentile(gradient_values, [60, 80, 92])
+    )
+    figure, axes = plt.subplots(
+        2,
+        len(caches),
+        figsize=(4.3 * len(caches), 8.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    do_artist = None
+    rate_artist = None
+    for column, item in enumerate(caches):
+        row = item['row']
+        lon = item['lon']
+        lat = item['lat']
+        top = axes[0, column]
+        do_artist = top.pcolormesh(
+            lon,
+            lat,
+            item['isopycnal_do'],
+            shading='auto',
+            cmap='viridis',
+            vmin=float(do_limits[0]),
+            vmax=float(do_limits[1]),
+        )
+        if salinity_levels.size >= 2:
+            contours = top.contour(
+                lon,
+                lat,
+                item['isopycnal_salinity'],
+                levels=salinity_levels,
+                colors='white',
+                linewidths=0.7,
+                alpha=0.8,
+            )
+            top.clabel(contours, fontsize=6, fmt='%.2f')
+        stride = int(quiver_stride)
+        top.quiver(
+            lon[::stride],
+            lat[::stride],
+            item['isopycnal_u'][::stride, ::stride],
+            item['isopycnal_v'][::stride, ::stride],
+            color='black',
+            alpha=0.65,
+            scale=10,
+            width=0.0025,
+        )
+        top.scatter(
+            row.requested_core_lon,
+            row.requested_core_lat,
+            marker='x',
+            s=45,
+            linewidths=1.5,
+            color='#ef4444',
+        )
+        top.set_title(
+            f'{row.anchor_roles.replace("|", "+")}\n'
+            f'{pd.Timestamp(row.date):%Y-%m-%d}'
+        )
+        bottom = axes[1, column]
+        rate_artist = bottom.pcolormesh(
+            lon,
+            lat,
+            item['frontogenesis_rate'] * 86400.0,
+            shading='auto',
+            cmap='RdBu_r',
+            vmin=-rate_limit,
+            vmax=rate_limit,
+        )
+        if gradient_levels.size >= 2:
+            bottom.contour(
+                lon,
+                lat,
+                item['density_gradient'] * 1e6,
+                levels=gradient_levels,
+                colors='black',
+                linewidths=0.7,
+            )
+        bottom.scatter(
+            row.requested_core_lon,
+            row.requested_core_lat,
+            marker='x',
+            s=45,
+            linewidths=1.5,
+            color='#111827',
+        )
+        for axis in (top, bottom):
+            axis.set_aspect('equal', adjustable='box')
+            axis.set_xlabel('Longitude')
+            if column == 0:
+                axis.set_ylabel('Latitude')
+            axis.grid(alpha=0.15)
+    if do_artist is not None:
+        figure.colorbar(
+            do_artist,
+            ax=axes[0, :].tolist(),
+            shrink=0.82,
+            label=r'Isopycnal DO ($\mu$mol kg$^{-1}$)',
+        )
+    if rate_artist is not None:
+        figure.colorbar(
+            rate_artist,
+            ax=axes[1, :].tolist(),
+            shrink=0.82,
+            label='Resolved horizontal frontogenesis (day$^{-1}$)',
+        )
+    figure.suptitle(
+        f'{event["regime_label"]}: {event["event_id"]} '
+        f'on $\\sigma_0={event["target_sigma0"]:.3f}$',
+        fontsize=15,
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_event_onset_regimes(
+    population_dir: str | Path | None = None,
+    *,
+    onset_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """诊断 OFES 深层事件客观机制代表的 onset/formation 演化。
+
+    函数只消费固定目录中的 population 结果，先要求
+    start-to-peak 可展开且完整背景环带不越过交付边界，再按固定规则选择
+    可诊断事件中的总体深层排名第一、应变主导中排名第一，以及表层核心
+    弱或反号的旋转主导中排名第一。对每例诊断 detector start 前五天和
+    start-to-peak 的所有已观测事件日，并固定比较 peak depth 上的水团/
+    heave、旋转、应变、水平密度梯度、收敛和解析水平速度梯度锋生率。
+
+    参数:
+        - population_dir (str | Path | None): population 目录；None 时读取固定正式目录。
+        - onset_overrides (dict | None): 临时覆盖已声明的 event_onset 配置。
+        - output_dir (str | Path | None): 输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、三例选择表、逐日诊断、事件总结、JSON 总结和图件路径。
+
+    输出:
+        - `<output_dir>/days/*.parquet`、`<output_dir>/fields/*.npz`。
+        - `<output_dir>/selected_regimes.parquet`、`daily_requests.parquet`、`daily_diagnostics.parquet`、`event_onset_summary.parquet`、`analysis_summary.json` 及图件。
+
+    说明:
+        - 事件 start 是 catalog detector 首次识别日；首次进入深层定义为逐日最大 ΔDO 深度首次达到配置的 500 m 门槛。
+        - pre-start 位置固定在 start 日最大 ΔDO 网格列，仅提供 Eulerian 上下文，不是回溯轨迹。
+        - 逐日标量分解使用当日核心参考深度的 sigma0；anchor 地图固定使用事件 peak-day 核心 sigma0，以比较同一密度面结构。
+        - 锋生率只含解析水平速度梯度对固定深度 sigma0 水平梯度的运动学作用；正值不等同于已证明下沉或 subduction。
+        - 本节点不读取 `w`，不计算完整 PV，也不启动轨迹。
+    """
+    population_root = (
+        Path(population_dir)
+        if population_dir is not None
+        else _ofes_analysis_output_dir('event_population')
+    )
+    population = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    catalog_start = pd.Timestamp(
+        daily_objects['date'].min()
+    ).normalize()
+    settings = _ofes_event_onset_settings(onset_overrides)
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    selected = _ofes_select_onset_regimes(
+        population,
+        daily_objects,
+        settings,
+        catalog_start,
+        float(diagnostic_settings['background_outer_radius_km']),
+    )
+    requests = _ofes_onset_daily_requests(
+        selected,
+        daily_objects,
+        settings,
+        catalog_start,
+    )
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    days_dir = output_path / 'days'
+    fields_dir = output_path / 'fields'
+    figures_dir = output_path / 'figures'
+    for directory in (days_dir, fields_dir, figures_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'selected_regimes.parquet',
+        output_path / 'daily_requests.parquet',
+        output_path / 'daily_diagnostics.parquet',
+        output_path / 'event_onset_summary.parquet',
+        output_path / 'map_diagnostics.parquet',
+        output_path / 'analysis_summary.json',
+        figures_dir / 'onset_regime_evolution.png',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_onset(output_dir=output_path)
+        expected_keys = set(requests['daily_request_key'].astype(str))
+        stored_keys = set(
+            loaded['daily_requests']['daily_request_key'].astype(str)
+        )
+        if stored_keys != expected_keys:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['reused_complete_run'] = True
+        return loaded
+    _atomic_write_parquet(
+        selected, output_path / 'selected_regimes.parquet'
+    )
+    _atomic_write_parquet(
+        requests, output_path / 'daily_requests.parquet'
+    )
+    completed_days = 0
+    completed_maps = 0
+    day_frames: list[pd.DataFrame] = []
+    for row in requests.itertuples(index=False):
+        fragment = days_dir / f'{row.daily_request_key}.parquet'
+        reused = False
+        if fragment.exists():
+            frame = pd.read_parquet(fragment)
+            if (
+                len(frame) == 1
+                and _ofes_assert_fragment_request(
+                    frame, str(row.event_id), pd.Timestamp(row.date)
+                )
+                and frame.iloc[0]['daily_request_key']
+                == row.daily_request_key
+            ):
+                reused = True
+        if not reused:
+            water_mass = _ofes_diagnose_water_mass_day(
+                row.date,
+                float(row.requested_core_lon),
+                float(row.requested_core_lat),
+                float(row.reference_depth_m),
+                diagnostic_settings,
+            )
+            frontogenesis = _ofes_frontogenesis_day(
+                row.date,
+                float(row.requested_core_lon),
+                float(row.requested_core_lat),
+                float(row.reference_depth_m),
+                settings,
+            )
+            record = row._asdict()
+            record.update(water_mass)
+            record.update(frontogenesis)
+            record['onset_diagnostic_passed'] = bool(
+                water_mass['diagnostic_passed']
+                and frontogenesis[
+                    'frontogenesis_diagnostic_passed'
+                ]
+            )
+            record['onset_diagnostic_status'] = ';'.join(
+                status
+                for status in (
+                    water_mass['diagnostic_status'],
+                    frontogenesis[
+                        'frontogenesis_diagnostic_status'
+                    ],
+                )
+                if status != 'passed'
+            ) or 'passed'
+            frame = pd.DataFrame([record])
+            _atomic_write_parquet(frame, fragment)
+        day_frames.append(frame)
+        completed_days += 1
+        if (
+            completed_days == 1
+            or completed_days == len(requests)
+            or completed_days % 10 == 0
+        ):
+            print(
+                '[OFES onset] '
+                f'day {completed_days:02d}/{len(requests):02d} '
+                f'{row.event_id} {pd.Timestamp(row.date):%Y-%m-%d} '
+                f'({"reused" if reused else "diagnosed"})'
+            )
+    diagnostics = pd.concat(day_frames, ignore_index=True).sort_values(
+        ['regime_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    _atomic_write_parquet(
+        diagnostics, output_path / 'daily_diagnostics.parquet'
+    )
+    if not bool(diagnostics['onset_diagnostic_passed'].all()):
+        failed = diagnostics.loc[
+            ~diagnostics['onset_diagnostic_passed'],
+            ['daily_request_key', 'onset_diagnostic_status'],
+        ]
+        raise RuntimeError(
+            'OFES onset daily diagnostic gate failed: '
+            f'{failed.to_dict(orient="records")}'
+        )
+
+    map_records: list[dict] = []
+    anchors = requests.loc[requests['is_map_anchor']]
+    for row in anchors.itertuples(index=False):
+        safe_roles = str(row.anchor_roles).replace('|', '_')
+        cache_path = fields_dir / (
+            f'{row.daily_request_key}_{safe_roles}.npz'
+        )
+        metadata = _ofes_build_onset_map_field(
+            row._asdict(),
+            settings,
+            cache_path,
+        )
+        map_records.append({**row._asdict(), **metadata})
+        completed_maps += 1
+        print(
+            '[OFES onset] '
+            f'map {completed_maps:02d}/{len(anchors):02d} '
+            f'{row.event_id} {row.anchor_roles} '
+            f'({"reused" if metadata["map_field_cache_reused"] else "mapped"})'
+        )
+    map_table = pd.DataFrame(map_records).sort_values(
+        ['regime_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    _atomic_write_parquet(
+        map_table, output_path / 'map_diagnostics.parquet'
+    )
+    if not bool(map_table['map_diagnostic_passed'].all()):
+        raise RuntimeError(
+            'OFES onset anchor map finite-field gate failed.'
+        )
+    event_summary, analysis_summary = _ofes_summarize_event_onset(
+        diagnostics, selected
+    )
+    _atomic_write_parquet(
+        event_summary, output_path / 'event_onset_summary.parquet'
+    )
+    _ofes_atomic_write_json(
+        analysis_summary, output_path / 'analysis_summary.json'
+    )
+    figure_paths = [
+        _plot_ofes_event_onset_timeseries(
+            diagnostics,
+            selected,
+            figures_dir / 'onset_regime_evolution.png',
+            int(settings['figure_dpi']),
+        )
+    ]
+    for event in selected.to_dict(orient='records'):
+        event_series = pd.Series(event)
+        figure_paths.append(
+            _plot_ofes_event_onset_maps(
+                event_series,
+                map_table,
+                figures_dir
+                / f'{event["event_id"]}_onset_maps.png',
+                int(settings['map_quiver_stride']),
+                int(settings['figure_dpi']),
+            )
+        )
+    figure_paths = [path.resolve() for path in figure_paths]
+    return {
+        'output_dir': output_path,
+        'selected_regimes': selected,
+        'daily_diagnostics': diagnostics,
+        'map_diagnostics': map_table,
+        'event_onset_summary': event_summary,
+        'analysis_summary': analysis_summary,
+        'figure_paths': figure_paths,
+    }
+
+
+
+def _ofes_centroid_velocity_day(
+    date: str | pd.Timestamp,
+    centroid_lon: float,
+    centroid_lat: float,
+    reference_depth_m: float,
+    smoothing_sigma_pixels: float,
+) -> dict:
+    """在 detected object 质心双线性采样平滑固定深度 u/v。"""
+    date_ts = pd.Timestamp(date).normalize()
+    available_depth = np.asarray(
+        _ofes_tracer_coordinates(date_ts)[2], dtype=float
+    )
+    delivered_depth = float(
+        available_depth[
+            np.argmin(
+                np.abs(available_depth - float(reference_depth_m))
+            )
+        ]
+    )
+    radius_km = 40.0
+    scale = approximate_degree_length(float(centroid_lat))
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['u', 'v'],
+        lon_bounds=(
+            float(centroid_lon) - lon_half_width,
+            float(centroid_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(centroid_lat) - lat_half_width,
+            float(centroid_lat) + lat_half_width,
+        ),
+        depth_bounds=(delivered_depth, delivered_depth),
+    )
+    fields = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        delivered_depth,
+        float(smoothing_sigma_pixels),
+    )
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    point = np.asarray(
+        [[float(centroid_lat), float(centroid_lon)]], dtype=float
+    )
+    values = {}
+    for name in ('u', 'v'):
+        interpolator = RegularGridInterpolator(
+            (lat, lon),
+            np.asarray(fields[name], dtype=float),
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        values[name] = float(interpolator(point)[0])
+    return {
+        'centroid_flow_depth_m': delivered_depth,
+        'centroid_u_m_s': values['u'],
+        'centroid_v_m_s': values['v'],
+        'centroid_flow_speed_m_s': float(
+            np.hypot(values['u'], values['v'])
+        ),
+    }
+
+
+def _ofes_event_flow_segments(
+    onset_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+    diagnostic_settings: dict,
+) -> pd.DataFrame:
+    """比较 detected 对象质心逐段位移与核心/质心端点流速。"""
+    detected = onset_diagnostics.loc[
+        onset_diagnostics['phase'] == 'detected'
+    ].merge(
+        daily_objects[
+            [
+                'daily_object_key',
+                'centroid_lon',
+                'centroid_lat',
+                'link_gap_days',
+            ]
+        ],
+        on='daily_object_key',
+        how='left',
+        validate='one_to_one',
+    )
+    centroid_records = []
+    for row in detected.itertuples(index=False):
+        centroid_records.append(
+            {
+                'daily_object_key': str(row.daily_object_key),
+                **_ofes_centroid_velocity_day(
+                    row.date,
+                    float(row.centroid_lon),
+                    float(row.centroid_lat),
+                    float(row.reference_depth_m),
+                    float(
+                        diagnostic_settings[
+                            'velocity_smoothing_sigma_pixels'
+                        ]
+                    ),
+                ),
+            }
+        )
+    detected = detected.merge(
+        pd.DataFrame(centroid_records),
+        on='daily_object_key',
+        how='left',
+        validate='one_to_one',
+    )
+    required = (
+        'centroid_lon',
+        'centroid_lat',
+        'u_m_s',
+        'v_m_s',
+        'centroid_u_m_s',
+        'centroid_v_m_s',
+    )
+    if detected[list(required)].isna().any().any():
+        raise RuntimeError(
+            'OFES event-flow audit is missing centroid or core-flow data.'
+        )
+    records: list[dict] = []
+    for event_id, group in detected.groupby(
+        'event_id', sort=False
+    ):
+        ordered = group.sort_values('date', kind='mergesort').reset_index(
+            drop=True
+        )
+        for segment_index in range(len(ordered) - 1):
+            start = ordered.iloc[segment_index]
+            end = ordered.iloc[segment_index + 1]
+            start_date = pd.Timestamp(start['date']).normalize()
+            end_date = pd.Timestamp(end['date']).normalize()
+            elapsed_seconds = float(
+                (end_date - start_date).total_seconds()
+            )
+            if elapsed_seconds <= 0:
+                raise RuntimeError(
+                    f'Non-positive OFES event-flow interval for {event_id}.'
+                )
+            midpoint_lat = 0.5 * (
+                float(start['centroid_lat'])
+                + float(end['centroid_lat'])
+            )
+            scale = approximate_degree_length(midpoint_lat)
+            observed_dx = float(
+                _minimal_lon_diff_deg(
+                    float(end['centroid_lon']),
+                    float(start['centroid_lon']),
+                )
+                * float(scale['meters_per_degree_lon'])
+            )
+            observed_dy = float(
+                (
+                    float(end['centroid_lat'])
+                    - float(start['centroid_lat'])
+                )
+                * float(scale['meters_per_degree_lat'])
+            )
+            mean_u = 0.5 * (
+                float(start['u_m_s']) + float(end['u_m_s'])
+            )
+            mean_v = 0.5 * (
+                float(start['v_m_s']) + float(end['v_m_s'])
+            )
+            mean_centroid_u = 0.5 * (
+                float(start['centroid_u_m_s'])
+                + float(end['centroid_u_m_s'])
+            )
+            mean_centroid_v = 0.5 * (
+                float(start['centroid_v_m_s'])
+                + float(end['centroid_v_m_s'])
+            )
+            predicted_dx = mean_u * elapsed_seconds
+            predicted_dy = mean_v * elapsed_seconds
+            centroid_predicted_dx = mean_centroid_u * elapsed_seconds
+            centroid_predicted_dy = mean_centroid_v * elapsed_seconds
+            observed_distance = float(
+                np.hypot(observed_dx, observed_dy)
+            )
+            predicted_distance = float(
+                np.hypot(predicted_dx, predicted_dy)
+            )
+            centroid_predicted_distance = float(
+                np.hypot(
+                    centroid_predicted_dx,
+                    centroid_predicted_dy,
+                )
+            )
+            dot_product = (
+                observed_dx * predicted_dx
+                + observed_dy * predicted_dy
+            )
+            direction_cosine = (
+                float(
+                    dot_product
+                    / (observed_distance * predicted_distance)
+                )
+                if observed_distance > 0 and predicted_distance > 0
+                else np.nan
+            )
+            centroid_dot_product = (
+                observed_dx * centroid_predicted_dx
+                + observed_dy * centroid_predicted_dy
+            )
+            centroid_direction_cosine = (
+                float(
+                    centroid_dot_product
+                    / (
+                        observed_distance
+                        * centroid_predicted_distance
+                    )
+                )
+                if (
+                    observed_distance > 0
+                    and centroid_predicted_distance > 0
+                )
+                else np.nan
+            )
+            residual_dx = observed_dx - predicted_dx
+            residual_dy = observed_dy - predicted_dy
+            residual_distance = float(
+                np.hypot(residual_dx, residual_dy)
+            )
+            centroid_residual_dx = (
+                observed_dx - centroid_predicted_dx
+            )
+            centroid_residual_dy = (
+                observed_dy - centroid_predicted_dy
+            )
+            centroid_residual_distance = float(
+                np.hypot(
+                    centroid_residual_dx,
+                    centroid_residual_dy,
+                )
+            )
+            start_offset = float(
+                great_circle_distance_m(
+                    float(start['requested_core_lon']),
+                    float(start['requested_core_lat']),
+                    float(start['centroid_lon']),
+                    float(start['centroid_lat']),
+                )
+            )
+            end_offset = float(
+                great_circle_distance_m(
+                    float(end['requested_core_lon']),
+                    float(end['requested_core_lat']),
+                    float(end['centroid_lon']),
+                    float(end['centroid_lat']),
+                )
+            )
+            finite = (
+                np.isfinite(direction_cosine)
+                and np.isfinite(centroid_direction_cosine)
+                and np.isfinite(residual_distance)
+                and np.isfinite(centroid_residual_distance)
+                and observed_distance > 0
+                and predicted_distance > 0
+                and centroid_predicted_distance > 0
+            )
+            records.append(
+                {
+                    'regime_order': int(start['regime_order']),
+                    'regime_label': str(start['regime_label']),
+                    'event_id': str(event_id),
+                    'segment_index': int(segment_index + 1),
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'elapsed_days': elapsed_seconds / 86400.0,
+                    'start_daily_object_key': str(
+                        start['daily_object_key']
+                    ),
+                    'end_daily_object_key': str(end['daily_object_key']),
+                    'catalog_link_gap_days': int(end['link_gap_days']),
+                    'reference_depth_m': float(
+                        start['reference_depth_m']
+                    ),
+                    'start_centroid_lon': float(start['centroid_lon']),
+                    'start_centroid_lat': float(start['centroid_lat']),
+                    'end_centroid_lon': float(end['centroid_lon']),
+                    'end_centroid_lat': float(end['centroid_lat']),
+                    'observed_dx_m': observed_dx,
+                    'observed_dy_m': observed_dy,
+                    'observed_distance_m': observed_distance,
+                    'observed_speed_m_s': (
+                        observed_distance / elapsed_seconds
+                    ),
+                    'mean_core_u_m_s': mean_u,
+                    'mean_core_v_m_s': mean_v,
+                    'core_flow_speed_m_s': (
+                        predicted_distance / elapsed_seconds
+                    ),
+                    'mean_centroid_u_m_s': mean_centroid_u,
+                    'mean_centroid_v_m_s': mean_centroid_v,
+                    'centroid_flow_speed_m_s': (
+                        centroid_predicted_distance / elapsed_seconds
+                    ),
+                    'predicted_dx_m': predicted_dx,
+                    'predicted_dy_m': predicted_dy,
+                    'predicted_distance_m': predicted_distance,
+                    'direction_cosine': direction_cosine,
+                    'centroid_direction_cosine': (
+                        centroid_direction_cosine
+                    ),
+                    'vector_residual_dx_m': residual_dx,
+                    'vector_residual_dy_m': residual_dy,
+                    'vector_residual_distance_m': residual_distance,
+                    'centroid_predicted_dx_m': centroid_predicted_dx,
+                    'centroid_predicted_dy_m': centroid_predicted_dy,
+                    'centroid_predicted_distance_m': (
+                        centroid_predicted_distance
+                    ),
+                    'centroid_vector_residual_dx_m': (
+                        centroid_residual_dx
+                    ),
+                    'centroid_vector_residual_dy_m': (
+                        centroid_residual_dy
+                    ),
+                    'centroid_vector_residual_distance_m': (
+                        centroid_residual_distance
+                    ),
+                    'observed_to_core_flow_speed_ratio': float(
+                        observed_distance / predicted_distance
+                    ),
+                    'residual_to_observed_distance_ratio': float(
+                        residual_distance / observed_distance
+                    ),
+                    'observed_to_centroid_flow_speed_ratio': float(
+                        observed_distance
+                        / centroid_predicted_distance
+                    ),
+                    'centroid_residual_to_observed_distance_ratio': float(
+                        centroid_residual_distance / observed_distance
+                    ),
+                    'start_peak_to_centroid_offset_km': (
+                        start_offset / 1000.0
+                    ),
+                    'end_peak_to_centroid_offset_km': (
+                        end_offset / 1000.0
+                    ),
+                    'segment_diagnostic_passed': bool(finite),
+                }
+            )
+    segments = pd.DataFrame(records).sort_values(
+        ['regime_order', 'segment_index'], kind='mergesort'
+    ).reset_index(drop=True)
+    if segments.empty or not bool(
+        segments['segment_diagnostic_passed'].all()
+    ):
+        raise RuntimeError(
+            'OFES event-flow audit produced no complete segments.'
+        )
+    return segments
+
+
+def _ofes_event_flow_summary(
+    segments: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """并列汇总事件质心平移与核心/质心流速的一致性。"""
+    records: list[dict] = []
+    for event_id, group in segments.groupby(
+        'event_id', sort=False
+    ):
+        records.append(
+            {
+                'regime_order': int(group['regime_order'].iloc[0]),
+                'regime_label': str(group['regime_label'].iloc[0]),
+                'event_id': str(event_id),
+                'segment_count': int(len(group)),
+                'median_direction_cosine': float(
+                    group['direction_cosine'].median()
+                ),
+                'q25_direction_cosine': float(
+                    group['direction_cosine'].quantile(0.25)
+                ),
+                'q75_direction_cosine': float(
+                    group['direction_cosine'].quantile(0.75)
+                ),
+                'same_half_plane_fraction': float(
+                    np.mean(group['direction_cosine'] > 0)
+                ),
+                'median_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].median()
+                ),
+                'q25_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].quantile(0.25)
+                ),
+                'q75_centroid_direction_cosine': float(
+                    group['centroid_direction_cosine'].quantile(0.75)
+                ),
+                'centroid_same_half_plane_fraction': float(
+                    np.mean(group['centroid_direction_cosine'] > 0)
+                ),
+                'median_observed_speed_m_s': float(
+                    group['observed_speed_m_s'].median()
+                ),
+                'median_core_flow_speed_m_s': float(
+                    group['core_flow_speed_m_s'].median()
+                ),
+                'median_centroid_flow_speed_m_s': float(
+                    group['centroid_flow_speed_m_s'].median()
+                ),
+                'median_observed_to_core_flow_speed_ratio': float(
+                    group[
+                        'observed_to_core_flow_speed_ratio'
+                    ].median()
+                ),
+                'median_residual_to_observed_distance_ratio': float(
+                    group[
+                        'residual_to_observed_distance_ratio'
+                    ].median()
+                ),
+                'median_observed_to_centroid_flow_speed_ratio': float(
+                    group[
+                        'observed_to_centroid_flow_speed_ratio'
+                    ].median()
+                ),
+                'median_centroid_residual_to_observed_distance_ratio': (
+                    float(
+                        group[
+                            'centroid_residual_to_observed_distance_ratio'
+                        ].median()
+                    )
+                ),
+                'centroid_minus_core_median_direction_cosine': float(
+                    group['centroid_direction_cosine'].median()
+                    - group['direction_cosine'].median()
+                ),
+                'maximum_observed_segment_distance_km': float(
+                    group['observed_distance_m'].max() / 1000.0
+                ),
+                'median_peak_to_centroid_offset_km': float(
+                    pd.concat(
+                        (
+                            group['start_peak_to_centroid_offset_km'],
+                            group['end_peak_to_centroid_offset_km'],
+                        ),
+                        ignore_index=True,
+                    ).median()
+                ),
+            }
+        )
+    summary = pd.DataFrame(records).sort_values(
+        'regime_order', kind='mergesort'
+    ).reset_index(drop=True)
+    payload = {
+        'event_count': int(len(summary)),
+        'segment_count': int(len(segments)),
+        'event_records': summary.to_dict(orient='records'),
+        'interpretation': (
+            'Directional agreement indicates that linked object-centroid '
+            'translation is kinematically compared with the resolved flow '
+            'at both the maximum-DeltaDO core and the object centroid.'
+        ),
+        'causal_limits': [
+            'Daily connected objects and their centroids are Eulerian '
+            'features, not material parcels.',
+            'Core and centroid sampling are retained side by side; a weaker '
+            'centroid result is sensitivity information rather than a '
+            'failed or discardable result.',
+            'Trapezoidal endpoint velocity is not a trajectory integration '
+            'and does not test deformation, diffusion, or vertical motion.',
+            'No alignment threshold is used as a gate or causal label.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_flow_consistency(
+    segments: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int = 180,
+) -> Path:
+    """绘制对象质心逐段位移与核心流预测位移。"""
+    figure, axes = plt.subplots(
+        1,
+        len(summary),
+        figsize=(5.2 * len(summary), 5.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, event in zip(
+        axes[0], summary.itertuples(index=False)
+    ):
+        group = segments.loc[
+            segments['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('segment_index', kind='mergesort')
+        observed_dx = group['observed_dx_m'].to_numpy(dtype=float) / 1000.0
+        observed_dy = group['observed_dy_m'].to_numpy(dtype=float) / 1000.0
+        path_x = np.r_[0.0, np.cumsum(observed_dx)]
+        path_y = np.r_[0.0, np.cumsum(observed_dy)]
+        predicted_dx = (
+            group['predicted_dx_m'].to_numpy(dtype=float) / 1000.0
+        )
+        predicted_dy = (
+            group['predicted_dy_m'].to_numpy(dtype=float) / 1000.0
+        )
+        centroid_predicted_dx = (
+            group['centroid_predicted_dx_m'].to_numpy(dtype=float)
+            / 1000.0
+        )
+        centroid_predicted_dy = (
+            group['centroid_predicted_dy_m'].to_numpy(dtype=float)
+            / 1000.0
+        )
+        axis.plot(path_x, path_y, color='#111827', linewidth=1.0)
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            observed_dx,
+            observed_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#111827',
+            width=0.006,
+            label='Observed centroid step',
+        )
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            predicted_dx,
+            predicted_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#dc2626',
+            alpha=0.75,
+            width=0.005,
+            label='Endpoint core-flow step',
+        )
+        axis.quiver(
+            path_x[:-1],
+            path_y[:-1],
+            centroid_predicted_dx,
+            centroid_predicted_dy,
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='#2563eb',
+            alpha=0.70,
+            width=0.004,
+            label='Endpoint centroid-flow step',
+        )
+        axis.scatter(
+            path_x[0], path_y[0], color='#2563eb', s=45, zorder=3
+        )
+        axis.scatter(
+            path_x[-1], path_y[-1], color='#b91c1c', s=45, zorder=3
+        )
+        axis.set_title(
+            f'{event.regime_label}\n{event.event_id}\n'
+            f'core/centroid cos={event.median_direction_cosine:.2f}/'
+            f'{event.median_centroid_direction_cosine:.2f}'
+        )
+        axis.set_xlabel('Cumulative eastward displacement (km)')
+        axis.set_ylabel('Cumulative northward displacement (km)')
+        axis.set_aspect('equal', adjustable='datalim')
+        axis.grid(alpha=0.2)
+    handles = [
+        Line2D([0], [0], color='#111827', linewidth=2),
+        Line2D([0], [0], color='#dc2626', linewidth=2),
+        Line2D([0], [0], color='#2563eb', linewidth=2),
+    ]
+    figure.legend(
+        handles,
+        [
+            'Observed centroid step',
+            'Endpoint core-flow step',
+            'Endpoint centroid-flow step',
+        ],
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.08),
+        ncol=3,
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def quantify_ofes_event_flow_consistency(
+    onset_dir: str | Path | None = None,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """量化 OFES onset 代表事件质心平移与解析核心流的一致性。
+
+    函数消费固定目录中的 onset 结果及其源 catalog。对每个 detected
+    event 的相邻对象，以对象质心定义观测位移，并列比较两端最大 ΔDO
+    核心与对象质心处固定参考深度 u/v 的梯形平均，报告方向余弦、速度比
+    和矢量残差；质心结果变弱时仍作为正式敏感性结果保留。
+
+    参数:
+        - onset_dir (str | Path | None): onset 目录；None 时读取固定正式目录。
+        - output_dir (str | Path | None): 输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、逐段表、事件总结、JSON 总结和图件路径。
+
+    输出:
+        - `<output_dir>/event_flow_segments.parquet`、`event_flow_summary.parquet`、`analysis_summary.json` 与 `event_flow_consistency.png`。
+
+    说明:
+        - 这是 linked Eulerian object 的准拉格朗日运动学审计，不是粒子轨迹或物质水团证明。
+        - 核心与质心流速并列输出，不因质心结果削弱原结论而选择性丢弃。
+        - 本节点不读取 `w`，不重建中间时刻速度，也不计算扩散或形变后的 patch overlap。
+    """
+    onset_root = (
+        Path(onset_dir)
+        if onset_dir is not None
+        else _ofes_analysis_output_dir('event_onset')
+    )
+    onset_diagnostics = pd.read_parquet(
+        onset_root / 'daily_diagnostics.parquet'
+    )
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    segments = _ofes_event_flow_segments(
+        onset_diagnostics,
+        daily_objects,
+        diagnostic_settings,
+    )
+    summary, analysis_summary = _ofes_event_flow_summary(segments)
+    output_path = _ofes_analysis_output_dir(
+        'event_flow', output_dir
+    )
+    segments_path = output_path / 'event_flow_segments.parquet'
+    summary_path = output_path / 'event_flow_summary.parquet'
+    analysis_path = output_path / 'analysis_summary.json'
+    figure_path = output_path / 'event_flow_consistency.png'
+    _atomic_write_parquet(segments, segments_path)
+    _atomic_write_parquet(summary, summary_path)
+    _ofes_atomic_write_json(analysis_summary, analysis_path)
+    _plot_ofes_event_flow_consistency(
+        segments, summary, figure_path
+    )
+    return {
+        'output_dir': output_path,
+        'segments': segments,
+        'summary': summary,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+    }
+
+
+def _ofes_event_patch_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES water-mass patch 连续性配置。"""
+    raw = dict(_OFES_CFG.get('event_patch', {}) or {})
+    if overrides:
+        allowed = set(raw) | {'representative_event_ids'}
+        unknown = sorted(set(overrides) - allowed)
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_patch override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'representative_event_ids': tuple(
+            str(value)
+            for value in raw.get('representative_event_ids', ())
+        ),
+        'map_radius_km': float(raw.get('map_radius_km', 180.0)),
+        'do_contrast_min_umol_kg': float(
+            raw.get('do_contrast_min_umol_kg', 50.0)
+        ),
+        'spiciness_peak_fraction_min': float(
+            raw.get('spiciness_peak_fraction_min', 0.5)
+        ),
+        'minimum_consecutive_days': int(
+            raw.get('minimum_consecutive_days', 5)
+        ),
+        'centroid_transition_pass_fraction_min': float(
+            raw.get('centroid_transition_pass_fraction_min', 0.75)
+        ),
+        'centroid_error_floor_km': float(
+            raw.get('centroid_error_floor_km', 30.0)
+        ),
+        'translated_mask_median_iou_min': float(
+            raw.get('translated_mask_median_iou_min', 0.20)
+        ),
+        'median_direction_cosine_min': float(
+            raw.get('median_direction_cosine_min', 0.80)
+        ),
+        'positive_direction_fraction_min': float(
+            raw.get('positive_direction_fraction_min', 0.75)
+        ),
+        'median_speed_ratio_min': float(
+            raw.get('median_speed_ratio_min', 0.5)
+        ),
+        'median_speed_ratio_max': float(
+            raw.get('median_speed_ratio_max', 2.0)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(raw.get('output_subdir', 'event_patch')),
+    }
+    if len(settings['representative_event_ids']) != 3:
+        raise ValueError(
+            'OFES event_patch requires exactly three representative events.'
+        )
+    positive = (
+        'map_radius_km',
+        'do_contrast_min_umol_kg',
+        'spiciness_peak_fraction_min',
+        'centroid_error_floor_km',
+        'translated_mask_median_iou_min',
+        'median_direction_cosine_min',
+        'median_speed_ratio_min',
+        'median_speed_ratio_max',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive
+    ):
+        raise ValueError(
+            'OFES event_patch numeric thresholds must be finite and positive.'
+        )
+    fractions = (
+        'spiciness_peak_fraction_min',
+        'centroid_transition_pass_fraction_min',
+        'translated_mask_median_iou_min',
+        'median_direction_cosine_min',
+        'positive_direction_fraction_min',
+    )
+    if any(not 0 < settings[key] <= 1 for key in fractions):
+        raise ValueError(
+            'OFES event_patch fraction thresholds must lie in (0, 1].'
+        )
+    if settings['minimum_consecutive_days'] < 2:
+        raise ValueError(
+            'OFES patch minimum_consecutive_days must be at least two.'
+        )
+    if (
+        settings['median_speed_ratio_max']
+        <= settings['median_speed_ratio_min']
+    ):
+        raise ValueError('OFES patch speed-ratio bounds are not ordered.')
+    return settings
+
+
+def _ofes_patch_requests(
+    onset_diagnostics: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """为调用方显式选择的 onset 事件构造逐日 patch fingerprint 请求。"""
+    requested_ids = settings['representative_event_ids']
+    available_ids = set(onset_diagnostics['event_id'].astype(str))
+    missing = [value for value in requested_ids if value not in available_ids]
+    if missing:
+        raise RuntimeError(
+            f'OFES patch representative events are absent: {missing}.'
+        )
+    records = []
+    for event_order, event_id in enumerate(requested_ids, start=1):
+        group = onset_diagnostics.loc[
+            onset_diagnostics['event_id'].astype(str) == str(event_id)
+        ].sort_values('date', kind='mergesort')
+        peak = group.loc[group['is_peak']]
+        if len(peak) != 1:
+            raise RuntimeError(
+                f'OFES patch peak fingerprint is ambiguous for {event_id}.'
+            )
+        peak_row = peak.iloc[0]
+        peak_spice = float(
+            peak_row['same_sigma_spiciness0_contrast']
+        )
+        if not np.isfinite(peak_spice) or np.isclose(peak_spice, 0.0):
+            raise RuntimeError(
+                f'OFES patch peak spiciness is invalid for {event_id}.'
+            )
+        finite_radii = group[
+            'catalog_equivalent_radius_km'
+        ].dropna().to_numpy(dtype=float)
+        event_radius = (
+            float(np.nanmedian(finite_radii))
+            if finite_radii.size
+            else float(settings['centroid_error_floor_km'])
+        )
+        for row in group.itertuples(index=False):
+            records.append(
+                {
+                    'event_order': int(event_order),
+                    'event_id': str(event_id),
+                    'regime_label': str(row.regime_label),
+                    'date': pd.Timestamp(row.date).normalize(),
+                    'day_relative_to_start': int(
+                        row.day_relative_to_start
+                    ),
+                    'phase': str(row.phase),
+                    'daily_object_key': (
+                        str(row.daily_object_key)
+                        if pd.notna(row.daily_object_key)
+                        else ''
+                    ),
+                    'requested_core_lon': float(row.requested_core_lon),
+                    'requested_core_lat': float(row.requested_core_lat),
+                    'reference_depth_m': float(row.reference_depth_m),
+                    'target_sigma0': float(row.map_target_sigma0),
+                    'background_do_same_sigma': float(
+                        row.background_do_same_sigma
+                    ),
+                    'background_spiciness0_same_sigma': float(
+                        row.background_spiciness0_same_sigma
+                    ),
+                    'peak_spiciness0_contrast': peak_spice,
+                    'spiciness0_contrast_sign': int(np.sign(peak_spice)),
+                    'spiciness0_contrast_magnitude_min': float(
+                        abs(peak_spice)
+                        * settings['spiciness_peak_fraction_min']
+                    ),
+                    'event_equivalent_radius_km': event_radius,
+                    'is_start': bool(row.is_start),
+                    'is_deep_entry': bool(row.is_deep_entry),
+                    'is_peak': bool(row.is_peak),
+                }
+            )
+    requests = pd.DataFrame(records).sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    requests.insert(
+        0,
+        'patch_request_key',
+        requests.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    return requests
+
+
+def _ofes_nearest_coordinate_indices(
+    coordinate: np.ndarray,
+    values: np.ndarray,
+) -> np.ndarray:
+    """返回单调坐标中各值的最近索引，越界值为 -1。"""
+    axis = np.asarray(coordinate, dtype=float)
+    targets = np.asarray(values, dtype=float)
+    result = np.full(targets.shape, -1, dtype=np.int32)
+    finite = (
+        np.isfinite(targets)
+        & (targets >= axis[0])
+        & (targets <= axis[-1])
+    )
+    if not np.any(finite):
+        return result
+    insertion = np.searchsorted(axis, targets[finite], side='left')
+    insertion = np.clip(insertion, 0, len(axis) - 1)
+    left = np.clip(insertion - 1, 0, len(axis) - 1)
+    choose_left = (
+        np.abs(targets[finite] - axis[left])
+        <= np.abs(targets[finite] - axis[insertion])
+    )
+    result[finite] = np.where(choose_left, left, insertion)
+    return result
+
+
+def _ofes_build_patch_day(
+    request: dict,
+    settings: dict,
+    cache_path: str | Path,
+) -> dict:
+    """构建一个代表事件日的等密度面 DO/spice patch。"""
+    target = Path(cache_path)
+    expected = {
+        'patch_request_key': str(request['patch_request_key']),
+    }
+    if target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            if all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            ):
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['patch_field_cache_reused'] = True
+                metadata['patch_field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+    date = pd.Timestamp(request['date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(core_lon - lon_half_width, core_lon + lon_half_width),
+        lat_bounds=(core_lat - lat_half_width, core_lat + lat_half_width),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(request['target_sigma0']),
+        float(request['reference_depth_m']),
+        {
+            'do': snapshot['do2'],
+            'theta': snapshot['temp'],
+            'salinity': snapshot['salinity'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    mapped_pressure = np.asarray(
+        gsw.p_from_z(-mapped['depth'], lat_grid), dtype=float
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        mapped['salinity'],
+        mapped_pressure,
+        lon_grid,
+        lat_grid,
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, mapped['theta']
+    )
+    spiciness0 = np.asarray(
+        gsw.spiciness0(absolute_salinity, conservative_temperature),
+        dtype=float,
+    )
+    do_contrast = (
+        np.asarray(mapped['do'], dtype=float)
+        - float(request['background_do_same_sigma'])
+    )
+    spice_contrast = (
+        spiciness0
+        - float(request['background_spiciness0_same_sigma'])
+    )
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid, lat_grid, core_lon, core_lat
+        ),
+        dtype=float,
+    ) / 1000.0
+    circle = distance_km <= radius_km
+    fingerprint = (
+        circle
+        & np.isfinite(do_contrast)
+        & np.isfinite(spice_contrast)
+        & (
+            do_contrast
+            >= float(settings['do_contrast_min_umol_kg'])
+        )
+        & (
+            spice_contrast
+            * int(request['spiciness0_contrast_sign'])
+            > 0
+        )
+        & (
+            np.abs(spice_contrast)
+            >= float(request['spiciness0_contrast_magnitude_min'])
+        )
+    )
+    labels, component_count = ndimage_label(
+        fingerprint,
+        structure=np.ones((3, 3), dtype=np.int8),
+    )
+    chosen_label = 0
+    chosen_min_distance = np.nan
+    candidate_limit = max(
+        float(settings['centroid_error_floor_km']),
+        float(request['event_equivalent_radius_km']),
+    )
+    candidates = []
+    for label_id in range(1, int(component_count) + 1):
+        component = labels == label_id
+        minimum_distance = float(np.nanmin(distance_km[component]))
+        if minimum_distance <= candidate_limit:
+            candidates.append(
+                (
+                    minimum_distance,
+                    -int(np.count_nonzero(component)),
+                    label_id,
+                )
+            )
+    if candidates:
+        chosen_min_distance, _, chosen_label = min(candidates)
+    patch_mask = labels == int(chosen_label) if chosen_label else np.zeros_like(
+        fingerprint, dtype=bool
+    )
+    patch_identified = bool(np.any(patch_mask))
+    if patch_identified:
+        area_weights = np.cos(np.deg2rad(lat_grid[patch_mask]))
+        patch_lon = float(
+            np.average(lon_grid[patch_mask], weights=area_weights)
+        )
+        patch_lat = float(
+            np.average(lat_grid[patch_mask], weights=area_weights)
+        )
+        patch_u = float(
+            np.average(mapped['u'][patch_mask], weights=area_weights)
+        )
+        patch_v = float(
+            np.average(mapped['v'][patch_mask], weights=area_weights)
+        )
+        patch_do = float(np.nanmedian(do_contrast[patch_mask]))
+        patch_spice = float(np.nanmedian(spice_contrast[patch_mask]))
+        scale = approximate_degree_length(patch_lat)
+        dx = float(np.nanmedian(np.diff(lon))) * float(
+            scale['meters_per_degree_lon']
+        )
+        dy = float(np.nanmedian(np.diff(lat))) * float(
+            scale['meters_per_degree_lat']
+        )
+        area_km2 = float(
+            np.count_nonzero(patch_mask) * abs(dx * dy) / 1e6
+        )
+        equivalent_radius = float(np.sqrt(area_km2 / np.pi))
+    else:
+        patch_lon = patch_lat = patch_u = patch_v = np.nan
+        patch_do = patch_spice = area_km2 = equivalent_radius = np.nan
+    metadata = {
+        **{key: request[key] for key in request},
+        'patch_date': date,
+        'patch_identified': patch_identified,
+        'fingerprint_component_count': int(component_count),
+        'chosen_component_label': int(chosen_label),
+        'chosen_component_minimum_core_distance_km': float(
+            chosen_min_distance
+        ),
+        'patch_pixel_count': int(np.count_nonzero(patch_mask)),
+        'patch_centroid_lon': patch_lon,
+        'patch_centroid_lat': patch_lat,
+        'patch_mean_u_m_s': patch_u,
+        'patch_mean_v_m_s': patch_v,
+        'patch_median_do_contrast': patch_do,
+        'patch_median_spiciness0_contrast': patch_spice,
+        'patch_area_km2': area_km2,
+        'patch_equivalent_radius_km': equivalent_radius,
+        'patch_field_cache_reused': False,
+        'patch_field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        do_contrast=do_contrast.astype(np.float32),
+        spiciness0_contrast=spice_contrast.astype(np.float32),
+        isopycnal_depth=np.asarray(mapped['depth'], dtype=np.float32),
+        isopycnal_u=np.asarray(mapped['u'], dtype=np.float32),
+        isopycnal_v=np.asarray(mapped['v'], dtype=np.float32),
+        fingerprint_mask=fingerprint.astype(np.uint8),
+        patch_mask=patch_mask.astype(np.uint8),
+    )
+    return metadata
+
+
+
+def _ofes_patch_transition_metrics(
+    daily: pd.DataFrame,
+) -> pd.DataFrame:
+    """量化相邻日 fingerprint patch 的平移、流向和形状重叠。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        ordered = group.sort_values('date', kind='mergesort').reset_index(
+            drop=True
+        )
+        for index in range(len(ordered) - 1):
+            start = ordered.iloc[index]
+            end = ordered.iloc[index + 1]
+            start_date = pd.Timestamp(start['date']).normalize()
+            end_date = pd.Timestamp(end['date']).normalize()
+            elapsed_seconds = float(
+                (end_date - start_date).total_seconds()
+            )
+            if (
+                elapsed_seconds != 86400.0
+                or not bool(start['patch_identified'])
+                or not bool(end['patch_identified'])
+            ):
+                continue
+            midpoint_lat = 0.5 * (
+                float(start['patch_centroid_lat'])
+                + float(end['patch_centroid_lat'])
+            )
+            scale = approximate_degree_length(midpoint_lat)
+            observed_dx = float(
+                _minimal_lon_diff_deg(
+                    float(end['patch_centroid_lon']),
+                    float(start['patch_centroid_lon']),
+                )
+                * float(scale['meters_per_degree_lon'])
+            )
+            observed_dy = float(
+                (
+                    float(end['patch_centroid_lat'])
+                    - float(start['patch_centroid_lat'])
+                )
+                * float(scale['meters_per_degree_lat'])
+            )
+            mean_u = 0.5 * (
+                float(start['patch_mean_u_m_s'])
+                + float(end['patch_mean_u_m_s'])
+            )
+            mean_v = 0.5 * (
+                float(start['patch_mean_v_m_s'])
+                + float(end['patch_mean_v_m_s'])
+            )
+            predicted_dx = mean_u * elapsed_seconds
+            predicted_dy = mean_v * elapsed_seconds
+            observed_distance = float(np.hypot(observed_dx, observed_dy))
+            predicted_distance = float(
+                np.hypot(predicted_dx, predicted_dy)
+            )
+            direction_cosine = (
+                float(
+                    (
+                        observed_dx * predicted_dx
+                        + observed_dy * predicted_dy
+                    )
+                    / (observed_distance * predicted_distance)
+                )
+                if observed_distance > 0 and predicted_distance > 0
+                else np.nan
+            )
+            centroid_error = float(
+                np.hypot(
+                    observed_dx - predicted_dx,
+                    observed_dy - predicted_dy,
+                )
+                / 1000.0
+            )
+            with np.load(
+                start['patch_field_cache_path'], allow_pickle=False
+            ) as first, np.load(
+                end['patch_field_cache_path'], allow_pickle=False
+            ) as second:
+                first_mask = np.asarray(first['patch_mask'], dtype=bool)
+                first_u = np.asarray(first['isopycnal_u'], dtype=float)
+                first_v = np.asarray(first['isopycnal_v'], dtype=float)
+                first_lon = np.asarray(first['lon'], dtype=float)
+                first_lat = np.asarray(first['lat'], dtype=float)
+                second_mask = np.asarray(second['patch_mask'], dtype=bool)
+                second_lon = np.asarray(second['lon'], dtype=float)
+                second_lat = np.asarray(second['lat'], dtype=float)
+                first_lon_grid, first_lat_grid = np.meshgrid(
+                    first_lon, first_lat
+                )
+                pixel_scale = approximate_degree_length(
+                    first_lat_grid[first_mask]
+                )
+                predicted_lon = (
+                    first_lon_grid[first_mask]
+                    + first_u[first_mask]
+                    * elapsed_seconds
+                    / np.asarray(
+                        pixel_scale['meters_per_degree_lon'], dtype=float
+                    )
+                )
+                predicted_lat = (
+                    first_lat_grid[first_mask]
+                    + first_v[first_mask]
+                    * elapsed_seconds
+                    / np.asarray(
+                        pixel_scale['meters_per_degree_lat'], dtype=float
+                    )
+                )
+                rows = _ofes_nearest_coordinate_indices(
+                    second_lat, predicted_lat
+                )
+                columns = _ofes_nearest_coordinate_indices(
+                    second_lon, predicted_lon
+                )
+                valid = (rows >= 0) & (columns >= 0)
+                predicted_mask = np.zeros(second_mask.shape, dtype=bool)
+                predicted_mask[rows[valid], columns[valid]] = True
+                intersection = int(
+                    np.count_nonzero(predicted_mask & second_mask)
+                )
+                union = int(
+                    np.count_nonzero(predicted_mask | second_mask)
+                )
+                translated_iou = (
+                    float(intersection / union) if union else np.nan
+                )
+            error_limit = max(
+                float(start['centroid_error_floor_km']),
+                0.5
+                * (
+                    float(start['patch_equivalent_radius_km'])
+                    + float(end['patch_equivalent_radius_km'])
+                ),
+            )
+            records.append(
+                {
+                    'event_order': int(start['event_order']),
+                    'event_id': str(event_id),
+                    'regime_label': str(start['regime_label']),
+                    'transition_index': int(index + 1),
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'observed_distance_km': observed_distance / 1000.0,
+                    'predicted_distance_km': predicted_distance / 1000.0,
+                    'direction_cosine': direction_cosine,
+                    'observed_to_flow_speed_ratio': (
+                        float(observed_distance / predicted_distance)
+                        if predicted_distance > 0
+                        else np.nan
+                    ),
+                    'centroid_prediction_error_km': centroid_error,
+                    'centroid_error_limit_km': error_limit,
+                    'centroid_transition_passed': bool(
+                        centroid_error <= error_limit
+                    ),
+                    'translated_mask_iou': translated_iou,
+                }
+            )
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                'event_order',
+                'event_id',
+                'regime_label',
+                'transition_index',
+                'start_date',
+                'end_date',
+                'observed_distance_km',
+                'predicted_distance_km',
+                'direction_cosine',
+                'observed_to_flow_speed_ratio',
+                'centroid_prediction_error_km',
+                'centroid_error_limit_km',
+                'centroid_transition_passed',
+                'translated_mask_iou',
+            ]
+        )
+    return pd.DataFrame(records).sort_values(
+        ['event_order', 'start_date'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_maximum_consecutive_patch_days(group: pd.DataFrame) -> int:
+    """返回事件中连续可识别 patch 的最长日数。"""
+    dates = sorted(
+        pd.to_datetime(
+            group.loc[group['patch_identified'], 'date']
+        ).dt.normalize().unique()
+    )
+    if not dates:
+        return 0
+    maximum = current = 1
+    for earlier, later in zip(dates[:-1], dates[1:]):
+        if pd.Timestamp(later) - pd.Timestamp(earlier) == pd.Timedelta(days=1):
+            current += 1
+        else:
+            maximum = max(maximum, current)
+            current = 1
+    return int(max(maximum, current))
+
+
+def _ofes_patch_summary(
+    daily: pd.DataFrame,
+    transitions: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总三事件 patch 连续性并预注册判定 E000002 轨迹解释门。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        event_transitions = transitions.loc[
+            transitions['event_id'].astype(str) == str(event_id)
+        ]
+        speed_ratio = event_transitions[
+            'observed_to_flow_speed_ratio'
+        ].to_numpy(dtype=float)
+        maximum_run = _ofes_maximum_consecutive_patch_days(group)
+        record = {
+            'event_order': int(group['event_order'].iloc[0]),
+            'event_id': str(event_id),
+            'regime_label': str(group['regime_label'].iloc[0]),
+            'diagnostic_day_count': int(len(group)),
+            'identified_day_count': int(group['patch_identified'].sum()),
+            'maximum_consecutive_identified_days': maximum_run,
+            'transition_count': int(len(event_transitions)),
+            'centroid_transition_pass_fraction': (
+                float(
+                    event_transitions[
+                        'centroid_transition_passed'
+                    ].mean()
+                )
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_translated_mask_iou': (
+                float(event_transitions['translated_mask_iou'].median())
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_direction_cosine': (
+                float(event_transitions['direction_cosine'].median())
+                if len(event_transitions)
+                else np.nan
+            ),
+            'positive_direction_fraction': (
+                float(np.mean(event_transitions['direction_cosine'] > 0))
+                if len(event_transitions)
+                else np.nan
+            ),
+            'median_observed_to_flow_speed_ratio': (
+                float(np.nanmedian(speed_ratio))
+                if speed_ratio.size
+                else np.nan
+            ),
+        }
+        record['consecutive_day_gate_passed'] = bool(
+            maximum_run >= settings['minimum_consecutive_days']
+        )
+        record['centroid_transition_gate_passed'] = bool(
+            np.isfinite(record['centroid_transition_pass_fraction'])
+            and record['centroid_transition_pass_fraction']
+            >= settings['centroid_transition_pass_fraction_min']
+        )
+        record['translated_mask_gate_passed'] = bool(
+            np.isfinite(record['median_translated_mask_iou'])
+            and record['median_translated_mask_iou']
+            >= settings['translated_mask_median_iou_min']
+        )
+        record['direction_gate_passed'] = bool(
+            np.isfinite(record['median_direction_cosine'])
+            and record['median_direction_cosine']
+            >= settings['median_direction_cosine_min']
+            and record['positive_direction_fraction']
+            >= settings['positive_direction_fraction_min']
+        )
+        record['speed_gate_passed'] = bool(
+            np.isfinite(record['median_observed_to_flow_speed_ratio'])
+            and settings['median_speed_ratio_min']
+            <= record['median_observed_to_flow_speed_ratio']
+            <= settings['median_speed_ratio_max']
+        )
+        record['candidate_pathway_gate_passed'] = bool(
+            record['consecutive_day_gate_passed']
+            and record['centroid_transition_gate_passed']
+            and record['translated_mask_gate_passed']
+            and record['direction_gate_passed']
+            and record['speed_gate_passed']
+        )
+        records.append(record)
+    summary = pd.DataFrame(records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    headline_id = settings['representative_event_ids'][0]
+    headline = summary.loc[
+        summary['event_id'].astype(str) == str(headline_id)
+    ]
+    if len(headline) != 1:
+        raise RuntimeError('OFES patch headline gate row is missing.')
+    headline_record = headline.iloc[0].to_dict()
+    payload = {
+        'headline_event_id': str(headline_id),
+        'headline_candidate_pathway_gate_passed': bool(
+            headline_record['candidate_pathway_gate_passed']
+        ),
+        'trajectory_execution_policy': (
+            'Validated fixed-depth ensembles are run regardless of this '
+            'gate; the gate controls promotion into source-pathway claims.'
+        ),
+        'predeclared_thresholds': settings,
+        'event_records': summary.to_dict(orient='records'),
+        'causal_limits': [
+            'A connected Eulerian fingerprint patch is not a material parcel.',
+            'Resolved horizontal flow omits diffusion, mixing, vertical '
+            'motion, and unresolved submesoscale tendencies.',
+            'E000176 and E000239 remain controls and cannot replace the '
+            'blind headline event as the trajectory-interpretation trigger.',
+        ],
+    }
+    return summary, payload
+
+
+def _plot_ofes_patch_continuity(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制三类代表事件的 fingerprint patch 质心演化。"""
+    figure, axes = plt.subplots(
+        1,
+        len(summary),
+        figsize=(5.4 * len(summary), 5.2),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, event in zip(axes[0], summary.itertuples(index=False)):
+        group = daily.loc[
+            daily['event_id'].astype(str) == str(event.event_id)
+        ].sort_values('date', kind='mergesort')
+        identified = group.loc[group['patch_identified']]
+        axis.plot(
+            identified['patch_centroid_lon'],
+            identified['patch_centroid_lat'],
+            color='#111827',
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        scatter = axis.scatter(
+            identified['patch_centroid_lon'],
+            identified['patch_centroid_lat'],
+            c=identified['day_relative_to_start'],
+            cmap='viridis',
+            s=np.clip(
+                identified['patch_area_km2'].to_numpy(dtype=float) / 8.0,
+                20.0,
+                180.0,
+            ),
+            edgecolor='#111827',
+            linewidth=0.4,
+        )
+        axis.scatter(
+            group['requested_core_lon'],
+            group['requested_core_lat'],
+            marker='x',
+            color='#dc2626',
+            s=28,
+            alpha=0.65,
+            label='ΔDO core',
+        )
+        axis.set_title(
+            f'{event.regime_label}\n{event.event_id}\n'
+            f'{event.maximum_consecutive_identified_days} consecutive days; '
+            f'gate={bool(event.candidate_pathway_gate_passed)}'
+        )
+        axis.set_xlabel('Longitude')
+        axis.set_ylabel('Latitude')
+        axis.grid(alpha=0.2)
+        axis.legend(loc='best')
+        if not identified.empty:
+            figure.colorbar(
+                scatter,
+                ax=axis,
+                shrink=0.72,
+                label='Days relative to event start',
+            )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_water_mass_patch_continuity(
+    onset_dir: str | Path | None = None,
+    *,
+    patch_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """追踪调用方选择的 OFES onset 事件的同密度面 DO/spice fingerprint patch。
+
+    函数按 `patch_overrides['representative_event_ids']` 选择事件，并以各自
+    peak σ₀ 在逐日窗口中识别同时满足 DO50 与 peak-spice 指纹的连通 patch，
+    再量化连续日数、流场平移后的 mask IoU、质心误差、方向余弦和速度比。
+    代表事件选择不写入配置文件。
+
+    参数:
+        - onset_dir (str | Path | None): onset 目录；None 时读取固定正式目录。
+        - patch_overrides (dict | None): 临时覆盖 `ofes.event_patch` 配置；其中
+          `representative_event_ids` 必须由 notebook setup cell 显式提供三个事件编号。
+        - output_dir (str | Path | None): 输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、逐日 patch、相邻日 transition、事件总结、解释 gate 和图件路径。
+
+    输出:
+        - `<output_dir>/fields/*.npz`、`daily_patch_diagnostics.parquet`、`patch_transitions.parquet`、`patch_summary.parquet`、`trajectory_interpretation_gate.json` 与 `patch_continuity.png`。
+
+    说明:
+        - fingerprint continuity 是 Eulerian/quasi-Lagrangian 候选路径，不是物质水团证明。
+    """
+    onset_root = (
+        Path(onset_dir)
+        if onset_dir is not None
+        else _ofes_analysis_output_dir('event_onset')
+    )
+    settings = _ofes_event_patch_settings(patch_overrides)
+    onset_diagnostics = pd.read_parquet(
+        onset_root / 'daily_diagnostics.parquet'
+    )
+    requests = _ofes_patch_requests(onset_diagnostics, settings)
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    fields_dir = output_path / 'fields'
+    fields_dir.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'daily_patch_diagnostics.parquet',
+        output_path / 'patch_transitions.parquet',
+        output_path / 'patch_summary.parquet',
+        output_path / 'trajectory_interpretation_gate.json',
+        output_path / 'patch_continuity.png',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_patch_continuity(output_dir=output_path)
+        expected_keys = set(requests['patch_request_key'].astype(str))
+        stored_keys = set(
+            loaded['daily_patch_diagnostics']['patch_request_key'].astype(str)
+        )
+        if stored_keys != expected_keys:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['reused_complete_run'] = True
+        return loaded
+    daily_records = []
+    for row in requests.itertuples(index=False):
+        cache_path = fields_dir / f'{row.patch_request_key}.npz'
+        metadata = _ofes_build_patch_day(
+            row._asdict(),
+            settings,
+            cache_path,
+        )
+        metadata['centroid_error_floor_km'] = float(
+            settings['centroid_error_floor_km']
+        )
+        daily_records.append(metadata)
+    daily = pd.DataFrame(daily_records).sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    transitions = _ofes_patch_transition_metrics(daily)
+    summary, gate = _ofes_patch_summary(
+        daily, transitions, settings
+    )
+    daily_path = output_path / 'daily_patch_diagnostics.parquet'
+    transition_path = output_path / 'patch_transitions.parquet'
+    summary_path = output_path / 'patch_summary.parquet'
+    gate_path = output_path / 'trajectory_interpretation_gate.json'
+    figure_path = output_path / 'patch_continuity.png'
+    _atomic_write_parquet(daily, daily_path)
+    _atomic_write_parquet(transitions, transition_path)
+    _atomic_write_parquet(summary, summary_path)
+    _ofes_atomic_write_json(gate, gate_path)
+    _plot_ofes_patch_continuity(
+        daily, summary, figure_path, settings['figure_dpi']
+    )
+    return {
+        'output_dir': output_path,
+        'daily_patch_diagnostics': daily,
+        'patch_transitions': transitions,
+        'patch_summary': summary,
+        'trajectory_interpretation_gate': gate,
+        'figure_path': figure_path,
+    }
+
+
+
+def _ofes_event_lifecycle_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES 事件生命周期与 SCV-compatible 配置。"""
+    raw = dict(_OFES_CFG.get('event_lifecycle', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_lifecycle override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    settings = {
+        'persistent_day_fraction_min': float(
+            raw.get('persistent_day_fraction_min', 0.75)
+        ),
+        'intermittent_day_fraction_min': float(
+            raw.get('intermittent_day_fraction_min', 0.25)
+        ),
+        'minimum_lag_pairs': int(raw.get('minimum_lag_pairs', 7)),
+        'maximum_lag_days': int(raw.get('maximum_lag_days', 5)),
+        'maximum_lag_duration_fraction': float(
+            raw.get('maximum_lag_duration_fraction', 1 / 3)
+        ),
+        'lag_correlation_min': float(
+            raw.get('lag_correlation_min', 0.5)
+        ),
+        'lag_improvement_over_zero_min': float(
+            raw.get('lag_improvement_over_zero_min', 0.1)
+        ),
+        'minimum_classified_lag_days': int(
+            raw.get('minimum_classified_lag_days', 2)
+        ),
+        'scv_rotation_day_fraction_min': float(
+            raw.get('scv_rotation_day_fraction_min', 0.5)
+        ),
+        'scv_anticyclonic_rotation_fraction_min': float(
+            raw.get('scv_anticyclonic_rotation_fraction_min', 0.75)
+        ),
+        'scv_subsurface_max_depth_min_m': float(
+            raw.get('scv_subsurface_max_depth_min_m', 200.0)
+        ),
+        'scv_minimum_consecutive_days': int(
+            raw.get('scv_minimum_consecutive_days', 5)
+        ),
+        'surface_profile_rossby_tolerance': float(
+            raw.get('surface_profile_rossby_tolerance', 0.001)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_lifecycle')
+        ),
+    }
+    fraction_keys = (
+        'persistent_day_fraction_min',
+        'intermittent_day_fraction_min',
+        'maximum_lag_duration_fraction',
+        'lag_correlation_min',
+        'lag_improvement_over_zero_min',
+        'scv_rotation_day_fraction_min',
+        'scv_anticyclonic_rotation_fraction_min',
+    )
+    if any(
+        not np.isfinite(settings[key]) or not 0 < settings[key] <= 1
+        for key in fraction_keys
+    ):
+        raise ValueError(
+            'OFES lifecycle fraction thresholds must lie in (0, 1].'
+        )
+    if (
+        settings['intermittent_day_fraction_min']
+        >= settings['persistent_day_fraction_min']
+    ):
+        raise ValueError(
+            'OFES lifecycle intermittent threshold must be below persistent.'
+        )
+    integer_keys = (
+        'minimum_lag_pairs',
+        'maximum_lag_days',
+        'minimum_classified_lag_days',
+        'scv_minimum_consecutive_days',
+        'figure_dpi',
+    )
+    if any(settings[key] <= 0 for key in integer_keys):
+        raise ValueError(
+            'OFES lifecycle integer thresholds must be positive.'
+        )
+    if (
+        not np.isfinite(settings['surface_profile_rossby_tolerance'])
+        or settings['surface_profile_rossby_tolerance'] <= 0
+    ):
+        raise ValueError(
+            'OFES lifecycle surface/profile Ro tolerance must be positive.'
+        )
+    return settings
+
+
+def _ofes_lifecycle_requests(
+    population_diagnostics: pd.DataFrame,
+    daily_objects: pd.DataFrame,
+) -> pd.DataFrame:
+    """从当前通过 population 诊断的事件构建 observed-day 请求。"""
+    strict = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+    ].sort_values(
+        'deep_sensitivity_rank_within_threshold', kind='mergesort'
+    )
+    if strict.empty:
+        raise RuntimeError(
+            'OFES lifecycle found no population events passing diagnostics.'
+        )
+    event_columns = [
+        'event_id',
+        'deep_sensitivity_rank_within_threshold',
+        'start_date',
+        'peak_date',
+        'peak_daily_object_key',
+        'reference_depth_m',
+        'daily_peak_equivalent_radius_km',
+        'rotation_dominated',
+        'rossby_number',
+        'surface_core_rotation_polarity_match',
+        'surface_weak_or_reversed_rotation',
+        'surface_core_weighted_rossby_number',
+    ]
+    event_meta = strict[event_columns].rename(
+        columns={
+            'rotation_dominated': 'population_peak_rotation_dominated',
+            'rossby_number': 'population_peak_rossby_number',
+            'surface_core_rotation_polarity_match': (
+                'population_peak_surface_polarity_matched'
+            ),
+            'surface_weak_or_reversed_rotation': (
+                'population_peak_surface_weak_or_reversed'
+            ),
+            'surface_core_weighted_rossby_number': (
+                'population_peak_surface_core_weighted_rossby_number'
+            ),
+            'daily_peak_equivalent_radius_km': (
+                'event_peak_equivalent_radius_km'
+            ),
+        }
+    ).copy()
+    event_meta.insert(
+        0,
+        'event_order',
+        np.arange(1, len(event_meta) + 1, dtype=np.int16),
+    )
+    selected = daily_objects.loc[
+        (daily_objects['threshold'] == 50.0)
+        & daily_objects['event_id'].astype(str).isin(
+            event_meta['event_id'].astype(str)
+        )
+    ].merge(
+        event_meta,
+        on='event_id',
+        how='inner',
+        validate='many_to_one',
+    )
+    selected['date'] = pd.to_datetime(selected['date']).dt.normalize()
+    selected['start_date'] = pd.to_datetime(
+        selected['start_date']
+    ).dt.normalize()
+    selected['peak_date'] = pd.to_datetime(
+        selected['peak_date']
+    ).dt.normalize()
+    selected['day_relative_to_start'] = (
+        selected['date'] - selected['start_date']
+    ).dt.days.astype(np.int16)
+    start_to_peak = (
+        selected['peak_date'] - selected['start_date']
+    ).dt.days.to_numpy(dtype=float)
+    selected['normalized_event_time'] = np.divide(
+        selected['day_relative_to_start'].to_numpy(dtype=float),
+        start_to_peak,
+        out=np.full(len(selected), np.nan, dtype=float),
+        where=start_to_peak > 0,
+    )
+    selected['event_peak_polarity_sign'] = np.sign(
+        selected['population_peak_rossby_number'].to_numpy(dtype=float)
+    ).astype(np.int8)
+    selected['is_event_peak_day'] = (
+        selected['daily_object_key'].astype(str)
+        == selected['peak_daily_object_key'].astype(str)
+    )
+    selected = selected.sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    selected.insert(
+        0,
+        'lifecycle_request_key',
+        selected.apply(
+            lambda row: (
+                f'{row["event_id"]}_{pd.Timestamp(row["date"]):%Y%m%d}'
+            ),
+            axis=1,
+        ),
+    )
+    if selected['lifecycle_request_key'].duplicated().any():
+        raise RuntimeError('OFES lifecycle requests contain duplicate days.')
+    return selected
+
+
+def _ofes_vertical_core_rossby_day(
+    date: str | pd.Timestamp,
+    core_lon: float,
+    core_lat: float,
+    reference_depth_m: float,
+    weight_scale_km: float,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> tuple[dict, pd.DataFrame]:
+    """提取逐层核心加权 Ro 与固定参考深度点动力量。"""
+    support_km = (
+        float(weight_scale_km)
+        * float(population_settings['surface_weight_support_factor'])
+    )
+    if support_km >= float(
+        diagnostic_settings['background_inner_radius_km']
+    ):
+        raise ValueError(
+            'OFES lifecycle core weight overlaps the background annulus.'
+        )
+    load_radius_km = max(60.0, support_km + 20.0)
+    scale = approximate_degree_length(float(core_lat))
+    lon_half_width = (
+        load_radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        load_radius_km
+        * 1000.0
+        / float(scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        pd.Timestamp(date).normalize(),
+        variables=['u', 'v'],
+        lon_bounds=(
+            float(core_lon) - lon_half_width,
+            float(core_lon) + lon_half_width,
+        ),
+        lat_bounds=(
+            float(core_lat) - lat_half_width,
+            float(core_lat) + lat_half_width,
+        ),
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = np.asarray(
+        adaptive_distance_m(
+            lon_grid,
+            lat_grid,
+            float(core_lon),
+            float(core_lat),
+            force_great_circle=True,
+        ),
+        dtype=float,
+    ) / 1000.0
+    weight_mask = distance_km <= support_km
+    weights = np.exp(
+        -0.5 * (distance_km[weight_mask] / float(weight_scale_km)) ** 2
+    )
+    if not weights.size or float(np.sum(weights)) <= 0:
+        raise RuntimeError('OFES lifecycle core weight has no support.')
+    profile_records = []
+    reference_fields = None
+    reference_index = int(
+        np.argmin(np.abs(depth - float(reference_depth_m)))
+    )
+    for level_index, level_depth in enumerate(depth):
+        fields = _ofes_fixed_depth_kinematic_fields(
+            snapshot,
+            float(level_depth),
+            float(
+                diagnostic_settings['velocity_smoothing_sigma_pixels']
+            ),
+        )
+        core_weighted_rossby = float(
+            np.sum(weights * fields['rossby_number'][weight_mask])
+            / np.sum(weights)
+        )
+        profile_records.append(
+            {
+                'depth_m': float(level_depth),
+                'core_weighted_rossby_number': core_weighted_rossby,
+            }
+        )
+        if level_index == reference_index:
+            reference_fields = fields
+    if reference_fields is None:
+        raise RuntimeError('OFES lifecycle reference depth was not sampled.')
+    kinematics = _ofes_kinematics_at_point(
+        reference_fields,
+        lon,
+        lat,
+        float(core_lon),
+        float(core_lat),
+    )
+    profile = pd.DataFrame(profile_records)
+    finite = profile['core_weighted_rossby_number'].notna()
+    if not bool(finite.any()):
+        raise RuntimeError('OFES lifecycle vertical Ro profile is empty.')
+    valid_profile = profile.loc[finite]
+    maximum_index = valid_profile[
+        'core_weighted_rossby_number'
+    ].abs().idxmax()
+    maximum = profile.loc[maximum_index]
+    summary = {
+        **kinematics,
+        'vertical_max_abs_rossby_number': float(
+            abs(maximum['core_weighted_rossby_number'])
+        ),
+        'vertical_max_rossby_number': float(
+            maximum['core_weighted_rossby_number']
+        ),
+        'vertical_max_rossby_depth_m': float(maximum['depth_m']),
+        'vertical_surface_core_weighted_rossby_number': float(
+            profile.iloc[0]['core_weighted_rossby_number']
+        ),
+        'vertical_profile_level_count': int(len(profile)),
+    }
+    return summary, profile
+
+
+def _ofes_lifecycle_day(
+    request: dict,
+    diagnostic_settings: dict,
+    population_settings: dict,
+) -> tuple[dict, pd.DataFrame]:
+    """计算一个严格事件日的深层、表层和垂向旋转诊断。"""
+    core_lon = float(request['peak_lon'])
+    core_lat = float(request['peak_lat'])
+    weight_scale = (
+        float(request['event_peak_equivalent_radius_km'])
+        * float(population_settings['surface_weight_scale_factor'])
+    )
+    vertical, profile = _ofes_vertical_core_rossby_day(
+        request['date'],
+        core_lon,
+        core_lat,
+        float(request['reference_depth_m']),
+        weight_scale,
+        diagnostic_settings,
+        population_settings,
+    )
+    surface = _ofes_surface_expression_day(
+        request['date'],
+        core_lon,
+        core_lat,
+        float(vertical['rossby_number']),
+        float(request['event_peak_equivalent_radius_km']),
+        diagnostic_settings,
+        population_settings,
+    )
+    record = {
+        **request,
+        **vertical,
+        **surface,
+        'lifecycle_diagnostic_passed': bool(
+            surface['surface_diagnostic_passed']
+            and np.isfinite(vertical['rossby_number'])
+            and np.isfinite(vertical['normalized_strain'])
+            and np.isfinite(vertical['vertical_max_rossby_number'])
+        ),
+    }
+    classified = _ofes_add_surface_rotation_metrics(
+        pd.DataFrame([record]), population_settings
+    ).iloc[0].to_dict()
+    classified['surface_core_weighted_profile_agreement'] = float(
+        classified['vertical_surface_core_weighted_rossby_number']
+        - classified['surface_core_weighted_rossby_number']
+    )
+    profile.insert(0, 'date', pd.Timestamp(request['date']).normalize())
+    profile.insert(0, 'event_id', str(request['event_id']))
+    profile.insert(
+        0, 'lifecycle_request_key', str(request['lifecycle_request_key'])
+    )
+    return classified, profile
+
+
+def _ofes_fraction_class(value: float, settings: dict) -> str:
+    """按预注册 75%/25% 门槛返回 persistent/intermittent/rare。"""
+    if not np.isfinite(value):
+        return 'unresolved'
+    if value >= settings['persistent_day_fraction_min']:
+        return 'persistent'
+    if value >= settings['intermittent_day_fraction_min']:
+        return 'intermittent'
+    return 'rare'
+
+
+def _ofes_maximum_consecutive_true(
+    dates: pd.Series,
+    values: pd.Series,
+) -> int:
+    """返回按日排序布尔序列中连续 True 的最长天数。"""
+    frame = pd.DataFrame(
+        {
+            'date': pd.to_datetime(dates).dt.normalize(),
+            'value': values.astype(bool).to_numpy(),
+        }
+    ).sort_values('date', kind='mergesort')
+    maximum = current = 0
+    previous_date = None
+    for row in frame.itertuples(index=False):
+        if row.value and (
+            previous_date is None
+            or row.date - previous_date == pd.Timedelta(days=1)
+        ):
+            current += 1
+        elif row.value:
+            current = 1
+        else:
+            current = 0
+        maximum = max(maximum, current)
+        previous_date = row.date
+    return int(maximum)
+
+
+def _ofes_lifecycle_lag_diagnostic(
+    group: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """用旋转强度交叉相关描述表层相对深层的 lead/lag。"""
+    ordered = group.sort_values('date', kind='mergesort')
+    peak_sign = int(ordered['event_peak_polarity_sign'].iloc[0])
+    surface = (
+        ordered['surface_core_weighted_rossby_number'].to_numpy(dtype=float)
+        * peak_sign
+    )
+    deep = ordered['rossby_number'].to_numpy(dtype=float) * peak_sign
+    n_pairs = len(ordered)
+    if n_pairs < settings['minimum_lag_pairs']:
+        return {
+            'lag_pair_count': int(n_pairs),
+            'lag_search_max_days': 0,
+            'zero_lag_correlation': np.nan,
+            'maximum_lag_correlation': np.nan,
+            'best_surface_lead_days': np.nan,
+            'lead_lag_class': 'unresolved_too_short',
+        }
+    duration_days = int(
+        (ordered['date'].max() - ordered['date'].min()).days
+    )
+    lag_max = min(
+        int(settings['maximum_lag_days']),
+        max(
+            1,
+            int(
+                np.floor(
+                    duration_days
+                    * settings['maximum_lag_duration_fraction']
+                )
+            ),
+        ),
+    )
+    correlations = {}
+    for lag in range(-lag_max, lag_max + 1):
+        if lag > 0:
+            surface_values = surface[:-lag]
+            deep_values = deep[lag:]
+        elif lag < 0:
+            surface_values = surface[-lag:]
+            deep_values = deep[:lag]
+        else:
+            surface_values = surface
+            deep_values = deep
+        finite = np.isfinite(surface_values) & np.isfinite(deep_values)
+        if (
+            int(np.count_nonzero(finite))
+            < settings['minimum_lag_pairs']
+            or np.nanstd(surface_values[finite]) == 0
+            or np.nanstd(deep_values[finite]) == 0
+        ):
+            correlations[lag] = np.nan
+        else:
+            correlations[lag] = float(
+                np.corrcoef(
+                    surface_values[finite], deep_values[finite]
+                )[0, 1]
+            )
+    finite_items = [
+        (lag, value)
+        for lag, value in correlations.items()
+        if np.isfinite(value)
+    ]
+    zero = correlations.get(0, np.nan)
+    if not finite_items:
+        best_lag, best = 0, np.nan
+        label = 'unresolved_nonfinite'
+    else:
+        best_lag, best = max(finite_items, key=lambda item: item[1])
+        improvement = best - zero if np.isfinite(zero) else np.nan
+        classified = (
+            best >= settings['lag_correlation_min']
+            and np.isfinite(improvement)
+            and improvement
+            >= settings['lag_improvement_over_zero_min']
+            and abs(best_lag)
+            >= settings['minimum_classified_lag_days']
+        )
+        if classified:
+            label = (
+                'surface_leads'
+                if best_lag > 0
+                else 'surface_lags'
+            )
+        elif np.isfinite(zero) and zero >= settings['lag_correlation_min']:
+            label = 'synchronous_or_unresolved'
+        else:
+            label = 'unresolved'
+    return {
+        'lag_pair_count': int(n_pairs),
+        'lag_search_max_days': int(lag_max),
+        'zero_lag_correlation': float(zero),
+        'maximum_lag_correlation': float(best),
+        'best_surface_lead_days': float(best_lag),
+        'lead_lag_class': label,
+    }
+
+
+def _ofes_lifecycle_peak_parity(
+    daily: pd.DataFrame,
+    population_diagnostics: pd.DataFrame,
+) -> dict:
+    """要求生命周期 peak 日逐值继承 population 的旋转分类与数值。"""
+    rotation_population = population_diagnostics.loc[
+        population_diagnostics['population_diagnostic_passed']
+        & population_diagnostics['rotation_dominated']
+    ]
+    peak = daily.loc[daily['is_event_peak_day']].merge(
+        rotation_population[
+            [
+                'event_id',
+                'rossby_number',
+                'surface_core_weighted_rossby_number',
+                'surface_core_rotation_polarity_match',
+                'surface_weak_or_reversed_rotation',
+            ]
+        ],
+        on='event_id',
+        how='inner',
+        validate='one_to_one',
+        suffixes=('_lifecycle', '_population'),
+    )
+    if peak.empty:
+        raise RuntimeError(
+            'OFES lifecycle peak parity found no rotation events to compare.'
+        )
+    numeric_columns = (
+        'rossby_number',
+        'surface_core_weighted_rossby_number',
+    )
+    maximum_differences = {}
+    for column in numeric_columns:
+        difference = np.abs(
+            peak[f'{column}_lifecycle'].to_numpy(dtype=float)
+            - peak[f'{column}_population'].to_numpy(dtype=float)
+        )
+        maximum_differences[column] = float(np.nanmax(difference))
+    lifecycle_matched = int(
+        peak['surface_core_rotation_polarity_match_lifecycle'].sum()
+    )
+    lifecycle_weak = int(
+        peak['surface_weak_or_reversed_rotation_lifecycle'].sum()
+    )
+    boolean_exact = bool(
+        np.array_equal(
+            peak[
+                'surface_core_rotation_polarity_match_lifecycle'
+            ].to_numpy(dtype=bool),
+            peak[
+                'surface_core_rotation_polarity_match_population'
+            ].to_numpy(dtype=bool),
+        )
+        and np.array_equal(
+            peak[
+                'surface_weak_or_reversed_rotation_lifecycle'
+            ].to_numpy(dtype=bool),
+            peak[
+                'surface_weak_or_reversed_rotation_population'
+            ].to_numpy(dtype=bool),
+        )
+    )
+    passed = bool(
+        boolean_exact
+        and all(value <= 1e-10 for value in maximum_differences.values())
+    )
+    payload = {
+        'passed': passed,
+        'rotation_event_count': int(len(peak)),
+        'surface_polarity_matched_count': lifecycle_matched,
+        'surface_weak_or_reversed_count': lifecycle_weak,
+        'boolean_columns_exact': boolean_exact,
+        'maximum_numeric_differences': maximum_differences,
+    }
+    if not passed:
+        raise RuntimeError(
+            f'OFES lifecycle peak-day population parity failed: {payload}'
+        )
+    return payload
+
+
+def _ofes_lifecycle_summary(
+    daily: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """汇总当前事件集合的时间口径表层表达与 SCV-compatible 分类。"""
+    records = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        eligible = group.loc[group['lifecycle_diagnostic_passed']].copy()
+        rotation = eligible.loc[eligible['rotation_dominated']]
+        rotation_fraction = float(
+            eligible['rotation_dominated'].mean()
+        ) if len(eligible) else np.nan
+        anticyclonic_fraction = (
+            float(rotation['negative_subsurface_rossby_number'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        scv_day = (
+            eligible['rotation_dominated']
+            & eligible['negative_subsurface_rossby_number']
+            & (
+                eligible['vertical_max_rossby_depth_m']
+                >= settings['scv_subsurface_max_depth_min_m']
+            )
+            & (eligible['vertical_max_rossby_number'] < 0)
+        )
+        maximum_scv_days = _ofes_maximum_consecutive_true(
+            eligible['date'], scv_day
+        ) if len(eligible) else 0
+        polarity_fraction = (
+            float(rotation['surface_core_rotation_polarity_match'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        weak_fraction = (
+            float(rotation['surface_weak_or_reversed_rotation'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        offset_fraction = (
+            float(rotation['surface_spatial_offset_rotation'].mean())
+            if len(rotation)
+            else np.nan
+        )
+        persistent_anticyclonic = bool(
+            np.isfinite(rotation_fraction)
+            and rotation_fraction
+            >= settings['scv_rotation_day_fraction_min']
+            and np.isfinite(anticyclonic_fraction)
+            and anticyclonic_fraction
+            >= settings['scv_anticyclonic_rotation_fraction_min']
+        )
+        scv_compatible = bool(
+            persistent_anticyclonic
+            and maximum_scv_days
+            >= settings['scv_minimum_consecutive_days']
+        )
+        surface_obscured = bool(
+            scv_compatible
+            and np.isfinite(weak_fraction)
+            and weak_fraction
+            >= settings['persistent_day_fraction_min']
+        )
+        records.append(
+            {
+                'event_order': int(group['event_order'].iloc[0]),
+                'event_id': str(event_id),
+                'deep_sensitivity_rank_within_threshold': int(
+                    group[
+                        'deep_sensitivity_rank_within_threshold'
+                    ].iloc[0]
+                ),
+                'population_peak_rotation_dominated': bool(
+                    group['population_peak_rotation_dominated'].iloc[0]
+                ),
+                'observed_day_count': int(len(group)),
+                'eligible_day_count': int(len(eligible)),
+                'rotation_day_count': int(len(rotation)),
+                'rotation_day_fraction': rotation_fraction,
+                'anticyclonic_fraction_among_rotation_days': (
+                    anticyclonic_fraction
+                ),
+                'surface_polarity_match_fraction_among_rotation_days': (
+                    polarity_fraction
+                ),
+                'surface_weak_or_reversed_fraction_among_rotation_days': (
+                    weak_fraction
+                ),
+                'surface_spatial_offset_fraction_among_rotation_days': (
+                    offset_fraction
+                ),
+                'surface_polarity_match_lifecycle_class': (
+                    _ofes_fraction_class(polarity_fraction, settings)
+                ),
+                'surface_weak_or_reversed_lifecycle_class': (
+                    _ofes_fraction_class(weak_fraction, settings)
+                ),
+                'surface_spatial_offset_lifecycle_class': (
+                    _ofes_fraction_class(offset_fraction, settings)
+                ),
+                'maximum_consecutive_scv_compatible_days': (
+                    maximum_scv_days
+                ),
+                'persistent_anticyclonic_rotational_carrier': (
+                    persistent_anticyclonic
+                ),
+                'scv_compatible': scv_compatible,
+                'surface_obscured_scv_compatible': surface_obscured,
+                **_ofes_lifecycle_lag_diagnostic(eligible, settings),
+            }
+        )
+    summary = pd.DataFrame(records).sort_values(
+        'event_order', kind='mergesort'
+    ).reset_index(drop=True)
+    strict_count = int(len(summary))
+    anticyclonic_count = int(
+        summary['persistent_anticyclonic_rotational_carrier'].sum()
+    )
+    scv_count = int(summary['scv_compatible'].sum())
+    obscured_count = int(
+        summary['surface_obscured_scv_compatible'].sum()
+    )
+    def dominance_label(count: int) -> str:
+        return 'dominant' if count / strict_count > 0.5 else 'subset'
+    payload = {
+        'strict_event_count': strict_count,
+        'peak_rotation_event_count': int(
+            summary['population_peak_rotation_dominated'].sum()
+        ),
+        'persistent_anticyclonic_rotational_carrier_count': (
+            anticyclonic_count
+        ),
+        'persistent_anticyclonic_rotational_carrier_fraction': (
+            anticyclonic_count / strict_count
+        ),
+        'persistent_anticyclonic_rotational_carrier_label': (
+            dominance_label(anticyclonic_count)
+        ),
+        'scv_compatible_count': scv_count,
+        'scv_compatible_fraction': scv_count / strict_count,
+        'scv_compatible_label': dominance_label(scv_count),
+        'surface_obscured_scv_compatible_count': obscured_count,
+        'surface_obscured_scv_compatible_fraction': (
+            obscured_count / strict_count
+        ),
+        'surface_obscured_scv_compatible_label': (
+            dominance_label(obscured_count)
+        ),
+        'lead_lag_counts': summary['lead_lag_class'].value_counts(
+            dropna=False
+        ).to_dict(),
+        'wording_rule': (
+            'Dominant is reserved for more than half of the current strict '
+            'event set; conditional majorities are explicitly labeled.'
+        ),
+        'lead_lag_limit': (
+            'Lag uses rotation-strength cross-correlation rather than DO '
+            'threshold onset, but remains descriptive and cannot prove '
+            'vertical propagation.'
+        ),
+    }
+    return summary, payload
+
+
+def _plot_ofes_event_lifecycle(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: str | Path,
+    figure_dpi: int,
+) -> Path:
+    """绘制当前事件集合的 carrier 和表层表达摘要。"""
+    figure, axes = plt.subplots(
+        1, 3, figsize=(17, 5.2), constrained_layout=True
+    )
+    counts = [
+        int(summary['persistent_anticyclonic_rotational_carrier'].sum()),
+        int(summary['scv_compatible'].sum()),
+        int(summary['surface_obscured_scv_compatible'].sum()),
+    ]
+    labels = [
+        'Persistent\nanticyclonic carrier',
+        'SCV-compatible',
+        'Surface-obscured\nSCV-compatible',
+    ]
+    axes[0].bar(labels, counts, color=['#4c78a8', '#7b61a8', '#d95f59'])
+    axes[0].axhline(
+        len(summary) / 2.0,
+        color='#111827',
+        linestyle='--',
+        linewidth=1,
+    )
+    axes[0].set_ylabel(
+        f'Events (strict denominator = {len(summary)})'
+    )
+    axes[0].set_title('Predeclared carrier hierarchy')
+    rotation = summary.loc[
+        summary['population_peak_rotation_dominated']
+    ]
+    axes[1].scatter(
+        rotation['rotation_day_fraction'],
+        rotation[
+            'surface_weak_or_reversed_fraction_among_rotation_days'
+        ],
+        c=rotation['scv_compatible'].map(
+            {True: '#7b61a8', False: '#9ca3af'}
+        ),
+        s=45,
+        alpha=0.85,
+    )
+    axes[1].axhline(0.75, color='#d95f59', linestyle='--', linewidth=1)
+    axes[1].set_xlabel('Rotation-dominated day fraction')
+    axes[1].set_ylabel('Weak/reversed fraction on rotation days')
+    axes[1].set_title('Peak-rotation events through time')
+    lifecycle = daily.loc[
+        daily['population_peak_rotation_dominated']
+        & np.isfinite(daily['normalized_event_time'])
+    ].copy()
+    lifecycle['time_bin'] = pd.cut(
+        lifecycle['normalized_event_time'],
+        bins=np.linspace(0, 1, 9),
+        include_lowest=True,
+    )
+    binned = lifecycle.groupby(
+        'time_bin', observed=True
+    ).agg(
+        normalized_event_time=('normalized_event_time', 'median'),
+        deep_rotation=('absolute_subsurface_rossby_number', 'median'),
+        surface_rotation=(
+            'absolute_surface_core_weighted_rossby_number', 'median'
+        ),
+    ).reset_index(drop=True)
+    axes[2].plot(
+        binned['normalized_event_time'],
+        binned['deep_rotation'],
+        marker='o',
+        label='Subsurface |Ro|',
+    )
+    axes[2].plot(
+        binned['normalized_event_time'],
+        binned['surface_rotation'],
+        marker='o',
+        label='Surface core-weighted |Ro|',
+    )
+    axes[2].set_xlabel('Normalized start-to-peak time')
+    axes[2].set_ylabel('|Ro|')
+    axes[2].set_title('Population lifecycle composite')
+    axes[2].legend()
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=int(figure_dpi), bbox_inches='tight')
+    plt.close(figure)
+    return output
+
+
+def diagnose_ofes_event_lifecycle(
+    population_dir: str | Path | None = None,
+    *,
+    lifecycle_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """推广 OFES 深层事件的动力载体和表层表达至完整生命周期。
+
+    函数对当前背景环带完整事件的全部 observed days 复用 population
+    的深层 rotation/strain 与三套表层表达口径，同时构建核心加权垂向 Ro
+    剖面。peak 日逐值复现 population 的 polarity-matched 与
+    weak-or-reversed 分类，再按预注册日数与比例定义 persistent
+    anticyclonic、SCV-compatible 和 surface-obscured 子集。
+
+    参数:
+        - population_dir (str | Path | None): population 目录；None 时读取固定正式目录。
+        - lifecycle_overrides (dict | None): 临时覆盖 `ofes.event_lifecycle` 配置。
+        - output_dir (str | Path | None): 输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、daily lifecycle、vertical profiles、event summary、peak parity、analysis summary 和图件路径。
+
+    输出:
+        - `<output_dir>/days/*.parquet`、`profiles/*.parquet`、`lifecycle_daily_diagnostics.parquet`、`lifecycle_vertical_profiles.parquet`、`lifecycle_event_summary.parquet`、`peak_population_parity.json`、`analysis_summary.json` 与 `event_lifecycle.png`。
+
+    说明:
+        - lead/lag 使用旋转强度交叉相关，不使用 DO 首次过阈值时间；仍只作描述，不能证明垂向传播。
+        - SCV-compatible 是 OFES 动力代理，未与 McCoy 目录的观测判据完全等同，论文中不得省略 compatible 限定。
+    """
+    population_root = (
+        Path(population_dir)
+        if population_dir is not None
+        else _ofes_analysis_output_dir('event_population')
+    )
+    settings = _ofes_event_lifecycle_settings(lifecycle_overrides)
+    population_settings = _ofes_event_population_settings()
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    population_diagnostics = pd.read_parquet(
+        population_root / 'population_peak_diagnostics.parquet'
+    )
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet'
+    )
+    requests = _ofes_lifecycle_requests(
+        population_diagnostics, daily_objects
+    )
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    days_dir = output_path / 'days'
+    profiles_dir = output_path / 'profiles'
+    days_dir.mkdir(parents=True, exist_ok=True)
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'lifecycle_daily_diagnostics.parquet',
+        output_path / 'lifecycle_vertical_profiles.parquet',
+        output_path / 'lifecycle_event_summary.parquet',
+        output_path / 'peak_population_parity.json',
+        output_path / 'analysis_summary.json',
+        output_path / 'event_lifecycle.png',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_lifecycle(output_dir=output_path)
+        expected_keys = set(requests['lifecycle_request_key'].astype(str))
+        stored_keys = set(
+            loaded['daily_diagnostics']['lifecycle_request_key'].astype(str)
+        )
+        if stored_keys != expected_keys:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['reused_complete_run'] = True
+        return loaded
+    daily_frames = []
+    profile_frames = []
+    for row in requests.itertuples(index=False):
+        day_path = days_dir / f'{row.lifecycle_request_key}.parquet'
+        profile_path = (
+            profiles_dir / f'{row.lifecycle_request_key}.parquet'
+        )
+        reused = False
+        if day_path.exists() and profile_path.exists():
+            day_frame = pd.read_parquet(day_path)
+            profile = pd.read_parquet(profile_path)
+            reused = bool(
+                len(day_frame) == 1
+                and _ofes_assert_fragment_request(
+                    day_frame, str(row.event_id), pd.Timestamp(row.date)
+                )
+                and str(
+                    day_frame.iloc[0]['lifecycle_request_key']
+                ) == row.lifecycle_request_key
+                and profile['lifecycle_request_key'].astype(str)
+                .eq(row.lifecycle_request_key).all()
+            )
+        if not reused:
+            record, profile = _ofes_lifecycle_day(
+                row._asdict(),
+                diagnostic_settings,
+                population_settings,
+            )
+            day_frame = pd.DataFrame([record])
+            _atomic_write_parquet(day_frame, day_path)
+            _atomic_write_parquet(profile, profile_path)
+        daily_frames.append(day_frame)
+        profile_frames.append(profile)
+        completed = len(daily_frames)
+        if completed % 10 == 0 or completed == len(requests):
+            print(
+                f'[OFES lifecycle] {completed}/{len(requests)}',
+                flush=True,
+            )
+    daily = pd.concat(daily_frames, ignore_index=True).sort_values(
+        ['event_order', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    profiles = pd.concat(profile_frames, ignore_index=True)
+    maximum_profile_disagreement = float(
+        daily['surface_core_weighted_profile_agreement'].abs().max()
+    )
+    if (
+        maximum_profile_disagreement
+        > settings['surface_profile_rossby_tolerance']
+    ):
+        raise RuntimeError(
+            'OFES lifecycle surface/profile weighted Ro mismatch: '
+            f'{maximum_profile_disagreement}.'
+        )
+    peak_parity = _ofes_lifecycle_peak_parity(
+        daily, population_diagnostics
+    )
+    event_summary, analysis_summary = _ofes_lifecycle_summary(
+        daily, settings
+    )
+    analysis_summary['peak_population_parity'] = peak_parity
+    analysis_summary[
+        'maximum_surface_profile_rossby_disagreement'
+    ] = maximum_profile_disagreement
+    daily_path = output_path / 'lifecycle_daily_diagnostics.parquet'
+    profiles_path = output_path / 'lifecycle_vertical_profiles.parquet'
+    event_path = output_path / 'lifecycle_event_summary.parquet'
+    parity_path = output_path / 'peak_population_parity.json'
+    analysis_path = output_path / 'analysis_summary.json'
+    figure_path = output_path / 'event_lifecycle.png'
+    _atomic_write_parquet(daily, daily_path)
+    _atomic_write_parquet(profiles, profiles_path)
+    _atomic_write_parquet(event_summary, event_path)
+    _ofes_atomic_write_json(peak_parity, parity_path)
+    _ofes_atomic_write_json(analysis_summary, analysis_path)
+    _plot_ofes_event_lifecycle(
+        daily, event_summary, figure_path, settings['figure_dpi']
+    )
+    return {
+        'output_dir': output_path,
+        'daily_diagnostics': daily,
+        'vertical_profiles': profiles,
+        'event_summary': event_summary,
+        'peak_population_parity': peak_parity,
+        'analysis_summary': analysis_summary,
+        'figure_path': figure_path,
+    }
+
+
+def _ofes_daily_water_mass_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析逐日 water-mass/heave producer 的轻量配置。"""
+    raw = dict(_OFES_CFG.get('daily_water_mass', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES daily_water_mass override keys: {unknown}.'
+            )
+        raw.update(overrides)
+    modes = tuple(str(value) for value in raw.get(
+        'geometry_modes', ('fixed_site', 'moving_core')
+    ))
+    settings = {
+        'worker_count': int(raw.get('worker_count', 16)),
+        'output_subdir': str(raw.get('output_subdir', 'daily_water_mass')),
+        'geometry_modes': modes,
+    }
+    if settings['worker_count'] <= 0:
+        raise ValueError('OFES daily water-mass worker_count must be positive.')
+    if not settings['output_subdir'].strip():
+        raise ValueError('OFES daily water-mass output_subdir must not be empty.')
+    if not modes or any(mode not in ('fixed_site', 'moving_core') for mode in modes):
+        raise ValueError(
+            'OFES daily water-mass geometry_modes must use fixed_site or moving_core.'
+        )
+    if len(set(modes)) != len(modes):
+        raise ValueError('OFES daily water-mass geometry_modes must be unique.')
+    return settings
+
+
+def _ofes_daily_water_mass_task(task: dict) -> dict:
+    """计算一个 fixed-site event-day water-mass/heave fragment。"""
+    try:
+        result = _ofes_diagnose_water_mass_day(
+            task['date'],
+            float(task['core_lon']),
+            float(task['core_lat']),
+            float(task['reference_depth_m']),
+            task['settings'],
+        )
+        result.update(
+            {
+                'event_id': str(task['event_id']),
+                'date': pd.Timestamp(task['date']).normalize(),
+                'geometry': 'fixed_site',
+                'request_core_lon': float(task['core_lon']),
+                'request_core_lat': float(task['core_lat']),
+                'request_reference_depth_m': float(task['reference_depth_m']),
+                'request_target_sigma0': float(task['target_sigma0']),
+                'status': 'complete',
+            }
+        )
+        return result
+    except Exception as exc:
+        return {
+            'event_id': str(task['event_id']),
+            'date': pd.Timestamp(task['date']).normalize(),
+            'geometry': 'fixed_site',
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+
+
+def _ofes_moving_water_mass_event_task(task: dict) -> list[dict]:
+    """按日期顺序计算一个 moving-core 事件并维持 crossing-depth continuity。"""
+    outputs: list[dict] = []
+    hint_depth = float(task['reference_depth_m'])
+    target_sigma0 = float(task['target_sigma0'])
+    for row in task['rows']:
+        try:
+            result = _ofes_diagnose_water_mass_day(
+                row['date'],
+                float(row['core_lon']),
+                float(row['core_lat']),
+                hint_depth,
+                task['settings'],
+                target_sigma0_override=target_sigma0,
+            )
+            result.update(
+                {
+                    'event_id': str(task['event_id']),
+                    'date': pd.Timestamp(row['date']).normalize(),
+                    'geometry': 'moving_core',
+                    'request_core_lon': float(row['core_lon']),
+                    'request_core_lat': float(row['core_lat']),
+                    'request_reference_depth_m': float(
+                        row['reference_depth_m']
+                    ),
+                    'request_target_sigma0': float(
+                        row['target_sigma0']
+                    ),
+                    'status': 'complete',
+                }
+            )
+            crossing = result.get('background_sigma_depth_m')
+            if crossing is not None and np.isfinite(float(crossing)):
+                hint_depth = float(crossing)
+        except Exception as exc:
+            result = {
+                'event_id': str(task['event_id']),
+                'date': pd.Timestamp(row['date']).normalize(),
+                'geometry': 'moving_core',
+                'status': 'error',
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+        outputs.append(result)
+    return outputs
+
+
+def _ofes_daily_water_mass_requests(
+    lifecycle_daily: pd.DataFrame,
+    population: pd.DataFrame,
+) -> pd.DataFrame:
+    """由 lifecycle 日表和 population peak 表派生 event-day 请求。"""
+    required = ('event_id', 'date', 'peak_lon', 'peak_lat')
+    _missing = sorted(set(required) - set(lifecycle_daily.columns))
+    if _missing:
+        raise KeyError(f'OFES lifecycle daily table lacks columns: {_missing}')
+    _missing = sorted(set(('event_id', 'target_sigma0')) - set(population.columns))
+    if _missing:
+        raise KeyError(f'OFES population table lacks columns: {_missing}')
+
+    daily = lifecycle_daily.copy()
+    daily['event_id'] = daily['event_id'].astype(str)
+    daily['date'] = pd.to_datetime(daily['date']).dt.normalize()
+    if daily.duplicated(['event_id', 'date']).any():
+        raise RuntimeError('OFES daily water-mass requests contain duplicate event-days.')
+    if 'is_event_peak_day' not in daily.columns:
+        if 'peak_daily_object_key' not in daily.columns or 'daily_object_key' not in daily.columns:
+            raise KeyError(
+                'Lifecycle daily table needs is_event_peak_day or peak object keys.'
+            )
+        daily['is_event_peak_day'] = (
+            daily['daily_object_key'].astype(str)
+            == daily['peak_daily_object_key'].astype(str)
+        )
+    peak_flags = daily['is_event_peak_day'].fillna(False).astype(bool)
+    if not peak_flags.groupby(daily['event_id']).sum().eq(1).all():
+        raise RuntimeError('Each OFES lifecycle event must have exactly one peak day.')
+
+    population_meta = population.copy()
+    population_meta['event_id'] = population_meta['event_id'].astype(str)
+    if population_meta['event_id'].duplicated().any():
+        raise RuntimeError('OFES population table contains duplicate event IDs.')
+    population_meta = population_meta.drop_duplicates('event_id')
+    missing_population_events = sorted(
+        set(daily['event_id']) - set(population_meta['event_id'])
+    )
+    if missing_population_events:
+        raise RuntimeError(
+            'OFES lifecycle contains events absent from population: '
+            f'{missing_population_events[:5]}'
+        )
+    meta_columns = ['event_id', 'target_sigma0']
+    if 'reference_depth_m' in population_meta.columns:
+        meta_columns.append('reference_depth_m')
+    daily = daily.merge(
+        population_meta[meta_columns],
+        on='event_id',
+        how='inner',
+        suffixes=('', '_population'),
+        validate='many_to_one',
+    )
+    if daily.empty:
+        raise RuntimeError('No lifecycle event-days overlap the current population.')
+    if 'reference_depth_m' not in daily.columns:
+        if 'reference_depth_m_population' not in daily.columns:
+            raise KeyError('OFES daily water-mass requests lack reference_depth_m.')
+        daily['reference_depth_m'] = daily['reference_depth_m_population']
+    peak = daily.loc[daily['is_event_peak_day']].set_index('event_id')
+    records: list[dict] = []
+    for row in daily.sort_values(['event_id', 'date'], kind='mergesort').itertuples(index=False):
+        peak_row = peak.loc[str(row.event_id)]
+        records.append(
+            {
+                'event_id': str(row.event_id),
+                'date': pd.Timestamp(row.date).normalize(),
+                'daily_core_lon': float(row.peak_lon),
+                'daily_core_lat': float(row.peak_lat),
+                'fixed_core_lon': float(peak_row.peak_lon),
+                'fixed_core_lat': float(peak_row.peak_lat),
+                'reference_depth_m': float(row.reference_depth_m),
+                'target_sigma0': float(row.target_sigma0),
+                'is_event_peak_day': bool(row.is_event_peak_day),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _ofes_water_mass_fragment_valid(
+    path: Path,
+    request: Mapping[str, Any],
+    geometry: str,
+) -> bool:
+    """检查逐日 fragment 的事件、日期和科学几何请求是否一致。"""
+    try:
+        frame = pd.read_parquet(path)
+        if len(frame) != 1:
+            return False
+        required_columns = {
+            'event_id',
+            'date',
+            'geometry',
+            'diagnostic_passed',
+            'water_mass_do_contrast',
+            'heave_do_contribution',
+            'fixed_depth_do_contrast',
+            'request_core_lon',
+            'request_core_lat',
+            'request_reference_depth_m',
+            'request_target_sigma0',
+        }
+        if not required_columns.issubset(frame.columns):
+            return False
+        row = frame.iloc[0]
+        if 'status' in frame.columns and str(row['status']) != 'complete':
+            return False
+        expected_core_lon = (
+            request['fixed_core_lon']
+            if geometry == 'fixed_site'
+            else request['daily_core_lon']
+        )
+        expected_core_lat = (
+            request['fixed_core_lat']
+            if geometry == 'fixed_site'
+            else request['daily_core_lat']
+        )
+        return bool(
+            str(row.get('event_id')) == str(request['event_id'])
+            and pd.Timestamp(row.get('date')).normalize()
+            == pd.Timestamp(request['date']).normalize()
+            and str(row.get('geometry')) == geometry
+            and np.isclose(
+                float(row['request_core_lon']),
+                float(expected_core_lon),
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(row['request_core_lat']),
+                float(expected_core_lat),
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(row['request_reference_depth_m']),
+                float(request['reference_depth_m']),
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(row['request_target_sigma0']),
+                float(request['target_sigma0']),
+                rtol=0.0,
+                atol=1e-9,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _ofes_water_mass_requests_match(
+    stored: pd.DataFrame,
+    expected: pd.DataFrame,
+    geometry: str,
+) -> bool:
+    """比较 water-mass event-day 请求的事件、几何、深度和 sigma0。"""
+    required = {
+        'event_id',
+        'date',
+        'geometry',
+        'daily_core_lon',
+        'daily_core_lat',
+        'fixed_core_lon',
+        'fixed_core_lat',
+        'reference_depth_m',
+        'target_sigma0',
+        'is_event_peak_day',
+    }
+    if (
+        not required.issubset(stored.columns)
+        or not required.issubset(expected.columns)
+        or len(stored) != len(expected)
+    ):
+        return False
+    left = stored.copy()
+    right = expected.copy()
+    for frame in (left, right):
+        frame['event_id'] = frame['event_id'].astype(str)
+        frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+        frame['geometry'] = frame['geometry'].astype(str)
+    keys = ['event_id', 'date']
+    if left.duplicated(keys).any() or right.duplicated(keys).any():
+        return False
+    if not left['geometry'].eq(str(geometry)).all():
+        return False
+    if not right['geometry'].eq(str(geometry)).all():
+        return False
+    left = left.sort_values(keys, kind='mergesort').reset_index(drop=True)
+    right = right.sort_values(keys, kind='mergesort').reset_index(drop=True)
+    if not left[keys].equals(right[keys]):
+        return False
+    for column in (
+        'daily_core_lon',
+        'daily_core_lat',
+        'fixed_core_lon',
+        'fixed_core_lat',
+        'reference_depth_m',
+        'target_sigma0',
+    ):
+        if not np.allclose(
+            left[column].to_numpy(dtype=float),
+            right[column].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-9,
+            equal_nan=True,
+        ):
+            return False
+    return np.array_equal(
+        left['is_event_peak_day'].to_numpy(dtype=bool),
+        right['is_event_peak_day'].to_numpy(dtype=bool),
+    )
+
+
+def _ofes_water_mass_results_match_requests(
+    daily: pd.DataFrame,
+    requests: pd.DataFrame,
+    geometry: str,
+) -> bool:
+    """比较已写入 daily 结果中的请求身份列。"""
+    required = {
+        'event_id',
+        'date',
+        'geometry',
+        'request_core_lon',
+        'request_core_lat',
+        'request_reference_depth_m',
+        'request_target_sigma0',
+    }
+    if not required.issubset(daily.columns):
+        return False
+    expected = requests.copy()
+    expected['event_id'] = expected['event_id'].astype(str)
+    expected['date'] = pd.to_datetime(expected['date']).dt.normalize()
+    expected['geometry'] = str(geometry)
+    if geometry == 'fixed_site':
+        expected['request_core_lon'] = expected['fixed_core_lon']
+        expected['request_core_lat'] = expected['fixed_core_lat']
+    else:
+        expected['request_core_lon'] = expected['daily_core_lon']
+        expected['request_core_lat'] = expected['daily_core_lat']
+    expected = expected[
+        [
+            'event_id',
+            'date',
+            'geometry',
+            'request_core_lon',
+            'request_core_lat',
+            'reference_depth_m',
+            'target_sigma0',
+        ]
+    ].rename(
+        columns={
+            'reference_depth_m': 'request_reference_depth_m',
+            'target_sigma0': 'request_target_sigma0',
+        }
+    )
+    actual = daily[list(required)].copy()
+    actual['event_id'] = actual['event_id'].astype(str)
+    actual['date'] = pd.to_datetime(actual['date']).dt.normalize()
+    actual['geometry'] = actual['geometry'].astype(str)
+    keys = ['event_id', 'date']
+    if actual.duplicated(keys).any() or expected.duplicated(keys).any():
+        return False
+    if not actual['geometry'].eq(str(geometry)).all():
+        return False
+    actual = actual.sort_values(keys, kind='mergesort').reset_index(drop=True)
+    expected = expected.sort_values(keys, kind='mergesort').reset_index(drop=True)
+    if not actual[keys].equals(expected[keys]):
+        return False
+    for column in (
+        'request_core_lon',
+        'request_core_lat',
+        'request_reference_depth_m',
+        'request_target_sigma0',
+    ):
+        if not np.allclose(
+            actual[column].to_numpy(dtype=float),
+            expected[column].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-9,
+            equal_nan=True,
+        ):
+            return False
+    return True
+
+
+def _ofes_run_daily_water_mass_geometry(
+    requests: pd.DataFrame,
+    population: pd.DataFrame,
+    settings: dict,
+    geometry: str,
+    output_root: Path,
+    worker_count: int,
+) -> dict:
+    """运行或读取一个 geometry 的逐日 producer，不包含 retention 统计。"""
+    root = output_root / geometry
+    days_dir = root / 'days'
+    root.mkdir(parents=True, exist_ok=True)
+    days_dir.mkdir(parents=True, exist_ok=True)
+    request_table = requests.copy()
+    request_table['geometry'] = geometry
+    request_path = root / 'event_day_requests.parquet'
+    if request_path.exists():
+        stored = pd.read_parquet(request_path)
+        if not _ofes_water_mass_requests_match(
+            stored, request_table, geometry
+        ):
+            raise RuntimeError(
+                f'Existing {geometry} water-mass output was created for a '
+                'different event/date/core/depth/sigma0 request. Remove '
+                'that output directory before rerunning.'
+            )
+    else:
+        _atomic_write_parquet(request_table, request_path)
+
+    data_path = root / 'daily_water_mass.parquet'
+    event_path = root / 'event_summary.parquet'
+    summary_path = root / 'analysis_summary.json'
+    complete_paths = (request_path, data_path, event_path, summary_path)
+    if all(path.exists() for path in complete_paths):
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        if summary.get('status') == 'complete':
+            try:
+                daily = pd.read_parquet(data_path)
+                event_summary = pd.read_parquet(event_path)
+                stored_pairs = set(
+                    zip(
+                        daily['event_id'].astype(str),
+                        pd.to_datetime(daily['date']).dt.strftime('%Y-%m-%d'),
+                    )
+                )
+                expected_pairs = set(
+                    zip(
+                        request_table['event_id'].astype(str),
+                        pd.to_datetime(request_table['date']).dt.strftime('%Y-%m-%d'),
+                    )
+                )
+                required_daily = {
+                    'event_id', 'date', 'geometry', 'diagnostic_passed',
+                    'water_mass_do_contrast', 'heave_do_contribution',
+                    'fixed_depth_do_contrast',
+                }
+                structurally_complete = (
+                    required_daily.issubset(daily.columns)
+                    and stored_pairs == expected_pairs
+                    and daily['geometry'].astype(str).eq(geometry).all()
+                    and (
+                        'status' not in daily.columns
+                        or daily['status'].astype(str).eq('complete').all()
+                    )
+                    and _ofes_water_mass_results_match_requests(
+                        daily, request_table, geometry
+                    )
+                    and {
+                        'event_id',
+                        'water_mass_start',
+                        'water_mass_peak',
+                        'water_mass_last',
+                    }.issubset(event_summary.columns)
+                    and len(event_summary)
+                    == request_table['event_id'].nunique()
+                )
+            except Exception:
+                structurally_complete = False
+            if structurally_complete:
+                return {
+                    'output_dir': root,
+                    'requests': request_table,
+                    'daily_water_mass': daily,
+                    'event_summary': event_summary,
+                    'summary': summary,
+                    'reused_complete_run': True,
+                }
+
+    task_results: list[dict] = []
+    if geometry == 'fixed_site':
+        pending: list[dict] = []
+        for request in request_table.to_dict(orient='records'):
+            fragment = days_dir / f"{request['event_id']}_{pd.Timestamp(request['date']):%Y%m%d}.parquet"
+            if _ofes_water_mass_fragment_valid(fragment, request, geometry):
+                task_results.append(pd.read_parquet(fragment).iloc[0].to_dict())
+            else:
+                pending.append(
+                    {
+                        'event_id': request['event_id'],
+                        'date': request['date'],
+                        'core_lon': request['fixed_core_lon'],
+                        'core_lat': request['fixed_core_lat'],
+                        'reference_depth_m': request['reference_depth_m'],
+                        'target_sigma0': request['target_sigma0'],
+                        'settings': _ofes_event_diagnostic_settings(),
+                    }
+                )
+        if pending:
+            if int(worker_count) > 1 and len(pending) > 1:
+                from multiprocessing import get_context
+                with get_context('fork').Pool(int(worker_count)) as pool:
+                    produced = pool.map(_ofes_daily_water_mass_task, pending)
+            else:
+                produced = [_ofes_daily_water_mass_task(task) for task in pending]
+            for task, result in zip(pending, produced):
+                fragment = days_dir / f"{task['event_id']}_{pd.Timestamp(task['date']):%Y%m%d}.parquet"
+                _atomic_write_parquet(pd.DataFrame([result]), fragment)
+                task_results.append(result)
+    else:
+        pending_events: list[dict] = []
+        for event_id, group in request_table.groupby('event_id', sort=True):
+            rows = group.sort_values('date', kind='mergesort').to_dict(orient='records')
+            fragments = [
+                days_dir / f"{event_id}_{pd.Timestamp(row['date']):%Y%m%d}.parquet"
+                for row in rows
+            ]
+            if all(
+                _ofes_water_mass_fragment_valid(path, row, geometry)
+                for path, row in zip(fragments, rows)
+            ):
+                task_results.extend(
+                    pd.concat([pd.read_parquet(path) for path in fragments], ignore_index=True)
+                    .to_dict(orient='records')
+                )
+            else:
+                pending_events.append(
+                    {
+                        'event_id': str(event_id),
+                        'rows': [
+                            {
+                                'date': row['date'],
+                                'core_lon': row['daily_core_lon'],
+                                'core_lat': row['daily_core_lat'],
+                                'reference_depth_m': row['reference_depth_m'],
+                                'target_sigma0': row['target_sigma0'],
+                            }
+                            for row in rows
+                        ],
+                        'reference_depth_m': float(rows[0]['reference_depth_m']),
+                        'target_sigma0': float(rows[0]['target_sigma0']),
+                        'settings': _ofes_event_diagnostic_settings(),
+                    }
+                )
+        if pending_events:
+            if int(worker_count) > 1 and len(pending_events) > 1:
+                from multiprocessing import get_context
+                with get_context('fork').Pool(int(worker_count)) as pool:
+                    produced_events = pool.map(_ofes_moving_water_mass_event_task, pending_events)
+            else:
+                produced_events = [_ofes_moving_water_mass_event_task(task) for task in pending_events]
+            for task, event_results in zip(pending_events, produced_events):
+                for result in event_results:
+                    fragment = days_dir / f"{task['event_id']}_{pd.Timestamp(result['date']):%Y%m%d}.parquet"
+                    _atomic_write_parquet(pd.DataFrame([result]), fragment)
+                    task_results.append(result)
+
+    daily = pd.DataFrame(task_results)
+    if daily.empty:
+        raise RuntimeError(f'OFES {geometry} water-mass producer produced no rows.')
+    daily['event_id'] = daily['event_id'].astype(str)
+    daily['date'] = pd.to_datetime(daily['date']).dt.normalize()
+    daily['geometry'] = geometry
+    if 'status' not in daily.columns:
+        daily['status'] = 'complete'
+    else:
+        daily['status'] = daily['status'].fillna('complete')
+    daily = daily.sort_values(['event_id', 'date'], kind='mergesort').reset_index(drop=True)
+    _atomic_write_parquet(daily, data_path)
+
+    event_records: list[dict] = []
+    for event_id, group in request_table.groupby('event_id', sort=True):
+        values = daily.loc[daily['event_id'].eq(str(event_id))]
+        completed = values.loc[values['status'].eq('complete')]
+        requested_dates = pd.to_datetime(group['date']).dt.normalize().sort_values()
+        peak_date = pd.Timestamp(group.loc[group['is_event_peak_day'], 'date'].iloc[0]).normalize()
+        peak_rows = completed.loc[completed['date'].eq(peak_date)]
+        event_records.append(
+            {
+                'event_id': str(event_id),
+                'requested_days': int(len(group)),
+                'completed_days': int(len(completed)),
+                'failed_days': int(len(group) - len(completed)),
+                'start_date': requested_dates.iloc[0],
+                'peak_date': peak_date,
+                'last_date': requested_dates.iloc[-1],
+                'water_mass_start': float(completed.loc[completed['date'].eq(requested_dates.iloc[0]), 'water_mass_do_contrast'].iloc[0]) if not completed.loc[completed['date'].eq(requested_dates.iloc[0])].empty else np.nan,
+                'water_mass_peak': float(peak_rows['water_mass_do_contrast'].iloc[0]) if not peak_rows.empty else np.nan,
+                'water_mass_last': float(completed.loc[completed['date'].eq(requested_dates.iloc[-1]), 'water_mass_do_contrast'].iloc[0]) if not completed.loc[completed['date'].eq(requested_dates.iloc[-1])].empty else np.nan,
+            }
+        )
+    event_summary = pd.DataFrame(event_records)
+    _atomic_write_parquet(event_summary, event_path)
+
+    population_index = population.copy()
+    population_index['event_id'] = population_index['event_id'].astype(str)
+    population_index = population_index.drop_duplicates('event_id')
+    peak_completed = daily.loc[
+        daily['status'].eq('complete')
+        & daily['event_id'].isin(set(request_table.loc[request_table['is_event_peak_day'], 'event_id']))
+    ].merge(
+        request_table.loc[request_table['is_event_peak_day'], ['event_id', 'date']],
+        on=['event_id', 'date'],
+        how='inner',
+    )
+    peak_completed = peak_completed.drop_duplicates('event_id')
+    if (
+        geometry == 'fixed_site'
+        and set(
+            (
+                'target_sigma0',
+                'water_mass_do_contrast',
+                'heave_do_contribution',
+                'fixed_depth_do_contrast',
+            )
+        ).issubset(population_index.columns)
+    ):
+        parity = population_index[
+            [
+                'event_id',
+                'target_sigma0',
+                'water_mass_do_contrast',
+                'heave_do_contribution',
+                'fixed_depth_do_contrast',
+            ]
+        ].merge(
+            peak_completed[
+                [
+                    'event_id',
+                    'target_sigma0',
+                    'water_mass_do_contrast',
+                    'heave_do_contribution',
+                    'fixed_depth_do_contrast',
+                ]
+            ].rename(columns={
+                'target_sigma0': 'daily_target_sigma0',
+                'water_mass_do_contrast': 'daily_water_mass',
+                'heave_do_contribution': 'daily_heave',
+                'fixed_depth_do_contrast': 'daily_fixed_depth',
+            }),
+            on='event_id',
+            how='inner',
+        )
+        peak_parity = {
+            'n_compared': int(len(parity)),
+            'target_sigma0_max_abs_diff': float(
+                (parity['target_sigma0'] - parity['daily_target_sigma0']).abs().max()
+            ) if len(parity) else np.nan,
+            'water_mass_max_abs_diff': float((parity['water_mass_do_contrast'] - parity['daily_water_mass']).abs().max()) if len(parity) else np.nan,
+            'heave_max_abs_diff': float((parity['heave_do_contribution'] - parity['daily_heave']).abs().max()) if len(parity) else np.nan,
+            'fixed_depth_max_abs_diff': float((parity['fixed_depth_do_contrast'] - parity['daily_fixed_depth']).abs().max()) if len(parity) else np.nan,
+        }
+    else:
+        target_parity = population_index[
+            ['event_id', 'target_sigma0']
+        ].merge(
+            peak_completed[['event_id', 'target_sigma0']].rename(
+                columns={'target_sigma0': 'daily_target_sigma0'}
+            ),
+            on='event_id',
+            how='inner',
+        ) if 'target_sigma0' in population_index.columns and 'target_sigma0' in peak_completed.columns else pd.DataFrame()
+        peak_parity = {
+            'n_compared': int(len(peak_completed)),
+            'target_sigma0_max_abs_diff': float(
+                (target_parity['target_sigma0'] - target_parity['daily_target_sigma0']).abs().max()
+            ) if len(target_parity) else np.nan,
+            'note': 'moving_core keeps peak target_sigma0 fixed; fixed-depth values are not expected to match.',
+        }
+    completed_days = int(daily['status'].eq('complete').sum())
+    requested_days = int(len(request_table))
+    summary = {
+        'status': 'complete' if completed_days == requested_days else 'partial',
+        'geometry': geometry,
+        'requested_event_count': int(request_table['event_id'].nunique()),
+        'requested_event_days': requested_days,
+        'completed_event_days': completed_days,
+        'failed_event_days': int(requested_days - completed_days),
+        'requested_date_range': [
+            pd.Timestamp(request_table['date'].min()).strftime('%Y-%m-%d'),
+            pd.Timestamp(request_table['date'].max()).strftime('%Y-%m-%d'),
+        ],
+        'peak_population_parity': peak_parity,
+    }
+    _ofes_atomic_write_json(summary, summary_path)
+    return {
+        'output_dir': root,
+        'requests': request_table,
+        'daily_water_mass': daily,
+        'event_summary': event_summary,
+        'summary': summary,
+    }
+
+
+def run_ofes_daily_water_mass_diagnostics(
+    lifecycle_dir: str | Path | None = None,
+    *,
+    population_dir: str | Path | None = None,
+    geometry_mode: str = 'both',
+    output_dir: str | Path | None = None,
+    water_mass_overrides: dict | None = None,
+    worker_count: int | None = None,
+) -> dict:
+    """生产当前 lifecycle 事件全部 observed days 的 water-mass/heave 诊断。
+
+    该 producer 在同一公共入口内支持 fixed-site 与 moving-core 两种几何，
+    由当前 lifecycle 日表和 population peak 表派生请求集合，不依赖粒子轨迹。
+
+    参数:
+        - lifecycle_dir (str | Path | None): lifecycle 输出目录；None 使用固定正式目录。
+        - population_dir (str | Path | None): population 输出目录；None 使用固定正式目录。
+        - geometry_mode (str): `fixed_site`、`moving_core` 或 `both`（默认）。
+        - output_dir (str | Path | None): 固定输出根目录；None 使用 YAML 的 output_subdir。
+        - water_mass_overrides (dict | None): 临时覆盖 YAML 中已声明的 producer 参数。
+        - worker_count (int | None): 并行进程数；None 使用 YAML 配置。
+
+    返回:
+        - dict: 单一 geometry 时返回该结果；`both` 时返回 `geometries` 映射、各自 summary 和 output_dir。
+
+    输出:
+        - 各 geometry 目录中的 `event_day_requests.parquet`、`days/*.parquet`、
+          `daily_water_mass.parquet`、`event_summary.parquet` 和 `analysis_summary.json`。
+
+    说明:
+        - fixed-site 固定 peak 核心位置和参考深度；moving-core 跟随逐日对象位置，
+          冻结 peak target sigma0，并用前一日背景交点维持 crossing-depth continuity。
+        - 这里只生产逐日分解和 peak parity；carrier retention 统计属于后续 mechanism-synthesis。
+    """
+    settings = _ofes_daily_water_mass_settings(water_mass_overrides)
+    if worker_count is not None:
+        if int(worker_count) <= 0:
+            raise ValueError('worker_count must be positive.')
+        settings['worker_count'] = int(worker_count)
+    if geometry_mode == 'both':
+        modes = settings['geometry_modes']
+    elif geometry_mode in ('fixed_site', 'moving_core'):
+        modes = (geometry_mode,)
+    else:
+        raise ValueError("geometry_mode must be 'fixed_site', 'moving_core', or 'both'.")
+
+    lifecycle_root = _ofes_analysis_output_path('event_lifecycle', lifecycle_dir)
+    population_root = _ofes_analysis_output_path('event_population', population_dir)
+    lifecycle_path = lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
+    population_path = population_root / 'population_peak_diagnostics.parquet'
+    if not lifecycle_path.exists() or not population_path.exists():
+        missing = [str(path) for path in (lifecycle_path, population_path) if not path.exists()]
+        raise FileNotFoundError(f'OFES daily water-mass inputs are missing: {missing}')
+    lifecycle_daily = pd.read_parquet(lifecycle_path)
+    population = pd.read_parquet(population_path)
+    requests = _ofes_daily_water_mass_requests(lifecycle_daily, population)
+    output_root = _ofes_analysis_output_path(settings['output_subdir'], output_dir)
+    results = {
+        mode: _ofes_run_daily_water_mass_geometry(
+            requests,
+            population,
+            settings,
+            mode,
+            output_root,
+            settings['worker_count'],
+        )
+        for mode in modes
+    }
+    if len(results) == 1:
+        result = next(iter(results.values()))
+        result['geometries'] = results
+        return result
+    return {
+        'output_dir': output_root,
+        'geometries': results,
+        'summaries': {mode: result['summary'] for mode, result in results.items()},
+    }
+
+
+
+def _ofes_event_evolution_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """解析并校验 OFES event 演化与 Hosoda benchmark 配置。"""
+    raw = dict(_OFES_CFG.get('event_evolution', {}) or {})
+    if overrides:
+        allowed = set(raw) | {'hosoda_dates'}
+        unknown = sorted(set(overrides) - allowed)
+        if unknown:
+            raise KeyError(
+                f'Unknown OFES event_evolution override keys: {unknown}.'
+            )
+        raw.update(overrides)
+
+    settings = {
+        'map_radius_km': float(
+            raw.get('map_radius_km', 350.0)
+        ),
+        'map_quiver_stride': int(
+            raw.get('map_quiver_stride', 12)
+        ),
+        'map_min_finite_fraction': float(
+            raw.get('map_min_finite_fraction', 0.50)
+        ),
+        'figure_dpi': int(raw.get('figure_dpi', 180)),
+        'hosoda_dates': tuple(
+            str(value)
+            for value in raw.get('hosoda_dates', ())
+        ),
+        'hosoda_lon_bounds': tuple(
+            float(value)
+            for value in raw.get(
+                'hosoda_lon_bounds', (142.0, 150.0)
+            )
+        ),
+        'hosoda_lat_bounds': tuple(
+            float(value)
+            for value in raw.get(
+                'hosoda_lat_bounds', (32.0, 39.0)
+            )
+        ),
+        'hosoda_do_sigma0': float(
+            raw.get('hosoda_do_sigma0', 26.5)
+        ),
+        'hosoda_do_reference_depth_m': float(
+            raw.get(
+                'hosoda_do_reference_depth_m', 500.0
+            )
+        ),
+        'hosoda_salinity_sigma0': float(
+            raw.get('hosoda_salinity_sigma0', 26.7)
+        ),
+        'hosoda_salinity_reference_depth_m': float(
+            raw.get(
+                'hosoda_salinity_reference_depth_m',
+                600.0,
+            )
+        ),
+        'output_subdir': str(
+            raw.get('output_subdir', 'event_evolution')
+        ),
+    }
+    positive_keys = (
+        'map_radius_km',
+        'map_quiver_stride',
+        'figure_dpi',
+        'hosoda_do_sigma0',
+        'hosoda_do_reference_depth_m',
+        'hosoda_salinity_sigma0',
+        'hosoda_salinity_reference_depth_m',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES evolution radii, strides, depths, densities, '
+            'and figure DPI must be finite and positive.'
+        )
+    if not (
+        0 < settings['map_min_finite_fraction'] <= 1
+    ):
+        raise ValueError(
+            'OFES map_min_finite_fraction must lie in (0, 1].'
+        )
+    if len(settings['hosoda_dates']) != 3:
+        raise ValueError(
+            'OFES Hosoda benchmark requires exactly three dates.'
+        )
+    for key in ('hosoda_lon_bounds', 'hosoda_lat_bounds'):
+        bounds = settings[key]
+        if (
+            len(bounds) != 2
+            or not np.all(np.isfinite(bounds))
+            or bounds[0] >= bounds[1]
+        ):
+            raise ValueError(
+                f'OFES {key} must contain two ordered finite values.'
+            )
+    if not settings['output_subdir'].strip():
+        raise ValueError(
+            'OFES event evolution output_subdir must not be empty.'
+        )
+    return settings
+
+
+def _ofes_fields_on_sigma0(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    target_sigma0: float,
+    reference_depth: float | np.ndarray,
+    fields: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """把三维 OFES 场线性映射到最接近参考深度的指定 sigma0 交点。"""
+    depth_arr = np.asarray(depth, dtype=float)
+    sigma0_arr = np.asarray(sigma0, dtype=float)
+    if (
+        depth_arr.ndim != 1
+        or sigma0_arr.ndim != 3
+        or sigma0_arr.shape[0] != depth_arr.size
+    ):
+        raise ValueError(
+            'sigma0 must have shape (depth, lat, lon) on a '
+            'one-dimensional depth coordinate.'
+        )
+    if depth_arr.size < 2 or not np.all(
+        np.diff(depth_arr) > 0
+    ):
+        raise ValueError(
+            'OFES depth must contain at least two increasing levels.'
+        )
+
+    lower = sigma0_arr[:-1] - float(target_sigma0)
+    upper = sigma0_arr[1:] - float(target_sigma0)
+    denominator = sigma0_arr[1:] - sigma0_arr[:-1]
+    crossing = (
+        np.isfinite(lower)
+        & np.isfinite(upper)
+        & (lower * upper <= 0)
+        & (denominator != 0)
+    )
+    fraction = np.full(lower.shape, np.nan, dtype=float)
+    np.divide(
+        -lower,
+        denominator,
+        out=fraction,
+        where=crossing,
+    )
+    pair_depth = (
+        depth_arr[:-1, None, None]
+        + fraction * np.diff(depth_arr)[:, None, None]
+    )
+    reference = np.broadcast_to(
+        np.asarray(reference_depth, dtype=float),
+        sigma0_arr.shape[1:],
+    )
+    score = np.where(
+        crossing,
+        np.abs(pair_depth - reference[None, :, :]),
+        np.inf,
+    )
+    best = np.argmin(score, axis=0)
+    available = np.any(crossing, axis=0)
+    gather = best[None, :, :]
+    chosen_fraction = np.take_along_axis(
+        fraction, gather, axis=0
+    )[0]
+    chosen_depth = np.take_along_axis(
+        pair_depth, gather, axis=0
+    )[0]
+    result = {
+        'depth': np.where(
+            available, chosen_depth, np.nan
+        ),
+        'crossing_count': np.count_nonzero(
+            crossing, axis=0
+        ).astype(np.int16),
+    }
+    for key, field_values in fields.items():
+        values = np.asarray(field_values, dtype=float)
+        if values.shape != sigma0_arr.shape:
+            raise ValueError(
+                f'OFES field {key!r} does not match sigma0 shape '
+                f'{sigma0_arr.shape}.'
+            )
+        lower_values = np.take_along_axis(
+            values[:-1], gather, axis=0
+        )[0]
+        upper_values = np.take_along_axis(
+            values[1:], gather, axis=0
+        )[0]
+        interpolated = lower_values + chosen_fraction * (
+            upper_values - lower_values
+        )
+        result[key] = np.where(
+            available
+            & np.isfinite(lower_values)
+            & np.isfinite(upper_values),
+            interpolated,
+            np.nan,
+        )
+    return result
+
+
+def _ofes_sigma0_volume(snapshot: dict) -> np.ndarray:
+    """由 OFES 位温与实用盐度计算完整三维 TEOS-10 sigma0。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    salinity = np.asarray(snapshot['salinity'], dtype=float)
+    theta = np.asarray(snapshot['temp'], dtype=float)
+    expected_shape = (
+        depth.size, lat_grid.shape[0], lon_grid.shape[1]
+    )
+    if (
+        salinity.shape != expected_shape
+        or theta.shape != expected_shape
+    ):
+        raise ValueError(
+            'OFES temperature and salinity must share the '
+            '(depth, lat, lon) tracer grid.'
+        )
+    seawater_pressure = gsw.p_from_z(
+        -depth[:, None], lat[None, :]
+    )[:, :, None]
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        seawater_pressure,
+        lon_grid[None, :, :],
+        lat_grid[None, :, :],
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity, theta
+    )
+    return np.asarray(
+        gsw.sigma0(
+            absolute_salinity, conservative_temperature
+        ),
+        dtype=float,
+    )
+
+
+def _ofes_event_context_requests(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    context_days: int,
+    catalog_start: str | pd.Timestamp,
+    catalog_end: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """为每个固定候选建立 before/start/peak/end/after 请求表。"""
+    lower_date = pd.Timestamp(catalog_start).normalize()
+    upper_date = pd.Timestamp(catalog_end).normalize()
+    role_specs = (
+        ('context_before', -int(context_days), 'start'),
+        ('start', 0, 'start'),
+        ('peak', 0, 'peak'),
+        ('end', 0, 'end'),
+        ('context_after', int(context_days), 'end'),
+    )
+    records: list[dict] = []
+    ordered_events = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    )
+    for event in ordered_events.itertuples(index=False):
+        group = daily_diagnostics.loc[
+            daily_diagnostics['event_id'] == event.event_id
+        ].sort_values('date', kind='mergesort')
+        if group.empty:
+            raise RuntimeError(
+                f'No daily diagnostics found for {event.event_id}.'
+            )
+        peak_rows = group.loc[
+            group['daily_object_key']
+            == event.peak_daily_object_key
+        ]
+        if len(peak_rows) != 1:
+            raise RuntimeError(
+                f'Expected one peak row for {event.event_id}.'
+            )
+        position_rows = {
+            'start': group.iloc[0],
+            'peak': peak_rows.iloc[0],
+            'end': group.iloc[-1],
+        }
+        event_dates = {
+            'start': pd.Timestamp(event.start_date).normalize(),
+            'peak': pd.Timestamp(event.peak_date).normalize(),
+            'end': pd.Timestamp(event.end_date).normalize(),
+        }
+        target_sigma0 = float(
+            peak_rows.iloc[0]['target_sigma0']
+        )
+        if not np.isfinite(target_sigma0):
+            raise RuntimeError(
+                f'Peak target sigma0 is missing for {event.event_id}.'
+            )
+        for order, (role, offset, position_role) in enumerate(
+            role_specs
+        ):
+            if role == 'context_before':
+                requested_date = (
+                    event_dates['start']
+                    + pd.Timedelta(days=offset)
+                )
+            elif role == 'context_after':
+                requested_date = (
+                    event_dates['end']
+                    + pd.Timedelta(days=offset)
+                )
+            else:
+                requested_date = event_dates[role]
+            actual_date = min(
+                max(requested_date, lower_date), upper_date
+            )
+            position = position_rows[position_role]
+            records.append(
+                {
+                    'event_id': str(event.event_id),
+                    'quality_rank_within_threshold': int(
+                        event.quality_rank_within_threshold
+                    ),
+                    'context_order': int(order),
+                    'context_role': role,
+                    'requested_date': requested_date,
+                    'actual_date': actual_date,
+                    'date_was_clipped': bool(
+                        actual_date != requested_date
+                    ),
+                    'position_basis': (
+                        f'{position_role}_daily_max_delta_do_column'
+                    ),
+                    'requested_core_lon': float(
+                        position['requested_core_lon']
+                    ),
+                    'requested_core_lat': float(
+                        position['requested_core_lat']
+                    ),
+                    'reference_depth_m': float(
+                        event.peak_depth_m
+                    ),
+                    'target_sigma0': target_sigma0,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+
+
+def _ofes_atomic_write_npz(
+    path: str | Path,
+    **arrays,
+) -> Path:
+    """在目标目录内原子写入压缩 OFES 场缓存。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        with temporary.open('wb') as handle:
+            np.savez_compressed(handle, **arrays)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+
+
+def _ofes_build_context_field(
+    request: dict,
+    settings: dict,
+    cache_path: str | Path,
+) -> dict:
+    """构建或复用一个候选事件角色的等密度面场缓存。"""
+    target = Path(cache_path)
+    expected = {
+        'event_id': str(request['event_id']),
+        'context_role': str(request['context_role']),
+        'actual_date': pd.Timestamp(
+            request['actual_date']
+        ).strftime('%Y-%m-%d'),
+    }
+    if target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            matches = all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            )
+            if matches:
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['field_cache_reused'] = True
+                metadata['field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+
+    date = pd.Timestamp(request['actual_date']).normalize()
+    core_lon = float(request['requested_core_lon'])
+    core_lat = float(request['requested_core_lat'])
+    radius_km = float(settings['map_radius_km'])
+    local_scale = approximate_degree_length(core_lat)
+    lon_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lon'])
+    )
+    lat_half_width = (
+        radius_km
+        * 1000.0
+        / float(local_scale['meters_per_degree_lat'])
+    )
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            core_lon - lon_half_width,
+            core_lon + lon_half_width,
+        ),
+        lat_bounds=(
+            core_lat - lat_half_width,
+            core_lat + lat_half_width,
+        ),
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    mapped = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(request['target_sigma0']),
+        float(request['reference_depth_m']),
+        {
+            'do': snapshot['do2'],
+            'salinity': snapshot['salinity'],
+            'theta': snapshot['temp'],
+            'u': snapshot['u'],
+            'v': snapshot['v'],
+        },
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_km = (
+        np.asarray(
+            adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                core_lon,
+                core_lat,
+            ),
+            dtype=float,
+        )
+        / 1000.0
+    )
+    circle_mask = distance_km <= radius_km
+    finite_mask = circle_mask & np.isfinite(mapped['do'])
+    circle_columns = int(np.count_nonzero(circle_mask))
+    finite_columns = int(np.count_nonzero(finite_mask))
+    finite_fraction = (
+        float(finite_columns / circle_columns)
+        if circle_columns
+        else 0.0
+    )
+    row = int(np.argmin(np.abs(lat - core_lat)))
+    column = int(
+        np.argmin(
+            np.abs(_minimal_lon_diff_deg(lon, core_lon))
+        )
+    )
+    annulus_mask = (
+        distance_km
+        >= float(settings['background_inner_radius_km'])
+    ) & (
+        distance_km
+        <= float(settings['background_outer_radius_km'])
+    )
+    annulus_valid = annulus_mask & np.isfinite(mapped['do'])
+    annulus_valid_columns = int(
+        np.count_nonzero(annulus_valid)
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(
+        date
+    )
+    edge_distance_km = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(core_lon),
+            np.asarray(core_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    mapped_core = {
+        key: float(np.asarray(values)[row, column])
+        for key, values in mapped.items()
+        if key != 'crossing_count'
+    }
+    required_core = (
+        mapped_core['depth'],
+        mapped_core['do'],
+        mapped_core['salinity'],
+        mapped_core['theta'],
+        mapped_core['u'],
+        mapped_core['v'],
+    )
+    failure_reasons: list[str] = []
+    if (
+        finite_fraction
+        < float(settings['map_min_finite_fraction'])
+    ):
+        failure_reasons.append('insufficient_map_finite_fraction')
+    if (
+        annulus_valid_columns
+        < int(settings['background_min_valid_columns'])
+    ):
+        failure_reasons.append(
+            'insufficient_isopycnal_annulus_columns'
+        )
+    if not all(np.isfinite(value) for value in required_core):
+        failure_reasons.append('nonfinite_core_isopycnal_field')
+
+    masked_fields = {
+        key: np.where(
+            circle_mask, np.asarray(values, dtype=float), np.nan
+        ).astype(np.float32)
+        for key, values in mapped.items()
+        if key != 'crossing_count'
+    }
+    metadata = {
+        'actual_core_lon': float(lon[column]),
+        'actual_core_lat': float(lat[row]),
+        'core_grid_distance_m': float(
+            great_circle_distance_m(
+                float(lon[column]),
+                float(lat[row]),
+                core_lon,
+                core_lat,
+            )
+        ),
+        'map_radius_km': radius_km,
+        'map_circle_column_count': circle_columns,
+        'map_finite_column_count': finite_columns,
+        'map_finite_fraction': finite_fraction,
+        'isopycnal_annulus_valid_columns': (
+            annulus_valid_columns
+        ),
+        'delivery_edge_distance_km': edge_distance_km,
+        'requested_circle_within_delivery_window': bool(
+            edge_distance_km >= radius_km
+        ),
+        'core_isopycnal_depth_m': (
+            mapped_core['depth']
+        ),
+        'core_isopycnal_do_umol_kg': mapped_core['do'],
+        'core_isopycnal_salinity': mapped_core['salinity'],
+        'core_isopycnal_theta_deg_c': mapped_core['theta'],
+        'core_isopycnal_u_m_s': mapped_core['u'],
+        'core_isopycnal_v_m_s': mapped_core['v'],
+        'core_isopycnal_speed_m_s': float(
+            np.hypot(mapped_core['u'], mapped_core['v'])
+        ),
+        'annulus_isopycnal_do_median_umol_kg': float(
+            np.nanmedian(
+                np.asarray(mapped['do'])[annulus_valid]
+            )
+        ),
+        'annulus_isopycnal_salinity_median': float(
+            np.nanmedian(
+                np.asarray(mapped['salinity'])[
+                    annulus_valid
+                ]
+            )
+        ),
+        'field_diagnostic_passed': bool(
+            not failure_reasons
+        ),
+        'field_diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'field_cache_reused': False,
+        'field_cache_path': str(target.resolve()),
+    }
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        lon=lon.astype(np.float32),
+        lat=lat.astype(np.float32),
+        distance_km=distance_km.astype(np.float32),
+        crossing_count=np.where(
+            circle_mask,
+            mapped['crossing_count'],
+            0,
+        ).astype(np.int16),
+        **masked_fields,
+    )
+    return metadata
+
+
+
+def _ofes_build_hosoda_field(
+    date: str | pd.Timestamp,
+    settings: dict,
+    cache_path: str | Path,
+) -> dict:
+    """构建或复用一个 Hosoda benchmark 日期的双等密度面场。"""
+    date_ts = pd.Timestamp(date).normalize()
+    target = Path(cache_path)
+    expected = {
+        'date': date_ts.strftime('%Y-%m-%d'),
+    }
+    if target.exists():
+        with np.load(target, allow_pickle=False) as cached:
+            matches = all(
+                str(cached[key].item()) == value
+                for key, value in expected.items()
+            )
+            if matches:
+                metadata = json.loads(
+                    str(cached['metadata_json'].item())
+                )
+                metadata['field_cache_reused'] = True
+                metadata['field_cache_path'] = str(
+                    target.resolve()
+                )
+                return metadata
+
+    snapshot = load_ofes_snapshot(
+        date_ts,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=settings['hosoda_lon_bounds'],
+        lat_bounds=settings['hosoda_lat_bounds'],
+    )
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    fields = {
+        'do': snapshot['do2'],
+        'salinity': snapshot['salinity'],
+        'theta': snapshot['temp'],
+        'u': snapshot['u'],
+        'v': snapshot['v'],
+    }
+    mapped_do = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(settings['hosoda_do_sigma0']),
+        float(
+            settings['hosoda_do_reference_depth_m']
+        ),
+        fields,
+    )
+    mapped_salinity = _ofes_fields_on_sigma0(
+        snapshot['depth'],
+        sigma0,
+        float(settings['hosoda_salinity_sigma0']),
+        float(
+            settings[
+                'hosoda_salinity_reference_depth_m'
+            ]
+        ),
+        fields,
+    )
+    do_values = np.asarray(mapped_do['do'], dtype=float)
+    salinity_values = np.asarray(
+        mapped_salinity['salinity'], dtype=float
+    )
+    do_finite = np.isfinite(do_values)
+    salinity_finite = np.isfinite(salinity_values)
+    do_fraction = float(np.mean(do_finite))
+    salinity_fraction = float(np.mean(salinity_finite))
+    do_q05, do_q95 = np.nanpercentile(
+        do_values, (5.0, 95.0)
+    )
+    salinity_q05, salinity_q95 = np.nanpercentile(
+        salinity_values, (5.0, 95.0)
+    )
+    failure_reasons: list[str] = []
+    if (
+        min(do_fraction, salinity_fraction)
+        < float(settings['map_min_finite_fraction'])
+    ):
+        failure_reasons.append('insufficient_map_finite_fraction')
+    required = (
+        do_q05,
+        do_q95,
+        np.nanmax(do_values),
+        salinity_q05,
+        salinity_q95,
+        np.nanmin(salinity_values),
+    )
+    if not all(np.isfinite(value) for value in required):
+        failure_reasons.append('nonfinite_benchmark_metric')
+    if (
+        np.isfinite(do_q05)
+        and np.isfinite(do_q95)
+        and do_q95 <= do_q05
+    ):
+        failure_reasons.append('unresolved_do_spatial_structure')
+    if (
+        np.isfinite(salinity_q05)
+        and np.isfinite(salinity_q95)
+        and salinity_q95 <= salinity_q05
+    ):
+        failure_reasons.append(
+            'unresolved_salinity_spatial_structure'
+        )
+    metadata = {
+        'date': date_ts,
+        'do_target_sigma0': float(
+            settings['hosoda_do_sigma0']
+        ),
+        'do_reference_depth_m': float(
+            settings['hosoda_do_reference_depth_m']
+        ),
+        'salinity_target_sigma0': float(
+            settings['hosoda_salinity_sigma0']
+        ),
+        'salinity_reference_depth_m': float(
+            settings[
+                'hosoda_salinity_reference_depth_m'
+            ]
+        ),
+        'do_finite_fraction': do_fraction,
+        'salinity_finite_fraction': salinity_fraction,
+        'do_q05_umol_kg': float(do_q05),
+        'do_q95_umol_kg': float(do_q95),
+        'do_max_umol_kg': float(np.nanmax(do_values)),
+        'salinity_q05': float(salinity_q05),
+        'salinity_q95': float(salinity_q95),
+        'salinity_min': float(
+            np.nanmin(salinity_values)
+        ),
+        'diagnostic_passed': bool(not failure_reasons),
+        'diagnostic_status': (
+            'passed'
+            if not failure_reasons
+            else ';'.join(failure_reasons)
+        ),
+        'field_cache_reused': False,
+        'field_cache_path': str(target.resolve()),
+    }
+    cache_arrays = {
+        'lon': np.asarray(
+            snapshot['lon'], dtype=np.float32
+        ),
+        'lat': np.asarray(
+            snapshot['lat'], dtype=np.float32
+        ),
+    }
+    for prefix, mapped in (
+        ('do_surface', mapped_do),
+        ('salinity_surface', mapped_salinity),
+    ):
+        for key in (
+            'depth',
+            'do',
+            'salinity',
+            'theta',
+            'u',
+            'v',
+        ):
+            cache_arrays[f'{prefix}_{key}'] = np.asarray(
+                mapped[key], dtype=np.float32
+            )
+    _ofes_atomic_write_npz(
+        target,
+        **expected,
+        metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_ofes_json_default,
+        ),
+        **cache_arrays,
+    )
+    return metadata
+
+
+
+def _ofes_save_figure(
+    fig: plt.Figure,
+    path: str | Path,
+    dpi: int,
+) -> Path:
+    """原子保存 OFES 诊断图并关闭 Figure。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f'.{target.name}.{os.getpid()}.tmp'
+    )
+    try:
+        fig.savefig(
+            temporary,
+            format=target.suffix.lstrip('.') or 'png',
+            dpi=int(dpi),
+            bbox_inches='tight',
+        )
+        os.replace(temporary, target)
+    finally:
+        plt.close(fig)
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _ofes_plot_annual_catalog_overview(
+    catalog_dir: str | Path,
+    quality_events: pd.DataFrame,
+    selected_events: pd.DataFrame,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制年度扫描强度、空间分布、深度与固定候选排名总览。"""
+    catalog_root = Path(catalog_dir)
+    scan = pd.read_parquet(
+        catalog_root / 'scan_summary.parquet'
+    )
+    do50 = quality_events.loc[
+        quality_events['threshold'] == 50.0
+    ].copy()
+    selected = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    )
+    fig, axes = plt.subplots(
+        2, 2, figsize=(15.5, 10.5), constrained_layout=True
+    )
+    ax = axes[0, 0]
+    for threshold, group in scan.groupby(
+        'threshold', sort=True
+    ):
+        key = _ofes_threshold_tag(float(threshold)).upper()
+        ax.plot(
+            group['date'],
+            group['peak_pixel_count'],
+            color=_THRESHOLD_COLORS.get(key, '#6b7280'),
+            linewidth=1.0,
+            label=key,
+        )
+    ax.set_yscale('symlog', linthresh=1)
+    ax.set_ylabel('Daily peak pixels')
+    ax.set_title('(a) Annual ΔDO occurrence')
+    ax.legend(frameon=False, ncol=3)
+    ax.grid(alpha=0.2)
+
+    ax = axes[0, 1]
+    eligible = do50.loc[do50['quality_eligible']]
+    truncated = do50.loc[do50['touches_delivery_edge']]
+    ax.scatter(
+        eligible['peak_lon'],
+        eligible['peak_lat'],
+        s=np.clip(eligible['rank_score'] ** 2, 5, 50),
+        c='#9ca3af',
+        alpha=0.45,
+        linewidths=0,
+        label='Quality-eligible DO50',
+    )
+    if not truncated.empty:
+        ax.scatter(
+            truncated['peak_lon'],
+            truncated['peak_lat'],
+            s=18,
+            marker='x',
+            c='#d97706',
+            alpha=0.8,
+            label='Delivery-edge truncated',
+        )
+    label_offsets = {
+        1: (7, 5),
+        2: (7, 5),
+        3: (9, -13),
+        4: (-15, 8),
+        5: (6, 5),
+    }
+    for row in selected.itertuples(index=False):
+        rank = int(row.quality_rank_within_threshold)
+        ax.scatter(
+            row.peak_lon,
+            row.peak_lat,
+            s=70,
+            c='#b91c1c',
+            edgecolors='white',
+            linewidths=0.8,
+            zorder=3,
+        )
+        ax.annotate(
+            str(rank),
+            (row.peak_lon, row.peak_lat),
+            xytext=label_offsets[rank],
+            textcoords='offset points',
+            ha='right' if rank == 4 else 'left',
+            fontsize=9,
+            fontweight='bold',
+            bbox={
+                'boxstyle': 'round,pad=0.12',
+                'facecolor': 'white',
+                'edgecolor': 'none',
+                'alpha': 0.72,
+            },
+        )
+    ax.set_xlim(140, 170)
+    ax.set_ylim(25, 45)
+    ax.set_xlabel('Longitude (°E)')
+    ax.set_ylabel('Latitude (°N)')
+    ax.set_title('(b) DO50 event peaks')
+    ax.grid(alpha=0.2)
+    ax.legend(frameon=False, fontsize=8, loc='lower right')
+
+    ax = axes[1, 0]
+    bins = np.linspace(300, 1000, 29)
+    ax.hist(
+        eligible['peak_depth_m'],
+        bins=bins,
+        color='#6b7280',
+        alpha=0.75,
+        label='Quality-eligible DO50',
+    )
+    deep = eligible.loc[
+        eligible['deep_sensitivity_eligible']
+    ]
+    ax.hist(
+        deep['peak_depth_m'],
+        bins=bins,
+        histtype='step',
+        linewidth=1.8,
+        color='#2563eb',
+        label='500–900 m sensitivity',
+    )
+    lower_count = int(
+        np.count_nonzero(
+            eligible['peak_on_lower_search_level']
+        )
+    )
+    ax.text(
+        0.98,
+        0.67,
+        (
+            f'Lower-bound peaks: {lower_count}/{len(eligible)}'
+            f' ({100 * lower_count / max(len(eligible), 1):.1f}%)'
+        ),
+        transform=ax.transAxes,
+        ha='right',
+        va='top',
+        fontsize=9,
+    )
+    ax.set_xlabel('Event peak depth (m)')
+    ax.set_ylabel('Events')
+    ax.set_title('(c) Delivered-depth distribution')
+    ax.legend(frameon=False, fontsize=8, loc='upper right')
+
+    ax = axes[1, 1]
+    components = (
+        ('rank_amplitude_component', 'Amplitude', '#991b1b'),
+        ('rank_area_component', 'Area', '#c2410c'),
+        ('rank_thickness_component', 'Thickness', '#ca8a04'),
+        ('rank_duration_component', 'Duration', '#2563eb'),
+    )
+    x = np.arange(len(selected))
+    bottom = np.zeros(len(selected), dtype=float)
+    for column, label, color in components:
+        values = selected[column].to_numpy(dtype=float)
+        ax.bar(
+            x,
+            values,
+            bottom=bottom,
+            label=label,
+            color=color,
+            width=0.72,
+        )
+        bottom += values
+    ax.set_xticks(
+        x,
+        [
+            f'Rank {int(value)}'
+            for value in selected[
+                'quality_rank_within_threshold'
+            ]
+        ],
+    )
+    ax.set_ylabel('Predeclared rank score')
+    ax.set_title('(d) Locked formal top five')
+    ax.legend(frameon=False, ncol=2, fontsize=8)
+    fig.suptitle(
+        'OFES 2003 objective ΔDO event catalog',
+        fontsize=16,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_event_time_series(
+    event: pd.Series,
+    daily_diagnostics: pd.DataFrame,
+    context_days: int,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制单个固定候选的水团分解、层结与动力演化。"""
+    group = daily_diagnostics.loc[
+        daily_diagnostics['event_id'] == event['event_id']
+    ].sort_values('date', kind='mergesort')
+    dates = pd.to_datetime(group['date'])
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11.5, 9.5), sharex=True,
+        constrained_layout=True,
+    )
+    axes[0].plot(
+        dates,
+        group['fixed_depth_do_contrast'],
+        '-o',
+        markersize=3.5,
+        linewidth=1.4,
+        color='#111827',
+        label='Fixed-depth contrast',
+    )
+    axes[0].plot(
+        dates,
+        group['water_mass_do_contrast'],
+        '-o',
+        markersize=3.0,
+        linewidth=1.2,
+        color='#b91c1c',
+        label='Same-isopycnal water mass',
+    )
+    axes[0].plot(
+        dates,
+        group['heave_do_contribution'],
+        '-o',
+        markersize=3.0,
+        linewidth=1.2,
+        color='#2563eb',
+        label='Background-profile heave',
+    )
+    axes[0].axhline(0, color='#6b7280', linewidth=0.7)
+    axes[0].set_ylabel('DO contrast\n(μmol kg⁻¹)')
+    axes[0].legend(frameon=False, ncol=3, fontsize=8)
+    axes[0].grid(alpha=0.2)
+
+    axes[1].plot(
+        dates,
+        group['n2_ratio_core_to_background'],
+        '-o',
+        markersize=3.5,
+        color='#7c3aed',
+        label='N² core/background',
+    )
+    axes[1].axhline(
+        1.0, color='#6b7280', linewidth=0.8, linestyle='--'
+    )
+    axes[1].set_ylabel('N² ratio')
+    axes[1].grid(alpha=0.2)
+    depth_axis = axes[1].twinx()
+    depth_axis.plot(
+        dates,
+        group['daily_peak_depth_m'],
+        color='#0891b2',
+        linewidth=1.0,
+        alpha=0.75,
+        label='Daily peak depth',
+    )
+    depth_axis.invert_yaxis()
+    depth_axis.set_ylabel(
+        'Daily peak depth (m)',
+        color='#0891b2',
+    )
+
+    axes[2].plot(
+        dates,
+        group['rossby_number'],
+        '-o',
+        markersize=3.0,
+        color='#b91c1c',
+        label='ζ/f',
+    )
+    axes[2].plot(
+        dates,
+        group['normalized_strain'],
+        '-o',
+        markersize=3.0,
+        color='#d97706',
+        label='strain/|f|',
+    )
+    axes[2].plot(
+        dates,
+        group['normalized_okubo_weiss'],
+        '-o',
+        markersize=3.0,
+        color='#2563eb',
+        label='OW/f²',
+    )
+    axes[2].axhline(0, color='#6b7280', linewidth=0.7)
+    axes[2].set_ylabel('Normalized kinematics')
+    axes[2].legend(frameon=False, ncol=3, fontsize=8)
+    axes[2].grid(alpha=0.2)
+    for ax in axes:
+        for role, date, style in (
+            ('start', event['start_date'], ':'),
+            ('peak', event['peak_date'], '-'),
+            ('end', event['end_date'], ':'),
+        ):
+            ax.axvline(
+                pd.Timestamp(date),
+                color=(
+                    '#b91c1c' if role == 'peak' else '#6b7280'
+                ),
+                linewidth=0.9,
+                linestyle=style,
+                alpha=0.8,
+            )
+    axes[-1].set_xlim(
+        pd.Timestamp(event['start_date'])
+        - pd.Timedelta(days=int(context_days)),
+        pd.Timestamp(event['end_date'])
+        + pd.Timedelta(days=int(context_days)),
+    )
+    axes[-1].xaxis.set_major_formatter(
+        mdates.DateFormatter('%b %d')
+    )
+    rank = int(event['quality_rank_within_threshold'])
+    fig.suptitle(
+        (
+            f'OFES DO50 rank {rank}: {event["event_id"]}  '
+            f'(reference {float(event["peak_depth_m"]):.1f} m)'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_event_context_maps(
+    event: pd.Series,
+    context: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    quiver_stride: int,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制单个固定候选五角色的等密度面 DO 与几何演化。"""
+    event_context = context.loc[
+        context['event_id'] == event['event_id']
+    ].sort_values('context_order', kind='mergesort')
+    if len(event_context) != 5:
+        raise RuntimeError(
+            f'Expected five context roles for {event["event_id"]}.'
+        )
+    fields: list[dict] = []
+    for row in event_context.itertuples(index=False):
+        with np.load(
+            row.field_cache_path, allow_pickle=False
+        ) as cached:
+            fields.append(
+                {
+                    key: np.asarray(cached[key]).copy()
+                    for key in (
+                        'lon',
+                        'lat',
+                        'do',
+                        'salinity',
+                        'depth',
+                        'u',
+                        'v',
+                    )
+                }
+            )
+    do_values = np.concatenate(
+        [
+            field['do'][np.isfinite(field['do'])]
+            for field in fields
+        ]
+    )
+    depth_anomalies = np.concatenate(
+        [
+            (
+                field['depth']
+                - float(event['peak_depth_m'])
+            )[np.isfinite(field['depth'])]
+            for field in fields
+        ]
+    )
+    do_vmin, do_vmax = np.nanpercentile(
+        do_values, (2.0, 98.0)
+    )
+    depth_limit = float(
+        np.nanpercentile(np.abs(depth_anomalies), 98.0)
+    )
+    depth_limit = max(25.0, depth_limit)
+    fig, axes = plt.subplots(
+        2,
+        5,
+        figsize=(23.5, 9.2),
+        constrained_layout=True,
+    )
+    top_mappable = None
+    bottom_mappable = None
+    track = daily_diagnostics.loc[
+        daily_diagnostics['event_id'] == event['event_id']
+    ].sort_values('date', kind='mergesort')
+    for column, (row, field_data) in enumerate(
+        zip(event_context.itertuples(index=False), fields)
+    ):
+        lon = field_data['lon']
+        lat = field_data['lat']
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        top = axes[0, column]
+        bottom = axes[1, column]
+        top_mappable = top.pcolormesh(
+            lon,
+            lat,
+            field_data['do'],
+            cmap='viridis',
+            shading='auto',
+            vmin=float(do_vmin),
+            vmax=float(do_vmax),
+        )
+        bottom_mappable = bottom.pcolormesh(
+            lon,
+            lat,
+            field_data['depth']
+            - float(event['peak_depth_m']),
+            cmap='RdBu_r',
+            shading='auto',
+            vmin=-depth_limit,
+            vmax=depth_limit,
+        )
+        salinity = field_data['salinity']
+        finite_salinity = salinity[np.isfinite(salinity)]
+        if (
+            finite_salinity.size
+            and np.nanmax(finite_salinity)
+            > np.nanmin(finite_salinity)
+        ):
+            levels = np.unique(
+                np.nanpercentile(
+                    finite_salinity, (20.0, 50.0, 80.0)
+                )
+            )
+            if len(levels) > 1:
+                bottom.contour(
+                    lon,
+                    lat,
+                    salinity,
+                    levels=levels,
+                    colors='#374151',
+                    linewidths=0.55,
+                    alpha=0.75,
+                )
+        stride = int(quiver_stride)
+        top.quiver(
+            lon_grid[::stride, ::stride],
+            lat_grid[::stride, ::stride],
+            field_data['u'][::stride, ::stride],
+            field_data['v'][::stride, ::stride],
+            color='white',
+            alpha=0.75,
+            scale=4.5,
+            width=0.003,
+        )
+        for ax in (top, bottom):
+            ax.plot(
+                track['requested_core_lon'],
+                track['requested_core_lat'],
+                color='#111827',
+                linewidth=0.8,
+                alpha=0.65,
+            )
+            ax.scatter(
+                row.requested_core_lon,
+                row.requested_core_lat,
+                s=45,
+                marker='x',
+                linewidths=1.5,
+                c='#ef4444',
+                zorder=5,
+            )
+            ax.set_xlim(float(lon[0]), float(lon[-1]))
+            ax.set_ylim(float(lat[0]), float(lat[-1]))
+            ax.grid(alpha=0.16)
+            mean_latitude = float(np.nanmean(lat))
+            ax.set_aspect(
+                1.0 / max(
+                    np.cos(np.deg2rad(mean_latitude)), 0.2
+                )
+            )
+        clipped = ' (clipped)' if row.date_was_clipped else ''
+        top.set_title(
+            (
+                f'{row.context_role.replace("_", " ")}\n'
+                f'{pd.Timestamp(row.actual_date):%Y-%m-%d}{clipped}'
+            ),
+            fontsize=10,
+        )
+        bottom.set_xlabel('Longitude (°E)')
+        if column == 0:
+            top.set_ylabel('Latitude (°N)')
+            bottom.set_ylabel('Latitude (°N)')
+    if top_mappable is None or bottom_mappable is None:
+        raise RuntimeError('No OFES event context field was plotted.')
+    fig.colorbar(
+        top_mappable,
+        ax=axes[0, :].tolist(),
+        shrink=0.88,
+        pad=0.01,
+        label='DO on peak sigma0 (μmol kg⁻¹)',
+    )
+    fig.colorbar(
+        bottom_mappable,
+        ax=axes[1, :].tolist(),
+        shrink=0.88,
+        pad=0.01,
+        label='Isopycnal depth − reference (m)',
+    )
+    rank = int(event['quality_rank_within_threshold'])
+    target_sigma0 = float(event_context.iloc[0]['target_sigma0'])
+    fig.suptitle(
+        (
+            f'OFES DO50 rank {rank}: fixed σ0={target_sigma0:.3f} '
+            'event evolution'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_negative_control_comparison(
+    selected_events: pd.DataFrame,
+    daily_diagnostics: pd.DataFrame,
+    negative_control: pd.DataFrame,
+    control_diagnostic: pd.DataFrame,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制头条事件峰值与预声明匹配负对照的对比。"""
+    headline = selected_events.sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).iloc[0]
+    peak_rows = daily_diagnostics.loc[
+        daily_diagnostics['daily_object_key']
+        == headline['peak_daily_object_key']
+    ]
+    if len(peak_rows) != 1 or len(control_diagnostic) != 1:
+        raise RuntimeError(
+            'Negative-control figure requires one event peak and '
+            'one control diagnosis.'
+        )
+    peak = peak_rows.iloc[0]
+    control = control_diagnostic.iloc[0]
+    match = negative_control.iloc[0]
+    fig, axes = plt.subplots(
+        1, 3, figsize=(14.5, 4.8), constrained_layout=True
+    )
+    labels = ('Fixed depth', 'Water mass', 'Heave')
+    event_values = (
+        peak['fixed_depth_do_contrast'],
+        peak['water_mass_do_contrast'],
+        peak['heave_do_contribution'],
+    )
+    control_values = (
+        control['fixed_depth_do_contrast'],
+        control['water_mass_do_contrast'],
+        control['heave_do_contribution'],
+    )
+    x = np.arange(len(labels))
+    axes[0].bar(
+        x - 0.18,
+        event_values,
+        width=0.36,
+        color='#b91c1c',
+        label='Rank-1 peak',
+    )
+    axes[0].bar(
+        x + 0.18,
+        control_values,
+        width=0.36,
+        color='#6b7280',
+        label='Matched control',
+    )
+    axes[0].axhline(0, color='#111827', linewidth=0.7)
+    axes[0].set_xticks(x, labels, rotation=18, ha='right')
+    axes[0].set_ylabel('DO contrast (μmol kg⁻¹)')
+    axes[0].set_title('(a) Exact decomposition')
+    axes[0].legend(frameon=False, fontsize=8)
+
+    dynamics = ('ζ/f', 'strain/|f|', 'OW/f²', 'N² ratio')
+    axes[1].plot(
+        dynamics,
+        [
+            peak['rossby_number'],
+            peak['normalized_strain'],
+            peak['normalized_okubo_weiss'],
+            peak['n2_ratio_core_to_background'],
+        ],
+        '-o',
+        color='#b91c1c',
+        label='Rank-1 peak',
+    )
+    axes[1].plot(
+        dynamics,
+        [
+            control['rossby_number'],
+            control['normalized_strain'],
+            control['normalized_okubo_weiss'],
+            control['n2_ratio_core_to_background'],
+        ],
+        '-o',
+        color='#6b7280',
+        label='Matched control',
+    )
+    axes[1].axhline(0, color='#111827', linewidth=0.7)
+    axes[1].tick_params(axis='x', rotation=18)
+    axes[1].set_title('(b) Dynamics and stratification')
+    axes[1].legend(frameon=False, fontsize=8)
+
+    mismatch_columns = (
+        'match_sigma0_normalized',
+        'match_theta_normalized',
+        'match_salinity_normalized',
+        'match_do_normalized',
+        'match_vorticity_normalized',
+        'match_strain_normalized',
+    )
+    mismatch_labels = (
+        'σ0', 'θ', 'S', 'DO', 'ζ/f', 'strain/f'
+    )
+    mismatch_values = [
+        abs(float(match[column]))
+        for column in mismatch_columns
+    ]
+    axes[2].bar(
+        mismatch_labels,
+        mismatch_values,
+        color='#2563eb',
+    )
+    axes[2].axhline(
+        1.0,
+        color='#6b7280',
+        linestyle='--',
+        linewidth=0.8,
+    )
+    axes[2].set_ylabel('|Normalized mismatch|')
+    axes[2].set_title(
+        f'(c) Match score = {float(match["match_score"]):.2f}'
+    )
+    axes[2].tick_params(axis='x', rotation=18)
+    fig.suptitle(
+        (
+            f'{headline["event_id"]} peak versus same-day '
+            'predeclared negative control'
+        ),
+        fontsize=14,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def _ofes_plot_hosoda_benchmark(
+    benchmark: pd.DataFrame,
+    settings: dict,
+    output_path: str | Path,
+    dpi: int,
+) -> Path:
+    """绘制 Hosoda 日期的高 DO 与低盐双等密度面集成检验。"""
+    benchmark_sorted = benchmark.sort_values(
+        'date', kind='mergesort'
+    )
+    fields: list[dict] = []
+    for row in benchmark_sorted.itertuples(index=False):
+        with np.load(
+            row.field_cache_path, allow_pickle=False
+        ) as cached:
+            fields.append(
+                {
+                    key: np.asarray(cached[key]).copy()
+                    for key in (
+                        'lon',
+                        'lat',
+                        'do_surface_do',
+                        'do_surface_depth',
+                        'do_surface_u',
+                        'do_surface_v',
+                        'salinity_surface_salinity',
+                        'salinity_surface_depth',
+                    )
+                }
+            )
+    all_do = np.concatenate(
+        [
+            field['do_surface_do'][
+                np.isfinite(field['do_surface_do'])
+            ]
+            for field in fields
+        ]
+    )
+    all_salinity = np.concatenate(
+        [
+            field['salinity_surface_salinity'][
+                np.isfinite(field['salinity_surface_salinity'])
+            ]
+            for field in fields
+        ]
+    )
+    do_vmin, do_vmax = np.nanpercentile(
+        all_do, (2.0, 98.0)
+    )
+    salinity_vmin, salinity_vmax = np.nanpercentile(
+        all_salinity, (2.0, 98.0)
+    )
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(15.8, 9.0),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    do_mappable = None
+    salinity_mappable = None
+    for column, (row, field_data) in enumerate(
+        zip(benchmark_sorted.itertuples(index=False), fields)
+    ):
+        lon = field_data['lon']
+        lat = field_data['lat']
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        do_mappable = axes[0, column].pcolormesh(
+            lon,
+            lat,
+            field_data['do_surface_do'],
+            cmap='viridis',
+            shading='auto',
+            vmin=float(do_vmin),
+            vmax=float(do_vmax),
+        )
+        depth = field_data['do_surface_depth']
+        finite_depth = depth[np.isfinite(depth)]
+        if (
+            finite_depth.size
+            and np.nanmax(finite_depth)
+            > np.nanmin(finite_depth)
+        ):
+            axes[0, column].contour(
+                lon,
+                lat,
+                depth,
+                levels=np.unique(
+                    np.nanpercentile(
+                        finite_depth, (20.0, 50.0, 80.0)
+                    )
+                ),
+                colors='white',
+                linewidths=0.55,
+                alpha=0.8,
+            )
+        stride = int(settings['map_quiver_stride'])
+        axes[0, column].quiver(
+            lon_grid[::stride, ::stride],
+            lat_grid[::stride, ::stride],
+            field_data['do_surface_u'][::stride, ::stride],
+            field_data['do_surface_v'][::stride, ::stride],
+            color='white',
+            scale=4.0,
+            width=0.003,
+            alpha=0.75,
+        )
+        salinity_mappable = axes[1, column].pcolormesh(
+            lon,
+            lat,
+            field_data['salinity_surface_salinity'],
+            cmap='cividis_r',
+            shading='auto',
+            vmin=float(salinity_vmin),
+            vmax=float(salinity_vmax),
+        )
+        salinity_depth = field_data[
+            'salinity_surface_depth'
+        ]
+        finite_salinity_depth = salinity_depth[
+            np.isfinite(salinity_depth)
+        ]
+        if (
+            finite_salinity_depth.size
+            and np.nanmax(finite_salinity_depth)
+            > np.nanmin(finite_salinity_depth)
+        ):
+            axes[1, column].contour(
+                lon,
+                lat,
+                salinity_depth,
+                levels=np.unique(
+                    np.nanpercentile(
+                        finite_salinity_depth,
+                        (20.0, 50.0, 80.0),
+                    )
+                ),
+                colors='white',
+                linewidths=0.55,
+                alpha=0.8,
+            )
+        axes[0, column].set_title(
+            pd.Timestamp(row.date).strftime('%Y-%m-%d')
+        )
+        axes[1, column].set_xlabel('Longitude (°E)')
+        for ax in axes[:, column]:
+            ax.grid(alpha=0.16)
+            ax.set_aspect(
+                1.0
+                / max(
+                    np.cos(np.deg2rad(float(np.mean(lat)))),
+                    0.2,
+                )
+            )
+    axes[0, 0].set_ylabel('Latitude (°N)')
+    axes[1, 0].set_ylabel('Latitude (°N)')
+    if do_mappable is None or salinity_mappable is None:
+        raise RuntimeError('No Hosoda benchmark field was plotted.')
+    fig.colorbar(
+        do_mappable,
+        ax=axes[0, :].tolist(),
+        shrink=0.86,
+        pad=0.01,
+        label=(
+            f'DO on σ0={settings["hosoda_do_sigma0"]:.1f} '
+            '(μmol kg⁻¹)'
+        ),
+    )
+    fig.colorbar(
+        salinity_mappable,
+        ax=axes[1, :].tolist(),
+        shrink=0.86,
+        pad=0.01,
+        label=(
+            f'Salinity on σ0='
+            f'{settings["hosoda_salinity_sigma0"]:.1f}'
+        ),
+    )
+    fig.suptitle(
+        (
+            'Hosoda et al. (2021) April–May 2003 '
+            'qualitative integration benchmark'
+        ),
+        fontsize=15,
+        fontweight='bold',
+    )
+    return _ofes_save_figure(fig, output_path, dpi)
+
+
+def build_ofes_event_evolution_diagnostics(
+    diagnostic_dir: str | Path | None = None,
+    *,
+    evolution_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """构建 OFES 候选的等密度面演化、基准图与轨迹门控。
+
+    本入口只消费已完成的年度 catalog 和排名候选水团诊断。它为每个预锁定
+    候选建立起始前、起始、峰值、结束和结束后五个场景，在事件峰值 sigma0
+    与固定峰值 depth 参考下绘制演化；另以
+    `evolution_overrides['hosoda_dates']` 指定的三天双等密度面图复核
+    Hosoda benchmark，并依据尚未解决的时空插值与垂向坐标问题写出显式
+    轨迹门槛。
+
+    参数:
+        - diagnostic_dir (str | Path | None): 排名候选水团诊断目录；None 时读取固定正式目录。
+        - evolution_overrides (dict | None): 临时覆盖 `event_evolution` 配置；其中
+          `hosoda_dates` 必须由 notebook setup cell 显式提供三个 benchmark 日期。
+        - output_dir (str | Path | None): 演化输出目录；None 时写入固定正式目录。
+
+    返回:
+        - dict: 含 output_dir、五角色 context 表、Hosoda benchmark 表、日期裁切记录和图件路径。
+
+    输出:
+        - `<output_dir>/fields/*.npz`、`event_context_snapshots.parquet` 与 `hosoda_benchmark_summary.parquet`。
+        - `<output_dir>/figures/*.png`。
+
+    说明:
+        - 五角色位置来自事件 start/peak/end 的逐日最大 ΔDO 网格列；before/after 沿用对应端点位置。
+        - 每个事件始终使用其 peak-day sigma0 与 catalog peak depth，不随日期重新选择参考面。
+        - Hosoda 图只作 loader、坐标、TEOS-10 映射与中尺度场的正向集成检验，不参与正式候选替换或排名。
+        - 轨迹分析不在本函数内执行；本函数只负责事件演化和 Hosoda benchmark 的正式结果。
+    """
+    diagnostic_root = (
+        Path(diagnostic_dir)
+        if diagnostic_dir is not None
+        else _ofes_analysis_output_dir('event_diagnostics')
+    )
+    diagnostic_summary = json.loads(
+        (diagnostic_root / 'analysis_summary.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    if not diagnostic_summary['diagnostic_gate_passed']:
+        raise RuntimeError(
+            'OFES event evolution requires the water-mass and '
+            'negative-control diagnostic gate to pass.'
+        )
+    required_inputs = (
+        'selected_events.parquet',
+        'quality_event_catalog.parquet',
+        'daily_diagnostics.parquet',
+        'event_diagnostic_summary.parquet',
+        'negative_control.parquet',
+        'negative_control_diagnostic.parquet',
+    )
+    missing = [
+        name
+        for name in required_inputs
+        if not (diagnostic_root / name).exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'OFES diagnostic inputs are missing: {missing}.'
+        )
+
+    selected_events = pd.read_parquet(
+        diagnostic_root / 'selected_events.parquet'
+    ).sort_values(
+        'quality_rank_within_threshold',
+        kind='mergesort',
+    ).reset_index(drop=True)
+    quality_events = pd.read_parquet(
+        diagnostic_root / 'quality_event_catalog.parquet'
+    )
+    daily_diagnostics = pd.read_parquet(
+        diagnostic_root / 'daily_diagnostics.parquet'
+    )
+    event_summary = pd.read_parquet(
+        diagnostic_root / 'event_diagnostic_summary.parquet'
+    )
+    negative_control = pd.read_parquet(
+        diagnostic_root / 'negative_control.parquet'
+    )
+    control_diagnostic = pd.read_parquet(
+        diagnostic_root
+        / 'negative_control_diagnostic.parquet'
+    )
+    if len(selected_events) != 5:
+        raise RuntimeError(
+            'OFES event evolution expects the locked top five '
+            f'candidates; found {len(selected_events)}.'
+        )
+
+    settings = _ofes_event_evolution_settings(
+        evolution_overrides
+    )
+    diagnostic_settings = _ofes_event_diagnostic_settings()
+    settings.update(
+        {
+            'context_days': int(
+                diagnostic_settings['context_days']
+            ),
+            'background_inner_radius_km': float(
+                diagnostic_settings[
+                    'background_inner_radius_km'
+                ]
+            ),
+            'background_outer_radius_km': float(
+                diagnostic_settings[
+                    'background_outer_radius_km'
+                ]
+            ),
+            'background_min_valid_columns': int(
+                diagnostic_settings[
+                    'background_min_valid_columns'
+                ]
+            ),
+        }
+    )
+    catalog_root = _ofes_analysis_output_dir('event_catalog')
+    daily_objects = pd.read_parquet(
+        catalog_root / 'daily_objects.parquet',
+        columns=['date'],
+    )
+    context_requests = _ofes_event_context_requests(
+        selected_events,
+        daily_diagnostics,
+        settings['context_days'],
+        pd.Timestamp(daily_objects['date'].min()),
+        pd.Timestamp(daily_objects['date'].max()),
+    )
+    output_path = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    fields_dir = output_path / 'fields'
+    figures_dir = output_path / 'figures'
+    fields_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    complete_outputs = (
+        output_path / 'event_context_snapshots.parquet',
+        output_path / 'hosoda_benchmark_summary.parquet',
+        figures_dir / 'annual_catalog_overview.png',
+        figures_dir / 'negative_control_comparison.png',
+        figures_dir / 'hosoda_benchmark.png',
+    )
+    if all(path.exists() for path in complete_outputs):
+        loaded = load_ofes_event_evolution(output_dir=output_path)
+        expected_context = {
+            (
+                str(row.event_id),
+                str(row.context_role),
+                pd.Timestamp(row.actual_date).strftime('%Y-%m-%d'),
+            )
+            for row in context_requests.itertuples(index=False)
+        }
+        stored_context = {
+            (
+                str(row.event_id),
+                str(row.context_role),
+                pd.Timestamp(row.actual_date).strftime('%Y-%m-%d'),
+            )
+            for row in loaded['event_context_snapshots'].itertuples(index=False)
+        }
+        if stored_context != expected_context:
+            raise RuntimeError(
+                'Existing output was created for a different event/date '
+                'request. Use another output_dir or remove the existing '
+                'directory.'
+            )
+        loaded['event_diagnostic_summary'] = event_summary
+        loaded['context_date_clipping'] = loaded[
+            'event_context_snapshots'
+        ].loc[
+            lambda frame: frame['date_was_clipped']
+        ].to_dict(orient='records')
+        loaded['reused_complete_run'] = True
+        return loaded
+    context_records: list[dict] = []
+    for index, row in enumerate(
+        context_requests.itertuples(index=False),
+        start=1,
+    ):
+        cache_path = (
+            fields_dir
+            / (
+                f'{row.event_id}_'
+                f'{row.context_order}_{row.context_role}.npz'
+            )
+        )
+        request = row._asdict()
+        metadata = _ofes_build_context_field(
+            request,
+            settings,
+            cache_path,
+        )
+        context_records.append({**request, **metadata})
+        print(
+            '[OFES evolution] '
+            f'context {index:02d}/{len(context_requests):02d} '
+            f'{row.event_id} {row.context_role} '
+            f'({"reused" if metadata["field_cache_reused"] else "mapped"})'
+        )
+    context = pd.DataFrame(context_records).sort_values(
+        [
+            'quality_rank_within_threshold',
+            'context_order',
+        ],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    _atomic_write_parquet(
+        context,
+        output_path / 'event_context_snapshots.parquet',
+    )
+    if not bool(context['field_diagnostic_passed'].all()):
+        failed = context.loc[
+            ~context['field_diagnostic_passed'],
+            ['event_id', 'context_role', 'field_diagnostic_status'],
+        ]
+        raise RuntimeError(
+            'OFES event context field gate failed: '
+            f'{failed.to_dict(orient="records")}'
+        )
+
+    benchmark_records: list[dict] = []
+    for index, date_text in enumerate(
+        settings['hosoda_dates'], start=1
+    ):
+        date = pd.Timestamp(date_text).normalize()
+        cache_path = (
+            fields_dir
+            / f'hosoda_{date:%Y%m%d}.npz'
+        )
+        metadata = _ofes_build_hosoda_field(
+            date,
+            settings,
+            cache_path,
+        )
+        benchmark_records.append(metadata)
+        print(
+            '[OFES evolution] '
+            f'Hosoda {index}/{len(settings["hosoda_dates"])} '
+            f'{date:%Y-%m-%d} '
+            f'({"reused" if metadata["field_cache_reused"] else "mapped"})'
+        )
+    benchmark = pd.DataFrame(benchmark_records)
+    benchmark['date'] = pd.to_datetime(benchmark['date'])
+    benchmark = benchmark.sort_values(
+        'date', kind='mergesort'
+    ).reset_index(drop=True)
+    _atomic_write_parquet(
+        benchmark,
+        output_path / 'hosoda_benchmark_summary.parquet',
+    )
+    if not bool(benchmark['diagnostic_passed'].all()):
+        raise RuntimeError(
+            'OFES Hosoda benchmark field gate failed: '
+            f'{benchmark.loc[~benchmark["diagnostic_passed"]].to_dict(orient="records")}'
+        )
+
+    figure_paths: list[Path] = []
+    figure_paths.append(
+        _ofes_plot_annual_catalog_overview(
+            catalog_root,
+            quality_events,
+            selected_events,
+            figures_dir / 'annual_catalog_overview.png',
+            settings['figure_dpi'],
+        )
+    )
+    for event in selected_events.to_dict(orient='records'):
+        event_series = pd.Series(event)
+        event_id = str(event['event_id'])
+        figure_paths.append(
+            _ofes_plot_event_time_series(
+                event_series,
+                daily_diagnostics,
+                settings['context_days'],
+                (
+                    figures_dir
+                    / f'{event_id}_diagnostic_evolution.png'
+                ),
+                settings['figure_dpi'],
+            )
+        )
+        figure_paths.append(
+            _ofes_plot_event_context_maps(
+                event_series,
+                context,
+                daily_diagnostics,
+                settings['map_quiver_stride'],
+                (
+                    figures_dir
+                    / f'{event_id}_isopycnal_context.png'
+                ),
+                settings['figure_dpi'],
+            )
+        )
+    figure_paths.append(
+        _ofes_plot_negative_control_comparison(
+            selected_events,
+            daily_diagnostics,
+            negative_control,
+            control_diagnostic,
+            figures_dir / 'negative_control_comparison.png',
+            settings['figure_dpi'],
+        )
+    )
+    figure_paths.append(
+        _ofes_plot_hosoda_benchmark(
+            benchmark,
+            settings,
+            figures_dir / 'hosoda_benchmark.png',
+            settings['figure_dpi'],
+        )
+    )
+    figure_paths = [
+        path.resolve() for path in figure_paths
+    ]
+
+    context_date_clipping = context.loc[
+        context['date_was_clipped']
+    ].to_dict(orient='records')
+
+    return {
+        'output_dir': output_path,
+        'event_context_snapshots': context,
+        'hosoda_benchmark_summary': benchmark,
+        'event_diagnostic_summary': event_summary,
+        'context_date_clipping': context_date_clipping,
+        'figure_paths': figure_paths,
+    }
+
+def load_ofes_event_catalog(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES ΔDO event catalog 的正式表格和 preflight 摘要。
+
+    本函数只读取 catalog 产物，不扫描 OFES 日场，也不创建输出目录。
+
+    参数:
+        - output_dir (str | Path | None): catalog 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 catalog 表、scan summary、preflight、summary 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 缺少任一正式产物时直接报告需要先运行的生产步骤。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_catalog',
+        output_dir=output_dir,
+        parquet_paths={
+            'daily_objects': 'daily_objects.parquet',
+            'event_catalog': 'event_catalog.parquet',
+            'scan_summary': 'scan_summary.parquet',
+        },
+        json_paths={
+            'preflight': 'preflight.json',
+            'summary': 'catalog_summary.json',
+        },
+    )
+
+def load_ofes_event_diagnostics(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES 排名事件水团、动力和负对照诊断结果。
+
+    本函数只读取正式 parquet 和 JSON 摘要，不重新计算逐日诊断。
+
+    参数:
+        - output_dir (str | Path | None): event diagnostics 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含质量 catalog、候选、逐日/事件诊断、负对照、分析摘要和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 结果缺失时直接指出缺少的表格。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_diagnostics',
+        output_dir=output_dir,
+        parquet_paths={
+            'quality_event_catalog': 'quality_event_catalog.parquet',
+            'selected_events': 'selected_events.parquet',
+            'deep_sensitivity_ranking': 'deep_sensitivity_ranking.parquet',
+            'daily_diagnostics': 'daily_diagnostics.parquet',
+            'event_diagnostic_summary': 'event_diagnostic_summary.parquet',
+            'negative_control': 'negative_control.parquet',
+            'negative_control_diagnostic': 'negative_control_diagnostic.parquet',
+        },
+        json_paths={'analysis_summary': 'analysis_summary.json'},
+    )
+
+def load_ofes_event_population(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES 深层事件总体峰值诊断结果。
+
+    本函数只读取总体 parquet、JSON 摘要和正式图件。
+
+    参数:
+        - output_dir (str | Path | None): event population 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含总体事件表、峰值诊断、summary、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 不启动轨迹或其他后续诊断。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_population',
+        output_dir=output_dir,
+        parquet_paths={
+            'population_events': 'population_events.parquet',
+            'population_peak_diagnostics': 'population_peak_diagnostics.parquet',
+        },
+        json_paths={'summary': 'population_summary.json'},
+        figure_paths={'figure': 'population_phase_space.png'},
+    )
+
+def load_ofes_event_onset(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES onset/formation 代表事件诊断结果。
+
+    本函数只读取 onset 的逐日表、anchor map 表、summary 和正式演化图。
+
+    参数:
+        - output_dir (str | Path | None): event onset 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含选择表、请求表、逐日诊断、map 诊断、事件摘要、analysis_summary、figure_paths 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 不读取 OFES NetCDF。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_onset',
+        output_dir=output_dir,
+        parquet_paths={
+            'selected_regimes': 'selected_regimes.parquet',
+            'daily_requests': 'daily_requests.parquet',
+            'daily_diagnostics': 'daily_diagnostics.parquet',
+            'event_onset_summary': 'event_onset_summary.parquet',
+            'map_diagnostics': 'map_diagnostics.parquet',
+        },
+        json_paths={'analysis_summary': 'analysis_summary.json'},
+        figure_paths={
+            'onset_regime_evolution': 'figures/onset_regime_evolution.png',
+        },
+    )
+
+def load_ofes_event_flow_consistency(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES onset 事件的 object-flow consistency 结果。
+
+    本函数只读取逐段表、事件汇总、analysis summary 和正式图件。
+
+    参数:
+        - output_dir (str | Path | None): event flow 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 segments、summary、analysis_summary、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 该结果是 Eulerian object 的运动学比较，不是粒子轨迹。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_flow',
+        output_dir=output_dir,
+        parquet_paths={
+            'segments': 'event_flow_segments.parquet',
+            'summary': 'event_flow_summary.parquet',
+        },
+        json_paths={'analysis_summary': 'analysis_summary.json'},
+        figure_paths={'figure': 'event_flow_consistency.png'},
+    )
+
+def load_ofes_event_patch_continuity(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES 同密度面 fingerprint patch continuity 结果。
+
+    本函数只读取 patch 日表、transition、summary、解释 gate 和正式图件。
+
+    参数:
+        - output_dir (str | Path | None): event patch 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 daily/transition/summary/gate、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - patch continuity 是 Eulerian/quasi-Lagrangian 诊断，不等同于物质粒子证明。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_patch',
+        output_dir=output_dir,
+        parquet_paths={
+            'daily_patch_diagnostics': 'daily_patch_diagnostics.parquet',
+            'patch_transitions': 'patch_transitions.parquet',
+            'patch_summary': 'patch_summary.parquet',
+        },
+        json_paths={'trajectory_interpretation_gate': 'trajectory_interpretation_gate.json'},
+        figure_paths={'figure': 'patch_continuity.png'},
+    )
+
+def load_ofes_event_lifecycle(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES 事件全生命周期动力和表层表达结果。
+
+    本函数只读取 lifecycle 日表、垂向剖面、事件汇总、parity、analysis summary 和图件。
+
+    参数:
+        - output_dir (str | Path | None): event lifecycle 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 daily/profile/event 表、peak parity、analysis_summary、figure_path 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 不重建生命周期场。
+    """
+    return _ofes_load_fixed_outputs(
+        'event_lifecycle',
+        output_dir=output_dir,
+        parquet_paths={
+            'daily_diagnostics': 'lifecycle_daily_diagnostics.parquet',
+            'vertical_profiles': 'lifecycle_vertical_profiles.parquet',
+            'event_summary': 'lifecycle_event_summary.parquet',
+        },
+        json_paths={
+            'peak_population_parity': 'peak_population_parity.json',
+            'analysis_summary': 'analysis_summary.json',
+        },
+        figure_paths={'figure': 'event_lifecycle.png'},
+    )
+
+def load_ofes_event_evolution(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES event evolution 和 Hosoda benchmark 结果。
+
+    本函数只读取五角色 context、benchmark 表和正式图件索引，不重建场。
+
+    参数:
+        - output_dir (str | Path | None): event evolution 目录；None 使用固定 OFES 路径。
+
+    返回:
+        - dict: 含 context、benchmark、figure_paths 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 事件演化结果只提供候选阶段上下文，不启动轨迹积分。
+    """
+    run_dir = _ofes_analysis_output_path('event_evolution', output_dir)
+    parquet_paths = {
+        'event_context_snapshots': run_dir / 'event_context_snapshots.parquet',
+        'hosoda_benchmark_summary': run_dir / 'hosoda_benchmark_summary.parquet',
+    }
+    required = {
+        **parquet_paths,
+        'annual_catalog_overview': run_dir / 'figures/annual_catalog_overview.png',
+        'negative_control_comparison': run_dir / 'figures/negative_control_comparison.png',
+        'hosoda_benchmark': run_dir / 'figures/hosoda_benchmark.png',
+    }
+    missing = [key for key, path in required.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f'OFES event_evolution output is incomplete; missing: '
+            f'{", ".join(sorted(missing))}. Run the corresponding producer first.'
+        )
+    event_figures = sorted((run_dir / 'figures').glob('*_diagnostic_evolution.png'))
+    context_figures = sorted((run_dir / 'figures').glob('*_isopycnal_context.png'))
+    if not event_figures or not context_figures:
+        raise FileNotFoundError(
+            'OFES event_evolution output is incomplete; missing event figure set. '
+            'Run the corresponding producer first.'
+        )
+    output_paths = {key: path for key, path in required.items()}
+    output_paths['event_diagnostic_evolution'] = event_figures
+    output_paths['event_isopycnal_context'] = context_figures
+    return {
+        'run_dir': run_dir,
+        'output_dir': run_dir,
+        'output_paths': output_paths,
+        'event_context_snapshots': pd.read_parquet(parquet_paths['event_context_snapshots']),
+        'hosoda_benchmark_summary': pd.read_parquet(parquet_paths['hosoda_benchmark_summary']),
+        'figure_paths': {
+            'annual_catalog_overview': output_paths['annual_catalog_overview'],
+            'negative_control_comparison': output_paths['negative_control_comparison'],
+            'hosoda_benchmark': output_paths['hosoda_benchmark'],
+            'event_diagnostic_evolution': event_figures,
+            'event_isopycnal_context': context_figures,
+        },
+    }
+
+
+def load_ofes_quality_event_diagnostics(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取当前 quality-eligible 事件 census 的正式产物。
+
+    参数:
+        - output_dir (str | Path | None): census 目录；None 使用固定 `quality_event_diagnostics` 目录。
+
+    返回:
+        - dict: 含质量事件表、逐日诊断、事件汇总、负对照、summary 和 output_paths。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 不访问 OFES 原始场、不创建目录，也不重新运行诊断。
+    """
+    return _ofes_load_fixed_outputs(
+        'quality_event_diagnostics',
+        output_dir=output_dir,
+        parquet_paths={
+            'quality_event_catalog': 'quality_event_catalog.parquet',
+            'selected_events': 'selected_events.parquet',
+            'deep_sensitivity_ranking': 'deep_sensitivity_ranking.parquet',
+            'daily_diagnostics': 'daily_diagnostics.parquet',
+            'event_diagnostic_summary': 'event_diagnostic_summary.parquet',
+            'negative_control': 'negative_control.parquet',
+            'negative_control_diagnostic': 'negative_control_diagnostic.parquet',
+        },
+        json_paths={'analysis_summary': 'analysis_summary.json'},
+    )
+
+
+def load_ofes_daily_water_mass_diagnostics(
+    *,
+    output_dir: str | Path | None = None,
+    geometry_mode: str = 'both',
+) -> dict:
+    """读取 fixed-site/moving-core 逐日 water-mass/heave 产物。
+
+    参数:
+        - output_dir (str | Path | None): producer 输出根目录；None 使用 YAML 的固定目录。
+        - geometry_mode (str): `fixed_site`、`moving_core` 或 `both`（默认）。
+
+    返回:
+        - dict: `both` 时返回 `geometries` 映射；单一 geometry 时返回该 geometry 的正式表和 summary。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - loader 只读取请求表、逐日表、事件汇总和 JSON；不访问 OFES NetCDF、不启动计算。
+    """
+    settings = _ofes_daily_water_mass_settings()
+    if geometry_mode == 'both':
+        modes = settings['geometry_modes']
+    elif geometry_mode in ('fixed_site', 'moving_core'):
+        modes = (geometry_mode,)
+    else:
+        raise ValueError("geometry_mode must be 'fixed_site', 'moving_core', or 'both'.")
+    output_root = _ofes_analysis_output_path(settings['output_subdir'], output_dir)
+    results: dict[str, dict] = {}
+    for mode in modes:
+        root = output_root / mode
+        paths = {
+            'requests': root / 'event_day_requests.parquet',
+            'daily_water_mass': root / 'daily_water_mass.parquet',
+            'event_summary': root / 'event_summary.parquet',
+            'analysis_summary': root / 'analysis_summary.json',
+        }
+        missing = [name for name, path in paths.items() if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f'OFES {mode} daily water-mass output is incomplete; missing: '
+                f'{", ".join(missing)}. Run the producer first.'
+            )
+        results[mode] = {
+            'output_dir': root,
+            'output_paths': paths,
+            'requests': pd.read_parquet(paths['requests']),
+            'daily_water_mass': pd.read_parquet(paths['daily_water_mass']),
+            'event_summary': pd.read_parquet(paths['event_summary']),
+            'summary': json.loads(paths['analysis_summary'].read_text(encoding='utf-8')),
+        }
+    if len(results) == 1:
+        result = next(iter(results.values()))
+        result['geometries'] = results
+        return result
+    return {'output_dir': output_root, 'geometries': results}
+
+
+def plot_ofes_daily_water_mass_diagnostics(
+    result: dict,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制已加载的逐日 water-mass/heave 事件汇总。
+
+    参数:
+        - result (dict): `load_ofes_daily_water_mass_diagnostics` 的返回值。
+        - output_dir (str | Path | None): 图件输出根目录；None 使用各 geometry 的正式目录。
+        - show_fig (bool): 是否显示图件，默认 True。
+        - save_fig (bool): 是否覆盖保存固定图件，默认 True。
+
+    返回:
+        - dict: 各 geometry 的 figure 对象和（保存时）figure_path。
+
+    输出:
+        - `daily_water_mass_summary.png`（save_fig=True）。
+
+    说明:
+        - 只消费 producer/loader 返回的事件汇总，不访问 OFES 原始场、不重新运行生产步骤。
+    """
+    geometries = result.get('geometries')
+    if not geometries:
+        if 'event_summary' not in result:
+            raise KeyError('result must contain event_summary or geometries.')
+        geometry = str(result['summary'].get('geometry', 'fixed_site'))
+        geometries = {geometry: result}
+    outputs: dict[str, dict] = {}
+    for geometry, payload in geometries.items():
+        summary = payload['event_summary']
+        required_columns = {
+            'event_id',
+            'water_mass_start',
+            'water_mass_peak',
+            'water_mass_last',
+        }
+        missing_columns = sorted(required_columns - set(summary.columns))
+        if missing_columns:
+            raise KeyError(
+                f'{geometry} water-mass event summary lacks columns: '
+                f'{missing_columns}'
+            )
+        figure, axis = plt.subplots(figsize=(10.5, 5.0), constrained_layout=True)
+        x = np.arange(len(summary))
+        for column, label, color in (
+            ('water_mass_start', 'start', '#72b7b2'),
+            ('water_mass_peak', 'peak', '#d62728'),
+            ('water_mass_last', 'last', '#4c78a8'),
+        ):
+            axis.plot(x, summary[column].to_numpy(dtype=float), marker='o', linewidth=1.2, markersize=3.5, label=label, color=color)
+        axis.axhline(0.0, color='#111827', linestyle='--', linewidth=0.9)
+        axis.set_xlabel('Event order')
+        axis.set_ylabel('Water-mass DO contrast (µmol kg⁻¹)')
+        axis.set_title(f'OFES daily water-mass contrast ({geometry})')
+        axis.legend(frameon=False)
+        axis.grid(alpha=0.2)
+        payload_out = {'figure': figure}
+        if save_fig:
+            base = Path(output_dir) / geometry if output_dir is not None else Path(payload['output_dir'])
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / 'daily_water_mass_summary.png'
+            figure.savefig(path, dpi=180, bbox_inches='tight')
+            payload_out['figure_path'] = path
+        if show_fig:
+            plt.show()
+        plt.close(figure)
+        outputs[geometry] = payload_out
+    return {'geometries': outputs}
+
+
+def summarize_ofes_analysis_populations(
+    *,
+    catalog_dir: str | Path | None = None,
+    diagnostic_dir: str | Path | None = None,
+    population_dir: str | Path | None = None,
+) -> dict:
+    """汇总当前 OFES catalog、quality census 与 strict population 的集合关系。
+
+    参数:
+        - catalog_dir (str | Path | None): event catalog 目录；None 使用固定正式目录。
+        - diagnostic_dir (str | Path | None): quality census 目录；None 使用固定正式目录。
+        - population_dir (str | Path | None): population 目录；None 使用固定正式目录。
+
+    返回:
+        - dict: 当前 candidate、quality-eligible、strict 集合数量、日期范围和可见的请求/完成差集。
+
+    输出:
+        - 无；只读取已有 parquet/JSON，不创建输出目录。
+
+    说明:
+        - 所有数量均由正式产物计算，不作为永久运行许可或配置门槛。
+    """
+    catalog_root = _ofes_analysis_output_path('event_catalog', catalog_dir)
+    diagnostic_root = _ofes_analysis_output_path('quality_event_diagnostics', diagnostic_dir)
+    population_root = _ofes_analysis_output_path('event_population', population_dir)
+    result: dict[str, Any] = {}
+    catalog_path = catalog_root / 'event_catalog.parquet'
+    quality_path = diagnostic_root / 'quality_event_catalog.parquet'
+    selected_path = diagnostic_root / 'selected_events.parquet'
+    daily_path = diagnostic_root / 'daily_diagnostics.parquet'
+    population_path = population_root / 'population_peak_diagnostics.parquet'
+    if catalog_path.exists():
+        catalog = pd.read_parquet(catalog_path)
+        result['candidate'] = int(catalog['event_id'].nunique())
+        result['catalog_date_range'] = [
+            pd.Timestamp(catalog['date'].min()).strftime('%Y-%m-%d'),
+            pd.Timestamp(catalog['date'].max()).strftime('%Y-%m-%d'),
+        ] if 'date' in catalog.columns and len(catalog) else []
+    if quality_path.exists():
+        quality = pd.read_parquet(quality_path)
+        threshold = float(_ofes_event_diagnostic_settings()['candidate_threshold'])
+        eligible = quality.loc[quality['threshold'].eq(threshold) & quality['quality_eligible']]
+        result['quality_eligible'] = int(eligible['event_id'].nunique())
+        result['quality_event_ids'] = sorted(eligible['event_id'].astype(str).unique())
+    if selected_path.exists():
+        selected = pd.read_parquet(selected_path)
+        result['requested_event_count'] = int(selected['event_id'].nunique())
+        result['requested_event_ids'] = sorted(selected['event_id'].astype(str).unique())
+    if daily_path.exists() and selected_path.exists():
+        daily = pd.read_parquet(daily_path)
+        requested = set(selected['event_id'].astype(str))
+        completed = set(daily.loc[daily.get('diagnostic_passed', True).astype(bool), 'event_id'].astype(str))
+        result['completed_event_count'] = int(len(completed))
+        result['requested_not_completed'] = sorted(requested - completed)
+    if population_path.exists():
+        population = pd.read_parquet(population_path)
+        strict = population.loc[population['population_diagnostic_passed']]
+        result['strict'] = int(strict['event_id'].nunique())
+        result['strict_event_ids'] = sorted(strict['event_id'].astype(str).unique())
+    if 'quality_event_ids' in result and 'strict_event_ids' in result:
+        result['quality_not_strict'] = sorted(
+            set(result['quality_event_ids']) - set(result['strict_event_ids'])
+        )
+    return result
