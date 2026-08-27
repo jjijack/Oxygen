@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.27 变更：
+#   - 新增 w_along、winter MLD 与 mechanism-synthesis 的正式参数；这些
+#     reducer 只消费已完成产物，输出目录采用固定语义路径。
 # version 1.26 变更：
 #   - 新增 OFES PET surface-eddy detection、tracking、valid-domain 与
 #     event-association/null 的正式科学参数；输出目录由 paths.yml 控制。
@@ -100,7 +103,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.26
+version: 1.27
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -316,6 +319,30 @@ ofes:
       annual_latitude_bin_deg: 1.0
       bootstrap_replicates: 10000
       random_seed: 20260814
+  w_along:
+    time_window_days: 3
+    core_radius_km: 20.0
+    ring_inner_km: 120.0
+    ring_outer_km: 240.0
+    window_margin_km: 25.0
+    smooth_km: 10.0
+    core_minimum_availability: 0.8
+    bootstrap_replicates: 10000
+    random_seed: 20260816
+    output_subdir: w_along
+  winter_mld:
+    winter_start: 2003-01-01
+    winter_end: 2003-03-31
+    reference_depth_m: 10.0
+    density_threshold_kg_m3: 0.03
+    window_deg: 0.05
+    output_subdir: winter_mld
+  mechanism_synthesis:
+    bootstrap_replicates: 10000
+    random_seed: 20260729
+    minimum_lag_pairs: 7
+    maximum_lag_days: 5
+    output_subdir: mechanism_synthesis
   rk4_dt_seconds: 3600            # 拉格朗日积分步长（秒），每日场内亚步进
   delta_do_catalog:
     thresholds: [20.0, 35.0, 50.0]

@@ -68179,3 +68179,2779 @@ def plot_ofes_surface_eddy_diagnostics(
     if show_fig:
         plt.show()
     return {'figure': fig, 'figure_path': path}
+
+
+def _ofes_mechanism_output_root(name: str, output_dir: str | Path | None = None) -> Path:
+    """Resolve one fixed output directory for a mechanism diagnostic."""
+
+    if output_dir is not None:
+        return Path(output_dir).expanduser()
+    base = Path(_PATHS_CFG.get('paths', {}).get('plots_output', './plot_outputs'))
+    region = str(_OFES_CFG.get('delta_do_catalog', {}).get('output_region_slug', 'ofes_np30_ke'))
+    return base / 'do' / region / name
+
+
+def _ofes_mechanism_read_optional(path: str | Path | None, names: Sequence[str]) -> pd.DataFrame | None:
+    """Read one explicitly named parquet table when supplied."""
+
+    if path is None:
+        return None
+    candidate = _ofes_surface_eddy_resolve_table(path, names)
+    return pd.read_parquet(candidate)
+
+
+def _ofes_mechanism_write_result(root: Path, files: Mapping[str, pd.DataFrame], summary: Mapping[str, Any], request: Mapping[str, Any]) -> dict:
+    """Write mechanism tables and a structural manifest, then return them."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    for name, frame in files.items():
+        path = root / f'{name}.parquet'
+        frame.to_parquet(path, index=False)
+        paths[name] = path
+    summary_payload = dict(summary)
+    summary_payload['paths'] = {name: str(path) for name, path in paths.items()}
+    summary_path = root / 'summary.json'
+    _ofes_surface_eddy_write_json(summary_path, summary_payload)
+    status = (
+        'complete'
+        if int(summary_payload.get('task_error_count', 0)) == 0
+        else 'partial'
+    )
+    manifest = {
+        'schema_version': 1,
+        'status': status,
+        'request': _ofes_normalize_request_value(dict(request)),
+        'outputs': {name: str(path) for name, path in paths.items()},
+        'summary': str(summary_path),
+    }
+    manifest_path = root / 'manifest.json'
+    _ofes_surface_eddy_write_json(manifest_path, manifest)
+    manifest['outputs']['summary'] = str(summary_path)
+    manifest['outputs']['manifest'] = str(manifest_path)
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'summary': summary_payload,
+        **files,
+    }
+
+
+def _ofes_mechanism_load_result(output_dir: str | Path, names: Sequence[str]) -> dict:
+    """Load named mechanism tables from one explicit completed directory."""
+
+    root = Path(output_dir).expanduser()
+    manifest = _ofes_surface_eddy_read_json(root / 'manifest.json')
+    if manifest.get('status') != 'complete':
+        raise RuntimeError(f'Mechanism output is not complete: {root}')
+    result: dict[str, Any] = {'run_dir': root, 'manifest': manifest}
+    for name in names:
+        path = root / f'{name}.parquet'
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        result[name] = pd.read_parquet(path)
+    summary_path = root / 'summary.json'
+    if summary_path.is_file():
+        result['summary'] = _ofes_surface_eddy_read_json(summary_path)
+    return result
+
+
+def _ofes_mechanism_nan_uniform_filter(field: np.ndarray, size: int) -> np.ndarray:
+    """Apply a NaN-aware local mean without changing the field geometry."""
+
+    values = np.asarray(field, dtype=float)
+    if values.size == 0 or int(size) <= 1:
+        return values.copy()
+    from scipy.ndimage import uniform_filter
+
+    valid = np.isfinite(values).astype(float)
+    numerator = uniform_filter(np.where(valid > 0, values, 0.0), size=int(size), mode='nearest')
+    denominator = uniform_filter(valid, size=int(size), mode='nearest')
+    output = np.full(values.shape, np.nan, dtype=float)
+    np.divide(numerator, denominator, out=output, where=denominator > 0.5)
+    return output
+
+
+def _ofes_mechanism_gradients(field: np.ndarray, lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical x/y gradients for a regular longitude/latitude grid."""
+
+    values = np.asarray(field, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    if values.shape != (lat.size, lon.size) or lon.size < 2 or lat.size < 2:
+        raise ValueError('Isopycnal fields must be 2-D on a regular lon/lat grid.')
+    dlon = float(np.nanmedian(np.diff(lon)))
+    dlat = float(np.nanmedian(np.diff(lat)))
+    if not np.isfinite(dlon) or not np.isfinite(dlat) or dlon == 0 or dlat == 0:
+        raise ValueError('Isopycnal longitude and latitude coordinates must be increasing.')
+    grad_lon = np.gradient(values, dlon, axis=1)
+    grad_lat = np.gradient(values, dlat, axis=0)
+    scale = approximate_degree_length(lat)
+    return (
+        grad_lon / np.asarray(scale['meters_per_degree_lon'], dtype=float)[:, None],
+        grad_lat / np.asarray(scale['meters_per_degree_lat'], dtype=float)[:, None],
+    )
+
+
+def _ofes_mechanism_day_metrics(
+    z_sigma: np.ndarray,
+    u_sigma: np.ndarray,
+    v_sigma: np.ndarray,
+    do2_sigma: np.ndarray,
+    crossing_count: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    lon0: float,
+    lat0: float,
+    core_radius_km: float,
+    ring_inner_km: float,
+    ring_outer_km: float,
+    smooth_cells: int,
+) -> dict[str, float]:
+    """Compute core/ring w-along and DO-advection metrics with separate masks."""
+
+    z_s = _ofes_mechanism_nan_uniform_filter(z_sigma, smooth_cells)
+    u_s = _ofes_mechanism_nan_uniform_filter(u_sigma, smooth_cells)
+    v_s = _ofes_mechanism_nan_uniform_filter(v_sigma, smooth_cells)
+    do_s = _ofes_mechanism_nan_uniform_filter(do2_sigma, smooth_cells)
+    dz_dx, dz_dy = _ofes_mechanism_gradients(z_s, lon, lat)
+    ddo_dx, ddo_dy = _ofes_mechanism_gradients(do_s, lon, lat)
+    w_raw = u_s * dz_dx + v_s * dz_dy
+    do_raw = u_s * ddo_dx + v_s * ddo_dy
+    speed = np.hypot(u_s, v_s)
+    slope = np.hypot(dz_dx, dz_dy)
+    do_slope = np.hypot(ddo_dx, ddo_dy)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        alignment = np.where((speed > 0) & (slope > 0), w_raw / (speed * slope), np.nan)
+        do_alignment = np.where((speed > 0) & (do_slope > 0), do_raw / (speed * do_slope), np.nan)
+    finite_w = (
+        (np.asarray(crossing_count) > 0)
+        & np.isfinite(z_s) & np.isfinite(u_s) & np.isfinite(v_s)
+        & np.isfinite(w_raw) & np.isfinite(alignment)
+    )
+    finite_do = (
+        (np.asarray(crossing_count) > 0)
+        & np.isfinite(do_s) & np.isfinite(u_s) & np.isfinite(v_s)
+        & np.isfinite(do_raw) & np.isfinite(do_alignment)
+    )
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_m = great_circle_distance_m(lon_grid, lat_grid, float(lon0), float(lat0))
+    masks = {
+        'core': distance_m <= float(core_radius_km) * 1000.0,
+        'ring': (distance_m >= float(ring_inner_km) * 1000.0)
+        & (distance_m <= float(ring_outer_km) * 1000.0),
+    }
+    result: dict[str, float] = {}
+    for region, region_mask in masks.items():
+        total = int(np.count_nonzero(region_mask))
+        valid = region_mask & finite_w
+        valid_do = region_mask & finite_do
+        result[f'{region}_total_cells'] = total
+        result[f'{region}_available_cells'] = int(np.count_nonzero(valid))
+        result[f'{region}_availability'] = float(np.mean(finite_w[region_mask])) if total else np.nan
+        result[f'{region}_do_availability'] = float(np.mean(finite_do[region_mask])) if total else np.nan
+        for name, values, mask in (
+            ('w_along', w_raw * 86400.0, valid),
+            ('slope', slope, valid),
+            ('speed', speed, valid),
+            ('cos', alignment, valid),
+            ('do_tendency', do_raw * 86400.0, valid_do),
+            ('cos_do', do_alignment, valid_do),
+        ):
+            selected = np.asarray(values)[mask]
+            result[f'{region}_{name}_mean'] = float(np.nanmean(selected)) if selected.size else np.nan
+            result[f'{region}_{name}_median'] = float(np.nanmedian(selected)) if selected.size else np.nan
+        result[f'{region}_w_along_positive_fraction'] = float(np.mean((w_raw * 86400.0)[valid] > 0)) if np.any(valid) else np.nan
+    return result
+
+
+def _ofes_walong_fragment_complete(
+    path: Path,
+    task: Mapping[str, Any],
+) -> bool:
+    """Return whether one mapped-field fragment matches its event-day task."""
+
+    if not path.is_file():
+        return False
+    try:
+        with Dataset(path, 'r') as store:
+            required = {
+                'lon', 'lat', 'z_sigma', 'u_sigma', 'v_sigma', 'do2_sigma',
+                'crossing_count',
+            }
+            if not required.issubset(store.variables):
+                return False
+            shape = (
+                int(store.dimensions['lat'].size),
+                int(store.dimensions['lon'].size),
+            )
+            if any(
+                tuple(store.variables[name].shape) != shape
+                for name in (
+                    'z_sigma', 'u_sigma', 'v_sigma', 'do2_sigma',
+                    'crossing_count',
+                )
+            ):
+                return False
+            return (
+                str(store.getncattr('event_id')) == str(task['event_id'])
+                and str(store.getncattr('date')) == str(task['date'])
+                and np.isclose(
+                    float(store.getncattr('target_sigma0')),
+                    float(task['target_sigma0']),
+                    rtol=0.0,
+                    atol=1e-10,
+                )
+                and np.isclose(
+                    float(store.getncattr('reference_depth_m')),
+                    float(task['reference_depth_m']),
+                    rtol=0.0,
+                    atol=1e-8,
+                )
+            )
+    except (OSError, KeyError, ValueError, AttributeError):
+        return False
+
+
+def _ofes_walong_write_fragment(
+    path: Path,
+    task: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    mapped: Mapping[str, np.ndarray],
+) -> None:
+    """Write one mapped isopycnal event-day field fragment atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    with Dataset(temporary, 'w') as store:
+        store.createDimension('lat', lat.size)
+        store.createDimension('lon', lon.size)
+        store.createVariable('lat', 'f8', ('lat',))[:] = lat
+        store.createVariable('lon', 'f8', ('lon',))[:] = lon
+        for name, values in (
+            ('z_sigma', mapped['depth']),
+            ('u_sigma', mapped['u']),
+            ('v_sigma', mapped['v']),
+            ('do2_sigma', mapped['do2']),
+            ('crossing_count', mapped['crossing_count']),
+        ):
+            store.createVariable(name, 'f8', ('lat', 'lon'))[:] = np.asarray(
+                values, dtype=float
+            )
+        store.event_id = str(task['event_id'])
+        store.date = str(task['date'])
+        store.core_lon = float(task['core_lon'])
+        store.core_lat = float(task['core_lat'])
+        store.target_sigma0 = float(task['target_sigma0'])
+        store.reference_depth_m = float(task['reference_depth_m'])
+        for name in (
+            'requested_lon_bounds', 'requested_lat_bounds',
+            'loaded_lon_bounds', 'loaded_lat_bounds',
+        ):
+            store.setncattr(name, json.dumps(task[name]))
+    os.replace(temporary, path)
+
+
+def _ofes_walong_produce_fragment(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Map one OFES event-day window to its target isopycnal surface."""
+
+    path = Path(task['fields_path'])
+    if _ofes_walong_fragment_complete(path, task):
+        return {
+            'event_id': str(task['event_id']),
+            'date': str(task['date']),
+            'status': 'reused',
+        }
+    try:
+        snapshot = load_ofes_snapshot(
+            str(task['date']),
+            variables=['temp', 'salinity', 'u', 'v', 'do2'],
+            lon_bounds=tuple(task['requested_lon_bounds']),
+            lat_bounds=tuple(task['requested_lat_bounds']),
+        )
+        sigma0 = _ofes_sigma0_volume(dict(snapshot))
+        mapped = _ofes_fields_on_sigma0(
+            np.asarray(snapshot['depth'], dtype=float),
+            sigma0,
+            float(task['target_sigma0']),
+            float(task['reference_depth_m']),
+            {
+                'u': np.asarray(snapshot['u'], dtype=float),
+                'v': np.asarray(snapshot['v'], dtype=float),
+                'do2': np.asarray(snapshot['do2'], dtype=float),
+            },
+        )
+        task_with_loaded = dict(task)
+        task_with_loaded['loaded_lon_bounds'] = [
+            float(np.min(snapshot['lon'])), float(np.max(snapshot['lon'])),
+        ]
+        task_with_loaded['loaded_lat_bounds'] = [
+            float(np.min(snapshot['lat'])), float(np.max(snapshot['lat'])),
+        ]
+        _ofes_walong_write_fragment(
+            path, task_with_loaded, snapshot, mapped
+        )
+        return {
+            'event_id': str(task['event_id']),
+            'date': str(task['date']),
+            'status': 'complete',
+        }
+    except Exception as exc:
+        return {
+            'event_id': str(task['event_id']),
+            'date': str(task['date']),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+
+
+def _ofes_walong_read_fragment(path: Path) -> dict[str, Any]:
+    """Read one complete mapped-field fragment for lightweight reduction."""
+
+    with Dataset(path, 'r') as store:
+        result = {
+            'lon': np.asarray(store.variables['lon'][:], dtype=float),
+            'lat': np.asarray(store.variables['lat'][:], dtype=float),
+        }
+        for name in (
+            'z_sigma', 'u_sigma', 'v_sigma', 'do2_sigma', 'crossing_count',
+        ):
+            result[name] = np.asarray(store.variables[name][:], dtype=float)
+        for name in (
+            'requested_lon_bounds', 'requested_lat_bounds',
+            'loaded_lon_bounds', 'loaded_lat_bounds',
+        ):
+            attribute = (
+                name if name in store.ncattrs() else f'window_{name}'
+            )
+            value = store.getncattr(attribute)
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = [float(item) for item in value.split(',')]
+            result[name] = value
+    return result
+
+
+def _ofes_walong_smooth_cells(
+    association: pd.DataFrame,
+    fields_root: Path,
+    smooth_km: float,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Derive the formal and legacy-sensitivity odd smoothing widths."""
+
+    formal: dict[str, int] = {}
+    legacy: dict[str, int] = {}
+    for row in association.itertuples(index=False):
+        event_id = str(row.event_id)
+        candidates = sorted((fields_root / event_id).glob('*.nc'))
+        if not candidates:
+            formal[event_id], legacy[event_id] = 3, 5
+            continue
+        field = _ofes_walong_read_fragment(candidates[0])
+        cell_km = float(
+            np.median(
+                approximate_degree_length(field['lat'])[
+                    'meters_per_degree_lon'
+                ]
+                * np.diff(field['lon']).mean()
+            )
+            / 1000.0
+        )
+        formal[event_id] = max(
+            3, int(np.floor(float(smooth_km) / cell_km / 2.0) * 2 + 1)
+        )
+        legacy[event_id] = max(
+            3, int(round(float(smooth_km) / cell_km / 2.0) * 2 + 1)
+        )
+    return formal, legacy
+
+
+def _ofes_walong_apply_core_gate(
+    metrics: dict[str, Any],
+    minimum_fraction: float,
+) -> bool:
+    """Mask core scientific metrics below the formal availability threshold."""
+
+    availability = pd.to_numeric(
+        pd.Series([metrics.get('core_availability')]), errors='coerce'
+    ).iloc[0]
+    if pd.isna(availability) or float(availability) >= minimum_fraction:
+        return False
+    retained = {
+        'core_total_cells', 'core_available_cells', 'core_availability',
+        'core_do_availability',
+    }
+    for name in tuple(metrics):
+        if name.startswith('core_') and name not in retained:
+            metrics[name] = np.nan
+    return True
+
+
+def _ofes_walong_assemble(
+    association: pd.DataFrame,
+    fields_root: Path,
+    offsets: Mapping[str, Sequence[int]],
+    *,
+    core_radius_km: float,
+    ring_inner_km: float,
+    ring_outer_km: float,
+    smooth_cells: Mapping[str, int],
+    minimum_core_availability: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Assemble formal single, field-mean, and daily-mean w-along estimates."""
+
+    audit_rows: list[dict[str, Any]] = []
+    daily_rows: list[dict[str, Any]] = []
+    core_gated = 0
+    ring_below = 0
+    ring_clip: list[float] = []
+    for row in association.itertuples(index=False):
+        event_id = str(row.event_id)
+        peak_date = pd.Timestamp(row.peak_date).normalize()
+        event_fields: dict[pd.Timestamp, dict[str, Any]] = {}
+        daily_metrics: dict[pd.Timestamp, dict[str, Any]] = {}
+        for offset in offsets.get(event_id, []):
+            date = peak_date + pd.Timedelta(days=int(offset))
+            path = fields_root / event_id / f'{event_id}_{date:%Y%m%d}.nc'
+            if not path.is_file():
+                continue
+            field = _ofes_walong_read_fragment(path)
+            event_fields[date] = field
+            metrics = _ofes_mechanism_day_metrics(
+                field['z_sigma'], field['u_sigma'], field['v_sigma'],
+                field['do2_sigma'], field['crossing_count'],
+                field['lon'], field['lat'], float(row.core_lon),
+                float(row.core_lat), float(core_radius_km),
+                float(ring_inner_km), float(ring_outer_km),
+                int(smooth_cells[event_id]),
+            )
+            if _ofes_walong_apply_core_gate(
+                metrics, float(minimum_core_availability)
+            ):
+                core_gated += 1
+            ring_availability = pd.to_numeric(
+                pd.Series([metrics.get('ring_availability')]),
+                errors='coerce',
+            ).iloc[0]
+            if (
+                pd.notna(ring_availability)
+                and float(ring_availability) < minimum_core_availability
+            ):
+                ring_below += 1
+            daily_metrics[date] = metrics
+            requested = field['requested_lon_bounds']
+            loaded = field['loaded_lon_bounds']
+            requested_width = float(requested[1]) - float(requested[0])
+            loaded_width = float(loaded[1]) - float(loaded[0])
+            if requested_width > 0:
+                ring_clip.append(
+                    1.0 - min(requested_width, loaded_width) / requested_width
+                )
+            for region in ('core', 'ring'):
+                daily_rows.append({
+                    'event_id': event_id,
+                    'date': date,
+                    'offset_days': int(offset),
+                    'region': region,
+                    **{
+                        name: value for name, value in metrics.items()
+                        if name.startswith(f'{region}_')
+                    },
+                })
+        if not event_fields:
+            continue
+        dates = sorted(event_fields)
+        peak_metrics = daily_metrics.get(peak_date, {})
+        for region in ('core', 'ring'):
+            audit_rows.append({
+                'event_id': event_id,
+                'aggregation': 'single',
+                'region': region,
+                'day_count': int(peak_date in daily_metrics),
+                **{
+                    name: value for name, value in peak_metrics.items()
+                    if name.startswith(f'{region}_')
+                },
+            })
+
+        first = event_fields[dates[0]]
+        field_mean: dict[str, np.ndarray] = {}
+        for name in (
+            'z_sigma', 'u_sigma', 'v_sigma', 'do2_sigma', 'crossing_count',
+        ):
+            field_mean[name] = np.nanmean(
+                np.stack([event_fields[date][name] for date in dates]),
+                axis=0,
+            )
+        field_metrics = _ofes_mechanism_day_metrics(
+            field_mean['z_sigma'], field_mean['u_sigma'],
+            field_mean['v_sigma'], field_mean['do2_sigma'],
+            field_mean['crossing_count'], first['lon'], first['lat'],
+            float(row.core_lon), float(row.core_lat), float(core_radius_km),
+            float(ring_inner_km), float(ring_outer_km),
+            int(smooth_cells[event_id]),
+        )
+        for region in ('core', 'ring'):
+            audit_rows.append({
+                'event_id': event_id,
+                'aggregation': 'field_mean',
+                'region': region,
+                'day_count': int(len(dates)),
+                **{
+                    name: value for name, value in field_metrics.items()
+                    if name.startswith(f'{region}_')
+                },
+            })
+            prefix = f'{region}_'
+            keys = {
+                name for metrics in daily_metrics.values() for name in metrics
+                if name.startswith(prefix)
+            }
+            means = {}
+            for name in keys:
+                values = pd.to_numeric(
+                    pd.Series([
+                        metrics.get(name, np.nan)
+                        for metrics in daily_metrics.values()
+                    ]),
+                    errors='coerce',
+                ).to_numpy(float)
+                means[name] = (
+                    float(np.nanmean(values))
+                    if np.isfinite(values).any() else np.nan
+                )
+            audit_rows.append({
+                'event_id': event_id,
+                'aggregation': 'daily_mean',
+                'region': region,
+                'day_count': int(len(dates)),
+                **means,
+            })
+    gate = {
+        'minimum_core_availability': float(minimum_core_availability),
+        'core_below_threshold_event_days': int(core_gated),
+        'ring_below_threshold_event_days': int(ring_below),
+        'ring_clip_fraction_median': (
+            float(np.nanmedian(ring_clip)) if ring_clip else np.nan
+        ),
+    }
+    return pd.DataFrame(audit_rows), pd.DataFrame(daily_rows), gate
+
+
+def _ofes_walong_report_tests(
+    audit: pd.DataFrame,
+    *,
+    seed: int,
+    replicates: int,
+) -> dict[str, dict[str, Any]]:
+    """Calculate the formal paired and event-regime report statistics."""
+
+    from scipy.stats import mannwhitneyu, wilcoxon
+
+    def paired_bootstrap(values: np.ndarray) -> list[float] | None:
+        if values.size <= 1:
+            return None
+        rng = np.random.default_rng(int(seed))
+        indices = rng.integers(
+            0,
+            values.size,
+            size=(max(1, int(replicates)), values.size),
+        )
+        means = values[indices].mean(axis=1)
+        return [
+            float(np.percentile(means, 2.5)),
+            float(np.percentile(means, 97.5)),
+        ]
+
+    tests: dict[str, dict[str, Any]] = {}
+    group_columns = (
+        ('rotation_dominated', 'rotation_vs_strain'),
+        (
+            'resolved_downward_pathway_supported',
+            'resolved_down_vs_rest',
+        ),
+        ('resolved_upward_pathway_supported', 'resolved_up_vs_rest'),
+        ('water_mass_dominated', 'water_mass_vs_heave'),
+    )
+    for aggregation in ('single', 'field_mean', 'daily_mean'):
+        subset = audit.loc[audit['aggregation'].eq(aggregation)]
+        core = subset.loc[
+            subset['region'].eq('core'), 'core_w_along_mean'
+        ]
+        ring = subset.loc[
+            subset['region'].eq('ring'), 'ring_w_along_mean'
+        ]
+        paired = core.to_numpy(float) - ring.to_numpy(float)
+        paired = paired[np.isfinite(paired)]
+        result: dict[str, Any] = {
+            'core_ring_paired_mean_diff': float(np.nanmean(paired)),
+            'core_ring_paired_wilcoxon_p': (
+                float(wilcoxon(
+                    paired,
+                    alternative='two-sided',
+                    zero_method='wilcox',
+                ).pvalue)
+                if paired.size else np.nan
+            ),
+            'core_ring_paired_bootstrap_ci': paired_bootstrap(paired),
+            'core_w_along_pooled_median': float(np.nanmedian(
+                core.to_numpy(float)
+            )),
+            'core_w_along_pooled_max': float(np.nanmax(np.abs(
+                core.to_numpy(float)
+            ))),
+            'core_positive_fraction_pooled': float(np.nanmean(
+                (core.to_numpy(float) > 0).astype(float)
+            )),
+        }
+        for column, label in group_columns:
+            if column not in subset:
+                continue
+            true_values = core.loc[
+                subset.loc[core.index, column].eq(True)
+            ].to_numpy(float)
+            false_values = core.loc[
+                subset.loc[core.index, column].eq(False)
+            ].to_numpy(float)
+            true_finite = true_values[np.isfinite(true_values)]
+            false_finite = false_values[np.isfinite(false_values)]
+            result[f'{label}_true_n'] = int(true_finite.size)
+            result[f'{label}_false_n'] = int(false_finite.size)
+            if true_finite.size >= 2 and false_finite.size >= 2:
+                result[f'{label}_mw_p'] = float(mannwhitneyu(
+                    true_finite,
+                    false_finite,
+                    alternative='two-sided',
+                ).pvalue)
+                result[f'{label}_true_median'] = float(np.median(true_finite))
+                result[f'{label}_false_median'] = float(
+                    np.median(false_finite)
+                )
+        tests[aggregation] = result
+    return tests
+
+
+def _ofes_walong_analytic_check() -> dict[str, Any]:
+    """Verify flat and analytically tilted isopycnal test fields."""
+
+    depth = np.linspace(100.0, 600.0, 20)
+    lon = np.linspace(145.0, 145.5, 8)
+    lat = np.linspace(33.0, 33.5, 8)
+    u = np.full((20, 8, 8), 0.5)
+    v = np.full((20, 8, 8), 0.2)
+    do2 = np.full((20, 8, 8), 200.0 - depth[:, None, None] * 0.1)
+    sigma_flat = depth[:, None, None] * 0.01 + np.zeros((8, 8))[None]
+    mapped_flat = _ofes_fields_on_sigma0(
+        depth, sigma_flat, 3.0, 300.0, {'u': u, 'v': v, 'do2': do2}
+    )
+    dz_dx, dz_dy = _ofes_mechanism_gradients(
+        mapped_flat['depth'], lon, lat
+    )
+    flat = float(np.nanmax(np.abs(
+        mapped_flat['u'] * dz_dx + mapped_flat['v'] * dz_dy
+    )))
+    lon_3d = np.meshgrid(depth, lat, lon, indexing='ij')[2]
+    sigma_tilt = 0.01 * (depth[:, None, None] + 0.05 * lon_3d)
+    mapped_tilt = _ofes_fields_on_sigma0(
+        depth, sigma_tilt, 3.0, 300.0, {'u': u, 'v': v, 'do2': do2}
+    )
+    tilted_dx, _ = _ofes_mechanism_gradients(
+        mapped_tilt['depth'], lon, lat
+    )
+    expected = -0.05 / np.asarray(
+        approximate_degree_length(lat)['meters_per_degree_lon'], dtype=float
+    )[:, None]
+    relative_error = float(np.nanmax(
+        np.abs(tilted_dx - expected) / np.abs(expected)
+    ))
+    return {
+        'flat_surface_max_abs_w_along_m_s': flat,
+        'tilted_surface_mean_dz_dx': float(np.nanmean(tilted_dx)),
+        'tilted_surface_gradient_relative_error': relative_error,
+        'passed': bool(flat < 1e-9 and relative_error < 1e-6),
+    }
+
+
+def run_ofes_event_isopycnal_velocity_audit(
+    event_association_path: str | Path,
+    *,
+    trajectory_classification_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    time_window_days: int | None = None,
+    event_offsets: Mapping[str, Sequence[int]] | None = None,
+    core_radius_km: float | None = None,
+    ring_inner_km: float | None = None,
+    ring_outer_km: float | None = None,
+    window_margin_km: float | None = None,
+    smooth_km: float | None = None,
+    worker_count: int = 1,
+) -> dict:
+    """Produce event-day w-along and DO-advection diagnostics.
+
+    The producer reads the requested OFES snapshots around each event peak,
+    maps velocity and dissolved oxygen to the event target sigma surface,
+    computes core/ring along-isopycnal motion, and stores single-day,
+    field-mean, and daily-mean aggregation tables.  Existing complete output
+    with the same scientific request is returned directly.
+
+    参数:
+        - event_association_path (str | Path): event table with peak identity and depth.
+        - trajectory_classification_path (str | Path | None): optional pathway flags to join.
+        - output_dir (str | Path | None): fixed output directory override.
+        - time_window_days (int | None): symmetric peak window from configuration when omitted.
+        - event_offsets (Mapping | None): explicit event-to-offset mapping overriding the symmetric window.
+        - core_radius_km (float | None): core diagnostic radius; None uses configuration.
+        - ring_inner_km (float | None): inner ring radius; None uses configuration.
+        - ring_outer_km (float | None): outer ring radius; None uses configuration.
+        - window_margin_km (float | None): source-window margin; None uses configuration.
+        - smooth_km (float | None): horizontal smoothing scale; None uses configuration.
+        - worker_count (int): event-day fragment worker process count.
+    返回:
+        - dict: `daily_metrics`, `audit`, `summary`, `manifest`, and `run_dir`.
+    输出:
+        - `daily_metrics.parquet`, `audit.parquet`, `summary.json`, and `manifest.json`.
+    说明:
+        - 统计单位是事件；core 与 ring 使用独立 finite masks，resolved-downward
+          只作为条件子集；结果是机制诊断而非新的 SCV 身份判据。
+    """
+
+    from multiprocessing import get_context
+
+    cfg = dict(_OFES_CFG.get('w_along', {}) or {})
+    time_window = int(
+        time_window_days
+        if time_window_days is not None else cfg.get('time_window_days', 3)
+    )
+    core_radius = float(
+        core_radius_km
+        if core_radius_km is not None else cfg.get('core_radius_km', 20.0)
+    )
+    ring_inner = float(
+        ring_inner_km
+        if ring_inner_km is not None else cfg.get('ring_inner_km', 120.0)
+    )
+    ring_outer = float(
+        ring_outer_km
+        if ring_outer_km is not None else cfg.get('ring_outer_km', 240.0)
+    )
+    margin = float(
+        window_margin_km
+        if window_margin_km is not None else cfg.get('window_margin_km', 25.0)
+    )
+    smoothing = float(
+        smooth_km if smooth_km is not None else cfg.get('smooth_km', 10.0)
+    )
+    minimum_availability = float(cfg.get('core_minimum_availability', 0.8))
+    association_path = Path(event_association_path).expanduser()
+    association = _ofes_mechanism_canonical_events(
+        pd.read_parquet(association_path)
+    )
+    aliases = {
+        'peak_date': ('peak_date', 'event_peak_date', 'date'),
+        'core_lon': ('core_lon', 'peak_lon', 'peak_core_lon', 'event_lon'),
+        'core_lat': ('core_lat', 'peak_lat', 'peak_core_lat', 'event_lat'),
+        'core_depth_m': (
+            'core_depth_m', 'peak_depth_m', 'reference_depth_m'
+        ),
+    }
+    for target, names in aliases.items():
+        if target not in association:
+            source = next((name for name in names if name in association), None)
+            if source is None:
+                raise KeyError(f'Event association lacks {target}.')
+            association[target] = association[source]
+    if 'target_sigma0' not in association:
+        raise KeyError('Event association lacks target_sigma0.')
+    association['event_id'] = association['event_id'].astype(str)
+    association['peak_date'] = pd.to_datetime(
+        association['peak_date'], errors='raise'
+    ).dt.normalize()
+    if association['event_id'].duplicated().any():
+        raise ValueError('Event association contains duplicate event IDs.')
+    default_offsets = list(range(-time_window, time_window + 1))
+    offsets = {
+        event_id: [int(value) for value in (
+            event_offsets.get(event_id, default_offsets)
+            if event_offsets is not None else default_offsets
+        )]
+        for event_id in association['event_id']
+    }
+    request = {
+        'event_association_path': str(association_path),
+        'trajectory_classification_path': (
+            str(Path(trajectory_classification_path).expanduser())
+            if trajectory_classification_path is not None else None
+        ),
+        'event_offsets': offsets,
+        'core_radius_km': core_radius,
+        'ring_inner_km': ring_inner,
+        'ring_outer_km': ring_outer,
+        'window_margin_km': margin,
+        'smooth_km': smoothing,
+        'core_minimum_availability': minimum_availability,
+    }
+    normalized_request = _ofes_normalize_request_value(request)
+    root = _ofes_mechanism_output_root(
+        str(cfg.get('output_subdir', 'w_along')), output_dir
+    )
+    manifest_path = root / 'manifest.json'
+    expected_tables = (
+        'audit.parquet', 'daily_metrics.parquet', 'audit_smooth5.parquet',
+        'daily_metrics_smooth5.parquet', 'summary.json',
+    )
+    if manifest_path.is_file():
+        manifest = _ofes_surface_eddy_read_json(manifest_path)
+        if (
+            manifest.get('status') == 'complete'
+            and manifest.get('request') == normalized_request
+            and all((root / name).is_file() for name in expected_tables)
+        ):
+            return _ofes_mechanism_load_result(
+                root,
+                (
+                    'daily_metrics', 'audit', 'daily_metrics_smooth5',
+                    'audit_smooth5',
+                ),
+            )
+        if manifest.get('request') not in (None, normalized_request):
+            raise ValueError(
+                'Existing w-along output has a different scientific request; '
+                'pass a new output_dir or remove it explicitly.'
+            )
+
+    analytic = _ofes_walong_analytic_check()
+    if not analytic['passed']:
+        raise RuntimeError(f'Isopycnal analytic check failed: {analytic}')
+    root.mkdir(parents=True, exist_ok=True)
+    fields_root = root / 'fields'
+    tasks: list[dict[str, Any]] = []
+    for row in association.itertuples(index=False):
+        factors = approximate_degree_length(float(row.core_lat))
+        dx = (ring_outer + margin) * 1000.0 / float(
+            factors['meters_per_degree_lon']
+        )
+        dy = (ring_outer + margin) * 1000.0 / float(
+            factors['meters_per_degree_lat']
+        )
+        for offset in offsets[str(row.event_id)]:
+            date = pd.Timestamp(row.peak_date) + pd.Timedelta(days=offset)
+            tasks.append({
+                'event_id': str(row.event_id),
+                'date': date.strftime('%Y-%m-%d'),
+                'core_lon': float(row.core_lon),
+                'core_lat': float(row.core_lat),
+                'target_sigma0': float(row.target_sigma0),
+                'reference_depth_m': float(row.core_depth_m),
+                'requested_lon_bounds': [
+                    float(row.core_lon) - dx, float(row.core_lon) + dx,
+                ],
+                'requested_lat_bounds': [
+                    float(row.core_lat) - dy, float(row.core_lat) + dy,
+                ],
+                'fields_path': str(
+                    fields_root / str(row.event_id)
+                    / f'{row.event_id}_{date:%Y%m%d}.nc'
+                ),
+            })
+    manifest = {
+        'schema_version': 1,
+        'status': 'running',
+        'request': normalized_request,
+        'worker_count': int(worker_count),
+        'task_count': int(len(tasks)),
+    }
+    _ofes_surface_eddy_write_json(manifest_path, manifest)
+    if int(worker_count) > 1 and len(tasks) > 1:
+        with get_context('fork').Pool(
+            min(int(worker_count), len(tasks))
+        ) as pool:
+            task_results = list(pool.map(_ofes_walong_produce_fragment, tasks))
+    else:
+        task_results = [_ofes_walong_produce_fragment(task) for task in tasks]
+    errors = [row for row in task_results if row['status'] == 'error']
+    formal_cells, legacy_cells = _ofes_walong_smooth_cells(
+        association, fields_root, smoothing
+    )
+    audit, daily, gate = _ofes_walong_assemble(
+        association, fields_root, offsets,
+        core_radius_km=core_radius,
+        ring_inner_km=ring_inner,
+        ring_outer_km=ring_outer,
+        smooth_cells=formal_cells,
+        minimum_core_availability=minimum_availability,
+    )
+    audit_smooth5, daily_smooth5, _ = _ofes_walong_assemble(
+        association, fields_root, offsets,
+        core_radius_km=core_radius,
+        ring_inner_km=ring_inner,
+        ring_outer_km=ring_outer,
+        smooth_cells=legacy_cells,
+        minimum_core_availability=minimum_availability,
+    )
+    if trajectory_classification_path is not None:
+        trajectory = pd.read_parquet(
+            Path(trajectory_classification_path).expanduser()
+        ).copy()
+        trajectory['event_id'] = trajectory['event_id'].astype(str)
+        keep = ['event_id'] + [
+            name for name in (
+                'rotation_dominated', 'water_mass_dominated',
+                'resolved_downward_pathway_supported',
+                'resolved_upward_pathway_supported',
+                'resolved_vertical_pathway_supported',
+            ) if name in trajectory
+        ]
+        labels = trajectory[keep].drop_duplicates('event_id')
+        audit = audit.merge(labels, on='event_id', how='left')
+        audit_smooth5 = audit_smooth5.merge(
+            labels, on='event_id', how='left'
+        )
+    report_seed = int(cfg.get('random_seed', 20260816))
+    report_replicates = int(cfg.get('bootstrap_replicates', 10000))
+    tests = _ofes_walong_report_tests(
+        audit,
+        seed=report_seed,
+        replicates=report_replicates,
+    )
+    tests_smooth5 = _ofes_walong_report_tests(
+        audit_smooth5,
+        seed=report_seed,
+        replicates=report_replicates,
+    )
+    sensitivity = {
+        'smooth_cells': '5-cell (~15 km) legacy smoothing sensitivity',
+        'single_core_ring_paired_mean_diff': (
+            tests_smooth5['single']['core_ring_paired_mean_diff']
+        ),
+        'single_core_ring_paired_wilcoxon_p': (
+            tests_smooth5['single']['core_ring_paired_wilcoxon_p']
+        ),
+        'field_mean_resolved_down_mw_p': (
+            tests_smooth5['field_mean'].get('resolved_down_vs_rest_mw_p')
+        ),
+        'daily_mean_resolved_down_mw_p': (
+            tests_smooth5['daily_mean'].get('resolved_down_vs_rest_mw_p')
+        ),
+        'daily_mean_resolved_down_true_median': (
+            tests_smooth5['daily_mean'].get(
+                'resolved_down_vs_rest_true_median'
+            )
+        ),
+    }
+    summary = {
+        'analytic_check': analytic,
+        'event_count': int(len(association)),
+        'task_count': int(len(tasks)),
+        'task_error_count': int(len(errors)),
+        'task_errors': [row['error'] for row in errors[:20]],
+        'events_with_all_days_available': int(
+            audit.loc[
+                audit['aggregation'].eq('daily_mean')
+                & audit['region'].eq('core')
+            ].apply(
+                lambda row: int(row['day_count'])
+                == len(offsets.get(str(row['event_id']), [])),
+                axis=1,
+            ).sum()
+        ),
+        'gate_stats': gate,
+        'smooth_cells_by_event': formal_cells,
+        'sensitivity': sensitivity,
+        'tests': tests,
+        'notes': [
+            'Core event-days below 0.8 mapped-field availability are masked.',
+            'Field-mean recomputes gradients from mean mapped fields; '
+            'daily-mean averages the independently reduced event-days.',
+        ],
+    }
+    for name, frame in (
+        ('daily_metrics', daily), ('audit', audit),
+        ('daily_metrics_smooth5', daily_smooth5),
+        ('audit_smooth5', audit_smooth5),
+    ):
+        frame.to_parquet(root / f'{name}.parquet', index=False)
+    _ofes_surface_eddy_write_json(root / 'summary.json', summary)
+    manifest.update({
+        'status': 'complete' if not errors else 'partial',
+        'task_error_count': int(len(errors)),
+        'outputs': {
+            name: str(root / name) for name in expected_tables
+        },
+    })
+    _ofes_surface_eddy_write_json(manifest_path, manifest)
+    return {
+        'run_dir': root,
+        'manifest': manifest,
+        'daily_metrics': daily,
+        'audit': audit,
+        'daily_metrics_smooth5': daily_smooth5,
+        'audit_smooth5': audit_smooth5,
+        'summary': summary,
+    }
+
+
+def load_ofes_event_isopycnal_velocity_audit(output_dir: str | Path | None = None) -> dict:
+    """Load completed w-along audit tables.
+
+    参数:
+        - output_dir (str | Path | None): explicit fixed w-along directory.
+    返回:
+        - dict: daily metrics, audit, summary, and manifest.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+
+    return _ofes_mechanism_load_result(_ofes_mechanism_output_root(str((_OFES_CFG.get('w_along', {}) or {}).get('output_subdir', 'w_along')), output_dir), ('daily_metrics', 'audit'))
+
+
+def plot_ofes_event_isopycnal_velocity_audit(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """Plot core/ring w-along audit summaries.
+
+    参数:
+        - result (Mapping | None): loader result; None loads fixed output.
+        - output_dir (str | Path | None): explicit fixed directory.
+        - show_fig (bool): display the figure.
+        - save_fig (bool): overwrite the fixed PNG when True.
+    返回:
+        - dict: figure and optional figure path.
+    输出:
+        - `walong_summary.png` when `save_fig=True`。
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+
+    payload = result if result is not None else load_ofes_event_isopycnal_velocity_audit(output_dir)
+    daily = payload['daily_metrics']; fig, axis = plt.subplots(figsize=(7.0, 3.8))
+    if not daily.empty:
+        for column, label, color in (('core_w_along_mean', 'core', '#2563eb'), ('ring_w_along_mean', 'ring', '#94a3b8')):
+            if column in daily: axis.plot(pd.to_datetime(daily['date']), pd.to_numeric(daily[column], errors='coerce'), '.', label=label, color=color, alpha=0.6)
+    axis.axhline(0.0, color='0.3', linestyle='--', linewidth=0.8); axis.set_ylabel('w_along (m d⁻¹)'); axis.set_title('OFES along-isopycnal velocity'); axis.legend(frameon=False)
+    fig.tight_layout(); path = None
+    if save_fig:
+        root = _ofes_mechanism_output_root(str((_OFES_CFG.get('w_along', {}) or {}).get('output_subdir', 'w_along')), output_dir); root.mkdir(parents=True, exist_ok=True); path = root / 'walong_summary.png'; fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig: plt.show()
+    return {'figure': fig, 'figure_path': path}
+
+
+def _ofes_winter_mld_profile(
+    depth: np.ndarray,
+    sigma0: np.ndarray,
+    reference_depth_m: float,
+    threshold: float,
+) -> tuple[float, bool]:
+    """Calculate one density-threshold MLD and mark unresolved profiles."""
+
+    depth = np.asarray(depth, dtype=float)
+    sigma0 = np.asarray(sigma0, dtype=float)
+    valid = np.isfinite(depth) & np.isfinite(sigma0)
+    if np.count_nonzero(valid) < 3:
+        return np.nan, True
+    z = depth[valid]
+    density = sigma0[valid]
+    reference = int(np.nanargmin(np.abs(z - float(reference_depth_m))))
+    threshold_reached = bool(np.any(
+        (z > z[reference])
+        & (density - density[reference] >= float(threshold))
+    ))
+    value = _mld_from_sigma(
+        z, density, float(threshold), float(reference_depth_m)
+    )
+    return float(value), bool(not threshold_reached)
+
+
+def _ofes_winter_mld_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Load one event-day profile and calculate its density-threshold MLD."""
+
+    try:
+        snapshot = load_ofes_snapshot(
+            str(task['date']),
+            variables=['temp', 'salinity'],
+            lon_bounds=tuple(task['lon_bounds']),
+            lat_bounds=tuple(task['lat_bounds']),
+        )
+        lon = np.asarray(snapshot['lon'], dtype=float)
+        lat = np.asarray(snapshot['lat'], dtype=float)
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        distance = great_circle_distance_m(
+            lon_grid,
+            lat_grid,
+            float(task['core_lon']),
+            float(task['core_lat']),
+        )
+        flat = int(np.nanargmin(distance))
+        j, i = np.unravel_index(flat, distance.shape)
+        sigma0 = _ofes_sigma0_volume(dict(snapshot))[:, j, i]
+        value, capped = _ofes_winter_mld_profile(
+            np.asarray(snapshot['depth'], dtype=float),
+            sigma0,
+            float(task['reference_depth_m']),
+            float(task['density_threshold_kg_m3']),
+        )
+        return {
+            'event_id': str(task['event_id']),
+            'date': str(task['date']),
+            'mld_m': value,
+            'capped': capped,
+            'cell_distance_km': float(distance[j, i] / 1000.0),
+            'status': 'ok',
+        }
+    except Exception as exc:
+        return {
+            'event_id': str(task.get('event_id', '')),
+            'date': str(task.get('date', '')),
+            'status': 'error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+
+
+def run_ofes_event_winter_mld_audit(
+    event_association_path: str | Path,
+    *,
+    trajectory_horizon_summary_path: str | Path | None = None,
+    trajectory_classification_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    winter_start: str | pd.Timestamp | None = None,
+    winter_end: str | pd.Timestamp | None = None,
+    window_deg: float | None = None,
+    worker_count: int = 1,
+) -> dict:
+    """Produce winter mixed-layer depth diagnostics for event cores.
+
+    参数:
+        - event_association_path (str | Path): event peak identities and core depths.
+        - trajectory_horizon_summary_path (str | Path | None): optional ventilation horizon table.
+        - trajectory_classification_path (str | Path | None): optional event regime table.
+        - output_dir (str | Path | None): fixed output directory override.
+        - winter_start (str | pandas.Timestamp | None): first winter day; None uses configuration.
+        - winter_end (str | pandas.Timestamp | None): last winter day; None uses configuration.
+        - window_deg (float | None): local OFES load half-width in degrees.
+        - worker_count (int): event-day worker process count.
+    返回:
+        - dict: daily MLD, event summary, summary, manifest, and run directory.
+    输出:
+        - `winter_mld.parquet`, `event_summary.parquet`, `summary.json`, and `manifest.json`。
+    说明:
+        - MLD uses the ventilation definition: 10-m reference and 0.03 kg m⁻³ density threshold; it is a depth-scale diagnostic, not a ventilation proof.
+    """
+
+    cfg = dict(_OFES_CFG.get('winter_mld', {}) or {})
+    start = pd.Timestamp(
+        winter_start
+        if winter_start is not None else cfg.get('winter_start', '2003-01-01')
+    ).normalize()
+    end = pd.Timestamp(
+        winter_end
+        if winter_end is not None else cfg.get('winter_end', '2003-03-31')
+    ).normalize()
+    if end < start:
+        raise ValueError('winter_end precedes winter_start.')
+    half_width = float(
+        window_deg if window_deg is not None else cfg.get('window_deg', 0.05)
+    )
+    reference_depth = float(cfg.get('reference_depth_m', 10.0))
+    density_threshold = float(cfg.get('density_threshold_kg_m3', 0.03))
+    association_path = Path(event_association_path).expanduser()
+    request = {
+        'event_association_path': str(association_path),
+        'trajectory_horizon_summary_path': (
+            str(Path(trajectory_horizon_summary_path).expanduser())
+            if trajectory_horizon_summary_path is not None else None
+        ),
+        'trajectory_classification_path': (
+            str(Path(trajectory_classification_path).expanduser())
+            if trajectory_classification_path is not None else None
+        ),
+        'winter_start': start.strftime('%Y-%m-%d'),
+        'winter_end': end.strftime('%Y-%m-%d'),
+        'window_deg': half_width,
+        'reference_depth_m': reference_depth,
+        'density_threshold_kg_m3': density_threshold,
+    }
+    root = _ofes_mechanism_output_root(
+        str(cfg.get('output_subdir', 'winter_mld')), output_dir
+    )
+    manifest_path = root / 'manifest.json'
+    normalized_request = _ofes_normalize_request_value(request)
+    if manifest_path.is_file():
+        manifest = _ofes_surface_eddy_read_json(manifest_path)
+        if (
+            manifest.get('status') == 'complete'
+            and manifest.get('request') == normalized_request
+        ):
+            return _ofes_mechanism_load_result(
+                root, ('winter_mld', 'event_summary')
+            )
+        if manifest.get('request') not in (None, normalized_request):
+            raise ValueError(
+                'Existing winter MLD output has a different scientific request; '
+                'pass a new output_dir or remove it explicitly.'
+            )
+    association = _ofes_mechanism_canonical_events(
+        pd.read_parquet(association_path)
+    )
+    lon_name = next(
+        (name for name in ('core_lon', 'peak_lon', 'peak_core_lon')
+         if name in association),
+        None,
+    )
+    lat_name = next(
+        (name for name in ('core_lat', 'peak_lat', 'peak_core_lat')
+         if name in association),
+        None,
+    )
+    depth_name = next(
+        (name for name in ('core_depth_m', 'peak_depth_m', 'reference_depth_m')
+         if name in association),
+        None,
+    )
+    if lon_name is None or lat_name is None or depth_name is None:
+        raise KeyError('Event association needs core coordinates and depth.')
+    tasks: list[dict[str, Any]] = []
+    for event in association.to_dict('records'):
+        event_id = str(event['event_id'])
+        lon0 = float(event[lon_name])
+        lat0 = float(event[lat_name])
+        for date in pd.date_range(start, end, freq='D'):
+            tasks.append({
+                'event_id': event_id,
+                'date': date.strftime('%Y-%m-%d'),
+                'core_lon': lon0,
+                'core_lat': lat0,
+                'lon_bounds': (
+                    lon0 - half_width,
+                    lon0 + half_width,
+                ),
+                'lat_bounds': (
+                    lat0 - half_width,
+                    lat0 + half_width,
+                ),
+                'reference_depth_m': reference_depth,
+                'density_threshold_kg_m3': density_threshold,
+            })
+    if int(worker_count) > 1 and tasks:
+        from multiprocessing import get_context
+
+        with get_context('fork').Pool(int(worker_count)) as pool:
+            task_results = list(pool.map(_ofes_winter_mld_task, tasks))
+    else:
+        task_results = [_ofes_winter_mld_task(task) for task in tasks]
+    errors = [
+        f"{row.get('event_id')} {row.get('date')}: {row.get('error')}"
+        for row in task_results if row.get('status') == 'error'
+    ]
+    rows = [
+        {
+            'event_id': row['event_id'],
+            'date': str(row['date']),
+            'mld_m': row.get('mld_m', np.nan),
+            'capped': row.get('capped', True),
+            'cell_distance_km': row.get('cell_distance_km', np.nan),
+        }
+        for row in task_results if row.get('status') == 'ok'
+    ]
+    winter = pd.DataFrame(rows)
+    event_rows: list[dict[str, Any]] = []
+    for event in association.to_dict('records'):
+        event_id = str(event['event_id'])
+        group = winter.loc[winter['event_id'].eq(event_id)]
+        uncapped = pd.to_numeric(
+            group.loc[
+                ~group['capped'].fillna(True).astype(bool), 'mld_m'
+            ],
+            errors='coerce',
+        ).dropna()
+        core_depth = float(event[depth_name])
+        event_rows.append({
+            'event_id': event_id,
+            'core_depth_m': core_depth,
+            'winter_max_mld_m': (
+                float(uncapped.max()) if not uncapped.empty else np.nan
+            ),
+            'winter_median_mld_m': (
+                float(uncapped.median()) if not uncapped.empty else np.nan
+            ),
+            'valid_day_count': int(len(uncapped)),
+            'capped_day_count': int(
+                group['capped'].fillna(True).astype(bool).sum()
+            ),
+            'core_minus_winter_max_mld_m': (
+                core_depth - float(uncapped.max())
+                if not uncapped.empty else np.nan
+            ),
+        })
+    event_summary = pd.DataFrame(event_rows)
+    if trajectory_horizon_summary_path is not None:
+        horizon = pd.read_parquet(
+            Path(trajectory_horizon_summary_path).expanduser()
+        ).copy()
+        if {'particle_group', 'horizon_days'}.issubset(horizon.columns):
+            horizon = horizon.loc[
+                horizon['particle_group'].eq('anomaly')
+                & pd.to_numeric(horizon['horizon_days'], errors='coerce').eq(30)
+            ]
+        horizon_value = next(
+            (name for name in (
+                'median_minimum_depth_minus_mld_m',
+                'trajectory_median_min_depth_minus_mld_m',
+            ) if name in horizon),
+            None,
+        )
+        if horizon_value is not None:
+            event_summary = event_summary.merge(
+                horizon[['event_id', horizon_value]].rename(columns={
+                    horizon_value:
+                    'trajectory_median_min_depth_minus_mld_m'
+                }).drop_duplicates('event_id'),
+                on='event_id',
+                how='left',
+                validate='one_to_one',
+            )
+    if trajectory_classification_path is not None:
+        classification = pd.read_parquet(
+            Path(trajectory_classification_path).expanduser()
+        ).copy()
+        keep = ['event_id'] + [
+            name for name in (
+                'rotation_dominated',
+                'resolved_downward_pathway_supported',
+                'resolved_upward_pathway_supported',
+                'water_mass_dominated',
+            ) if name in classification
+        ]
+        event_summary = event_summary.merge(
+            classification[keep].drop_duplicates('event_id'),
+            on='event_id',
+            how='left',
+            validate='one_to_one',
+        )
+    margin_values = pd.to_numeric(
+        event_summary['core_minus_winter_max_mld_m'], errors='coerce'
+    ).dropna().to_numpy(float)
+    summary = {
+        'event_count': int(len(event_summary)),
+        'task_count': int(len(association) * len(pd.date_range(start, end))),
+        'task_error_count': int(len(errors)),
+        'task_errors': errors[:20],
+        'events_with_valid_days_ge_45': int(
+            event_summary['valid_day_count'].ge(45).sum()
+        ),
+        'winter_max_mld_m': {
+            'median': float(np.nanmedian(event_summary['winter_max_mld_m'])),
+            'p10': float(np.nanpercentile(event_summary['winter_max_mld_m'], 10)),
+            'p90': float(np.nanpercentile(event_summary['winter_max_mld_m'], 90)),
+        },
+        'core_minus_winter_max_mld_m': {
+            'median': (
+                float(np.nanmedian(margin_values))
+                if margin_values.size else np.nan
+            ),
+            'min': float(np.nanmin(margin_values)) if margin_values.size else np.nan,
+            'max': float(np.nanmax(margin_values)) if margin_values.size else np.nan,
+            'negative_count': int(np.count_nonzero(margin_values < 0)),
+        },
+        'regime_medians': {
+            column: {
+                'true': float(np.nanmedian(pd.to_numeric(
+                    event_summary.loc[
+                        event_summary[column].eq(True),
+                        'core_minus_winter_max_mld_m',
+                    ],
+                    errors='coerce',
+                ))),
+                'false': float(np.nanmedian(pd.to_numeric(
+                    event_summary.loc[
+                        event_summary[column].eq(False),
+                        'core_minus_winter_max_mld_m',
+                    ],
+                    errors='coerce',
+                ))),
+            }
+            for column in (
+                'rotation_dominated',
+                'resolved_downward_pathway_supported',
+                'resolved_upward_pathway_supported',
+                'water_mass_dominated',
+            )
+            if column in event_summary
+        },
+        'trajectory_reachability': {
+            'events_with_trajectory_min_reached': int(pd.to_numeric(
+                event_summary.get(
+                    'trajectory_median_min_depth_minus_mld_m',
+                    pd.Series(dtype=float),
+                ),
+                errors='coerce',
+            ).le(0.0).sum()),
+            'events_with_trajectory_value': int(pd.to_numeric(
+                event_summary.get(
+                    'trajectory_median_min_depth_minus_mld_m',
+                    pd.Series(dtype=float),
+                ),
+                errors='coerce',
+            ).notna().sum()),
+        },
+        'reference_depth_m': reference_depth,
+        'density_threshold_kg_m3': density_threshold,
+        'notes': [
+            'Profiles that never reach the density threshold are capped and '
+            'excluded from event-level winter maximum and median MLD.',
+        ],
+    }
+    return _ofes_mechanism_write_result(
+        root,
+        {'winter_mld': winter, 'event_summary': event_summary},
+        summary,
+        request,
+    )
+
+
+def load_ofes_event_winter_mld_audit(output_dir: str | Path | None = None) -> dict:
+    """Load completed winter MLD diagnostic tables.
+
+    参数:
+        - output_dir (str | Path | None): explicit fixed winter MLD directory.
+    返回:
+        - dict: winter MLD table, event summary, summary, and manifest.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+
+    return _ofes_mechanism_load_result(_ofes_mechanism_output_root(str((_OFES_CFG.get('winter_mld', {}) or {}).get('output_subdir', 'winter_mld')), output_dir), ('winter_mld', 'event_summary'))
+
+
+def plot_ofes_event_winter_mld_audit(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """Plot event core depth against winter MLD.
+
+    参数:
+        - result (Mapping | None): loader result; None loads fixed output.
+        - output_dir (str | Path | None): explicit fixed directory.
+        - show_fig (bool): display the figure.
+        - save_fig (bool): overwrite the fixed PNG when True.
+    返回:
+        - dict: figure and optional figure path.
+    输出:
+        - `winter_mld_summary.png` when `save_fig=True`。
+    说明:
+        - 不访问 OFES 原始场、不重新运行生产步骤。
+    """
+
+    payload = result if result is not None else load_ofes_event_winter_mld_audit(output_dir); frame = payload['event_summary']; fig, axis = plt.subplots(figsize=(5.8, 4.2));
+    if not frame.empty: axis.scatter(frame['winter_max_mld_m'], frame['core_depth_m'], color='#2563eb', alpha=0.75); lim = [0, float(np.nanmax([frame['winter_max_mld_m'].max(), frame['core_depth_m'].max()])) * 1.05]; axis.plot(lim, lim, '--', color='0.4')
+    axis.set_xlabel('Winter maximum MLD (m)'); axis.set_ylabel('Event core depth (m)'); axis.set_title('OFES winter MLD depth audit'); axis.invert_yaxis(); fig.tight_layout(); path = None
+    if save_fig: root = _ofes_mechanism_output_root(str((_OFES_CFG.get('winter_mld', {}) or {}).get('output_subdir', 'winter_mld')), output_dir); root.mkdir(parents=True, exist_ok=True); path = root / 'winter_mld_summary.png'; fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig: plt.show()
+    return {'figure': fig, 'figure_path': path}
+
+
+def _ofes_mechanism_canonical_events(frame: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize event IDs and peak identities for mechanism reducers."""
+
+    result = frame.copy()
+    if 'event_id' not in result:
+        raise KeyError('event table lacks event_id')
+    result['event_id'] = result['event_id'].astype(str)
+    if 'threshold' in result:
+        threshold = pd.to_numeric(result['threshold'], errors='coerce')
+        result = result.loc[np.isclose(
+            threshold, 50.0, equal_nan=False
+        )].copy()
+    if 'population_diagnostic_passed' in result:
+        result = result.loc[
+            result['population_diagnostic_passed']
+            .map(_ofes_surface_eddy_bool)
+            .eq(True)
+        ].copy()
+    aliases = {
+        'peak_date': ('peak_date', 'event_peak_date', 'date'),
+        'peak_lon': ('peak_lon', 'peak_core_lon', 'core_lon', 'lon'),
+        'peak_lat': ('peak_lat', 'peak_core_lat', 'core_lat', 'lat'),
+        'core_depth_m': (
+            'core_depth_m', 'reference_depth_m', 'peak_depth_m'
+        ),
+    }
+    for target, names in aliases.items():
+        if target not in result:
+            source = next((name for name in names if name in result), None)
+            if source is not None:
+                result[target] = result[source]
+    if 'peak_date' in result:
+        result['peak_date'] = pd.to_datetime(
+            result['peak_date'], errors='coerce'
+        ).dt.normalize()
+    return result
+
+
+def _ofes_mechanism_load_event_sources(
+    event_association_path: str | Path,
+    lifecycle_path: str | Path | None,
+    lifecycle_summary_path: str | Path | None,
+    trajectory_classification_path: str | Path | None,
+    stage_bridge_path: str | Path | None,
+    fixed_water_mass_path: str | Path | None,
+    moving_water_mass_path: str | Path | None,
+    mccoy_path: str | Path | None = None,
+    walong_path: str | Path | None = None,
+    ventilation_path: str | Path | None = None,
+    tracer_daily_path: str | Path | None = None,
+    tracer_event_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Load only explicitly supplied upstream mechanism tables."""
+
+    association = _ofes_mechanism_canonical_events(pd.read_parquet(Path(event_association_path).expanduser()))
+    sources: dict[str, pd.DataFrame] = {}
+    for key, path, names in (
+        ('lifecycle', lifecycle_path, ('lifecycle_daily_diagnostics.parquet', 'lifecycle_event_summary.parquet')),
+        ('lifecycle_summary', lifecycle_summary_path, ('lifecycle_event_summary.parquet',)),
+        ('trajectory', trajectory_classification_path, ('population_classification.parquet', 'trajectory3d_population_classification.parquet')),
+        ('stage', stage_bridge_path, ('stage_diagnostics.parquet', 'stage_bridge.parquet')),
+        ('fixed_water', fixed_water_mass_path, ('event_summary.parquet', 'daily_water_mass.parquet')),
+        ('moving_water', moving_water_mass_path, ('event_summary.parquet', 'daily_water_mass.parquet')),
+        ('mccoy_event', mccoy_path, ('event_summary.parquet',)),
+        ('walong', walong_path, ('audit.parquet', 'daily_metrics.parquet')),
+        ('ventilation_daily', ventilation_path, ('daily_ventilation_diagnostics.parquet', 'daily_diagnostics.parquet')),
+        ('tracer_daily', tracer_daily_path, ('daily_tracer_summary.parquet',)),
+        ('tracer_event', tracer_event_path, ('event_tracer_summary.parquet', 'event_summary.parquet')),
+    ):
+        if path is not None: sources[key] = _ofes_mechanism_canonical_events(_ofes_mechanism_read_optional(path, names))
+    return association, sources
+
+
+def _ofes_mechanism_bootstrap_median_difference(
+    true_values: np.ndarray,
+    false_values: np.ndarray,
+    *,
+    seed: int,
+    replicates: int,
+) -> dict[str, Any] | None:
+    """Return an event-level median difference and percentile interval."""
+
+    a = np.asarray(true_values, dtype=float)
+    b = np.asarray(false_values, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if a.size == 0 or b.size == 0:
+        return None
+    rng = np.random.default_rng(int(seed))
+    n_reps = max(1, int(replicates))
+    sample_a = a[rng.integers(0, a.size, size=(n_reps, a.size))]
+    sample_b = b[rng.integers(0, b.size, size=(n_reps, b.size))]
+    difference = np.median(sample_a, axis=1) - np.median(sample_b, axis=1)
+    return {
+        'n_true': int(a.size),
+        'n_false': int(b.size),
+        'median_true': float(np.median(a)),
+        'median_false': float(np.median(b)),
+        'median_difference': float(np.median(a) - np.median(b)),
+        'bootstrap_ci_95': [
+            float(np.percentile(difference, 2.5)),
+            float(np.percentile(difference, 97.5)),
+        ],
+    }
+
+
+def _ofes_mechanism_series(frame: pd.DataFrame, names: Sequence[str]) -> pd.Series:
+    """Select the first available numeric response column from a table."""
+
+    for name in names:
+        if name in frame.columns:
+            return pd.to_numeric(frame[name], errors='coerce')
+    return pd.Series(np.nan, index=frame.index, dtype=float)
+
+
+def _ofes_mechanism_merge_event_table(
+    daily: pd.DataFrame,
+    source: pd.DataFrame | None,
+    *,
+    name: str,
+) -> pd.DataFrame:
+    """Join an optional event/day table without creating duplicate rows."""
+
+    if source is None or source.empty or 'event_id' not in source.columns:
+        return daily
+    source = source.copy()
+    source['event_id'] = source['event_id'].astype(str)
+    keys = ['event_id']
+    if 'date' in daily.columns and 'date' in source.columns:
+        source['date'] = pd.to_datetime(source['date'], errors='coerce').dt.normalize()
+        if source.duplicated(['event_id', 'date']).any():
+            source = source.sort_values(['event_id', 'date'], kind='mergesort').drop_duplicates(['event_id', 'date'], keep='last')
+        keys = ['event_id', 'date']
+    else:
+        source = source.drop_duplicates('event_id', keep='last')
+    columns = [column for column in source.columns if column not in keys]
+    rename = {column: f'{name}_{column}' for column in columns if column in daily.columns}
+    source = source.rename(columns=rename)
+    return daily.merge(source[keys + [column for column in source.columns if column not in keys]], on=keys, how='left', validate='many_to_one')
+
+
+def _ofes_mechanism_group_comparison(
+    frame: pd.DataFrame,
+    label: str,
+    response_columns: Sequence[str],
+    *,
+    seed: int,
+    replicates: int,
+) -> dict[str, Any]:
+    """Summarize one carrier/non-carrier comparison without a sample-size gate."""
+
+    response = _ofes_mechanism_series(frame, response_columns)
+    carrier = frame[label].fillna(False).astype(bool) if label in frame else pd.Series(False, index=frame.index)
+    valid = response.notna()
+    result: dict[str, Any] = {
+        'response': next((name for name in response_columns if name in frame.columns), None),
+        'n_usable': int(valid.sum()),
+        'n_missing': int((~valid).sum()),
+        'carrier_n': int((carrier & valid).sum()),
+        'noncarrier_n': int((~carrier & valid).sum()),
+    }
+    difference = _ofes_mechanism_bootstrap_median_difference(
+        response.loc[carrier & valid].to_numpy(float),
+        response.loc[(~carrier) & valid].to_numpy(float),
+        seed=seed,
+        replicates=replicates,
+    )
+    result['comparison'] = difference
+    return result
+
+
+def _ofes_mechanism_ols(
+    names: Sequence[str],
+    response: np.ndarray,
+    predictors: np.ndarray,
+) -> dict[str, Any]:
+    """Fit the formal small OLS robustness model and return coefficients."""
+
+    from scipy.stats import t as t_dist
+
+    design = np.column_stack([
+        np.ones(len(response), dtype=float),
+        np.asarray(predictors, dtype=float),
+    ])
+    response = np.asarray(response, dtype=float)
+    beta, _, _, _ = np.linalg.lstsq(design, response, rcond=None)
+    residual = response - design @ beta
+    n, parameter_count = design.shape
+    degrees_of_freedom = n - parameter_count
+    variance = (
+        float((residual @ residual) / degrees_of_freedom)
+        if degrees_of_freedom > 0 else np.nan
+    )
+    covariance = variance * np.linalg.inv(design.T @ design)
+    standard_error = np.sqrt(np.diag(covariance))
+    t_values = beta / standard_error
+    p_values = 2.0 * (
+        1.0 - t_dist.cdf(np.abs(t_values), degrees_of_freedom)
+    )
+    result: dict[str, Any] = {
+        'intercept': {
+            'beta': float(beta[0]),
+            'se': float(standard_error[0]),
+            'p': float(p_values[0]),
+        }
+    }
+    for index, name in enumerate(names, start=1):
+        result[str(name)] = {
+            'beta': float(beta[index]),
+            'se': float(standard_error[index]),
+            'p': float(p_values[index]),
+        }
+    result['n'] = int(n)
+    return result
+
+
+def run_ofes_event_mechanism_transition_audit(
+    event_association_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    lifecycle_path: str | Path | None = None,
+    lifecycle_summary_path: str | Path | None = None,
+    trajectory_classification_path: str | Path | None = None,
+    stage_bridge_path: str | Path | None = None,
+    fixed_water_mass_path: str | Path | None = None,
+    moving_water_mass_path: str | Path | None = None,
+    mccoy_path: str | Path | None = None,
+    walong_path: str | Path | None = None,
+    ventilation_path: str | Path | None = None,
+    tracer_daily_path: str | Path | None = None,
+    tracer_event_path: str | Path | None = None,
+) -> dict:
+    """Reduce formation, organization, lag, and retention diagnostics.
+
+    The reducer consumes completed lifecycle, trajectory, McCoy-stage,
+    water-mass, ventilation, and w-along products.  It does not read raw OFES
+    fields or rerun any upstream classifier.
+
+    参数:
+        - event_association_path (str | Path): authoritative event identities.
+        - output_dir (str | Path | None): fixed synthesis output directory.
+        - lifecycle_path (str | Path | None): explicit daily lifecycle table.
+        - lifecycle_summary_path (str | Path | None): explicit event lifecycle table.
+        - trajectory_classification_path (str | Path | None): explicit trajectory classification table.
+        - stage_bridge_path (str | Path | None): explicit McCoy stage table.
+        - fixed_water_mass_path (str | Path | None): explicit fixed-site water-mass summary.
+        - moving_water_mass_path (str | Path | None): explicit moving-core water-mass summary.
+        - mccoy_path (str | Path | None): optional McCoy event summary.
+        - walong_path (str | Path | None): optional w-along result directory.
+        - ventilation_path (str | Path | None): optional daily ventilation result directory.
+        - tracer_daily_path (str | Path | None): optional trajectory tracer daily table.
+        - tracer_event_path (str | Path | None): optional trajectory tracer event table.
+    返回:
+        - dict: daily mechanism, transition, retention, lag, summary, and manifest.
+    输出:
+        - `daily_event_mechanism.parquet`, `phase_transition_table.parquet`, `retention_comparison.parquet`, `event_lag_diagnostics.parquet`, `summary.json`, and `manifest.json`。
+    说明:
+        - 统计单位是事件；DO 是响应变量。formation、organization 与 retention 是同一事件链上的相关诊断，不宣称相互独立或因果。
+    """
+
+    cfg = dict(_OFES_CFG.get('mechanism_synthesis', {}) or {})
+    root = _ofes_mechanism_output_root(
+        str(cfg.get('output_subdir', 'mechanism_synthesis')), output_dir
+    )
+    request = {
+        'event_association_path': str(Path(event_association_path).expanduser()),
+        'lifecycle_path': str(lifecycle_path) if lifecycle_path is not None else None,
+        'lifecycle_summary_path': str(lifecycle_summary_path) if lifecycle_summary_path is not None else None,
+        'trajectory_classification_path': str(trajectory_classification_path) if trajectory_classification_path is not None else None,
+        'stage_bridge_path': str(stage_bridge_path) if stage_bridge_path is not None else None,
+        'fixed_water_mass_path': str(fixed_water_mass_path) if fixed_water_mass_path is not None else None,
+        'moving_water_mass_path': str(moving_water_mass_path) if moving_water_mass_path is not None else None,
+        'mccoy_path': str(mccoy_path) if mccoy_path is not None else None,
+        'walong_path': str(walong_path) if walong_path is not None else None,
+        'ventilation_path': str(ventilation_path) if ventilation_path is not None else None,
+        'tracer_daily_path': str(tracer_daily_path) if tracer_daily_path is not None else None,
+        'tracer_event_path': str(tracer_event_path) if tracer_event_path is not None else None,
+    }
+    manifest_path = root / 'manifest.json'
+    normalized_request = _ofes_normalize_request_value(request)
+    if manifest_path.is_file():
+        manifest = _ofes_surface_eddy_read_json(manifest_path)
+        if manifest.get('status') == 'complete' and manifest.get('request') == normalized_request:
+            return _ofes_mechanism_load_result(
+                root,
+                ('daily_event_mechanism', 'phase_transition_table',
+                 'retention_comparison', 'retention_group_comparison',
+                 'event_lag_diagnostics'),
+            )
+        if manifest.get('request') not in (None, normalized_request):
+            raise ValueError(
+                'Existing mechanism synthesis has a different scientific request; '
+                'pass a new output_dir or remove it explicitly.'
+            )
+
+    association, sources = _ofes_mechanism_load_event_sources(
+        event_association_path, lifecycle_path, lifecycle_summary_path,
+        trajectory_classification_path,
+        stage_bridge_path, fixed_water_mass_path, moving_water_mass_path,
+        mccoy_path, walong_path, ventilation_path, tracer_daily_path,
+        tracer_event_path,
+    )
+    event_ids = association['event_id'].astype(str).drop_duplicates().tolist()
+    if len(event_ids) != len(association):
+        raise ValueError('event association contains duplicate event IDs')
+    lifecycle = sources.get('lifecycle')
+    if lifecycle is None:
+        daily = association.copy()
+        daily['date'] = daily.get('peak_date', pd.NaT)
+        daily['is_peak'] = True
+    else:
+        daily = lifecycle.copy()
+        daily['event_id'] = daily['event_id'].astype(str)
+        if 'date' not in daily.columns:
+            date_name = next((name for name in ('day', 'diagnostic_date', 'peak_date') if name in daily.columns), None)
+            daily['date'] = daily[date_name] if date_name else pd.NaT
+        daily['date'] = pd.to_datetime(daily['date'], errors='coerce').dt.normalize()
+        daily = daily.loc[daily['event_id'].isin(event_ids)].copy()
+        if daily.empty:
+            raise ValueError('lifecycle output contains no requested event IDs')
+        if 'is_peak' not in daily.columns:
+            if 'is_event_peak_day' in daily.columns:
+                daily['is_peak'] = daily['is_event_peak_day'].fillna(False).astype(bool)
+            elif 'peak_date' in daily.columns:
+                daily['is_peak'] = daily['date'].eq(pd.to_datetime(daily['peak_date'], errors='coerce').dt.normalize())
+            else:
+                daily['is_peak'] = False
+        if not daily.groupby('event_id')['is_peak'].sum().ge(1).all():
+            daily['is_peak'] = daily.groupby('event_id')['date'].transform(lambda values: values.eq(values.iloc[len(values) // 2]))
+
+    association_columns = ['event_id'] + [
+        name for name in (
+            'span_days', 'water_mass_dominated',
+            'water_mass_absolute_fraction', 'core_depth_m',
+            'target_sigma0',
+        ) if name in association and name not in daily
+    ]
+    if len(association_columns) > 1:
+        daily = daily.merge(
+            association[association_columns],
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+    daily['date'] = pd.to_datetime(daily['date'], errors='coerce').dt.normalize()
+    bounds = daily.groupby('event_id')['date'].agg(
+        start_date_derived='min', end_date_derived='max'
+    )
+    daily = daily.merge(bounds, on='event_id', how='left', suffixes=('', '_existing'))
+    for name in ('start_date', 'end_date'):
+        derived = f'{name}_derived'
+        existing = f'{name}_existing'
+        if name in daily.columns:
+            values = pd.to_datetime(daily[name], errors='coerce')
+        elif existing in daily.columns:
+            values = pd.to_datetime(daily[existing], errors='coerce')
+        else:
+            values = pd.Series(pd.NaT, index=daily.index)
+        daily[name] = values.fillna(pd.to_datetime(daily[derived], errors='coerce'))
+    daily = daily.drop(columns=['start_date_derived', 'end_date_derived', 'start_date_existing', 'end_date_existing'], errors='ignore')
+    span = (daily['end_date'] - daily['start_date']).dt.days.clip(lower=1)
+    daily['days_from_start'] = (daily['date'] - daily['start_date']).dt.days
+    peak_dates = daily.loc[daily['is_peak']].groupby('event_id')['date'].first()
+    daily['peak_date'] = daily['event_id'].map(peak_dates)
+    daily['days_from_peak'] = (daily['date'] - daily['peak_date']).dt.days
+    if 'span_days' not in daily:
+        daily['span_days'] = span
+    daily['phase_norm'] = daily['days_from_start'] / pd.to_numeric(
+        daily['span_days'], errors='coerce'
+    ).clip(lower=1)
+    daily['is_start'] = daily['days_from_start'].eq(0)
+    daily['is_end'] = daily['date'].eq(daily['end_date'])
+    if 'depth_mean' in daily:
+        deep_entry = (
+            daily.loc[pd.to_numeric(
+                daily['depth_mean'], errors='coerce'
+            ).ge(500.0)]
+            .groupby('event_id')['date']
+            .min()
+            .rename('deep_entry_date')
+        )
+        daily = daily.merge(
+            deep_entry,
+            on='event_id',
+            how='left',
+            validate='many_to_one',
+        )
+        daily['is_deep_entry'] = daily['date'].eq(
+            daily['deep_entry_date']
+        )
+    if 'phase' not in daily.columns:
+        fraction = daily['days_from_start'] / span
+        daily['phase'] = np.select([fraction < 1 / 3, fraction > 2 / 3], ['formation', 'retention'], default='organization')
+    if 'rotation_dominated' not in daily.columns:
+        candidate = next((name for name in ('population_peak_rotation_dominated', 'persistent_anticyclonic_rotational_carrier', 'rotation') if name in daily.columns), None)
+        daily['rotation_dominated'] = daily[candidate].fillna(False).astype(bool) if candidate else False
+    else:
+        daily['rotation_dominated'] = daily['rotation_dominated'].fillna(False).astype(bool)
+    if 'r_share' not in daily.columns and {'rossby_number', 'normalized_strain'}.issubset(daily.columns):
+        denominator = daily['rossby_number'].abs() + daily['normalized_strain'].abs()
+        daily['r_share'] = np.where(denominator > 0, daily['rossby_number'].abs() / denominator, np.nan)
+    if 'strain_dominated' not in daily.columns:
+        daily['strain_dominated'] = (~daily['rotation_dominated']) & daily.get('normalized_strain', pd.Series(np.nan, index=daily.index)).notna()
+    if 'bbox_aspect_ratio' not in daily.columns and {
+        'lon_min', 'lon_max', 'lat_min', 'lat_max', 'centroid_lat'
+    }.issubset(daily.columns):
+        degree_scale = approximate_degree_length(
+            pd.to_numeric(daily['centroid_lat'], errors='coerce').to_numpy(float)
+        )
+        lon_span = (
+            pd.to_numeric(daily['lon_max'], errors='coerce')
+            - pd.to_numeric(daily['lon_min'], errors='coerce')
+        ) * np.asarray(degree_scale['meters_per_degree_lon'], dtype=float)
+        lat_span = (
+            pd.to_numeric(daily['lat_max'], errors='coerce')
+            - pd.to_numeric(daily['lat_min'], errors='coerce')
+        ) * np.asarray(degree_scale['meters_per_degree_lat'], dtype=float)
+        daily['bbox_aspect_ratio'] = lat_span / np.maximum(lon_span, 1e-6)
+    daily['daily_class'] = np.where(
+        daily['rotation_dominated'],
+        'rotation',
+        np.where(daily['strain_dominated'], 'strain', 'unclassified'),
+    )
+    daily = _ofes_mechanism_merge_event_table(
+        daily, sources.get('lifecycle_summary'), name='lifecycle_summary'
+    )
+    daily = _ofes_mechanism_merge_event_table(daily, sources.get('trajectory'), name='trajectory')
+    daily = _ofes_mechanism_merge_event_table(daily, sources.get('stage'), name='stage')
+    daily = _ofes_mechanism_merge_event_table(daily, sources.get('fixed_water'), name='fixed_water')
+    daily = _ofes_mechanism_merge_event_table(daily, sources.get('moving_water'), name='moving_water')
+    daily = _ofes_mechanism_merge_event_table(
+        daily, sources.get('mccoy_event'), name='mccoy_event'
+    )
+    daily = _ofes_mechanism_merge_event_table(
+        daily, sources.get('tracer_event'), name='tracer_event'
+    )
+    tracer_daily = sources.get('tracer_daily')
+    if tracer_daily is not None:
+        tracer_daily = tracer_daily.copy()
+        tracer_daily['date'] = pd.to_datetime(
+            tracer_daily['date'], errors='coerce'
+        ).dt.normalize()
+        if 'integration_label' in tracer_daily:
+            tracer_daily = tracer_daily.loc[
+                tracer_daily['integration_label'].eq(
+                    'forward_observed_start_to_peak'
+                )
+            ]
+        tracer_columns = [
+            name for name in (
+                'active_fraction', 'ensemble_centroid_depth_m'
+            ) if name in tracer_daily
+        ]
+        daily = daily.merge(
+            tracer_daily[
+                ['event_id', 'date', *tracer_columns]
+            ].rename(columns={
+                'active_fraction': 'trajectory_active_fraction',
+                'ensemble_centroid_depth_m':
+                'trajectory_centroid_depth_m',
+            }),
+            on=['event_id', 'date'],
+            how='left',
+            validate='one_to_one',
+        )
+    ventilation_daily = sources.get('ventilation_daily')
+    if ventilation_daily is not None:
+        ventilation_daily = ventilation_daily.copy()
+        required = {
+            'event_id', 'date', 'particle_id', 'particle_group',
+            'direct_mld_contact', 'near_mld_contact',
+            'isopycnal_outcrop_opportunity',
+        }
+        missing = sorted(required.difference(ventilation_daily.columns))
+        if missing:
+            raise KeyError(
+                f'daily ventilation table lacks required columns: {missing}'
+            )
+        ventilation_daily['date'] = pd.to_datetime(
+            ventilation_daily['date'], errors='coerce'
+        ).dt.normalize()
+        anomaly = ventilation_daily.loc[
+            ventilation_daily['particle_group'].eq('anomaly')
+        ]
+        ventilation_by_day = (
+            anomaly.groupby(['event_id', 'date'])
+            .agg(
+                vent_particle_count=('particle_id', 'count'),
+                direct_mld_contact_fraction=(
+                    'direct_mld_contact', 'mean'
+                ),
+                near_mld_contact_fraction=(
+                    'near_mld_contact', 'mean'
+                ),
+                outcrop_opportunity_fraction=(
+                    'isopycnal_outcrop_opportunity', 'mean'
+                ),
+            )
+            .reset_index()
+        )
+        daily = daily.merge(
+            ventilation_by_day,
+            on=['event_id', 'date'],
+            how='left',
+            validate='one_to_one',
+        )
+
+    transition_rows: list[dict[str, Any]] = []
+    retention_rows: list[dict[str, Any]] = []
+    lag_rows: list[dict[str, Any]] = []
+
+    def _first_value(
+        row: Mapping[str, Any], names: Sequence[str], default: Any = np.nan
+    ) -> Any:
+        for name in names:
+            if name in row and not pd.isna(row[name]):
+                return row[name]
+        return default
+
+    def _best_lag(x: np.ndarray, y: np.ndarray, maximum: int) -> float:
+        best_correlation = -2.0
+        best_lag = np.nan
+        for offset in range(-int(maximum), int(maximum) + 1):
+            x_shift = x[max(0, -offset): x.size - max(0, offset)]
+            y_shift = y[max(0, offset): y.size - max(0, -offset)]
+            valid = np.isfinite(x_shift) & np.isfinite(y_shift)
+            if np.count_nonzero(valid) < int(cfg.get('minimum_lag_pairs', 7)):
+                continue
+            correlation = float(np.corrcoef(
+                x_shift[valid], y_shift[valid]
+            )[0, 1])
+            if np.isfinite(correlation) and correlation > best_correlation:
+                best_correlation = correlation
+                best_lag = float(offset)
+        return best_lag
+
+    for event_id, group in daily.groupby('event_id', sort=False):
+        ordered = group.sort_values('date', kind='mergesort').reset_index(drop=True)
+        early = ordered.head(3)
+        late = ordered.tail(3)
+        peak_rows = ordered.loc[ordered['is_peak'].astype(bool)]
+        peak_row = peak_rows.iloc[0] if len(peak_rows) else ordered.iloc[len(ordered) // 2]
+
+        def _phase_class(frame: pd.DataFrame) -> str:
+            if frame.empty:
+                return 'missing'
+            mode = frame['daily_class'].mode()
+            return str(mode.iloc[0]) if len(mode) else 'missing'
+
+        early_class, peak_class, late_class = _phase_class(early), _phase_class(peak_rows), _phase_class(late)
+        start_row = ordered.iloc[0]
+        base_rows = association.loc[association['event_id'].eq(str(event_id))]
+        base = base_rows.iloc[0].to_dict() if len(base_rows) else {}
+        carrier = bool(_ofes_surface_eddy_bool(_first_value(
+            peak_row,
+            (
+                'persistent_anticyclonic_rotational_carrier',
+                'lifecycle_summary_persistent_anticyclonic_rotational_carrier',
+                'persistent_carrier',
+            ),
+            False,
+        )) is True)
+        peak_rotation = bool(_ofes_surface_eddy_bool(_first_value(
+            peak_row,
+            ('population_peak_rotation_dominated', 'rotation_dominated'),
+            False,
+        )) is True)
+        transition_rows.append({
+            'event_id': str(event_id), 'early_class': early_class,
+            'peak_class': peak_class, 'late_class': late_class,
+            'transition': f'{early_class}->{late_class}',
+            'n_days': int(len(ordered)),
+            'resolved_downward': bool(_ofes_surface_eddy_bool(peak_row.get('resolved_downward_pathway_supported', peak_row.get('trajectory_resolved_downward_pathway_supported', False))) is True),
+            'start_date': ordered.iloc[0]['date'], 'peak_date': peak_row['date'], 'last_date': ordered.iloc[-1]['date'],
+            'delta_r_share_start_to_peak': (
+                float(peak_row['r_share'] - start_row['r_share'])
+                if pd.notna(peak_row.get('r_share'))
+                and pd.notna(start_row.get('r_share')) else np.nan
+            ),
+            'delta_normalized_strain_start_to_peak': (
+                float(
+                    peak_row['normalized_strain']
+                    - start_row['normalized_strain']
+                )
+                if pd.notna(peak_row.get('normalized_strain'))
+                and pd.notna(start_row.get('normalized_strain')) else np.nan
+            ),
+            'delta_bbox_aspect_start_to_peak': (
+                float(
+                    peak_row['bbox_aspect_ratio']
+                    - start_row['bbox_aspect_ratio']
+                )
+                if pd.notna(peak_row.get('bbox_aspect_ratio'))
+                and pd.notna(start_row.get('bbox_aspect_ratio')) else np.nan
+            ),
+            'delta_do_start_to_peak': (
+                float(peak_row['delta_do_max'] - start_row['delta_do_max'])
+                if pd.notna(peak_row.get('delta_do_max'))
+                and pd.notna(start_row.get('delta_do_max')) else np.nan
+            ),
+            'persistent_carrier': carrier,
+            'scv_compatible': bool(_ofes_surface_eddy_bool(_first_value(
+                peak_row,
+                ('scv_compatible', 'lifecycle_summary_scv_compatible'),
+                False,
+            )) is True),
+            'mccoy_any_compatible': bool(_ofes_surface_eddy_bool(_first_value(
+                peak_row,
+                ('any_event_profile_mccoy_compatible',
+                 'mccoy_event_any_event_profile_mccoy_compatible',
+                 'stage_any_event_profile_mccoy_compatible'),
+                False,
+            )) is True),
+        })
+        response = _ofes_mechanism_series(
+            ordered, ('delta_do_max', 'delta_do')
+        )
+        finite_response = response.notna()
+        response_peak = (
+            float(response.loc[ordered['is_peak'] & response.notna()].iloc[0])
+            if (ordered['is_peak'] & response.notna()).any() else np.nan
+        )
+        post = ordered.loc[(ordered['date'] > peak_row['date']) & response.notna()].copy()
+        post_values = response.loc[post.index].to_numpy(float)
+        slope = np.nan
+        half_time = np.nan
+        auc = np.nan
+        if (
+            np.isfinite(response_peak)
+            and response_peak > 0
+            and post_values.size >= 2
+        ):
+            x_post = (
+                pd.to_datetime(post['date']) - pd.Timestamp(peak_row['date'])
+            ).dt.days.to_numpy(float)
+            normalized_post = post_values / response_peak
+            valid_post = np.isfinite(normalized_post)
+            if np.count_nonzero(valid_post) >= 2:
+                slope = float(np.polyfit(
+                    x_post[valid_post], normalized_post[valid_post], 1
+                )[0])
+            below = post.loc[post_values < 0.5 * response_peak]
+            if len(below):
+                half_time = float((pd.Timestamp(below.iloc[0]['date']) - pd.Timestamp(peak_row['date'])).days)
+            peak_and_post = pd.concat([
+                ordered.loc[ordered['is_peak']], post
+            ]).sort_values('date', kind='mergesort')
+            auc_values = response.loc[peak_and_post.index].to_numpy(float) / response_peak
+            auc_time = (
+                pd.to_datetime(peak_and_post['date'])
+                - pd.Timestamp(peak_row['date'])
+            ).dt.days.to_numpy(float)
+            valid_auc = np.isfinite(auc_values)
+            if np.count_nonzero(valid_auc) >= 2:
+                auc = float(np.trapezoid(
+                    auc_values[valid_auc], auc_time[valid_auc]
+                )) if hasattr(np, 'trapezoid') else float(np.trapz(
+                    auc_values[valid_auc], auc_time[valid_auc]
+                ))
+        lifetime = float(
+            (pd.Timestamp(ordered.iloc[-1]['date'])
+             - pd.Timestamp(ordered.iloc[0]['date'])).days + 1
+        )
+        retention_rows.append({
+            'event_id': str(event_id), 'persistent_carrier': carrier,
+            'peak_rotation': peak_rotation,
+            'lifetime_days': lifetime,
+            'response_start': (
+                float(response.iloc[0]) if pd.notna(response.iloc[0]) else np.nan
+            ),
+            'response_peak': response_peak,
+            'post_peak_decay_slope': slope, 'post_peak_auc': auc,
+            'time_to_half_days': half_time,
+            'time_to_half_right_censored': bool(not np.isfinite(half_time)),
+            'usable': bool(np.isfinite(response_peak)),
+            'missing_days': int((~finite_response).sum()),
+            'unassessable': bool(not finite_response.any()),
+            'do_fingerprint_day_fraction': pd.to_numeric(pd.Series([
+                _first_value(
+                    peak_row,
+                    ('do_fingerprint_day_fraction',
+                     'tracer_event_do_fingerprint_day_fraction'),
+                    np.nan,
+                )
+            ]), errors='coerce').iloc[0],
+            'peak_delta_do': response_peak,
+            'core_depth_m': float(_first_value(
+                base,
+                ('core_depth_m', 'peak_depth_m', 'reference_depth_m'),
+                np.nan,
+            )),
+            'target_sigma0': float(_first_value(
+                base, ('target_sigma0',), np.nan
+            )),
+            'fixed_water_mass_decay_slope': pd.to_numeric(pd.Series([
+                _first_value(
+                    peak_row,
+                    ('fixed_water_wm_normalized_decay_slope',
+                     'wm_normalized_decay_slope'),
+                    np.nan,
+                )
+            ]), errors='coerce').iloc[0],
+            'moving_water_mass_decay_slope': pd.to_numeric(pd.Series([
+                _first_value(
+                    peak_row,
+                    ('moving_water_wm_normalized_decay_slope',),
+                    np.nan,
+                )
+            ]), errors='coerce').iloc[0],
+        })
+        if len(ordered) >= int(cfg.get('minimum_lag_pairs', 7)) and {
+            'normalized_strain', 'r_share'
+        }.issubset(ordered.columns):
+            strain = pd.to_numeric(
+                ordered['normalized_strain'], errors='coerce'
+            ).to_numpy(float)
+            r_share = pd.to_numeric(
+                ordered['r_share'], errors='coerce'
+            ).to_numpy(float)
+            do_values = response.to_numpy(float)
+            do_growth = np.full(do_values.size, np.nan)
+            do_growth[1:] = np.diff(do_values)
+            maximum = min(
+                int(cfg.get('maximum_lag_days', 5)),
+                max(0, (len(ordered) - 1) // 3),
+            )
+            lag_rshare = _best_lag(strain, r_share, maximum)
+            lag_do = _best_lag(strain, do_growth, maximum)
+            lag_rows.append({
+                'event_id': str(event_id),
+                'n_days': int(len(ordered)),
+                'k_max': int(maximum),
+                'lag_strain_to_rshare_days': lag_rshare,
+                'lag_strain_to_do_growth_days': lag_do,
+                'formation_to_organization_lag_days': lag_rshare,
+                'event_status': (
+                    'complete' if finite_response.any() else 'unassessable'
+                ),
+            })
+
+    transition = pd.DataFrame(transition_rows)
+    retention = pd.DataFrame(retention_rows)
+    lag = pd.DataFrame(lag_rows)
+    mech_cfg = dict(cfg)
+    response_columns = (
+        'lifetime_days', 'post_peak_decay_slope', 'post_peak_auc',
+        'do_fingerprint_day_fraction',
+    )
+    group_rows = []
+    for label in ('persistent_carrier', 'peak_rotation'):
+        for response_name in response_columns:
+            stats = _ofes_mechanism_group_comparison(
+                retention, label, (response_name,),
+                seed=int(mech_cfg.get('random_seed', 20260729)),
+                replicates=int(mech_cfg.get('bootstrap_replicates', 10000)),
+            )
+            group_rows.append({'group_label': label, 'response': response_name, **stats})
+    group_comparison = pd.DataFrame(group_rows)
+
+    from scipy.stats import binomtest, mannwhitneyu
+
+    def _retention_comparison(label: str) -> dict[str, Any]:
+        true_rows = retention.loc[retention[label].eq(True)]
+        false_rows = retention.loc[retention[label].eq(False)]
+        result: dict[str, Any] = {
+            f'{label}_n': [int(len(true_rows)), int(len(false_rows))]
+        }
+        for response_name in response_columns:
+            true_values = pd.to_numeric(
+                true_rows[response_name], errors='coerce'
+            ).dropna().to_numpy(float)
+            false_values = pd.to_numeric(
+                false_rows[response_name], errors='coerce'
+            ).dropna().to_numpy(float)
+            if true_values.size < 2 or false_values.size < 2:
+                result[response_name] = None
+                continue
+            comparison = _ofes_mechanism_bootstrap_median_difference(
+                true_values,
+                false_values,
+                seed=int(mech_cfg.get('random_seed', 20260729)),
+                replicates=int(mech_cfg.get('bootstrap_replicates', 10000)),
+            )
+            result[response_name] = {
+                'median_true': comparison['median_true'],
+                'median_false': comparison['median_false'],
+                'median_diff': comparison['median_difference'],
+                'bootstrap_ci': comparison['bootstrap_ci_95'],
+                'mw_p': float(mannwhitneyu(
+                    true_values, false_values, alternative='two-sided'
+                ).pvalue),
+            }
+        return result
+
+    transition_counts = transition['transition'].value_counts().to_dict()
+    transition_props = {}
+    for transition_name, rows in transition.groupby('transition'):
+        transition_props[str(transition_name)] = {
+            'n': int(len(rows)),
+            'persistent_carrier': int(rows['persistent_carrier'].sum()),
+            'scv_compatible': int(rows['scv_compatible'].sum()),
+            'mccoy_any_compatible': int(rows['mccoy_any_compatible'].sum()),
+            'resolved_downward': int(rows['resolved_downward'].sum()),
+        }
+
+    def _lag_summary(column: str) -> dict[str, Any]:
+        if column not in lag:
+            return {'n': 0}
+        values = pd.to_numeric(lag[column], errors='coerce').dropna().to_numpy(float)
+        if values.size == 0:
+            return {'n': 0}
+        positive = int(np.count_nonzero(values > 0))
+        negative = int(np.count_nonzero(values < 0))
+        zero = int(np.count_nonzero(values == 0))
+        return {
+            'n': int(values.size),
+            'median_lag_days': float(np.median(values)),
+            'positive_count': positive,
+            'negative_count': negative,
+            'zero_count': zero,
+            'sign_test_p_two_sided': (
+                float(binomtest(
+                    max(positive, negative), positive + negative, 0.5
+                ).pvalue)
+                if positive + negative else np.nan
+            ),
+        }
+
+    retention_comparison = {
+        'primary_persistent_carrier': _retention_comparison(
+            'persistent_carrier'
+        ),
+        'secondary_peak_rotation': _retention_comparison('peak_rotation'),
+    }
+    regression_response = pd.to_numeric(
+        retention['lifetime_days'], errors='coerce'
+    ).to_numpy(float)
+    peak_delta_do = pd.to_numeric(
+        retention['peak_delta_do'], errors='coerce'
+    ).to_numpy(float)
+    core_depth = pd.to_numeric(
+        retention['core_depth_m'], errors='coerce'
+    ).to_numpy(float)
+    target_sigma0 = pd.to_numeric(
+        retention['target_sigma0'], errors='coerce'
+    ).to_numpy(float)
+    start_day_of_year = pd.to_datetime(
+        daily.groupby('event_id', sort=False)['start_date'].first()
+    ).dt.dayofyear
+    start_day = retention['event_id'].map(
+        start_day_of_year
+    ).to_numpy(float)
+    regression_mask = (
+        np.isfinite(regression_response)
+        & np.isfinite(peak_delta_do)
+        & np.isfinite(core_depth)
+        & np.isfinite(target_sigma0)
+        & np.isfinite(start_day)
+    )
+    regression_predictors = np.column_stack([
+        retention['persistent_carrier'].astype(float),
+        peak_delta_do,
+        core_depth,
+        target_sigma0,
+        start_day,
+    ])[regression_mask]
+    retention_regression = _ofes_mechanism_ols(
+        (
+            'persistent_carrier', 'peak_delta_do', 'core_depth_m',
+            'target_sigma0', 'start_day_of_year',
+        ),
+        regression_response[regression_mask],
+        regression_predictors,
+    )
+    summary = {
+        'status': 'complete',
+        'event_count': int(len(event_ids)),
+        'requested_event_count': int(len(event_ids)),
+        'completed_event_count': int(transition['event_id'].nunique()) if not transition.empty else 0,
+        'daily_row_count': int(len(daily)),
+        'retention_usable_events': int(retention['usable'].sum()) if not retention.empty else 0,
+        'retention_unassessable_events': int(retention['unassessable'].sum()) if not retention.empty else 0,
+        'transition_counts': {
+            str(name): int(count) for name, count in transition_counts.items()
+        },
+        'transition_props': transition_props,
+        'always_strain_n': int((
+            transition['early_class'].eq('strain')
+            & transition['late_class'].eq('strain')
+        ).sum()),
+        'always_rotation_n': int((
+            transition['early_class'].eq('rotation')
+            & transition['late_class'].eq('rotation')
+        ).sum()),
+        'strain_to_rotation_n': int((
+            transition['early_class'].eq('strain')
+            & transition['late_class'].eq('rotation')
+        ).sum()),
+        'rotation_to_strain_n': int((
+            transition['early_class'].eq('rotation')
+            & transition['late_class'].eq('strain')
+        ).sum()),
+        'continuous_changes_start_to_peak': {
+            'delta_r_share_median': float(np.nanmedian(
+                transition['delta_r_share_start_to_peak']
+            )),
+            'delta_r_share_positive_fraction': float(np.nanmean(
+                transition['delta_r_share_start_to_peak'] > 0
+            )),
+            'delta_normalized_strain_median': float(np.nanmedian(
+                transition['delta_normalized_strain_start_to_peak']
+            )),
+            'delta_bbox_aspect_median': float(np.nanmedian(
+                transition['delta_bbox_aspect_start_to_peak']
+            )),
+            'delta_do_median': float(np.nanmedian(
+                transition['delta_do_start_to_peak']
+            )),
+        },
+        'retention_comparison': retention_comparison,
+        'retention_regression': retention_regression,
+        'lag_summary': {
+            'strain_to_rshare': _lag_summary(
+                'lag_strain_to_rshare_days'
+            ),
+            'strain_to_do_growth': _lag_summary(
+                'lag_strain_to_do_growth_days'
+            ),
+        },
+        'sources': sorted(sources),
+        'linked_optional_paths': {
+            name: {'provided': name in sources, 'rows': int(len(frame))}
+            for name, frame in sources.items()
+            if name in {
+                'stage', 'fixed_water', 'moving_water', 'walong',
+                'ventilation_daily', 'tracer_daily',
+            }
+        },
+        'notes': [
+            'All statistics use events, not event-days or particles.',
+            'DO is a response variable and is not used for rotation/strain classification.',
+            'Post-peak slopes use days after the event peak; AUC uses only the peak and later observations.',
+            'Formation-to-organization lag requires at least seven valid pairs at each candidate lag.',
+        ],
+    }
+    return _ofes_mechanism_write_result(
+        root,
+        {
+            'daily_event_mechanism': daily,
+            'phase_transition_table': transition,
+            'retention_comparison': retention,
+            'retention_group_comparison': group_comparison,
+            'event_lag_diagnostics': lag,
+        },
+        summary,
+        request,
+    )
+
+
+def load_ofes_event_mechanism_transition_audit(output_dir: str | Path | None = None) -> dict:
+    """Load the completed transition/retention reducer outputs.
+
+    参数:
+        - output_dir (str | Path | None): explicit fixed synthesis directory.
+    返回:
+        - dict: daily mechanism, transition, retention, lag, summary, and manifest.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不重新运行任何上游 producer。
+    """
+
+    return _ofes_mechanism_load_result(
+        _ofes_mechanism_output_root(
+            str((_OFES_CFG.get('mechanism_synthesis', {}) or {}).get('output_subdir', 'mechanism_synthesis')),
+            output_dir,
+        ),
+        ('daily_event_mechanism', 'phase_transition_table',
+         'retention_comparison', 'retention_group_comparison',
+         'event_lag_diagnostics'),
+    )
+
+
+def plot_ofes_event_mechanism_transition_audit(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """Plot event-level formation-to-retention lags and decay slopes.
+
+    参数:
+        - result (Mapping | None): reducer result; None loads fixed output.
+        - output_dir (str | Path | None): explicit fixed synthesis directory.
+        - show_fig (bool): display the figure.
+        - save_fig (bool): overwrite the fixed PNG when True.
+    返回:
+        - dict: figure and optional figure path.
+    输出:
+        - `mechanism_transition_summary.png` when `save_fig=True`。
+    说明:
+        - 不访问 OFES 原始场、不重新运行 reducer。
+    """
+
+    payload = result if result is not None else load_ofes_event_mechanism_transition_audit(output_dir); lag = payload['event_lag_diagnostics']; retention = payload['retention_comparison']; fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.6)); axes[0].hist(pd.to_numeric(lag.get('formation_to_organization_lag_days', pd.Series(dtype=float)), errors='coerce').dropna(), bins=12, color='#2563eb'); axes[0].set_xlabel('Formation → organization lag (d)'); axes[0].set_ylabel('Events'); axes[1].hist(pd.to_numeric(retention.get('post_peak_decay_slope', pd.Series(dtype=float)), errors='coerce').dropna(), bins=12, color='#7c3aed'); axes[1].axvline(0, color='0.3', linestyle='--'); axes[1].set_xlabel('Post-peak decay slope'); axes[1].set_ylabel('Events'); fig.tight_layout(); path = None
+    if save_fig: root = _ofes_mechanism_output_root(str((_OFES_CFG.get('mechanism_synthesis', {}) or {}).get('output_subdir', 'mechanism_synthesis')), output_dir); root.mkdir(parents=True, exist_ok=True); path = root / 'mechanism_transition_summary.png'; fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig: plt.show()
+    return {'figure': fig, 'figure_path': path}
+
+
+def load_ofes_mccoy_virtual_argo_stage_bridge(output_dir: str | Path | None = None) -> dict:
+    """Load completed McCoy stage-bridge diagnostics.
+
+    参数:
+        - output_dir (str | Path | None): explicit fixed stage-bridge directory.
+    返回:
+        - dict: stage diagnostics, summary, and manifest.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不重新运行 McCoy。
+    """
+
+    root = (
+        Path(output_dir).expanduser()
+        if output_dir is not None
+        else _ofes_analysis_output_path(
+            str((_OFES_CFG.get('mccoy_virtual_argo', {}) or {}).get(
+                'stage_bridge_output_subdir', 'mccoy_virtual_argo_stage_bridge'
+            ))
+        )
+    )
+    return _ofes_mechanism_load_result(root, ('stage_diagnostics',))
+
+
+def plot_ofes_mccoy_virtual_argo_stage_bridge(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """Plot compatible McCoy event counts at start, peak, and last stages.
+
+    参数:
+        - result (Mapping | None): loader result; None loads fixed output.
+        - output_dir (str | Path | None): explicit fixed stage-bridge directory.
+        - show_fig (bool): display the figure.
+        - save_fig (bool): overwrite the fixed PNG when True.
+    返回:
+        - dict: figure and optional figure path.
+    输出:
+        - `mccoy_stage_bridge.png` when `save_fig=True`。
+    说明:
+        - 不访问 OFES 原始场、不重新运行 McCoy。
+    """
+
+    payload = result if result is not None else load_ofes_mccoy_virtual_argo_stage_bridge(output_dir); frame = payload['stage_diagnostics']; grouped = frame.groupby('stage')['event_compatible_count'].apply(lambda values: values.gt(0).sum()) if not frame.empty else pd.Series(dtype=float); fig, axis = plt.subplots(figsize=(5.6, 3.5)); axis.bar(grouped.index.astype(str), grouped.to_numpy(), color=['#94a3b8', '#2563eb', '#7c3aed'][:len(grouped)]); axis.set_ylabel('Events with ≥1 compatible profile'); axis.set_title('McCoy stage bridge'); fig.tight_layout(); path = None
+    if save_fig:
+        root = (
+            Path(output_dir).expanduser()
+            if output_dir is not None
+            else _ofes_analysis_output_path(
+                str((_OFES_CFG.get('mccoy_virtual_argo', {}) or {}).get(
+                    'stage_bridge_output_subdir', 'mccoy_virtual_argo_stage_bridge'
+                ))
+            )
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / 'mccoy_stage_bridge.png'
+        fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig: plt.show()
+    return {'figure': fig, 'figure_path': path}
+
+
+def run_ofes_event_daily_water_mass_audit(
+    event_association_path: str | Path,
+    *,
+    geometry_mode: str = 'fixed_site',
+    daily_water_mass_path: str | Path | None = None,
+    lifecycle_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Reduce completed fixed-site or moving-core water-mass diagnostics.
+
+    参数:
+        - event_association_path (str | Path): authoritative event table.
+        - geometry_mode (str): `fixed_site` or `moving_core`.
+        - daily_water_mass_path (str | Path | None): explicit daily water-mass table/directory.
+        - lifecycle_path (str | Path | None): optional lifecycle table for carrier labels.
+        - output_dir (str | Path | None): fixed reducer directory.
+    返回:
+        - dict: daily water-mass, event summary, summary, and manifest.
+    输出:
+        - `daily_water_mass.parquet`, `event_summary.parquet`, `summary.json`, and `manifest.json`。
+    说明:
+        - 只读取并组合已有 water-mass producer output，不重新计算水团/heave 分解。
+    """
+
+    if geometry_mode not in {'fixed_site', 'moving_core'}:
+        raise ValueError("geometry_mode must be 'fixed_site' or 'moving_core'")
+    if daily_water_mass_path is None:
+        raise ValueError('daily_water_mass_path is required for the reducer')
+    association_path = Path(event_association_path).expanduser()
+    association = _ofes_mechanism_canonical_events(
+        pd.read_parquet(association_path)
+    )
+    daily = _ofes_mechanism_read_optional(
+        daily_water_mass_path,
+        ('daily_water_mass.parquet', 'daily.parquet'),
+    )
+    daily['event_id'] = daily['event_id'].astype(str)
+    daily['date'] = pd.to_datetime(daily['date'], errors='raise').dt.normalize()
+    daily = daily.loc[
+        daily['event_id'].isin(set(association['event_id']))
+    ].copy()
+    carrier = None
+    if lifecycle_path is not None:
+        carrier = _ofes_mechanism_read_optional(
+            lifecycle_path, ('lifecycle_event_summary.parquet',)
+        )
+        carrier['event_id'] = carrier['event_id'].astype(str)
+    event_rows: list[dict[str, Any]] = []
+    for event_id, group in daily.groupby('event_id', sort=False):
+        group = group.sort_values('date', kind='mergesort')
+        event = association.loc[association['event_id'].eq(event_id)].iloc[0]
+        peak_date = pd.Timestamp(event['peak_date']).normalize()
+        values = pd.to_numeric(
+            group['water_mass_do_contrast'], errors='coerce'
+        ).to_numpy(float)
+        peak_values = pd.to_numeric(
+            group.loc[group['date'].eq(peak_date), 'water_mass_do_contrast'],
+            errors='coerce',
+        ).dropna()
+        peak_value = (
+            float(peak_values.iloc[0]) if len(peak_values) else np.nan
+        )
+        decay_slope = np.nan
+        post_peak_auc = np.nan
+        if np.isfinite(peak_value) and peak_value != 0:
+            post = group.loc[group['date'].ge(peak_date)].copy()
+            y = pd.to_numeric(
+                post['water_mass_do_contrast'], errors='coerce'
+            ).to_numpy(float) / peak_value
+            x = (post['date'] - peak_date).dt.days.to_numpy(float)
+            valid = np.isfinite(x) & np.isfinite(y)
+            if np.count_nonzero(valid) >= 2:
+                decay_slope = float(np.polyfit(x[valid], y[valid], 1)[0])
+                post_peak_auc = float(np.trapezoid(
+                    y[valid], x[valid]
+                )) if hasattr(np, 'trapezoid') else float(np.trapz(
+                    y[valid], x[valid]
+                ))
+        event_rows.append({
+            'event_id': event_id,
+            'wm_start': float(values[0]) if values.size else np.nan,
+            'wm_peak': peak_value,
+            'wm_last': float(values[-1]) if values.size else np.nan,
+            'wm_normalized_decay_slope': decay_slope,
+            'wm_post_peak_auc': post_peak_auc,
+            'observed_days': int(len(group)),
+            'geometry_mode': geometry_mode,
+        })
+    event_summary = pd.DataFrame(event_rows)
+    if carrier is not None:
+        keep = ['event_id'] + [
+            name for name in (
+                'persistent_anticyclonic_rotational_carrier',
+                'rotation_day_fraction',
+            ) if name in carrier
+        ]
+        event_summary = event_summary.merge(
+            carrier[keep].drop_duplicates('event_id'),
+            on='event_id',
+            how='left',
+            validate='one_to_one',
+        )
+
+    from scipy.stats import mannwhitneyu
+    mechanism_cfg = dict(_OFES_CFG.get('mechanism_synthesis', {}) or {})
+
+    def _compare(column: str) -> dict[str, Any] | None:
+        if 'persistent_anticyclonic_rotational_carrier' not in event_summary:
+            return None
+        label = event_summary[
+            'persistent_anticyclonic_rotational_carrier'
+        ].fillna(False).astype(bool)
+        true_values = pd.to_numeric(
+            event_summary.loc[label, column], errors='coerce'
+        ).dropna().to_numpy(float)
+        false_values = pd.to_numeric(
+            event_summary.loc[~label, column], errors='coerce'
+        ).dropna().to_numpy(float)
+        if true_values.size < 2 or false_values.size < 2:
+            return None
+        comparison = _ofes_mechanism_bootstrap_median_difference(
+            true_values,
+            false_values,
+            seed=int(mechanism_cfg.get('random_seed', 20260729)),
+            replicates=int(
+                mechanism_cfg.get('bootstrap_replicates', 10000)
+            ),
+        )
+        return {
+            'median_true': comparison['median_true'],
+            'median_false': comparison['median_false'],
+            'median_diff': comparison['median_difference'],
+            'bootstrap_ci': comparison['bootstrap_ci_95'],
+            'mw_p': float(mannwhitneyu(
+                true_values, false_values, alternative='two-sided'
+            ).pvalue),
+        }
+
+    summary = {
+        'event_count': int(len(event_summary)),
+        'event_day_count': int(len(daily)),
+        'geometry_mode': geometry_mode,
+        'carrier_retention': {
+            name: _compare(name) for name in (
+                'wm_normalized_decay_slope', 'wm_post_peak_auc', 'wm_peak'
+            )
+        },
+        'notes': [
+            'Water-mass retention is calculated from the peak day and later '
+            'observations; DO does not define the carrier classification.',
+        ],
+    }
+    request = {
+        'event_association_path': str(association_path),
+        'daily_water_mass_path': str(daily_water_mass_path),
+        'lifecycle_path': str(lifecycle_path) if lifecycle_path is not None else None,
+        'geometry_mode': geometry_mode,
+    }
+    root = _ofes_mechanism_output_root(
+        f'daily_water_mass_{geometry_mode}', output_dir
+    )
+    return _ofes_mechanism_write_result(
+        root,
+        {'daily_water_mass': daily, 'event_summary': event_summary},
+        summary,
+        request,
+    )
+
+
+def load_ofes_event_daily_water_mass_audit(output_dir: str | Path) -> dict:
+    """Load completed daily water-mass audit tables.
+
+    参数:
+        - output_dir (str | Path): explicit reducer directory.
+    返回:
+        - dict: daily water-mass, event summary, summary, and manifest.
+    输出:
+        - 无；只读取已有正式产物。
+    说明:
+        - 不访问 OFES 原始场、不重新计算水团/heave。
+    """
+
+    return _ofes_mechanism_load_result(output_dir, ('daily_water_mass', 'event_summary'))
+
+
+def summarize_ofes_mechanism_synthesis(
+    *,
+    transition_result: Mapping[str, Any] | None = None,
+    walong_result: Mapping[str, Any] | None = None,
+    winter_mld_result: Mapping[str, Any] | None = None,
+    stage_result: Mapping[str, Any] | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Summarize the linked OFES mechanism diagnostics.
+
+    参数:
+        - transition_result (Mapping | None): loaded transition and retention outputs.
+        - walong_result (Mapping | None): loaded isopycnal-velocity outputs.
+        - winter_mld_result (Mapping | None): loaded winter MLD outputs.
+        - stage_result (Mapping | None): loaded McCoy stage-bridge outputs.
+        - output_dir (str | Path | None): fixed synthesis directory when loading transition output.
+    返回:
+        - dict: event counts, usable rows, and linked diagnostic summaries.
+    输出:
+        - 无；只读取并汇总已有正式产物。
+    说明:
+        - 相关诊断共享事件与上游资料，不被解释为相互独立证据。
+    """
+
+    transition = transition_result if transition_result is not None else load_ofes_event_mechanism_transition_audit(output_dir)
+    summary = {
+        'event_count': int(len(transition.get('phase_transition_table', pd.DataFrame()))),
+        'retention_usable_events': int(transition.get('retention_comparison', pd.DataFrame()).get('usable', pd.Series(dtype=bool)).fillna(False).sum()),
+        'linked': {},
+    }
+    for name, payload, table in (('walong', walong_result, 'daily_metrics'), ('winter_mld', winter_mld_result, 'event_summary'), ('stage_bridge', stage_result, 'stage_diagnostics')):
+        if payload is not None: summary['linked'][name] = {'rows': int(len(payload.get(table, pd.DataFrame()))), 'summary': payload.get('summary', {})}
+    return summary
+
+
+def plot_ofes_mechanism_synthesis(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """Plot one compact overview of the mechanism synthesis outputs.
+
+    参数:
+        - result (Mapping | None): `summarize_ofes_mechanism_synthesis` result; None loads transition output.
+        - output_dir (str | Path | None): explicit synthesis directory.
+        - show_fig (bool): display the figure.
+        - save_fig (bool): overwrite the fixed PNG when True.
+    返回:
+        - dict: figure and optional figure path.
+    输出:
+        - `mechanism_synthesis_summary.png` when `save_fig=True`。
+    说明:
+        - 不访问 OFES 原始场、不重新运行任何 producer。
+    """
+
+    payload = result if result is not None else summarize_ofes_mechanism_synthesis(output_dir=output_dir); linked = payload.get('linked', {}); labels = list(linked) or ['transition']; values = [linked[name].get('rows', 0) for name in labels] if linked else [payload.get('event_count', 0)]; fig, axis = plt.subplots(figsize=(6.0, 3.5)); axis.bar(labels, values, color=['#2563eb', '#7c3aed', '#059669'][:len(labels)]); axis.set_ylabel('Rows'); axis.set_title('OFES mechanism synthesis'); fig.tight_layout(); path = None
+    if save_fig: root = _ofes_mechanism_output_root(str((_OFES_CFG.get('mechanism_synthesis', {}) or {}).get('output_subdir', 'mechanism_synthesis')), output_dir); root.mkdir(parents=True, exist_ok=True); path = root / 'mechanism_synthesis_summary.png'; fig.savefig(path, dpi=180, bbox_inches='tight')
+    if show_fig: plt.show()
+    return {'figure': fig, 'figure_path': path}
