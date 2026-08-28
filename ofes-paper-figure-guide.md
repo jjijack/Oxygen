@@ -161,8 +161,9 @@ occurred in the Kuroshio Extension；这表示空间集中性，不是区域背�
 分数、联合 θ–S 状态和 event-core McCoy enrichment。56 strict events 高亮；
 水团贡献分数中位数为 86.2%（54/56 dominated）和 78.2%（138/161 dominated）。
 McCoy 面板使用 19/56、事件等权差 0.144、bootstrap 95% CI [0.076, 0.221]，
-并同时标注单侧与透明双侧 p。θ 与 S 是一个联合热盐状态的两个坐标，不是三条
-独立证据；标题限定为 OFES anomaly cores 的 conditional enrichment。
+主图标注配对单侧 p；双侧审计值留在 caption/结果报告，不再挤入面板。θ 与 S
+是一个联合热盐状态的两个坐标，不是三条独立证据；总标题同时概括水团主导与
+McCoy-compatible profile enrichment。
 
 ### Figure3_ventilation_downward.png（通风史与向下路径）
 左侧是正式 30-day trajectory-complete paired subset 的三项 event-equal
@@ -171,7 +172,7 @@ hydrographic n=28 与 kinematic n=27 的 CI/p。每个事件先作 anomaly−con
 再事件等权；三个指标相关，六个点不是六次独立验证。右侧三个并列诊断框各自
 保留分母：displacement-classifiable 24/56（21 down、3 up），strict
 resolved pathways 18（15 down、3 up），以及 w_along n=19、daily mean
-主要值 +4.8 m d⁻¹、nominal p=0.040。它们是 related but non-independent
+主要值 +4.8 m d⁻¹、13/19 downward、nominal p=0.040。它们是 related but non-independent
 diagnostics with distinct eligibility criteria，不是漏斗或可相加计数。
 
 ### Figure4_E000073_case.png（E000073 配对路径案例）
@@ -183,9 +184,10 @@ earliest reconstructed position/depth within the integration window，不称
 release/start/source。E000073 初始连续 direct contact 为 13 d、累计为 20 d；
 Jan 26 与 Feb 1–6 是 intermittent re-encounters，Feb 7 以后才是 final
 detachment and major descent。hydrographic control 的正式含义是 0 of 51
-trajectory days with direct MLD contact，不是 51 个 control 粒子。
+trajectory days with direct MLD contact，不是 51 个 control 粒子；图中蓝色点线为
+control trajectory 自身路径上的 MLD 中位数，不能用 anomaly-path MLD 替代核验。
 
-### Figure5_rotational_organization.png（反气旋组织与有限 retention）
+### Figure5_rotational_organization.png（反气旋组织与一致 retention tendency）
 三面板使用 nested hierarchy（56 strict → 27 persistent anticyclonic
 rotational carriers → 6 SCV-compatible → 1 surface-obscured SCV-compatible）、
 per-stage McCoy expression（start/peak/last = 10/56、19/56、9/56）和三种
