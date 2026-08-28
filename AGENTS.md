@@ -38,7 +38,8 @@ GLORYS NetCDF is not truly local. It is mounted from SJTU HPC through `sshfs`. I
 ## Architecture
 
 - **`track.py`**: monolithic core for geometry helpers, data ingestion, analytics, and plotting.
-- **Notebooks**: `GLORYS.ipynb`, `GLORYS AOU.ipynb`, `GLORYS TRIM.ipynb` are consumers of `track.py`; do not put new logic in notebooks.
+- **Notebooks**: `GLORYS.ipynb`, `GLORYS AOU.ipynb`, `GLORYS TRIM.ipynb`, and `OFES.ipynb` are consumers and workflow entrypoints; do not put new scientific logic in notebooks.
+- **OFES surface eddies**: `ofes_surface_eddy.py` contains the PET detector and `run_ofes_surface_eddy.py` is its standalone producer wrapper. Run the producer in the dedicated `ofes-pet` environment; ordinary `track.py` imports must not require PET.
 - **`config/`**:
   - `paths.yml`: data directory layout
   - `regions.yml`: spatial region definitions
@@ -64,6 +65,7 @@ GLORYS NetCDF is not truly local. It is mounted from SJTU HPC through `sshfs`. I
 - **Anomaly detection**: `calculate_delta_do` configured through `DetectionConfig` and `processing.yml`.
 - **Hotspot maps**: `plot_argo_hotspots(...)` writes to `plot_outputs/<method>/<region>/plot_argo_hotspots/`.
 - **Argo 3D reconstruction**: `collect_argo_pool(...)` -> `_build_argo_3d_field(...)` -> slice and overview plotting helpers.
+- **OFES**: expensive public producers create fixed semantic outputs; lightweight loaders, reducers, and plotters consume them. `OFES.ipynb` keeps producer cells visible but unexecuted and retains executed lightweight summaries and figures.
 
 ## Running And Validation
 
