@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.28 变更：
+#   - 将 deep-process sensitivity 的上界从 900 m 对齐到 1000 m，
+#     与预定义的 300–1000 m 研究域保持一致；当前 DO50 quality catalog
+#     没有 900–1000 m 峰值事件，因此成员集合不变。
 # version 1.27 变更：
 #   - 新增 w_along、winter MLD 与 mechanism-synthesis 的正式参数；这些
 #     reducer 只消费已完成产物，输出目录采用固定语义路径。
@@ -103,7 +107,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.27
+version: 1.28
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -373,7 +377,7 @@ ofes:
     candidate_count: 5
     maximum_sampled_event_days: 31
     deep_depth_min_m: 500.0
-    deep_depth_max_m: 900.0
+    deep_depth_max_m: 1000.0
     background_inner_radius_km: 120.0
     background_outer_radius_km: 240.0
     background_load_margin_km: 50.0

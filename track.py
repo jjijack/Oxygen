@@ -39965,7 +39965,7 @@ def _ofes_event_diagnostic_settings(
             raw.get('deep_depth_min_m', 500.0)
         ),
         'deep_depth_max_m': float(
-            raw.get('deep_depth_max_m', 900.0)
+            raw.get('deep_depth_max_m', 1000.0)
         ),
         'background_inner_radius_km': float(
             raw.get('background_inner_radius_km', 120.0)
@@ -41668,7 +41668,7 @@ def diagnose_ofes_ranked_events(
         - `<output_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet` 与 `analysis_summary.json`。
 
     说明:
-        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–900 m 仅是另表敏感性排名。
+        - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–1000 m 仅是另表敏感性排名。
         - sigma0、spiciness0、氧饱和度与 N2 使用 TEOS-10；OFES temp 按交付位温解释。
         - u/v 先在交付网格上以 1.5 像元 Gaussian 平滑，再计算相对涡度、总应变与 Okubo-Weiss。
         - 负对照必须距事件 300–700 km、纬差不超过 3°、距任一 DO20 像元至少 100 km，且完整 240 km 环带留在交付窗口内。
@@ -43130,7 +43130,7 @@ def generalize_ofes_deep_events(
     """OFES DO50 深层事件的峰值水团、动力与表层表达总体诊断。
 
     入口只消费固定目录中的候选诊断结果及其年度 catalog，
-    选择当前 catalog 中 DO50、500–900 m 且诊断通过的事件。每个事件仅在
+    选择当前 catalog 中 DO50、500–1000 m 且诊断通过的事件。每个事件仅在
     catalog peak 日诊断一次，并将深层水团/heave 分解与同日 SSH
     环带异常、最上层涡度/应变及 50 km 内同极性涡度峰值合并成
     event-level scalars。
@@ -60115,7 +60115,7 @@ def _ofes_plot_annual_catalog_overview(
         histtype='step',
         linewidth=1.8,
         color='#2563eb',
-        label='500–900 m sensitivity',
+        label='500–1000 m sensitivity',
     )
     lower_count = int(
         np.count_nonzero(
