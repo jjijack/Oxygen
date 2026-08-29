@@ -40547,9 +40547,29 @@ def _ofes_unit_sphere_xyz(
     )
 
 
+def _ofes_catalog_settings_from_dir(
+    catalog_dir: str | Path,
+    explicit_settings: dict | None = None,
+) -> dict:
+    """读取 catalog 自带的扫描设置，必要时回退到当前配置。"""
+    if explicit_settings is not None:
+        return _ofes_delta_do_catalog_settings(explicit_settings)
+    summary_path = Path(catalog_dir) / 'catalog_summary.json'
+    if not summary_path.exists():
+        return _ofes_delta_do_catalog_settings()
+    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    stored_settings = summary.get('settings')
+    if stored_settings is None:
+        return _ofes_delta_do_catalog_settings()
+    return _ofes_delta_do_catalog_settings(dict(stored_settings))
+
+
 def _ofes_quality_event_catalog(
     catalog_dir: str | Path,
     settings: dict,
+    *,
+    catalog_settings: dict | None = None,
+    require_candidate_count: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """标记交付边界截断并生成正式与深层敏感性排名。"""
     root = Path(catalog_dir)
@@ -40599,7 +40619,9 @@ def _ofes_quality_event_catalog(
             ranked.index, 'quality_rank_within_threshold'
         ] = np.arange(1, len(ranked) + 1)
 
-    catalog_settings = _ofes_delta_do_catalog_settings()
+    catalog_settings = _ofes_catalog_settings_from_dir(
+        root, catalog_settings
+    )
     candidate_depth = depth[
         (
             depth
@@ -40675,7 +40697,10 @@ def _ofes_quality_event_catalog(
         'quality_rank_within_threshold',
         kind='mergesort',
     ).head(int(settings['candidate_count']))
-    if len(selected) != int(settings['candidate_count']):
+    if (
+        require_candidate_count
+        and len(selected) != int(settings['candidate_count'])
+    ):
         raise RuntimeError(
             'The OFES catalog does not contain the requested number '
             'of quality-eligible candidate events.'
@@ -41304,7 +41329,7 @@ def _ofes_select_negative_control(
     )
     catalog_thresholds = {
         float(value)
-        for value in _ofes_delta_do_catalog_settings()[
+        for value in _ofes_catalog_settings_from_dir(catalog_dir)[
             'thresholds'
         ]
     }
@@ -41646,26 +41671,29 @@ def diagnose_ofes_ranked_events(
     *,
     diagnostic_overrides: dict | None = None,
     output_dir: str | Path | None = None,
+    include_negative_control: bool = True,
 ) -> dict:
     """诊断客观排名 OFES 事件的等密度水团、heave、动力量与负对照。
 
     入口先从完整年度 catalog 排除触及 900 x 600 交付边界的截断事件，再按
     原定 score 重排并固定 DO50 前五名。每个事件最多诊断 31 个观测日，核心
     取逐日对象最大 ΔDO 列，参考层固定为事件峰值 depth；同日 120–240 km
-    环带给出精确的固定 depth DO = 同密度水团项 + heave 项分解。第一名
-    事件另按预声明的六维水团/动力距离选择一个无 DO20 的空间负对照。
+    环带给出精确的固定 depth DO = 同密度水团项 + heave 项分解。默认情况下，
+    第一名事件另按预声明的六维水团/动力距离选择一个无 DO20 的空间负对照。
+    depth-gate sensitivity 可关闭该独立的负对照步骤。
 
     参数:
         - catalog_dir (str | Path | None): event catalog 目录；None 时读取固定正式目录。
         - diagnostic_overrides (dict | None): 临时覆盖已声明的 event_diagnostics 配置。
         - output_dir (str | Path | None): 诊断输出目录；None 时写入固定正式目录。
+        - include_negative_control (bool): 是否执行并写入正式负对照；默认 True。depth-gate sensitivity 只需要峰值分解时可关闭。
 
     返回:
         - dict: 含 output_dir、总结、边界审计、质量 catalog、固定候选、逐日/事件诊断与负对照表。
 
     输出:
         - `<output_dir>/days/<event_id>_YYYYMMDD.parquet`。
-        - `<output_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet` 与 `analysis_summary.json`。
+        - `<output_dir>/quality_event_catalog.parquet`、`selected_events.parquet`、`deep_sensitivity_ranking.parquet`、`daily_diagnostics.parquet`、`event_diagnostic_summary.parquet`、`negative_control.parquet`、`negative_control_diagnostic.parquet` 与 `analysis_summary.json`；关闭 `include_negative_control` 时后两张控制表为空表。
 
     说明:
         - 候选只按预锁定质量排名取前五，不因诊断结果替换；500–1000 m 仅是另表敏感性排名。
@@ -41683,7 +41711,7 @@ def diagnose_ofes_ranked_events(
     )
     catalog_thresholds = {
         float(value)
-        for value in _ofes_delta_do_catalog_settings()[
+        for value in _ofes_catalog_settings_from_dir(catalog_root)[
             'thresholds'
         ]
     }
@@ -41755,39 +41783,45 @@ def diagnose_ofes_ranked_events(
     )
     if all(path.exists() for path in complete_outputs):
         loaded = load_ofes_event_diagnostics(output_dir=output_path)
-        expected_events = [str(value) for value in selected_events['event_id']]
-        stored_events = [str(value) for value in loaded['selected_events']['event_id']]
-        if stored_events != expected_events:
-            raise RuntimeError(
-                'Existing output was created for a different event request. '
-                'Use another output_dir or remove the existing directory.'
+        stored_negative_control_request = loaded[
+            'analysis_summary'
+        ].get('negative_control_requested', True)
+        if bool(stored_negative_control_request) == bool(
+            include_negative_control
+        ):
+            expected_events = [str(value) for value in selected_events['event_id']]
+            stored_events = [str(value) for value in loaded['selected_events']['event_id']]
+            if stored_events != expected_events:
+                raise RuntimeError(
+                    'Existing output was created for a different event request. '
+                    'Use another output_dir or remove the existing directory.'
+                )
+            expected_pairs = {
+                (
+                    str(row.event_id),
+                    pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                )
+                for row in sampled_objects.itertuples(index=False)
+            }
+            stored_pairs = {
+                (
+                    str(row.event_id),
+                    pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+                )
+                for row in loaded['daily_diagnostics'].itertuples(index=False)
+            }
+            if stored_pairs != expected_pairs:
+                raise RuntimeError(
+                    'Existing output was created for a different event/date '
+                    'request. Use another output_dir or remove the existing '
+                    'directory.'
+                )
+            loaded['summary'] = loaded['analysis_summary']
+            loaded['quality_audit'] = loaded['analysis_summary'].get(
+                'quality_audit'
             )
-        expected_pairs = {
-            (
-                str(row.event_id),
-                pd.Timestamp(row.date).strftime('%Y-%m-%d'),
-            )
-            for row in sampled_objects.itertuples(index=False)
-        }
-        stored_pairs = {
-            (
-                str(row.event_id),
-                pd.Timestamp(row.date).strftime('%Y-%m-%d'),
-            )
-            for row in loaded['daily_diagnostics'].itertuples(index=False)
-        }
-        if stored_pairs != expected_pairs:
-            raise RuntimeError(
-                'Existing output was created for a different event/date '
-                'request. Use another output_dir or remove the existing '
-                'directory.'
-            )
-        loaded['summary'] = loaded['analysis_summary']
-        loaded['quality_audit'] = loaded['analysis_summary'].get(
-            'quality_audit'
-        )
-        loaded['reused_complete_run'] = True
-        return loaded
+            loaded['reused_complete_run'] = True
+            return loaded
     _atomic_write_parquet(
         quality_events,
         output_path / 'quality_event_catalog.parquet',
@@ -41929,58 +41963,68 @@ def diagnose_ofes_ranked_events(
             'The headline event lacks exactly one peak diagnosis.'
         )
     headline_peak = headline_peak_rows.iloc[0]
-    if not bool(headline_peak['diagnostic_passed']):
+    if include_negative_control and not bool(
+        headline_peak['diagnostic_passed']
+    ):
         raise RuntimeError(
             'The headline peak failed the water-mass diagnostic '
             'gate; the candidate is retained but a matched '
             'negative control cannot be defined.'
         )
-    negative_control = _ofes_select_negative_control(
-        catalog_root,
-        headline_event['peak_date'],
-        float(headline_event['peak_lon']),
-        float(headline_event['peak_lat']),
-        float(headline_event['peak_depth_m']),
-        headline_peak.to_dict(),
-        settings,
-    )
-    negative_control.update(
-        {
-            'control_id': (
-                f"{headline_event['event_id']}_CONTROL"
-            ),
-            'event_id': str(headline_event['event_id']),
-            'quality_rank_within_threshold': int(
-                headline_event[
-                    'quality_rank_within_threshold'
+    if include_negative_control:
+        negative_control = _ofes_select_negative_control(
+            catalog_root,
+            headline_event['peak_date'],
+            float(headline_event['peak_lon']),
+            float(headline_event['peak_lat']),
+            float(headline_event['peak_depth_m']),
+            headline_peak.to_dict(),
+            settings,
+        )
+        negative_control.update(
+            {
+                'control_id': (
+                    f"{headline_event['event_id']}_CONTROL"
+                ),
+                'event_id': str(headline_event['event_id']),
+                'quality_rank_within_threshold': int(
+                    headline_event[
+                        'quality_rank_within_threshold'
+                    ]
+                ),
+            }
+        )
+        negative_control_frame = pd.DataFrame(
+            [negative_control]
+        )
+        control_diagnosis = _ofes_diagnose_water_mass_day(
+            negative_control['date'],
+            float(negative_control['lon']),
+            float(negative_control['lat']),
+            float(
+                negative_control[
+                    'reference_depth_m'
                 ]
             ),
-        }
-    )
-    negative_control_frame = pd.DataFrame(
-        [negative_control]
-    )
-    control_diagnosis = _ofes_diagnose_water_mass_day(
-        negative_control['date'],
-        float(negative_control['lon']),
-        float(negative_control['lat']),
-        float(
-            negative_control[
-                'reference_depth_m'
-            ]
-        ),
-        settings,
-    )
-    control_diagnosis.update(
-        {
-            'control_id': negative_control['control_id'],
-            'event_id': str(headline_event['event_id']),
-            'role': 'matched_negative_control',
-        }
-    )
-    control_diagnostic_frame = pd.DataFrame(
-        [control_diagnosis]
-    )
+            settings,
+        )
+        control_diagnosis.update(
+            {
+                'control_id': negative_control['control_id'],
+                'event_id': str(headline_event['event_id']),
+                'role': 'matched_negative_control',
+            }
+        )
+        control_diagnostic_frame = pd.DataFrame(
+            [control_diagnosis]
+        )
+    else:
+        negative_control_frame = pd.DataFrame(
+            {'control_id': pd.Series(dtype='string')}
+        )
+        control_diagnostic_frame = pd.DataFrame(
+            {'control_id': pd.Series(dtype='string')}
+        )
     _atomic_write_parquet(
         negative_control_frame,
         output_path / 'negative_control.parquet',
@@ -41992,9 +42036,12 @@ def diagnose_ofes_ranked_events(
 
     diagnostic_gate_passed = bool(
         daily_diagnostics['diagnostic_passed'].all()
-        and control_diagnostic_frame[
-            'diagnostic_passed'
-        ].all()
+        and (
+            not include_negative_control
+            or control_diagnostic_frame[
+                'diagnostic_passed'
+            ].all()
+        )
     )
     summary = {
         'generated_at_utc': pd.Timestamp.now(
@@ -42008,15 +42055,20 @@ def diagnose_ofes_ranked_events(
             len(selected_events)
         ),
         'diagnostic_gate_passed': diagnostic_gate_passed,
+        'negative_control_requested': bool(include_negative_control),
         'failed_daily_diagnostic_count': int(
             np.count_nonzero(
                 ~daily_diagnostics['diagnostic_passed']
             )
         ),
-        'negative_control_passed': bool(
-            control_diagnostic_frame.iloc[0][
-                'diagnostic_passed'
-            ]
+        'negative_control_passed': (
+            bool(
+                control_diagnostic_frame.iloc[0][
+                    'diagnostic_passed'
+                ]
+            )
+            if include_negative_control
+            else None
         ),
     }
     _ofes_atomic_write_json(
@@ -42044,6 +42096,7 @@ def diagnose_ofes_quality_eligible_events(
     *,
     diagnostic_overrides: dict | None = None,
     output_dir: str | Path | None = None,
+    include_negative_control: bool = True,
 ) -> dict:
     """运行当前 DO50 quality-eligible 事件的完整水团诊断 census。
 
@@ -42055,6 +42108,7 @@ def diagnose_ofes_quality_eligible_events(
         - catalog_dir (str | Path | None): event catalog 目录；None 使用固定正式目录。
         - diagnostic_overrides (dict | None): 临时覆盖已声明的 event_diagnostics 参数。
         - output_dir (str | Path | None): census 输出目录；None 使用固定 `quality_event_diagnostics` 目录。
+        - include_negative_control (bool): 是否执行正式负对照；默认 True。depth-gate sensitivity 可关闭。
 
     返回:
         - dict: 含完整 quality-event 表、逐日诊断、负对照、summary 和 output_dir。
@@ -42073,7 +42127,9 @@ def diagnose_ofes_quality_eligible_events(
     )
     settings = _ofes_event_diagnostic_settings(diagnostic_overrides)
     quality_events, _, _ = _ofes_quality_event_catalog(
-        catalog_root, settings
+        catalog_root,
+        settings,
+        require_candidate_count=False,
     )
     eligible = quality_events.loc[
         quality_events['threshold'].eq(float(settings['candidate_threshold']))
@@ -42094,6 +42150,7 @@ def diagnose_ofes_quality_eligible_events(
             if output_dir is not None
             else _ofes_analysis_output_path('quality_event_diagnostics')
         ),
+        include_negative_control=include_negative_control,
     )
     result['event_scope'] = 'quality_eligible'
     result['summary']['event_scope'] = 'quality_eligible'
@@ -42111,11 +42168,1401 @@ def diagnose_ofes_quality_eligible_events(
     return result
 
 
+def _ofes_depth_gate_sensitivity_settings(
+    depth_gates_m: Sequence[float] | None = None,
+    candidate_depth_max_m: float | None = None,
+    candidate_threshold: float | None = None,
+    bootstrap_replicates: int | None = None,
+    random_seed: int | None = None,
+) -> dict:
+    """解析并校验 OFES depth-gate sensitivity 配置。"""
+    raw = dict(_OFES_CFG.get('depth_gate_sensitivity', {}) or {})
+    gates = tuple(
+        sorted(
+            {
+                float(value)
+                for value in (
+                    raw.get('depth_gates_m', (100.0, 300.0))
+                    if depth_gates_m is None
+                    else depth_gates_m
+                )
+            }
+        )
+    )
+    settings = {
+        'depth_gates_m': gates,
+        'candidate_depth_max_m': float(
+            raw.get('candidate_depth_max_m', 1000.0)
+            if candidate_depth_max_m is None
+            else candidate_depth_max_m
+        ),
+        'candidate_threshold': float(
+            raw.get('candidate_threshold', 50.0)
+            if candidate_threshold is None
+            else candidate_threshold
+        ),
+        'bootstrap_replicates': int(
+            raw.get('bootstrap_replicates', 10000)
+            if bootstrap_replicates is None
+            else bootstrap_replicates
+        ),
+        'random_seed': int(
+            raw.get('random_seed', 20260829)
+            if random_seed is None
+            else random_seed
+        ),
+        'output_subdir': str(
+            raw.get('output_subdir', 'depth_gate_sensitivity')
+        ),
+    }
+    if not settings['depth_gates_m']:
+        raise ValueError('depth_gates_m must contain at least one value.')
+    if any(
+        not np.isfinite(value) or value <= 0
+        for value in settings['depth_gates_m']
+    ):
+        raise ValueError('depth_gates_m must contain finite positive values.')
+    if (
+        not np.isfinite(settings['candidate_depth_max_m'])
+        or settings['candidate_depth_max_m'] <= max(settings['depth_gates_m'])
+    ):
+        raise ValueError(
+            'candidate_depth_max_m must exceed every depth gate.'
+        )
+    if (
+        not np.isfinite(settings['candidate_threshold'])
+        or settings['candidate_threshold'] <= 0
+    ):
+        raise ValueError('candidate_threshold must be finite and positive.')
+    if settings['bootstrap_replicates'] <= 0:
+        raise ValueError('bootstrap_replicates must be positive.')
+    if not settings['output_subdir']:
+        raise ValueError('depth-gate sensitivity output_subdir is empty.')
+    return settings
+
+
+def _ofes_depth_gate_tag(depth_gate_m: float) -> str:
+    """返回 depth-gate sensitivity 的稳定目录标签。"""
+    value = float(depth_gate_m)
+    if np.isclose(value, round(value), rtol=0.0, atol=1e-10):
+        return f'depth{int(round(value))}m'
+    return f'depth{_format_detection_value(value)}m'
+
+
+def _ofes_depth_gate_paths(
+    sensitivity_root: str | Path,
+    depth_gate_m: float,
+) -> dict[str, Path]:
+    """返回单个 depth gate 的固定输出路径。"""
+    gate_root = Path(sensitivity_root) / _ofes_depth_gate_tag(
+        depth_gate_m
+    )
+    return {
+        'gate_root': gate_root,
+        'catalog_dir': gate_root / 'event_catalog',
+        'diagnostic_dir': gate_root / 'quality_event_diagnostics',
+        'event_table': gate_root / 'event_summary.parquet',
+        'secondary_event_table': (
+            gate_root / 'secondary_event_summary.parquet'
+        ),
+        'summary_table': gate_root / 'summary.parquet',
+        'summary_json': gate_root / 'summary.json',
+    }
+
+
+def _ofes_depth_gate_bootstrap_median(
+    values: pd.Series | np.ndarray,
+    replicates: int,
+    seed: int,
+) -> tuple[float | None, list[float | None], int]:
+    """以事件为单位 bootstrap 一个中位数及其 95% 区间。"""
+    array = pd.to_numeric(
+        pd.Series(values), errors='coerce'
+    ).replace([np.inf, -np.inf], np.nan).dropna().to_numpy(
+        dtype=float
+    )
+    if array.size == 0:
+        return None, [None, None], 0
+    rng = np.random.default_rng(int(seed))
+    indices = rng.integers(
+        0,
+        array.size,
+        size=(int(replicates), array.size),
+    )
+    medians = np.median(array[indices], axis=1)
+    interval = np.quantile(medians, (0.025, 0.975))
+    return (
+        float(np.median(array)),
+        [float(interval[0]), float(interval[1])],
+        int(array.size),
+    )
+
+
+def _ofes_depth_gate_catalog_metadata(
+    catalog_dir: str | Path,
+    diagnostic_result: Mapping[str, Any],
+    settings: dict,
+) -> dict:
+    """读取一个 depth gate 的 catalog 事件数、深度范围和分布。"""
+    root = Path(catalog_dir)
+    catalog = pd.read_parquet(root / 'event_catalog.parquet')
+    daily_objects = pd.read_parquet(
+        root / 'daily_objects.parquet',
+        columns=['date'],
+    )
+    catalog_reference_date = pd.Timestamp(
+        daily_objects['date'].min()
+    )
+    catalog_settings = _ofes_catalog_settings_from_dir(root)
+    threshold = float(settings['candidate_threshold'])
+    threshold_values = catalog['threshold'].to_numpy(dtype=float)
+    candidate = catalog.loc[np.isclose(
+        threshold_values,
+        threshold,
+        rtol=0.0,
+        atol=1e-10,
+    )].copy()
+    counts = {
+        _ofes_threshold_tag(value): int(
+            np.count_nonzero(
+                np.isclose(
+                    threshold_values,
+                    float(value),
+                    rtol=0.0,
+                    atol=1e-10,
+                )
+            )
+        )
+        for value in catalog_settings['thresholds']
+    }
+    depths = pd.to_numeric(
+        candidate.get('peak_depth_m', pd.Series(dtype=float)),
+        errors='coerce',
+    ).replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+    if depths.size:
+        quantiles = {
+            'count': int(depths.size),
+            'min': float(np.min(depths)),
+            'q25': float(np.quantile(depths, 0.25)),
+            'median': float(np.median(depths)),
+            'q75': float(np.quantile(depths, 0.75)),
+            'max': float(np.max(depths)),
+        }
+    else:
+        quantiles = {
+            'count': 0,
+            'min': None,
+            'q25': None,
+            'median': None,
+            'q75': None,
+            'max': None,
+        }
+    quality_audit = diagnostic_result.get('quality_audit') or {}
+    if quality_audit.get('lower_search_level_m') is None:
+        depth = _ofes_tracer_coordinates(
+            catalog_reference_date
+        )[2]
+        candidate_depth = depth[
+            (depth >= float(catalog_settings['candidate_depth_min_m']))
+            & (depth <= float(catalog_settings['candidate_depth_max_m']))
+        ]
+        lower_level = float(candidate_depth[0])
+        upper_level = float(candidate_depth[-1])
+    else:
+        lower_level = float(quality_audit['lower_search_level_m'])
+        upper_level = float(quality_audit['upper_search_level_m'])
+    depth = _ofes_tracer_coordinates(
+        catalog_reference_date
+    )[2]
+    first_gate_level = int(
+        np.searchsorted(
+            np.asarray(depth, dtype=float),
+            float(settings['depth_gates_m'][0]),
+            side='left',
+        )
+    )
+    effective_index = max(1, first_gate_level)
+    effective_index = min(effective_index, len(depth) - 1)
+    return {
+        'catalog_event_count': int(len(candidate)),
+        'catalog_rank_eligible_count': int(
+            np.count_nonzero(
+                candidate.get(
+                    'rank_eligible',
+                    pd.Series(False, index=candidate.index),
+                ).astype(bool)
+            )
+        ),
+        'catalog_event_counts_by_threshold': counts,
+        'catalog_peak_depth_distribution': quantiles,
+        'actual_lower_search_level_m': lower_level,
+        'actual_upper_search_level_m': upper_level,
+        'effective_detector_minimum_m': float(depth[effective_index]),
+        'candidate_depth_max_m': float(
+            catalog_settings['candidate_depth_max_m']
+        ),
+    }
+
+
+def _ofes_depth_gate_event_rows(
+    diagnostic_result: Mapping[str, Any],
+    settings: dict,
+    catalog_metadata: dict,
+) -> pd.DataFrame:
+    """组装单个 gate 的质量事件、峰值诊断和可空分类字段。"""
+    quality = diagnostic_result['quality_event_catalog'].copy()
+    threshold = float(settings['candidate_threshold'])
+    quality = quality.loc[
+        np.isclose(
+            quality['threshold'].to_numpy(dtype=float),
+            threshold,
+            rtol=0.0,
+            atol=1e-10,
+        )
+        & quality['quality_eligible'].astype(bool)
+    ].copy()
+    quality['event_id'] = quality['event_id'].astype(str)
+    quality['peak_daily_object_key'] = (
+        quality['peak_daily_object_key'].astype(str)
+    )
+    daily = diagnostic_result['daily_diagnostics'].copy()
+    daily['event_id'] = daily['event_id'].astype(str)
+    daily['daily_object_key'] = daily['daily_object_key'].astype(str)
+    peak = daily.loc[
+        daily['daily_object_key'].isin(
+            quality['peak_daily_object_key']
+        )
+    ].copy()
+    if peak['daily_object_key'].duplicated().any():
+        raise RuntimeError(
+            'Depth-gate sensitivity found duplicate peak diagnostics.'
+        )
+    peak_columns = [
+        'event_id',
+        'daily_object_key',
+        'diagnostic_passed',
+        'diagnostic_status',
+        'water_mass_do_contrast',
+        'heave_do_contribution',
+        'decomposition_closure_error',
+        'rossby_number',
+        'normalized_strain',
+    ]
+    missing_peak_columns = sorted(
+        set(peak_columns).difference(peak.columns)
+    )
+    if missing_peak_columns:
+        raise KeyError(
+            'Depth-gate sensitivity peak diagnostics lack columns: '
+            f'{missing_peak_columns}'
+        )
+    peak = peak[peak_columns].rename(
+        columns={
+            'daily_object_key': 'peak_daily_object_key',
+            'diagnostic_passed': 'peak_full_diagnostic_passed',
+            'diagnostic_status': 'peak_diagnostic_status',
+            'water_mass_do_contrast': 'peak_water_mass_do_contrast',
+            'heave_do_contribution': 'peak_heave_do_contribution',
+            'decomposition_closure_error': (
+                'peak_decomposition_closure_error'
+            ),
+            'rossby_number': 'peak_rossby_number',
+            'normalized_strain': 'peak_normalized_strain',
+        }
+    )
+    rows = quality.merge(
+        peak,
+        on=['event_id', 'peak_daily_object_key'],
+        how='left',
+        validate='one_to_one',
+    )
+    event_summary = diagnostic_result[
+        'event_diagnostic_summary'
+    ].copy()
+    event_summary['event_id'] = event_summary['event_id'].astype(str)
+    summary_columns = [
+        'event_id',
+        'diagnosed_days',
+        'passed_days',
+        'all_sampled_days_passed',
+    ]
+    missing_summary_columns = sorted(
+        set(summary_columns).difference(event_summary.columns)
+    )
+    if missing_summary_columns:
+        raise KeyError(
+            'Depth-gate sensitivity event summaries lack columns: '
+            f'{missing_summary_columns}'
+        )
+    rows = rows.merge(
+        event_summary[summary_columns],
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    rows['minimum_depth_m'] = float(settings['depth_gates_m'][0])
+    rows['actual_lower_search_level_m'] = float(
+        catalog_metadata['actual_lower_search_level_m']
+    )
+    rows['actual_upper_search_level_m'] = float(
+        catalog_metadata['actual_upper_search_level_m']
+    )
+    rows['effective_detector_minimum_m'] = float(
+        catalog_metadata['effective_detector_minimum_m']
+    )
+    rows['peak_full_diagnostic_passed'] = rows[
+        'peak_full_diagnostic_passed'
+    ].astype('boolean')
+    rows['all_sampled_days_complete'] = rows[
+        'all_sampled_days_passed'
+    ].astype('boolean')
+    water_mass = pd.to_numeric(
+        rows['peak_water_mass_do_contrast'], errors='coerce'
+    )
+    heave = pd.to_numeric(
+        rows['peak_heave_do_contribution'], errors='coerce'
+    )
+    closure = pd.to_numeric(
+        rows['peak_decomposition_closure_error'], errors='coerce'
+    )
+    finite_decomposition = (
+        np.isfinite(water_mass.to_numpy(dtype=float))
+        & np.isfinite(heave.to_numpy(dtype=float))
+        & np.isfinite(closure.to_numpy(dtype=float))
+    )
+    decomposition_passed = finite_decomposition & (
+        np.abs(closure.to_numpy(dtype=float)) <= 1e-10
+    )
+    water_abs = water_mass.abs()
+    heave_abs = heave.abs()
+    total = water_abs + heave_abs
+    finite_total = np.isfinite(total.to_numpy(dtype=float)) & (
+        total.to_numpy(dtype=float) > 0
+    )
+    decomposition_passed &= finite_total
+    rows['peak_decomposition_eligible'] = pd.Series(
+        pd.NA, index=rows.index, dtype='boolean'
+    )
+    rows.loc[finite_decomposition, 'peak_decomposition_eligible'] = (
+        decomposition_passed[finite_decomposition]
+    )
+    fraction_valid = decomposition_passed
+    rows['water_mass_absolute_fraction'] = np.nan
+    rows.loc[fraction_valid, 'water_mass_absolute_fraction'] = (
+        water_abs.loc[fraction_valid]
+        / total.loc[fraction_valid]
+    )
+    rows['heave_absolute_fraction'] = np.nan
+    rows.loc[fraction_valid, 'heave_absolute_fraction'] = (
+        1.0 - rows.loc[
+            fraction_valid, 'water_mass_absolute_fraction'
+        ]
+    )
+    boolean_columns = (
+        'water_mass_dominated',
+        'anticyclonic',
+        'rotation_dominated',
+        'anticyclonic_rotation',
+    )
+    for column in boolean_columns:
+        rows[column] = pd.Series(
+            pd.NA, index=rows.index, dtype='boolean'
+        )
+    rows.loc[fraction_valid, 'water_mass_dominated'] = (
+        water_abs.loc[fraction_valid]
+        > heave_abs.loc[fraction_valid]
+    )
+    rossby = pd.to_numeric(
+        rows['peak_rossby_number'], errors='coerce'
+    )
+    strain = pd.to_numeric(
+        rows['peak_normalized_strain'], errors='coerce'
+    )
+    finite_kinematics = (
+        np.isfinite(rossby.to_numpy(dtype=float))
+        & np.isfinite(strain.to_numpy(dtype=float))
+    )
+    rows['peak_kinematic_eligible'] = pd.Series(
+        pd.NA, index=rows.index, dtype='boolean'
+    )
+    rows.loc[finite_kinematics, 'peak_kinematic_eligible'] = True
+    rows.loc[finite_kinematics, 'anticyclonic'] = (
+        rossby.loc[finite_kinematics] < 0
+    )
+    rows.loc[finite_kinematics, 'rotation_dominated'] = (
+        rossby.loc[finite_kinematics].abs()
+        > strain.loc[finite_kinematics]
+    )
+    rows.loc[finite_kinematics, 'anticyclonic_rotation'] = (
+        (rossby.loc[finite_kinematics] < 0)
+        & (
+            rossby.loc[finite_kinematics].abs()
+            > strain.loc[finite_kinematics]
+        )
+    )
+    return rows.sort_values(
+        'quality_rank_within_threshold', kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_depth_gate_summary(
+    event_rows: pd.DataFrame,
+    settings: dict,
+    catalog_metadata: dict,
+    *,
+    boundary_excluded: bool = False,
+) -> dict:
+    """计算一个 depth gate 的主或边界排除 summary。"""
+    decomposition_eligible = event_rows[
+        'peak_decomposition_eligible'
+    ].eq(True).fillna(False)
+    kinematic_eligible = event_rows[
+        'peak_kinematic_eligible'
+    ].eq(True).fillna(False)
+    full_diagnostic_passed = event_rows[
+        'peak_full_diagnostic_passed'
+    ].eq(True).fillna(False)
+    decomposition_rows = event_rows.loc[decomposition_eligible].copy()
+    fraction_rows = decomposition_rows.loc[
+        np.isfinite(
+            decomposition_rows['water_mass_absolute_fraction'].to_numpy(
+                dtype=float
+            )
+        )
+    ]
+    heave_median, heave_ci, heave_n = (
+        _ofes_depth_gate_bootstrap_median(
+            fraction_rows['heave_absolute_fraction'],
+            int(settings['bootstrap_replicates']),
+            int(settings['random_seed']),
+        )
+    )
+    water_median, water_ci, water_n = (
+        _ofes_depth_gate_bootstrap_median(
+            fraction_rows['water_mass_absolute_fraction'],
+            int(settings['bootstrap_replicates']),
+            int(settings['random_seed']),
+        )
+    )
+    dominated = event_rows['water_mass_dominated']
+    dominated_count = int((dominated == True).sum())
+    dominated_total = int(dominated.notna().sum())
+    if dominated_total:
+        dominated_fraction = float(dominated_count / dominated_total)
+        dominated_ci = _binomial_wilson_interval(
+            dominated_count, dominated_total
+        )
+        dominated_ci_list: list[float | None] = [
+            float(dominated_ci[0]),
+            float(dominated_ci[1]),
+        ]
+    else:
+        dominated_fraction = None
+        dominated_ci_list = [None, None]
+    peak_depth = pd.to_numeric(
+        event_rows['peak_depth_m'], errors='coerce'
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    water_contrast = pd.to_numeric(
+        fraction_rows['peak_water_mass_do_contrast'], errors='coerce'
+    ).abs().dropna()
+    heave_contrast = pd.to_numeric(
+        fraction_rows['peak_heave_do_contribution'], errors='coerce'
+    ).abs().dropna()
+    summary = {
+        'minimum_depth_m': float(settings['depth_gates_m'][0]),
+        'actual_lower_search_level_m': float(
+            catalog_metadata['actual_lower_search_level_m']
+        ),
+        'actual_upper_search_level_m': float(
+            catalog_metadata['actual_upper_search_level_m']
+        ),
+        'effective_detector_minimum_m': float(
+            catalog_metadata['effective_detector_minimum_m']
+        ),
+        'candidate_depth_max_m': float(
+            catalog_metadata['candidate_depth_max_m']
+        ),
+        'boundary_excluded': bool(boundary_excluded),
+        'quality_event_count': int(len(event_rows)),
+        'peak_decomposition_eligible_count': int(
+            decomposition_eligible.sum()
+        ),
+        'peak_decomposition_missing_count': int(
+            (~decomposition_eligible).sum()
+        ),
+        'peak_decomposition_failed_count': int(
+            event_rows['peak_decomposition_eligible'].eq(False).sum()
+        ),
+        'peak_decomposition_unavailable_count': int(
+            event_rows['peak_decomposition_eligible'].isna().sum()
+        ),
+        'peak_kinematic_eligible_count': int(
+            kinematic_eligible.sum()
+        ),
+        'peak_kinematic_missing_count': int(
+            (~kinematic_eligible).sum()
+        ),
+        'peak_kinematic_unavailable_count': int(
+            event_rows['peak_kinematic_eligible'].isna().sum()
+        ),
+        'peak_full_diagnostic_passed_count': int(
+            full_diagnostic_passed.sum()
+        ),
+        'peak_full_diagnostic_failed_count': int(
+            event_rows['peak_full_diagnostic_passed'].eq(False).sum()
+        ),
+        'peak_full_diagnostic_unavailable_count': int(
+            event_rows['peak_full_diagnostic_passed'].isna().sum()
+        ),
+        'peak_fraction_eligible_count': int(len(fraction_rows)),
+        'all_sampled_days_complete_count': int(
+            (event_rows['all_sampled_days_complete'] == True).sum()
+        ),
+        'lower_search_boundary_peak_count': int(
+            event_rows['peak_on_lower_search_level'].astype(bool).sum()
+        ),
+        'upper_search_boundary_peak_count': int(
+            event_rows['peak_on_upper_search_level'].astype(bool).sum()
+        ),
+        'median_peak_depth_m': (
+            float(peak_depth.median()) if not peak_depth.empty else None
+        ),
+        'median_water_mass_absolute_fraction': water_median,
+        'median_water_mass_absolute_fraction_bootstrap95': water_ci,
+        'median_heave_absolute_fraction': heave_median,
+        'median_heave_absolute_fraction_bootstrap95': heave_ci,
+        'median_abs_water_mass_do_contrast': (
+            float(water_contrast.median())
+            if not water_contrast.empty else None
+        ),
+        'median_abs_heave_do_contribution': (
+            float(heave_contrast.median())
+            if not heave_contrast.empty else None
+        ),
+        'water_mass_dominated_count': dominated_count,
+        'water_mass_dominated_denominator': dominated_total,
+        'water_mass_dominated_fraction': dominated_fraction,
+        'water_mass_dominated_wilson95': dominated_ci_list,
+        'anticyclonic_denominator': int(
+            event_rows['anticyclonic'].notna().sum()
+        ),
+        'rotation_dominated_denominator': int(
+            event_rows['rotation_dominated'].notna().sum()
+        ),
+        'anticyclonic_rotation_denominator': int(
+            event_rows['anticyclonic_rotation'].notna().sum()
+        ),
+        'anticyclonic_count': int(
+            (event_rows['anticyclonic'] == True).sum()
+        ),
+        'rotation_dominated_count': int(
+            (event_rows['rotation_dominated'] == True).sum()
+        ),
+        'anticyclonic_rotation_count': int(
+            (event_rows['anticyclonic_rotation'] == True).sum()
+        ),
+        'catalog_event_count': int(catalog_metadata['catalog_event_count']),
+        'catalog_rank_eligible_count': int(
+            catalog_metadata['catalog_rank_eligible_count']
+        ),
+        'catalog_event_counts_by_threshold': catalog_metadata[
+            'catalog_event_counts_by_threshold'
+        ],
+        'catalog_peak_depth_distribution': catalog_metadata[
+            'catalog_peak_depth_distribution'
+        ],
+        'bootstrap_replicates': int(settings['bootstrap_replicates']),
+        'random_seed': int(settings['random_seed']),
+        'bootstrap_water_mass_fraction_n': int(water_n),
+        'bootstrap_heave_fraction_n': int(heave_n),
+        'cumulative_depth_gates_are_not_independent_samples': True,
+    }
+    return summary
+
+
+def _ofes_depth_gate_summary_frame(
+    summaries: Sequence[Mapping[str, Any]],
+) -> pd.DataFrame:
+    """把 gate summary 的嵌套 provenance 字段编码成 parquet 列。"""
+    frame = pd.DataFrame(list(summaries))
+    for column in (
+        'median_water_mass_absolute_fraction_bootstrap95',
+        'median_heave_absolute_fraction_bootstrap95',
+        'water_mass_dominated_wilson95',
+        'catalog_event_counts_by_threshold',
+        'catalog_peak_depth_distribution',
+    ):
+        if column in frame.columns:
+            frame[column] = frame[column].map(
+                lambda value: json.dumps(
+                    value, ensure_ascii=False, default=_ofes_json_default
+                )
+            )
+    return frame
+
+
+def _ofes_depth_gate_restore_summary_frame(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """恢复 loader 读取的 gate summary 嵌套字段。"""
+    result = frame.copy()
+    for column in (
+        'median_water_mass_absolute_fraction_bootstrap95',
+        'median_heave_absolute_fraction_bootstrap95',
+        'water_mass_dominated_wilson95',
+        'catalog_event_counts_by_threshold',
+        'catalog_peak_depth_distribution',
+    ):
+        if column in result.columns:
+            result[column] = result[column].map(
+                lambda value: json.loads(value)
+                if isinstance(value, str) else value
+            )
+    return result
+
+
+def _ofes_depth_gate_write_outputs(
+    event_rows: pd.DataFrame,
+    secondary_rows: pd.DataFrame,
+    summary: dict,
+    secondary_summary: dict,
+    paths: Mapping[str, Path],
+) -> None:
+    """原子写入单个 depth gate 的表格和 summary。"""
+    paths['gate_root'].mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(event_rows, paths['event_table'])
+    _atomic_write_parquet(
+        secondary_rows, paths['secondary_event_table']
+    )
+    _atomic_write_parquet(
+        _ofes_depth_gate_summary_frame([summary]),
+        paths['summary_table'],
+    )
+    _ofes_atomic_write_json(
+        {
+            'summary': summary,
+            'secondary_summary': secondary_summary,
+            'outputs': {
+                key: str(value)
+                for key, value in paths.items()
+                if key != 'gate_root'
+            },
+        },
+        paths['summary_json'],
+    )
+
+
+def _ofes_plot_depth_gate_sensitivity(
+    payload: Mapping[str, Any],
+    output_path: str | Path,
+    *,
+    dpi: int = 600,
+    save_fig: bool = True,
+    show_fig: bool = False,
+    close_fig: bool = True,
+) -> tuple[Path | None, Any]:
+    """绘制 OFES depth-gate 主估计和边界排除估计。"""
+    summaries = payload['gate_summaries'].copy()
+    summaries = summaries.sort_values(
+        'minimum_depth_m', kind='mergesort'
+    ).reset_index(drop=True)
+    secondary_source = payload.get('secondary_gate_summaries')
+    if secondary_source is None:
+        raise KeyError(
+            'Depth-gate sensitivity plotting requires '
+            'secondary_gate_summaries.'
+        )
+    secondary_summaries = (
+        secondary_source.copy()
+        if isinstance(secondary_source, pd.DataFrame)
+        else pd.DataFrame(list(secondary_source))
+    )
+    if secondary_summaries.empty:
+        raise ValueError(
+            'Depth-gate sensitivity plotting requires boundary-excluded summaries.'
+        )
+    if 'gate_tag' in summaries.columns and 'gate_tag' in secondary_summaries.columns:
+        secondary_summaries = (
+            secondary_summaries.set_index('gate_tag')
+            .reindex(summaries['gate_tag'])
+            .reset_index()
+        )
+    else:
+        secondary_summaries = secondary_summaries.sort_values(
+            'minimum_depth_m', kind='mergesort'
+        ).reset_index(drop=True)
+        if len(secondary_summaries) != len(summaries):
+            raise ValueError(
+                'Depth-gate sensitivity main and boundary-excluded summaries '
+                'have different gate counts.'
+            )
+    event_tables = payload['event_tables']
+    secondary_tables = payload.get('secondary_event_tables')
+    if secondary_tables is None:
+        raise KeyError(
+            'Depth-gate sensitivity plotting requires secondary_event_tables.'
+        )
+
+    def _summary_intervals(frame: pd.DataFrame, column: str) -> np.ndarray:
+        intervals = np.full((len(frame), 2), np.nan, dtype=float)
+        if column not in frame.columns:
+            return intervals
+        for index, value in enumerate(frame[column].tolist()):
+            if isinstance(value, (list, tuple, np.ndarray)) and len(value) == 2:
+                intervals[index] = np.asarray(value, dtype=float)
+        return intervals
+
+    def _event_values(table: pd.DataFrame) -> np.ndarray:
+        eligible = table['peak_decomposition_eligible'].eq(True)
+        return pd.to_numeric(
+            table.loc[eligible, 'heave_absolute_fraction'],
+            errors='coerce',
+        ).dropna().to_numpy(dtype=float)
+
+    labels = []
+    values: list[np.ndarray] = []
+    secondary_values: list[np.ndarray] = []
+    for row in summaries.itertuples(index=False):
+        gate = float(row.minimum_depth_m)
+        labels.append(
+            f'{_ofes_depth_gate_tag(gate).replace("depth", "").replace("m", " m")}\n'
+            + (
+                'primary definition'
+                if np.isclose(gate, 300.0)
+                else (
+                    'nested deep-process'
+                    if np.isclose(gate, 500.0)
+                    else 'upper-ocean'
+                )
+            )
+        )
+        table = event_tables[_ofes_depth_gate_tag(gate)]
+        values.append(_event_values(table))
+        secondary_values.append(
+            _event_values(
+                secondary_tables[_ofes_depth_gate_tag(gate)]
+            )
+        )
+    fig, axes = plt.subplots(
+        1, 2, figsize=(13.5, 5.8), constrained_layout=True
+    )
+    axis = axes[0]
+    positions = np.arange(1, len(values) + 1, dtype=float)
+    box_values = [
+        array for array in values if array.size
+    ]
+    box_positions = [
+        position
+        for position, array in zip(positions, values)
+        if array.size
+    ]
+    if box_values:
+        axis.boxplot(
+            box_values,
+            positions=np.asarray(box_positions) - 0.13,
+            widths=0.28,
+            patch_artist=True,
+            showfliers=False,
+            boxprops={'facecolor': '#dbeafe', 'edgecolor': '#2563eb'},
+            medianprops={'color': '#1d4ed8', 'linewidth': 1.5},
+            whiskerprops={'color': '#2563eb'},
+            capprops={'color': '#2563eb'},
+        )
+    secondary_box_values = [
+        array for array in secondary_values if array.size
+    ]
+    secondary_box_positions = [
+        position
+        for position, array in zip(positions, secondary_values)
+        if array.size
+    ]
+    if secondary_box_values:
+        axis.boxplot(
+            secondary_box_values,
+            positions=np.asarray(secondary_box_positions) + 0.13,
+            widths=0.28,
+            patch_artist=True,
+            showfliers=False,
+            boxprops={
+                'facecolor': '#fff7ed',
+                'edgecolor': '#ea580c',
+            },
+            medianprops={'color': '#c2410c', 'linewidth': 1.5},
+            whiskerprops={'color': '#ea580c'},
+            capprops={'color': '#ea580c'},
+        )
+    for index, array in enumerate(values, start=1):
+        if array.size:
+            jitter = np.linspace(-0.08, 0.08, array.size)
+            axis.scatter(
+                np.full(array.size, index - 0.13) + jitter,
+                array,
+                s=10,
+                color='#64748b',
+                alpha=0.32,
+                label='main estimate' if index == 1 else None,
+                zorder=2,
+            )
+    for index, array in enumerate(secondary_values, start=1):
+        if array.size:
+            jitter = np.linspace(-0.08, 0.08, array.size)
+            axis.scatter(
+                np.full(array.size, index + 0.13) + jitter,
+                array,
+                s=10,
+                facecolors='none',
+                edgecolors='#ea580c',
+                alpha=0.18,
+                label='boundary-excluded estimate' if index == 1 else None,
+                zorder=2,
+            )
+    medians = pd.to_numeric(
+        summaries['median_heave_absolute_fraction'], errors='coerce'
+    ).to_numpy(dtype=float)
+    intervals = _summary_intervals(
+        summaries, 'median_heave_absolute_fraction_bootstrap95'
+    )
+    low = intervals[:, 0]
+    high = intervals[:, 1]
+    finite_medians = (
+        np.isfinite(medians)
+        & np.isfinite(low)
+        & np.isfinite(high)
+    )
+    if np.any(finite_medians):
+        axis.errorbar(
+            positions[finite_medians] - 0.13,
+            medians[finite_medians],
+            yerr=np.vstack(
+                (
+                    medians[finite_medians] - low[finite_medians],
+                    high[finite_medians] - medians[finite_medians],
+                )
+            ),
+            fmt='o',
+            color='#dc2626',
+            capsize=4,
+            label='main median, bootstrap 95% CI',
+            zorder=3,
+        )
+    secondary_medians = pd.to_numeric(
+        secondary_summaries['median_heave_absolute_fraction'],
+        errors='coerce',
+    ).to_numpy(dtype=float)
+    secondary_intervals = _summary_intervals(
+        secondary_summaries,
+        'median_heave_absolute_fraction_bootstrap95',
+    )
+    secondary_finite = (
+        np.isfinite(secondary_medians)
+        & np.isfinite(secondary_intervals[:, 0])
+        & np.isfinite(secondary_intervals[:, 1])
+    )
+    if np.any(secondary_finite):
+        axis.errorbar(
+            positions[secondary_finite] + 0.13,
+            secondary_medians[secondary_finite],
+            yerr=np.vstack(
+                (
+                    secondary_medians[secondary_finite]
+                    - secondary_intervals[secondary_finite, 0],
+                    secondary_intervals[secondary_finite, 1]
+                    - secondary_medians[secondary_finite],
+                )
+            ),
+            fmt='D',
+            markerfacecolor='white',
+            markeredgecolor='#c2410c',
+            color='#c2410c',
+            capsize=4,
+            label='boundary-excluded median, bootstrap 95% CI',
+            zorder=3,
+        )
+    axis.set_xticks(positions, labels)
+    axis.set_ylim(0, 1)
+    axis.set_ylabel('Heave absolute fraction')
+    axis.set_title('A  Heave contribution by depth gate')
+    axis.legend(frameon=False, loc='upper left', fontsize=8)
+    axis.grid(axis='y', alpha=0.2)
+
+    axis = axes[1]
+    fractions = pd.to_numeric(
+        summaries['water_mass_dominated_fraction'], errors='coerce'
+    ).to_numpy(dtype=float)
+    intervals = _summary_intervals(
+        summaries, 'water_mass_dominated_wilson95'
+    )
+    interval_low = intervals[:, 0]
+    interval_high = intervals[:, 1]
+    finite_fractions = (
+        np.isfinite(fractions)
+        & np.isfinite(interval_low)
+        & np.isfinite(interval_high)
+    )
+    bar_width = 0.30
+    axis.bar(
+        positions - 0.17,
+        np.where(finite_fractions, fractions, 0.0),
+        color='#93c5fd',
+        edgecolor='#1d4ed8',
+        width=bar_width,
+        label='main estimate',
+    )
+    if np.any(finite_fractions):
+        axis.errorbar(
+            positions[finite_fractions] - 0.17,
+            fractions[finite_fractions],
+            yerr=np.vstack(
+                (
+                    fractions[finite_fractions]
+                    - interval_low[finite_fractions],
+                    interval_high[finite_fractions]
+                    - fractions[finite_fractions],
+                )
+            ),
+            fmt='none',
+            ecolor='#111827',
+            capsize=4,
+            linewidth=1.2,
+        )
+    secondary_fractions = pd.to_numeric(
+        secondary_summaries['water_mass_dominated_fraction'],
+        errors='coerce',
+    ).to_numpy(dtype=float)
+    secondary_intervals = _summary_intervals(
+        secondary_summaries, 'water_mass_dominated_wilson95'
+    )
+    secondary_finite = (
+        np.isfinite(secondary_fractions)
+        & np.isfinite(secondary_intervals[:, 0])
+        & np.isfinite(secondary_intervals[:, 1])
+    )
+    axis.bar(
+        positions + 0.17,
+        np.where(secondary_finite, secondary_fractions, 0.0),
+        color='#fff7ed',
+        edgecolor='#ea580c',
+        hatch='//',
+        width=bar_width,
+        label='boundary-excluded estimate',
+    )
+    if np.any(secondary_finite):
+        axis.errorbar(
+            positions[secondary_finite] + 0.17,
+            secondary_fractions[secondary_finite],
+            yerr=np.vstack(
+                (
+                    secondary_fractions[secondary_finite]
+                    - secondary_intervals[secondary_finite, 0],
+                    secondary_intervals[secondary_finite, 1]
+                    - secondary_fractions[secondary_finite],
+                )
+            ),
+            fmt='none',
+            ecolor='#c2410c',
+            capsize=4,
+            linewidth=1.2,
+        )
+    for index, row in enumerate(summaries.itertuples(index=False), start=1):
+        fraction_value = pd.to_numeric(
+            pd.Series([row.water_mass_dominated_fraction]),
+            errors='coerce',
+        ).iloc[0]
+        if pd.notna(fraction_value):
+            axis.text(
+                index - 0.17,
+                min(0.98, float(fraction_value) + 0.045),
+                f'{int(row.water_mass_dominated_count)}/{int(row.water_mass_dominated_denominator)}',
+                ha='center',
+                va='bottom',
+                fontsize=8,
+            )
+        secondary_row = secondary_summaries.iloc[index - 1]
+        secondary_fraction = pd.to_numeric(
+            pd.Series([secondary_row['water_mass_dominated_fraction']]),
+            errors='coerce',
+        ).iloc[0]
+        same_as_main = (
+            pd.notna(fraction_value)
+            and pd.notna(secondary_fraction)
+            and np.isclose(
+                float(fraction_value),
+                float(secondary_fraction),
+                rtol=0.0,
+                atol=1e-12,
+            )
+            and int(row.water_mass_dominated_count)
+            == int(secondary_row['water_mass_dominated_count'])
+            and int(row.water_mass_dominated_denominator)
+            == int(secondary_row['water_mass_dominated_denominator'])
+        )
+        if pd.notna(secondary_fraction) and not same_as_main:
+            axis.text(
+                index + 0.17,
+                min(0.98, float(secondary_fraction) + 0.045),
+                f'{int(secondary_row["water_mass_dominated_count"])}'
+                f'/{int(secondary_row["water_mass_dominated_denominator"])}',
+                ha='center',
+                va='bottom',
+                fontsize=8,
+            )
+    axis.set_xticks(positions, labels)
+    axis.set_ylim(0, 1)
+    axis.set_ylabel('Water-mass-dominated proportion')
+    axis.set_title('B  Water-mass dominance')
+    axis.legend(
+        frameon=False,
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=2,
+        fontsize=8,
+    )
+    axis.grid(axis='y', alpha=0.2)
+    target = Path(output_path)
+    if save_fig:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(target, dpi=int(dpi), bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    if close_fig:
+        plt.close(fig)
+    return (target if save_fig else None), fig
+
+
+def run_ofes_depth_gate_sensitivity(
+    start_date: str | pd.Timestamp = '2003-01-01',
+    end_date: str | pd.Timestamp = '2003-12-31',
+    *,
+    depth_gates_m: Sequence[float] | None = None,
+    candidate_depth_max_m: float | None = None,
+    candidate_threshold: float | None = None,
+    bootstrap_replicates: int | None = None,
+    random_seed: int | None = None,
+    output_dir: str | Path | None = None,
+    validate_preflight: bool = True,
+) -> dict:
+    """运行 OFES 累积深度门 sensitivity 并汇总峰值分解。
+
+    该入口为调用者请求的累积深度门分别保留 catalog 与 quality diagnostic
+    语义。默认只比较 100 m 与 300 m：100 m 作为 shallow sensitivity，300 m
+    作为 primary definition。300 m
+    优先读取正式 `event_catalog` 与 `quality_event_diagnostics`，缺失时按
+    当前正式配置重建。所有 gate 保留 DO20/35/50 catalog，但 summary 只取
+    candidate threshold 对应的 DO50 事件。
+
+    参数:
+        - start_date (str | pd.Timestamp): 年度扫描起始日期（闭区间），默认 2003-01-01。
+        - end_date (str | pd.Timestamp): 年度扫描结束日期（闭区间），默认 2003-12-31。
+        - depth_gates_m (Sequence[float] | None): 累积最浅异常深度门；None 使用 YAML 配置。
+        - candidate_depth_max_m (float | None): catalog 最深候选深度；None 使用 YAML 配置。
+        - candidate_threshold (float | None): summary 使用的候选阈值；None 使用 YAML 配置。
+        - bootstrap_replicates (int | None): median fraction bootstrap 次数；None 使用 YAML 配置。
+        - random_seed (int | None): bootstrap 随机种子；None 使用 YAML 配置。
+        - output_dir (str | Path | None): sensitivity 输出根目录；None 使用固定 OFES 路径。
+        - validate_preflight (bool): 新建 catalog 时是否运行 mask/detector parity preflight，默认 True。
+
+    返回:
+        - dict: 含 gate summaries、事件表、边界排除 summaries、catalog 路径和独立图件路径。
+
+    输出:
+        - `<output_dir>/depth<gate>m/event_catalog/` 与 `<output_dir>/depth<gate>m/quality_event_diagnostics/`。
+        - `<output_dir>/depth<gate>m/event_summary.parquet`、`secondary_event_summary.parquet`、`summary.parquet` 和 `summary.json`。
+        - `<output_dir>/gate_summaries.parquet`、`sensitivity_summary.json` 和 `depth_gate_sensitivity.png`。
+
+    说明:
+        - 默认 100/300 m 是 cumulative depth gates，彼此重叠且改变最强峰选择，不能视为独立样本；调用者仍可显式请求其他 gate，但不执行 gate 间 t test、Wilcoxon 或显著性 p 值检验。
+        - decomposition、kinematic 和 full diagnostic 分别使用各自的 peak-day 资格门；质量事件总数与 all-sampled-day 完整分母也单独报告。
+        - 300 m 正式输出不写入 sensitivity 子目录，也不因本入口覆盖；100 m 的实际有效检测最低层由 delivered depth 和 detector shoulder 共同决定，单独报告而不强行等同于 100 m。
+        - 本入口不启动轨迹、通风、McCoy、PET、grid-SCV、生命周期或 retention 诊断。
+    """
+    settings = _ofes_depth_gate_sensitivity_settings(
+        depth_gates_m,
+        candidate_depth_max_m,
+        candidate_threshold,
+        bootstrap_replicates,
+        random_seed,
+    )
+    catalog_settings = _ofes_delta_do_catalog_settings()
+    expected_thresholds = (20.0, 35.0, 50.0)
+    if catalog_settings['thresholds'] != expected_thresholds:
+        raise ValueError(
+            'Depth-gate sensitivity requires OFES catalog thresholds '
+            '[20.0, 35.0, 50.0].'
+        )
+    if float(settings['candidate_threshold']) not in expected_thresholds:
+        raise ValueError(
+            'candidate_threshold must be one of the DO20/35/50 catalog thresholds.'
+        )
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError('end_date must be on or after start_date.')
+    root = _ofes_analysis_output_dir(
+        settings['output_subdir'], output_dir
+    )
+    request = {
+        'start_date': start.strftime('%Y-%m-%d'),
+        'end_date': end.strftime('%Y-%m-%d'),
+        'settings': settings,
+        'catalog_thresholds': expected_thresholds,
+    }
+    summary_path = root / 'sensitivity_summary.json'
+    if summary_path.exists():
+        previous = json.loads(summary_path.read_text(encoding='utf-8'))
+        previous_request = previous.get('request')
+        compatible_previous = False
+        if previous_request is None:
+            compatible_previous = True
+        elif _ofes_requests_equal(previous_request, request):
+            compatible_previous = True
+        else:
+            previous_settings = dict(
+                previous_request.get('settings', {}) or {}
+            )
+            current_settings = dict(request['settings'])
+            previous_gates = {
+                float(value)
+                for value in previous_settings.pop('depth_gates_m', [])
+            }
+            current_gates = {
+                float(value)
+                for value in current_settings.pop('depth_gates_m', [])
+            }
+            compatible_previous = bool(
+                current_gates.issubset(previous_gates)
+                and _ofes_requests_equal(
+                    {
+                        **previous_request,
+                        'settings': previous_settings,
+                    },
+                    {
+                        **request,
+                        'settings': current_settings,
+                    },
+                )
+            )
+        if not compatible_previous:
+            raise RuntimeError(
+                'Existing depth-gate sensitivity output was created for a '
+                'different request. Use another output_dir or remove the '
+                'existing directory.'
+            )
+
+    running_summary = {
+        'analysis': 'ofes_depth_gate_sensitivity',
+        'status': 'running',
+        'request': request,
+        'scientific_scope': {
+            'primary_definition': 'DO50, anomaly peak >=300 m, 300-1000 m',
+            'deep_process_subset': '500-1000 m',
+            'sensitivity_label': 'upper-ocean depth sensitivity',
+        },
+        'cumulative_depth_gates_are_not_independent_samples': True,
+    }
+    _ofes_atomic_write_json(running_summary, summary_path)
+    gate_summaries: list[dict] = []
+    secondary_gate_summaries: list[dict] = []
+    event_tables: dict[str, pd.DataFrame] = {}
+    secondary_tables: dict[str, pd.DataFrame] = {}
+    gate_paths: dict[str, dict[str, Path]] = {}
+    try:
+        for gate in settings['depth_gates_m']:
+            tag = _ofes_depth_gate_tag(gate)
+            paths = _ofes_depth_gate_paths(root, gate)
+            gate_paths[tag] = paths
+            if np.isclose(gate, 300.0, rtol=0.0, atol=1e-10):
+                catalog_dir = _ofes_analysis_output_path('event_catalog')
+                diagnostic_dir = _ofes_analysis_output_path(
+                    'quality_event_diagnostics'
+                )
+                catalog_overrides = None
+            else:
+                catalog_dir = paths['catalog_dir']
+                diagnostic_dir = paths['diagnostic_dir']
+                catalog_overrides = {
+                    'thresholds': expected_thresholds,
+                    'candidate_depth_min_m': float(gate),
+                    'candidate_depth_max_m': float(
+                        settings['candidate_depth_max_m']
+                    ),
+                }
+            catalog_result = build_ofes_delta_do_event_catalog(
+                start_date=start,
+                end_date=end,
+                catalog_overrides=catalog_overrides,
+                output_dir=catalog_dir,
+                validate_preflight=validate_preflight,
+            )
+            include_negative_control = np.isclose(
+                gate, 300.0, rtol=0.0, atol=1e-10
+            )
+            formal_quality_outputs = (
+                diagnostic_dir / 'quality_event_catalog.parquet',
+                diagnostic_dir / 'selected_events.parquet',
+                diagnostic_dir / 'deep_sensitivity_ranking.parquet',
+                diagnostic_dir / 'daily_diagnostics.parquet',
+                diagnostic_dir / 'event_diagnostic_summary.parquet',
+                diagnostic_dir / 'negative_control.parquet',
+                diagnostic_dir / 'negative_control_diagnostic.parquet',
+                diagnostic_dir / 'analysis_summary.json',
+            )
+            formal_quality_reusable = (
+                include_negative_control
+                and all(
+                    path.exists() for path in formal_quality_outputs
+                )
+            )
+            if formal_quality_reusable:
+                formal_summary = json.loads(
+                    (diagnostic_dir / 'analysis_summary.json').read_text(
+                        encoding='utf-8'
+                    )
+                )
+                formal_quality_reusable = bool(
+                    formal_summary.get(
+                        'negative_control_requested', True
+                    )
+                )
+            if formal_quality_reusable:
+                diagnostic_result = load_ofes_quality_event_diagnostics(
+                    output_dir=diagnostic_dir
+                )
+            else:
+                diagnostic_result = diagnose_ofes_quality_eligible_events(
+                    catalog_dir=catalog_result['output_dir'],
+                    diagnostic_overrides={
+                        'candidate_threshold': float(
+                            settings['candidate_threshold']
+                        )
+                    },
+                    output_dir=diagnostic_dir,
+                    include_negative_control=include_negative_control,
+                )
+            metadata = _ofes_depth_gate_catalog_metadata(
+                catalog_result['output_dir'],
+                diagnostic_result,
+                {
+                    **settings,
+                    'depth_gates_m': (float(gate),),
+                },
+            )
+            event_rows = _ofes_depth_gate_event_rows(
+                diagnostic_result,
+                {
+                    **settings,
+                    'depth_gates_m': (float(gate),),
+                },
+                metadata,
+            )
+            secondary_rows = event_rows.loc[
+                ~event_rows['peak_on_lower_search_level'].astype(bool)
+                & ~event_rows['peak_on_upper_search_level'].astype(bool)
+            ].copy()
+            gate_summary = _ofes_depth_gate_summary(
+                event_rows,
+                {
+                    **settings,
+                    'depth_gates_m': (float(gate),),
+                },
+                metadata,
+            )
+            secondary_summary = _ofes_depth_gate_summary(
+                secondary_rows,
+                {
+                    **settings,
+                    'depth_gates_m': (float(gate),),
+                },
+                metadata,
+                boundary_excluded=True,
+            )
+            gate_metadata = {
+                'gate': float(gate),
+                'gate_tag': tag,
+                'catalog_dir': str(catalog_result['output_dir']),
+                'diagnostic_dir': str(diagnostic_result['output_dir']),
+            }
+            gate_summary.update(gate_metadata)
+            secondary_summary.update(gate_metadata)
+            _ofes_depth_gate_write_outputs(
+                event_rows,
+                secondary_rows,
+                gate_summary,
+                secondary_summary,
+                paths,
+            )
+            gate_summaries.append(gate_summary)
+            secondary_gate_summaries.append(dict(secondary_summary))
+            event_tables[tag] = event_rows
+            secondary_tables[tag] = secondary_rows
+            print(
+                f'[OFES depth-gate sensitivity] {tag}: '
+                f'{len(event_rows)} quality events, '
+                f'{gate_summary["peak_decomposition_eligible_count"]} '
+                'decomposition-eligible peaks'
+            )
+        gate_summary_frame = pd.DataFrame(gate_summaries).sort_values(
+            'minimum_depth_m', kind='mergesort'
+        ).reset_index(drop=True)
+        _atomic_write_parquet(
+            _ofes_depth_gate_summary_frame(
+                gate_summary_frame.to_dict(orient='records')
+            ),
+            root / 'gate_summaries.parquet',
+        )
+        plot_path, _ = _ofes_plot_depth_gate_sensitivity(
+            {
+                'gate_summaries': gate_summary_frame,
+                'event_tables': event_tables,
+                'secondary_gate_summaries': pd.DataFrame(
+                    secondary_gate_summaries
+                ),
+                'secondary_event_tables': secondary_tables,
+            },
+            root / 'depth_gate_sensitivity.png',
+            dpi=600,
+        )
+        final_summary = {
+            **running_summary,
+            'status': 'complete',
+            'gate_summaries': gate_summary_frame.to_dict(
+                orient='records'
+            ),
+            'secondary_gate_summaries': secondary_gate_summaries,
+            'outputs': {
+                'gate_summaries': str(root / 'gate_summaries.parquet'),
+                'figure': str(plot_path),
+                'gates': {
+                    tag: {
+                        key: str(value)
+                        for key, value in paths.items()
+                        if key != 'gate_root'
+                    }
+                    for tag, paths in gate_paths.items()
+                },
+            },
+        }
+        _ofes_atomic_write_json(final_summary, summary_path)
+    except Exception as error:
+        _ofes_atomic_write_json(
+            {
+                **running_summary,
+                'status': 'failed',
+                'error_type': type(error).__name__,
+                'error': str(error),
+            },
+            summary_path,
+        )
+        raise
+    result = load_ofes_depth_gate_sensitivity(output_dir=root)
+    result['reused_complete_run'] = False
+    return result
+
+
 
 def _ofes_event_population_settings(
     overrides: dict | None = None,
 ) -> dict:
-    """解析并校验 OFES 深层事件总体诊断配置。"""
+    """解析并校验 OFES 事件总体峰值诊断配置。"""
     raw = dict(_OFES_CFG.get('event_population', {}) or {})
     if overrides:
         unknown = sorted(set(overrides) - set(raw))
@@ -42145,7 +43592,7 @@ def _ofes_event_population_settings(
         ),
         'figure_dpi': int(raw.get('figure_dpi', 180)),
         'output_subdir': str(
-            raw.get('output_subdir', 'event_population')
+            raw.get('output_subdir', 'primary_event_population')
         ),
     }
     if (
@@ -42204,6 +43651,78 @@ def _ofes_event_population_settings(
             'OFES population output_subdir must not be empty.'
         )
     return settings
+
+
+def _ofes_event_population_scope_settings(
+    population_scope: str | None = None,
+) -> dict:
+    """解析 OFES primary/deep population scope 及其独立输出目录。"""
+    raw = dict(_OFES_CFG.get('event_population', {}) or {})
+    scope_name = str(
+        population_scope
+        if population_scope is not None
+        else raw.get('default_scope', 'primary_300_1000')
+    )
+    definitions = {
+        'primary_300_1000': {
+            'depth_min_m': float(raw.get('primary_depth_min_m', 300.0)),
+            'depth_max_m': float(raw.get('primary_depth_max_m', 1000.0)),
+            'output_subdir': str(
+                raw.get(
+                    'primary_output_subdir',
+                    'primary_event_population',
+                )
+            ),
+            'output_prefix': 'primary',
+        },
+        'deep_500_1000': {
+            'depth_min_m': float(raw.get('deep_depth_min_m', 500.0)),
+            'depth_max_m': float(raw.get('deep_depth_max_m', 1000.0)),
+            'output_subdir': str(
+                raw.get('deep_output_subdir', 'deep_event_population')
+            ),
+            'output_prefix': 'deep',
+        },
+    }
+    if scope_name not in definitions:
+        raise ValueError(
+            'Unknown OFES population_scope '
+            f'{scope_name!r}; choose primary_300_1000 or deep_500_1000.'
+        )
+    scope = {
+        'population_scope': scope_name,
+        **definitions[scope_name],
+    }
+    if (
+        not np.isfinite(scope['depth_min_m'])
+        or not np.isfinite(scope['depth_max_m'])
+        or scope['depth_min_m'] < 0
+        or scope['depth_max_m'] <= scope['depth_min_m']
+    ):
+        raise ValueError(
+            'OFES population scope depths must be finite and ordered.'
+        )
+    if not scope['output_subdir'].strip():
+        raise ValueError(
+            'OFES population scope output_subdir must not be empty.'
+        )
+    return scope
+
+
+def _ofes_population_output_path(
+    analysis_name: str,
+    population_scope: str | None = None,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """返回按 population scope 隔离的 OFES 输出目录。"""
+    if output_dir is not None:
+        return Path(output_dir).expanduser()
+    scope = _ofes_event_population_scope_settings(population_scope)
+    if analysis_name == 'event_population':
+        return _ofes_analysis_output_path(scope['output_subdir'])
+    return _ofes_analysis_output_path(
+        f'{scope["output_prefix"]}_{analysis_name}'
+    )
 
 
 def _ofes_surface_expression_day(
@@ -42475,75 +43994,112 @@ def _ofes_add_surface_rotation_metrics(
             > 0
         ),
     )
-    result['rotation_dominated'] = (
-        result['absolute_subsurface_rossby_number']
-        > result['normalized_strain']
-    )
+    absolute_subsurface = result[
+        'absolute_subsurface_rossby_number'
+    ].to_numpy(dtype=float)
+    strain = pd.to_numeric(
+        result['normalized_strain'], errors='coerce'
+    ).to_numpy(dtype=float)
+    kinematic_valid = np.isfinite(absolute_subsurface) & np.isfinite(strain)
+    rotation_values = absolute_subsurface > strain
+    rotation = pd.Series(pd.NA, index=result.index, dtype='boolean')
+    rotation.loc[kinematic_valid] = rotation_values[kinematic_valid]
+    result['rotation_dominated'] = rotation
     result['kinematic_regime'] = np.select(
         [
-            result['absolute_subsurface_rossby_number']
-            > result['normalized_strain'],
-            result['normalized_strain']
-            > result['absolute_subsurface_rossby_number'],
+            kinematic_valid & rotation_values,
+            kinematic_valid & (strain > absolute_subsurface),
         ],
         ['rotation_dominated', 'strain_dominated'],
-        default='balanced',
+        default='unresolved',
     )
-    result['negative_subsurface_rossby_number'] = (
-        result['rossby_number'] < 0
+    rossby = pd.to_numeric(
+        result['rossby_number'], errors='coerce'
+    ).to_numpy(dtype=float)
+    negative = pd.Series(pd.NA, index=result.index, dtype='boolean')
+    negative.loc[np.isfinite(rossby)] = rossby[np.isfinite(rossby)] < 0
+    result['negative_subsurface_rossby_number'] = negative
+
+    core_surface = pd.to_numeric(
+        result['surface_core_weighted_rossby_number'], errors='coerce'
+    ).to_numpy(dtype=float)
+    core_polarity_valid = np.isfinite(core_surface) & np.isfinite(rossby)
+    core_polarity = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
     )
-    result['surface_core_rotation_polarity_match'] = (
-        result['surface_core_weighted_rossby_number']
-        * result['rossby_number']
+    core_polarity.loc[core_polarity_valid] = (
+        core_surface[core_polarity_valid]
+        * rossby[core_polarity_valid]
         > 0
     )
-    result['surface_attenuated_rotation'] = (
-        result['rotation_dominated']
-        & result['surface_core_rotation_polarity_match']
+    result['surface_core_rotation_polarity_match'] = core_polarity
+    core_ratio = pd.to_numeric(
+        result['surface_to_subsurface_core_weighted_rotation_ratio'],
+        errors='coerce',
+    ).to_numpy(dtype=float)
+    attenuation_valid = kinematic_valid & core_polarity_valid & np.isfinite(
+        core_ratio
+    )
+    attenuated = pd.Series(pd.NA, index=result.index, dtype='boolean')
+    attenuated.loc[attenuation_valid] = (
+        rotation_values[attenuation_valid]
+        & (core_surface[attenuation_valid] * rossby[attenuation_valid] > 0)
+        & (core_ratio[attenuation_valid]
+           <= float(settings['surface_attenuation_ratio_max']))
+    )
+    result['surface_attenuated_rotation'] = attenuated
+    weak_or_reversed = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
+    )
+    weak_or_reversed.loc[attenuation_valid] = (
+        rotation_values[attenuation_valid]
         & (
-            result[
-                'surface_to_subsurface_core_weighted_rotation_ratio'
-            ]
-            <= float(settings['surface_attenuation_ratio_max'])
+            (core_surface[attenuation_valid] * rossby[attenuation_valid] <= 0)
+            | (core_ratio[attenuation_valid]
+               <= float(settings['surface_attenuation_ratio_max']))
         )
     )
-    result['surface_weak_or_reversed_rotation'] = (
-        result['rotation_dominated']
-        & (
-            ~result['surface_core_rotation_polarity_match']
-            | (
-                result[
-                    'surface_to_subsurface_core_weighted_rotation_ratio'
-                ]
-                <= float(settings['surface_attenuation_ratio_max'])
-            )
-        )
+    result['surface_weak_or_reversed_rotation'] = weak_or_reversed
+
+    surface = pd.to_numeric(
+        result['surface_rossby_number'], errors='coerce'
+    ).to_numpy(dtype=float)
+    colocated_valid = kinematic_valid & np.isfinite(surface)
+    colocated_polarity = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
     )
-    colocated_polarity_match = (
-        result['surface_rossby_number'] * result['rossby_number'] > 0
-    )
-    colocated_weak_or_reversed = (
-        result['rotation_dominated']
-        & (
-            ~colocated_polarity_match
-            | (
-                result[
-                    'surface_to_subsurface_colocated_rotation_ratio'
-                ]
-                <= float(settings['surface_attenuation_ratio_max'])
-            )
-        )
+    colocated_polarity.loc[colocated_valid] = (
+        surface[colocated_valid] * rossby[colocated_valid] > 0
     )
     result['surface_colocated_rotation_polarity_match'] = (
-        colocated_polarity_match
+        colocated_polarity
+    )
+    colocated_ratio = pd.to_numeric(
+        result['surface_to_subsurface_colocated_rotation_ratio'],
+        errors='coerce',
+    ).to_numpy(dtype=float)
+    colocated_rule_valid = colocated_valid & np.isfinite(colocated_ratio)
+    colocated_weak_or_reversed = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
+    )
+    colocated_weak_or_reversed.loc[colocated_rule_valid] = (
+        rotation_values[colocated_rule_valid]
+        & (
+            (surface[colocated_rule_valid] * rossby[colocated_rule_valid] <= 0)
+            | (colocated_ratio[colocated_rule_valid]
+               <= float(settings['surface_attenuation_ratio_max']))
+        )
     )
     result['surface_colocated_weak_or_reversed_rotation'] = (
         colocated_weak_or_reversed
     )
-    result['surface_spatial_offset_rotation'] = (
-        colocated_weak_or_reversed
-        & ~result['surface_weak_or_reversed_rotation']
+    spatial_offset = pd.Series(pd.NA, index=result.index, dtype='boolean')
+    spatial_valid = colocated_rule_valid & attenuation_valid
+    spatial_offset.loc[spatial_valid] = (
+        colocated_weak_or_reversed.loc[spatial_valid].to_numpy(dtype=bool)
+        & ~weak_or_reversed.loc[spatial_valid].to_numpy(dtype=bool)
     )
+    result['surface_spatial_offset_rotation'] = spatial_offset
     return result
 
 
@@ -42565,34 +44121,62 @@ def _ofes_add_population_metrics(
     result['heave_absolute_fraction'] = (
         1.0 - result['water_mass_absolute_fraction']
     )
-    result['water_mass_dominated'] = (
-        water_mass_abs > heave_abs
+    contribution_valid = np.isfinite(
+        water_mass_abs.to_numpy(dtype=float)
+    ) & np.isfinite(heave_abs.to_numpy(dtype=float)) & (
+        contribution_total.to_numpy(dtype=float) > 0
     )
-    result['heave_important'] = (
-        result['heave_absolute_fraction']
-        >= float(
-            settings['heave_important_absolute_fraction_min']
-        )
+    water_mass_dominated = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
     )
+    water_mass_dominated.loc[contribution_valid] = (
+        water_mass_abs.to_numpy(dtype=float)[contribution_valid]
+        > heave_abs.to_numpy(dtype=float)[contribution_valid]
+    )
+    result['water_mass_dominated'] = water_mass_dominated
+    heave_important = pd.Series(
+        pd.NA, index=result.index, dtype='boolean'
+    )
+    heave_important.loc[contribution_valid] = (
+        result.loc[contribution_valid, 'heave_absolute_fraction']
+        >= float(settings['heave_important_absolute_fraction_min'])
+    )
+    result['heave_important'] = heave_important
     result['contribution_regime'] = np.select(
-        [water_mass_abs > heave_abs, heave_abs > water_mass_abs],
+        [
+            contribution_valid
+            & (water_mass_abs.to_numpy(dtype=float)
+               > heave_abs.to_numpy(dtype=float)),
+            contribution_valid
+            & (heave_abs.to_numpy(dtype=float)
+               > water_mass_abs.to_numpy(dtype=float)),
+        ],
         ['water_mass_dominated', 'heave_dominated'],
-        default='balanced',
+        default='unresolved',
     )
-    result['low_salinity_fingerprint'] = (
-        result['same_sigma_salinity_contrast'] < 0
+    fingerprint_columns = (
+        ('low_salinity_fingerprint', 'same_sigma_salinity_contrast', 0.0),
+        ('low_aou_fingerprint', 'same_sigma_aou_contrast', 0.0),
+        ('weak_n2_fingerprint', 'n2_ratio_core_to_background', 1.0),
     )
-    result['low_aou_fingerprint'] = (
-        result['same_sigma_aou_contrast'] < 0
+    fingerprint_valid = []
+    for output_name, input_name, threshold in fingerprint_columns:
+        values = pd.to_numeric(
+            result[input_name], errors='coerce'
+        ).to_numpy(dtype=float)
+        valid = np.isfinite(values)
+        fingerprint_valid.append(valid)
+        flag = pd.Series(pd.NA, index=result.index, dtype='boolean')
+        flag.loc[valid] = values[valid] < threshold
+        result[output_name] = flag
+    joint_valid = np.logical_and.reduce(fingerprint_valid)
+    joint = pd.Series(pd.NA, index=result.index, dtype='boolean')
+    joint.loc[joint_valid] = (
+        result.loc[joint_valid, 'low_salinity_fingerprint'].to_numpy(dtype=bool)
+        & result.loc[joint_valid, 'low_aou_fingerprint'].to_numpy(dtype=bool)
+        & result.loc[joint_valid, 'weak_n2_fingerprint'].to_numpy(dtype=bool)
     )
-    result['weak_n2_fingerprint'] = (
-        result['n2_ratio_core_to_background'] < 1
-    )
-    result['joint_water_mass_fingerprint'] = (
-        result['low_salinity_fingerprint']
-        & result['low_aou_fingerprint']
-        & result['weak_n2_fingerprint']
-    )
+    result['joint_water_mass_fingerprint'] = joint
     result = _ofes_add_surface_rotation_metrics(result, settings)
     result['absolute_surface_eta_contrast_m'] = (
         result['surface_eta_contrast_m'].abs()
@@ -43121,24 +44705,27 @@ def _plot_ofes_event_population(
 
 
 
-def generalize_ofes_deep_events(
+def run_ofes_event_population(
     diagnostic_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     population_overrides: dict | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
-    """OFES DO50 深层事件的峰值水团、动力与表层表达总体诊断。
+    """运行一个 OFES DO50 事件总体的峰值水团、动力与表层表达诊断。
 
     入口只消费固定目录中的候选诊断结果及其年度 catalog，
-    选择当前 catalog 中 DO50、500–1000 m 且诊断通过的事件。每个事件仅在
-    catalog peak 日诊断一次，并将深层水团/heave 分解与同日 SSH
+    按 `population_scope` 选择当前 catalog 中 DO50、质量合格且位于
+    scope 深度窗的事件。每个事件仅在 catalog peak 日诊断一次，并将
+    深层水团/heave 分解与同日 SSH
     环带异常、最上层涡度/应变及 50 km 内同极性涡度峰值合并成
     event-level scalars。
 
     参数:
         - diagnostic_dir (str | Path | None): event diagnostics 目录；None 时读取固定正式目录。
+        - population_scope (str | None): `primary_300_1000` 或 `deep_500_1000`；None 使用 YAML 默认 primary scope。
         - population_overrides (dict | None): 临时覆盖已声明的 event_population 配置。
-        - output_dir (str | Path | None): 总体诊断输出目录；None 时写入固定正式目录。
+        - output_dir (str | Path | None): 总体诊断输出目录；None 时写入 scope 专属固定目录。
 
     返回:
         - dict: 含当前事件输入表、峰值诊断表、总结和图件路径。
@@ -43153,10 +44740,11 @@ def generalize_ofes_deep_events(
         - AOU 包含 DO，与正 DO 事件检测器不独立；联合 fingerprint 只作水团描述，不当作额外独立证据。
         - 该节点不启动轨迹、聚类、frontogenesis 或混合层诊断；后续方法由总体结果选择。
     """
+    scope = _ofes_event_population_scope_settings(population_scope)
     diagnostic_root = (
         Path(diagnostic_dir)
         if diagnostic_dir is not None
-        else _ofes_analysis_output_dir('event_diagnostics')
+        else _ofes_analysis_output_dir('quality_event_diagnostics')
     )
     settings = _ofes_event_population_settings(
         population_overrides
@@ -43167,42 +44755,52 @@ def generalize_ofes_deep_events(
             encoding='utf-8'
         )
     )
-    if not diagnostic_summary['diagnostic_gate_passed']:
-        raise RuntimeError(
-            'OFES population diagnostics require the ranked-event '
-            'diagnostic gate to pass.'
-        )
+    upstream_daily_gate_passed = bool(
+        diagnostic_summary.get('diagnostic_gate_passed', False)
+    )
     catalog_root = _ofes_analysis_output_dir('event_catalog')
 
-    deep_events = pd.read_parquet(
-        diagnostic_root / 'deep_sensitivity_ranking.parquet'
+    quality_events = pd.read_parquet(
+        diagnostic_root / 'quality_event_catalog.parquet'
     )
-    deep_events = deep_events.loc[
+    depth = pd.to_numeric(
+        quality_events['peak_depth_m'], errors='coerce'
+    )
+    population_events = quality_events.loc[
         np.isclose(
-            deep_events['threshold'].to_numpy(dtype=float),
+            quality_events['threshold'].to_numpy(dtype=float),
             float(settings['candidate_threshold']),
         )
-        & deep_events['deep_sensitivity_eligible']
+        & quality_events['quality_eligible'].astype(bool)
+        & depth.ge(float(scope['depth_min_m']))
+        & depth.le(float(scope['depth_max_m']))
     ].sort_values(
-        'deep_sensitivity_rank_within_threshold',
+        'quality_rank_within_threshold',
         kind='mergesort',
     ).reset_index(drop=True)
-    if deep_events.empty:
+    if population_events.empty:
         raise RuntimeError(
-            'OFES deep population contains no current quality-eligible events.'
+            'OFES population scope contains no current quality-eligible events.'
         )
-    if deep_events['event_id'].duplicated().any():
-        raise RuntimeError('OFES deep population contains duplicate events.')
+    if population_events['event_id'].duplicated().any():
+        raise RuntimeError('OFES population scope contains duplicate events.')
+    population_events = population_events.copy()
+    population_events['population_scope'] = scope['population_scope']
+    population_events['population_depth_min_m'] = float(scope['depth_min_m'])
+    population_events['population_depth_max_m'] = float(scope['depth_max_m'])
+    population_events['population_rank_within_threshold'] = np.arange(
+        1, len(population_events) + 1, dtype=np.int32
+    )
     linked_objects = pd.read_parquet(
         catalog_root / 'daily_objects.parquet'
     )
     peak_objects = linked_objects.loc[
         linked_objects['daily_object_key'].isin(
-            deep_events['peak_daily_object_key']
+            population_events['peak_daily_object_key']
         )
     ].copy()
     if (
-        len(peak_objects) != len(deep_events)
+        len(peak_objects) != len(population_events)
         or peak_objects['daily_object_key'].duplicated().any()
     ):
         raise RuntimeError(
@@ -43222,7 +44820,7 @@ def generalize_ofes_deep_events(
             'pixel_count': 'daily_peak_pixel_count',
         }
     )
-    requests = deep_events.merge(
+    requests = population_events.merge(
         peak_objects[
             [
                 'event_id',
@@ -43260,8 +44858,8 @@ def generalize_ofes_deep_events(
     requests['population_event_index'] = np.arange(
         1, len(requests) + 1, dtype=np.int16
     )
-    output_path = _ofes_analysis_output_dir(
-        settings['output_subdir'], output_dir
+    output_path = _ofes_population_output_path(
+        'event_population', scope['population_scope'], output_dir
     )
     events_dir = output_path / 'events'
     events_dir.mkdir(parents=True, exist_ok=True)
@@ -43361,6 +44959,21 @@ def generalize_ofes_deep_events(
         diagnostics, settings
     )
     summary = _ofes_population_summary(diagnostics, settings)
+    summary.update(
+        {
+            'population_scope': scope['population_scope'],
+            'population_depth_min_m': float(scope['depth_min_m']),
+            'population_depth_max_m': float(scope['depth_max_m']),
+            'quality_event_count': int(len(requests)),
+            'upstream_daily_diagnostic_gate_passed': (
+                upstream_daily_gate_passed
+            ),
+            'upstream_daily_diagnostic_gate_note': (
+                'Population eligibility is peak-level and remains valid when '
+                'some non-peak sampled days are unavailable.'
+            ),
+        }
+    )
     diagnostic_path = (
         output_path / 'population_peak_diagnostics.parquet'
     )
@@ -43376,11 +44989,42 @@ def generalize_ofes_deep_events(
     )
     return {
         'output_dir': output_path,
+        'population_scope': scope['population_scope'],
         'population_events': requests,
         'population_peak_diagnostics': diagnostics,
         'summary': summary,
         'figure_path': figure_path,
     }
+
+
+def generalize_ofes_deep_events(
+    diagnostic_dir: str | Path | None = None,
+    *,
+    population_overrides: dict | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """兼容入口：运行嵌套的 500–1000 m deep-process population。
+
+    参数:
+        - diagnostic_dir (str | Path | None): event diagnostics 目录；None 使用固定正式目录。
+        - population_overrides (dict | None): 临时覆盖已声明的总体诊断配置。
+        - output_dir (str | Path | None): deep population 输出目录；None 使用 scope 专属目录。
+
+    返回:
+        - dict: `run_ofes_event_population` 的 deep scope 结果。
+
+    输出:
+        - deep scope 的事件、峰值诊断、summary 和图件。
+
+    说明:
+        - 该 wrapper 不复制科学算法；deep scope 直接复用通用 population 入口。
+    """
+    return run_ofes_event_population(
+        diagnostic_dir=diagnostic_dir,
+        population_scope='deep_500_1000',
+        population_overrides=population_overrides,
+        output_dir=output_dir,
+    )
 
 
 def _ofes_event_onset_settings(
@@ -46527,7 +48171,7 @@ def _ofes_lifecycle_requests(
     strict = population_diagnostics.loc[
         population_diagnostics['population_diagnostic_passed']
     ].sort_values(
-        'deep_sensitivity_rank_within_threshold', kind='mergesort'
+        'population_rank_within_threshold', kind='mergesort'
     )
     if strict.empty:
         raise RuntimeError(
@@ -46535,7 +48179,7 @@ def _ofes_lifecycle_requests(
         )
     event_columns = [
         'event_id',
-        'deep_sensitivity_rank_within_threshold',
+        'population_rank_within_threshold',
         'start_date',
         'peak_date',
         'peak_daily_object_key',
@@ -47095,9 +48739,9 @@ def _ofes_lifecycle_summary(
             {
                 'event_order': int(group['event_order'].iloc[0]),
                 'event_id': str(event_id),
-                'deep_sensitivity_rank_within_threshold': int(
+                'population_rank_within_threshold': int(
                     group[
-                        'deep_sensitivity_rank_within_threshold'
+                        'population_rank_within_threshold'
                     ].iloc[0]
                 ),
                 'population_peak_rotation_dominated': bool(
@@ -47287,6 +48931,7 @@ def _plot_ofes_event_lifecycle(
 def diagnose_ofes_event_lifecycle(
     population_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     lifecycle_overrides: dict | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
@@ -47299,7 +48944,8 @@ def diagnose_ofes_event_lifecycle(
     anticyclonic、SCV-compatible 和 surface-obscured 子集。
 
     参数:
-        - population_dir (str | Path | None): population 目录；None 时读取固定正式目录。
+        - population_dir (str | Path | None): population 目录；None 时读取 scope 专属固定目录。
+        - population_scope (str | None): `primary_300_1000` 或 `deep_500_1000`；None 使用 YAML 默认 scope。
         - lifecycle_overrides (dict | None): 临时覆盖 `ofes.event_lifecycle` 配置。
         - output_dir (str | Path | None): 输出目录；None 时写入固定正式目录。
 
@@ -47313,10 +48959,11 @@ def diagnose_ofes_event_lifecycle(
         - lead/lag 使用旋转强度交叉相关，不使用 DO 首次过阈值时间；仍只作描述，不能证明垂向传播。
         - SCV-compatible 是 OFES 动力代理，未与 McCoy 目录的观测判据完全等同，论文中不得省略 compatible 限定。
     """
-    population_root = (
-        Path(population_dir)
-        if population_dir is not None
-        else _ofes_analysis_output_dir('event_population')
+    population_scope_settings = _ofes_event_population_scope_settings(
+        population_scope
+    )
+    population_root = _ofes_population_output_path(
+        'event_population', population_scope, population_dir
     )
     settings = _ofes_event_lifecycle_settings(lifecycle_overrides)
     population_settings = _ofes_event_population_settings()
@@ -47331,8 +48978,10 @@ def diagnose_ofes_event_lifecycle(
     requests = _ofes_lifecycle_requests(
         population_diagnostics, daily_objects
     )
-    output_path = _ofes_analysis_output_dir(
-        settings['output_subdir'], output_dir
+    output_path = _ofes_population_output_path(
+        'event_lifecycle',
+        population_scope_settings['population_scope'],
+        output_dir,
     )
     days_dir = output_path / 'days'
     profiles_dir = output_path / 'profiles'
@@ -47419,6 +49068,12 @@ def diagnose_ofes_event_lifecycle(
     )
     event_summary, analysis_summary = _ofes_lifecycle_summary(
         daily, settings
+    )
+    analysis_summary['population_scope'] = (
+        population_scope_settings['population_scope']
+    )
+    analysis_summary['population_event_count'] = int(
+        len(population_diagnostics)
     )
     analysis_summary['peak_population_parity'] = peak_parity
     analysis_summary[
@@ -49315,6 +50970,7 @@ def _plot_ofes_mccoy_virtual_argo(
 def run_ofes_mccoy_virtual_argo(
     lifecycle_run_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     mccoy_overrides: dict | None = None,
     source_archive_path: str | Path | None = None,
     output_dir: str | Path | None = None,
@@ -49329,7 +50985,8 @@ def run_ofes_mccoy_virtual_argo(
     通过后再用原生 OFES u/v 检验核深是否为反气旋 rotation-dominated。
 
     参数:
-        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用固定的 `event_lifecycle` 目录。
+        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用 scope 专属固定目录。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - mccoy_overrides (dict | None): 临时覆盖 `ofes.mccoy_virtual_argo` 配置。
         - source_archive_path (str | Path | None): McCoy v1.3 源码 zip；None 使用 paths 配置。
         - output_dir (str | Path | None): 输出根目录；None 写入固定 `mccoy_virtual_argo` 目录。
@@ -49344,10 +51001,9 @@ def run_ofes_mccoy_virtual_argo(
         - OFES 仅交付至约 1077 m，且主运行用模式自身稀疏环带代替 RG 气候态与多年 Argo IQR 池，因此正式名称是 McCoy-method-compatible，而非 McCoy-catalog-equivalent。
         - 现有 `scv_compatible` 五日连续动力代理不被修改；三层结果并列，不能因新方法命中更多事件而后验放宽旧判据。
     """
-    lifecycle_root = (
-        Path(lifecycle_run_dir)
-        if lifecycle_run_dir is not None
-        else _ofes_analysis_output_dir('event_lifecycle')
+    scope = _ofes_event_population_scope_settings(population_scope)
+    lifecycle_root = _ofes_population_output_path(
+        'event_lifecycle', scope['population_scope'], lifecycle_run_dir
     )
     lifecycle_required = (
         'lifecycle_daily_diagnostics.parquet',
@@ -49395,13 +51051,14 @@ def run_ofes_mccoy_virtual_argo(
         or requests['event_id'].duplicated().any()
     ):
         raise RuntimeError('OFES McCoy peak-day event requests are invalid.')
-    run_dir = _ofes_analysis_output_dir(
-        settings['output_subdir'], output_dir
+    run_dir = _ofes_population_output_path(
+        'mccoy_virtual_argo', scope['population_scope'], output_dir
     )
     events_dir = run_dir / 'events'
     events_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / 'manifest.json'
     request = {
+        'population_scope': scope['population_scope'],
         'settings': _ofes_material_settings(settings),
         'event_ids': [str(value) for value in requests['event_id']],
         'dates': [
@@ -49712,6 +51369,50 @@ def _ofes_mccoy_stage_fragment_reusable(
     return True
 
 
+def _ofes_mccoy_stage_unavailable_fragment(
+    request: dict,
+    error: Exception,
+) -> pd.DataFrame:
+    """为单个不可评估阶段写入保留请求元数据的 fragment。"""
+    return pd.DataFrame(
+        [
+            {
+                'event_id': str(request['event_id']),
+                'stage': str(request['stage']),
+                'event_order': int(request['event_order']),
+                'date': pd.Timestamp(request['date']).normalize(),
+                'event_peak_lon': float(request['peak_lon']),
+                'event_peak_lat': float(request['peak_lat']),
+                'event_peak_depth_m': float(request['peak_depth_at_max']),
+                'event_reference_depth_m': float(
+                    request['reference_depth_m']
+                ),
+                'event_equivalent_radius_km': float(
+                    request['event_peak_equivalent_radius_km']
+                ),
+                'sample_id': (
+                    f"UNAVAILABLE_{request['event_id']}_"
+                    f"{request['stage']}"
+                ),
+                'sample_role': 'unavailable',
+                'ring_fraction': np.nan,
+                'radius_km': np.nan,
+                'azimuth_deg': np.nan,
+                'sample_lon': np.nan,
+                'sample_lat': np.nan,
+                'valid_control_profile_count': np.nan,
+                'off_domain_dropped_event_count': np.nan,
+                'off_domain_dropped_control_count': np.nan,
+                'mccoy_profile_compatible': pd.NA,
+                'velocity_confirmed_mccoy_compatible': pd.NA,
+                'stage_diagnostic_available': False,
+                'failure_type': type(error).__name__,
+                'failure': str(error),
+            }
+        ]
+    )
+
+
 def _ofes_mccoy_stage_fragment_stats(
     fragment: pd.DataFrame,
     request: dict,
@@ -49719,6 +51420,29 @@ def _ofes_mccoy_stage_fragment_stats(
     fragment_reused: bool,
 ) -> dict:
     """汇总一个 McCoy 阶段 fragment 的事件/对照通过率。"""
+    if (
+        'stage_diagnostic_available' in fragment.columns
+        and not bool(fragment.iloc[0]['stage_diagnostic_available'])
+    ):
+        unavailable = fragment.iloc[0]
+        return {
+            'event_id': str(request['event_id']),
+            'event_order': int(request['event_order']),
+            'stage': str(request['stage']),
+            'date': pd.Timestamp(request['date']).normalize(),
+            'event_profile_count': 0,
+            'event_compatible_count': 0,
+            'event_velocity_confirmed_count': 0,
+            'event_compatible_fraction': np.nan,
+            'control_profile_count': 0,
+            'control_pass_fraction': np.nan,
+            'off_domain_dropped_event_count': np.nan,
+            'off_domain_dropped_control_count': np.nan,
+            'stage_diagnostic_available': False,
+            'failure_type': str(unavailable.get('failure_type', 'unknown')),
+            'failure': str(unavailable.get('failure', 'unknown')),
+            'fragment_reused': bool(fragment_reused),
+        }
     event_rows = fragment.loc[fragment['sample_role'] == 'event']
     control_rows = fragment.loc[
         fragment['sample_role'] == 'background_control'
@@ -49748,6 +51472,9 @@ def _ofes_mccoy_stage_fragment_stats(
         'off_domain_dropped_control_count': int(
             fragment['off_domain_dropped_control_count'].max()
         ) if 'off_domain_dropped_control_count' in fragment.columns else 0,
+        'stage_diagnostic_available': True,
+        'failure_type': None,
+        'failure': None,
         'fragment_reused': bool(fragment_reused),
     }
 
@@ -49785,27 +51512,41 @@ def _ofes_mccoy_stage_summary(
         rows = stage_diagnostics.loc[
             stage_diagnostics['stage'] == stage
         ]
+        available = rows.loc[
+            rows['stage_diagnostic_available'].eq(True)
+        ]
         stage_summary[stage] = {
             'event_count': int(len(rows)),
+            'available_event_count': int(len(available)),
+            'unavailable_event_count': int(len(rows) - len(available)),
             'events_with_any_compatible': int(
-                (rows['event_compatible_count'] > 0).sum()
+                (available['event_compatible_count'] > 0).sum()
             ),
             'mean_event_compatible_fraction': float(
-                rows['event_compatible_fraction'].mean()
-            ),
+                available['event_compatible_fraction'].mean()
+            ) if len(available) else np.nan,
             'mean_control_pass_fraction': float(
-                rows['control_pass_fraction'].mean()
-            ),
+                available['control_pass_fraction'].mean()
+            ) if len(available) else np.nan,
             'off_domain_dropped_event_count': int(
-                rows['off_domain_dropped_event_count'].sum()
+                available['off_domain_dropped_event_count'].sum()
             ),
             'off_domain_dropped_control_count': int(
-                rows['off_domain_dropped_control_count'].sum()
+                available['off_domain_dropped_control_count'].sum()
             ),
         }
+    event_availability = stage_diagnostics.groupby('event_id')[
+        'stage_diagnostic_available'
+    ].all()
+    unavailable_events = sorted(
+        event_availability.index[~event_availability].astype(str).tolist()
+    )
     wide = stage_diagnostics.pivot(
         index='event_id', columns='stage', values='event_compatible_fraction'
-    ).reindex(columns=expected_stages)
+    ).reindex(
+        index=event_availability.index[event_availability],
+        columns=expected_stages,
+    )
     paired = wide[['start', 'last']].dropna()
     paired_stats = {
         'n': int(len(paired)),
@@ -49841,7 +51582,8 @@ def _ofes_mccoy_stage_summary(
             expected = peak_summary.copy()
             expected['event_id'] = expected['event_id'].astype(str)
             observed = stage_diagnostics.loc[
-                stage_diagnostics['stage'] == 'peak',
+                (stage_diagnostics['stage'] == 'peak')
+                & stage_diagnostics['stage_diagnostic_available'].eq(True),
                 ['event_id', 'event_compatible_count'],
             ].copy()
             observed['event_id'] = observed['event_id'].astype(str)
@@ -49866,6 +51608,15 @@ def _ofes_mccoy_stage_summary(
     return {
         'event_count': int(stage_diagnostics['event_id'].nunique()),
         'request_count': int(len(stage_diagnostics)),
+        'available_request_count': int(
+            stage_diagnostics['stage_diagnostic_available'].sum()
+        ),
+        'unavailable_request_count': int(
+            (~stage_diagnostics['stage_diagnostic_available']).sum()
+        ),
+        'eligible_event_count': int(event_availability.sum()),
+        'unavailable_event_count': int(len(unavailable_events)),
+        'unavailable_event_ids': unavailable_events,
         'footprint_mode': str(footprint_mode),
         'stage_summary': stage_summary,
         'paired_start_last': paired_stats,
@@ -49955,6 +51706,7 @@ def _ofes_mccoy_stage_source_inventory(
 def run_ofes_mccoy_virtual_argo_stage_bridge(
     lifecycle_run_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     event_ids: list[str] | tuple[str, ...] | None = None,
     footprint_mode: str = 'per_stage',
     mccoy_overrides: dict | None = None,
@@ -49969,7 +51721,8 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
     新的 SCV 身份判据。
 
     参数:
-        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用固定正式目录。
+        - lifecycle_run_dir (str | Path | None): event-lifecycle 输出目录；None 使用 scope 专属固定目录。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - event_ids (list[str] | tuple[str, ...] | None): 可选的显式事件子集；None 使用全部严格事件。
         - footprint_mode (str): `per_stage` 或 `fixed_peak`，默认 `per_stage`。
         - mccoy_overrides (dict | None): 临时覆盖 McCoy 配置。
@@ -49986,10 +51739,9 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
         - 不使用运行标签、代码/config/hash 拒绝门或锁文件；完整结果按请求结构复用，缺失或不完整 fragment 自动重算。
         - DO 不参与 McCoy profile 的 rotation/strain 分类；峰值运行的一致性只作报告项。
     """
-    lifecycle_root = (
-        Path(lifecycle_run_dir)
-        if lifecycle_run_dir is not None
-        else _ofes_analysis_output_dir('event_lifecycle')
+    scope = _ofes_event_population_scope_settings(population_scope)
+    lifecycle_root = _ofes_population_output_path(
+        'event_lifecycle', scope['population_scope'], lifecycle_run_dir
     )
     daily_path = lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
     summary_path = lifecycle_root / 'lifecycle_event_summary.parquet'
@@ -50072,16 +51824,16 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
         key=lambda values: values.map(stage_order) if values.name == 'stage' else values,
         kind='mergesort',
     ).reset_index(drop=True)
-    run_dir = _ofes_analysis_output_dir(
-        str(settings.get(
-            'stage_bridge_output_subdir', 'mccoy_virtual_argo_stage_bridge'
-        )),
+    run_dir = _ofes_population_output_path(
+        'mccoy_virtual_argo_stage_bridge',
+        scope['population_scope'],
         output_dir,
     )
     fragments_dir = run_dir / 'fragments'
     fragments_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / 'manifest.json'
     request_payload = {
+        'population_scope': scope['population_scope'],
         'settings': _ofes_material_settings(settings),
         'event_ids': selected_ids,
         'footprint_mode': footprint_mode,
@@ -50136,7 +51888,40 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
     _atomic_write_parquet(source_inventory, run_dir / 'source_inventory.parquet')
     diagnostics = []
     completed = 0
+    failed_requests = []
     pending = []
+
+    def _record_stage_fragment(
+        task: dict,
+        fragment: pd.DataFrame,
+        *,
+        fragment_reused: bool,
+    ) -> None:
+        nonlocal completed
+        _atomic_write_parquet(fragment, task['fragment_path'])
+        stats = _ofes_mccoy_stage_fragment_stats(
+            fragment,
+            task['request'],
+            fragment_reused=fragment_reused,
+        )
+        diagnostics.append(stats)
+        if not stats['stage_diagnostic_available']:
+            failed_requests.append(task['request'])
+        completed += 1
+        manifest['completed_requests'] = completed
+        manifest['updated_at_utc'] = pd.Timestamp.now(
+            tz='UTC'
+        ).isoformat()
+        _ofes_atomic_write_json(manifest, manifest_path)
+
+    def _is_expected_unavailable_error(error: Exception) -> bool:
+        message = str(error)
+        return (
+            isinstance(error, RuntimeError)
+            and 'valid McCoy controls' in message
+            and 'required' in message
+        )
+
     try:
         for row in requests.to_dict(orient='records'):
             fragment_path = fragments_dir / (
@@ -50145,12 +51930,14 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
             )
             if _ofes_mccoy_stage_fragment_reusable(fragment_path, row):
                 fragment = pd.read_parquet(fragment_path)
-                diagnostics.append(
-                    _ofes_mccoy_stage_fragment_stats(
-                        fragment, row, fragment_reused=True
-                    )
+                _record_stage_fragment(
+                    {
+                        'request': row,
+                        'fragment_path': fragment_path,
+                    },
+                    fragment,
+                    fragment_reused=True,
                 )
-                completed += 1
                 continue
             pending.append(
                 {
@@ -50161,44 +51948,54 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
             )
         workers = min(int(settings['worker_count']), len(pending))
         if workers == 1:
-            results = [
-                (task, _ofes_mccoy_event_worker(task)) for task in pending
-            ]
+            for task in pending:
+                try:
+                    fragment, _audit = _ofes_mccoy_event_worker(task)
+                except Exception as error:
+                    if not _is_expected_unavailable_error(error):
+                        raise
+                    fragment = _ofes_mccoy_stage_unavailable_fragment(
+                        task['request'], error
+                    )
+                _record_stage_fragment(
+                    task,
+                    fragment,
+                    fragment_reused=False,
+                )
         elif workers > 1:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(_ofes_mccoy_event_worker, task): task
                     for task in pending
                 }
-                results = [
-                    (task, future.result())
-                    for future, task in (
-                        (future, futures[future])
-                        for future in futures_as_completed(futures)
+                for future in futures_as_completed(futures):
+                    task = futures[future]
+                    try:
+                        fragment, _audit = future.result()
+                    except Exception as error:
+                        if not _is_expected_unavailable_error(error):
+                            raise
+                        fragment = _ofes_mccoy_stage_unavailable_fragment(
+                            task['request'], error
+                        )
+                    _record_stage_fragment(
+                        task,
+                        fragment,
+                        fragment_reused=False,
                     )
-                ]
-        else:
-            results = []
-        for task, (fragment, _audit) in results:
-            _atomic_write_parquet(fragment, task['fragment_path'])
-            diagnostics.append(
-                _ofes_mccoy_stage_fragment_stats(
-                    fragment, task['request'], fragment_reused=False
-                )
+        elif pending:
+            raise RuntimeError(
+                'OFES McCoy stage bridge requires at least one worker.'
             )
-            completed += 1
-            manifest['completed_requests'] = completed
-            manifest['updated_at_utc'] = pd.Timestamp.now(
-                tz='UTC'
-            ).isoformat()
-            _ofes_atomic_write_json(manifest, manifest_path)
         stage_diagnostics = pd.DataFrame(diagnostics).sort_values(
             ['event_order', 'stage'],
             key=lambda values: values.map(stage_order) if values.name == 'stage' else values,
             kind='mergesort',
         ).reset_index(drop=True)
         peak_summary = None
-        peak_path = _ofes_analysis_output_path('mccoy_virtual_argo') / 'event_summary.parquet'
+        peak_path = _ofes_population_output_path(
+            'mccoy_virtual_argo', scope['population_scope']
+        ) / 'event_summary.parquet'
         if peak_path.exists():
             peak_summary = pd.read_parquet(peak_path)
         summary = _ofes_mccoy_stage_summary(
@@ -50229,6 +52026,13 @@ def run_ofes_mccoy_virtual_argo_stage_bridge(
                     key: str(path.resolve())
                     for key, path in output_paths.items()
                 },
+                'unavailable_request_count': int(len(failed_requests)),
+                'unavailable_event_count': int(
+                    len({
+                        str(row['event_id'])
+                        for row in failed_requests
+                    })
+                ),
             }
         )
         _ofes_atomic_write_json(manifest, manifest_path)
@@ -54598,7 +56402,7 @@ def _ofes_trajectory_3d_population_classification(
     """用预注册位移与对齐门槛对总体三维路径分类。"""
     population_columns = (
         'event_id',
-        'deep_sensitivity_rank_within_threshold',
+        'population_rank_within_threshold',
         'kinematic_regime',
         'rotation_dominated',
         'negative_subsurface_rossby_number',
@@ -55561,6 +57365,7 @@ def run_ofes_3d_trajectory_tracers(
     trajectory_population_run_dir: str | Path | None = None,
     population_run_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     tracer_overrides: dict | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
@@ -55572,7 +57377,8 @@ def run_ofes_3d_trajectory_tracers(
 
     参数:
         - trajectory_population_run_dir (str | Path | None): 三维轨迹总体目录；None 使用固定 `trajectory_3d_population` 输出。
-        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用 scope 专属固定 population 输出。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - tracer_overrides (dict | None): 临时覆盖 `ofes.trajectory_tracers` 配置。
         - output_dir (str | Path | None): 输出根目录；None 写入固定 `trajectory_tracers` 目录。
     返回:
@@ -55585,15 +57391,14 @@ def run_ofes_3d_trajectory_tracers(
         - 温度、盐度和spiciness来自同一T-S状态，属于相关的水团指纹，不作为三份独立证据计数。
         - 沿粒子路径保持同号异常支持载体一致性，但仍不能单独证明通风地点或严格material source。
     """
-    trajectory_root = (
-        Path(trajectory_population_run_dir)
-        if trajectory_population_run_dir is not None
-        else _ofes_analysis_output_dir('trajectory_3d_population')
+    scope = _ofes_event_population_scope_settings(population_scope)
+    trajectory_root = _ofes_population_output_path(
+        'trajectory_3d_population',
+        scope['population_scope'],
+        trajectory_population_run_dir,
     )
-    population_root = (
-        Path(population_run_dir)
-        if population_run_dir is not None
-        else _ofes_analysis_output_dir('event_population')
+    population_root = _ofes_population_output_path(
+        'event_population', scope['population_scope'], population_run_dir
     )
     settings = _ofes_trajectory_tracer_settings(tracer_overrides)
     trajectories = pd.read_parquet(trajectory_root / 'trajectories.parquet')
@@ -55640,13 +57445,14 @@ def run_ofes_3d_trajectory_tracers(
         raise RuntimeError(
             f'OFES trajectory tracers lack peak fingerprints: {missing}.'
         )
-    run_dir = _ofes_analysis_output_dir(
-        settings['output_subdir'], output_dir
+    run_dir = _ofes_population_output_path(
+        'trajectory_tracers', scope['population_scope'], output_dir
     )
     events_dir = run_dir / 'events'
     events_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / 'manifest.json'
     request = {
+        'population_scope': scope['population_scope'],
         'settings': _ofes_material_settings(settings),
         'event_ids': [str(value) for value in event_ids],
         'start_dates': [
@@ -56012,6 +57818,7 @@ def run_ofes_3d_trajectory_population(
     w_validation_run_dir: str | Path | None = None,
     representative_3d_run_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     trajectory_overrides: dict | None = None,
     population_overrides: dict | None = None,
     output_dir: str | Path | None = None,
@@ -56024,7 +57831,8 @@ def run_ofes_3d_trajectory_population(
     每个事件单独落盘，以便在固定结果目录中断点续跑。
 
     参数:
-        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用 scope 专属固定 population 输出。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - w_validation_run_dir (str | Path | None): `w` 验证目录；None 使用固定 `vertical_velocity_validation` 输出。
         - representative_3d_run_dir (str | Path | None): 三事件三维运行目录；None 使用固定 `trajectory_3d` 输出。
         - trajectory_overrides (dict | None): 临时覆盖 `ofes.trajectory_3d` 配置；其中
@@ -56041,10 +57849,9 @@ def run_ofes_3d_trajectory_population(
         - 严格比例只使用 population 背景环带完整且 start-to-peak 至少一天的事件。
         - 观测异常核深度变化与粒子变化同号仍只是 resolved-pathway 一致性，不证明 material source 或严格 SCV 身份。
     """
-    population_root = (
-        Path(population_run_dir)
-        if population_run_dir is not None
-        else _ofes_analysis_output_dir('event_population')
+    scope = _ofes_event_population_scope_settings(population_scope)
+    population_root = _ofes_population_output_path(
+        'event_population', scope['population_scope'], population_run_dir
     )
     validation_root = (
         Path(w_validation_run_dir)
@@ -56077,13 +57884,14 @@ def run_ofes_3d_trajectory_population(
     population = pd.read_parquet(
         population_root / 'population_peak_diagnostics.parquet'
     )
-    run_dir = _ofes_analysis_output_dir(
-        population_settings['output_subdir'], output_dir
+    run_dir = _ofes_population_output_path(
+        'trajectory_3d_population', scope['population_scope'], output_dir
     )
     events_dir = run_dir / 'events'
     events_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / 'manifest.json'
     request = {
+        'population_scope': scope['population_scope'],
         'trajectory_settings': _ofes_material_settings(
             trajectory_settings
         ),
@@ -57888,6 +59696,7 @@ def run_ofes_3d_trajectory_ventilation(
     w_validation_run_dir: str | Path | None = None,
     trajectory_population_run_dir: str | Path | None = None,
     *,
+    population_scope: str | None = None,
     ventilation_overrides: dict | None = None,
     trajectory_overrides: dict | None = None,
     output_dir: str | Path | None = None,
@@ -57900,7 +59709,8 @@ def run_ofes_3d_trajectory_ventilation(
     90 天；逐日密度阈值 MLD 的实际接触和释放 sigma0 在当前位置的出露机会分开统计。
 
     参数:
-        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用固定 `event_population` 输出。
+        - population_run_dir (str | Path | None): 严格事件总体目录；None 使用 scope 专属固定 population 输出。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - w_validation_run_dir (str | Path | None): 垂向速度验证目录；None 使用固定 `vertical_velocity_validation` 输出。
         - trajectory_population_run_dir (str | Path | None): 三维轨迹总体目录；None 使用固定 `trajectory_3d_population` 输出。
         - ventilation_overrides (dict | None): 临时覆盖 `ofes.trajectory_ventilation` 配置。
@@ -57910,28 +59720,29 @@ def run_ofes_3d_trajectory_ventilation(
         - dict: 含 run_dir、manifest、逐日诊断、事件×窗口摘要、配对审计、总体比较、analysis summary和图件路径。
 
     输出:
-        - 固定输出目录下的 `events/<event_id>/*.parquet`、`daily_ventilation_diagnostics.parquet`、`event_horizon_summary.parquet`、`control_match_audit.parquet`、`group_comparison.parquet`、`analysis_summary.json`、`trajectory_ventilation.png` 与 `manifest.json`。
+        - 固定输出目录下的 `events/<event_id>/*.parquet`、`daily_ventilation_diagnostics.parquet`、`event_horizon_summary.parquet`、`control_match_audit.parquet`、`unavailable_events.parquet`、`group_comparison.parquet`、`analysis_summary.json`、`trajectory_ventilation.png` 与 `manifest.json`。
 
     说明:
         - direct MLD contact 要求粒子深度不深于同日同点 MLD；25 m near-contact 仅作敏感性。
         - outcrop opportunity 只表示粒子峰值 sigma0 落入当前位置混合层密度范围，不等同于粒子实际通风。
         - 对照不匹配异常水团指纹；主对照故意不匹配旋转，Ro/strain匹配只作次级敏感性。
         - 30/60/90 天比例只纳入窗口完整且组内存活率达门槛的事件，年初事件显式左删失。
+        - 若事件没有足够的 ordinary matched controls，则记录为
+          unavailable 并从事件等权比较中排除，不放宽 control fingerprint 门槛。
     """
-    population_root = (
-        Path(population_run_dir)
-        if population_run_dir is not None
-        else _ofes_analysis_output_dir('event_population')
+    scope = _ofes_event_population_scope_settings(population_scope)
+    population_root = _ofes_population_output_path(
+        'event_population', scope['population_scope'], population_run_dir
     )
     validation_root = (
         Path(w_validation_run_dir)
         if w_validation_run_dir is not None
         else _ofes_analysis_output_dir('vertical_velocity_validation')
     )
-    trajectory_root = (
-        Path(trajectory_population_run_dir)
-        if trajectory_population_run_dir is not None
-        else _ofes_analysis_output_dir('trajectory_3d_population')
+    trajectory_root = _ofes_population_output_path(
+        'trajectory_3d_population',
+        scope['population_scope'],
+        trajectory_population_run_dir,
     )
     settings = _ofes_trajectory_ventilation_settings(
         ventilation_overrides
@@ -57990,13 +59801,14 @@ def run_ofes_3d_trajectory_ventilation(
         how='left',
         validate='one_to_one',
     )
-    run_dir = _ofes_analysis_output_dir(
-        settings['output_subdir'], output_dir
+    run_dir = _ofes_population_output_path(
+        'trajectory_ventilation', scope['population_scope'], output_dir
     )
     events_dir = run_dir / 'events'
     events_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / 'manifest.json'
     request = {
+        'population_scope': scope['population_scope'],
         'settings': _ofes_material_settings(settings),
         'trajectory_settings': _ofes_material_settings(
             trajectory_settings
@@ -58022,6 +59834,13 @@ def run_ofes_3d_trajectory_ventilation(
             'control_audit': pd.read_parquet(outputs['control_audit']),
             'particle_metadata': pd.read_parquet(
                 outputs['particle_metadata']
+            ),
+            'unavailable_events': (
+                pd.read_parquet(outputs['unavailable_events'])
+                if outputs.get('unavailable_events')
+                else pd.DataFrame(
+                    columns=['event_id', 'error_type', 'error']
+                )
             ),
             'group_comparison': pd.read_parquet(
                 outputs['group_comparison']
@@ -58079,6 +59898,8 @@ def run_ofes_3d_trajectory_ventilation(
     analytic_path = run_dir / 'analytic_validation.json'
     _ofes_atomic_write_json(analytic_validation, analytic_path)
     completed = 0
+    available_event_ids: set[str] = set()
+    unavailable_events: list[dict] = []
     try:
         pending = []
         for event in events.to_dict(orient='records'):
@@ -58091,6 +59912,7 @@ def run_ofes_3d_trajectory_ventilation(
                 peak_date=pd.Timestamp(event['peak_date']),
             ):
                 completed += 1
+                available_event_ids.add(str(event['event_id']))
             else:
                 pending.append(
                     {
@@ -58133,8 +59955,42 @@ def run_ofes_3d_trajectory_ventilation(
                 }
                 for future in futures_as_completed(futures):
                     event_id = futures[future]
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        if not (
+                            isinstance(error, RuntimeError)
+                            and 'Insufficient ordinary matched controls'
+                            in str(error)
+                        ):
+                            raise
+                        completed += 1
+                        unavailable_events.append(
+                            {
+                                'event_id': event_id,
+                                'error_type': type(error).__name__,
+                                'error': str(error),
+                            }
+                        )
+                        manifest.update(
+                            {
+                                'completed_events': completed,
+                                'last_unavailable_event': event_id,
+                                'updated_at_utc': pd.Timestamp.now(
+                                    tz='UTC'
+                                ).isoformat(),
+                            }
+                        )
+                        _ofes_atomic_write_json(manifest, manifest_path)
+                        print(
+                            '[OFES trajectory ventilation] '
+                            f'{completed}/{len(events)} unavailable: '
+                            f'{event_id} ({error})',
+                            flush=True,
+                        )
+                        continue
                     completed += 1
+                    available_event_ids.add(event_id)
                     manifest.update(
                         {
                             'completed_events': completed,
@@ -58152,9 +60008,14 @@ def run_ofes_3d_trajectory_ventilation(
                         f'({result["available_backtrack_days"]} d)',
                         flush=True,
                     )
+        available_ids = [
+            str(event_id)
+            for event_id in events['event_id'].astype(str)
+            if str(event_id) in available_event_ids
+        ]
         fragments = [
             _ofes_load_ventilation_fragment(events_dir, event_id)
-            for event_id in events['event_id'].astype(str)
+            for event_id in available_ids
         ]
         daily = pd.concat(
             [item['daily_diagnostics'] for item in fragments],
@@ -58178,9 +60039,7 @@ def run_ofes_3d_trajectory_ventilation(
                 item['particle_metadata'].assign(
                     event_id=str(event_id)
                 )
-                for event_id, item in zip(
-                    events['event_id'].astype(str), fragments
-                )
+                for event_id, item in zip(available_ids, fragments)
             ],
             ignore_index=True,
         )
@@ -58261,11 +60120,20 @@ def run_ofes_3d_trajectory_ventilation(
             ]
         requested_event_ids = set(events['event_id'].astype(str))
         completed_event_ids = set(event_summary['event_id'].astype(str))
+        unavailable_event_ids = {
+            str(item['event_id']) for item in unavailable_events
+        }
+        processed_event_ids = completed_event_ids | unavailable_event_ids
         analysis_summary = {
             'requested_event_count': int(len(requested_event_ids)),
             'completed_event_count': int(len(completed_event_ids)),
+            'available_event_count': int(len(completed_event_ids)),
+            'unavailable_event_count': int(len(unavailable_event_ids)),
+            'unavailable_event_ids': sorted(unavailable_event_ids),
+            'unavailable_events': unavailable_events,
+            'processed_event_count': int(len(processed_event_ids)),
             'requested_not_completed_event_ids': sorted(
-                requested_event_ids - completed_event_ids
+                requested_event_ids - processed_event_ids
             ),
             'completed_not_requested_event_ids': sorted(
                 completed_event_ids - requested_event_ids
@@ -58273,7 +60141,7 @@ def run_ofes_3d_trajectory_ventilation(
             'strict_population_event_count': int(len(events)),
             'particle_count_per_event': int(
                 event_summary['particle_count'].iloc[0]
-            ),
+            ) if not event_summary.empty else None,
             'full_window_event_counts': full_window_counts,
             'complete_pair_counts_by_horizon': complete_pair_counts,
             'left_censored_event_count': int(
@@ -58326,6 +60194,10 @@ def run_ofes_3d_trajectory_ventilation(
                 'encounter the MLD.',
             ],
         }
+        unavailable_frame = pd.DataFrame(
+            unavailable_events,
+            columns=['event_id', 'error_type', 'error'],
+        )
         output_paths = {
             'daily_diagnostics': (
                 run_dir / 'daily_ventilation_diagnostics.parquet'
@@ -58334,6 +60206,7 @@ def run_ofes_3d_trajectory_ventilation(
             'control_audit': run_dir / 'control_match_audit.parquet',
             'particle_metadata': run_dir / 'particle_metadata.parquet',
             'event_summary': run_dir / 'event_summary.parquet',
+            'unavailable_events': run_dir / 'unavailable_events.parquet',
             'group_comparison': run_dir / 'group_comparison.parquet',
             'analysis_summary': run_dir / 'analysis_summary.json',
             'figure': run_dir / 'trajectory_ventilation.png',
@@ -58347,6 +60220,7 @@ def run_ofes_3d_trajectory_ventilation(
             ('control_audit', control_audit),
             ('particle_metadata', particle_metadata),
             ('event_summary', event_summary),
+            ('unavailable_events', unavailable_frame),
             ('group_comparison', comparison),
         ):
             _atomic_write_parquet(frame, output_paths[key])
@@ -58362,6 +60236,9 @@ def run_ofes_3d_trajectory_ventilation(
             {
                 'status': 'complete',
                 'completed_events': int(len(events)),
+                'available_event_count': int(len(completed_event_ids)),
+                'unavailable_event_count': int(len(unavailable_event_ids)),
+                'unavailable_event_ids': sorted(unavailable_event_ids),
                 'updated_at_utc': pd.Timestamp.now(
                     tz='UTC'
                 ).isoformat(),
@@ -58377,6 +60254,10 @@ def run_ofes_3d_trajectory_ventilation(
             {
                 'status': 'failed',
                 'completed_events': completed,
+                'unavailable_event_count': int(len(unavailable_events)),
+                'unavailable_event_ids': sorted(
+                    str(item['event_id']) for item in unavailable_events
+                ),
                 'updated_at_utc': pd.Timestamp.now(
                     tz='UTC'
                 ).isoformat(),
@@ -58393,6 +60274,7 @@ def run_ofes_3d_trajectory_ventilation(
         'horizon_summary': horizon,
         'control_audit': control_audit,
         'particle_metadata': particle_metadata,
+        'unavailable_events': unavailable_frame,
         'group_comparison': comparison,
         'analysis_summary': analysis_summary,
         'figure_path': output_paths['figure'],
@@ -59107,6 +60989,7 @@ def run_ofes_daily_water_mass_diagnostics(
     lifecycle_dir: str | Path | None = None,
     *,
     population_dir: str | Path | None = None,
+    population_scope: str | None = None,
     geometry_mode: str = 'both',
     output_dir: str | Path | None = None,
     water_mass_overrides: dict | None = None,
@@ -59119,7 +61002,8 @@ def run_ofes_daily_water_mass_diagnostics(
 
     参数:
         - lifecycle_dir (str | Path | None): lifecycle 输出目录；None 使用固定正式目录。
-        - population_dir (str | Path | None): population 输出目录；None 使用固定正式目录。
+        - population_dir (str | Path | None): population 输出目录；None 使用 scope 专属固定目录。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
         - geometry_mode (str): `fixed_site`、`moving_core` 或 `both`（默认）。
         - output_dir (str | Path | None): 固定输出根目录；None 使用 YAML 的 output_subdir。
         - water_mass_overrides (dict | None): 临时覆盖 YAML 中已声明的 producer 参数。
@@ -59149,8 +61033,13 @@ def run_ofes_daily_water_mass_diagnostics(
     else:
         raise ValueError("geometry_mode must be 'fixed_site', 'moving_core', or 'both'.")
 
-    lifecycle_root = _ofes_analysis_output_path('event_lifecycle', lifecycle_dir)
-    population_root = _ofes_analysis_output_path('event_population', population_dir)
+    scope = _ofes_event_population_scope_settings(population_scope)
+    lifecycle_root = _ofes_population_output_path(
+        'event_lifecycle', scope['population_scope'], lifecycle_dir
+    )
+    population_root = _ofes_population_output_path(
+        'event_population', scope['population_scope'], population_dir
+    )
     lifecycle_path = lifecycle_root / 'lifecycle_daily_diagnostics.parquet'
     population_path = population_root / 'population_peak_diagnostics.parquet'
     if not lifecycle_path.exists() or not population_path.exists():
@@ -59159,7 +61048,9 @@ def run_ofes_daily_water_mass_diagnostics(
     lifecycle_daily = pd.read_parquet(lifecycle_path)
     population = pd.read_parquet(population_path)
     requests = _ofes_daily_water_mass_requests(lifecycle_daily, population)
-    output_root = _ofes_analysis_output_path(settings['output_subdir'], output_dir)
+    output_root = _ofes_population_output_path(
+        'daily_water_mass', scope['population_scope'], output_dir
+    )
     results = {
         mode: _ofes_run_daily_water_mass_geometry(
             requests,
@@ -61244,14 +63135,16 @@ def load_ofes_event_diagnostics(
 
 def load_ofes_event_population(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
-    """读取 OFES 深层事件总体峰值诊断结果。
+    """读取指定 OFES population scope 的峰值诊断结果。
 
     本函数只读取总体 parquet、JSON 摘要和正式图件。
 
     参数:
-        - output_dir (str | Path | None): event population 目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): `primary_300_1000` 或 `deep_500_1000`；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): event population 目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含总体事件表、峰值诊断、summary、figure_path 和 output_paths。
@@ -61262,9 +63155,12 @@ def load_ofes_event_population(
     说明:
         - loader 不启动轨迹或其他后续诊断。
     """
+    population_root = _ofes_population_output_path(
+        'event_population', population_scope, output_dir
+    )
     return _ofes_load_fixed_outputs(
         'event_population',
-        output_dir=output_dir,
+        output_dir=population_root,
         parquet_paths={
             'population_events': 'population_events.parquet',
             'population_peak_diagnostics': 'population_peak_diagnostics.parquet',
@@ -61378,6 +63274,7 @@ def load_ofes_event_patch_continuity(
 
 def load_ofes_event_lifecycle(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取 OFES 事件全生命周期动力和表层表达结果。
@@ -61385,7 +63282,8 @@ def load_ofes_event_lifecycle(
     本函数只读取 lifecycle 日表、垂向剖面、事件汇总、parity、analysis summary 和图件。
 
     参数:
-        - output_dir (str | Path | None): event lifecycle 目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): event lifecycle 目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含 daily/profile/event 表、peak parity、analysis_summary、figure_path 和 output_paths。
@@ -61398,7 +63296,9 @@ def load_ofes_event_lifecycle(
     """
     return _ofes_load_fixed_outputs(
         'event_lifecycle',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'event_lifecycle', population_scope, output_dir
+        ),
         parquet_paths={
             'daily_diagnostics': 'lifecycle_daily_diagnostics.parquet',
             'vertical_profiles': 'lifecycle_vertical_profiles.parquet',
@@ -61577,6 +63477,7 @@ def load_ofes_3d_trajectory_ensembles(
 
 def load_ofes_3d_trajectory_population(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取已完成的 OFES 三维轨迹总体结果。
@@ -61584,7 +63485,8 @@ def load_ofes_3d_trajectory_population(
     本函数读取事件资格、轨迹汇总、总体分类和代表事件 parity，不重新运行总体轨迹。
 
     参数:
-        - output_dir (str | Path | None): 三维轨迹总体结果目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): 三维轨迹总体结果目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含资格表、事件摘要、轨迹、总体分类、parity、分析摘要、manifest 和 output_paths。
@@ -61597,7 +63499,9 @@ def load_ofes_3d_trajectory_population(
     """
     return _ofes_load_completed_outputs(
         'trajectory_3d_population',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'trajectory_3d_population', population_scope, output_dir
+        ),
         parquet_keys=(
             'event_eligibility',
             'event_summary',
@@ -61613,6 +63517,7 @@ def load_ofes_3d_trajectory_population(
 
 def load_ofes_trajectory_tracers(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取已完成的 OFES 轨迹 DO、温盐和 spiciness 指纹结果。
@@ -61620,7 +63525,8 @@ def load_ofes_trajectory_tracers(
     本函数只读取轨迹位置上的示踪剂样本和汇总表，不重新采样 OFES 快照。
 
     参数:
-        - output_dir (str | Path | None): 轨迹示踪剂结果目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): 轨迹示踪剂结果目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含粒子样本、逐日摘要、逐事件摘要、分析摘要、manifest 和 output_paths。
@@ -61633,7 +63539,9 @@ def load_ofes_trajectory_tracers(
     """
     return _ofes_load_completed_outputs(
         'trajectory_tracers',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'trajectory_tracers', population_scope, output_dir
+        ),
         parquet_keys=(
             'particle_tracer_samples',
             'daily_tracer_summary',
@@ -61645,6 +63553,7 @@ def load_ofes_trajectory_tracers(
 
 def load_ofes_mccoy_virtual_argo(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取已完成的 OFES McCoy-compatible virtual-Argo 结果。
@@ -61652,7 +63561,8 @@ def load_ofes_mccoy_virtual_argo(
     本函数只读取虚拟剖面、事件汇总和审计表，不重新读取 McCoy 源码或 OFES NetCDF。
 
     参数:
-        - output_dir (str | Path | None): McCoy virtual-Argo 结果目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): McCoy virtual-Argo 结果目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含 profile/event/audit 表、分析摘要、manifest、figure_path 和 output_paths。
@@ -61665,7 +63575,9 @@ def load_ofes_mccoy_virtual_argo(
     """
     return _ofes_load_completed_outputs(
         'mccoy_virtual_argo',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'mccoy_virtual_argo', population_scope, output_dir
+        ),
         parquet_keys=(
             'profile_diagnostics',
             'event_summary',
@@ -61677,6 +63589,7 @@ def load_ofes_mccoy_virtual_argo(
 
 def load_ofes_mccoy_stage_bridge(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取已完成的 OFES McCoy start/peak/last 阶段诊断。
@@ -61684,7 +63597,8 @@ def load_ofes_mccoy_stage_bridge(
     本函数只读取阶段统计和汇总，不重新读取 McCoy 源码或 OFES NetCDF。
 
     参数:
-        - output_dir (str | Path | None): 阶段 bridge 结果目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): 阶段 bridge 结果目录；None 使用 scope 专属固定路径。
 
     返回:
         - dict: 含 stage_diagnostics、summary、manifest、figure_path 和 output_paths。
@@ -61697,7 +63611,9 @@ def load_ofes_mccoy_stage_bridge(
     """
     return _ofes_load_completed_outputs(
         'mccoy_virtual_argo_stage_bridge',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'mccoy_virtual_argo_stage_bridge', population_scope, output_dir
+        ),
         parquet_keys=('stage_diagnostics',),
         json_keys=('summary',),
     )
@@ -61705,6 +63621,7 @@ def load_ofes_mccoy_stage_bridge(
 
 def load_ofes_trajectory_ventilation(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """读取已完成的 OFES 轨迹通风历史结果。
@@ -61712,10 +63629,11 @@ def load_ofes_trajectory_ventilation(
     本函数只读取逐日通风、时间窗口、对照匹配和总体比较产物，不重新回溯粒子。
 
     参数:
-        - output_dir (str | Path | None): 轨迹通风结果目录；None 使用固定 OFES 路径。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): 轨迹通风结果目录；None 使用 scope 专属固定路径。
 
     返回:
-        - dict: 含逐日诊断、窗口摘要、对照审计、粒子元数据、总体比较、分析摘要、manifest 和 output_paths。
+        - dict: 含逐日诊断、窗口摘要、对照审计、粒子元数据、unavailable 事件、总体比较、分析摘要、manifest 和 output_paths。
 
     输出:
         - 无；只读取已有正式产物。
@@ -61725,12 +63643,15 @@ def load_ofes_trajectory_ventilation(
     """
     return _ofes_load_completed_outputs(
         'trajectory_ventilation',
-        output_dir=output_dir,
+        output_dir=_ofes_population_output_path(
+            'trajectory_ventilation', population_scope, output_dir
+        ),
         parquet_keys=(
             'daily_diagnostics',
             'horizon_summary',
             'control_audit',
             'particle_metadata',
+            'unavailable_events',
             'group_comparison',
         ),
         json_keys=('analytic_validation', 'analysis_summary'),
@@ -62102,6 +64023,8 @@ def plot_ofes_trajectory_ventilation(
         show_fig=show_fig,
         save_fig=save_fig,
     )
+
+
 def load_ofes_quality_event_diagnostics(
     *,
     output_dir: str | Path | None = None,
@@ -62136,15 +64059,660 @@ def load_ofes_quality_event_diagnostics(
     )
 
 
+def load_ofes_depth_gate_sensitivity(
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取 OFES depth-gate sensitivity 的事件表、summary 和图件。
+
+    本函数只读取已经完成的 sensitivity 产物，不访问 OFES NetCDF，也不重建
+    catalog 或 quality diagnostic。每个 gate 的事件表分别保留 decomposition、
+    kinematic 和 full diagnostic 资格门；缺失值保持为 NA，以便调用方区分不可评估
+    与明确失败。
+
+    参数:
+        - output_dir (str | Path | None): sensitivity 输出根目录；None 使用 YAML 配置的固定 OFES 路径。
+
+    返回:
+        - dict: 含 `summary`、`gate_summaries`、`secondary_gate_summaries`、`event_tables`、`secondary_event_tables`、路径和可用图件。
+
+    输出:
+        - 无；只读取已有 parquet、JSON 和 PNG。
+
+    说明:
+        - `gate_summaries` 的 fraction CI 是事件级 bootstrap 或 Wilson 描述区间；默认 100/300 m gate 不是独立样本。
+    """
+    settings = _ofes_depth_gate_sensitivity_settings()
+    root = _ofes_analysis_output_path(
+        settings['output_subdir'], output_dir
+    )
+    summary_path = root / 'sensitivity_summary.json'
+    summary_table_path = root / 'gate_summaries.parquet'
+    if not summary_path.exists() or not summary_table_path.exists():
+        raise FileNotFoundError(
+            'OFES depth-gate sensitivity output is unavailable or incomplete: '
+            f'{root}. Run the producer first.'
+        )
+    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    if summary.get('status') != 'complete':
+        raise RuntimeError(
+            'OFES depth-gate sensitivity output is not complete '
+            f'(status={summary.get("status", "unknown")}).'
+        )
+    gate_summaries = _ofes_depth_gate_restore_summary_frame(
+        pd.read_parquet(summary_table_path)
+    )
+    if gate_summaries.empty:
+        raise RuntimeError(
+            'OFES depth-gate sensitivity contains no gate summaries.'
+        )
+    event_tables: dict[str, pd.DataFrame] = {}
+    secondary_tables: dict[str, pd.DataFrame] = {}
+    secondary_summaries: list[dict] = []
+    gate_outputs = (summary.get('outputs') or {}).get('gates') or {}
+    for row in gate_summaries.sort_values(
+        'minimum_depth_m', kind='mergesort'
+    ).itertuples(index=False):
+        tag = str(getattr(row, 'gate_tag'))
+        paths = _ofes_depth_gate_paths(
+            root, float(getattr(row, 'minimum_depth_m'))
+        )
+        if tag != _ofes_depth_gate_tag(
+            float(getattr(row, 'minimum_depth_m'))
+        ):
+            raise RuntimeError(
+                f'Inconsistent depth-gate tag in summary: {tag}.'
+            )
+        missing = [
+            key for key in (
+                'event_table',
+                'secondary_event_table',
+                'summary_json',
+            ) if not paths[key].exists()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f'OFES depth-gate sensitivity {tag} is incomplete; '
+                f'missing: {", ".join(missing)}.'
+            )
+        event_tables[tag] = pd.read_parquet(paths['event_table'])
+        secondary_tables[tag] = pd.read_parquet(
+            paths['secondary_event_table']
+        )
+        if tag in gate_outputs:
+            stored_summary = json.loads(
+                paths['summary_json'].read_text(encoding='utf-8')
+            )
+            if stored_summary.get('summary', {}).get('gate_tag', tag) != tag:
+                raise RuntimeError(
+                    f'Inconsistent depth-gate summary for {tag}.'
+                )
+            secondary_summary = stored_summary.get('secondary_summary')
+            if secondary_summary is None:
+                raise RuntimeError(
+                    f'Missing boundary-excluded summary for {tag}.'
+                )
+            secondary_summaries.append(secondary_summary)
+    figure_path = root / 'depth_gate_sensitivity.png'
+    return {
+        'output_dir': root,
+        'summary': summary,
+        'gate_summaries': gate_summaries,
+        'event_tables': event_tables,
+        'secondary_event_tables': secondary_tables,
+        'secondary_gate_summaries': secondary_summaries,
+        'figure_path': figure_path if figure_path.exists() else None,
+        'output_paths': {
+            'summary': summary_path,
+            'gate_summaries': summary_table_path,
+            'figure': figure_path,
+        },
+    }
+
+
+def plot_ofes_depth_gate_sensitivity(
+    result: Mapping[str, Any] | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    dpi: int = 600,
+) -> dict:
+    """绘制 OFES depth-gate 的主估计与边界排除估计。
+
+    图件消费 producer/loader 已保存的事件级表格，不重新扫描 OFES 日场。左图
+    显示 heave absolute fraction 的事件分布、主估计和排除搜索边界峰后的中位数；
+    右图并列显示两套 water-mass-dominated proportion 及 Wilson 95% CI。
+
+    参数:
+        - result (Mapping | None): `load_ofes_depth_gate_sensitivity` 的返回值；None 时读取固定 sensitivity 产物。
+        - output_dir (str | Path | None): 图件所在 sensitivity 根目录；None 使用 result 目录或 YAML 配置路径。
+        - show_fig (bool): 是否显示图件，默认 True。
+        - save_fig (bool): 是否保存独立 sensitivity PNG，默认 True。
+        - dpi (int): PNG 输出分辨率，默认 600。
+
+    返回:
+        - dict: 含 figure 对象和（保存时）figure_path。
+
+    输出:
+        - `<output_dir>/depth_gate_sensitivity.png`（`save_fig=True`，默认 600 dpi）。
+
+    说明:
+        - 图中 100 m 标为 shallow sensitivity，300 m 标为 primary OFES definition；不修改 Figure 1–6。
+        - 主估计和边界排除估计使用各自的 decomposition-eligible 分母；图中事件数以 `numerator/denominator` 标注。
+    """
+    payload = (
+        result
+        if result is not None
+        else load_ofes_depth_gate_sensitivity(output_dir=output_dir)
+    )
+    root = Path(
+        output_dir
+        if output_dir is not None
+        else payload.get(
+            'output_dir',
+            _ofes_analysis_output_path(
+                _ofes_depth_gate_sensitivity_settings()['output_subdir']
+            ),
+        )
+    )
+    path = root / 'depth_gate_sensitivity.png'
+    figure_path, figure = _ofes_plot_depth_gate_sensitivity(
+        payload,
+        path,
+        dpi=dpi,
+        save_fig=save_fig,
+        show_fig=show_fig,
+        close_fig=not show_fig,
+    )
+    return {'figure': figure, 'figure_path': figure_path}
+
+
+def _ofes_depth_gate_supplement_summary(
+    event_rows: pd.DataFrame,
+    *,
+    source_population_count: int,
+    source_population_passed_count: int,
+    boundary_excluded: bool,
+    settings: Mapping[str, Any],
+) -> dict:
+    """汇总已有 500 m deep population 的补充 depth-gate 结果。"""
+    required = {
+        'event_id',
+        'peak_depth_m',
+        'peak_decomposition_eligible',
+        'water_mass_absolute_fraction',
+        'heave_absolute_fraction',
+        'water_mass_dominated',
+    }
+    missing = sorted(required.difference(event_rows.columns))
+    if missing:
+        raise KeyError(
+            f'Depth-gate supplement event table lacks columns: {missing}'
+        )
+    eligible = event_rows['peak_decomposition_eligible'].eq(True).fillna(False)
+    fraction_rows = event_rows.loc[eligible].copy()
+    if fraction_rows.empty:
+        raise ValueError(
+            'Depth-gate supplement has no decomposition-evaluable events.'
+        )
+    heave_median, heave_ci, heave_n = _ofes_depth_gate_bootstrap_median(
+        fraction_rows['heave_absolute_fraction'],
+        int(settings['bootstrap_replicates']),
+        int(settings['random_seed']),
+    )
+    water_median, water_ci, water_n = _ofes_depth_gate_bootstrap_median(
+        fraction_rows['water_mass_absolute_fraction'],
+        int(settings['bootstrap_replicates']),
+        int(settings['random_seed']),
+    )
+    dominated = fraction_rows['water_mass_dominated']
+    dominated_denominator = int(dominated.notna().sum())
+    dominated_count = int((dominated == True).sum())  # noqa: E712
+    if dominated_denominator <= 0:
+        raise ValueError(
+            'Depth-gate supplement has no water-mass classification rows.'
+        )
+    dominated_interval = _binomial_wilson_interval(
+        dominated_count,
+        dominated_denominator,
+    )
+    peak_depth = pd.to_numeric(
+        fraction_rows['peak_depth_m'], errors='coerce'
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    lower_boundary_count = int(
+        event_rows.get(
+            'peak_on_lower_search_level',
+            pd.Series(False, index=event_rows.index),
+        ).fillna(False).astype(bool).sum()
+    )
+    upper_boundary_count = int(
+        event_rows.get(
+            'peak_on_upper_search_level',
+            pd.Series(False, index=event_rows.index),
+        ).fillna(False).astype(bool).sum()
+    )
+    if peak_depth.empty:
+        depth_distribution = {
+            'count': 0,
+            'min': None,
+            'q25': None,
+            'median': None,
+            'q75': None,
+            'max': None,
+        }
+    else:
+        depth_distribution = {
+            'count': int(len(peak_depth)),
+            'min': float(peak_depth.min()),
+            'q25': float(peak_depth.quantile(0.25)),
+            'median': float(peak_depth.median()),
+            'q75': float(peak_depth.quantile(0.75)),
+            'max': float(peak_depth.max()),
+        }
+    return {
+        'minimum_depth_m': 500.0,
+        'actual_lower_search_level_m': float(peak_depth.min()) if len(peak_depth) else None,
+        'actual_upper_search_level_m': None,
+        'effective_detector_minimum_m': float(peak_depth.min()) if len(peak_depth) else None,
+        'candidate_depth_max_m': 1000.0,
+        'boundary_excluded': bool(boundary_excluded),
+        'quality_event_count': int(len(event_rows)),
+        'analysis_event_count': int(len(event_rows)),
+        'source_population_event_count': int(source_population_count),
+        'source_population_passed_event_count': int(source_population_passed_count),
+        'source_population_failed_event_count': int(
+            source_population_count - source_population_passed_count
+        ),
+        'peak_decomposition_eligible_count': int(eligible.sum()),
+        'peak_decomposition_missing_count': int((~eligible).sum()),
+        'peak_decomposition_failed_count': int(
+            event_rows['peak_decomposition_eligible'].eq(False).sum()
+        ),
+        'peak_decomposition_unavailable_count': int(
+            event_rows['peak_decomposition_eligible'].isna().sum()
+        ),
+        'peak_kinematic_eligible_count': None,
+        'peak_kinematic_missing_count': None,
+        'peak_kinematic_unavailable_count': None,
+        'peak_full_diagnostic_passed_count': int(source_population_passed_count),
+        'peak_full_diagnostic_failed_count': int(
+            source_population_count - source_population_passed_count
+        ),
+        'peak_full_diagnostic_unavailable_count': 0,
+        'peak_fraction_eligible_count': int(len(fraction_rows)),
+        'all_sampled_days_complete_count': None,
+        'lower_search_boundary_peak_count': lower_boundary_count,
+        'upper_search_boundary_peak_count': upper_boundary_count,
+        'median_peak_depth_m': float(peak_depth.median()) if len(peak_depth) else None,
+        'median_water_mass_absolute_fraction': water_median,
+        'median_water_mass_absolute_fraction_bootstrap95': water_ci,
+        'median_heave_absolute_fraction': heave_median,
+        'median_heave_absolute_fraction_bootstrap95': heave_ci,
+        'median_abs_water_mass_do_contrast': float(
+            pd.to_numeric(
+                fraction_rows.get(
+                    'water_mass_do_contrast', pd.Series(dtype=float)
+                ),
+                errors='coerce',
+            ).abs().median()
+        ) if 'water_mass_do_contrast' in fraction_rows else None,
+        'median_abs_heave_do_contribution': float(
+            pd.to_numeric(
+                fraction_rows.get(
+                    'heave_do_contribution', pd.Series(dtype=float)
+                ),
+                errors='coerce',
+            ).abs().median()
+        ) if 'heave_do_contribution' in fraction_rows else None,
+        'water_mass_dominated_count': dominated_count,
+        'water_mass_dominated_denominator': dominated_denominator,
+        'water_mass_dominated_fraction': float(
+            dominated_count / dominated_denominator
+        ),
+        'water_mass_dominated_wilson95': [
+            float(dominated_interval[0]),
+            float(dominated_interval[1]),
+        ],
+        'catalog_event_count': int(source_population_count),
+        'catalog_rank_eligible_count': int(source_population_count),
+        'catalog_peak_depth_distribution': depth_distribution,
+        'bootstrap_replicates': int(settings['bootstrap_replicates']),
+        'random_seed': int(settings['random_seed']),
+        'bootstrap_water_mass_fraction_n': int(water_n),
+        'bootstrap_heave_fraction_n': int(heave_n),
+        'cumulative_depth_gates_are_not_independent_samples': True,
+        'gate': 500.0,
+        'gate_tag': _ofes_depth_gate_tag(500.0),
+        'catalog_dir': None,
+        'diagnostic_dir': None,
+    }
+
+
+def build_ofes_depth_gate_sensitivity_supplement(
+    *,
+    sensitivity_dir: str | Path | None = None,
+    deep_population_dir: str | Path | None = None,
+    deep_lifecycle_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    dpi: int = 600,
+) -> dict:
+    """从已完成产物组装 100/300/500 m OFES depth sensitivity 补充图表。
+
+    该轻量 reducer 读取已有的 100/300 m depth-gate summary，以及 500–1000 m
+    deep population 和 lifecycle 表，只将 lifecycle 中的 56 个完整事件与深层
+    峰值诊断配对。它不访问 OFES NetCDF，不启动 event catalog、quality diagnosis、
+    PET、轨迹或任何全年 producer。
+
+    参数:
+        - sensitivity_dir (str | Path | None): 已完成 100/300 m sensitivity 根目录；None 使用固定 OFES 路径。
+        - deep_population_dir (str | Path | None): 已完成 500–1000 m population 目录；None 使用固定 OFES 路径。
+        - deep_lifecycle_dir (str | Path | None): 已完成 500–1000 m lifecycle 目录；None 使用固定 OFES 路径。
+        - output_dir (str | Path | None): 补充图表输出目录；None 写入 sensitivity 根目录下的 supplementary_100_300_500。
+        - dpi (int): 补充 PNG 分辨率，默认 600。
+
+    返回:
+        - dict: 含 3 个 depth gate 的主/边界排除 summary、事件表、图件路径和输出路径。
+
+    输出:
+        - gate_summaries.parquet、secondary_gate_summaries.parquet 和 depth_sensitivity_summary.parquet。
+        - depth500_event_summary.parquet、depth500_secondary_event_summary.parquet。
+        - depth_gate_sensitivity_100_300_500.png 和 summary.json。
+
+    说明:
+        - 500 m 行使用 deep_event_lifecycle/lifecycle_event_summary.parquet 的 56 个事件作为完整分析分母；深层 population 中另外 3 个 delivery-edge 失败事件保留在 provenance 计数中但不进入 54/56。
+        - 500 m 边界排除估计按实际搜索上下边界标记过滤，并在 summary 中报告排除后的实际分母。
+        - 100/300 m 行由已有 loader 读取，所有深度门是 cumulative gates，不作独立样本显著性检验。
+        - 这是补充 reducer/plotter，不是新的 depth-gate 扫描；已有源数据保持不变。
+    """
+    settings = _ofes_depth_gate_sensitivity_settings()
+    base_root = _ofes_analysis_output_path(
+        settings['output_subdir'], sensitivity_dir
+    )
+    deep_population_root = (
+        Path(deep_population_dir)
+        if deep_population_dir is not None
+        else _ofes_analysis_output_path('deep_event_population')
+    )
+    deep_lifecycle_root = (
+        Path(deep_lifecycle_dir)
+        if deep_lifecycle_dir is not None
+        else _ofes_analysis_output_path('deep_event_lifecycle')
+    )
+    target_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else base_root / 'supplementary_100_300_500'
+    )
+    peak_path = deep_population_root / 'population_peak_diagnostics.parquet'
+    lifecycle_path = deep_lifecycle_root / 'lifecycle_event_summary.parquet'
+    if not peak_path.exists() or not lifecycle_path.exists():
+        raise FileNotFoundError(
+            '500 m depth-gate supplement requires existing deep population '
+            f'and lifecycle outputs: {peak_path}, {lifecycle_path}'
+        )
+    base = load_ofes_depth_gate_sensitivity(output_dir=base_root)
+    base_tags = set(base['event_tables'])
+    expected_base_tags = {
+        _ofes_depth_gate_tag(100.0),
+        _ofes_depth_gate_tag(300.0),
+    }
+    if base_tags != expected_base_tags:
+        raise RuntimeError(
+            'Depth-gate supplement expects existing 100 m and 300 m '
+            f'summaries, found {sorted(base_tags)}.'
+        )
+
+    peak = pd.read_parquet(peak_path).copy()
+    lifecycle = pd.read_parquet(lifecycle_path).copy()
+    if 'event_id' not in peak.columns or 'event_id' not in lifecycle.columns:
+        raise KeyError('Deep population and lifecycle tables require event_id.')
+    peak['event_id'] = peak['event_id'].astype(str)
+    lifecycle['event_id'] = lifecycle['event_id'].astype(str)
+    lifecycle_ids = set(lifecycle['event_id'])
+    if len(lifecycle_ids) != len(lifecycle):
+        raise RuntimeError('500 m lifecycle table contains duplicate event_id rows.')
+    if 'population_diagnostic_passed' not in peak.columns:
+        raise KeyError(
+            '500 m deep population lacks population_diagnostic_passed.'
+        )
+    source_population_count = int(len(peak))
+    source_population_passed_count = int(
+        peak['population_diagnostic_passed'].eq(True).sum()
+    )
+    deep_rows = peak.loc[
+        peak['event_id'].isin(lifecycle_ids)
+        & peak['population_diagnostic_passed'].eq(True)
+    ].copy()
+    if len(deep_rows) != len(lifecycle_ids):
+        raise RuntimeError(
+            '500 m lifecycle and population diagnostic event sets do not '
+            f'match: lifecycle={len(lifecycle_ids)}, selected={len(deep_rows)}.'
+        )
+    if deep_rows['event_id'].duplicated().any():
+        raise RuntimeError('500 m supplement selected duplicate event_id rows.')
+    required_decomposition = {
+        'peak_depth_m',
+        'water_mass_do_contrast',
+        'heave_do_contribution',
+        'decomposition_closure_error',
+    }
+    missing = sorted(required_decomposition.difference(deep_rows.columns))
+    if missing:
+        raise KeyError(
+            f'500 m deep population lacks decomposition columns: {missing}'
+        )
+    water_mass = pd.to_numeric(
+        deep_rows['water_mass_do_contrast'], errors='coerce'
+    )
+    heave = pd.to_numeric(
+        deep_rows['heave_do_contribution'], errors='coerce'
+    )
+    closure = pd.to_numeric(
+        deep_rows['decomposition_closure_error'], errors='coerce'
+    )
+    total = water_mass.abs() + heave.abs()
+    decomposition_eligible = (
+        np.isfinite(water_mass.to_numpy(dtype=float))
+        & np.isfinite(heave.to_numpy(dtype=float))
+        & np.isfinite(closure.to_numpy(dtype=float))
+        & (np.abs(closure.to_numpy(dtype=float)) <= 1e-10)
+        & np.isfinite(total.to_numpy(dtype=float))
+        & (total.to_numpy(dtype=float) > 0)
+    )
+    if not np.all(decomposition_eligible):
+        raise RuntimeError(
+            '500 m deep lifecycle events contain incomplete decomposition '
+            'values; refusing to change the 54/56 denominator.'
+        )
+    deep_rows['minimum_depth_m'] = 500.0
+    deep_rows['gate'] = 500.0
+    deep_rows['gate_tag'] = _ofes_depth_gate_tag(500.0)
+    deep_rows['peak_decomposition_eligible'] = pd.Series(
+        decomposition_eligible,
+        index=deep_rows.index,
+        dtype='boolean',
+    )
+    deep_rows['water_mass_absolute_fraction'] = (
+        water_mass.abs() / total
+    )
+    deep_rows['heave_absolute_fraction'] = 1.0 - deep_rows[
+        'water_mass_absolute_fraction'
+    ]
+    deep_rows['water_mass_dominated'] = pd.Series(
+        water_mass.abs().to_numpy(dtype=float)
+        > heave.abs().to_numpy(dtype=float),
+        index=deep_rows.index,
+        dtype='boolean',
+    )
+    deep_rows['boundary_excluded'] = False
+    deep_rows['supplement_source'] = (
+        'deep_event_population + deep_event_lifecycle'
+    )
+    deep_rows = deep_rows.sort_values(
+        'population_rank_within_threshold', kind='mergesort'
+    ).reset_index(drop=True)
+    secondary_rows = deep_rows.loc[
+        ~deep_rows['peak_on_lower_search_level'].astype(bool)
+        & ~deep_rows['peak_on_upper_search_level'].astype(bool)
+    ].copy()
+    secondary_rows['boundary_excluded'] = True
+    supplement_summary = _ofes_depth_gate_supplement_summary(
+        deep_rows,
+        source_population_count=source_population_count,
+        source_population_passed_count=source_population_passed_count,
+        boundary_excluded=False,
+        settings=settings,
+    )
+    supplement_secondary_summary = _ofes_depth_gate_supplement_summary(
+        secondary_rows,
+        source_population_count=source_population_count,
+        source_population_passed_count=source_population_passed_count,
+        boundary_excluded=True,
+        settings=settings,
+    )
+    for summary in (supplement_summary, supplement_secondary_summary):
+        summary['source_population_dir'] = str(deep_population_root)
+        summary['source_lifecycle_dir'] = str(deep_lifecycle_root)
+    def _append_summary_row(
+        frame: pd.DataFrame,
+        row: Mapping[str, Any],
+    ) -> pd.DataFrame:
+        result = frame.copy()
+        for column in row:
+            if column not in result.columns:
+                result[column] = pd.Series(
+                    index=result.index,
+                    dtype='object',
+                )
+        new_index = len(result)
+        result.loc[new_index] = np.nan
+        for column, value in row.items():
+            if isinstance(value, (list, tuple, dict, np.ndarray)):
+                result[column] = result[column].astype(object)
+            result.at[new_index, column] = value
+        return result
+
+    gate_summaries = _append_summary_row(
+        base['gate_summaries'],
+        supplement_summary,
+    ).sort_values(
+        'minimum_depth_m', kind='mergesort'
+    ).reset_index(drop=True)
+    secondary_summaries = _append_summary_row(
+        pd.DataFrame(base['secondary_gate_summaries']),
+        supplement_secondary_summary,
+    ).sort_values(
+        'minimum_depth_m', kind='mergesort'
+    ).reset_index(drop=True)
+    event_tables = dict(base['event_tables'])
+    secondary_tables = dict(base['secondary_event_tables'])
+    event_tables[_ofes_depth_gate_tag(500.0)] = deep_rows
+    secondary_tables[_ofes_depth_gate_tag(500.0)] = secondary_rows
+    target_root.mkdir(parents=True, exist_ok=True)
+    summary_table = pd.concat(
+        [
+            gate_summaries.assign(estimate='main'),
+            secondary_summaries.assign(estimate='boundary_excluded'),
+        ],
+        ignore_index=True,
+        sort=False,
+    ).sort_values(
+        ['minimum_depth_m', 'estimate'], kind='mergesort'
+    ).reset_index(drop=True)
+    output_paths = {
+        'gate_summaries': target_root / 'gate_summaries.parquet',
+        'secondary_gate_summaries': target_root / 'secondary_gate_summaries.parquet',
+        'summary_table': target_root / 'depth_sensitivity_summary.parquet',
+        'depth500_event_summary': target_root / 'depth500_event_summary.parquet',
+        'depth500_secondary_event_summary': target_root / 'depth500_secondary_event_summary.parquet',
+        'figure': target_root / 'depth_gate_sensitivity_100_300_500.png',
+        'summary_json': target_root / 'summary.json',
+    }
+    _atomic_write_parquet(
+        _ofes_depth_gate_summary_frame(
+            gate_summaries.to_dict(orient='records')
+        ),
+        output_paths['gate_summaries'],
+    )
+    _atomic_write_parquet(
+        _ofes_depth_gate_summary_frame(
+            secondary_summaries.to_dict(orient='records')
+        ),
+        output_paths['secondary_gate_summaries'],
+    )
+    _atomic_write_parquet(
+        _ofes_depth_gate_summary_frame(
+            summary_table.to_dict(orient='records')
+        ),
+        output_paths['summary_table'],
+    )
+    _atomic_write_parquet(deep_rows, output_paths['depth500_event_summary'])
+    _atomic_write_parquet(
+        secondary_rows,
+        output_paths['depth500_secondary_event_summary'],
+    )
+    payload = {
+        **base,
+        'output_dir': target_root,
+        'gate_summaries': gate_summaries,
+        'secondary_gate_summaries': secondary_summaries,
+        'event_tables': event_tables,
+        'secondary_event_tables': secondary_tables,
+    }
+    figure_path, _ = _ofes_plot_depth_gate_sensitivity(
+        payload,
+        output_paths['figure'],
+        dpi=dpi,
+    )
+    output_paths['figure'] = figure_path
+    _ofes_atomic_write_json(
+        {
+            'analysis': 'ofes_depth_gate_sensitivity_supplement',
+            'status': 'complete',
+            'gate_summaries': gate_summaries.to_dict(orient='records'),
+            'secondary_gate_summaries': secondary_summaries.to_dict(
+                orient='records'
+            ),
+            'scientific_scope': {
+                'gates': [100.0, 300.0, 500.0],
+                'primary_definition': 'DO50, anomaly peak >=300 m, 300-1000 m',
+                'deep_process_subset': '500-1000 m',
+                'cumulative_depth_gates_are_not_independent_samples': True,
+            },
+            'sources': {
+                'base_sensitivity_dir': str(base_root),
+                'deep_population_dir': str(deep_population_root),
+                'deep_lifecycle_dir': str(deep_lifecycle_root),
+            },
+            'outputs': {key: str(value) for key, value in output_paths.items()},
+        },
+        output_paths['summary_json'],
+    )
+    return {
+        **payload,
+        'summary_table': summary_table,
+        'output_paths': output_paths,
+        'figure_path': figure_path,
+        'source_paths': {
+            'base_sensitivity_dir': base_root,
+            'deep_population_dir': deep_population_root,
+            'deep_lifecycle_dir': deep_lifecycle_root,
+        },
+    }
+
+
 def load_ofes_daily_water_mass_diagnostics(
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
     geometry_mode: str = 'both',
 ) -> dict:
     """读取 fixed-site/moving-core 逐日 water-mass/heave 产物。
 
     参数:
-        - output_dir (str | Path | None): producer 输出根目录；None 使用 YAML 的固定目录。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
+        - output_dir (str | Path | None): producer 输出根目录；None 使用 scope 专属固定目录。
         - geometry_mode (str): `fixed_site`、`moving_core` 或 `both`（默认）。
 
     返回:
@@ -62157,13 +64725,16 @@ def load_ofes_daily_water_mass_diagnostics(
         - loader 只读取请求表、逐日表、事件汇总和 JSON；不访问 OFES NetCDF、不启动计算。
     """
     settings = _ofes_daily_water_mass_settings()
+    scope = _ofes_event_population_scope_settings(population_scope)
     if geometry_mode == 'both':
         modes = settings['geometry_modes']
     elif geometry_mode in ('fixed_site', 'moving_core'):
         modes = (geometry_mode,)
     else:
         raise ValueError("geometry_mode must be 'fixed_site', 'moving_core', or 'both'.")
-    output_root = _ofes_analysis_output_path(settings['output_subdir'], output_dir)
+    output_root = _ofes_population_output_path(
+        'daily_water_mass', scope['population_scope'], output_dir
+    )
     results: dict[str, dict] = {}
     for mode in modes:
         root = output_root / mode
@@ -62267,31 +64838,160 @@ def plot_ofes_daily_water_mass_diagnostics(
     return {'geometries': outputs}
 
 
+def _ofes_quality_population_census(
+    quality_events: pd.DataFrame,
+    event_diagnostic_summary: pd.DataFrame,
+) -> dict:
+    """汇总完整 quality population 的事件级普查字段。"""
+    event_ids = quality_events[['event_id']].copy()
+    event_ids['event_id'] = event_ids['event_id'].astype(str)
+    event_ids = event_ids.drop_duplicates('event_id')
+    diagnostics = event_diagnostic_summary.copy()
+    diagnostics['event_id'] = diagnostics['event_id'].astype(str)
+    rows = event_ids.merge(
+        diagnostics,
+        on='event_id',
+        how='left',
+        validate='one_to_one',
+    )
+    quality_count = int(len(rows))
+    water_mass = pd.to_numeric(
+        rows['peak_water_mass_do_contrast'], errors='coerce'
+    )
+    heave = pd.to_numeric(
+        rows['peak_heave_do_contribution'], errors='coerce'
+    )
+    total = water_mass.abs() + heave.abs()
+    closure = pd.to_numeric(
+        rows.get(
+            'maximum_abs_decomposition_closure_error',
+            pd.Series(np.nan, index=rows.index),
+        ),
+        errors='coerce',
+    )
+    fraction_valid = (
+        np.isfinite(water_mass.to_numpy(dtype=float))
+        & np.isfinite(heave.to_numpy(dtype=float))
+        & np.isfinite(total.to_numpy(dtype=float))
+        & (total.to_numpy(dtype=float) > 0)
+        & np.isfinite(closure.to_numpy(dtype=float))
+        & (closure.to_numpy(dtype=float) <= 1e-10)
+    )
+    water_mass_fraction = pd.Series(np.nan, index=rows.index)
+    water_mass_fraction.loc[fraction_valid] = (
+        water_mass.abs().loc[fraction_valid]
+        / total.loc[fraction_valid]
+    )
+    heave_fraction = 1.0 - water_mass_fraction
+    water_mass_dominated = (
+        fraction_valid
+        & (water_mass.abs().to_numpy(dtype=float)
+           > heave.abs().to_numpy(dtype=float))
+    )
+    rossby = pd.to_numeric(
+        rows['peak_rossby_number'], errors='coerce'
+    )
+    strain = pd.to_numeric(
+        rows['peak_normalized_strain'], errors='coerce'
+    )
+    kinematic_valid = (
+        np.isfinite(rossby.to_numpy(dtype=float))
+        & np.isfinite(strain.to_numpy(dtype=float))
+    )
+    anticyclonic = kinematic_valid & (rossby.to_numpy(dtype=float) < 0)
+    rotation_dominated = kinematic_valid & (
+        np.abs(rossby.to_numpy(dtype=float))
+        > strain.to_numpy(dtype=float)
+    )
+    anticyclonic_rotation = anticyclonic & rotation_dominated
+    peak_complete = (
+        rows['all_sampled_days_passed'].eq(True).fillna(False)
+    )
+    decomposition_count = int(fraction_valid.sum())
+    kinematic_count = int(kinematic_valid.sum())
+    if decomposition_count:
+        dominated_fraction = float(
+            int(water_mass_dominated.sum()) / decomposition_count
+        )
+        dominated_ci = _binomial_wilson_interval(
+            int(water_mass_dominated.sum()), decomposition_count
+        )
+        dominated_ci_list: list[float | None] = [
+            float(dominated_ci[0]),
+            float(dominated_ci[1]),
+        ]
+    else:
+        dominated_fraction = None
+        dominated_ci_list = [None, None]
+    return {
+        'quality_event_count': quality_count,
+        'all_sampled_days_complete_count': int(peak_complete.sum()),
+        'water_mass_fraction_eligible_count': int(
+            decomposition_count
+        ),
+        'water_mass_fraction_missing_count': int(
+            quality_count - decomposition_count
+        ),
+        'decomposition_eligible_count': decomposition_count,
+        'decomposition_missing_count': int(
+            quality_count - decomposition_count
+        ),
+        'kinematic_eligible_count': kinematic_count,
+        'kinematic_missing_count': int(
+            quality_count - kinematic_count
+        ),
+        'median_water_mass_absolute_fraction': (
+            float(water_mass_fraction.loc[fraction_valid].median())
+            if fraction_valid.any() else None
+        ),
+        'median_heave_absolute_fraction': (
+            float(heave_fraction.loc[fraction_valid].median())
+            if fraction_valid.any() else None
+        ),
+        'water_mass_dominated_count': int(water_mass_dominated.sum()),
+        'water_mass_dominated_denominator': decomposition_count,
+        'water_mass_dominated_fraction': dominated_fraction,
+        'water_mass_dominated_wilson95': dominated_ci_list,
+        'anticyclonic_denominator': kinematic_count,
+        'rotation_dominated_denominator': kinematic_count,
+        'anticyclonic_rotation_denominator': kinematic_count,
+        'anticyclonic_count': int(anticyclonic.sum()),
+        'rotation_dominated_count': int(rotation_dominated.sum()),
+        'anticyclonic_rotation_count': int(
+            anticyclonic_rotation.sum()
+        ),
+    }
+
+
 def summarize_ofes_analysis_populations(
     *,
     catalog_dir: str | Path | None = None,
     diagnostic_dir: str | Path | None = None,
     population_dir: str | Path | None = None,
+    population_scope: str | None = None,
 ) -> dict:
     """汇总当前 OFES catalog、quality census 与 strict population 的集合关系。
 
     参数:
         - catalog_dir (str | Path | None): event catalog 目录；None 使用固定正式目录。
         - diagnostic_dir (str | Path | None): quality census 目录；None 使用固定正式目录。
-        - population_dir (str | Path | None): population 目录；None 使用固定正式目录。
+        - population_dir (str | Path | None): population 目录；None 使用 scope 专属固定目录。
+        - population_scope (str | None): population scope；None 使用 YAML 默认 scope。
 
     返回:
-        - dict: 当前 candidate、quality-eligible、strict 集合数量、日期范围和可见的请求/完成差集。
+        - dict: 当前 candidate、quality-eligible、strict 集合数量、日期范围、可见的请求/完成差集，以及按 decomposition/kinematic/full 资格门拆分的 primary quality census 与 peak-day summary。
 
     输出:
         - 无；只读取已有 parquet/JSON，不创建输出目录。
 
     说明:
-        - 所有数量均由正式产物计算，不作为永久运行许可或配置门槛。
+        - 所有数量均由正式产物计算，不作为永久运行许可或配置门槛。primary quality census 保留 161-event 总体，并将水团/heave、动力和全日完整性分别报告；primary quality summary 使用对应的 peak-day 资格门。
     """
     catalog_root = _ofes_analysis_output_path('event_catalog', catalog_dir)
     diagnostic_root = _ofes_analysis_output_path('quality_event_diagnostics', diagnostic_dir)
-    population_root = _ofes_analysis_output_path('event_population', population_dir)
+    population_root = _ofes_population_output_path(
+        'event_population', population_scope, population_dir
+    )
     result: dict[str, Any] = {}
     catalog_path = catalog_root / 'event_catalog.parquet'
     quality_path = diagnostic_root / 'quality_event_catalog.parquet'
@@ -62326,6 +65026,51 @@ def summarize_ofes_analysis_populations(
         strict = population.loc[population['population_diagnostic_passed']]
         result['strict'] = int(strict['event_id'].nunique())
         result['strict_event_ids'] = sorted(strict['event_id'].astype(str).unique())
+    quality_summary_path = diagnostic_root / 'analysis_summary.json'
+    quality_event_summary_path = diagnostic_root / 'event_diagnostic_summary.parquet'
+    if all(
+        path.exists()
+        for path in (
+            quality_path,
+            daily_path,
+            quality_event_summary_path,
+            quality_summary_path,
+            catalog_path,
+        )
+    ):
+        quality_analysis = json.loads(
+            quality_summary_path.read_text(encoding='utf-8')
+        )
+        quality_result = {
+            'quality_event_catalog': pd.read_parquet(quality_path),
+            'daily_diagnostics': pd.read_parquet(daily_path),
+            'event_diagnostic_summary': pd.read_parquet(
+                quality_event_summary_path
+            ),
+            'quality_audit': quality_analysis.get('quality_audit') or {},
+        }
+        primary_settings = _ofes_depth_gate_sensitivity_settings(
+            depth_gates_m=(300.0,)
+        )
+        primary_metadata = _ofes_depth_gate_catalog_metadata(
+            catalog_root,
+            quality_result,
+            primary_settings,
+        )
+        primary_rows = _ofes_depth_gate_event_rows(
+            quality_result,
+            primary_settings,
+            primary_metadata,
+        )
+        result['primary_quality_peak_summary'] = _ofes_depth_gate_summary(
+            primary_rows,
+            primary_settings,
+            primary_metadata,
+        )
+        result['primary_quality_census'] = _ofes_quality_population_census(
+            eligible,
+            quality_result['event_diagnostic_summary'],
+        )
     if 'quality_event_ids' in result and 'strict_event_ids' in result:
         result['quality_not_strict'] = sorted(
             set(result['quality_event_ids']) - set(result['strict_event_ids'])
@@ -68879,6 +71624,7 @@ def _ofes_walong_analytic_check() -> dict[str, Any]:
 def run_ofes_event_isopycnal_velocity_audit(
     event_association_path: str | Path,
     *,
+    population_scope: str | None = None,
     trajectory_classification_path: str | Path | None = None,
     output_dir: str | Path | None = None,
     time_window_days: int | None = None,
@@ -68900,6 +71646,7 @@ def run_ofes_event_isopycnal_velocity_audit(
 
     参数:
         - event_association_path (str | Path): event table with peak identity and depth.
+        - population_scope (str | None): population scope used for the default output directory; None uses YAML default scope.
         - trajectory_classification_path (str | Path | None): optional pathway flags to join.
         - output_dir (str | Path | None): fixed output directory override.
         - time_window_days (int | None): symmetric peak window from configuration when omitted.
@@ -68922,6 +71669,7 @@ def run_ofes_event_isopycnal_velocity_audit(
     from multiprocessing import get_context
 
     cfg = dict(_OFES_CFG.get('w_along', {}) or {})
+    scope = _ofes_event_population_scope_settings(population_scope)
     time_window = int(
         time_window_days
         if time_window_days is not None else cfg.get('time_window_days', 3)
@@ -68981,6 +71729,7 @@ def run_ofes_event_isopycnal_velocity_audit(
         for event_id in association['event_id']
     }
     request = {
+        'population_scope': scope['population_scope'],
         'event_association_path': str(association_path),
         'trajectory_classification_path': (
             str(Path(trajectory_classification_path).expanduser())
@@ -68995,8 +71744,8 @@ def run_ofes_event_isopycnal_velocity_audit(
         'core_minimum_availability': minimum_availability,
     }
     normalized_request = _ofes_normalize_request_value(request)
-    root = _ofes_mechanism_output_root(
-        str(cfg.get('output_subdir', 'w_along')), output_dir
+    root = _ofes_population_output_path(
+        'w_along', scope['population_scope'], output_dir
     )
     manifest_path = root / 'manifest.json'
     expected_tables = (
@@ -69194,11 +71943,16 @@ def run_ofes_event_isopycnal_velocity_audit(
     }
 
 
-def load_ofes_event_isopycnal_velocity_audit(output_dir: str | Path | None = None) -> dict:
+def load_ofes_event_isopycnal_velocity_audit(
+    output_dir: str | Path | None = None,
+    *,
+    population_scope: str | None = None,
+) -> dict:
     """Load completed w-along audit tables.
 
     参数:
         - output_dir (str | Path | None): explicit fixed w-along directory.
+        - population_scope (str | None): population scope used when output_dir is omitted.
     返回:
         - dict: daily metrics, audit, summary, and manifest.
     输出:
@@ -69207,7 +71961,10 @@ def load_ofes_event_isopycnal_velocity_audit(output_dir: str | Path | None = Non
         - 不访问 OFES 原始场、不重新运行生产步骤。
     """
 
-    return _ofes_mechanism_load_result(_ofes_mechanism_output_root(str((_OFES_CFG.get('w_along', {}) or {}).get('output_subdir', 'w_along')), output_dir), ('daily_metrics', 'audit'))
+    return _ofes_mechanism_load_result(
+        _ofes_population_output_path('w_along', population_scope, output_dir),
+        ('daily_metrics', 'audit'),
+    )
 
 
 def plot_ofes_event_isopycnal_velocity_audit(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
@@ -69313,6 +72070,7 @@ def _ofes_winter_mld_task(task: Mapping[str, Any]) -> dict[str, Any]:
 def run_ofes_event_winter_mld_audit(
     event_association_path: str | Path,
     *,
+    population_scope: str | None = None,
     trajectory_horizon_summary_path: str | Path | None = None,
     trajectory_classification_path: str | Path | None = None,
     output_dir: str | Path | None = None,
@@ -69325,6 +72083,7 @@ def run_ofes_event_winter_mld_audit(
 
     参数:
         - event_association_path (str | Path): event peak identities and core depths.
+        - population_scope (str | None): population scope used for the default output directory; None uses YAML default scope.
         - trajectory_horizon_summary_path (str | Path | None): optional ventilation horizon table.
         - trajectory_classification_path (str | Path | None): optional event regime table.
         - output_dir (str | Path | None): fixed output directory override.
@@ -69341,6 +72100,7 @@ def run_ofes_event_winter_mld_audit(
     """
 
     cfg = dict(_OFES_CFG.get('winter_mld', {}) or {})
+    scope = _ofes_event_population_scope_settings(population_scope)
     start = pd.Timestamp(
         winter_start
         if winter_start is not None else cfg.get('winter_start', '2003-01-01')
@@ -69358,6 +72118,7 @@ def run_ofes_event_winter_mld_audit(
     density_threshold = float(cfg.get('density_threshold_kg_m3', 0.03))
     association_path = Path(event_association_path).expanduser()
     request = {
+        'population_scope': scope['population_scope'],
         'event_association_path': str(association_path),
         'trajectory_horizon_summary_path': (
             str(Path(trajectory_horizon_summary_path).expanduser())
@@ -69373,8 +72134,8 @@ def run_ofes_event_winter_mld_audit(
         'reference_depth_m': reference_depth,
         'density_threshold_kg_m3': density_threshold,
     }
-    root = _ofes_mechanism_output_root(
-        str(cfg.get('output_subdir', 'winter_mld')), output_dir
+    root = _ofes_population_output_path(
+        'winter_mld', scope['population_scope'], output_dir
     )
     manifest_path = root / 'manifest.json'
     normalized_request = _ofes_normalize_request_value(request)
@@ -69611,11 +72372,16 @@ def run_ofes_event_winter_mld_audit(
     )
 
 
-def load_ofes_event_winter_mld_audit(output_dir: str | Path | None = None) -> dict:
+def load_ofes_event_winter_mld_audit(
+    output_dir: str | Path | None = None,
+    *,
+    population_scope: str | None = None,
+) -> dict:
     """Load completed winter MLD diagnostic tables.
 
     参数:
         - output_dir (str | Path | None): explicit fixed winter MLD directory.
+        - population_scope (str | None): population scope used when output_dir is omitted.
     返回:
         - dict: winter MLD table, event summary, summary, and manifest.
     输出:
@@ -69624,7 +72390,12 @@ def load_ofes_event_winter_mld_audit(output_dir: str | Path | None = None) -> di
         - 不访问 OFES 原始场、不重新运行生产步骤。
     """
 
-    return _ofes_mechanism_load_result(_ofes_mechanism_output_root(str((_OFES_CFG.get('winter_mld', {}) or {}).get('output_subdir', 'winter_mld')), output_dir), ('winter_mld', 'event_summary'))
+    return _ofes_mechanism_load_result(
+        _ofes_population_output_path(
+            'winter_mld', population_scope, output_dir
+        ),
+        ('winter_mld', 'event_summary'),
+    )
 
 
 def plot_ofes_event_winter_mld_audit(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
@@ -69870,6 +72641,7 @@ def _ofes_mechanism_ols(
 def run_ofes_event_mechanism_transition_audit(
     event_association_path: str | Path,
     *,
+    population_scope: str | None = None,
     output_dir: str | Path | None = None,
     lifecycle_path: str | Path | None = None,
     lifecycle_summary_path: str | Path | None = None,
@@ -69891,6 +72663,7 @@ def run_ofes_event_mechanism_transition_audit(
 
     参数:
         - event_association_path (str | Path): authoritative event identities.
+        - population_scope (str | None): population scope used for the default output directory; None uses YAML default scope.
         - output_dir (str | Path | None): fixed synthesis output directory.
         - lifecycle_path (str | Path | None): explicit daily lifecycle table.
         - lifecycle_summary_path (str | Path | None): explicit event lifecycle table.
@@ -69912,10 +72685,12 @@ def run_ofes_event_mechanism_transition_audit(
     """
 
     cfg = dict(_OFES_CFG.get('mechanism_synthesis', {}) or {})
-    root = _ofes_mechanism_output_root(
-        str(cfg.get('output_subdir', 'mechanism_synthesis')), output_dir
+    scope = _ofes_event_population_scope_settings(population_scope)
+    root = _ofes_population_output_path(
+        'mechanism_synthesis', scope['population_scope'], output_dir
     )
     request = {
+        'population_scope': scope['population_scope'],
         'event_association_path': str(Path(event_association_path).expanduser()),
         'lifecycle_path': str(lifecycle_path) if lifecycle_path is not None else None,
         'lifecycle_summary_path': str(lifecycle_summary_path) if lifecycle_summary_path is not None else None,
@@ -70610,11 +73385,16 @@ def run_ofes_event_mechanism_transition_audit(
     )
 
 
-def load_ofes_event_mechanism_transition_audit(output_dir: str | Path | None = None) -> dict:
+def load_ofes_event_mechanism_transition_audit(
+    output_dir: str | Path | None = None,
+    *,
+    population_scope: str | None = None,
+) -> dict:
     """Load the completed transition/retention reducer outputs.
 
     参数:
         - output_dir (str | Path | None): explicit fixed synthesis directory.
+        - population_scope (str | None): population scope used when output_dir is omitted.
     返回:
         - dict: daily mechanism, transition, retention, lag, summary, and manifest.
     输出:
@@ -70624,9 +73404,8 @@ def load_ofes_event_mechanism_transition_audit(output_dir: str | Path | None = N
     """
 
     return _ofes_mechanism_load_result(
-        _ofes_mechanism_output_root(
-            str((_OFES_CFG.get('mechanism_synthesis', {}) or {}).get('output_subdir', 'mechanism_synthesis')),
-            output_dir,
+        _ofes_population_output_path(
+            'mechanism_synthesis', population_scope, output_dir
         ),
         ('daily_event_mechanism', 'phase_transition_table',
          'retention_comparison', 'retention_group_comparison',
@@ -70656,11 +73435,16 @@ def plot_ofes_event_mechanism_transition_audit(result: Mapping[str, Any] | None 
     return {'figure': fig, 'figure_path': path}
 
 
-def load_ofes_mccoy_virtual_argo_stage_bridge(output_dir: str | Path | None = None) -> dict:
+def load_ofes_mccoy_virtual_argo_stage_bridge(
+    output_dir: str | Path | None = None,
+    *,
+    population_scope: str | None = None,
+) -> dict:
     """Load completed McCoy stage-bridge diagnostics.
 
     参数:
         - output_dir (str | Path | None): explicit fixed stage-bridge directory.
+        - population_scope (str | None): population scope used when output_dir is omitted.
     返回:
         - dict: stage diagnostics, summary, and manifest.
     输出:
@@ -70669,14 +73453,8 @@ def load_ofes_mccoy_virtual_argo_stage_bridge(output_dir: str | Path | None = No
         - 不访问 OFES 原始场、不重新运行 McCoy。
     """
 
-    root = (
-        Path(output_dir).expanduser()
-        if output_dir is not None
-        else _ofes_analysis_output_path(
-            str((_OFES_CFG.get('mccoy_virtual_argo', {}) or {}).get(
-                'stage_bridge_output_subdir', 'mccoy_virtual_argo_stage_bridge'
-            ))
-        )
+    root = _ofes_population_output_path(
+        'mccoy_virtual_argo_stage_bridge', population_scope, output_dir
     )
     return _ofes_mechanism_load_result(root, ('stage_diagnostics',))
 
@@ -70718,6 +73496,7 @@ def plot_ofes_mccoy_virtual_argo_stage_bridge(result: Mapping[str, Any] | None =
 def run_ofes_event_daily_water_mass_audit(
     event_association_path: str | Path,
     *,
+    population_scope: str | None = None,
     geometry_mode: str = 'fixed_site',
     daily_water_mass_path: str | Path | None = None,
     lifecycle_path: str | Path | None = None,
@@ -70727,6 +73506,7 @@ def run_ofes_event_daily_water_mass_audit(
 
     参数:
         - event_association_path (str | Path): authoritative event table.
+        - population_scope (str | None): population scope used for the default output directory; None uses YAML default scope.
         - geometry_mode (str): `fixed_site` or `moving_core`.
         - daily_water_mass_path (str | Path | None): explicit daily water-mass table/directory.
         - lifecycle_path (str | Path | None): optional lifecycle table for carrier labels.
@@ -70739,6 +73519,7 @@ def run_ofes_event_daily_water_mass_audit(
         - 只读取并组合已有 water-mass producer output，不重新计算水团/heave 分解。
     """
 
+    scope = _ofes_event_population_scope_settings(population_scope)
     if geometry_mode not in {'fixed_site', 'moving_core'}:
         raise ValueError("geometry_mode must be 'fixed_site' or 'moving_core'")
     if daily_water_mass_path is None:
@@ -70868,13 +73649,16 @@ def run_ofes_event_daily_water_mass_audit(
         ],
     }
     request = {
+        'population_scope': scope['population_scope'],
         'event_association_path': str(association_path),
         'daily_water_mass_path': str(daily_water_mass_path),
         'lifecycle_path': str(lifecycle_path) if lifecycle_path is not None else None,
         'geometry_mode': geometry_mode,
     }
-    root = _ofes_mechanism_output_root(
-        f'daily_water_mass_{geometry_mode}', output_dir
+    root = _ofes_population_output_path(
+        f'daily_water_mass_{geometry_mode}',
+        scope['population_scope'],
+        output_dir,
     )
     return _ofes_mechanism_write_result(
         root,

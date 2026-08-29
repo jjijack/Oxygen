@@ -1,4 +1,10 @@
 # 处理与算法参数配置
+# version 1.29 变更：
+#   - 将 300–1000 m 提升为 OFES depth sensitivity 的 primary population，
+#     并保留 500–1000 m 作为其嵌套的 deep-process 子集；下游正式流程可
+#     通过 scope 选择总体，而不覆盖既有 deep-process 产物。
+#   - depth-gate sensitivity 默认只比较 100 m 与 300 m；仍可通过函数参数
+#     显式请求其他深度门，并使用事件级 bootstrap CI。
 # version 1.28 变更：
 #   - 将 deep-process sensitivity 的上界从 900 m 对齐到 1000 m，
 #     与预定义的 300–1000 m 研究域保持一致；当前 DO50 quality catalog
@@ -107,7 +113,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.28
+version: 1.29
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -396,11 +402,25 @@ ofes:
     control_match_strain_scale: 0.20
     context_days: 10
     output_subdir: event_diagnostics
+  depth_gate_sensitivity:
+    depth_gates_m: [100.0, 300.0]
+    candidate_depth_max_m: 1000.0
+    candidate_threshold: 50.0
+    bootstrap_replicates: 10000
+    random_seed: 20260829
+    output_subdir: depth_gate_sensitivity
   daily_water_mass:
     worker_count: 16
     output_subdir: daily_water_mass
     geometry_modes: [fixed_site, moving_core]
   event_population:
+    default_scope: primary_300_1000
+    primary_depth_min_m: 300.0
+    primary_depth_max_m: 1000.0
+    primary_output_subdir: primary_event_population
+    deep_depth_min_m: 500.0
+    deep_depth_max_m: 1000.0
+    deep_output_subdir: deep_event_population
     candidate_threshold: 50.0
     heave_important_absolute_fraction_min: 0.3333333333333333
     surface_search_radius_km: 50.0
@@ -408,7 +428,7 @@ ofes:
     surface_weight_support_factor: 2.0
     surface_attenuation_ratio_max: 0.5
     figure_dpi: 180
-    output_subdir: event_population
+    output_subdir: primary_event_population
   event_onset:
     pre_start_days: 5
     minimum_start_to_peak_observed_days: 2

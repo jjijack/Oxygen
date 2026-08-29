@@ -377,7 +377,7 @@ def _plot_figure2(
     output_dir: Path,
     dpi: int,
 ) -> Path:
-    """Render quality-event water-mass decomposition and McCoy enrichment."""
+    """Render quality-event decomposition and the primary-process comparison."""
 
     _require_columns(
         quality_summary,
@@ -396,21 +396,30 @@ def _plot_figure2(
         ),
         "McCoy event summary",
     )
-    strict_ids = set(mccoy_event["event_id"])
-    if len(quality_summary) != 161 or len(strict_ids) != 56:
-        raise ValueError("Expected 161 quality events and 56 strict events")
-    strict = quality_summary["event_id"].isin(strict_ids)
+    quality_ids = set(quality_summary["event_id"].astype(str))
+    primary_process_ids = set(mccoy_event["event_id"].astype(str))
+    quality_event_count = int(quality_summary["event_id"].nunique())
+    primary_process_count = int(len(primary_process_ids))
+    if not primary_process_ids.issubset(quality_ids):
+        raise ValueError("Primary process events must be a quality-event subset")
+    if quality_event_count <= 0 or primary_process_count <= 0:
+        raise ValueError("Quality and primary-process tables must be non-empty")
+    primary_process = quality_summary["event_id"].astype(str).isin(
+        primary_process_ids
+    )
     fraction = _water_mass_fraction(quality_summary)
-    strict_fraction = fraction.loc[strict]
+    primary_process_fraction = fraction.loc[primary_process]
     quality_fraction = fraction
-    strict_dominated = int((strict_fraction > 0.5).fillna(False).sum())
+    quality_decomposition_count = int(quality_fraction.notna().sum())
+    primary_process_decomposition_count = int(
+        primary_process_fraction.notna().sum()
+    )
+    primary_process_dominated = int(
+        (primary_process_fraction > 0.5).fillna(False).sum()
+    )
     quality_dominated = int((quality_fraction > 0.5).fillna(False).sum())
-    if strict_dominated != 54 or quality_dominated != 138:
-        raise ValueError("Frozen water-mass dominated counts changed")
-    if not np.isclose(float(strict_fraction.median()), 0.8621853205, atol=2e-3):
-        raise ValueError("Strict water-mass fraction median changed")
-    if not np.isclose(float(quality_fraction.median()), 0.7819122081, atol=2e-3):
-        raise ValueError("Quality water-mass fraction median changed")
+    if quality_decomposition_count <= 0 or primary_process_decomposition_count <= 0:
+        raise ValueError("Water-mass decomposition has no finite events")
 
     event_fraction = mccoy_event["event_profile_mccoy_compatible_fraction"].to_numpy(float)
     control_fraction = mccoy_event["background_control_mccoy_compatible_fraction"].to_numpy(float)
@@ -421,15 +430,22 @@ def _plot_figure2(
 
     fig, axes = plt.subplots(2, 2, figsize=(FIGURE_WIDTH_IN, 5.75))
     ax = axes[0, 0]
+    other_quality_count = quality_event_count - primary_process_count
     ax.scatter(
-        quality_summary.loc[~strict, "peak_water_mass_do_contrast"],
-        quality_summary.loc[~strict, "peak_heave_do_contribution"],
-        s=17, color=GRAY, alpha=0.45, label="other quality events (n=105)",
+        quality_summary.loc[~primary_process, "peak_water_mass_do_contrast"],
+        quality_summary.loc[~primary_process, "peak_heave_do_contribution"],
+        s=17,
+        color=GRAY,
+        alpha=0.45,
+        label=f"other quality events (n={other_quality_count})",
     )
     ax.scatter(
-        quality_summary.loc[strict, "peak_water_mass_do_contrast"],
-        quality_summary.loc[strict, "peak_heave_do_contribution"],
-        s=27, color=RED, alpha=0.8, label="strict DO50 events (n=56)",
+        quality_summary.loc[primary_process, "peak_water_mass_do_contrast"],
+        quality_summary.loc[primary_process, "peak_heave_do_contribution"],
+        s=27,
+        color=RED,
+        alpha=0.8,
+        label=f"primary process events (n={primary_process_count})",
     )
     x_limits = ax.get_xlim()
     y_limits = ax.get_ylim()
@@ -454,28 +470,42 @@ def _plot_figure2(
 
     ax = axes[0, 1]
     finite_quality = quality_fraction.dropna()
-    finite_strict = strict_fraction.dropna()
+    finite_primary_process = primary_process_fraction.dropna()
     ax.hist(
         finite_quality,
         bins=np.linspace(0, 1, 18),
         color=GRAY,
         alpha=0.55,
-        label="quality catalogue (n=161; includes strict)",
+        label=(
+            f"quality catalogue (n={quality_event_count}; "
+            f"decomposition-evaluable n={quality_decomposition_count})"
+        ),
     )
     ax.hist(
-        finite_strict,
+        finite_primary_process,
         bins=np.linspace(0, 1, 18),
         color=RED,
         alpha=0.62,
-        label="strict DO50 subset (n=56)",
+        label=(
+            f"primary process events (n={primary_process_count}; "
+            f"evaluable n={primary_process_decomposition_count})"
+        ),
     )
     ax.set_xlabel("Absolute water-mass contribution fraction")
     ax.set_ylabel("Events")
     ax.set_xlim(0, 1)
-    ax.set_title("Water-mass contribution fraction")
+    ax.set_title(
+        f"Water-mass contribution fraction\n"
+        f"quality {quality_dominated}/{quality_decomposition_count}; "
+        f"primary {primary_process_dominated}/"
+        f"{primary_process_decomposition_count}"
+    )
     ax.axvline(
-        float(strict_fraction.median()), color=RED, linestyle="--", linewidth=1.4,
-        label=f"strict median ({strict_fraction.median():.1%})",
+        float(primary_process_fraction.median()),
+        color=RED,
+        linestyle="--",
+        linewidth=1.4,
+        label=f"primary median ({primary_process_fraction.median():.1%})",
     )
     ax.axvline(
         float(quality_fraction.median()), color=INK, linestyle=":", linewidth=1.4,
@@ -484,13 +514,13 @@ def _plot_figure2(
 
     ax = axes[1, 0]
     ax.scatter(
-        quality_summary.loc[~strict, "peak_same_sigma_theta_contrast"],
-        quality_summary.loc[~strict, "peak_same_sigma_salinity_contrast"],
+        quality_summary.loc[~primary_process, "peak_same_sigma_theta_contrast"],
+        quality_summary.loc[~primary_process, "peak_same_sigma_salinity_contrast"],
         s=17, color=GRAY, alpha=0.42,
     )
     ax.scatter(
-        quality_summary.loc[strict, "peak_same_sigma_theta_contrast"],
-        quality_summary.loc[strict, "peak_same_sigma_salinity_contrast"],
+        quality_summary.loc[primary_process, "peak_same_sigma_theta_contrast"],
+        quality_summary.loc[primary_process, "peak_same_sigma_salinity_contrast"],
         s=27, color=RED, alpha=0.8,
     )
     ax.axhline(0, color=INK, linewidth=0.8)
@@ -514,11 +544,11 @@ def _plot_figure2(
     ax.set_title("McCoy-compatible profile fractions")
     fig.legend(
         handles=[
-            Line2D([], [], marker="o", linestyle="none", color=GRAY, label="other quality events (n=105)"),
-            Line2D([], [], marker="o", linestyle="none", color=RED, label="strict DO50 events (n=56)"),
-            Line2D([], [], color=GRAY, linewidth=7, alpha=0.55, label="quality catalogue (n=161)"),
-            Line2D([], [], color=RED, linewidth=7, alpha=0.62, label="strict DO50 subset (n=56)"),
-            Line2D([], [], color=RED, linestyle="--", label=f"strict median ({strict_fraction.median():.1%})"),
+            Line2D([], [], marker="o", linestyle="none", color=GRAY, label=f"other quality (n={other_quality_count})"),
+            Line2D([], [], marker="o", linestyle="none", color=RED, label=f"primary process (n={primary_process_count})"),
+            Line2D([], [], color=GRAY, linewidth=7, alpha=0.55, label=f"quality (n={quality_event_count}; decomp={quality_decomposition_count})"),
+            Line2D([], [], color=RED, linewidth=7, alpha=0.62, label=f"primary (n={primary_process_count}; decomp={primary_process_decomposition_count})"),
+            Line2D([], [], color=RED, linestyle="--", label=f"primary median ({primary_process_fraction.median():.1%})"),
             Line2D([], [], color=INK, linestyle=":", label=f"quality median ({quality_fraction.median():.1%})"),
             Line2D([], [], marker="o", linestyle="none", color=BLUE, label="same-event control"),
             Line2D([], [], marker="o", linestyle="none", color=RED, label="event core"),
@@ -582,32 +612,41 @@ def _plot_figure3(
     rows = rows.loc[rows["metric"].isin(metrics)]
     if set(rows["control_group"]) != {"hydrographic_control", "kinematic_control"}:
         raise ValueError("30-day ventilation table lacks both formal controls")
+    control_counts: dict[str, int] = {}
+    for control in ("hydrographic_control", "kinematic_control"):
+        counts = rows.loc[rows["control_group"].eq(control), "event_count"].dropna().unique()
+        if len(counts) != 1:
+            raise ValueError(f"30-day ventilation denominator varies for {control}")
+        control_counts[control] = int(counts[0])
 
     direction = trajectory.loc[_true_mask(trajectory["direction_evaluable"])]
     downward = int(direction["observed_vertical_motion"].eq("downward").sum())
     upward = int(direction["observed_vertical_motion"].eq("upward").sum())
-    if len(direction) != 24 or (downward, upward) != (21, 3):
-        raise ValueError("Frozen displacement-classifiable counts changed")
+    direction_other = int(len(direction) - downward - upward)
+    if direction_other < 0:
+        raise ValueError("Direction classes are not mutually exclusive")
     resolved = trajectory.loc[_true_mask(trajectory["resolved_vertical_pathway_supported"])]
     resolved_down = int(_true_mask(resolved["resolved_downward_pathway_supported"]).sum())
     resolved_up = int(_true_mask(resolved["resolved_upward_pathway_supported"]).sum())
-    if len(resolved) != 18 or (resolved_down, resolved_up) != (15, 3):
-        raise ValueError("Frozen strict pathway counts changed")
-    pathway_ids = set(transition.loc[_true_mask(transition["resolved_downward"]), "event_id"])
-    if len(pathway_ids) != 19:
-        raise ValueError("Frozen w_along population subset changed")
+    resolved_other = int(len(resolved) - resolved_down - resolved_up)
+    if resolved_other < 0:
+        raise ValueError("Resolved pathway classes are not mutually exclusive")
+    pathway_ids = set(
+        transition.loc[_true_mask(transition["resolved_downward"]), "event_id"].astype(str)
+    )
     daily = walong.loc[
-        walong["aggregation"].eq("daily_mean") & walong["event_id"].isin(pathway_ids)
+        walong["aggregation"].eq("daily_mean")
+        & walong["event_id"].astype(str).isin(pathway_ids)
     ]
-    core = daily.loc[daily["region"].eq("core"), "core_w_along_mean"].dropna()
-    ring = daily.loc[daily["region"].eq("ring"), "ring_w_along_mean"].dropna()
-    if len(core) != 19 or len(ring) != 19:
-        raise ValueError("w_along subset is incomplete")
-    if not np.isclose(float(core.mean()), 4.8095, atol=0.02):
-        raise ValueError("Formal w_along daily-mean value changed")
-    w_along_downward = int(core.gt(0).sum())
-    if w_along_downward != 13:
-        raise ValueError("Frozen downward w_along count changed")
+    core = daily.loc[daily["region"].eq("core"), ["event_id", "core_w_along_mean"]].copy()
+    ring = daily.loc[daily["region"].eq("ring"), ["event_id", "ring_w_along_mean"]].copy()
+    paired_w_along = core.merge(ring, on="event_id", how="inner", validate="one_to_one").dropna()
+    if paired_w_along.empty:
+        raise ValueError("w_along subset has no complete core/ring pairs")
+    w_along_count = int(len(paired_w_along))
+    w_along_downward = int(paired_w_along["core_w_along_mean"].gt(0).sum())
+    w_along_negative = int(paired_w_along["core_w_along_mean"].lt(0).sum())
+    w_along_other = int(w_along_count - w_along_downward - w_along_negative)
 
     fig, axes = plt.subplots(
         1, 2, figsize=(FIGURE_WIDTH_IN, 3.25),
@@ -629,9 +668,9 @@ def _plot_figure3(
                       [float(row["bootstrap95_high"] - row["event_equal_mean_difference"])]],
                 fmt="o", color=colors[control], capsize=3,
                 label=(
-                    "hydrographic control (n=28)"
+                    f"hydrographic control (n={control_counts['hydrographic_control']})"
                     if control == "hydrographic_control" and idx == 0
-                    else "kinematic control (n=27)"
+                    else f"kinematic control (n={control_counts['kinematic_control']})"
                     if control == "kinematic_control" and idx == 0
                     else None
                 ),
@@ -643,8 +682,8 @@ def _plot_figure3(
     ax.set_title("30-day event-equal ventilation contrasts")
     fig.legend(
         handles=[
-            Line2D([], [], marker="o", linestyle="none", color=BLUE, label="hydrographic control (n=28)"),
-            Line2D([], [], marker="o", linestyle="none", color=TEAL, label="kinematic control (n=27)"),
+            Line2D([], [], marker="o", linestyle="none", color=BLUE, label=f"hydrographic control (n={control_counts['hydrographic_control']})"),
+            Line2D([], [], marker="o", linestyle="none", color=TEAL, label=f"kinematic control (n={control_counts['kinematic_control']})"),
         ],
         loc="upper center",
         bbox_to_anchor=(0.55, 0.98),
@@ -659,19 +698,26 @@ def _plot_figure3(
     light_gray = "#d1d5db"
     composition_rows = [
         (
-            "Displacement classification\nn=56",
-            [("downward", downward), ("upward", upward), ("unclassified", 32)],
+            f"Displacement classification\nn={len(direction)}",
+            [("downward", downward), ("upward", upward)]
+            + ([('unclassified', direction_other)] if direction_other else []),
         ),
         (
-            "Strict resolved pathways\nn=18",
-            [("downward", resolved_down), ("upward", resolved_up)],
+            f"Resolved pathways\nn={len(resolved)}",
+            [("downward", resolved_down), ("upward", resolved_up)]
+            + ([('unclassified', resolved_other)] if resolved_other else []),
         ),
         (
-            "$w_{\\mathrm{along}}$ subset\nn=19",
-            [("downward", w_along_downward), ("negative $w_{\\mathrm{along}}$", 6)],
+            f"$w_{{\\mathrm{{along}}}}$ subset\nn={w_along_count}",
+            [("downward", w_along_downward), ("upward", w_along_negative)]
+            + ([('unclassified', w_along_other)] if w_along_other else []),
         ),
     ]
-    category_colors = {"downward": RED, "upward": BLUE, "unclassified": light_gray, "negative $w_{\\mathrm{along}}$": light_gray}
+    category_colors = {
+        "downward": RED,
+        "upward": BLUE,
+        "unclassified": light_gray,
+    }
     y_positions = np.arange(len(composition_rows))[::-1]
     ax.set_xlim(0, 1.90)
     ax.set_ylim(-0.5, 2.6)
@@ -692,7 +738,7 @@ def _plot_figure3(
             left += width
         if row_label.startswith("$w_"):
             ax.text(
-                1.02, y, f"+{core.mean():.1f} m d⁻¹\npositive =\ndownward",
+                1.02, y, f"+{paired_w_along['core_w_along_mean'].mean():.1f} m d⁻¹\npositive =\ndownward",
                 ha="left", va="center", fontsize=6.0, color=INK,
             )
     ax.set_yticks([])
@@ -957,25 +1003,32 @@ def _plot_figure5(
         ),
         "lifecycle event summary",
     )
-    _require_columns(stage, ("event_id", "stage", "event_compatible_count"), "per-stage McCoy diagnostics")
+    _require_columns(
+        stage,
+        ("event_id", "stage", "event_compatible_count", "stage_diagnostic_available"),
+        "per-stage McCoy diagnostics",
+    )
     _require_columns(
         retention, ("event_id", "persistent_carrier", "post_peak_decay_slope"), "retention comparison"
     )
-    if len(lifecycle) != 56:
-        raise ValueError("Expected 56 lifecycle events")
+    lifecycle_count = int(lifecycle["event_id"].astype(str).nunique())
+    retention_count = int(retention["event_id"].astype(str).nunique())
+    if lifecycle_count <= 0 or retention_count <= 0:
+        raise ValueError("Lifecycle and retention tables must be non-empty")
     carrier = int(_true_mask(lifecycle["persistent_anticyclonic_rotational_carrier"]).sum())
     scv = int(_true_mask(lifecycle["scv_compatible"]).sum())
     obscured = int(_true_mask(lifecycle["surface_obscured_scv_compatible"]).sum())
-    if (carrier, scv, obscured) != (27, 6, 1):
-        raise ValueError(f"Frozen rotational hierarchy changed: {(carrier, scv, obscured)}")
-    stage_counts = stage.groupby("stage").apply(
-        lambda frame: int(frame["event_compatible_count"].gt(0).sum()),
-        include_groups=False,
-    ).to_dict()
-    if stage_counts != {"start": 10, "peak": 19, "last": 9}:
-        raise ValueError(f"Frozen per-stage McCoy counts changed: {stage_counts}")
-    if len(retention) != 56:
-        raise ValueError("Retention comparison must contain 56 events")
+    stage_counts: dict[str, int] = {}
+    stage_denominators: dict[str, int] = {}
+    for stage_name in ("start", "peak", "last"):
+        stage_rows = stage.loc[stage["stage"].eq(stage_name)]
+        available = _true_mask(stage_rows["stage_diagnostic_available"])
+        stage_denominators[stage_name] = int(available.sum())
+        stage_counts[stage_name] = int(
+            stage_rows.loc[available, "event_compatible_count"].gt(0).sum()
+        )
+        if stage_denominators[stage_name] <= 0:
+            raise ValueError(f"No evaluable McCoy rows for stage {stage_name}")
 
     primary = transition_audit["retention_comparison"]["primary_persistent_carrier"]["post_peak_decay_slope"]
     fixed = fixed_water_audit["carrier_retention"]["wm_normalized_decay_slope"]
@@ -996,7 +1049,7 @@ def _plot_figure5(
     ax.set_ylim(0, 1)
     ax.axis("off")
     boxes = [
-        (0.05, 0.08, 0.90, 0.84, "56 strict events", INK),
+        (0.05, 0.08, 0.90, 0.84, f"{lifecycle_count} primary process events", INK),
         (0.16, 0.20, 0.68, 0.60, f"{carrier} persistent carriers", RED),
         (0.28, 0.32, 0.44, 0.36, f"{scv} SCV-compatible", PURPLE),
         (0.38, 0.40, 0.24, 0.20, f"{obscured} obscured SCV", TEAL),
@@ -1020,10 +1073,16 @@ def _plot_figure5(
     stages = ["start", "peak", "last"]
     counts = [stage_counts[s] for s in stages]
     bars = ax.bar(np.arange(3), counts, color=[BLUE, RED, BLUE], width=0.55)
-    for bar, count in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, count + 0.5, f"{count}/56", ha="center", fontsize=10)
+    for bar, count, stage_name in zip(bars, counts, stages):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            count + 0.5,
+            f"{count}/{stage_denominators[stage_name]}",
+            ha="center",
+            fontsize=10,
+        )
     ax.set_xticks(np.arange(3), ["start", "peak", "last"])
-    ax.set_ylim(0, 24)
+    ax.set_ylim(0, max(stage_counts.values()) * 1.25 + 1)
     ax.set_ylabel("Events with ≥1 compatible profile")
     ax.set_title("McCoy stage counts", loc="right")
 
