@@ -63375,6 +63375,1823 @@ def load_ofes_event_evolution(
     }
 
 
+def _ofes_post_peak_retention_settings(overrides: dict | None = None) -> dict:
+    """解析 OFES peak-to-future retention 配置。"""
+    raw = dict(_OFES_CFG.get("post_peak_retention", {}) or {})
+    common_keys = {
+        "integration_dt_seconds",
+        "domain_margin_km",
+        "minimum_active_fraction",
+        "minimum_valid_particle_fraction",
+        "background_inner_radius_km",
+        "background_outer_radius_km",
+        "background_load_margin_km",
+        "background_min_valid_columns",
+        "same_sigma_do_abs_min_umol_kg",
+        "same_sigma_theta_abs_min_deg_c",
+        "same_sigma_salinity_abs_min",
+        "same_sigma_spiciness0_abs_min",
+        "bootstrap_replicates",
+        "random_seed",
+    }
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw) - common_keys)
+        if unknown:
+            raise KeyError(f"Unknown post_peak_retention keys: {unknown}.")
+        raw.update(overrides)
+    horizons = tuple(int(v) for v in raw.get("reporting_horizons_days", (7, 14, 30)))
+    trajectory = _ofes_trajectory_3d_settings(
+        {"event_ids": ("OFES_DO50_E000002", "OFES_DO50_E000222", "OFES_DO50_E000276")}
+    )
+    tracer = _ofes_trajectory_tracer_settings()
+    synthesis = dict(_OFES_CFG.get("mechanism_synthesis", {}) or {})
+    settings = {
+        "worker_count": int(raw.get("worker_count", 16)),
+        "io_concurrency": int(raw.get("io_concurrency", 4)),
+        "maximum_forward_days": int(raw.get("maximum_forward_days", 30)),
+        "reporting_horizons_days": horizons,
+        "primary_horizon_days": int(raw.get("primary_horizon_days", 14)),
+        "integration_dt_seconds": float(trajectory["rk4_dt_seconds"]),
+        "domain_margin_km": float(trajectory["domain_margin_km"]),
+        "minimum_active_fraction": float(trajectory["minimum_active_fraction"]),
+        "minimum_valid_particle_fraction": float(
+            tracer["minimum_valid_particle_fraction"]
+        ),
+        "background_inner_radius_km": float(tracer["background_inner_radius_km"]),
+        "background_outer_radius_km": float(tracer["background_outer_radius_km"]),
+        "background_load_margin_km": float(tracer["background_load_margin_km"]),
+        "background_min_valid_columns": int(tracer["background_min_valid_columns"]),
+        "same_sigma_do_abs_min_umol_kg": float(tracer["same_sigma_do_abs_min_umol_kg"]),
+        "same_sigma_theta_abs_min_deg_c": float(
+            tracer["same_sigma_theta_abs_min_deg_c"]
+        ),
+        "same_sigma_salinity_abs_min": float(tracer["same_sigma_salinity_abs_min"]),
+        "same_sigma_spiciness0_abs_min": float(tracer["same_sigma_spiciness0_abs_min"]),
+        "bootstrap_replicates": int(synthesis.get("bootstrap_replicates", 10000)),
+        "random_seed": int(synthesis.get("random_seed", 20260729)),
+        "figure_dpi": int(raw.get("figure_dpi", 180)),
+        "output_subdir": str(raw.get("output_subdir", "post_peak_retention")),
+    }
+    if overrides:
+        for key in common_keys:
+            if key in overrides:
+                settings[key] = overrides[key]
+    if (
+        settings["maximum_forward_days"] <= 0
+        or settings["primary_horizon_days"] not in horizons
+    ):
+        raise ValueError("post_peak_retention horizon configuration is invalid.")
+    if (
+        tuple(sorted(set(horizons))) != horizons
+        or horizons[-1] > settings["maximum_forward_days"]
+    ):
+        raise ValueError("post_peak_retention horizons must be ordered and bounded.")
+    for key in (
+        "integration_dt_seconds",
+        "domain_margin_km",
+        "background_inner_radius_km",
+        "background_outer_radius_km",
+        "background_load_margin_km",
+        "same_sigma_do_abs_min_umol_kg",
+        "same_sigma_theta_abs_min_deg_c",
+        "same_sigma_salinity_abs_min",
+        "same_sigma_spiciness0_abs_min",
+    ):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(f"post_peak_retention {key} must be positive.")
+    if settings["background_outer_radius_km"] <= settings["background_inner_radius_km"]:
+        raise ValueError("post_peak_retention background radii are invalid.")
+    if (
+        settings["worker_count"] <= 0
+        or settings["worker_count"] > (os.cpu_count() or 1)
+        or settings["io_concurrency"] <= 0
+    ):
+        raise ValueError("post_peak_retention worker settings are invalid.")
+    if (
+        not 0 < settings["minimum_active_fraction"] <= 1
+        or not 0 < settings["minimum_valid_particle_fraction"] <= 1
+    ):
+        raise ValueError("post_peak_retention particle fractions are invalid.")
+    return settings
+
+
+def _ofes_post_peak_requests(population_run_dir: str | Path) -> pd.DataFrame:
+    """从 300–1000 m 主体派生 peak-day forward retention 请求。"""
+    population = pd.read_parquet(
+        Path(population_run_dir) / "population_peak_diagnostics.parquet"
+    )
+    population = population.loc[
+        population["population_diagnostic_passed"].astype(bool)
+    ].copy()
+    required = {
+        "event_id",
+        "peak_date",
+        "peak_lon",
+        "peak_lat",
+        "peak_depth_m",
+        "daily_peak_equivalent_radius_km",
+        "kinematic_regime",
+    }
+    missing = required - set(population.columns)
+    if missing:
+        raise KeyError(
+            f"OFES primary population lacks retention fields: {sorted(missing)}"
+        )
+    requests = (
+        population[list(required)]
+        .rename(columns={"peak_depth_m": "peak_reference_depth_m"})
+        .copy()
+    )
+    requests["event_id"] = requests["event_id"].astype(str)
+    requests["peak_date"] = pd.to_datetime(requests["peak_date"]).dt.normalize()
+    requests["peak_equivalent_radius_km"] = requests.pop(
+        "daily_peak_equivalent_radius_km"
+    ).astype(float)
+    deep_path = (
+        Path(population_run_dir).parent
+        / "deep_event_population"
+        / "population_peak_diagnostics.parquet"
+    )
+    if deep_path.exists():
+        deep_ids = set(pd.read_parquet(deep_path)["event_id"].astype(str))
+    else:
+        deep_ids = set()
+    requests["deep_500_1000_member"] = requests["event_id"].isin(deep_ids)
+    requests = requests.sort_values("event_id", kind="mergesort").reset_index(drop=True)
+    return requests
+
+
+_OFES_POST_PEAK_IO_GATE = None
+
+
+def _ofes_initialize_post_peak_worker(io_gate) -> None:
+    """在 post-peak worker 内安装共享 NetCDF I/O 闸门。"""
+    global _OFES_POST_PEAK_IO_GATE
+    _OFES_POST_PEAK_IO_GATE = io_gate
+
+
+@contextmanager
+def _ofes_post_peak_io_gate(io_gate):
+    """限制并行 worker 同时读取 OFES 快照的数量。"""
+    if io_gate is None:
+        yield
+        return
+    io_gate.acquire()
+    try:
+        yield
+    finally:
+        io_gate.release()
+
+
+def _ofes_post_peak_snapshots(
+    request: dict, settings: dict, trajectory_settings: dict
+) -> list[dict]:
+    """加载一个 peak-to-future 请求所需的三维速度快照。"""
+    seeds, _, _ = _ofes_trajectory_seed_ensemble(
+        request["peak_date"],
+        request["peak_lon"],
+        request["peak_lat"],
+        request["peak_reference_depth_m"],
+        request["peak_equivalent_radius_km"],
+        trajectory_settings,
+    )
+    lon0, lon1 = float(np.nanmin(seeds[:, 2])), float(np.nanmax(seeds[:, 2]))
+    lat0, lat1 = float(np.nanmin(seeds[:, 1])), float(np.nanmax(seeds[:, 1]))
+    scale = approximate_degree_length(float(request["peak_lat"]))
+    margin = settings["domain_margin_km"] * 1000.0
+    lon_margin = margin / float(scale["meters_per_degree_lon"])
+    lat_margin = margin / float(scale["meters_per_degree_lat"])
+    dates = pd.date_range(
+        request["peak_date"], periods=settings["maximum_forward_days"] + 1, freq="D"
+    )
+    snapshots = []
+    for date in dates:
+        with _ofes_post_peak_io_gate(_OFES_POST_PEAK_IO_GATE):
+            snapshot = load_ofes_snapshot(
+                date,
+                variables=["u", "v", "w"],
+                lon_bounds=(lon0 - lon_margin, lon1 + lon_margin),
+                lat_bounds=(lat0 - lat_margin, lat1 + lat_margin),
+                depth_bounds=None,
+            )
+        snapshot["metadata"]["w_validation_passed"] = True
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _ofes_post_peak_position_frame(
+    request: dict, integration: dict, peak_date: pd.Timestamp, metadata: pd.DataFrame
+) -> pd.DataFrame:
+    """把逐小时三维积分结果抽取为逐日粒子位置。"""
+    times = pd.to_datetime(integration["times"])
+    midnight = np.flatnonzero(
+        (times.hour == 0) & (times.minute == 0) & (times.second == 0)
+    )
+    positions = integration["positions"][midnight]
+    statuses = integration["status"][midnight]
+    rows = []
+    particle_meta = metadata.set_index("particle_index")
+    for day_index, (time, day_pos, day_status) in enumerate(
+        zip(times[midnight], positions, statuses)
+    ):
+        for particle_index, (pos, status) in enumerate(zip(day_pos, day_status)):
+            meta = particle_meta.loc[particle_index]
+            rows.append(
+                {
+                    "event_id": str(request["event_id"]),
+                    "date": pd.Timestamp(time).normalize(),
+                    "day_since_peak": int(
+                        (pd.Timestamp(time).normalize() - peak_date).days
+                    ),
+                    "particle_index": int(particle_index),
+                    "depth_m": float(pos[0]) if np.all(np.isfinite(pos)) else np.nan,
+                    "lat": float(pos[1]) if np.all(np.isfinite(pos)) else np.nan,
+                    "lon": float(pos[2]) if np.all(np.isfinite(pos)) else np.nan,
+                    "status": str(status),
+                    "particle_id": str(meta["particle_id"]),
+                    "ring_fraction": float(meta["ring_fraction"]),
+                    "depth_offset_index": int(meta["depth_offset_index"]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _ofes_post_peak_fragment_paths(
+    events_dir: str | Path, event_id: str
+) -> dict[str, Path]:
+    """返回一个 post-peak 事件 fragment 的固定路径。"""
+    event_dir = Path(events_dir) / str(event_id)
+    return {
+        "event_dir": event_dir,
+        "request": event_dir / "request.json",
+        "positions": event_dir / "daily_positions.parquet",
+        "samples": event_dir / "daily_tracer_samples.parquet",
+        "daily": event_dir / "daily_tracer_summary.parquet",
+        "event": event_dir / "event_summary.parquet",
+        "metadata": event_dir / "particle_metadata.parquet",
+    }
+
+
+def _ofes_post_peak_fragment_reusable(paths: dict[str, Path], request: dict) -> bool:
+    """判定一个 post-peak 事件 fragment 是否可直接复用。"""
+    required = [path for key, path in paths.items() if key != "event_dir"]
+    if not all(path.exists() for path in required):
+        return False
+    stored = json.loads(paths["request"].read_text(encoding="utf-8"))
+    if _ofes_normalize_request_value(stored) != _ofes_normalize_request_value(request):
+        raise RuntimeError(
+            "Existing post-peak fragment was created for a different request."
+        )
+    positions = pd.read_parquet(paths["positions"])
+    daily = pd.read_parquet(paths["daily"])
+    event = pd.read_parquet(paths["event"])
+    return bool(
+        not positions.empty
+        and not daily.empty
+        and len(event) == 1
+        and {"event_id", "day_since_peak", "status"}.issubset(positions)
+        and {"event_id", "day_since_peak", "daily_diagnostic_passed"}.issubset(daily)
+    )
+
+
+def _ofes_load_post_peak_fragment(paths: dict[str, Path]) -> dict:
+    """读取一个完整的 post-peak 事件 fragment。"""
+    return {
+        "request": json.loads(paths["request"].read_text(encoding="utf-8")),
+        "positions": pd.read_parquet(paths["positions"]),
+        "samples": pd.read_parquet(paths["samples"]),
+        "daily": pd.read_parquet(paths["daily"]),
+        "event": pd.read_parquet(paths["event"]).iloc[0].to_dict(),
+        "metadata": pd.read_parquet(paths["metadata"]),
+    }
+
+
+def _ofes_post_peak_event_worker(payload: dict) -> dict:
+    """运行单事件 peak-to-future 三维积分和逐日水团采样。"""
+    request = dict(payload["request"])
+    settings = payload["settings"]
+    trajectory_settings = payload["trajectory_settings"]
+    seeds, metadata, _ = _ofes_trajectory_seed_ensemble(
+        request["peak_date"],
+        request["peak_lon"],
+        request["peak_lat"],
+        request["peak_reference_depth_m"],
+        request["peak_equivalent_radius_km"],
+        trajectory_settings,
+    )
+    snapshots = _ofes_post_peak_snapshots(request, settings, trajectory_settings)
+    integration = advect_ofes_particles(
+        snapshots,
+        seeds,
+        dt_seconds=settings["integration_dt_seconds"],
+        temporal_interpolation="linear",
+        vertical_mode="three_dimensional",
+    )
+    positions = _ofes_post_peak_position_frame(
+        request, integration, pd.Timestamp(request["peak_date"]), metadata
+    )
+    tracer_settings = _ofes_trajectory_tracer_settings(
+        {
+            "background_inner_radius_km": settings["background_inner_radius_km"],
+            "background_outer_radius_km": settings["background_outer_radius_km"],
+            "background_load_margin_km": settings["background_load_margin_km"],
+            "background_min_valid_columns": settings["background_min_valid_columns"],
+            "minimum_active_fraction": settings["minimum_active_fraction"],
+            "minimum_valid_particle_fraction": settings[
+                "minimum_valid_particle_fraction"
+            ],
+        }
+    )
+    samples, daily = [], []
+    for date, day in positions.groupby("date", sort=True):
+        if (day["status"] == "active").sum() == 0:
+            daily.append(
+                {
+                    "event_id": request["event_id"],
+                    "date": date,
+                    "day_since_peak": int(day["day_since_peak"].iloc[0]),
+                    "particle_count": len(day),
+                    "active_particle_count": 0,
+                    "active_fraction": 0.0,
+                    "valid_particle_count": 0,
+                    "valid_particle_fraction": 0.0,
+                    "daily_diagnostic_passed": False,
+                }
+            )
+            continue
+        try:
+            with _ofes_post_peak_io_gate(_OFES_POST_PEAK_IO_GATE):
+                sampled, summary = _ofes_sample_trajectory_tracer_day(
+                    day.assign(integration_label="forward_peak_to_future"),
+                    tracer_settings,
+                )
+            samples.append(sampled)
+            summary["day_since_peak"] = int(day["day_since_peak"].iloc[0])
+            daily.append(summary)
+        except Exception as exc:
+            daily.append(
+                {
+                    "event_id": request["event_id"],
+                    "integration_label": "forward_peak_to_future",
+                    "date": date,
+                    "day_since_peak": int(day["day_since_peak"].iloc[0]),
+                    "particle_count": len(day),
+                    "active_particle_count": int((day["status"] == "active").sum()),
+                    "active_fraction": float((day["status"] == "active").mean()),
+                    "valid_particle_count": 0,
+                    "valid_particle_fraction": 0.0,
+                    "daily_diagnostic_passed": False,
+                    "sampling_error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    daily_frame = pd.DataFrame(daily)
+    samples_frame = pd.concat(samples, ignore_index=True) if samples else pd.DataFrame()
+    event = {
+        "event_id": request["event_id"],
+        "peak_date": request["peak_date"],
+        "peak_lon": request["peak_lon"],
+        "peak_lat": request["peak_lat"],
+        "peak_reference_depth_m": request["peak_reference_depth_m"],
+        "peak_equivalent_radius_km": request["peak_equivalent_radius_km"],
+        "kinematic_regime": request["kinematic_regime"],
+        "particle_count": len(seeds),
+        "integration_status": "complete",
+        "deep_500_1000_member": bool(request.get("deep_500_1000_member", False)),
+        "final_active_fraction": float(
+            np.mean(integration["final_status"].astype(str) == "active")
+        ),
+    }
+    metadata = metadata.assign(event_id=request["event_id"])
+    paths = _ofes_post_peak_fragment_paths(payload["events_dir"], request["event_id"])
+    paths["event_dir"].mkdir(parents=True, exist_ok=True)
+    _ofes_atomic_write_json(payload["fragment_request"], paths["request"])
+    _atomic_write_parquet(positions, paths["positions"])
+    _atomic_write_parquet(samples_frame, paths["samples"])
+    _atomic_write_parquet(daily_frame, paths["daily"])
+    _atomic_write_parquet(pd.DataFrame([event]), paths["event"])
+    _atomic_write_parquet(metadata, paths["metadata"])
+    return {
+        "event": event,
+        "positions": positions,
+        "samples": samples_frame,
+        "daily": daily_frame,
+        "metadata": metadata,
+    }
+
+
+def _ofes_post_peak_event_metrics(daily: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """计算逐事件逐日的归一化指纹和粒子集合紧凑度。"""
+    if daily.empty:
+        return pd.DataFrame()
+    records = []
+    thresholds = {
+        "do": settings["same_sigma_do_abs_min_umol_kg"],
+        "theta": settings["same_sigma_theta_abs_min_deg_c"],
+        "salinity": settings["same_sigma_salinity_abs_min"],
+        "spiciness0": settings["same_sigma_spiciness0_abs_min"],
+    }
+    # 峰值基准先逐变量判定；基准不合格的变量不进入该变量的分母。
+    for event_id, group in daily.groupby("event_id", sort=False):
+        group = group.sort_values("day_since_peak").copy()
+        peak = group.loc[group["day_since_peak"] == 0]
+        if peak.empty:
+            continue
+        peak = peak.iloc[0]
+        baseline_ok = {}
+        for name, column in (
+            ("do", "same_sigma_do_contrast"),
+            ("theta", "same_sigma_theta_contrast"),
+            ("salinity", "same_sigma_salinity_contrast"),
+            ("spiciness0", "same_sigma_spiciness0_contrast"),
+        ):
+            base = float(peak.get(f"median_{column}", np.nan))
+            baseline_ok[name] = bool(
+                np.isfinite(base)
+                and np.sign(base) != 0
+                and abs(base) >= thresholds[name]
+            )
+        event_records = []
+        for _, row in group.iterrows():
+            record = row.to_dict()
+            for name, column in (
+                ("do", "same_sigma_do_contrast"),
+                ("theta", "same_sigma_theta_contrast"),
+                ("salinity", "same_sigma_salinity_contrast"),
+                ("spiciness0", "same_sigma_spiciness0_contrast"),
+            ):
+                value = float(row.get(f"median_{column}", np.nan))
+                base = float(peak.get(f"median_{column}", np.nan))
+                record[f"{name}_baseline_eligible"] = baseline_ok[name]
+                current_ok = bool(
+                    np.isfinite(value)
+                    and np.sign(value) == np.sign(base)
+                    and abs(value) >= thresholds[name]
+                )
+                metric_ok = bool(
+                    row.get("daily_diagnostic_passed", False) and baseline_ok[name]
+                )
+                record[f"{name}_metric_eligible"] = metric_ok
+                record[f"normalized_{name}_contrast"] = (
+                    value / base if metric_ok and base != 0 else np.nan
+                )
+                record[f"{name}_fingerprint_retained"] = (
+                    bool(current_ok) if metric_ok else np.nan
+                )
+            joint_base = all(baseline_ok.values())
+            joint_eligible = bool(
+                row.get("daily_diagnostic_passed", False) and joint_base
+            )
+            record["joint_baseline_eligible"] = joint_base
+            record["joint_metric_eligible"] = joint_eligible
+            record["joint_do_thermohaline_fingerprint_retained"] = (
+                bool(
+                    all(
+                        record[f"{name}_fingerprint_retained"]
+                        for name in ("do", "theta", "salinity", "spiciness0")
+                    )
+                )
+                if joint_eligible
+                else np.nan
+            )
+            event_records.append(record)
+        event_frame = pd.DataFrame(event_records)
+        # 0--14 d AUC 是事件级指标，只有整段每日诊断和 DO 峰值基准均有效时才定义。
+        event_rows = event_frame.sort_values("day_since_peak")
+        auc = np.nan
+        first_15 = event_rows.loc[event_rows["day_since_peak"].isin(range(15))]
+        auc_ok = bool(
+            baseline_ok["do"]
+            and len(first_15) == 15
+            and first_15["day_since_peak"].nunique() == 15
+            and first_15["do_metric_eligible"].all()
+        )
+        if auc_ok:
+            auc = float(
+                scipy.integrate.trapezoid(
+                    first_15["normalized_do_contrast"].to_numpy(dtype=float),
+                    first_15["day_since_peak"].to_numpy(dtype=float),
+                )
+                / 14.0
+            )
+        event_frame["normalized_do_auc_0_14"] = auc
+        records.extend(event_frame.to_dict("records"))
+    return pd.DataFrame(records)
+
+
+def _ofes_post_peak_group_comparison(
+    event_summary: pd.DataFrame, settings: dict
+) -> pd.DataFrame:
+    """按事件比较 peak-to-future retention 的旋转和应变组。"""
+    records = []
+    horizon = int(settings["primary_horizon_days"])
+    specs = {
+        "normalized_do_contrast": ("do_metric_eligible", False),
+        "joint_do_thermohaline_fingerprint_retained": ("joint_metric_eligible", True),
+        "spread_ratio": ("spread_metric_eligible", False),
+        "normalized_do_auc_0_14": ("do_metric_eligible", False),
+    }
+    groups = (
+        "rotation_dominated",
+        "strain_dominated",
+        "persistent_carrier",
+        "other_carrier",
+        "transition_always_rotation",
+        "transition_always_strain",
+    )
+    if "persistent_carrier" not in event_summary:
+        event_summary = event_summary.assign(persistent_carrier=False)
+    event_summary = event_summary.assign(
+        other_carrier=~event_summary["persistent_carrier"].astype(bool),
+        transition_always_rotation=event_summary.get(
+            "transition", pd.Series("", index=event_summary.index)
+        ).eq("rotation->rotation"),
+        transition_always_strain=event_summary.get(
+            "transition", pd.Series("", index=event_summary.index)
+        ).eq("strain->strain"),
+    )
+    primary = event_summary.loc[event_summary["day_since_peak"].eq(horizon)].copy()
+
+    def group_mask(frame: pd.DataFrame, name: str) -> pd.Series:
+        if name in ("rotation_dominated", "strain_dominated"):
+            return frame["kinematic_regime"].eq(name)
+        return frame[name].astype(bool)
+
+    for metric, (eligibility, is_binary) in specs.items():
+        if metric not in primary:
+            continue
+        for group_name in groups:
+            values = (
+                primary.loc[
+                    group_mask(primary, group_name) & primary[eligibility].astype(bool),
+                    metric,
+                ]
+                .dropna()
+                .to_numpy(float)
+            )
+            if is_binary:
+                values = values.astype(bool).astype(float)
+            records.append(
+                {
+                    "horizon_days": horizon,
+                    "metric": metric,
+                    "regime": group_name,
+                    "event_count": int(values.size),
+                    "retained_count": int(values.sum()) if is_binary else np.nan,
+                    "retained_fraction": (
+                        float(np.mean(values)) if is_binary and values.size else np.nan
+                    ),
+                    "median": (
+                        float(np.median(values))
+                        if values.size and not is_binary
+                        else np.nan
+                    ),
+                    "mean": (
+                        float(np.mean(values))
+                        if values.size and not is_binary
+                        else np.nan
+                    ),
+                }
+            )
+    rng = np.random.default_rng(settings["random_seed"])
+    for metric, (eligibility, is_binary) in specs.items():
+        if metric not in primary:
+            continue
+        for left, right in (
+            ("rotation_dominated", "strain_dominated"),
+            ("persistent_carrier", "other_carrier"),
+            ("transition_always_rotation", "transition_always_strain"),
+        ):
+            left_values = (
+                primary.loc[
+                    group_mask(primary, left) & primary[eligibility].astype(bool),
+                    metric,
+                ]
+                .dropna()
+                .to_numpy(float)
+            )
+            right_values = (
+                primary.loc[
+                    group_mask(primary, right) & primary[eligibility].astype(bool),
+                    metric,
+                ]
+                .dropna()
+                .to_numpy(float)
+            )
+            if left_values.size and right_values.size:
+                left_draws = left_values[
+                    rng.integers(
+                        left_values.size,
+                        size=(settings["bootstrap_replicates"], left_values.size),
+                    )
+                ]
+                right_draws = right_values[
+                    rng.integers(
+                        right_values.size,
+                        size=(settings["bootstrap_replicates"], right_values.size),
+                    )
+                ]
+                if is_binary:
+                    interval = np.quantile(
+                        np.mean(left_draws.astype(bool), axis=1)
+                        - np.mean(right_draws.astype(bool), axis=1),
+                        (0.025, 0.975),
+                    )
+                    difference = float(
+                        np.mean(left_values.astype(bool))
+                        - np.mean(right_values.astype(bool))
+                    )
+                    mean_difference = difference
+                    p_value = float(
+                        scipy.stats.fisher_exact(
+                            [
+                                [
+                                    int(left_values.sum()),
+                                    int(left_values.size - left_values.sum()),
+                                ],
+                                [
+                                    int(right_values.sum()),
+                                    int(right_values.size - right_values.sum()),
+                                ],
+                            ],
+                            alternative="two-sided",
+                        ).pvalue
+                    )
+                else:
+                    interval = np.quantile(
+                        np.median(left_draws, axis=1) - np.median(right_draws, axis=1),
+                        (0.025, 0.975),
+                    )
+                    difference = float(np.median(left_values) - np.median(right_values))
+                    mean_difference = float(
+                        np.mean(left_values) - np.mean(right_values)
+                    )
+                    p_value = float(
+                        scipy.stats.mannwhitneyu(
+                            left_values, right_values, alternative="two-sided"
+                        ).pvalue
+                    )
+            else:
+                interval = (np.nan, np.nan)
+                difference = np.nan
+                mean_difference = np.nan
+                p_value = np.nan
+            records.append(
+                {
+                    "horizon_days": horizon,
+                    "metric": metric,
+                    "regime": f"{left}_minus_{right}",
+                    "event_count": int(left_values.size + right_values.size),
+                    "left_event_count": int(left_values.size),
+                    "right_event_count": int(right_values.size),
+                    "left_label": left,
+                    "right_label": right,
+                    "left_retained_count": (
+                        int(left_values.astype(bool).sum()) if is_binary else np.nan
+                    ),
+                    "right_retained_count": (
+                        int(right_values.astype(bool).sum()) if is_binary else np.nan
+                    ),
+                    "median": difference,
+                    "mean": mean_difference,
+                    "bootstrap95_low": float(interval[0]),
+                    "bootstrap95_high": float(interval[1]),
+                    "mann_whitney_p": p_value if not is_binary else np.nan,
+                    "fisher_exact_p": p_value if is_binary else np.nan,
+                    "statistical_test": (
+                        "fisher_exact_two_sided"
+                        if is_binary
+                        else "mann_whitney_two_sided"
+                    ),
+                }
+            )
+    for label, column in (
+        ("mccoy_any", "any_event_profile_mccoy_compatible"),
+        ("velocity_confirmed", "any_event_profile_velocity_confirmed"),
+    ):
+        if column not in primary:
+            continue
+        for regime in ("rotation_dominated", "strain_dominated"):
+            classified = primary.loc[
+                group_mask(primary, regime) & primary[column].notna()
+            ]
+            positive = classified.loc[classified[column].astype(bool)]
+            positive_do = positive.loc[
+                positive["do_metric_eligible"].fillna(False).astype(bool)
+            ]
+            positive_joint = positive.loc[
+                positive["joint_metric_eligible"].fillna(False).astype(bool)
+                & positive[
+                    "joint_do_thermohaline_fingerprint_retained"
+                ].notna()
+            ]
+            records.append(
+                {
+                    "horizon_days": horizon,
+                    "metric": label,
+                    "regime": regime,
+                    "classified_event_count": int(len(classified)),
+                    "positive_event_count": int(len(positive)),
+                    "positive_do_eligible_count": int(len(positive_do)),
+                    "positive_joint_eligible_count": int(len(positive_joint)),
+                    "event_count": int(len(classified)),
+                    "retained_count": int(
+                        positive_joint[
+                            "joint_do_thermohaline_fingerprint_retained"
+                        ].astype(bool).sum()
+                    ),
+                    "retained_fraction": (
+                        float(
+                            positive_joint[
+                                "joint_do_thermohaline_fingerprint_retained"
+                            ].astype(bool).mean()
+                        )
+                        if len(positive_joint)
+                        else np.nan
+                    ),
+                    "median": (
+                        float(positive_do["normalized_do_contrast"].median())
+                        if len(positive_do)
+                        else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _plot_ofes_post_peak_retention(
+    daily: pd.DataFrame,
+    events: pd.DataFrame,
+    output_path: str | Path,
+    settings: dict,
+    *,
+    show_fig: bool = False,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 post-peak DO 保持、联合指纹和粒子紧凑度诊断。"""
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    colors = {"rotation_dominated": "#4c78a8", "strain_dominated": "#e45756"}
+    rng = np.random.default_rng(settings["random_seed"])
+    for regime, group in daily.groupby("kinematic_regime", sort=True):
+        if group.empty:
+            continue
+        values = group.loc[group["do_metric_eligible"]].groupby("day_since_peak")[
+            "normalized_do_contrast"
+        ]
+        x = np.asarray(sorted(values.groups), dtype=float)
+        median = values.median().reindex(x).to_numpy(dtype=float)
+        low, high = [], []
+        counts = []
+        for day in x:
+            sample = values.get_group(day).dropna().to_numpy(dtype=float)
+            counts.append(int(sample.size))
+            if sample.size:
+                draws = sample[
+                    rng.integers(
+                        sample.size,
+                        size=(settings["bootstrap_replicates"], sample.size),
+                    )
+                ]
+                draws = np.median(draws, axis=1)
+                low.append(float(np.quantile(draws, 0.025)))
+                high.append(float(np.quantile(draws, 0.975)))
+            else:
+                low.append(np.nan)
+                high.append(np.nan)
+        color = colors.get(regime, "#666")
+        axes[0, 0].plot(
+            x,
+            median,
+            color=color,
+            label=f'{regime.replace("_", " ")} (n@0={counts[0] if counts else 0})',
+        )
+        axes[0, 0].fill_between(x, low, high, color=color, alpha=0.16)
+        for horizon in settings["reporting_horizons_days"]:
+            if horizon in x:
+                index = int(np.flatnonzero(x == horizon)[0])
+                axes[0, 0].annotate(
+                    f"n={counts[index]}",
+                    (x[index], median[index]),
+                    textcoords="offset points",
+                    xytext=(0, 5),
+                    ha="center",
+                    fontsize=7,
+                    color=color,
+                )
+    axes[0, 0].axhline(1, color="#888", ls="--", lw=0.8)
+    axes[0, 0].set(
+        title="Post-peak normalized DO fingerprint",
+        xlabel="Days after peak",
+        ylabel="Median DO(t) / DO(peak)",
+    )
+    for regime, group in events.groupby("kinematic_regime", sort=True):
+        eligible = group.loc[group["joint_metric_eligible"]]
+        frac = eligible.groupby("day_since_peak")[
+            "joint_do_thermohaline_fingerprint_retained"
+        ].mean()
+        n = eligible.groupby("day_since_peak")["event_id"].nunique()
+        axes[0, 1].plot(
+            frac.index,
+            frac.values,
+            marker="o",
+            color=colors.get(regime, "#666"),
+            label=regime.replace("_", " "),
+        )
+        for day, value in frac.items():
+            axes[0, 1].annotate(
+                f"n={int(n.loc[day])}",
+                (day, value),
+                textcoords="offset points",
+                xytext=(0, 5),
+                ha="center",
+                fontsize=7,
+                color=colors.get(regime, "#666"),
+            )
+    axes[0, 1].set(
+        title="Joint fingerprint retention",
+        xlabel="Days after peak",
+        ylabel="Fraction retained",
+    )
+    axes[0, 1].set_ylim(-0.03, 1.03)
+    spread = (
+        events.loc[
+            events["spread_metric_eligible"] & events["spread_ratio"].notna()
+        ]
+        .groupby(["kinematic_regime", "day_since_peak"])["spread_ratio"]
+        .median()
+        .reset_index()
+    )
+    for regime, group in spread.groupby("kinematic_regime"):
+        axes[1, 0].plot(
+            group["day_since_peak"],
+            group["spread_ratio"],
+            marker="o",
+            color=colors.get(regime, "#666"),
+            label=regime.replace("_", " "),
+        )
+        lows, highs = [], []
+        for day in group["day_since_peak"]:
+            sample = (
+                events.loc[
+                    (events["kinematic_regime"] == regime)
+                    & (events["day_since_peak"] == day)
+                    & events["spread_metric_eligible"],
+                    "spread_ratio",
+                ]
+                .dropna()
+                .to_numpy(float)
+            )
+            if sample.size:
+                draws = sample[
+                    rng.integers(
+                        sample.size,
+                        size=(settings["bootstrap_replicates"], sample.size),
+                    )
+                ]
+                q = np.quantile(np.median(draws, axis=1), (0.025, 0.975))
+                lows.append(q[0])
+                highs.append(q[1])
+            else:
+                lows.append(np.nan)
+                highs.append(np.nan)
+        axes[1, 0].fill_between(
+            group["day_since_peak"].to_numpy(float),
+            lows,
+            highs,
+            color=colors.get(regime, "#666"),
+            alpha=0.12,
+        )
+        for day, value in zip(group["day_since_peak"], group["spread_ratio"]):
+            n_value = int(
+                events.loc[
+                    (events["kinematic_regime"] == regime)
+                    & (events["day_since_peak"] == day)
+                    & events["spread_metric_eligible"]
+                    & events["spread_ratio"].notna(),
+                    "event_id",
+                ].nunique()
+            )
+            axes[1, 0].annotate(
+                f"n={n_value}",
+                (day, value),
+                textcoords="offset points",
+                xytext=(0, 5),
+                ha="center",
+                fontsize=7,
+                color=colors.get(regime, "#666"),
+            )
+    axes[1, 0].axhline(1, color="#888", ls="--", lw=0.8)
+    axes[1, 0].set(
+        title="Particle spread relative to peak",
+        xlabel="Days after peak",
+        ylabel="Spread ratio",
+    )
+    if "moving_core_wm_post_peak_auc" in events:
+        valid = events.loc[
+            (events["day_since_peak"] == settings["primary_horizon_days"])
+            & events["do_metric_eligible"]
+            & events["moving_core_wm_peak"].ge(
+                settings["same_sigma_do_abs_min_umol_kg"]
+            )
+            & events["moving_core_wm_post_peak_auc"].notna()
+            & events["normalized_do_contrast"].notna()
+        ]
+        axes[1, 1].scatter(
+            valid["moving_core_wm_post_peak_auc"],
+            valid["normalized_do_contrast"],
+            c=[colors.get(v, "#666") for v in valid["kinematic_regime"]],
+            alpha=0.7,
+        )
+        if len(valid) >= 3:
+            correlation = scipy.stats.spearmanr(
+                valid["moving_core_wm_post_peak_auc"], valid["normalized_do_contrast"]
+            )
+            axes[1, 1].set_title(
+                f"Lagrangian vs Eulerian retention (n={len(valid)}, rho={correlation.statistic:.2f}, p={correlation.pvalue:.3g})"
+            )
+        else:
+            axes[1, 1].set_title(f"Lagrangian vs Eulerian retention (n={len(valid)})")
+    axes[1, 1].set(xlabel="Moving-core post-peak AUC", ylabel="Day-14 normalized DO")
+    for axis in axes.flat:
+        axis.grid(alpha=0.2)
+    axes[0, 0].legend(frameon=False)
+    axes[0, 1].legend(frameon=False)
+    for axis, label in zip(axes.flat, ("(a)", "(b)", "(c)", "(d)")):
+        axis.text(
+            0.01,
+            0.99,
+            label,
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontweight="bold",
+        )
+    return _ofes_finalize_figure(
+        figure,
+        output_path,
+        settings["figure_dpi"],
+        show_fig=show_fig,
+        save_fig=save_fig,
+    )
+
+
+def run_ofes_post_peak_trajectory_retention(
+    population_run_dir: str | Path | None = None,
+    *,
+    population_scope: str | None = None,
+    retention_overrides: dict | None = None,
+    w_validation_run_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """向未来 30 天追踪 OFES peak-day 粒子并诊断水团指纹保持。
+
+    使用 300–1000 m primary population 的 peak-day 51 粒子 ensemble，沿已验证的三维
+    u/v/w 场前向积分，并在 7、14、30 天报告 DO–热盐指纹和粒子集合紧凑度。
+
+    参数:
+        - population_run_dir (str | Path | None): primary population 目录；None 使用 scope 默认目录。
+        - population_scope (str | None): population scope；None 使用默认 scope。
+        - retention_overrides (dict | None): 临时覆盖 `ofes.post_peak_retention` 配置。
+        - w_validation_run_dir (str | Path | None): 已完成的垂向速度验证目录；None 使用固定 OFES 输出路径。
+        - output_dir (str | Path | None): 输出目录；None 使用固定 OFES 输出路径。
+    返回:
+        - dict: 含逐日粒子位置、示踪剂、事件指标、分组比较、摘要和图件路径。
+
+    输出:
+        - `<run_dir>/particle_daily_positions.parquet`、`daily_retention_summary.parquet`、`event_retention_summary.parquet`、`event_eligibility.parquet`、`group_comparison.parquet`、`deep_500_1000_event_summary.parquet`、`deep_500_1000_group_comparison.parquet`、`summary.json`、`manifest.json` 与 `post_peak_retention.png`。
+
+    说明:
+        - 14 天是主窗口，7 天和 30 天是预设敏感性；事件、而非粒子或 event-day，是统计单位。
+    """
+    scope = _ofes_event_population_scope_settings(population_scope)
+    population_root = _ofes_population_output_path(
+        "event_population", scope["population_scope"], population_run_dir
+    )
+    validation_root = (
+        Path(w_validation_run_dir)
+        if w_validation_run_dir is not None
+        else _ofes_analysis_output_path("vertical_velocity_validation")
+    )
+    validation_summary_path = validation_root / "analysis_summary.json"
+    if not validation_summary_path.exists():
+        raise FileNotFoundError(
+            f"OFES post-peak retention requires w validation: {validation_summary_path}"
+        )
+    validation_summary = json.loads(validation_summary_path.read_text(encoding="utf-8"))
+    if validation_summary.get("validation_passed") is not True:
+        raise RuntimeError("OFES post-peak retention requires a passed w validation.")
+    settings = _ofes_post_peak_retention_settings(retention_overrides)
+    trajectory_settings = _ofes_trajectory_3d_settings(
+        {"event_ids": ("OFES_DO50_E000002", "OFES_DO50_E000222", "OFES_DO50_E000276")}
+    )
+    requests = _ofes_post_peak_requests(population_root)
+    run_dir = _ofes_analysis_output_path(
+        f'{scope["output_prefix"]}_{settings["output_subdir"]}', output_dir
+    )
+    events_dir = run_dir / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "manifest.json"
+    tracer_settings = _ofes_trajectory_tracer_settings()
+    request = {
+        "population_scope": scope["population_scope"],
+        "event_ids": requests["event_id"].tolist(),
+        "peak_dates": [
+            pd.Timestamp(v).strftime("%Y-%m-%d") for v in requests["peak_date"]
+        ],
+        "release_records": requests[
+            [
+                "event_id",
+                "peak_date",
+                "peak_lon",
+                "peak_lat",
+                "peak_reference_depth_m",
+                "peak_equivalent_radius_km",
+                "kinematic_regime",
+                "deep_500_1000_member",
+            ]
+        ]
+        .assign(peak_date=lambda frame: frame["peak_date"].dt.strftime("%Y-%m-%d"))
+        .to_dict("records"),
+        "settings": settings,
+        "trajectory_settings": _ofes_material_settings(trajectory_settings),
+        "tracer_settings": _ofes_material_settings(tracer_settings),
+        "w_validation_run_dir": str(validation_root.resolve()),
+    }
+    previous = _ofes_existing_manifest(manifest_path, request)
+    if previous is not None:
+        outputs = previous["outputs"]
+        return {
+            "run_dir": run_dir,
+            "manifest": previous,
+            "particle_daily_positions": pd.read_parquet(
+                outputs["particle_daily_positions"]
+            ),
+            "daily_retention_summary": pd.read_parquet(
+                outputs["daily_retention_summary"]
+            ),
+            "event_retention_summary": pd.read_parquet(
+                outputs["event_retention_summary"]
+            ),
+            "event_eligibility": (
+                pd.read_parquet(outputs["event_eligibility"])
+                if outputs.get("event_eligibility")
+                else pd.DataFrame()
+            ),
+            "group_comparison": pd.read_parquet(outputs["group_comparison"]),
+            "analysis_summary": json.loads(Path(outputs["summary"]).read_text()),
+            "figure_path": Path(outputs["figure"]),
+            "output_paths": {key: Path(value) for key, value in outputs.items()},
+            "reused_complete_run": True,
+        }
+    manifest = {
+        "analysis": "post_peak_retention",
+        "request": request,
+        "w_validation": {
+            "run_dir": str(validation_root.resolve()),
+            "validation_passed": True,
+        },
+        "status": "running",
+        "total_events": len(requests),
+        "completed_events": 0,
+        "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    pending = []
+    results = []
+    for row in requests.to_dict("records"):
+        event_request = {
+            "event_id": str(row["event_id"]),
+            "peak_date": pd.Timestamp(row["peak_date"]).strftime("%Y-%m-%d"),
+            "peak_lon": float(row["peak_lon"]),
+            "peak_lat": float(row["peak_lat"]),
+            "peak_reference_depth_m": float(row["peak_reference_depth_m"]),
+            "peak_equivalent_radius_km": float(row["peak_equivalent_radius_km"]),
+            "kinematic_regime": str(row["kinematic_regime"]),
+            "deep_500_1000_member": bool(row["deep_500_1000_member"]),
+            "maximum_forward_days": settings["maximum_forward_days"],
+            "settings": settings,
+            "trajectory_settings": _ofes_material_settings(trajectory_settings),
+            "tracer_settings": _ofes_material_settings(tracer_settings),
+        }
+        paths = _ofes_post_peak_fragment_paths(events_dir, str(row["event_id"]))
+        if _ofes_post_peak_fragment_reusable(paths, event_request):
+            results.append(_ofes_load_post_peak_fragment(paths))
+            manifest["completed_events"] += 1
+        else:
+            pending.append(
+                {
+                    "request": row,
+                    "settings": settings,
+                    "trajectory_settings": trajectory_settings,
+                    "events_dir": str(events_dir),
+                    "fragment_request": event_request,
+                }
+            )
+    _ofes_atomic_write_json(manifest, manifest_path)
+    try:
+        spawn_context = multiprocessing.get_context("spawn")
+        io_gate = spawn_context.BoundedSemaphore(int(settings["io_concurrency"]))
+        with ProcessPoolExecutor(
+            max_workers=int(settings["worker_count"]),
+            mp_context=spawn_context,
+            initializer=_ofes_initialize_post_peak_worker,
+            initargs=(io_gate,),
+        ) as executor:
+            futures = {
+                executor.submit(_ofes_post_peak_event_worker, payload): payload[
+                    "request"
+                ]["event_id"]
+                for payload in pending
+            }
+            for future in futures_as_completed(futures):
+                result = future.result()
+                results.append(result)
+                manifest["completed_events"] += 1
+                manifest["last_completed_event"] = futures[future]
+                _ofes_atomic_write_json(manifest, manifest_path)
+                print(
+                    f'[OFES post-peak retention] {manifest["completed_events"]}/{len(requests)} complete: {futures[future]}',
+                    flush=True,
+                )
+        positions = pd.concat([r["positions"] for r in results], ignore_index=True)
+        daily = pd.concat([r["daily"] for r in results], ignore_index=True)
+        samples = (
+            pd.concat(
+                [r["samples"] for r in results if not r["samples"].empty],
+                ignore_index=True,
+            )
+            if any(not r["samples"].empty for r in results)
+            else pd.DataFrame()
+        )
+        event_rows = pd.DataFrame([r["event"] for r in results])
+        daily = daily.merge(
+            requests[["event_id", "kinematic_regime"]],
+            on="event_id",
+            how="left",
+            validate="many_to_one",
+        )
+        if not samples.empty:
+            samples = samples.merge(
+                requests[["event_id", "kinematic_regime"]],
+                on="event_id",
+                how="left",
+                validate="many_to_one",
+            )
+        daily_metrics = _ofes_post_peak_event_metrics(daily, settings)
+        daily_metrics = daily_metrics.merge(
+            requests[["event_id", "kinematic_regime"]],
+            on="event_id",
+            how="left",
+            validate="many_to_one",
+            suffixes=("", "_request"),
+        )
+        # 用粒子位置计算每日 q90 spread，并将 horizon eligibility 单独记录。
+        spreads = []
+        for (event_id, day), group in positions.groupby(["event_id", "day_since_peak"]):
+            active = group.loc[group["status"] == "active"].dropna(
+                subset=["lat", "lon"]
+            )
+            if active.empty:
+                spread = np.nan
+                vertical_spread = np.nan
+            else:
+                clon, clat = active["lon"].median(), active["lat"].median()
+                distance = (
+                    np.asarray(
+                        adaptive_distance_m(active["lon"], active["lat"], clon, clat),
+                        dtype=float,
+                    )
+                    / 1000.0
+                )
+                spread = float(np.quantile(distance, 0.9))
+                vertical_spread = float(
+                    np.quantile(
+                        np.abs(active["depth_m"] - active["depth_m"].median()), 0.9
+                    )
+                )
+            spreads.append(
+                {
+                    "event_id": event_id,
+                    "day_since_peak": int(day),
+                    "spread_q90_km": spread,
+                    "vertical_spread_q90_m": vertical_spread,
+                }
+            )
+        spread_frame = pd.DataFrame(spreads)
+        peak_spread = spread_frame.loc[
+            spread_frame["day_since_peak"] == 0,
+            ["event_id", "spread_q90_km", "vertical_spread_q90_m"],
+        ].rename(
+            columns={
+                "spread_q90_km": "peak_spread_q90_km",
+                "vertical_spread_q90_m": "peak_vertical_spread_q90_m",
+            }
+        )
+        spread_frame = spread_frame.merge(peak_spread, on="event_id", how="left")
+        spread_frame["spread_ratio"] = (
+            spread_frame["spread_q90_km"] / spread_frame["peak_spread_q90_km"]
+        )
+        spread_frame["vertical_spread_ratio"] = (
+            spread_frame["vertical_spread_q90_m"]
+            / spread_frame["peak_vertical_spread_q90_m"]
+        )
+        daily_metrics = daily_metrics.merge(
+            spread_frame, on=["event_id", "day_since_peak"], how="left"
+        )
+
+        def add_post_peak_eligibility(frame: pd.DataFrame) -> pd.DataFrame:
+            frame = frame.copy()
+            frame["active_eligible"] = frame["active_fraction"].ge(
+                settings["minimum_active_fraction"]
+            )
+            frame["tracer_eligible"] = frame[
+                "daily_diagnostic_passed"
+            ].fillna(False).astype(bool)
+            frame["horizon_eligible"] = (
+                frame["active_eligible"] & frame["tracer_eligible"]
+            )
+            for metric, column in (
+                ("spread", "spread_ratio"),
+                ("vertical_spread", "vertical_spread_ratio"),
+                (
+                    "core_offset",
+                    "particle_centroid_to_observed_core_d_over_r",
+                ),
+            ):
+                finite = (
+                    np.isfinite(pd.to_numeric(frame[column], errors="coerce"))
+                    if column in frame
+                    else False
+                )
+                frame[f"{metric}_metric_eligible"] = (
+                    frame["active_eligible"] & finite
+                )
+            return frame
+
+        event_summary = daily_metrics.loc[
+            daily_metrics["day_since_peak"].isin(settings["reporting_horizons_days"])
+        ].copy()
+        event_summary = add_post_peak_eligibility(event_summary)
+        lifecycle_path = (
+            _ofes_population_output_path("event_lifecycle", scope["population_scope"])
+            / "lifecycle_daily_diagnostics.parquet"
+        )
+        if lifecycle_path.exists():
+            lifecycle = pd.read_parquet(lifecycle_path)
+            lifecycle["date"] = pd.to_datetime(lifecycle["date"]).dt.normalize()
+            positions["date"] = pd.to_datetime(positions["date"]).dt.normalize()
+            centroid = (
+                positions.loc[positions["status"].eq("active")]
+                .groupby(["event_id", "date"], as_index=False)
+                .agg(
+                    particle_centroid_lat=("lat", "median"),
+                    particle_centroid_lon=("lon", "median"),
+                )
+            )
+            lifecycle_last = (
+                lifecycle.groupby("event_id", as_index=False)["date"]
+                .max()
+                .rename(columns={"date": "last_date"})
+            )
+            lifecycle_core = (
+                lifecycle[
+                    [
+                        "event_id",
+                        "date",
+                        "centroid_lon",
+                        "centroid_lat",
+                        "equivalent_radius_km",
+                    ]
+                ]
+                .drop_duplicates(["event_id", "date"])
+                .merge(
+                    lifecycle_last, on="event_id", how="left", validate="many_to_one"
+                )
+            )
+            centroid = centroid.merge(
+                lifecycle_core, on=["event_id", "date"], how="left"
+            )
+            centroid["particle_centroid_to_observed_core_km"] = (
+                np.asarray(
+                    adaptive_distance_m(
+                        centroid["particle_centroid_lon"],
+                        centroid["particle_centroid_lat"],
+                        centroid["centroid_lon"],
+                        centroid["centroid_lat"],
+                    ),
+                    dtype=float,
+                )
+                / 1000.0
+            )
+            centroid["particle_centroid_to_observed_core_d_over_r"] = centroid[
+                "particle_centroid_to_observed_core_km"
+            ] / pd.to_numeric(
+                centroid["equivalent_radius_km"], errors="coerce"
+            ).to_numpy(
+                float
+            )
+            centroid.loc[
+                centroid["date"] > pd.to_datetime(centroid["last_date"]).dt.normalize(),
+                [
+                    "particle_centroid_to_observed_core_km",
+                    "particle_centroid_to_observed_core_d_over_r",
+                ],
+            ] = np.nan
+            daily_metrics = daily_metrics.merge(
+                centroid[
+                    [
+                        "event_id",
+                        "date",
+                        "particle_centroid_to_observed_core_km",
+                        "particle_centroid_to_observed_core_d_over_r",
+                    ]
+                ],
+                on=["event_id", "date"],
+                how="left",
+            )
+            event_summary = daily_metrics.loc[
+                daily_metrics["day_since_peak"].isin(
+                    settings["reporting_horizons_days"]
+                )
+            ].copy()
+            event_summary = add_post_peak_eligibility(event_summary)
+        lifecycle_summary_path = (
+            _ofes_population_output_path("event_lifecycle", scope["population_scope"])
+            / "lifecycle_event_summary.parquet"
+        )
+        if lifecycle_summary_path.exists():
+            lifecycle_summary = pd.read_parquet(lifecycle_summary_path)
+            label_columns = [
+                c
+                for c in (
+                    "event_id",
+                    "persistent_anticyclonic_rotational_carrier",
+                    "rotation_day_fraction",
+                )
+                if c in lifecycle_summary
+            ]
+            event_summary = event_summary.merge(
+                lifecycle_summary[label_columns].drop_duplicates("event_id"),
+                on="event_id",
+                how="left",
+                validate="many_to_one",
+            )
+        transition_path = (
+            _ofes_population_output_path(
+                "mechanism_synthesis", scope["population_scope"]
+            )
+            / "phase_transition_table.parquet"
+        )
+        if transition_path.exists():
+            transition = pd.read_parquet(transition_path)
+            transition_columns = [
+                c for c in ("event_id", "transition") if c in transition
+            ]
+            event_summary = event_summary.merge(
+                transition[transition_columns].drop_duplicates("event_id"),
+                on="event_id",
+                how="left",
+                validate="many_to_one",
+            )
+        mccoy_path = (
+            _ofes_population_output_path(
+                "mccoy_virtual_argo", scope["population_scope"]
+            )
+            / "event_summary.parquet"
+        )
+        if mccoy_path.exists():
+            mccoy = pd.read_parquet(mccoy_path)
+            mccoy_columns = [
+                c
+                for c in (
+                    "event_id",
+                    "any_event_profile_mccoy_compatible",
+                    "any_event_profile_velocity_confirmed",
+                )
+                if c in mccoy
+            ]
+            event_summary = event_summary.merge(
+                mccoy[mccoy_columns].drop_duplicates("event_id"),
+                on="event_id",
+                how="left",
+                validate="many_to_one",
+            )
+        event_summary["persistent_carrier"] = (
+            event_summary.get(
+                "persistent_anticyclonic_rotational_carrier",
+                pd.Series(False, index=event_summary.index),
+            )
+            .fillna(False)
+            .astype(bool)
+        )
+        water_mass_root = _ofes_population_output_path(
+            "mechanism_water_mass", scope["population_scope"]
+        )
+        moving = pd.read_parquet(
+            water_mass_root / "moving_core" / "event_summary.parquet"
+        )
+        fixed = pd.read_parquet(
+            water_mass_root / "fixed_site" / "event_summary.parquet"
+        )
+        moving_cols = [
+            c for c in ("event_id", "wm_peak", "wm_post_peak_auc") if c in moving
+        ]
+        fixed_cols = [
+            c for c in ("event_id", "wm_peak", "wm_post_peak_auc") if c in fixed
+        ]
+        event_summary = event_summary.merge(
+            moving[moving_cols].rename(
+                columns={
+                    "wm_peak": "moving_core_wm_peak",
+                    "wm_post_peak_auc": "moving_core_wm_post_peak_auc",
+                }
+            ),
+            on="event_id",
+            how="left",
+            validate="many_to_one",
+        )
+        event_summary = event_summary.merge(
+            fixed[fixed_cols].rename(
+                columns={
+                    "wm_peak": "fixed_site_wm_peak",
+                    "wm_post_peak_auc": "fixed_site_wm_post_peak_auc",
+                }
+            ),
+            on="event_id",
+            how="left",
+            validate="many_to_one",
+        )
+        event_summary = event_summary.merge(
+            event_rows[["event_id", "deep_500_1000_member"]],
+            on="event_id",
+            how="left",
+            validate="many_to_one",
+        )
+        comparison = _ofes_post_peak_group_comparison(event_summary, settings)
+        eulerian_connections = {}
+        for mode in ("moving_core", "fixed_site"):
+            peak_column = f"{mode}_wm_peak"
+            auc_column = f"{mode}_wm_post_peak_auc"
+            valid = event_summary.loc[
+                event_summary["day_since_peak"].eq(settings["primary_horizon_days"])
+                & event_summary["do_metric_eligible"].astype(bool)
+                & event_summary[peak_column].ge(
+                    settings["same_sigma_do_abs_min_umol_kg"]
+                )
+            ].drop_duplicates("event_id")
+            values = {}
+            for response in ("normalized_do_contrast", "normalized_do_auc_0_14"):
+                paired = valid[[auc_column, response]].dropna()
+                if len(paired) >= 3:
+                    corr = scipy.stats.spearmanr(paired[auc_column], paired[response])
+                    values[response] = {
+                        "n": int(len(paired)),
+                        "rho": float(corr.statistic),
+                        "p": float(corr.pvalue),
+                    }
+                else:
+                    values[response] = {"n": int(len(paired)), "rho": None, "p": None}
+            eulerian_connections[mode] = values
+        eligibility_rows = []
+        for event_id, group in daily_metrics.groupby("event_id", sort=True):
+            for h in settings["reporting_horizons_days"]:
+                row = group.loc[group["day_since_peak"].eq(h)]
+                if row.empty:
+                    eligibility_rows.append(
+                        {
+                            "event_id": event_id,
+                            "horizon_days": int(h),
+                            "requested": True,
+                            "integrated": False,
+                            "active_eligible": False,
+                            "tracer_eligible": False,
+                            "do_metric_eligible": False,
+                            "joint_metric_eligible": False,
+                            "failure_reason": "missing_horizon",
+                        }
+                    )
+                    continue
+                row = row.iloc[0]
+                reasons = []
+                active_ok = bool(
+                    float(row.get("active_fraction", 0))
+                    >= settings["minimum_active_fraction"]
+                )
+                tracer_ok = bool(row.get("daily_diagnostic_passed", False))
+                if not active_ok:
+                    reasons.append("active_fraction")
+                if not tracer_ok:
+                    reasons.append("tracer_or_background_diagnostic")
+                if not bool(row.get("do_metric_eligible", False)):
+                    reasons.append("do_baseline_or_metric")
+                if not bool(row.get("joint_metric_eligible", False)):
+                    reasons.append("joint_baseline_or_metric")
+                eligibility_rows.append(
+                    {
+                        "event_id": event_id,
+                        "horizon_days": int(h),
+                        "requested": True,
+                        "integrated": True,
+                        "active_eligible": active_ok,
+                        "tracer_eligible": tracer_ok,
+                        "do_metric_eligible": bool(
+                            row.get("do_metric_eligible", False)
+                        ),
+                        "joint_metric_eligible": bool(
+                            row.get("joint_metric_eligible", False)
+                        ),
+                        "failure_reason": ";".join(reasons) if reasons else "",
+                    }
+                )
+        event_eligibility = pd.DataFrame(eligibility_rows)
+        deep_summary = {}
+        for horizon in settings["reporting_horizons_days"]:
+            deep_window = event_summary.loc[
+                (event_summary["deep_500_1000_member"])
+                & (event_summary["day_since_peak"] == horizon)
+            ]
+            deep = deep_window.loc[deep_window["horizon_eligible"]]
+            deep_do = deep_window.loc[deep_window["do_metric_eligible"]]
+            deep_joint = deep_window.loc[deep_window["joint_metric_eligible"]]
+            deep_spread = deep_window.loc[deep_window["spread_metric_eligible"]]
+            deep_summary[str(horizon)] = {
+                "event_count": int(len(deep)),
+                "active_event_count": int(deep_window["active_eligible"].sum()),
+                "tracer_event_count": int(deep_window["tracer_eligible"].sum()),
+                "do_event_count": int(len(deep_do)),
+                "joint_event_count": int(len(deep_joint)),
+                "spread_event_count": int(len(deep_spread)),
+                "joint_retained_fraction": (
+                    float(
+                        deep_joint["joint_do_thermohaline_fingerprint_retained"]
+                        .astype(bool)
+                        .mean()
+                    )
+                    if len(deep_joint)
+                    else None
+                ),
+                "median_normalized_do": (
+                    float(deep_do["normalized_do_contrast"].median())
+                    if len(deep_do)
+                    else None
+                ),
+            }
+        mccoy_descriptive = {}
+        day14 = event_summary.loc[
+            event_summary["day_since_peak"].eq(settings["primary_horizon_days"])
+        ]
+        for label, column in (
+            ("mccoy_any", "any_event_profile_mccoy_compatible"),
+            ("velocity_confirmed", "any_event_profile_velocity_confirmed"),
+        ):
+            classified = day14.loc[day14[column].notna()]
+            positive = classified.loc[classified[column].astype(bool)]
+            positive_do = positive.loc[
+                positive["do_metric_eligible"].fillna(False).astype(bool)
+            ]
+            positive_joint = positive.loc[
+                positive["joint_metric_eligible"].fillna(False).astype(bool)
+                & positive["joint_do_thermohaline_fingerprint_retained"].notna()
+            ]
+            mccoy_descriptive[label] = {
+                "classified_event_count": int(len(classified)),
+                "positive_event_count": int(len(positive)),
+                "positive_do_eligible_count": int(len(positive_do)),
+                "positive_joint_eligible_count": int(len(positive_joint)),
+                "normalized_do_median": (
+                    float(positive_do["normalized_do_contrast"].median())
+                    if len(positive_do)
+                    else None
+                ),
+                "joint_retained_count": int(
+                    positive_joint["joint_do_thermohaline_fingerprint_retained"]
+                    .astype(bool)
+                    .sum()
+                ),
+                "joint_retained_fraction": (
+                    float(
+                        positive_joint["joint_do_thermohaline_fingerprint_retained"]
+                        .astype(bool)
+                        .mean()
+                    )
+                    if len(positive_joint)
+                    else None
+                ),
+            }
+        summary = {
+            "event_count_requested": len(requests),
+            "event_count_completed": len(event_rows),
+            "deep_500_1000_event_count": int(event_rows["deep_500_1000_member"].sum()),
+            "reporting_horizons_days": list(settings["reporting_horizons_days"]),
+            "primary_horizon_days": settings["primary_horizon_days"],
+            "eligible_by_horizon": {
+                str(h): int(
+                    event_summary.loc[
+                        (event_summary["day_since_peak"] == h)
+                        & event_summary["horizon_eligible"],
+                        "event_id",
+                    ].nunique()
+                )
+                for h in settings["reporting_horizons_days"]
+            },
+            "metric_specific_denominators": {
+                str(h): {
+                    "do": int(
+                        event_summary.loc[
+                            (event_summary["day_since_peak"] == h)
+                            & event_summary["do_metric_eligible"],
+                            "event_id",
+                        ].nunique()
+                    ),
+                    "joint": int(
+                        event_summary.loc[
+                            (event_summary["day_since_peak"] == h)
+                            & event_summary["joint_metric_eligible"],
+                            "event_id",
+                        ].nunique()
+                    ),
+                    "spread": int(
+                        event_summary.loc[
+                            (event_summary["day_since_peak"] == h)
+                            & event_summary["spread_metric_eligible"],
+                            "event_id",
+                        ].nunique()
+                    ),
+                }
+                for h in settings["reporting_horizons_days"]
+            },
+            "deep_500_1000_sensitivity": deep_summary,
+            "primary_group_comparison": comparison.to_dict("records"),
+            "w_validation_passed": True,
+            "eulerian_connections": eulerian_connections,
+            "mccoy_descriptive": mccoy_descriptive,
+            "interpretation": "Peak-day particle retention is a material-fate diagnostic; tracer identity and geometric compactness are reported separately.",
+        }
+        output_paths = {
+            "particle_daily_positions": run_dir / "particle_daily_positions.parquet",
+            "daily_retention_summary": run_dir / "daily_retention_summary.parquet",
+            "event_retention_summary": run_dir / "event_retention_summary.parquet",
+            "event_eligibility": run_dir / "event_eligibility.parquet",
+            "group_comparison": run_dir / "group_comparison.parquet",
+            "summary": run_dir / "summary.json",
+            "figure": run_dir / "post_peak_retention.png",
+        }
+        deep_event_summary = event_summary.loc[
+            event_summary["deep_500_1000_member"]
+        ].copy()
+        output_paths["deep_500_1000_event_summary"] = (
+            run_dir / "deep_500_1000_event_summary.parquet"
+        )
+        output_paths["deep_500_1000_group_comparison"] = (
+            run_dir / "deep_500_1000_group_comparison.parquet"
+        )
+        for key, frame in (
+            ("particle_daily_positions", positions),
+            ("daily_retention_summary", daily_metrics),
+            ("event_retention_summary", event_summary),
+            ("event_eligibility", event_eligibility),
+            ("group_comparison", comparison),
+        ):
+            _atomic_write_parquet(frame, output_paths[key])
+        _atomic_write_parquet(
+            deep_event_summary, output_paths["deep_500_1000_event_summary"]
+        )
+        _atomic_write_parquet(
+            _ofes_post_peak_group_comparison(deep_event_summary, settings),
+            output_paths["deep_500_1000_group_comparison"],
+        )
+        _ofes_atomic_write_json(summary, output_paths["summary"])
+        _plot_ofes_post_peak_retention(
+            daily_metrics, event_summary, output_paths["figure"], settings
+        )
+        manifest.update(
+            {
+                "status": "complete",
+                "completed_events": len(event_rows),
+                "outputs": {k: str(v.resolve()) for k, v in output_paths.items()},
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+    except Exception as error:
+        manifest.update(
+            {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        )
+        _ofes_atomic_write_json(manifest, manifest_path)
+        raise
+    return {
+        "run_dir": run_dir,
+        "manifest": manifest,
+        "particle_daily_positions": positions,
+        "daily_retention_summary": daily_metrics,
+        "event_retention_summary": event_summary,
+        "event_eligibility": event_eligibility,
+        "group_comparison": comparison,
+        "analysis_summary": summary,
+        "figure_path": output_paths["figure"],
+        "output_paths": output_paths,
+        "reused_complete_run": False,
+    }
+
+
+def load_ofes_post_peak_trajectory_retention(
+    *, population_scope: str | None = None, output_dir: str | Path | None = None
+) -> dict:
+    """读取 OFES peak-to-future retention 的正式结果。
+
+    本函数只读取已完成的逐日位置、示踪剂汇总和事件窗口产物，不重新积分粒子。
+
+    参数:
+        - population_scope (str | None): population scope；None 使用默认 scope。
+        - output_dir (str | Path | None): retention 结果目录；None 使用固定路径。
+
+    返回:
+        - dict: 含逐日位置、逐日/事件 retention、分组比较、摘要、manifest 和图件路径。
+
+    输出:
+        - 无；只读取已有正式产物。
+
+    说明:
+        - 不访问 OFES NetCDF，也不会启动新的生产计算。
+    """
+    scope = _ofes_event_population_scope_settings(population_scope)
+    root = _ofes_analysis_output_path(
+        f'{scope["output_prefix"]}_post_peak_retention', output_dir
+    )
+    manifest = json.loads((root / "manifest.json").read_text())
+    if manifest.get("status") != "complete":
+        raise RuntimeError(
+            f'OFES post-peak retention output is not complete: {manifest.get("status", "unknown")}'
+        )
+    outputs = manifest["outputs"]
+    return {
+        "run_dir": root,
+        "manifest": manifest,
+        "particle_daily_positions": pd.read_parquet(
+            outputs["particle_daily_positions"]
+        ),
+        "daily_retention_summary": pd.read_parquet(outputs["daily_retention_summary"]),
+        "event_retention_summary": pd.read_parquet(outputs["event_retention_summary"]),
+        "event_eligibility": (
+            pd.read_parquet(outputs["event_eligibility"])
+            if outputs.get("event_eligibility")
+            else pd.DataFrame()
+        ),
+        "group_comparison": pd.read_parquet(outputs["group_comparison"]),
+        "analysis_summary": json.loads(Path(outputs["summary"]).read_text()),
+        "figure_path": Path(outputs["figure"]),
+        "output_paths": {key: Path(value) for key, value in outputs.items()},
+    }
+
+
+def plot_ofes_post_peak_trajectory_retention(
+    result: dict | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> Path | None:
+    """绘制 OFES peak-to-future retention 的独立诊断图。
+
+    函数消费 loader 或 producer 返回的逐日和窗口摘要，不重新积分粒子。
+
+    参数:
+        - result (dict | None): retention producer 或 loader 返回值；None 时自动读取正式结果。
+        - output_dir (str | Path | None): 图件目录；None 使用结果固定目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+        - save_fig (bool): 是否保存图形，默认 True。
+
+    返回:
+        - Path | None: 保存的图件路径；不保存时返回 None。
+
+    输出:
+        - `post_peak_retention.png`（save_fig=True）。
+
+    说明:
+        - 图件展示 DO 指纹、联合热盐指纹、集合紧凑度和 moving-core 对照。
+    """
+    payload = (
+        load_ofes_post_peak_trajectory_retention(output_dir=output_dir)
+        if result is None
+        else result
+    )
+    settings = _ofes_post_peak_retention_settings(
+        payload.get("manifest", {}).get("request", {}).get("settings")
+    )
+    daily = payload["daily_retention_summary"]
+    events = payload["event_retention_summary"]
+    figure_path = (
+        (Path(output_dir) / "post_peak_retention.png")
+        if output_dir is not None
+        else payload.get("figure_path")
+    )
+    return _plot_ofes_post_peak_retention(
+        daily, events, figure_path, settings, show_fig=show_fig, save_fig=save_fig
+    )
+
+
 def load_ofes_vertical_velocity_validation(
     *,
     output_dir: str | Path | None = None,

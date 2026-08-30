@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.30 变更：
+#   - 新增 OFES peak-to-future post-peak water-mass retention 诊断，固定
+#     7/14/30 天报告窗口与 14 天主窗口；复用既有三维粒子和示踪剂口径。
 # version 1.29 变更：
 #   - 将 300–1000 m 提升为 OFES depth sensitivity 的 primary population，
 #     并保留 500–1000 m 作为其嵌套的 deep-process 子集；下游正式流程可
@@ -113,7 +116,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.29
+version: 1.30
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -622,6 +625,14 @@ ofes:
     random_seed: 20260729
     figure_dpi: 180
     output_subdir: trajectory_ventilation
+  post_peak_retention:
+    worker_count: 16
+    io_concurrency: 4
+    maximum_forward_days: 30
+    reporting_horizons_days: [7, 14, 30]
+    primary_horizon_days: 14
+    figure_dpi: 180
+    output_subdir: post_peak_retention
   grid_scv_v2:
     sigma0_min_kg_m3: 25.60
     sigma0_max_kg_m3: 27.50

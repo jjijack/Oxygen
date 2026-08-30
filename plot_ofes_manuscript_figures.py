@@ -984,127 +984,241 @@ def _plot_figure4(ventilation_event: pd.DataFrame, output_dir: Path, dpi: int) -
 
 
 def _plot_figure5(
-    lifecycle: pd.DataFrame,
-    stage: pd.DataFrame,
-    retention: pd.DataFrame,
-    transition_audit: Mapping[str, Any],
-    fixed_water_audit: Mapping[str, Any],
-    moving_water_audit: Mapping[str, Any],
+    post_peak_daily: pd.DataFrame,
+    post_peak_event: pd.DataFrame,
+    post_peak_comparison: pd.DataFrame,
     output_dir: Path,
     dpi: int,
 ) -> Path:
-    """Render nested rotational organization, McCoy stages, and retention."""
+    """Render post-peak water-mass retention and material dispersion."""
 
     _require_columns(
-        lifecycle,
+        post_peak_daily,
         (
-            "event_id", "persistent_anticyclonic_rotational_carrier",
-            "scv_compatible", "surface_obscured_scv_compatible",
+            "event_id",
+            "day_since_peak",
+            "kinematic_regime",
+            "do_metric_eligible",
+            "normalized_do_contrast",
         ),
-        "lifecycle event summary",
+        "post-peak daily retention",
     )
     _require_columns(
-        stage,
-        ("event_id", "stage", "event_compatible_count", "stage_diagnostic_available"),
-        "per-stage McCoy diagnostics",
+        post_peak_event,
+        (
+            "event_id",
+            "day_since_peak",
+            "kinematic_regime",
+            "joint_metric_eligible",
+            "joint_do_thermohaline_fingerprint_retained",
+            "spread_metric_eligible",
+            "spread_ratio",
+            "normalized_do_auc_0_14",
+        ),
+        "post-peak event retention",
     )
     _require_columns(
-        retention, ("event_id", "persistent_carrier", "post_peak_decay_slope"), "retention comparison"
+        post_peak_comparison,
+        (
+            "metric",
+            "regime",
+            "left_event_count",
+            "right_event_count",
+            "median",
+            "bootstrap95_low",
+            "bootstrap95_high",
+            "mann_whitney_p",
+            "fisher_exact_p",
+        ),
+        "post-peak group comparison",
     )
-    lifecycle_count = int(lifecycle["event_id"].astype(str).nunique())
-    retention_count = int(retention["event_id"].astype(str).nunique())
-    if lifecycle_count <= 0 or retention_count <= 0:
-        raise ValueError("Lifecycle and retention tables must be non-empty")
-    carrier = int(_true_mask(lifecycle["persistent_anticyclonic_rotational_carrier"]).sum())
-    scv = int(_true_mask(lifecycle["scv_compatible"]).sum())
-    obscured = int(_true_mask(lifecycle["surface_obscured_scv_compatible"]).sum())
-    stage_counts: dict[str, int] = {}
-    stage_denominators: dict[str, int] = {}
-    for stage_name in ("start", "peak", "last"):
-        stage_rows = stage.loc[stage["stage"].eq(stage_name)]
-        available = _true_mask(stage_rows["stage_diagnostic_available"])
-        stage_denominators[stage_name] = int(available.sum())
-        stage_counts[stage_name] = int(
-            stage_rows.loc[available, "event_compatible_count"].gt(0).sum()
+
+    regimes = ("rotation_dominated", "strain_dominated")
+    colors = {"rotation_dominated": BLUE, "strain_dominated": ORANGE}
+    labels = {"rotation_dominated": "rotation", "strain_dominated": "strain"}
+    primary_horizon = 14
+
+    def contrast(metric: str) -> pd.Series:
+        rows = post_peak_comparison.loc[
+            post_peak_comparison["metric"].eq(metric)
+            & post_peak_comparison["regime"].eq(
+                "rotation_dominated_minus_strain_dominated"
+            )
+        ]
+        if len(rows) != 1:
+            raise ValueError(f"Expected one primary contrast for {metric}, found {len(rows)}")
+        return rows.iloc[0]
+
+    def effect_text(metric: str, *, decimals: int = 3) -> str:
+        row = contrast(metric)
+        p_value = row["fisher_exact_p"]
+        if not np.isfinite(p_value):
+            p_value = row["mann_whitney_p"]
+        return (
+            f"Δ={float(row['median']):+.{decimals}f} "
+            f"[{float(row['bootstrap95_low']):+.{decimals}f}, "
+            f"{float(row['bootstrap95_high']):+.{decimals}f}]\n"
+            f"p={float(p_value):.3g}"
         )
-        if stage_denominators[stage_name] <= 0:
-            raise ValueError(f"No evaluable McCoy rows for stage {stage_name}")
 
-    primary = transition_audit["retention_comparison"]["primary_persistent_carrier"]["post_peak_decay_slope"]
-    fixed = fixed_water_audit["carrier_retention"]["wm_normalized_decay_slope"]
-    moving = moving_water_audit["carrier_retention"]["wm_normalized_decay_slope"]
-    forest_rows = [
-        (r"$\frac{\Delta\mathrm{DO\ proxy}}{\mathrm{fixed\ site}}$", primary),
-        (r"$\frac{\mathrm{water\ mass}}{\mathrm{fixed\ site}}$", fixed),
-        (r"$\frac{\mathrm{water\ mass}}{\mathrm{moving\ core}}$", moving),
-    ]
+    fig, axes = plt.subplots(2, 2, figsize=(FIGURE_WIDTH_IN, 5.2))
 
-    fig, axes = plt.subplots(
-        1, 3,
-        figsize=(FIGURE_WIDTH_IN, 3.15),
-        gridspec_kw={"width_ratios": (1.0, 0.95, 1.15)},
+    # a. Median post-peak DO fingerprint with event-level interquartile ranges.
+    ax = axes[0, 0]
+    for regime in regimes:
+        group = post_peak_daily.loc[
+            post_peak_daily["kinematic_regime"].eq(regime)
+            & _true_mask(post_peak_daily["do_metric_eligible"])
+        ]
+        summary = group.groupby("day_since_peak")["normalized_do_contrast"].agg(
+            median="median",
+            q25=lambda values: values.quantile(0.25),
+            q75=lambda values: values.quantile(0.75),
+        )
+        x = summary.index.to_numpy(dtype=float)
+        ax.plot(x, summary["median"], color=colors[regime], label=labels[regime])
+        ax.fill_between(
+            x,
+            summary["q25"].to_numpy(float),
+            summary["q75"].to_numpy(float),
+            color=colors[regime],
+            alpha=0.14,
+            linewidth=0,
+        )
+    ax.axhline(1, color=GRAY, linestyle="--", linewidth=0.8)
+    ax.axvline(primary_horizon, color=INK, linestyle=":", linewidth=0.9)
+    ax.text(1.00, 0.90, effect_text("normalized_do_contrast"), transform=ax.transAxes,
+            ha="right", va="top", fontsize=7.2)
+    ax.set(xlabel="Days after peak", ylabel="DO(t) / DO(peak)")
+    ax.set_title("DO fingerprint", loc="right")
+    ax.legend(frameon=False, loc="lower left")
+
+    # b. Joint DO-thermohaline fingerprint retention at the fixed horizons.
+    ax = axes[0, 1]
+    for regime in regimes:
+        group = post_peak_event.loc[
+            post_peak_event["kinematic_regime"].eq(regime)
+            & _true_mask(post_peak_event["joint_metric_eligible"])
+        ]
+        summary = group.groupby("day_since_peak")[
+            "joint_do_thermohaline_fingerprint_retained"
+        ].agg(["mean", "count"])
+        ax.plot(
+            summary.index,
+            summary["mean"],
+            color=colors[regime],
+            marker="o",
+            label=labels[regime],
+        )
+        for day, row in summary.iterrows():
+            ax.text(day, row["mean"] + 0.035, f"n={int(row['count'])}",
+                    color=colors[regime], ha="center", va="bottom", fontsize=6.8)
+    ax.axvline(primary_horizon, color=INK, linestyle=":", linewidth=0.9)
+    ax.text(
+        1.00,
+        0.96,
+        effect_text("joint_do_thermohaline_fingerprint_retained"),
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=7.2,
     )
-    ax = axes[0]
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    boxes = [
-        (0.05, 0.08, 0.90, 0.84, f"{lifecycle_count} primary process events", INK),
-        (0.16, 0.20, 0.68, 0.60, f"{carrier} persistent carriers", RED),
-        (0.28, 0.32, 0.44, 0.36, f"{scv} SCV-compatible", PURPLE),
-        (0.38, 0.40, 0.24, 0.20, f"{obscured} obscured SCV", TEAL),
-    ]
-    for index, (x, y, width, height, label, color) in enumerate(boxes):
-        ax.add_patch(Rectangle((x, y), width, height, fill=False, edgecolor=color, linewidth=2.0))
-        ax.text(
-            x + 0.015,
-            y + height - 0.025,
-            label,
-            ha="left",
-            va="top",
-            fontsize=7.5,
-            color=color,
-            clip_on=False,
-        )
-    ax.set_ylim(-0.12, 1)
-    ax.set_title("Hierarchy", loc="right")
+    ax.set(xlabel="Days after peak", ylabel="Fraction retained", ylim=(-0.03, 1.03))
+    ax.set_title("Joint water-mass fingerprint", loc="right")
 
-    ax = axes[1]
-    stages = ["start", "peak", "last"]
-    counts = [stage_counts[s] for s in stages]
-    bars = ax.bar(np.arange(3), counts, color=[BLUE, RED, BLUE], width=0.55)
-    for bar, count, stage_name in zip(bars, counts, stages):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            count + 0.5,
-            f"{count}/{stage_denominators[stage_name]}",
-            ha="center",
-            fontsize=10,
+    # c. Geometry-only particle spreading, independent of tracer availability.
+    ax = axes[1, 0]
+    for regime in regimes:
+        group = post_peak_event.loc[
+            post_peak_event["kinematic_regime"].eq(regime)
+            & _true_mask(post_peak_event["spread_metric_eligible"])
+        ]
+        summary = group.groupby("day_since_peak")["spread_ratio"].agg(
+            median="median",
+            q25=lambda values: values.quantile(0.25),
+            q75=lambda values: values.quantile(0.75),
         )
-    ax.set_xticks(np.arange(3), ["start", "peak", "last"])
-    ax.set_ylim(0, max(stage_counts.values()) * 1.25 + 1)
-    ax.set_ylabel("Events with ≥1 compatible profile")
-    ax.set_title("McCoy stage counts", loc="right")
+        x = summary.index.to_numpy(dtype=float)
+        ax.plot(x, summary["median"], color=colors[regime], marker="o")
+        ax.fill_between(
+            x,
+            summary["q25"].to_numpy(float),
+            summary["q75"].to_numpy(float),
+            color=colors[regime],
+            alpha=0.14,
+            linewidth=0,
+        )
+        counts = group.groupby("day_since_peak")["event_id"].nunique()
+        for day, value in summary["median"].items():
+            ax.text(day, value + 0.7, f"n={int(counts.loc[day])}", color=colors[regime],
+                    ha="center", va="bottom", fontsize=6.8)
+    ax.axhline(1, color=GRAY, linestyle="--", linewidth=0.8)
+    ax.axvline(primary_horizon, color=INK, linestyle=":", linewidth=0.9)
+    ax.text(1.00, 0.95, effect_text("spread_ratio", decimals=2), transform=ax.transAxes,
+            ha="right", va="top", fontsize=7.2)
+    ax.set(xlabel="Days after peak", ylabel="Spread / spread(peak)")
+    ax.set_title("Material dispersion", loc="right")
 
-    ax = axes[2]
-    y = np.arange(len(forest_rows))[::-1]
-    for yi, (label, row) in zip(y, forest_rows):
-        mean = float(row["median_diff"])
-        low, high = (float(value) for value in row["bootstrap_ci"])
-        ax.plot([low, high], [yi, yi], color=PURPLE, linewidth=3)
-        ax.plot([low, low], [yi - 0.12, yi + 0.12], color=PURPLE, linewidth=1.2)
-        ax.plot([high, high], [yi - 0.12, yi + 0.12], color=PURPLE, linewidth=1.2)
-        ax.plot(mean, yi, "o", color=INK, markersize=7)
-        ax.text(high + 0.004, yi, f"{mean:+.3f}", va="center", fontsize=8.5)
-    ax.axvline(0, color=INK, linestyle="--", linewidth=1)
-    ax.set_yticks(y, [row[0] for row in forest_rows])
-    ax.set_xlabel("Median decay-slope difference")
-    ax.set_xlim(-0.06, 0.50)
-    ax.set_title("Decay-slope contrasts")
-    ax.tick_params(axis="y", labelsize=8.5, pad=6)
-    _style_axes(axes[1:])
+    # d. The time-integrated DO response uses one point per eligible event.
+    ax = axes[1, 1]
+    auc_groups: list[np.ndarray] = []
+    for regime in regimes:
+        values = (
+            post_peak_event.loc[
+                post_peak_event["kinematic_regime"].eq(regime)
+                & post_peak_event["day_since_peak"].eq(primary_horizon),
+                "normalized_do_auc_0_14",
+            ]
+            .dropna()
+            .to_numpy(float)
+        )
+        auc_groups.append(values)
+    box = ax.boxplot(
+        auc_groups,
+        positions=(0, 1),
+        widths=0.42,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": INK, "linewidth": 1.3},
+        whiskerprops={"color": GRAY},
+        capprops={"color": GRAY},
+    )
+    for patch, regime in zip(box["boxes"], regimes):
+        patch.set(facecolor=colors[regime], alpha=0.20, edgecolor=colors[regime])
+    for position, regime, values in zip((0, 1), regimes, auc_groups):
+        rng = np.random.default_rng(20260729 + position)
+        jitter = rng.uniform(-0.11, 0.11, len(values))
+        ax.scatter(
+            position + jitter,
+            values,
+            s=9,
+            color=colors[regime],
+            alpha=0.50,
+            linewidth=0,
+            rasterized=True,
+        )
+        ax.text(position, np.nanmax(values) + 0.08, f"n={len(values)}", ha="center",
+                color=colors[regime], fontsize=6.8)
+    ax.axhline(1, color=GRAY, linestyle="--", linewidth=0.8)
+    ax.text(1.00, 0.95, effect_text("normalized_do_auc_0_14"), transform=ax.transAxes,
+            ha="right", va="top", fontsize=7.2)
+    ax.set_xticks((0, 1), ("rotation", "strain"))
+    ax.set_ylabel("Mean normalized DO, days 0–14")
+    ax.set_title("Integrated DO retention", loc="right")
+
+    _style_axes(axes)
     _add_panel_labels(axes)
-    return _save(fig, output_dir, "Figure5_rotational_organization.png", dpi, left=0.06, wspace=0.48)
+    return _save(
+        fig,
+        output_dir,
+        "Figure5_rotational_organization.png",
+        dpi,
+        top=0.96,
+        bottom=0.12,
+        left=0.10,
+        wspace=0.30,
+        hspace=0.42,
+    )
 
 
 def render_manuscript_figures_from_results(
@@ -1118,12 +1232,9 @@ def render_manuscript_figures_from_results(
     transition: pd.DataFrame,
     walong: pd.DataFrame,
     ventilation_event: pd.DataFrame,
-    lifecycle: pd.DataFrame,
-    stage: pd.DataFrame,
-    retention: pd.DataFrame,
-    transition_summary: Mapping[str, Any],
-    fixed_water_summary: Mapping[str, Any],
-    moving_water_summary: Mapping[str, Any],
+    post_peak_daily: pd.DataFrame,
+    post_peak_event: pd.DataFrame,
+    post_peak_comparison: pd.DataFrame,
     output_dir: Path,
     dpi: int = 600,
 ) -> list[Path]:
@@ -1140,8 +1251,11 @@ def render_manuscript_figures_from_results(
         ),
         _plot_figure4(ventilation_event, output_dir, dpi),
         _plot_figure5(
-            lifecycle, stage, retention, transition_summary,
-            fixed_water_summary, moving_water_summary, output_dir, dpi,
+            post_peak_daily,
+            post_peak_event,
+            post_peak_comparison,
+            output_dir,
+            dpi,
         ),
     ]
 
@@ -1152,11 +1266,8 @@ def render_manuscript_figures(
     global_sweep: Path,
     quality_summary: Path,
     mccoy_audit: Path,
-    transition_audit: Path,
-    fixed_water_audit: Path,
-    moving_water_audit: Path,
-    stage_diagnostics: Path,
     trajectory_ventilation_event: Path,
+    post_peak_root: Path,
     output_dir: Path,
     dpi: int = 600,
 ) -> list[Path]:
@@ -1169,18 +1280,16 @@ def render_manuscript_figures(
     sweep = pd.read_parquet(global_sweep.expanduser().resolve())
     quality = pd.read_parquet(quality_summary.expanduser().resolve())
     mccoy_event = _read_table(tables_root, "mccoy_event_summary.parquet")
-    lifecycle = _read_table(tables_root, "lifecycle_event_summary.parquet")
-    retention = _read_table(tables_root, "transition_retention_comparison.parquet")
     trajectory = _read_table(tables_root, "trajectory3d_population_classification.parquet")
     transition = _read_table(tables_root, "transition_phase_table.parquet")
     ventilation_group = _read_table(tables_root, "ventilation_group_comparison.parquet")
     walong = _read_table(tables_root, "walong_formal_audit.parquet")
-    stage = pd.read_parquet(stage_diagnostics.expanduser().resolve())
     ventilation_event = pd.read_parquet(trajectory_ventilation_event.expanduser().resolve())
+    post_peak_root = post_peak_root.expanduser().resolve()
+    post_peak_daily = pd.read_parquet(post_peak_root / "daily_retention_summary.parquet")
+    post_peak_event = pd.read_parquet(post_peak_root / "event_retention_summary.parquet")
+    post_peak_comparison = pd.read_parquet(post_peak_root / "group_comparison.parquet")
     mccoy_summary = _read_json(mccoy_audit)
-    transition_summary = _read_json(transition_audit)
-    fixed_summary = _read_json(fixed_water_audit)
-    moving_summary = _read_json(moving_water_audit)
     return render_manuscript_figures_from_results(
         thresholds,
         sweep,
@@ -1192,12 +1301,9 @@ def render_manuscript_figures(
         transition,
         walong,
         ventilation_event,
-        lifecycle,
-        stage,
-        retention,
-        transition_summary,
-        fixed_summary,
-        moving_summary,
+        post_peak_daily,
+        post_peak_event,
+        post_peak_comparison,
         output_dir,
         dpi,
     )
@@ -1210,11 +1316,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--global-sweep", required=True, type=Path)
     parser.add_argument("--quality-summary", required=True, type=Path)
     parser.add_argument("--mccoy-audit", required=True, type=Path)
-    parser.add_argument("--transition-audit", required=True, type=Path)
-    parser.add_argument("--fixed-water-audit", required=True, type=Path)
-    parser.add_argument("--moving-water-audit", required=True, type=Path)
-    parser.add_argument("--stage-diagnostics", required=True, type=Path)
     parser.add_argument("--trajectory-ventilation-event", required=True, type=Path)
+    parser.add_argument("--post-peak-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--dpi", type=int, default=600)
     args = parser.parse_args(argv)
@@ -1224,11 +1327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.global_sweep,
         args.quality_summary,
         args.mccoy_audit,
-        args.transition_audit,
-        args.fixed_water_audit,
-        args.moving_water_audit,
-        args.stage_diagnostics,
         args.trajectory_ventilation_event,
+        args.post_peak_root,
         args.output_dir,
         args.dpi,
     ):
