@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.31 变更：
+#   - 新增冻结 OFES 30-day observed mode-water source screening 的热盐采样、
+#     low-PV proxy、MLD/PV sensitivity、事件级 bootstrap 与固定输出目录参数。
 # version 1.30 变更：
 #   - 新增 OFES peak-to-future post-peak water-mass retention 诊断，固定
 #     7/14/30 天报告窗口与 14 天主窗口；复用既有三维粒子和示踪剂口径。
@@ -116,7 +119,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.30
+version: 1.31
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -680,6 +683,39 @@ ofes:
     hosoda_salinity_sigma0: 26.7
     hosoda_salinity_reference_depth_m: 600.0
     output_subdir: event_evolution
+
+  mode_water_screening:
+    output_subdir: primary_mode_water_screening
+    trajectory_subdir: primary_trajectory_ventilation
+    parent_population_subdir: primary_event_population
+    mld_density_thresholds_kg_m3: [0.03, 0.125]
+    pv_qmax_m1_s1: [2.0e-10, 1.5e-10]
+    thickness_thresholds_m: [100.0, 150.0]
+    reference_depth_m: 10.0
+    profile_grid_spacing_m: 1.0
+    pv_smoothing_points: 9
+    minimum_native_levels: 3
+    bootstrap_replicates: 10000
+    sign_flip_replicates: 20000
+    random_seed: 20260831
+    figure_dpi: 320
+    lookback_days: 30
+    contact_run_days: 3
+    outside_run_days: 3
+    evaluable_pair_fraction: 0.75
+    source_boxes:
+      STMW_like:
+        theta: [16.0, 21.5]
+        salinity: [34.65, 34.95]
+        sigma0: [24.2, 25.6]
+      CMW_like:
+        theta: [7.0, 15.0]
+        salinity: null
+        sigma0: [25.7, 26.4]
+      TRMW_like:
+        theta: [4.0, 9.0]
+        salinity: [33.3, 34.0]
+        sigma0: [26.3, 26.6]
 
 plot:
   basemap_colors:

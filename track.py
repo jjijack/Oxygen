@@ -75556,3 +75556,1309 @@ def plot_ofes_mechanism_synthesis(result: Mapping[str, Any] | None = None, *, ou
     if save_fig: root = _ofes_mechanism_output_root(str((_OFES_CFG.get('mechanism_synthesis', {}) or {}).get('output_subdir', 'mechanism_synthesis')), output_dir); root.mkdir(parents=True, exist_ok=True); path = root / 'mechanism_synthesis_summary.png'; fig.savefig(path, dpi=180, bbox_inches='tight')
     if show_fig: plt.show()
     return {'figure': fig, 'figure_path': path}
+
+
+def _ofes_mode_water_settings(overrides: Mapping[str, Any] | None = None) -> dict:
+    """解析冻结的 OFES mode-water screening 设置。"""
+    raw = dict(_OFES_CFG.get('mode_water_screening', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(f'Unknown mode_water_screening overrides: {unknown}')
+        raw.update(dict(overrides))
+    settings = {
+        'output_subdir': str(raw.get('output_subdir', 'primary_mode_water_screening')),
+        'trajectory_subdir': str(raw.get('trajectory_subdir', 'primary_trajectory_ventilation')),
+        'parent_population_subdir': str(raw.get('parent_population_subdir', 'primary_event_population')),
+        'mld_density_thresholds_kg_m3': tuple(float(x) for x in raw.get('mld_density_thresholds_kg_m3', (0.03, 0.125))),
+        'pv_qmax_m1_s1': tuple(float(x) for x in raw.get('pv_qmax_m1_s1', (2.0e-10, 1.5e-10))),
+        'thickness_thresholds_m': tuple(float(x) for x in raw.get('thickness_thresholds_m', (100.0, 150.0))),
+        'reference_depth_m': float(raw.get('reference_depth_m', 10.0)),
+        'profile_grid_spacing_m': float(raw.get('profile_grid_spacing_m', 1.0)),
+        'pv_smoothing_points': int(raw.get('pv_smoothing_points', 9)),
+        'minimum_native_levels': int(raw.get('minimum_native_levels', 3)),
+        'bootstrap_replicates': int(raw.get('bootstrap_replicates', 10000)),
+        'sign_flip_replicates': int(raw.get('sign_flip_replicates', 20000)),
+        'random_seed': int(raw.get('random_seed', 20260831)),
+        'figure_dpi': int(raw.get('figure_dpi', 320)),
+        'lookback_days': int(raw.get('lookback_days', 30)),
+        'contact_run_days': int(raw.get('contact_run_days', 3)),
+        'outside_run_days': int(raw.get('outside_run_days', 3)),
+        'evaluable_pair_fraction': float(raw.get('evaluable_pair_fraction', 0.75)),
+        'source_boxes': raw.get('source_boxes', {}),
+    }
+    if settings['profile_grid_spacing_m'] != 1.0:
+        raise ValueError('Frozen mode-water diagnostic grid must be 1 m.')
+    if settings['pv_smoothing_points'] != 9:
+        raise ValueError('Frozen mode-water PV smoothing must be 9 points.')
+    if settings['minimum_native_levels'] != 3:
+        raise ValueError('Frozen mode-water native-level minimum must be 3.')
+    if (settings['lookback_days'], settings['contact_run_days'],
+            settings['outside_run_days'], settings['evaluable_pair_fraction']) != (30, 3, 3, 0.75):
+        raise ValueError('Frozen 31-day detachment contract was changed.')
+    if (settings['mld_density_thresholds_kg_m3'] != (0.03, 0.125)
+            or settings['pv_qmax_m1_s1'] != (2.0e-10, 1.5e-10)
+            or settings['thickness_thresholds_m'] != (100.0, 150.0)):
+        raise ValueError('Frozen mode-water sensitivity settings were changed.')
+    if not isinstance(settings['source_boxes'], Mapping):
+        raise ValueError('mode_water_screening.source_boxes must be a mapping.')
+    return settings
+
+
+def _ofes_mode_water_output_root(output_dir: str | Path | None = None) -> Path:
+    """返回 mode-water screening 的固定语义输出目录。"""
+    if output_dir is not None:
+        return Path(output_dir).expanduser()
+    cfg = _ofes_mode_water_settings()
+    return plots_output_root / 'do' / 'ofes_np30_ke' / cfg['output_subdir']
+
+
+def _ofes_mode_water_source_layer(
+    depth: np.ndarray,
+    theta: np.ndarray,
+    salinity: np.ndarray,
+    sigma0: np.ndarray,
+    particle_depth_m: float,
+    latitude: float,
+    *,
+    q_max: float,
+    thickness_threshold_m: float,
+    settings: Mapping[str, Any] | None = None,
+) -> dict:
+    """返回包含粒子的连续热盐/低-PV source layer 诊断。"""
+    cfg = _ofes_mode_water_settings(settings)
+    d, t, sa, sg = (np.asarray(value, dtype=float) for value in (depth, theta, salinity, sigma0))
+    if not (d.ndim == t.ndim == sa.ndim == sg.ndim == 1 and d.size == t.size == sa.size == sg.size):
+        raise ValueError('profile arrays must be matching 1-D arrays.')
+    if not np.isfinite(q_max) or q_max <= 0 or thickness_threshold_m <= 0:
+        raise ValueError('q_max and thickness_threshold_m must be positive finite values.')
+    boxes = cfg['source_boxes']
+    out = {'point_theta': np.nan, 'point_salinity': np.nan, 'point_sigma0': np.nan,
+           'point_qp': np.nan, 'negative_proxy_fraction': np.nan,
+           'source_layer_censored': False, 'overlap_label': 'none'}
+    for name in boxes:
+        out.update({name: False, f'{name}_layer_found': False,
+                    f'{name}_layer_passed': False, f'{name}_layer_unknown': False,
+                    f'{name}_layer_top_m': np.nan, f'{name}_layer_bottom_m': np.nan,
+                    f'{name}_layer_thickness_m': np.nan, f'{name}_native_level_count': 0,
+                    f'{name}_layer_top_censored': False,
+                    f'{name}_layer_bottom_censored': False})
+    finite = np.isfinite(d) & np.isfinite(t) & np.isfinite(sa) & np.isfinite(sg)
+    finite_indices = np.flatnonzero(finite)
+    if finite_indices.size < cfg['minimum_native_levels']:
+        return out
+    split = np.flatnonzero(np.diff(finite_indices) > 1)
+    starts, stops = np.r_[0, split + 1], np.r_[split + 1, finite_indices.size]
+    p = float(particle_depth_m)
+    coriolis = 2.0 * 7.2921159e-5 * np.sin(np.deg2rad(float(latitude)))
+    all_q = []
+    for start, stop in zip(starts, stops):
+        indices = finite_indices[start:stop]
+        if indices.size < 2 or np.any(np.diff(d[indices]) <= 0):
+            continue
+        z = np.arange(np.ceil(d[indices[0]]), np.floor(d[indices[-1]]) + 1.0, 1.0)
+        if z.size < 2:
+            continue
+        tg = np.interp(z, d[indices], t[indices])
+        sag = np.interp(z, d[indices], sa[indices])
+        sgg = np.interp(z, d[indices], sg[indices])
+        derivative = np.gradient(sgg, z)
+        if z.size < cfg['pv_smoothing_points']:
+            smoothed = np.full(z.shape, np.nan)
+        else:
+            kernel = np.ones(cfg['pv_smoothing_points']) / cfg['pv_smoothing_points']
+            smoothed = np.convolve(derivative, kernel, mode='same')
+            half = cfg['pv_smoothing_points'] // 2
+            smoothed[:half] = np.nan
+            smoothed[-half:] = np.nan
+        qg = coriolis / (1000.0 + sgg) * smoothed
+        all_q.append(qg)
+        in_segment = z[0] <= p <= z[-1]
+        if in_segment:
+            out['point_theta'] = float(np.interp(p, z, tg))
+            out['point_salinity'] = float(np.interp(p, z, sag))
+            out['point_sigma0'] = float(np.interp(p, z, sgg))
+            out['point_qp'] = float(np.interp(p, z, qg))
+        for name, box in boxes.items():
+            mask = ((tg >= float(box['theta'][0])) & (tg <= float(box['theta'][1]))
+                    & (sgg >= float(box['sigma0'][0])) & (sgg <= float(box['sigma0'][1]))
+                    & np.isfinite(qg) & (qg >= 0.0) & (qg <= float(q_max)))
+            if box.get('salinity') is not None:
+                mask &= ((sag >= float(box['salinity'][0]))
+                         & (sag <= float(box['salinity'][1])))
+            if in_segment:
+                point_box = (float(box['theta'][0]) <= out['point_theta'] <= float(box['theta'][1])
+                             and float(box['sigma0'][0]) <= out['point_sigma0'] <= float(box['sigma0'][1]))
+                if box.get('salinity') is not None:
+                    point_box &= float(box['salinity'][0]) <= out['point_salinity'] <= float(box['salinity'][1])
+                point_q_supported = (np.isfinite(out['point_qp'])
+                                     and 0.0 <= out['point_qp'] <= float(q_max))
+                out[name] = bool(point_box and point_q_supported)
+                if point_box and not np.isfinite(out['point_qp']):
+                    out[f'{name}_layer_unknown'] = True
+            edges = np.flatnonzero(np.diff(np.r_[False, mask, False].astype(int)))
+            for lower, upper in edges.reshape(-1, 2):
+                if not (z[lower] <= p <= z[upper - 1]):
+                    continue
+                top, bottom = float(z[lower]), float(z[upper - 1])
+                top_censored = bool(lower == 0 or not np.isfinite(qg[:lower]).any())
+                bottom_censored = bool(upper == z.size or not np.isfinite(qg[upper:]).any())
+                native_count = int(np.count_nonzero((d[indices] >= top) & (d[indices] <= bottom)))
+                thickness = bottom - top
+                unknown = bool((top_censored or bottom_censored)
+                               and thickness < float(thickness_threshold_m))
+                out.update({f'{name}_layer_found': bool(native_count >= cfg['minimum_native_levels'] and not unknown),
+                            f'{name}_layer_passed': bool(native_count >= cfg['minimum_native_levels'] and thickness >= float(thickness_threshold_m)),
+                            f'{name}_layer_unknown': unknown, f'{name}_layer_top_m': top,
+                            f'{name}_layer_bottom_m': bottom, f'{name}_layer_thickness_m': thickness,
+                            f'{name}_native_level_count': native_count,
+                            f'{name}_layer_top_censored': top_censored,
+                            f'{name}_layer_bottom_censored': bottom_censored})
+    finite_q = np.concatenate([item[np.isfinite(item)] for item in all_q]) if all_q else np.array([])
+    if finite_q.size:
+        out['negative_proxy_fraction'] = float(np.mean(finite_q < 0.0))
+    active = [name for name in boxes if out[name] and out[f'{name}_layer_passed']]
+    out['overlap_label'] = 'overlap' if len(active) > 1 else (active[0] if active else 'none')
+    out['source_layer_censored'] = bool(any(out[f'{name}_layer_unknown'] for name in boxes))
+    return out
+
+
+def _ofes_mode_water_last_sustained_detachment(frame: pd.DataFrame, mld_prefix: str) -> dict:
+    """按冻结规则从 31 日正序轨迹找最后一次 sustained detachment。"""
+    if frame.empty:
+        return {'status': 'source_unavailable', 'censor_reason': 'empty_window'}
+    f = frame.sort_values('date', kind='mergesort').reset_index(drop=True)
+    required = {'date', 'profile_valid', f'{mld_prefix}_valid',
+                f'{mld_prefix}_capped', f'{mld_prefix}_direct'}
+    missing = sorted(required.difference(f.columns))
+    if missing:
+        raise KeyError(f'Mode-water detachment schema missing columns: {missing}')
+    dates = pd.to_datetime(f['date'], errors='coerce').dt.normalize()
+    cfg = _ofes_mode_water_settings()
+    expected = cfg['lookback_days'] + 1
+    if (len(f) != expected or dates.nunique() != expected
+            or dates.isna().any()
+            or not np.all(np.diff(dates.to_numpy()).astype('timedelta64[D]') == np.timedelta64(1, 'D'))):
+        return {'status': 'source_unavailable', 'censor_reason': 'incomplete_31_day_window'}
+    mld_ok = f[f'{mld_prefix}_valid'].fillna(False).astype(bool) & ~f[f'{mld_prefix}_capped'].fillna(False).astype(bool)
+    direct = mld_ok & f[f'{mld_prefix}_direct'].fillna(False).astype(bool)
+    if not direct.any():
+        return ({'status': 'source_unavailable', 'censor_reason': 'invalid_or_capped_mld'}
+                if not mld_ok.all() else {'status': 'no_contact_observed_30d'})
+    contact_idx = int(np.flatnonzero(direct.to_numpy())[-1])
+    if contact_idx == len(f) - 1:
+        return {'status': 'not_detached_by_peak', 'tc_index': contact_idx}
+    run = contact_idx
+    while run > 0 and bool(direct.iloc[run - 1]):
+        run -= 1
+    if contact_idx - run + 1 < cfg['contact_run_days']:
+        # A later unobserved MLD state may conceal the actual final contact run;
+        # a short known run is only a negative result when the remaining window
+        # is fully observed.
+        if not mld_ok.iloc[contact_idx + 1:].all():
+            return {'status': 'source_unavailable', 'tc_index': contact_idx,
+                    'censor_reason': 'later_mld_unknown_after_short_contact'}
+        if run == 0 or not mld_ok.iloc[run - 1]:
+            return {'status': 'source_unavailable', 'tc_index': contact_idx,
+                    'censor_reason': 'contact_run_left_censored'}
+        return {'status': 'transient_contact_only', 'tc_index': contact_idx}
+    post = f.iloc[contact_idx + 1:]
+    post_ok = mld_ok.iloc[contact_idx + 1:].to_numpy()
+    post_direct = direct.iloc[contact_idx + 1:].to_numpy()
+    if (len(post) < cfg['outside_run_days'] or not np.all(post_ok)
+            or np.any(post_direct)):
+        return {'status': 'source_unavailable', 'tc_index': contact_idx,
+                'censor_reason': 'post_exit_unknown_or_short'}
+    source_indices = tuple(range(contact_idx - cfg['contact_run_days'] + 1, contact_idx + 1))
+    return {'status': 'sustained_detachment', 'tc_index': contact_idx,
+            'td_index': contact_idx + 1, 'source_indices': source_indices}
+
+
+def _ofes_mode_water_preflight(output_dir: str | Path | None = None) -> dict:
+    """独立审计既有 30-day eligibility 与 complete pair 计数。"""
+    cfg = _ofes_mode_water_settings(); root = _ofes_mode_water_output_root(output_dir)
+    traj = plots_output_root / 'do' / 'ofes_np30_ke' / cfg['trajectory_subdir']
+    required = ['event_summary.parquet', 'event_horizon_summary.parquet', 'daily_ventilation_diagnostics.parquet', 'particle_metadata.parquet', 'control_match_audit.parquet']
+    missing = [x for x in required if not (traj / x).exists()]
+    if missing: raise FileNotFoundError(f'Missing OFES screening inputs: {missing}')
+    es = pd.read_parquet(traj / 'event_summary.parquet'); es['peak_date'] = pd.to_datetime(es['peak_date']).dt.normalize(); peaks = es.set_index('event_id')['peak_date']
+    eh = pd.read_parquet(traj / 'event_horizon_summary.parquet')
+    h = eh.query("horizon_days == 30 and particle_group in ['anomaly','hydrographic_control']")
+    p = h.pivot(index='event_id', columns='particle_group', values='diagnostic_passed').fillna(False).astype(bool)
+    candidates = sorted(p.index[p.all(axis=1)].astype(str))
+    d = pd.read_parquet(traj / 'daily_ventilation_diagnostics.parquet'); d['date'] = pd.to_datetime(d['date']).dt.normalize()
+    d = d[d.event_id.isin(candidates) & d.particle_group.isin(['anomaly','hydrographic_control'])]
+    rows = []
+    for (event, arm, pair), g in d.groupby(['event_id','particle_group','pair_id'], sort=False):
+        dates = pd.date_range(peaks[event] - pd.Timedelta(days=cfg['lookback_days']), peaks[event], freq='D'); q = g[g.date.isin(dates)]
+        valid = (q.status.eq('active') & np.isfinite(q.lat) & np.isfinite(q.lon)
+                 & np.isfinite(q.depth_m)
+                 & q.mld_diagnostic_valid.fillna(False).astype(bool))
+        duplicate = q.date.duplicated().any()
+        if duplicate:
+            raise ValueError(f'Duplicate dated trajectory key: {event}/{arm}/{pair}')
+        complete = bool(len(q) == 31 and q.date.nunique() == 31 and valid.all() and set(q.loc[valid,'date']) == set(dates))
+        rows.append({'event_id': event, 'particle_group': arm, 'pair_id': pair, 'complete': complete, 'reason': 'complete' if complete else 'incomplete_or_invalid'})
+    q = pd.DataFrame(rows); pivot = q.pivot(index=['event_id','pair_id'], columns='particle_group', values='complete'); common = pivot.dropna().query('anomaly and hydrographic_control').reset_index(); common_counts = common.groupby('event_id').size()
+    metadata = pd.read_parquet(traj / 'particle_metadata.parquet'); audit = pd.read_parquet(traj / 'control_match_audit.parquet')
+    selection = _ofes_mode_water_select_complete_pairs(es, eh, pd.read_parquet(traj / 'daily_ventilation_diagnostics.parquet'), metadata, audit)
+    if metadata[['event_id', 'particle_group', 'pair_id']].duplicated().any():
+        raise ValueError('Duplicate event/arm/pair keys in particle metadata.')
+    if d.duplicated(['event_id', 'particle_group', 'pair_id', 'date']).any():
+        raise ValueError('Duplicate dated trajectory keys prevent 31-day validation.')
+    ordinary_audit = audit[audit['particle_group'].eq('hydrographic_control')]
+    if len(ordinary_audit) != 7446 or int(ordinary_audit.ordinary_fingerprint_gate_passed.fillna(False).sum()) != 7446:
+        raise ValueError('Ordinary hydrographic-control audit is not the required 7,446 matched pairs.')
+    return {'event_count': int(len(es)), 'anomaly_diagnostic_passed': int((h[h.particle_group.eq('anomaly')].diagnostic_passed).sum()), 'hydrographic_diagnostic_passed': int((h[h.particle_group.eq('hydrographic_control')].diagnostic_passed).sum()), 'both_groups_passed': int(len(candidates)), 'candidate_event_ids': candidates, 'common_pair_min': int(common_counts.min()), 'common_pair_max': int(common_counts.max()), 'strict_75pct_event_count': int((common_counts >= 0.75 * 51).sum()), 'common_pair_total': int(len(common)), 'metadata_key_duplicates': 0, 'ordinary_audit_passed': 7446, 'parent_event_count': int(len(pd.read_parquet(plots_output_root / 'do' / 'ofes_np30_ke' / cfg['parent_population_subdir'] / 'population_events.parquet'))), 'output_dir': str(root)}
+
+
+def _ofes_mode_water_select_complete_pairs(event_summary: pd.DataFrame, horizon: pd.DataFrame,
+                                           daily: pd.DataFrame, metadata: pd.DataFrame | None = None,
+                                           audit: pd.DataFrame | None = None,
+                                           *, include_descriptive: bool = True) -> dict:
+    """Select complete 31-day paired trajectories and return auditable tables."""
+    cfg = _ofes_mode_water_settings()
+    peaks = (event_summary.assign(peak_date=pd.to_datetime(event_summary['peak_date']).dt.normalize())
+             .set_index('event_id')['peak_date'])
+    h = horizon[(horizon.horizon_days == 30) & horizon.particle_group.isin(['anomaly', 'hydrographic_control'])]
+    pivot = h.pivot(index='event_id', columns='particle_group', values='diagnostic_passed').fillna(False).astype(bool)
+    candidates = sorted(pivot.index[pivot.all(axis=1)].astype(str))
+    events = candidates + (['OFES_DO50_E000073'] if include_descriptive and 'OFES_DO50_E000073' in peaks else [])
+    d = daily.copy(); d['date'] = pd.to_datetime(d['date']).dt.normalize()
+    d = d[d.event_id.isin(events) & d.particle_group.isin(['anomaly', 'hydrographic_control'])]
+    complete_rows = []
+    for (event, arm, pair), group in d.groupby(['event_id', 'particle_group', 'pair_id'], sort=False):
+        dates = pd.date_range(peaks[event] - pd.Timedelta(days=cfg['lookback_days']), peaks[event], freq='D')
+        q = group[group.date.isin(dates)]
+        valid = (q.status.eq('active') & np.isfinite(q.lon) & np.isfinite(q.lat) & np.isfinite(q.depth_m)
+                 & q.mld_diagnostic_valid.fillna(False).astype(bool))
+        duplicate = q.date.duplicated().any()
+        if duplicate:
+            raise ValueError(f'Duplicate dated trajectory key: {event}/{arm}/{pair}')
+        complete_rows.append({'event_id': event, 'particle_group': arm, 'pair_id': pair,
+                              'complete': bool(len(q) == 31 and q.date.nunique() == 31 and not duplicate
+                                               and valid.all() and set(q.loc[valid, 'date']) == set(dates)),
+                              'reason': 'complete' if not duplicate and valid.all() else 'invalid_or_duplicate'})
+    complete = pd.DataFrame(complete_rows)
+    if metadata is not None:
+        key_cols = ['event_id', 'particle_group', 'pair_id']
+        if metadata.duplicated(key_cols).any():
+            raise ValueError('Duplicate event/arm/pair keys in particle metadata.')
+        compare_cols = [column for column in ('particle_id',) if column in metadata.columns and column in d.columns]
+        if compare_cols:
+            merged = d[key_cols + compare_cols].drop_duplicates().merge(metadata[key_cols + compare_cols], on=key_cols, how='left', indicator=True, suffixes=('_daily', '_meta'))
+            if merged._merge.ne('both').any():
+                raise ValueError('Particle metadata is missing selected event/arm/pair keys.')
+            for column in compare_cols:
+                if not (merged[f'{column}_daily'].astype(str) == merged[f'{column}_meta'].astype(str)).all():
+                    raise ValueError(f'Particle metadata mismatch for {column}.')
+    if audit is not None:
+        ordinary = audit[audit.particle_group.eq('hydrographic_control')]
+        if not ordinary.ordinary_fingerprint_gate_passed.fillna(False).astype(bool).all():
+            raise ValueError('Hydrographic-control ordinary fingerprint gate failed.')
+        daily_keys = set(zip(d.event_id, d.particle_group, d.pair_id))
+        audit_keys = set(zip(ordinary.event_id, ordinary.particle_group, ordinary.pair_id))
+        selected_hc = {key for key in daily_keys if key[1] == 'hydrographic_control'}
+        if not selected_hc.issubset(audit_keys):
+            raise ValueError('Selected hydrographic-control pair keys are missing from ordinary control audit.')
+    cp = complete.pivot(index=['event_id', 'pair_id'], columns='particle_group', values='complete').dropna()
+    common = cp[cp.anomaly & cp.hydrographic_control].reset_index()
+    formal_common = common[common.event_id.isin(candidates)].copy()
+    descriptive = common[common.event_id.eq('OFES_DO50_E000073')].copy()
+    strict_counts = formal_common.groupby('event_id').size()
+    allowed = set(zip(common.event_id, common.pair_id))
+    selected = d[d.apply(lambda row: (row.event_id, row.pair_id) in allowed, axis=1)].copy()
+    selected = selected[selected.apply(lambda row: peaks[row.event_id] - pd.Timedelta(days=30) <= row.date <= peaks[row.event_id], axis=1)]
+    attrition = pd.DataFrame([{'event_id': eid, 'candidate': eid in candidates,
+                               'strict_75pct_candidate': eid in set(strict_counts[strict_counts >= .75 * 51].index),
+                               'reason': 'eligible_both_group_diagnostic' if eid in candidates else 'descriptive_only'}
+                              for eid in sorted(set(peaks.index) | set(candidates))])
+    return {'candidates': candidates, 'common_pairs': formal_common, 'descriptive_pairs': descriptive,
+            'complete_pairs': complete, 'selected_daily': selected, 'strict_events': set(strict_counts[strict_counts >= .75 * 51].index),
+            'attrition': attrition}
+
+
+def _ofes_mode_water_pure_tests() -> dict:
+    """运行冻结协议要求的解析与时间边界纯测试。"""
+    depth = np.arange(0.0, 401.0, 50.0)
+    theta, salinity = np.full(depth.size, 18.0), np.full(depth.size, 34.8)
+    sigma = 25.0 + 0.001 * depth
+    layer = _ofes_mode_water_source_layer(depth, theta, salinity, sigma, 200.0, 35.0,
+                                          q_max=2e-10, thickness_threshold_m=100.0)
+    expected_q = (2.0 * 7.2921159e-5 * np.sin(np.deg2rad(35.0)) / 1025.2 * 0.001)
+    checks = {
+        'q_units_and_sign': np.isclose(layer['point_qp'], expected_q, rtol=2e-3),
+        'stable_containing_layer': layer['STMW_like_layer_passed'],
+        'negative_gradient_not_stable': not _ofes_mode_water_source_layer(
+            depth, theta, salinity, 25.0 - 0.001 * depth, 200.0, 35.0,
+            q_max=2e-10, thickness_threshold_m=100.0)['STMW_like_layer_passed'],
+        'nonuniform_native_not_gap': _ofes_mode_water_source_layer(
+            np.array([0., 10., 20., 30., 40., 60., 90., 140., 220., 320.]),
+            np.full(10, 18.), np.full(10, 34.8),
+            25.0 + .001 * np.array([0., 10., 20., 30., 40., 60., 90., 140., 220., 320.]),
+            100., 35., q_max=2e-10, thickness_threshold_m=100.)['STMW_like_layer_passed'],
+        'thin_boundary_unknown': _ofes_mode_water_source_layer(
+            np.arange(0., 81., 20.), np.full(5, 18.), np.full(5, 34.8),
+            25.0 + .001 * np.arange(0., 81., 20.), 40., 35., q_max=2e-10,
+            thickness_threshold_m=100.)['STMW_like_layer_unknown'],
+    }
+    dates = pd.date_range('2003-01-01', periods=31)
+    def trajectory(mask: np.ndarray) -> pd.DataFrame:
+        return pd.DataFrame({'date': dates, 'mld_valid': True, 'mld_capped': False,
+                             'mld_direct': mask, 'profile_valid': True})
+    contact = np.zeros(31, dtype=bool)
+    contact[20:23] = True
+    checks['forward_sustained_exit'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(contact).iloc[::-1], 'mld')['status'] == 'sustained_detachment')
+    checks['transient_contact_only'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(np.isin(np.arange(31), [10, 11])), 'mld')['status'] == 'transient_contact_only')
+    checks['left_censored_contact'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(np.isin(np.arange(31), [0, 1])), 'mld')['status'] == 'source_unavailable')
+    checks['short_post_exit'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(np.isin(np.arange(31), [27, 28, 29])), 'mld')['status'] == 'source_unavailable')
+    checks['no_contact_window'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(np.zeros(31, dtype=bool)), 'mld')['status'] == 'no_contact_observed_30d')
+    checks['peak_contact'] = (_ofes_mode_water_last_sustained_detachment(
+        trajectory(np.isin(np.arange(31), [28, 29, 30])), 'mld')['status'] == 'not_detached_by_peak')
+    invalid = trajectory(contact)
+    invalid.loc[21, 'mld_valid'] = False
+    checks['invalid_mld_censored'] = (_ofes_mode_water_last_sustained_detachment(
+        invalid, 'mld')['status'] == 'source_unavailable')
+    checks['duplicate_date_fails'] = (_ofes_mode_water_last_sustained_detachment(
+        pd.concat([trajectory(contact).iloc[:-1], trajectory(contact).iloc[[-1]]]).assign(date=lambda x: x['date'].mask(x.index == 30, dates[-2])),
+        'mld')['status'] == 'source_unavailable')
+    checks = {name: bool(value) for name, value in checks.items()}
+    return {'passed': bool(all(checks.values())), 'checks': checks,
+            'test_count': len(checks)}
+
+
+def _ofes_mode_water_scenario_name(mld: float, qmax: float, thickness: float) -> str:
+    return f'mld{mld:g}_q{qmax:.1e}_thick{thickness:g}'
+
+
+def _ofes_mode_water_classify_source(frame: pd.DataFrame, scenario: str, mld_prefix: str, thickness: float) -> dict:
+    """将一个 pair 的 profile diagnostics 归入冻结 source status。"""
+    if not np.isfinite(thickness) or thickness <= 0:
+        raise ValueError('thickness must be a positive finite value.')
+    det = _ofes_mode_water_last_sustained_detachment(frame, mld_prefix)
+    classes = ('STMW_like', 'CMW_like', 'TRMW_like')
+    required = {f'{scenario}_point_qp'}
+    for name in classes:
+        required.update({f'{scenario}_{name}', f'{scenario}_{name}_layer_passed',
+                         f'{scenario}_{name}_layer_unknown'})
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise KeyError(f'Mode-water source schema missing columns: {missing}')
+    result = {'status': det.get('status', 'source_unavailable'), 'tc_date': pd.NaT,
+              'td_date': pd.NaT, 'strong_mode_water': False, 'mode_water_like': False,
+              'STMW_like': False, 'CMW_like': False, 'TRMW_like': False,
+              'source_month': np.nan, 'source_is_jfm': False,
+              'censor_reason': det.get('censor_reason', '')}
+    for name in classes:
+        result[f'{name}_strong_source'] = False
+        result[f'{name}_peak_box_match'] = False
+        for suffix in ('layer_top_m', 'layer_bottom_m', 'layer_thickness_m',
+                       'native_level_count', 'layer_top_censored',
+                       'layer_bottom_censored', 'layer_unknown'):
+            result[f'{name}_source_{suffix}'] = np.nan
+    if 'tc_index' in det:
+        ordered = frame.sort_values('date', kind='mergesort').reset_index(drop=True)
+        result['tc_date'] = pd.Timestamp(ordered.iloc[int(det['tc_index'])]['date'])
+        if 'td_index' in det:
+            result['td_date'] = pd.Timestamp(ordered.iloc[int(det['td_index'])]['date'])
+    if det.get('status') != 'sustained_detachment':
+        return result
+    f = frame.sort_values('date', kind='mergesort').reset_index(drop=True)
+    i = int(det['tc_index'])
+    source = f.iloc[i]
+    result['tc_date'] = pd.Timestamp(source['date'])
+    result['td_date'] = pd.Timestamp(f.iloc[int(det['td_index'])]['date'])
+    result['source_month'] = int(result['tc_date'].month)
+    result['source_is_jfm'] = bool(result['source_month'] in (1, 2, 3))
+    peak = f.iloc[-1]
+    for field in ('theta', 'salinity', 'sigma0', 'qp'):
+        source_value = pd.to_numeric(pd.Series([source.get(f'{scenario}_point_{field}', np.nan)]), errors='coerce').iloc[0]
+        peak_value = pd.to_numeric(pd.Series([peak.get(f'{scenario}_point_{field}', np.nan)]), errors='coerce').iloc[0]
+        result[f'source_{field}'] = float(source_value) if np.isfinite(source_value) else np.nan
+        result[f'peak_{field}'] = float(peak_value) if np.isfinite(peak_value) else np.nan
+        result[f'peak_minus_source_{field}'] = float(peak_value - source_value) if np.isfinite(peak_value) and np.isfinite(source_value) else np.nan
+    result['source_depth_m'] = float(source.get('depth_m', np.nan))
+    result['peak_depth_m'] = float(peak.get('depth_m', np.nan))
+    result['peak_minus_source_depth_m'] = (result['peak_depth_m'] - result['source_depth_m']
+                                           if np.isfinite(result['peak_depth_m']) and np.isfinite(result['source_depth_m']) else np.nan)
+    source_qp = pd.to_numeric(pd.Series([source[f'{scenario}_point_qp']]), errors='coerce').iloc[0]
+    if not np.isfinite(source_qp):
+        result.update(status='source_unavailable', censor_reason='source_point_proxy_missing')
+        return result
+    window = f.iloc[list(det['source_indices'])]
+    strong, unresolved = [], []
+    for name in classes:
+        point = window[f'{scenario}_{name}'].fillna(False).astype(bool).to_numpy()
+        layer = window[f'{scenario}_{name}_layer_passed'].fillna(False).astype(bool).to_numpy()
+        unknown = window[f'{scenario}_{name}_layer_unknown'].fillna(False).astype(bool).to_numpy()
+        result[name] = bool(point[-1])
+        pass_tc = bool(point[-1] and layer[-1])
+        unknown_tc = bool(point[-1] and unknown[-1])
+        pass_previous = point[:-1] & layer[:-1]
+        unknown_previous = unknown[:-1]
+        is_strong = bool(pass_tc and np.any(pass_previous))
+        possible = bool((pass_tc or unknown_tc)
+                        and np.any(pass_previous | unknown_previous))
+        strong.append(is_strong)
+        unresolved.append(bool(possible and not is_strong))
+        result[f'{name}_strong_source'] = is_strong
+        for suffix in ('layer_top_m', 'layer_bottom_m', 'layer_thickness_m',
+                       'native_level_count', 'layer_top_censored',
+                       'layer_bottom_censored', 'layer_unknown'):
+            result[f'{name}_source_{suffix}'] = source.get(
+                f'{scenario}_{name}_{suffix}', np.nan,
+            )
+        box = _ofes_mode_water_settings()['source_boxes'].get(name)
+        if box is None:
+            # Analytic schema fixtures may intentionally omit regional boxes;
+            # strong-source flags remain determined solely by supplied layer flags.
+            continue
+        peak_theta = result['peak_theta']; peak_salinity = result['peak_salinity']
+        peak_sigma0 = result['peak_sigma0']
+        peak_box = (np.isfinite(peak_theta) and np.isfinite(peak_sigma0)
+                    and float(box['theta'][0]) <= peak_theta <= float(box['theta'][1])
+                    and float(box['sigma0'][0]) <= peak_sigma0 <= float(box['sigma0'][1]))
+        if box.get('salinity') is not None:
+            peak_box = bool(peak_box and np.isfinite(peak_salinity)
+                            and float(box['salinity'][0]) <= peak_salinity <= float(box['salinity'][1]))
+        result[f'{name}_peak_box_match'] = bool(peak_box)
+    if any(strong):
+        result.update(status='strong_mode_water_source', strong_mode_water=True)
+    elif any(unresolved):
+        result.update(status='source_unavailable', censor_reason='required_source_layer_unknown')
+    elif any(result[name] for name in classes):
+        result.update(status='mode_water_like', mode_water_like=True)
+    else:
+        result['status'] = 'other_recently_ventilated'
+    return result
+
+
+def _ofes_mode_water_source_identity(date: str | pd.Timestamp) -> dict:
+    """Return lightweight resolved-file identities for a dated T/S snapshot."""
+    files = {}
+    for variable in ('temp', 'salinity'):
+        path = _ofes_file_path(variable, date).expanduser().resolve()
+        if not path.exists():
+            files[variable] = {'path': str(path), 'size': None, 'st_mtime_ns': None}
+        else:
+            stat = path.stat()
+            files[variable] = {'path': str(path), 'size': int(stat.st_size), 'st_mtime_ns': int(stat.st_mtime_ns)}
+    return {'date': str(pd.Timestamp(date).date()), 'files': files}
+
+
+def _ofes_mode_water_profile_rows(
+    selected: pd.DataFrame,
+    root: Path,
+    *,
+    overwrite: bool = False,
+    cache_only: bool = False,
+    memory_limit: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按日期采样候选轨迹的原生 OFES T/S，并写入 cache 与 daily diagnostics。"""
+    import resource
+    import time
+    cfg = _ofes_mode_water_settings(); cache_dir = root / 'native_profiles'; cache_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_dir = root / 'daily_diagnostics'; diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    index_rows = []; daily_paths = []; daily_records = []; settings = _ofes_trajectory_ventilation_settings({'mld_density_threshold_kg_m3': 0.03})
+    limit_text = '4GiB' if memory_limit is None else str(memory_limit)
+    match = re.fullmatch(r'(?i)\s*([0-9]+(?:\.[0-9]+)?)\s*(kib|mib|gib|kb|mb|gb|b)\s*', limit_text)
+    if not match:
+        raise ValueError(f'Invalid memory_limit: {memory_limit!r}')
+    factors = {'b': 1, 'kb': 1000, 'mb': 1000**2, 'gb': 1000**3, 'kib': 1024, 'mib': 1024**2, 'gib': 1024**3}
+    memory_limit_bytes = float(match.group(1)) * factors[match.group(2).lower()]
+    selected = selected.copy(); selected['date'] = pd.to_datetime(selected['date']).dt.normalize()
+    required = {'event_id', 'particle_group', 'pair_id', 'date', 'lon', 'lat', 'depth_m'}
+    missing = sorted(required.difference(selected.columns))
+    if missing:
+        raise KeyError(f'Mode-water profile request lacks columns: {missing}')
+    date_groups = list(selected.groupby('date', sort=True))
+    for date_number, (date, day) in enumerate(date_groups, start=1):
+        started = time.monotonic()
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        if rss_before > memory_limit_bytes:
+            raise MemoryError(f'Mode-water memory limit exceeded before {pd.Timestamp(date):%Y-%m-%d}.')
+        day = day.reset_index(drop=True); stamp = pd.Timestamp(date).strftime('%Y%m%d'); npz_path = cache_dir / f'profiles_{stamp}.npz'
+        row_ids = np.array([
+            f"{row.event_id}|{row.particle_group}|{row.pair_id}|{pd.Timestamp(row.date):%Y-%m-%d}"
+            for _, row in day.iterrows()
+        ])
+        requested_lon = day['lon'].to_numpy(dtype=np.float64)
+        requested_lat = day['lat'].to_numpy(dtype=np.float64)
+        requested_depth = day['depth_m'].to_numpy(dtype=np.float64)
+        use_cache = False
+        if npz_path.exists() and not overwrite:
+            with np.load(npz_path, allow_pickle=False) as cached:
+                required_cache = {'cache_schema_version', 'row_uid', 'lon', 'lat', 'particle_depth_m', 'depth', 'theta', 'salinity', 'sigma0', 'depth_sha256', 'source_identity'}
+                if required_cache.issubset(cached.files):
+                    raw_arrays = tuple(np.array(cached[name], copy=True) for name in ('depth', 'theta', 'salinity', 'sigma0'))
+                    cached_identity = json.loads(str(cached['source_identity'].item()))
+                    expected_identity = _ofes_mode_water_source_identity(date)
+                    identity_ok = cached_identity == expected_identity
+                    use_cache = (identity_ok and str(cached['cache_schema_version'].item()) == 'mode_water_native_v2'
+                                 and cached['row_uid'].dtype.kind in {'U', 'S'}
+                                 and np.array_equal(cached['row_uid'].astype(str), row_ids)
+                                 and np.array_equal(cached['lon'], requested_lon)
+                                 and np.array_equal(cached['lat'], requested_lat)
+                                 and np.array_equal(cached['particle_depth_m'], requested_depth)
+                                 and all(value.dtype == np.float64 for value in raw_arrays)
+                                 and str(cached['depth_sha256'].item()) == hashlib.sha256(np.asarray(raw_arrays[0], dtype=np.float64).tobytes()).hexdigest()
+                                 and raw_arrays[0].ndim == 1 and np.isfinite(raw_arrays[0]).all() and np.all(np.diff(raw_arrays[0]) > 0)
+                                 and raw_arrays[1].shape == raw_arrays[2].shape == raw_arrays[3].shape
+                                 and raw_arrays[1].shape == (len(day), raw_arrays[0].size))
+                if use_cache:
+                    dep, theta, sal, sig = raw_arrays
+            if not use_cache:
+                print(f'[mode-water] cache identity mismatch; recomputing {npz_path.name}', flush=True)
+        if not use_cache:
+            if cache_only:
+                raise FileNotFoundError(f'Cache-only run cannot use missing or mismatched native profile cache: {npz_path}')
+            lon_min = float(np.nanmin(day['lon'])) - 0.15; lon_max = float(np.nanmax(day['lon'])) + 0.15; lat_min = float(np.nanmin(day['lat'])) - 0.15; lat_max = float(np.nanmax(day['lat'])) + 0.15
+            snapshot = load_ofes_snapshot(date, variables=['temp','salinity'], lon_bounds=(lon_min, lon_max), lat_bounds=(lat_min, lat_max), depth_bounds=None)
+            sampled = _ofes_ventilation_profile_samples(snapshot, day['lon'].to_numpy(float), day['lat'].to_numpy(float))
+            dep, theta, sal, sig = (np.asarray(sampled[name], dtype=np.float64)
+                                    for name in ('depth', 'theta', 'salinity', 'sigma0'))
+            temporary = npz_path.with_suffix('.partial.npz')
+            source_identity = json.dumps(_ofes_mode_water_source_identity(date), sort_keys=True)
+            np.savez_compressed(temporary, cache_schema_version='mode_water_native_v2',
+                                row_uid=row_ids, lon=requested_lon, lat=requested_lat,
+                                particle_depth_m=requested_depth, depth=dep,
+                                depth_sha256=hashlib.sha256(dep.tobytes()).hexdigest(),
+                                source_identity=source_identity, theta=theta,
+                                salinity=sal, sigma0=sig)
+            temporary.replace(npz_path)
+        print(f'[mode-water] date {date_number}/{len(date_groups)} {pd.Timestamp(date):%Y-%m-%d} rows={len(day)}', flush=True)
+        day_diagnostics = []
+        for j, row in day.iterrows():
+            uid = f"{row.event_id}|{row.particle_group}|{row.pair_id}|{pd.Timestamp(row.date):%Y-%m-%d}"
+            index_rows.append({'row_uid': uid, 'event_id': row.event_id, 'particle_group': row.particle_group, 'pair_id': row.pair_id, 'date': row.date, 'cache_file': str(npz_path), 'cache_row': int(j)})
+            base = row.to_dict(); base.update({'row_uid': uid, 'profile_valid': bool(np.isfinite(theta[j]).sum() >= cfg['minimum_native_levels'] and np.isfinite(sal[j]).sum() >= cfg['minimum_native_levels'] and np.isfinite(sig[j]).sum() >= cfg['minimum_native_levels']), 'rss_mb': float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0})
+            for mld, prefix in ((0.03,'mld003'), (0.125,'mld0125')):
+                msettings = dict(settings); msettings['mld_density_threshold_kg_m3'] = mld
+                target = _ofes_profile_value_at_depth(dep, sig[j], float(row.depth_m))
+                mld_result = _ofes_mld_contact_from_profile(dep, sig[j], float(row.depth_m), float(target), msettings)
+                base[f'{prefix}_valid'] = bool(mld_result['mld_diagnostic_valid']); base[f'{prefix}_capped'] = bool(mld_result['mld_capped_at_delivery_bottom']); base[f'{prefix}_mld'] = float(mld_result['mld_m']); base[f'{prefix}_direct'] = bool(mld_result['direct_mld_contact'])
+                base[f'{prefix}_formal_mld'] = float(row.mld_m) if np.isfinite(row.mld_m) else np.nan; base[f'{prefix}_formal_direct'] = bool(row.direct_mld_contact) if mld == 0.03 else np.nan
+            layer_cache = {(qmax, thick): _ofes_mode_water_source_layer(dep, theta[j], sal[j], sig[j], float(row.depth_m), float(row.lat), q_max=qmax, thickness_threshold_m=thick, settings=cfg) for qmax in cfg['pv_qmax_m1_s1'] for thick in cfg['thickness_thresholds_m']}
+            for mld in cfg['mld_density_thresholds_kg_m3']:
+                prefix = 'mld003' if np.isclose(mld, 0.03) else 'mld0125'
+                for (qmax, thick), layer in layer_cache.items():
+                    scenario = _ofes_mode_water_scenario_name(mld, qmax, thick)
+                    for key, value in layer.items(): base[f'{scenario}_{key}'] = value
+                    base[f'{scenario}_mld_prefix'] = prefix
+            day_diagnostics.append(base)
+        day_frame = pd.DataFrame(day_diagnostics)
+        day_path = diagnostic_dir / f'profiles_{stamp}.parquet'; partial = day_path.with_suffix('.partial.parquet')
+        day_frame.to_parquet(partial, index=False); partial.replace(day_path); daily_paths.append(str(day_path))
+        parity = day_frame[day_frame['mld003_formal_direct'].notna()]
+        if not parity.empty:
+            delta = pd.to_numeric(parity['mld003_mld'], errors='coerce') - pd.to_numeric(parity['mld003_formal_mld'], errors='coerce')
+            formal_valid = (parity['mld_diagnostic_valid'].fillna(False).astype(bool)
+                            if 'mld_diagnostic_valid' in parity else parity['mld003_formal_mld'].notna())
+            mismatch = ((np.abs(delta) > 1e-8).fillna(False)
+                        | (parity['mld003_direct'].astype(bool) != parity['mld003_formal_direct'].astype(bool))
+                        | (parity['mld003_valid'].astype(bool) != formal_valid))
+            if mismatch.any():
+                raise ValueError(f'Native .03 MLD parity failed before next date: {int(mismatch.sum())} rows on {stamp}.')
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        daily_records.append({'date': str(pd.Timestamp(date).date()), 'rows': int(len(day_frame)), 'elapsed_s': float(time.monotonic() - started), 'rss_bytes': int(rss), 'path': str(day_path)})
+        if rss > memory_limit_bytes:
+            raise MemoryError(f'Mode-water memory limit exceeded after {stamp}: {rss / 2**30:.3f} GiB > {memory_limit_bytes / 2**30:.3f} GiB')
+        del day_diagnostics, day_frame, theta, sal, sig, dep
+    frames = [pd.read_parquet(path) for path in daily_paths]
+    diagnostics = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    if rss > memory_limit_bytes:
+        raise MemoryError(f'Mode-water memory limit exceeded after typed diagnostic combination: {rss / 2**30:.3f} GiB > {memory_limit_bytes / 2**30:.3f} GiB')
+    diagnostics.attrs['daily_diagnostic_paths'] = daily_paths
+    (diagnostic_dir / 'manifest.json').write_text(json.dumps({'dates': daily_records, 'memory_limit_bytes': memory_limit_bytes}, ensure_ascii=False, indent=2))
+    return pd.DataFrame(index_rows), diagnostics
+
+
+def _ofes_mode_water_bootstrap(difference: np.ndarray, *, seed: int, replicates: int) -> tuple[float,float]:
+    values = np.asarray(difference, dtype=float); values = values[np.isfinite(values)]
+    if not values.size: return (np.nan, np.nan)
+    rng = np.random.default_rng(int(seed)); draws = rng.integers(0, values.size, size=(int(replicates), values.size)); means = values[draws].mean(axis=1); return (float(np.quantile(means, .025)), float(np.quantile(means, .975)))
+
+
+def _ofes_mode_water_sign_flip(difference: np.ndarray, *, seed: int, replicates: int) -> float:
+    values = np.asarray(difference, dtype=float); values = values[np.isfinite(values)]
+    if not values.size:
+        return np.nan
+    if np.array_equal(values, np.zeros(values.shape, dtype=float)):
+        return 1.0
+    rng = np.random.default_rng(int(seed)); observed = abs(float(values.mean())); signs = rng.choice(np.array([-1.0,1.0]), size=(int(replicates), values.size)); extreme = np.count_nonzero(np.abs((signs * values).mean(axis=1)) >= observed); return float((extreme + 1) / (int(replicates) + 1))
+
+
+def _ofes_mode_water_peak_month_bootstrap(
+    events: pd.DataFrame, *, seed: int, replicates: int,
+) -> dict:
+    """以 peak calendar month 为 block 重采事件等权差值。"""
+    if events.empty:
+        return {'month_block_count': 0, 'bootstrap95_low': np.nan, 'bootstrap95_high': np.nan}
+    month = pd.to_numeric(events['peak_month'], errors='coerce')
+    difference = pd.to_numeric(events['difference'], errors='coerce')
+    valid = pd.DataFrame({'month': month, 'difference': difference}).dropna()
+    blocks = [group['difference'].to_numpy(float) for _, group in valid.groupby('month', sort=True)]
+    if not blocks:
+        return {'month_block_count': 0, 'bootstrap95_low': np.nan, 'bootstrap95_high': np.nan}
+    rng = np.random.default_rng(int(seed))
+    means = np.empty(int(replicates), dtype=float)
+    for index in range(int(replicates)):
+        sampled = rng.integers(0, len(blocks), size=len(blocks))
+        values = np.concatenate([blocks[item] for item in sampled])
+        means[index] = values.mean()
+    return {'month_block_count': len(blocks), 'bootstrap95_low': float(np.quantile(means, .025)), 'bootstrap95_high': float(np.quantile(means, .975))}
+
+
+def _ofes_mode_water_event_equal_descriptives(
+    source: pd.DataFrame,
+    final_pair_mask: pd.DataFrame,
+    *,
+    analysis_event_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """汇总主设定 anomaly strong-source 粒子的事件内和事件等权特征。"""
+    scenario = _ofes_mode_water_scenario_name(0.03, 2.0e-10, 100.0)
+    required_source = {
+        'event_id', 'particle_group', 'pair_id', 'scenario',
+        'strong_mode_water', 'source_month', 'source_is_jfm',
+        'source_depth_m', 'peak_depth_m', 'peak_minus_source_depth_m',
+        'STMW_like_strong_source', 'CMW_like_strong_source',
+        'TRMW_like_strong_source',
+    }
+    missing_source = sorted(required_source - set(source.columns))
+    if missing_source:
+        raise KeyError(f'Mode-water source descriptives lack columns: {missing_source}')
+    required_mask = {'event_id', 'pair_id', 'scenario', 'cohort', 'final_pair_mask'}
+    missing_mask = sorted(required_mask - set(final_pair_mask.columns))
+    if missing_mask:
+        raise KeyError(f'Mode-water final-pair mask lacks columns: {missing_mask}')
+    retained = final_pair_mask[
+        final_pair_mask['scenario'].eq(scenario)
+        & final_pair_mask['cohort'].eq('core_common')
+        & final_pair_mask['final_pair_mask'].fillna(False).astype(bool)
+    ][['event_id', 'pair_id', 'scenario']].drop_duplicates()
+    classified = source.merge(
+        retained,
+        on=['event_id', 'pair_id', 'scenario'],
+        how='inner',
+        validate='many_to_one',
+    )
+    strong = classified[
+        classified['particle_group'].eq('anomaly')
+        & classified['strong_mode_water'].fillna(False).astype(bool)
+    ].copy()
+    if strong.duplicated(['event_id', 'pair_id']).any():
+        raise ValueError('Duplicate primary anomaly strong-source pair rows.')
+    class_columns = {
+        'STMW_like': 'STMW_like_strong_source',
+        'CMW_like': 'CMW_like_strong_source',
+        'TRMW_like': 'TRMW_like_strong_source',
+    }
+    event_rows = []
+    for event_id, values in strong.groupby('event_id', sort=True):
+        row = {
+            'event_id': str(event_id),
+            'scenario': scenario,
+            'strong_source_particle_count': int(len(values)),
+            'source_is_jfm_fraction': float(values['source_is_jfm'].fillna(False).mean()),
+            'source_month_median': float(pd.to_numeric(values['source_month'], errors='coerce').median()),
+            'source_depth_median_m': float(pd.to_numeric(values['source_depth_m'], errors='coerce').median()),
+            'peak_depth_median_m': float(pd.to_numeric(values['peak_depth_m'], errors='coerce').median()),
+            'deepening_median_m': float(pd.to_numeric(values['peak_minus_source_depth_m'], errors='coerce').median()),
+        }
+        for label, column in class_columns.items():
+            flags = values[column].fillna(False).astype(bool)
+            row[f'{label}_particle_count'] = int(flags.sum())
+            row[f'has_{label}'] = bool(flags.any())
+        row['subtype_count'] = int(sum(row[f'has_{label}'] for label in class_columns))
+        event_rows.append(row)
+    events = pd.DataFrame(event_rows)
+    summary_columns = [
+        'scenario', 'analysis_event_count', 'source_positive_event_count',
+        'strong_source_particle_count', 'particle_jfm_count',
+        'particle_jfm_fraction', 'event_equal_jfm_fraction_mean',
+        'source_month_median_of_event_medians',
+        'source_depth_median_of_event_medians_m',
+        'peak_depth_median_of_event_medians_m',
+        'deepening_median_of_event_medians_m', 'events_with_STMW_like',
+        'events_with_CMW_like', 'events_with_TRMW_like',
+        'events_with_multiple_subtypes',
+    ]
+    if events.empty:
+        return events, pd.DataFrame(columns=summary_columns)
+    population = pd.DataFrame([{
+        'scenario': scenario,
+        'analysis_event_count': int(analysis_event_count),
+        'source_positive_event_count': int(len(events)),
+        'strong_source_particle_count': int(len(strong)),
+        'particle_jfm_count': int(strong['source_is_jfm'].fillna(False).sum()),
+        'particle_jfm_fraction': float(strong['source_is_jfm'].fillna(False).mean()),
+        'event_equal_jfm_fraction_mean': float(events['source_is_jfm_fraction'].mean()),
+        'source_month_median_of_event_medians': float(events['source_month_median'].median()),
+        'source_depth_median_of_event_medians_m': float(events['source_depth_median_m'].median()),
+        'peak_depth_median_of_event_medians_m': float(events['peak_depth_median_m'].median()),
+        'deepening_median_of_event_medians_m': float(events['deepening_median_m'].median()),
+        'events_with_STMW_like': int(events['has_STMW_like'].sum()),
+        'events_with_CMW_like': int(events['has_CMW_like'].sum()),
+        'events_with_TRMW_like': int(events['has_TRMW_like'].sum()),
+        'events_with_multiple_subtypes': int((events['subtype_count'] > 1).sum()),
+    }], columns=summary_columns)
+    return events, population
+
+
+def _ofes_mode_water_event_tables(source: pd.DataFrame, scenarios: Sequence[str], common_pairs: pd.DataFrame, *, strict_events: set[str] | None = None) -> tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
+    """以双臂和跨场景共同 pair 构造正式、150 m 与描述性 cohort。"""
+    return _ofes_mode_water_reduce_fixed_cohort(
+        source, scenarios, common_pairs, strict_events=strict_events,
+    )
+
+
+def _ofes_mode_water_compare(summary: pd.DataFrame, scenarios: Sequence[str], *, seed: int, bootstrap_replicates: int, sign_flip_replicates: int, allow_primary_test: bool = True) -> pd.DataFrame:
+    """计算固定 cohort 的事件等权效应和唯一 primary sign-flip。"""
+    return _ofes_mode_water_compare_fixed_cohort(
+        summary, scenarios, seed=seed,
+        bootstrap_replicates=bootstrap_replicates,
+        sign_flip_replicates=sign_flip_replicates, allow_primary_test=allow_primary_test,
+    )
+
+
+def _ofes_mode_water_reduce_fixed_cohort(
+    source: pd.DataFrame,
+    scenarios: Sequence[str],
+    common_pairs: pd.DataFrame,
+    *,
+    strict_events: set[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """以双臂和跨场景共同 pair 构造正式、150 m 与描述性 cohort。"""
+    required = {'event_id', 'pair_id', 'particle_group', 'scenario', 'status', 'strong_mode_water'}
+    missing = sorted(required - set(source.columns))
+    if missing:
+        raise KeyError(f'Mode-water source table lacks columns: {missing}')
+    pairs = common_pairs[['event_id', 'pair_id']].drop_duplicates().copy()
+    if strict_events is not None:
+        pairs = pairs[pairs.event_id.isin(strict_events)].copy()
+    if pairs.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if source.duplicated(['event_id', 'pair_id', 'particle_group', 'scenario']).any():
+        raise ValueError('Duplicate mode-water arm/pair/scenario rows.')
+    arms = ('anomaly', 'hydrographic_control')
+    initial = pairs.groupby('event_id').pair_id.nunique().to_dict()
+    fraction = _ofes_mode_water_settings()['evaluable_pair_fraction']
+    by_scenario, exclusions = {}, []
+    for scenario in scenarios:
+        current = source[source.scenario.eq(scenario)]
+        by_event = {}
+        for event, group in pairs.groupby('event_id', sort=True):
+            good = set()
+            for pair in group.pair_id:
+                both = current[(current.event_id.eq(event)) & (current.pair_id.eq(pair))]
+                if len(both) == 2 and set(both.particle_group) == set(arms) and not both.status.eq('source_unavailable').any():
+                    good.add(pair)
+            by_event[event] = good
+        by_scenario[scenario] = by_event
+    summary, masks = [], []
+    detached = {'strong_mode_water_source', 'mode_water_like', 'other_recently_ventilated'}
+    def add(name: str, settings: Sequence[str]) -> None:
+        for event, group in pairs.groupby('event_id', sort=True):
+            keep = set(group.pair_id)
+            for scenario in settings:
+                keep &= by_scenario[scenario][event]
+            if len(keep) < fraction * initial[event]:
+                for scenario in settings:
+                    exclusions.append({'event_id': event, 'scenario': scenario, 'cohort': name, 'reason': 'post_qc_retention_below_75pct', 'initial_common_pairs': initial[event], 'evaluable_pairs': len(keep)})
+                continue
+            for scenario in settings:
+                rows = source[(source.scenario.eq(scenario)) & (source.event_id.eq(event)) & source.pair_id.isin(keep)]
+                for arm in arms:
+                    values = rows[rows.particle_group.eq(arm)]
+                    strong = int(values.strong_mode_water.fillna(False).sum())
+                    detach = int(values.status.isin(detached).sum())
+                    peak_month = (int(pd.Timestamp(values.peak_date.iloc[0]).month) if 'peak_date' in values and values.peak_date.notna().any() else np.nan)
+                    summary.append({'event_id': event, 'scenario': scenario, 'cohort': name, 'particle_group': arm, 'strong_count': strong, 'evaluable_count': len(values), 'strong_fraction': strong / len(values), 'sustained_detachment_count': detach, 'conditional_strong_fraction': strong / detach if detach else np.nan, 'pair_count_initial': initial[event], 'pair_count_evaluable': len(keep), 'peak_month': peak_month})
+                masks.extend({'event_id': event, 'pair_id': pair, 'scenario': scenario, 'cohort': name, 'final_pair_mask': True} for pair in sorted(keep))
+    core = [s for s in scenarios if s.endswith('thick100')]
+    thick150 = [s for s in scenarios if s.endswith('thick150')]
+    if core:
+        add('core_common', core)
+    if thick150:
+        add('thickness150_common', thick150)
+    for scenario in scenarios:
+        add('scenario_specific', [scenario])
+    return pd.DataFrame(summary), pd.DataFrame(exclusions), pd.DataFrame(masks)
+
+
+def _ofes_mode_water_compare_fixed_cohort(
+    summary: pd.DataFrame,
+    scenarios: Sequence[str],
+    *,
+    seed: int,
+    bootstrap_replicates: int,
+    sign_flip_replicates: int,
+    allow_primary_test: bool,
+) -> pd.DataFrame:
+    """对固定 cohort 计算事件等权配对效应与唯一 primary 随机化检验。"""
+    columns = ['scenario', 'cohort', 'event_count', 'anomaly_mean', 'control_mean',
+               'mean_difference', 'median_difference', 'bootstrap95_low',
+               'bootstrap95_high', 'sign_flip_p', 'pair_denominator_anomaly',
+               'pair_denominator_control']
+    if summary.empty or 'scenario' not in summary.columns:
+        empty_rows = []
+        for scenario in scenarios:
+            cohort = ('core_common' if scenario.endswith('thick100')
+                      else 'thickness150_common' if scenario.endswith('thick150')
+                      else 'scenario_specific')
+            empty_rows.append({'scenario': scenario, 'cohort': cohort,
+                               'event_count': 0, 'anomaly_mean': np.nan,
+                               'control_mean': np.nan, 'mean_difference': np.nan,
+                               'median_difference': np.nan, 'bootstrap95_low': np.nan,
+                               'bootstrap95_high': np.nan, 'sign_flip_p': np.nan,
+                               'pair_denominator_anomaly': 0,
+                               'pair_denominator_control': 0})
+        return pd.DataFrame(empty_rows, columns=columns)
+    output = []
+    for scenario in scenarios:
+        for cohort, values in summary[summary.scenario.eq(scenario)].groupby('cohort', sort=True):
+            anomaly = values[values.particle_group.eq('anomaly')].set_index('event_id')
+            control = values[values.particle_group.eq('hydrographic_control')].set_index('event_id')
+            events = sorted(set(anomaly.index) & set(control.index))
+            difference = (anomaly.loc[events, 'strong_fraction'] - control.loc[events, 'strong_fraction']).to_numpy(float) if events else np.array([], dtype=float)
+            low, high = _ofes_mode_water_bootstrap(difference, seed=seed, replicates=bootstrap_replicates)
+            primary = (allow_primary_test and cohort == 'core_common'
+                       and scenario == _ofes_mode_water_scenario_name(0.03, 2e-10, 100.0))
+            output.append({'scenario': scenario, 'cohort': cohort, 'event_count': len(events), 'anomaly_mean': float(anomaly.loc[events, 'strong_fraction'].mean()) if events else np.nan, 'control_mean': float(control.loc[events, 'strong_fraction'].mean()) if events else np.nan, 'mean_difference': float(difference.mean()) if difference.size else np.nan, 'median_difference': float(np.median(difference)) if difference.size else np.nan, 'bootstrap95_low': low, 'bootstrap95_high': high, 'sign_flip_p': _ofes_mode_water_sign_flip(difference, seed=seed, replicates=sign_flip_replicates) if primary else np.nan, 'pair_denominator_anomaly': int(anomaly.loc[events, 'evaluable_count'].sum()) if events else 0, 'pair_denominator_control': int(control.loc[events, 'evaluable_count'].sum()) if events else 0})
+    return pd.DataFrame(output, columns=columns)
+
+
+def run_ofes_mode_water_source_screening(
+    output_dir: str | Path | None = None,
+    *,
+    workers: int = 1,
+    memory_limit: str | None = None,
+    overwrite: bool = False,
+    preflight_only: bool = False,
+    validate_only: bool = False,
+    cache_only: bool = False,
+) -> dict:
+    """运行冻结的 OFES 30-day observed mode-water source pathway screen。
+
+    参数:
+        - output_dir (str | Path | None): 固定产物目录；None 使用 YAML 目录。
+        - workers (int): 原生快照读取 worker 数；当前实现按日期串行去重读取。
+        - memory_limit (str | None): 记录的内存上限字符串。
+        - overwrite (bool): 是否重建已存在的 profile cache。
+        - preflight_only (bool): 只执行既有资格与 pair 审计。
+        - validate_only (bool): 只执行纯函数测试与输入审计。
+        - cache_only (bool): 只从已验证 v2 native cache 重建派生产物，禁止读取 OFES 原始场。
+    返回:
+        - dict: 结果表、摘要、QA 与输出路径。
+    输出:
+        - `plot_outputs/do/ofes_np30_ke/primary_mode_water_screening/` 下的 parquet、JSON、NPZ cache 与唯一 PNG。
+    说明:
+        - 只读取 OFES temp/salinity；low-PV proxy 不是 exact Ertel PV，也不证明 lifetime origin。
+    """
+    if workers != 1:
+        raise ValueError('Mode-water date-batched producer currently supports exactly one NetCDF reader (workers=1).')
+    cfg = _ofes_mode_water_settings(); root = _ofes_mode_water_output_root(output_dir); root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'manifest.json'
+    if not overwrite and not cache_only and not validate_only and not preflight_only and manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get('status') == 'complete' and manifest.get('cache_schema_version') == 'mode_water_native_v2':
+            return load_ofes_mode_water_source_screening(root)
+    preflight = _ofes_mode_water_preflight(root)
+    pure = _ofes_mode_water_pure_tests()
+    if preflight_only: print(json.dumps(preflight, ensure_ascii=False, indent=2)); return {'preflight': preflight}
+    if validate_only:
+        if not pure['passed']: raise AssertionError(pure)
+        return {'preflight': preflight, 'pure_tests': pure}
+    if not pure['passed']: raise AssertionError(pure)
+    traj = plots_output_root / 'do' / 'ofes_np30_ke' / cfg['trajectory_subdir']; es = pd.read_parquet(traj/'event_summary.parquet'); eh = pd.read_parquet(traj/'event_horizon_summary.parquet'); d = pd.read_parquet(traj/'daily_ventilation_diagnostics.parquet');
+    selection = _ofes_mode_water_select_complete_pairs(es, eh, d, pd.read_parquet(traj/'particle_metadata.parquet'), pd.read_parquet(traj/'control_match_audit.parquet'))
+    peaks = es.assign(peak_date=pd.to_datetime(es['peak_date']).dt.normalize()).set_index('event_id')['peak_date']; candidates = selection['candidates']; common_rows = selection['common_pairs']; e073 = selection['descriptive_pairs']; strict_events = selection['strict_events']; selected = selection['selected_daily']
+    profile_index, profile_diag = _ofes_mode_water_profile_rows(selected, root, overwrite=overwrite, cache_only=cache_only, memory_limit=memory_limit)
+    parity = profile_diag[profile_diag['mld003_formal_direct'].notna()].copy()
+    direct_mismatch = int((parity['mld003_direct'].astype(bool) != parity['mld003_formal_direct'].astype(bool)).sum())
+    mld_delta = pd.to_numeric(parity['mld003_mld'], errors='coerce') - pd.to_numeric(parity['mld003_formal_mld'], errors='coerce')
+    parity_qa = {'rows': int(len(parity)), 'direct_contact_mismatch_count': direct_mismatch,
+                 'mld_abs_max_m': float(np.nanmax(np.abs(mld_delta))) if mld_delta.notna().any() else np.nan,
+                 'mld_abs_mean_m': float(np.nanmean(np.abs(mld_delta))) if mld_delta.notna().any() else np.nan}
+    formal_valid = (parity['mld_diagnostic_valid'].fillna(False).astype(bool)
+                    if 'mld_diagnostic_valid' in parity else parity['mld003_formal_mld'].notna())
+    validity_mismatch = int((parity['mld003_valid'].astype(bool) != formal_valid).sum())
+    depth_mismatch = int((np.abs(mld_delta) > 1e-8).fillna(False).sum())
+    parity_qa.update({'validity_mismatch_count': validity_mismatch, 'mld_depth_mismatch_count': depth_mismatch})
+    if direct_mismatch or validity_mismatch or depth_mismatch:
+        raise ValueError(f'Native .03 MLD parity failed: direct={direct_mismatch}, validity={validity_mismatch}, depth={depth_mismatch}.')
+    profile_diag.to_parquet(root/'daily_profile_diagnostics.parquet', index=False); profile_index.to_parquet(root/'native_profile_index.parquet', index=False)
+    scenario_names=[_ofes_mode_water_scenario_name(m,q,t) for m in cfg['mld_density_thresholds_kg_m3'] for q in cfg['pv_qmax_m1_s1'] for t in cfg['thickness_thresholds_m']]
+    # Keep the profile table wide.  A long eight-scenario copy would multiply
+    # both row count and prefix-heavy columns before any classifier needs it.
+    classifications=[]
+    for scenario in scenario_names:
+        mld_prefix='mld003' if scenario.startswith('mld0.03') else 'mld0125'
+        for (event, arm, pair), group in profile_diag.groupby(['event_id','particle_group','pair_id'], sort=False):
+            result = _ofes_mode_water_classify_source(
+                group, scenario, mld_prefix,
+                float(re.search(r'thick([0-9.]+)$', scenario).group(1)),
+            )
+            result.update({'event_id':event,'particle_group':arm,'pair_id':pair,
+                           'scenario':scenario,'initial_days':len(group)})
+            classifications.append(result)
+    source_class=pd.DataFrame(classifications); source_class.to_parquet(root/'particle_source_classifications.parquet',index=False)
+    comparisons=[]; exclusions=[]; scenario_summary=[]
+    for scenario in scenario_names:
+        sc=source_class[source_class.scenario.eq(scenario)]; # each pair is valid only when both arms have a usable determination
+        init=common_rows.copy(); init['scenario']=scenario
+        rows=[]
+        for (event,pair),g in init.groupby(['event_id','pair_id']):
+            a=sc[(sc.event_id==event)&(sc.pair_id==pair)&(sc.particle_group=='anomaly')]; c=sc[(sc.event_id==event)&(sc.pair_id==pair)&(sc.particle_group=='hydrographic_control')];
+            if len(a)!=1 or len(c)!=1 or a.status.iloc[0]=='source_unavailable' or c.status.iloc[0]=='source_unavailable': continue
+            rows.append({'event_id':event,'pair_id':pair,'anomaly':a.iloc[0].strong_mode_water,'control':c.iloc[0].strong_mode_water,'anomaly_detached':a.iloc[0].status in ('strong_mode_water_source','mode_water_like','other_recently_ventilated'),'control_detached':c.iloc[0].status in ('strong_mode_water_source','mode_water_like','other_recently_ventilated')})
+        pair_eval=pd.DataFrame(rows); scenario_summary.append({'scenario':scenario,'initial_pairs':len(init),'evaluable_pairs':len(pair_eval),'events_75pct':int((pair_eval.groupby('event_id').size()>=.75*init.groupby('event_id').size().reindex(pair_eval.event_id.unique()).fillna(51)).sum()) if not pair_eval.empty else 0})
+        for event,pg in pair_eval.groupby('event_id'):
+            for arm,col in [('anomaly','anomaly'),('hydrographic_control','control')]:
+                n=len(pg); strong=int(pg[col].sum()); det=int(pg[f'{col}_detached'].sum()); comparisons.append({'event_id':event,'scenario':scenario,'particle_group':arm,'strong_count':strong,'evaluable_count':n,'strong_fraction':strong/n if n else np.nan,'sustained_detachment_count':det,'conditional_strong_fraction':strong/det if det else np.nan,'pair_count_initial':int(len(init[init.event_id.eq(event)])),'pair_count_evaluable':n,'peak_month':int(pd.Timestamp(peaks[event]).month)})
+            if len(pg)<.75*len(init[init.event_id.eq(event)]): exclusions.append({'event_id':event,'scenario':scenario,'reason':'post_qc_retention_below_75pct','initial_common_pairs':len(init[init.event_id.eq(event)]),'evaluable_pairs':len(pg)})
+    event_summary, fixed_exclusions, final_pair_mask = _ofes_mode_water_event_tables(
+        source_class.assign(peak_date=source_class['event_id'].map(peaks)),
+        scenario_names,
+        common_rows,
+    )
+    event_summary.to_parquet(root/'event_paired_summary.parquet', index=False)
+    fixed_exclusions.to_parquet(root/'source_qc_exclusions.parquet', index=False)
+    final_pair_mask.to_parquet(root/'final_pair_mask.parquet', index=False)
+    pd.DataFrame(scenario_summary).to_parquet(root/'scenario_qc_summary.parquet',index=False)
+    compare=_ofes_mode_water_compare(event_summary,scenario_names,seed=cfg['random_seed'],bootstrap_replicates=cfg['bootstrap_replicates'],sign_flip_replicates=cfg['sign_flip_replicates']); compare.to_parquet(root/'population_comparisons.parquet',index=False); compare.to_csv(root/'population_comparisons.csv',index=False)
+    strict_summary, strict_exclusions, strict_mask = _ofes_mode_water_event_tables(
+        source_class.assign(peak_date=source_class['event_id'].map(peaks)),
+        scenario_names, common_rows, strict_events=strict_events,
+    )
+    strict_summary.to_parquet(root/'strict36_event_paired_summary.parquet', index=False)
+    strict_mask.to_parquet(root/'strict36_final_pair_mask.parquet', index=False)
+    strict_exclusions.to_parquet(root/'strict36_source_qc_exclusions.parquet', index=False)
+    strict_compare = _ofes_mode_water_compare(strict_summary, scenario_names,
+        seed=cfg['random_seed'], bootstrap_replicates=cfg['bootstrap_replicates'],
+        sign_flip_replicates=cfg['sign_flip_replicates'], allow_primary_test=False)
+    strict_compare.to_parquet(root/'strict36_population_comparisons.parquet', index=False)
+    primary_summary = event_summary[(event_summary.cohort.eq('core_common')) &
+        (event_summary.scenario.eq(_ofes_mode_water_scenario_name(0.03, 2e-10, 100.0)))]
+    conditional = []
+    for event, values in primary_summary.groupby('event_id', sort=True):
+        a = values[values.particle_group.eq('anomaly')].iloc[0]
+        c = values[values.particle_group.eq('hydrographic_control')].iloc[0]
+        if a.sustained_detachment_count and c.sustained_detachment_count:
+            conditional.append({'event_id': event, 'cohort': 'core_common',
+                'anomaly_detached_count': int(a.sustained_detachment_count),
+                'control_detached_count': int(c.sustained_detachment_count),
+                'anomaly_conditional_strong_fraction': a.conditional_strong_fraction,
+                'control_conditional_strong_fraction': c.conditional_strong_fraction,
+                'conditional_difference': a.conditional_strong_fraction - c.conditional_strong_fraction})
+    pd.DataFrame(conditional).to_parquet(root/'conditional_mode_water_given_detachment.parquet', index=False)
+    decomposition_rows = []
+    if not primary_summary.empty:
+        wide = primary_summary.pivot(index='event_id', columns='particle_group',
+                                     values=['sustained_detachment_count', 'evaluable_count',
+                                             'conditional_strong_fraction'])
+        det_a = wide[('sustained_detachment_count', 'anomaly')] / wide[('evaluable_count', 'anomaly')]
+        det_c = wide[('sustained_detachment_count', 'hydrographic_control')] / wide[('evaluable_count', 'hydrographic_control')]
+        for label, values, eligible in (
+            ('sustained_detachment_occurrence', det_a - det_c, wide.index),
+            ('strong_given_sustained_detachment',
+             wide[('conditional_strong_fraction', 'anomaly')] - wide[('conditional_strong_fraction', 'hydrographic_control')],
+             wide.index[(wide[('sustained_detachment_count', 'anomaly')] > 0) & (wide[('sustained_detachment_count', 'hydrographic_control')] > 0)]),
+        ):
+            diff = values.loc[eligible].dropna().to_numpy(float)
+            low, high = _ofes_mode_water_bootstrap(diff, seed=cfg['random_seed'], replicates=cfg['bootstrap_replicates'])
+            decomposition_rows.append({'metric': label, 'cohort': 'core_common',
+                'event_count': int(diff.size), 'anomaly_mean': float(values.loc[eligible].add(det_c.loc[eligible] if label == 'sustained_detachment_occurrence' else wide.loc[eligible, ('conditional_strong_fraction', 'hydrographic_control')]).mean()) if diff.size else np.nan,
+                'control_mean': float(det_c.loc[eligible].mean()) if label == 'sustained_detachment_occurrence' and diff.size else (float(wide.loc[eligible, ('conditional_strong_fraction', 'hydrographic_control')].mean()) if diff.size else np.nan),
+                'mean_difference': float(diff.mean()) if diff.size else np.nan,
+                'bootstrap95_low': low, 'bootstrap95_high': high,
+                'anomaly_detached_particles': int(wide.loc[eligible, ('sustained_detachment_count', 'anomaly')].sum()) if diff.size else 0,
+                'control_detached_particles': int(wide.loc[eligible, ('sustained_detachment_count', 'hydrographic_control')].sum()) if diff.size else 0})
+    pd.DataFrame(decomposition_rows, columns=['metric', 'cohort', 'event_count', 'anomaly_mean', 'control_mean', 'mean_difference', 'bootstrap95_low', 'bootstrap95_high', 'anomaly_detached_particles', 'control_detached_particles']).to_parquet(root/'decomposition_event_equal_comparisons.parquet', index=False)
+    class_columns = [f'{name}_strong_source' for name in ('STMW_like', 'CMW_like', 'TRMW_like')]
+    retained_classes = source_class.merge(
+        final_pair_mask[final_pair_mask.cohort.eq('core_common')][
+            ['event_id', 'pair_id', 'scenario']
+        ].drop_duplicates(), on=['event_id', 'pair_id', 'scenario'], how='inner', validate='many_to_one',
+    )
+    subtype_rows = []
+    for (scenario, arm), values in retained_classes.groupby(['scenario', 'particle_group'], sort=True):
+        denom = len(values)
+        row = {'scenario': scenario, 'cohort': 'core_common',
+               'particle_group': arm, 'evaluable_pair_count': denom,
+               'strong_union_count': int(values.strong_mode_water.fillna(False).sum()),
+               'strong_union_fraction': float(values.strong_mode_water.fillna(False).mean()) if denom else np.nan}
+        for column in class_columns:
+            row[f'{column}_count'] = int(values[column].fillna(False).sum())
+            row[f'{column}_fraction'] = float(values[column].fillna(False).mean()) if denom else np.nan
+        subtype_rows.append(row)
+    pd.DataFrame(subtype_rows).to_parquet(root/'source_class_descriptive_counts.parquet', index=False)
+    event_source_descriptives, population_source_descriptives = (
+        _ofes_mode_water_event_equal_descriptives(
+            source_class,
+            final_pair_mask,
+            analysis_event_count=int(primary_summary['event_id'].nunique()),
+        )
+    )
+    event_source_descriptives.to_parquet(
+        root/'mode_water_event_source_descriptives.parquet', index=False,
+    )
+    population_source_descriptives.to_parquet(
+        root/'mode_water_event_equal_descriptive_summary.parquet', index=False,
+    )
+    population_source_descriptives.to_csv(
+        root/'mode_water_event_equal_descriptive_summary.csv', index=False,
+    )
+    source_class[source_class.event_id.eq('OFES_DO50_E000073')].to_parquet(
+        root/'e000073_descriptive_source_classifications.parquet', index=False,
+    )
+    paired_primary = primary_summary.pivot(index='event_id', columns='particle_group', values=['strong_fraction', 'peak_month'])
+    if not paired_primary.empty:
+        month_events = pd.DataFrame({'peak_month': paired_primary[('peak_month', 'anomaly')],
+            'difference': paired_primary[('strong_fraction', 'anomaly')] - paired_primary[('strong_fraction', 'hydrographic_control')]}).reset_index()
+    else:
+        month_events = pd.DataFrame(columns=['event_id', 'peak_month', 'difference'])
+    month_block = _ofes_mode_water_peak_month_bootstrap(month_events, seed=cfg['random_seed'], replicates=cfg['bootstrap_replicates'])
+    pd.DataFrame([month_block]).to_parquet(root/'peak_month_block_bootstrap.parquet', index=False)
+    eligibility=[]; parent=pd.read_parquet(plots_output_root/'do'/'ofes_np30_ke'/cfg['parent_population_subdir']/'population_events.parquet'); parent_ids=set(parent.event_id.astype(str)) if 'event_id' in parent else set(); trajectory_ids=set(es.event_id.astype(str)); horizon_by_event=eh[eh.horizon_days.eq(30)].groupby('event_id')
+    for event in sorted(parent_ids|trajectory_ids):
+        if event not in trajectory_ids: reason = 'no_trajectory'
+        elif event in candidates: reason = 'eligible_both_group_diagnostic'
+        else:
+            rows = horizon_by_event.get_group(event) if event in horizon_by_event.groups else pd.DataFrame()
+            groups = set(rows.loc[rows.diagnostic_passed.fillna(False).astype(bool), 'particle_group']) if not rows.empty else set()
+            reason = 'anomaly_diagnostic_failed' if 'anomaly' not in groups else ('hydrographic_control_diagnostic_failed' if 'hydrographic_control' not in groups else 'pair_completeness_failed')
+        eligibility.append({'event_id':event,'parent_catalog':event in parent_ids,'candidate':event in candidates,'strict_75pct_candidate':event in strict_events,'exclusion_reason':reason})
+    pd.DataFrame(eligibility).to_parquet(root/'event_eligibility_attrition.parquet',index=False)
+    # One compact exploratory figure: paired event observations plus effect forest.
+    strong_thickness_violations = 0
+    strong_q_violations = 0
+    for scenario, values in source_class.groupby('scenario', sort=False):
+        match = re.search(r'_q([0-9.e+-]+)_thick([0-9.]+)$', scenario)
+        if match is None:
+            raise ValueError(f'Cannot parse frozen scenario identity: {scenario}')
+        qmax, thickness_value = float(match.group(1)), float(match.group(2))
+        for name in ('STMW_like', 'CMW_like', 'TRMW_like'):
+            strong_rows = values[values[f'{name}_strong_source'].fillna(False)]
+            strong_thickness_violations += int((pd.to_numeric(strong_rows[f'{name}_source_layer_thickness_m'], errors='coerce') < thickness_value).sum())
+            qp = pd.to_numeric(strong_rows['source_qp'], errors='coerce')
+            strong_q_violations += int((~np.isfinite(qp) | (qp < 0.0) | (qp > qmax)).sum())
+    monotonic_qa = {'strong_union_matches_class_union': bool((source_class['strong_mode_water'].fillna(False) == source_class[[f'{x}_strong_source' for x in ('STMW_like','CMW_like','TRMW_like')]].fillna(False).any(axis=1)).all()), 'strong_source_thickness_violations': strong_thickness_violations, 'strong_source_q_violations': strong_q_violations}
+    observed_rss_mb = float(profile_diag['rss_mb'].max()) if 'rss_mb' in profile_diag and not profile_diag.empty else np.nan
+    fig=plot_ofes_mode_water_source_screening({'event_summary':event_summary,'comparisons':compare},output_dir=root,show_fig=False,save_fig=True); qa={'preflight':preflight,'pure_tests':pure,'profile_rows':int(len(profile_index)),'profile_dates':int(profile_index.date.nunique()),'source_rows':int(len(source_class)),'mld_parity':parity_qa,'monotonic_qa':monotonic_qa,'scenarios':scenario_names,'workers_requested':int(workers),'workers_effective':1,'worker_policy':'date-batched T/S sampling is intentionally serial; at most one NetCDF reader is active','memory_limit_requested':memory_limit,'observed_peak_rss_mb':observed_rss_mb,'memory_limit_effective':'one daily temp/salinity snapshot plus bounded per-day diagnostics; observed RSS is recorded','month_block_bootstrap':month_block,'final_pair_mask_rows':int(len(final_pair_mask)),'strict36_final_pair_mask_rows':int(len(strict_mask)),'outputs':{p.name:str(p) for p in root.iterdir() if p.is_file()}}
+    (root/'qa_report.json').write_text(json.dumps(qa,ensure_ascii=False,indent=2,default=str)); (root/'settings.json').write_text(json.dumps(cfg,ensure_ascii=False,indent=2,default=str));
+    source_files = [traj/'event_summary.parquet', traj/'event_horizon_summary.parquet', traj/'daily_ventilation_diagnostics.parquet', traj/'particle_metadata.parquet', traj/'control_match_audit.parquet', traj/'event_context.parquet', plots_output_root/'do'/'ofes_np30_ke'/cfg['parent_population_subdir']/'population_events.parquet']
+    manifest={'status':'complete','analysis':'observed_30day_mode_water_source_screening','created_at_utc':pd.Timestamp.now(tz='UTC').isoformat(),'cache_schema_version':'mode_water_native_v2','source_inputs':{('parent_population_events.parquet' if p.name == 'population_events.parquet' else p.name):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files},'outputs':qa['outputs'],'candidate_count':len(candidates),'strict_75pct_count':len(strict_events),'settings_identity':hashlib.sha256(json.dumps(cfg,sort_keys=True,default=str).encode()).hexdigest()}; (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2,default=str))
+    return {
+        'output_dir': root,
+        'preflight': preflight,
+        'pure_tests': pure,
+        'event_summary': event_summary,
+        'comparisons': compare,
+        'source_classifications': source_class,
+        'event_source_descriptives': event_source_descriptives,
+        'event_equal_descriptive_summary': population_source_descriptives,
+        'qa': qa,
+        'figure_path': fig.get('figure_path'),
+    }
+
+
+def load_ofes_mode_water_source_screening(output_dir: str | Path | None = None) -> dict:
+    """读取已完成的 OFES mode-water source screening 结果。
+
+    参数:
+        - output_dir (str | Path | None): 显式结果目录；None 使用冻结 YAML 目录。
+    返回:
+        - dict: manifest、事件汇总、比较表、粒子分类和事件等权来源描述表。
+    说明:
+        - 只读取已验证的完成产物，不触发 OFES 原始场采样。
+    """
+    root=_ofes_mode_water_output_root(output_dir)
+    if not (root/'manifest.json').exists(): raise FileNotFoundError(f'Mode-water screening manifest not found: {root}')
+    manifest = json.loads((root/'manifest.json').read_text())
+    required = [
+        'event_paired_summary.parquet', 'population_comparisons.parquet',
+        'particle_source_classifications.parquet', 'final_pair_mask.parquet',
+        'mode_water_event_source_descriptives.parquet',
+        'mode_water_event_equal_descriptive_summary.parquet',
+        'settings.json', 'qa_report.json',
+    ]
+    missing = [name for name in required if not (root / name).exists()]
+    if manifest.get('status') != 'complete' or manifest.get('cache_schema_version') != 'mode_water_native_v2' or missing:
+        raise ValueError(f'Mode-water result is incomplete or lacks validated v2 identity: {missing}')
+    current_identity = hashlib.sha256(json.dumps(_ofes_mode_water_settings(), sort_keys=True, default=str).encode()).hexdigest()
+    if manifest.get('settings_identity') != current_identity:
+        raise ValueError('Mode-water result settings identity does not match frozen configuration.')
+    cfg = _ofes_mode_water_settings()
+    traj = plots_output_root / 'do' / 'ofes_np30_ke' / cfg['trajectory_subdir']
+    source_paths = {
+        'event_summary.parquet': traj / 'event_summary.parquet',
+        'event_horizon_summary.parquet': traj / 'event_horizon_summary.parquet',
+        'daily_ventilation_diagnostics.parquet': traj / 'daily_ventilation_diagnostics.parquet',
+        'particle_metadata.parquet': traj / 'particle_metadata.parquet',
+        'control_match_audit.parquet': traj / 'control_match_audit.parquet',
+        'event_context.parquet': traj / 'event_context.parquet',
+        'parent_population_events.parquet': plots_output_root / 'do' / 'ofes_np30_ke' / cfg['parent_population_subdir'] / 'population_events.parquet',
+    }
+    for name, digest in manifest.get('source_inputs', {}).items():
+        path = source_paths.get(name)
+        if path is None or not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError(f'Mode-water source input hash mismatch: {name}')
+    schemas = {
+        'event_paired_summary.parquet': ('event_id', 'particle_group', 'scenario'),
+        'population_comparisons.parquet': ('scenario', 'cohort', 'event_count'),
+        'particle_source_classifications.parquet': ('event_id', 'particle_group', 'pair_id', 'scenario'),
+        'final_pair_mask.parquet': ('event_id', 'pair_id', 'scenario'),
+    }
+    for name, columns in schemas.items():
+        frame = pd.read_parquet(root / name, columns=list(columns))
+        if any(column not in frame.columns for column in columns):
+            raise ValueError(f'Mode-water output schema mismatch: {name}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'event_summary': pd.read_parquet(root/'event_paired_summary.parquet'),
+        'comparisons': pd.read_parquet(root/'population_comparisons.parquet'),
+        'source_classifications': pd.read_parquet(root/'particle_source_classifications.parquet'),
+        'event_source_descriptives': pd.read_parquet(
+            root/'mode_water_event_source_descriptives.parquet'
+        ),
+        'event_equal_descriptive_summary': pd.read_parquet(
+            root/'mode_water_event_equal_descriptive_summary.parquet'
+        ),
+    }
+
+
+def _ofes_mode_water_scenario_label(scenario: str) -> str:
+    """将内部场景标识转换为图中的物理阈值标签。"""
+    match = re.fullmatch(r'mld([0-9.]+)_q([0-9.e+-]+)_thick([0-9.]+)', str(scenario))
+    if match is None:
+        raise ValueError(f'Cannot parse mode-water scenario label: {scenario}')
+    mld, qmax, thickness = (float(value) for value in match.groups())
+    return (
+        rf'$\Delta\sigma_\theta={mld:g}$ kg m$^{{-3}}$; '
+        rf'$q_p\leq {qmax / 1.0e-10:g}\times10^{{-10}}$ m$^{{-1}}$ s$^{{-1}}$'
+        f'\nminimum layer thickness = {thickness:g} m'
+    )
+
+
+def plot_ofes_mode_water_source_screening(result: Mapping[str, Any] | None = None, *, output_dir: str | Path | None = None, show_fig: bool = True, save_fig: bool = True) -> dict:
+    """绘制 paired event fractions 与四个核心场景的 effect/95% interval。
+
+    参数:
+        - result (Mapping | None): 已加载的 screening 结果；None 时从磁盘读取。
+        - output_dir (str | Path | None): 显式结果目录。
+        - show_fig (bool): 是否显示图形。
+        - save_fig (bool): 是否写入固定 PNG。
+    返回:
+        - dict: Matplotlib figure、figure path 和绘图使用的事件数。
+    输出:
+        - `mode_water_source_screening.png`，仅当 `save_fig=True`。
+    说明:
+        - 左图明确标注重复的零值事件；右图从正式比较表读取事件等权效应与 bootstrap 区间。
+    """
+    payload = result if result is not None else load_ofes_mode_water_source_screening(output_dir)
+    es = payload['event_summary']
+    comp = payload['comparisons']
+    settings = _ofes_mode_water_settings()
+    scenario_order = [
+        _ofes_mode_water_scenario_name(mld, qmax, 100.0)
+        for mld in settings['mld_density_thresholds_kg_m3']
+        for qmax in settings['pv_qmax_m1_s1']
+    ]
+    core = comp[
+        comp['scenario'].isin(scenario_order) & comp['cohort'].eq('core_common')
+    ].copy()
+    core['scenario'] = pd.Categorical(
+        core['scenario'], categories=scenario_order, ordered=True,
+    )
+    core = core.sort_values('scenario', kind='mergesort')
+    if core.empty:
+        fig, axis = plt.subplots(figsize=(8, 3.5))
+        axis.text(.5, .5, 'Inconclusive: no core-common evaluable event cohort', ha='center', va='center')
+        axis.set_axis_off()
+        path = None
+        if save_fig:
+            root=_ofes_mode_water_output_root(output_dir); root.mkdir(parents=True,exist_ok=True)
+            path=root/'mode_water_source_screening.png'; fig.savefig(path,dpi=_ofes_mode_water_settings()['figure_dpi'],bbox_inches='tight')
+        if show_fig: plt.show()
+        plt.close(fig)
+        return {
+            'figure': fig,
+            'figure_path': str(path) if path is not None else None,
+            'event_count': 0,
+        }
+    primary_scenario = _ofes_mode_water_scenario_name(0.03, 2.0e-10, 100.0)
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(12, 5.5), gridspec_kw={'width_ratios': [1.25, 1.15]},
+    )
+    base = es[
+        es['scenario'].eq(primary_scenario) & es['cohort'].eq('core_common')
+    ]
+    if base.duplicated(['event_id', 'particle_group']).any():
+        raise ValueError('Core paired plot requires one row per event and arm.')
+    anomaly = base[base['particle_group'].eq('anomaly')].set_index('event_id')
+    control = base[base['particle_group'].eq('hydrographic_control')].set_index('event_id')
+    event_ids = sorted(set(anomaly.index) & set(control.index))
+    anomaly_values = 100.0 * anomaly.loc[event_ids, 'strong_fraction'].to_numpy(float)
+    control_values = 100.0 * control.loc[event_ids, 'strong_fraction'].to_numpy(float)
+    for anomaly_value, control_value in zip(anomaly_values, control_values):
+        ax1.plot([0, 1], [anomaly_value, control_value], color='#b8c2cc', lw=.7, zorder=1)
+    ax1.scatter(np.zeros(len(event_ids)), anomaly_values, s=18, color='#b91c1c', zorder=2)
+    ax1.scatter(np.ones(len(event_ids)), control_values, s=18, color='#2563eb', zorder=2)
+    anomaly_zero = int(np.isclose(anomaly_values, 0.0).sum())
+    control_zero = int(np.isclose(control_values, 0.0).sum())
+    ax1.set_xticks([0, 1], ['DO-anomaly particles', 'Matched controls'])
+    ax1.set_ylabel('Strong low-PV source fraction (%)')
+    ax1.set_title(
+        f'Event-level paired observations (n={len(event_ids)})\n'
+        f'Zero-valued events: anomaly {anomaly_zero}/{len(event_ids)}; '
+        f'control {control_zero}/{len(event_ids)}',
+        fontsize=10,
+    )
+    ax1.grid(axis='y', color='#d1d5db', lw=.6, alpha=.6)
+    y = np.arange(len(core))
+    means = 100.0 * core['mean_difference'].to_numpy(float)
+    lower = 100.0 * core['bootstrap95_low'].to_numpy(float)
+    upper = 100.0 * core['bootstrap95_high'].to_numpy(float)
+    ax2.axvline(0, color='#111827', lw=.8)
+    ax2.errorbar(
+        means, y, xerr=[means - lower, upper - means], fmt='o',
+        color='#111827', ecolor='#4b5563', capsize=3,
+    )
+    labels = [
+        f'{_ofes_mode_water_scenario_label(str(scenario))}\n(n={int(count)} events)'
+        for scenario, count in zip(core['scenario'], core['event_count'])
+    ]
+    ax2.set_yticks(y, labels)
+    ax2.invert_yaxis()
+    ax2.set_xlabel('Anomaly − control fraction (percentage points)')
+    ax2.set_title('Event-equal effect (bootstrap 95% CI)', fontsize=10)
+    ax2.grid(axis='x', color='#d1d5db', lw=.6, alpha=.6)
+    for axis, label in zip((ax1, ax2), ('a', 'b')):
+        axis.text(-0.10, 1.04, label, transform=axis.transAxes,
+                  fontsize=12, fontweight='bold', va='bottom')
+        axis.spines[['top', 'right']].set_visible(False)
+    fig.suptitle('Observed 30-day mode-water source pathway screen', fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    path = None
+    if save_fig:
+        root = _ofes_mode_water_output_root(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root/'mode_water_source_screening.png'
+        fig.savefig(path, dpi=settings['figure_dpi'], bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return {
+        'figure': fig,
+        'figure_path': str(path) if path is not None else None,
+        'event_count': len(event_ids),
+        'zero_event_counts': {'anomaly': anomaly_zero, 'control': control_zero},
+    }
