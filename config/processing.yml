@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.32 变更：
+#   - 新增冻结的 OFES S5 反向 DO 富集审计参数与 control caliper/抽样设置；
+#     仅消费既有 S5/DO 产物。
 # version 1.31 变更：
 #   - 新增冻结 OFES 30-day observed mode-water source screening 的热盐采样、
 #     low-PV proxy、MLD/PV sensitivity、事件级 bootstrap 与固定输出目录参数。
@@ -119,7 +122,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.31
+version: 1.32
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -384,6 +387,25 @@ ofes:
     rank_thickness_reference_m: 100.0
     rank_duration_reference_days: 5.0
     output_region_slug: ofes_np30_ke
+  scv_reverse_enrichment:
+    s5_input: ./data/ofes_scv_reverse_inputs/s5
+    do_catalog_input: ./data/ofes_scv_reverse_inputs/do_catalog
+    scopes:
+      primary_300_1000: [300.0, 1000.0]
+      deep_500_1000: [500.0, 1000.0]
+    thresholds: [20.0, 35.0, 50.0]
+    standardization_min_reference: 20
+    block_lengths_days: [20, 40]
+    bootstrap_replicates: 10000
+    control_radii_km: [130.0, 155.0, 180.0, 205.0, 230.0]
+    control_azimuth_count: 16
+    control_min_count: 5
+    control_max_count: 20
+    control_latitude_caliper_deg: 1.0
+    control_density_caliper_kg_m3: 0.10
+    control_area_caliper_fraction: 0.05
+    control_random_seed: 20260831
+
   event_diagnostics:
     candidate_threshold: 50.0
     candidate_count: 5

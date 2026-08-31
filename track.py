@@ -76862,3 +76862,1846 @@ def plot_ofes_mode_water_source_screening(result: Mapping[str, Any] | None = Non
         'event_count': len(event_ids),
         'zero_event_counts': {'anomaly': anomaly_zero, 'control': control_zero},
     }
+def _ofes_scv_reverse_paths() -> dict[str, Path]:
+    """返回 S5 反向 DO 富集审计的输入和输出路径。"""
+    cfg = _PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {})
+    paths = _PATHS_CFG.get('paths', {})
+    return {
+        's5': Path(paths.get('ofes_scv_s5_input', cfg.get('s5_input', ''))),
+        'do_catalog': Path(paths.get('ofes_scv_do_catalog_input', cfg.get('do_catalog_input', ''))),
+        'output': Path(paths.get('ofes_scv_reverse_output', './plot_outputs/do/ofes_np30_ke/scv_reverse_enrichment_v1')),
+    }
+
+
+def _ofes_scv_reverse_scope(scope: str) -> tuple[float, float]:
+    """解析反向富集审计的固定垂向搜索范围。"""
+    scopes = _PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}).get('scopes', {})
+    if scope not in scopes:
+        raise ValueError(f'Unknown reverse enrichment scope: {scope}')
+    bounds = tuple(float(value) for value in scopes[scope])
+    if len(bounds) != 2 or bounds[0] >= bounds[1]:
+        raise ValueError(f'Invalid reverse enrichment scope: {scope}')
+    return bounds
+
+
+def _ofes_scv_reverse_global_index(day_summary: Mapping[str, Any], local_lat: Any, local_lon: Any, date: pd.Timestamp, *, source_lat: Any | None = None, source_lon: Any | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """将 S5 日片的窗口索引转换为 OFES 源网格索引。"""
+    lon, lat, _, _, _ = _ofes_tracer_coordinates(pd.Timestamp(date))
+    lat_slice = _ofes_contiguous_slice(np.asarray(lat), tuple(day_summary['window_lat_bounds']), 'latitude')
+    lon_slice = _ofes_contiguous_slice(np.asarray(lon), tuple(day_summary['window_lon_bounds']), 'longitude', longitude=True)
+    rows = np.asarray(local_lat, dtype=int) + int(lat_slice.start)
+    cols = np.asarray(local_lon, dtype=int) + int(lon_slice.start)
+    if np.any(rows < 0) or np.any(rows >= len(lat)) or np.any(cols < 0) or np.any(cols >= len(lon)):
+        raise ValueError('S5 local index falls outside the source grid.')
+    if source_lat is not None and not np.allclose(np.asarray(source_lat, dtype=float), np.asarray(lat)[rows], rtol=0.0, atol=2e-5):
+        raise ValueError('S5 voxel latitude disagrees with source coordinate.')
+    if source_lon is not None and not np.allclose(np.asarray(source_lon, dtype=float), np.asarray(lon)[cols], rtol=0.0, atol=2e-5):
+        raise ValueError('S5 voxel longitude disagrees with source coordinate.')
+    return rows, cols
+
+
+def build_ofes_scv_reverse_day(
+    date: str | pd.Timestamp,
+    *,
+    scope: str = 'primary_300_1000',
+    s5_root: str | Path | None = None,
+    do_catalog_root: str | Path | None = None,
+    read_raw_do: bool = True,
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict:
+    """构建单日、单垂向范围的 S5 反向 DO 资格与标签表。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - scope (str): `primary_300_1000` 或 `deep_500_1000`。
+        - s5_root (str | Path | None): S5 紧凑日片根目录。
+        - do_catalog_root (str | Path | None): 既有 DO 日目录。
+        - read_raw_do (bool): 是否读取原始 DO 以建立 outcome-independent eligibility。
+        - snapshot (Mapping[str, Any] | None): 已读取的 DO snapshot；提供时避免重复 NetCDF 读取。
+
+    返回:
+        - dict: 含逐源格点 `frame`、S5 attrition、DO metadata 和输入 provenance。
+
+    输出:
+        - 不写文件；调用方负责持久化紧凑日片。
+
+    说明:
+        - S5 标签只来自 owner tile 的 prefilter/seeds/objects；缺失 owner 行保持 unavailable。
+        - deep 范围独立调用向量化 peak helper，不从 primary peak 后过滤。
+    """
+    d = pd.Timestamp(date).normalize()
+    zmin, zmax = _ofes_scv_reverse_scope(scope)
+    paths = _ofes_scv_reverse_paths()
+    s5_root = Path(s5_root) if s5_root is not None else paths['s5']
+    do_catalog_root = Path(do_catalog_root) if do_catalog_root is not None else paths['do_catalog']
+    if (s5_root / 'days').is_dir():
+        s5_root = s5_root / 'days'
+    day_dirs = sorted(s5_root.glob(f'{d:%Y%m%d}_t*'))
+    manifest_path = s5_root.parent / 'manifest.json'
+    if not day_dirs or not manifest_path.exists():
+        raise FileNotFoundError(f'No S5 day fragments for {d:%Y-%m-%d}: {s5_root}')
+    manifest = json.loads(manifest_path.read_text())
+    tile_lats = np.asarray(manifest.get('tile_lat_centers', []), dtype=float)
+    tile_lons = np.asarray(manifest.get('tile_lon_centers', []), dtype=float)
+    expected_tiles = int(manifest.get('tile_count', 0))
+    if tile_lats.size == 0 or tile_lons.size == 0 or tile_lats.size * tile_lons.size != expected_tiles:
+        raise ValueError('S5 manifest has incomplete tile-center axes.')
+    if len(day_dirs) != expected_tiles:
+        raise ValueError(f'S5 date {d:%Y-%m-%d} has {len(day_dirs)} fragments, expected {expected_tiles}.')
+    if d.strftime('%Y-%m-%d') not in set(manifest.get('dates', [])):
+        raise ValueError(f'S5 date is absent from manifest: {d:%Y-%m-%d}')
+    if any(not _ofes_grid_scv_v2_s5_fragment_reusable(path) for path in day_dirs):
+        raise ValueError(f'S5 date {d:%Y-%m-%d} has incomplete tile fragments.')
+    records: dict[tuple[int, int], dict[str, Any]] = {}
+    diagnostics = {'tile_count': len(day_dirs), 'overlap_rows': 0, 'nonowner_overlap_rows': 0, 'nonowner_contradictory_labels': 0, 'contradictory_labels': 0, 'failure_states': {}}
+    tile_observations: dict[tuple[int, int], list[tuple[int, tuple[Any, ...]]]] = {}
+    pending_voxels: list[tuple[pd.DataFrame, pd.DataFrame, Mapping[str, Any], int]] = []
+    qualified_ids: set[str] | None = None
+    objects_table = s5_root.parent / 's5_objects.parquet'
+    if not objects_table.exists():
+        raise FileNotFoundError(f'Missing authoritative S5 object table: {objects_table}')
+    qualified_ids = set(pd.read_parquet(objects_table, columns=['object_id'])['object_id'].astype(str))
+    for day_dir in day_dirs:
+        summary_path = day_dir / 'day_summary.json'
+        if not summary_path.exists():
+            continue
+        summary = json.loads(summary_path.read_text())
+        if summary.get('status') != 'complete':
+            continue
+        tile_id = day_dir.name.rsplit('_', 2)[-2:]
+        tile_index = None
+        if tile_lats.size and tile_lons.size:
+            core = (float(summary['window_core_lon']), float(summary['window_core_lat']))
+            tile_index = int(_ofes_grid_v2_nearest_center(np.asarray([core[1]]), tile_lats)[0] * tile_lons.size + _ofes_grid_v2_nearest_center(np.asarray([core[0]]), tile_lons)[0])
+        seeds_path, scan_path = day_dir / 'seeds.parquet', day_dir / 'prefilter_scan.parquet'
+        if not scan_path.exists():
+            continue
+        scan = pd.read_parquet(scan_path)
+        if tile_index is not None and tile_lats.size:
+            expected = tile_index
+            tile_parts = day_dir.name.split('_t')[-1].split('_')
+            actual = int(tile_parts[1]) if len(tile_parts) > 1 else expected
+            if actual != expected:
+                raise ValueError(f'Tile core does not match manifest owner: {day_dir.name} expected {expected} got {actual}.')
+        rows, cols = _ofes_scv_reverse_global_index(summary, scan['lat_index'], scan['lon_index'], d)
+        tile_parts = day_dir.name.split('_t')[-1].split('_')
+        actual_tile = int(tile_parts[1]) if len(tile_parts) > 1 else -1
+        lon_grid, lat_grid, _, _, _ = _ofes_tracer_coordinates(d)
+        owner = _ofes_grid_v2_nearest_center(np.asarray(lat_grid)[rows], tile_lats) * tile_lons.size + _ofes_grid_v2_nearest_center(np.asarray(lon_grid)[cols], tile_lons) if tile_lats.size and tile_lons.size else np.full(len(rows), actual_tile)
+        known_scientific_negative = {'spice_envelope', 'n2_envelope', 'envelope_density_tolerance', 'initial_spice_n2_candidate', 'gaussian', 'dynamic_height', 'surface_connected_spice_anomaly', 'profile_offset_qc', 'below_pycnocline'}
+        known_positive = {'passed', 'grid_lens', 'mccoy_compatible'}
+        for position, (row, col, passed, stage, compatible, mstage, nctrl) in enumerate(zip(rows, cols, scan['prefilter_retained'], scan['prefilter_failure_stage'], scan['mccoy_profile_compatible'], scan['mccoy_failure_stage'], scan['valid_control_profile_count'])):
+            key = (int(row), int(col))
+            signature = (bool(passed), bool(compatible), str(stage), str(mstage), int(nctrl))
+            observations = tile_observations.setdefault(key, [])
+            if any(tile != actual_tile for tile, _ in observations):
+                diagnostics['nonowner_overlap_rows'] += 1
+                if any(previous != signature for _, previous in observations):
+                    diagnostics['nonowner_contradictory_labels'] += 1
+            observations.append((actual_tile, signature))
+            if tile_lats.size and tile_lons.size and int(owner[position]) != actual_tile:
+                continue
+            if key in records:
+                diagnostics['overlap_rows'] += 1
+                previous = tuple(records[key].get(name) for name in ('prefilter_retained', 'mccoy_profile_compatible', 'failure_stage', 'mccoy_failure_stage', 'valid_control_profile_count'))
+                current = (bool(passed), bool(compatible), str(stage), str(mstage), int(nctrl))
+                if previous != current:
+                    diagnostics['contradictory_labels'] += 1
+                    raise ValueError(f'Contradictory owner classification at source key {key}.')
+                continue
+            failure = str(mstage) if str(mstage) not in {'', 'nan', 'None'} else str(stage)
+            assessable = bool(int(nctrl) >= 61 and (failure in known_scientific_negative or failure in known_positive))
+            records[key] = {'global_lat_index': int(row), 'global_lon_index': int(col), 'classifier_assessable': assessable, 'classifier_outcome': ('positive' if bool(compatible) else ('negative' if assessable else 'unavailable')), 'prefilter_retained': bool(passed), 'mccoy_profile_compatible': bool(compatible), 'failure_stage': str(stage), 'mccoy_failure_stage': str(mstage), 'valid_control_profile_count': int(nctrl), 'tier0': False, 'tier1': False, 'weak_native': False, 'strong_native': False, 'well_resolved': False, 'seed_in_grid': False, 'core_pressure_dbar': np.nan, 'core_density': np.nan}
+            diagnostics['failure_states'][str(stage)] = diagnostics['failure_states'].get(str(stage), 0) + 1
+        if seeds_path.exists() and {'lat_index', 'lon_index'}.issubset(pd.read_parquet(seeds_path, columns=None).columns):
+            seeds = pd.read_parquet(seeds_path)
+            sr, sc = _ofes_scv_reverse_global_index(summary, seeds['lat_index'], seeds['lon_index'], d)
+            seed_owner = _ofes_grid_v2_nearest_center(np.asarray(lat_grid)[sr], tile_lats) * tile_lons.size + _ofes_grid_v2_nearest_center(np.asarray(lon_grid)[sc], tile_lons) if tile_lats.size and tile_lons.size else np.full(len(sr), actual_tile)
+            for row, col, own in zip(sr, sc, seed_owner):
+                if tile_lats.size and tile_lons.size and int(own) != actual_tile:
+                    continue
+                rec = records.get((int(row), int(col)))
+                if rec is not None:
+                    rec['tier0'] = True
+                    seed = seeds.loc[(seeds['lat_index'].astype(int) == int(row - int(_ofes_contiguous_slice(np.asarray(lat_grid), tuple(summary['window_lat_bounds']), 'latitude').start))) & (seeds['lon_index'].astype(int) == int(col - int(_ofes_contiguous_slice(np.asarray(lon_grid), tuple(summary['window_lon_bounds']), 'longitude', longitude=True).start)))]
+                    if not seed.empty:
+                        seed_row = seed.iloc[0]
+                        rec['seed_in_grid'] = bool(seed_row.get('seed_in_grid', False))
+                        rec['core_pressure_dbar'] = float(seed_row.get('gaussian_peak_pressure_dbar', np.nan))
+                        rec['core_density'] = float(seed_row.get('gaussian_peak_density', np.nan))
+        objects_path, voxels_path = day_dir / 'objects.parquet', day_dir / 'voxels.parquet'
+        if objects_path.exists() and voxels_path.exists():
+            objects = pd.read_parquet(objects_path)
+            voxels = pd.read_parquet(voxels_path)
+            if not objects.empty and not voxels.empty and {'lat_index', 'lon_index', 'depth_m', 'voxel_thickness_m', 'object_id'}.issubset(voxels.columns):
+                objects['qualified_object_id'] = day_dir.name + '_' + objects['object_id'].astype(str)
+                if qualified_ids is not None:
+                    objects = objects.loc[objects['qualified_object_id'].isin(qualified_ids)].copy()
+                good = objects.loc[objects['tier1_identity'].eq('grid_lens')].copy()
+                if not good.empty:
+                    pending_voxels.append((good, voxels, summary, actual_tile))
+    for objects, voxels, summary, actual_tile in pending_voxels:
+        kept_ids = set(objects['object_id'].astype(str))
+        voxels = voxels.loc[voxels['object_id'].astype(str).isin(kept_ids)].copy()
+        if voxels.empty:
+            continue
+        object_flags = objects.set_index('object_id')[['weak_native_support', 'strong_native_support', 'well_resolved_grid_lens']].to_dict('index')
+        vr, vc = _ofes_scv_reverse_global_index(summary, voxels['lat_index'], voxels['lon_index'], d, source_lat=voxels['voxel_lat'], source_lon=voxels['voxel_lon'])
+        for oid, row, col, dep, thick in zip(voxels['object_id'], vr, vc, voxels['depth_m'], voxels['voxel_thickness_m']):
+            if not (np.isfinite(dep) and np.isfinite(thick) and thick > 0 and zmin <= float(dep) + float(thick) / 2 and zmax >= float(dep) - float(thick) / 2):
+                continue
+            key = (int(row), int(col))
+            rec = records.get(key)
+            if rec is None:
+                rec = {'global_lat_index': key[0], 'global_lon_index': key[1], 'classifier_assessable': False, 'classifier_outcome': 'unavailable', 'prefilter_retained': False, 'mccoy_profile_compatible': False, 'failure_stage': 'missing_owner_scan', 'mccoy_failure_stage': 'missing_owner_scan', 'valid_control_profile_count': 0, 'tier0': False, 'tier1': False, 'weak_native': False, 'strong_native': False, 'well_resolved': False, 'seed_in_grid': False, 'core_pressure_dbar': np.nan, 'core_density': np.nan}
+                records[key] = rec
+                diagnostics['failure_states']['missing_owner_scan'] = diagnostics['failure_states'].get('missing_owner_scan', 0) + 1
+            rec['tier1'] = True
+            meta = object_flags[str(oid)]
+            rec['weak_native'] |= bool(meta.get('weak_native_support', False)); rec['strong_native'] |= bool(meta.get('strong_native_support', False)); rec['well_resolved'] |= bool(meta.get('well_resolved_grid_lens', False))
+    frame = pd.DataFrame(records.values())
+    frame['date'] = d
+    frame['scope'] = scope
+    if read_raw_do:
+        snap = snapshot if snapshot is not None else load_ofes_snapshot(d, variables=['do2'])
+        cfg = make_detection_config('do', do_threshold=float(min((_OFES_CFG.get('delta_do_catalog', {}).get('thresholds', [20.0])))), anomaly_min_depth=zmin, anomaly_max_depth=zmax)
+        peaks = _ofes_vectorized_do_peaks(snap['do2'], snap['depth'], cfg, minimum_delta=20.0)
+        valid = np.isfinite(snap['do2']) & (snap['do2'] > cfg.do_near_zero_threshold)
+        counts = np.count_nonzero(valid, axis=0)
+        rejected = peaks['rejected_near_zero']
+        searchable = np.zeros(counts.shape, dtype=bool)
+        for level, depth_value in enumerate(snap['depth']):
+            if depth_value < zmin or depth_value > zmax:
+                continue
+            lower = (snap['depth'] >= max(0.0, depth_value - cfg.depth_interval)) & (snap['depth'] < depth_value)
+            upper = (snap['depth'] > depth_value) & (snap['depth'] <= depth_value + cfg.depth_interval)
+            searchable |= valid[level] & (np.count_nonzero(valid & lower[:, None, None], axis=0) > 0) & (np.count_nonzero(valid & upper[:, None, None], axis=0) > 0)
+        frame['do_evaluable'] = False; frame['do_eligibility_reason'] = 'unavailable'; frame['delta_do'] = np.nan; frame['peak_depth'] = np.nan
+        if not frame.empty:
+            rr, cc = frame['global_lat_index'].to_numpy(), frame['global_lon_index'].to_numpy()
+            frame['lat'] = np.asarray(snap['lat'])[rr]
+            frame['lon'] = np.asarray(snap['lon'])[cc]
+            frame['do_evaluable'] = (counts[rr, cc] >= 5) & ~rejected[rr, cc] & searchable[rr, cc]
+            frame['do_eligibility_reason'] = np.select([rejected[rr, cc], counts[rr, cc] < 5, ~searchable[rr, cc]], ['near_zero_rejection', 'too_few_valid_levels', 'no_searchable_level'], default='evaluable')
+            frame['delta_do'] = peaks['delta_do'][rr, cc]; frame['peak_depth'] = peaks['peak_depth'][rr, cc]
+            frame['do20'] = np.isfinite(frame['delta_do']) & (frame['delta_do'] >= 20)
+            frame['do35'] = np.isfinite(frame['delta_do']) & (frame['delta_do'] >= 35)
+            frame['do50'] = np.isfinite(frame['delta_do']) & (frame['delta_do'] >= 50)
+    else:
+        frame['do_evaluable'] = False; frame['do_eligibility_reason'] = 'raw_do_not_loaded'; frame['delta_do'] = np.nan; frame['peak_depth'] = np.nan
+        for col in ('do20', 'do35', 'do50'): frame[col] = False
+    if not frame.empty and ('lat' not in frame or 'lon' not in frame):
+        frame['lat'] = np.asarray(lat_grid)[frame['global_lat_index'].astype(int)]
+        frame['lon'] = np.asarray(lon_grid)[frame['global_lon_index'].astype(int)]
+    return {'date': d, 'scope': scope, 'frame': frame, 'diagnostics': diagnostics, 'source': {'s5_root': str(s5_root), 'do_catalog_root': str(do_catalog_root)}}
+
+
+def summarize_ofes_scv_reverse_day(result: Mapping[str, Any]) -> pd.DataFrame:
+    """把单日反向富集 frame 汇总为固定标签和阈值的 2x2 统计表。
+
+    参数:
+        - result (Mapping[str, Any]): `build_ofes_scv_reverse_day` 返回的单日结果。
+
+    返回:
+        - pd.DataFrame: 每个标签和 DO 阈值的 raw `a/b/c/d` 统计。
+
+    输出:
+        - 无；调用方负责持久化返回表。
+
+    说明:
+        - 该函数保留为单日诊断接口；跨日标准化分析使用 `build_ofes_scv_reverse_analysis1_strata`。
+    """
+    frame = result['frame'].copy()
+    rows = []
+    universe = frame.loc[frame['classifier_assessable'] & frame['do_evaluable']]
+    for label in ('tier0', 'tier1', 'weak_native', 'strong_native', 'well_resolved'):
+        for threshold in (20, 35, 50):
+            outcome = f'do{threshold}'
+            a = int((universe[label] & universe[outcome]).sum())
+            b = int((universe[label] & ~universe[outcome]).sum())
+            c = int((~universe[label] & universe[outcome]).sum())
+            d = int((~universe[label] & ~universe[outcome]).sum())
+            rows.append({'date': result['date'], 'scope': result['scope'], 'label': label, 'threshold': threshold, 'a': a, 'b': b, 'c': c, 'd': d, 'label_count': a + b, 'label_absent_count': c + d, 'do_count': a + c, 'universe_count': a + b + c + d, 'p_do_label': a / (a + b) if a + b else np.nan, 'p_do_absent': c / (c + d) if c + d else np.nan})
+    return pd.DataFrame(rows)
+
+
+_OFES_SCV_REVERSE_LABELS = ('tier0', 'tier1', 'weak_native', 'strong_native', 'well_resolved')
+
+
+def _ofes_scv_reverse_thresholds() -> tuple[int, ...]:
+    """读取反向富集分析的整数 DO 阈值。"""
+    configured = (_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('thresholds', (20, 35, 50))
+    return tuple(int(float(value)) for value in configured)
+
+
+def _ofes_scv_reverse_ratio(numerator: Any, denominator: Any) -> np.ndarray:
+    """按零值约定计算比值：正数除零为 inf，零除零为 NaN。"""
+    num, den = np.broadcast_arrays(np.asarray(numerator, dtype=float), np.asarray(denominator, dtype=float))
+    result = np.full(num.shape, np.nan, dtype=float)
+    positive_den = den != 0
+    result[positive_den] = num[positive_den] / den[positive_den]
+    result[(den == 0) & (num > 0)] = np.inf
+    return result
+
+
+def _ofes_scv_reverse_metrics(case_hits: Any, case_n: Any, ref_hits: Any, ref_n: Any) -> dict[str, np.ndarray]:
+    """从同一组两臂充分统计量计算风险和比值。"""
+    case_hits, case_n, ref_hits, ref_n = (np.asarray(value, dtype=float) for value in (case_hits, case_n, ref_hits, ref_n))
+    p_case = _ofes_scv_reverse_ratio(case_hits, case_n)
+    p_ref = _ofes_scv_reverse_ratio(ref_hits, ref_n)
+    risk_difference = p_case - p_ref
+    risk_ratio = _ofes_scv_reverse_ratio(p_case, p_ref)
+    odds_numerator = p_case * (1.0 - p_ref)
+    odds_denominator = p_ref * (1.0 - p_case)
+    odds_ratio = _ofes_scv_reverse_ratio(odds_numerator, odds_denominator)
+    return {'p_case': p_case, 'p_ref': p_ref, 'risk_difference': risk_difference, 'risk_ratio': risk_ratio, 'odds_ratio': odds_ratio}
+
+
+def build_ofes_scv_reverse_analysis1_strata(
+    frames: pd.DataFrame,
+    *,
+    min_reference: int | None = None,
+) -> pd.DataFrame:
+    """构建 Analysis 1 的逐分层 DO 充分统计表。
+
+    参数:
+        - frames (pd.DataFrame): 合并后的逐源格点 frame，须含日期、经纬度、资格和标签列。
+        - min_reference (int | None): label-absent 最小样本数；省略时读取 YAML。
+
+    返回:
+        - pd.DataFrame: 每行一个 scope、label、阈值和日期×1°纬度×1°经度分层，含 `n_case`、`y_case`、`n_ref`、`y_ref` 与 `matched`。
+
+    输出:
+        - 无；调用方可将返回表持久化为 Parquet。
+
+    说明:
+        - 只使用 classifier-assessable 且 DO-evaluable 的原始 profile frame。
+        - `matched` 固定为 `n_case > 0` 且 `n_ref >= min_reference`；返回表不保留 pandas group 对象。
+    """
+    if not isinstance(frames, pd.DataFrame):
+        raise TypeError('frames must be a pandas DataFrame.')
+    required = {'date', 'lat', 'lon', 'classifier_assessable', 'do_evaluable', 'scope'}
+    required.update(_OFES_SCV_REVERSE_LABELS)
+    required.update(f'do{threshold}' for threshold in _ofes_scv_reverse_thresholds())
+    missing = sorted(required - set(frames.columns))
+    if missing:
+        raise ValueError(f'Analysis1 frames missing columns: {missing}')
+    limit = int(min_reference if min_reference is not None else ((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('standardization_min_reference', 20)))
+    if limit <= 0:
+        raise ValueError('min_reference must be positive.')
+    work = frames.loc[frames['classifier_assessable'].astype(bool) & frames['do_evaluable'].astype(bool)].copy()
+    work['date'] = pd.to_datetime(work['date'], errors='raise').dt.normalize()
+    work['lat_bin'] = np.floor(pd.to_numeric(work['lat'], errors='raise')).astype(int)
+    work['lon_bin'] = np.floor(pd.to_numeric(work['lon'], errors='raise')).astype(int)
+    rows: list[dict[str, Any]] = []
+    for scope, subset in work.groupby('scope', dropna=False, sort=True):
+        for label in _OFES_SCV_REVERSE_LABELS:
+            label_flag = subset[label].fillna(False).astype(bool)
+            for threshold in _ofes_scv_reverse_thresholds():
+                hit_flag = subset[f'do{threshold}'].fillna(False).astype(bool)
+                grouped_frame = pd.DataFrame({
+                    'date': subset['date'],
+                    'lat_bin': subset['lat_bin'],
+                    'lon_bin': subset['lon_bin'],
+                    '_label': label_flag,
+                    '_hit': hit_flag,
+                })
+                grouped = grouped_frame.groupby(['date', 'lat_bin', 'lon_bin'], sort=True, dropna=False)
+                for (date, lat_bin, lon_bin), part in grouped:
+                    case = part['_label'].to_numpy(dtype=bool)
+                    hit = part['_hit'].to_numpy(dtype=bool)
+                    n_case = int(case.sum())
+                    n_ref = int((~case).sum())
+                    y_case = int((case & hit).sum())
+                    y_ref = int((~case & hit).sum())
+                    rows.append({
+                        'scope': scope,
+                        'label': label,
+                        'threshold': threshold,
+                        'date': date,
+                        'lat_bin': int(lat_bin),
+                        'lon_bin': int(lon_bin),
+                        'n_case': n_case,
+                        'y_case': y_case,
+                        'n_ref': n_ref,
+                        'y_ref': y_ref,
+                        'matched': bool(n_case > 0 and n_ref >= limit),
+                        'min_reference': limit,
+                    })
+    return pd.DataFrame(rows, columns=['scope', 'label', 'threshold', 'date', 'lat_bin', 'lon_bin', 'n_case', 'y_case', 'n_ref', 'y_ref', 'matched', 'min_reference'])
+
+
+def build_ofes_scv_reverse_analysis1_daily(
+    strata: pd.DataFrame,
+    *,
+    min_reference: int | None = None,
+) -> pd.DataFrame:
+    """将 Analysis 1 分层充分统计聚合为逐日 raw 与 matched sums。
+
+    参数:
+        - strata (pd.DataFrame): `build_ofes_scv_reverse_analysis1_strata` 返回的分层表。
+        - min_reference (int | None): 匹配门槛；省略时沿用分层表或读取 YAML。
+
+    返回:
+        - pd.DataFrame: 每个 scope、日期、标签和阈值的 raw `a/b/c/d`、matched case sums、加权 reference hits、实际 reference sums 及 attrition。
+
+    输出:
+        - 无；调用方可将返回表持久化为 Parquet。
+
+    说明:
+        - `matched_weighted_ref_hits` 是 `sum(n_case * y_ref / n_ref)`，不能与 `matched_ref_hits` 混用。
+        - 未匹配分层的 case 样本和阳性数单独保留，且不进入 matched 两臂。
+    """
+    required = {'scope', 'label', 'threshold', 'date', 'n_case', 'y_case', 'n_ref', 'y_ref'}
+    if not isinstance(strata, pd.DataFrame) or not required.issubset(strata.columns):
+        missing = sorted(required - set(strata.columns)) if isinstance(strata, pd.DataFrame) else sorted(required)
+        raise ValueError(f'Analysis1 strata missing columns: {missing}')
+    if strata.empty:
+        return pd.DataFrame(columns=['scope', 'date', 'label', 'threshold'])
+    work = strata.copy()
+    work['date'] = pd.to_datetime(work['date'], errors='raise').dt.normalize()
+    configured_limit = ((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('standardization_min_reference', 20))
+    table_limit = work['min_reference'].iloc[0] if 'min_reference' in work and len(work) else configured_limit
+    limit = int(min_reference if min_reference is not None else table_limit)
+    if limit <= 0:
+        raise ValueError('min_reference must be positive.')
+    matched = (pd.to_numeric(work['n_case']) > 0) & (pd.to_numeric(work['n_ref']) >= limit)
+    work['_matched'] = matched
+    work['_weighted_ref_hits'] = np.where(matched, work['n_case'].astype(float) * work['y_ref'].astype(float) / work['n_ref'].astype(float), 0.0)
+    work['_weighted_ref_n'] = np.where(matched, work['n_case'].astype(float), 0.0)
+    work['_matched_case_n'] = np.where(matched, work['n_case'].astype(float), 0.0)
+    work['_matched_case_hits'] = np.where(matched, work['y_case'].astype(float), 0.0)
+    work['_matched_ref_n'] = np.where(matched, work['n_ref'].astype(float), 0.0)
+    work['_matched_ref_hits'] = np.where(matched, work['y_ref'].astype(float), 0.0)
+    work['_unmatched_case_n'] = np.where(~matched, work['n_case'].astype(float), 0.0)
+    work['_unmatched_case_hits'] = np.where(~matched, work['y_case'].astype(float), 0.0)
+    grouped = work.groupby(['scope', 'date', 'label', 'threshold'], dropna=False, sort=True)
+    rows: list[dict[str, Any]] = []
+    for key, part in grouped:
+        scope, date, label, threshold = key
+        n_case = int(part['n_case'].sum())
+        y_case = int(part['y_case'].sum())
+        n_ref = int(part['n_ref'].sum())
+        y_ref = int(part['y_ref'].sum())
+        rows.append({
+            'scope': scope,
+            'date': date,
+            'label': label,
+            'threshold': int(threshold),
+            'raw_a': y_case,
+            'raw_b': n_case - y_case,
+            'raw_c': y_ref,
+            'raw_d': n_ref - y_ref,
+            'matched_case_n': int(part['_matched_case_n'].sum()),
+            'matched_case_hits': int(part['_matched_case_hits'].sum()),
+            'matched_weighted_ref_n': float(part['_weighted_ref_n'].sum()),
+            'matched_weighted_ref_hits': float(part['_weighted_ref_hits'].sum()),
+            'matched_ref_n': int(part['_matched_ref_n'].sum()),
+            'matched_ref_hits': int(part['_matched_ref_hits'].sum()),
+            'unmatched_case_n': int(part['_unmatched_case_n'].sum()),
+            'unmatched_case_hits': int(part['_unmatched_case_hits'].sum()),
+            'strata_total': int(len(part)),
+            'matched_strata': int(part['_matched'].sum()),
+            'unmatched_strata': int((~part['_matched']).sum()),
+            'min_reference': limit,
+        })
+    return pd.DataFrame(rows)
+
+
+def _ofes_scv_reverse_daily_from_input(
+    frames: pd.DataFrame | None,
+    *,
+    strata: pd.DataFrame | None,
+    daily: pd.DataFrame | None,
+    min_reference: int | None,
+) -> pd.DataFrame:
+    """统一 summary 与 bootstrap 的每日充分统计输入。"""
+    if daily is not None:
+        result = daily.copy()
+    elif strata is not None:
+        result = build_ofes_scv_reverse_analysis1_daily(strata, min_reference=min_reference)
+    elif frames is not None:
+        generated = build_ofes_scv_reverse_analysis1_strata(frames, min_reference=min_reference)
+        result = build_ofes_scv_reverse_analysis1_daily(generated, min_reference=min_reference)
+    else:
+        raise ValueError('Provide frames, strata, or daily.')
+    required = {
+        'scope', 'date', 'label', 'threshold', 'raw_a', 'raw_b', 'raw_c', 'raw_d',
+        'matched_case_n', 'matched_case_hits', 'matched_weighted_ref_hits',
+        'matched_ref_n', 'matched_ref_hits', 'unmatched_case_n', 'unmatched_case_hits',
+        'strata_total', 'matched_strata', 'unmatched_strata',
+    }
+    missing = sorted(required - set(result.columns))
+    if missing:
+        raise ValueError(f'Analysis1 daily table missing columns: {missing}')
+    result['date'] = pd.to_datetime(result['date'], errors='raise').dt.normalize()
+    return result
+
+
+def summarize_ofes_scv_reverse_analysis1(
+    frames: pd.DataFrame | None = None,
+    *,
+    strata: pd.DataFrame | None = None,
+    daily: pd.DataFrame | None = None,
+    min_reference: int | None = None,
+) -> pd.DataFrame:
+    """汇总 Analysis 1 的 raw 与空间标准化反向 DO 富集统计。
+
+    参数:
+        - frames (pd.DataFrame | None): 合并后的逐源格点 frame；已提供 `strata` 或 `daily` 时可省略。
+        - strata (pd.DataFrame | None): 已持久化的分层充分统计表。
+        - daily (pd.DataFrame | None): 已持久化的逐日充分统计表。
+        - min_reference (int | None): 每个保留分层的最小 reference 样本数；省略时读取 YAML。
+
+    返回:
+        - pd.DataFrame: 每个 scope、label、threshold 的 raw 与 matched 风险、风险差、风险比和优势比，以及完整分母和 attrition。
+
+    输出:
+        - 无；调用方负责持久化 strata、daily 和 summary 表。
+
+    说明:
+        - point 与 bootstrap 共用同一份 daily sufficient sums；matched reference risk 使用 case-weighted reference fraction。
+        - 不输出由 matched reference 抽样分母拼出的反向 `P(label|DO)`。
+    """
+    work = _ofes_scv_reverse_daily_from_input(frames, strata=strata, daily=daily, min_reference=min_reference)
+    rows: list[dict[str, Any]] = []
+    for key, part in work.groupby(['scope', 'label', 'threshold'], dropna=False, sort=True):
+        scope, label, threshold = key
+        raw_a = int(part['raw_a'].sum())
+        raw_b = int(part['raw_b'].sum())
+        raw_c = int(part['raw_c'].sum())
+        raw_d = int(part['raw_d'].sum())
+        matched_case_n = int(part['matched_case_n'].sum())
+        matched_case_hits = int(part['matched_case_hits'].sum())
+        matched_weighted_ref_hits = float(part['matched_weighted_ref_hits'].sum())
+        matched_ref_n = int(part['matched_ref_n'].sum())
+        matched_ref_hits = int(part['matched_ref_hits'].sum())
+        raw_metrics = _ofes_scv_reverse_metrics(raw_a, raw_a + raw_b, raw_c, raw_c + raw_d)
+        matched_metrics = _ofes_scv_reverse_metrics(matched_case_hits, matched_case_n, matched_weighted_ref_hits, matched_case_n)
+        p_label_given_do = float(_ofes_scv_reverse_ratio(raw_a, raw_a + raw_c)[()])
+        rows.append({
+            'scope': scope,
+            'label': label,
+            'threshold': int(threshold),
+            'raw_a': raw_a,
+            'raw_b': raw_b,
+            'raw_c': raw_c,
+            'raw_d': raw_d,
+            'raw_label_n': raw_a + raw_b,
+            'raw_label_absent_n': raw_c + raw_d,
+            'raw_do_n': raw_a + raw_c,
+            'raw_universe_n': raw_a + raw_b + raw_c + raw_d,
+            'raw_p_do_label': float(raw_metrics['p_case'][()]),
+            'raw_p_do_absent': float(raw_metrics['p_ref'][()]),
+            'raw_p_label_given_do': p_label_given_do,
+            'raw_risk_difference': float(raw_metrics['risk_difference'][()]),
+            'raw_risk_ratio': float(raw_metrics['risk_ratio'][()]),
+            'raw_odds_ratio': float(raw_metrics['odds_ratio'][()]),
+            'matched_case_n': matched_case_n,
+            'matched_case_hits': matched_case_hits,
+            'matched_weighted_ref_hits': matched_weighted_ref_hits,
+            'matched_ref_n': matched_ref_n,
+            'matched_ref_hits': matched_ref_hits,
+            'matched_p_do_label': float(matched_metrics['p_case'][()]),
+            'matched_p_do_reference': float(matched_metrics['p_ref'][()]),
+            'matched_risk_difference': float(matched_metrics['risk_difference'][()]),
+            'matched_risk_ratio': float(matched_metrics['risk_ratio'][()]),
+            'matched_odds_ratio': float(matched_metrics['odds_ratio'][()]),
+            'unmatched_case_n': int(part['unmatched_case_n'].sum()),
+            'unmatched_case_hits': int(part['unmatched_case_hits'].sum()),
+            'strata_total': int(part['strata_total'].sum()),
+            'matched_strata': int(part['matched_strata'].sum()),
+            'unmatched_strata': int(part['unmatched_strata'].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def validate_ofes_scv_reverse_do_parity(
+    date: str | pd.Timestamp,
+    *,
+    do_catalog_root: str | Path | None = None,
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict:
+    """比较单日反向审计 DO 峰与既有 peak-pixels 阳性表。
+
+    参数:
+        - date (str | pd.Timestamp): 待比较的 OFES 日期。
+        - do_catalog_root (str | Path | None): 既有 DO 日目录；省略时读取 YAML。
+        - snapshot (Mapping[str, Any] | None): 已读取的 DO snapshot；提供时避免重复 NetCDF 读取。
+
+    返回:
+        - dict: source-index、峰深、峰值和各阈值计数的 parity 结果。
+
+    输出:
+        - 无；只读取既有 DO catalog 与原始 OFES snapshot。
+
+    说明:
+        - 该比较固定在 primary 300–1000 m 与 DO20 detector，任何 source-key 或数值不一致都返回 `passed=False`。
+    """
+    d = pd.Timestamp(date).normalize()
+    root = Path(do_catalog_root) if do_catalog_root is not None else _ofes_scv_reverse_paths()['do_catalog']
+    if (root / 'days').is_dir():
+        root = root / 'days'
+    peak_path = root / f'peak_pixels_{d:%Y%m%d}.parquet'
+    if not peak_path.exists():
+        raise FileNotFoundError(f'Missing existing DO peak table: {peak_path}')
+    snap = snapshot if snapshot is not None else load_ofes_snapshot(d, variables=['do2'])
+    cfg = make_detection_config('do', do_threshold=20.0, anomaly_min_depth=300.0, anomaly_max_depth=1000.0)
+    vector = _ofes_vectorized_do_peaks(snap['do2'], snap['depth'], cfg, minimum_delta=20.0)
+    existing = pd.read_parquet(peak_path)
+    vector_delta = vector['delta_do']
+    vector_keys = {(int(row), int(col)) for row, col in zip(*np.where(np.isfinite(vector_delta) & (vector_delta >= 20.0)))}
+    existing_keys = {(int(row), int(col)) for row, col in zip(existing['source_lat_index'], existing['source_lon_index'])} if not existing.empty else set()
+    key_equal = vector_keys == existing_keys
+    threshold_counts = {}
+    for threshold in (20, 35, 50):
+        vector_count = int(np.count_nonzero(np.isfinite(vector_delta) & (vector_delta >= threshold)))
+        existing_count = int(np.count_nonzero(pd.to_numeric(existing['delta_do'], errors='coerce').to_numpy(float) >= threshold)) if not existing.empty else 0
+        threshold_counts[str(threshold)] = {'vector': vector_count, 'existing': existing_count, 'equal': vector_count == existing_count}
+    if existing.empty:
+        return {'date': d.strftime('%Y-%m-%d'), 'rows_compared': 0, 'source_key_equal': key_equal, 'threshold_counts': threshold_counts, 'passed': bool(key_equal and all(v['equal'] for v in threshold_counts.values()))}
+    rows = pd.to_numeric(existing['source_lat_index'], errors='raise').astype(int).to_numpy()
+    cols = pd.to_numeric(existing['source_lon_index'], errors='raise').astype(int).to_numpy()
+    valid = (rows >= 0) & (rows < len(snap['lat'])) & (cols >= 0) & (cols < len(snap['lon']))
+    if not np.all(valid):
+        raise ValueError('Existing DO source indices fall outside current coordinates.')
+    delta_error = np.abs(vector['delta_do'][rows, cols] - existing['delta_do'].to_numpy(float))
+    depth_error = np.abs(vector['peak_depth'][rows, cols] - existing['peak_depth'].to_numpy(float))
+    passed = bool(key_equal and all(v['equal'] for v in threshold_counts.values()) and np.all(np.isfinite(delta_error)) and np.all(np.isfinite(depth_error)) and np.nanmax(delta_error) <= 2e-5 and np.nanmax(depth_error) <= 1e-6)
+    return {'date': d.strftime('%Y-%m-%d'), 'rows_compared': int(len(existing)), 'source_key_equal': key_equal, 'threshold_counts': threshold_counts, 'max_abs_delta_error': float(np.nanmax(delta_error)), 'max_abs_depth_error_m': float(np.nanmax(depth_error)), 'passed': passed}
+
+
+def _ofes_scv_reverse_empirical_quantile(values: np.ndarray, probability: float) -> float:
+    """使用包含 inf 的定义良好的顺序统计量计算经验分位数。"""
+    defined = np.asarray(values, dtype=float)
+    defined = defined[~np.isnan(defined)]
+    if not defined.size:
+        return float('nan')
+    ordered = np.sort(defined)
+    rank = min(ordered.size - 1, max(0, int(np.ceil(float(probability) * ordered.size) - 1)))
+    return float(ordered[rank])
+
+
+def bootstrap_ofes_scv_reverse_analysis1(
+    frames: pd.DataFrame | None = None,
+    *,
+    strata: pd.DataFrame | None = None,
+    daily: pd.DataFrame | None = None,
+    min_reference: int | None = None,
+    block_days: int = 20,
+    replicates: int | None = None,
+    seed: int = 20260831,
+    calendar_dates: Sequence[str | pd.Timestamp] | None = None,
+) -> pd.DataFrame:
+    """对固定逐日充分统计执行锚定日历 block bootstrap。
+
+    参数:
+        - frames (pd.DataFrame | None): 合并后的 profile frame；已提供 `strata` 或 `daily` 时可省略。
+        - strata (pd.DataFrame | None): 已持久化的分层充分统计表。
+        - daily (pd.DataFrame | None): 已持久化的逐日充分统计表。
+        - min_reference (int | None): 分层匹配门槛；省略时读取 YAML。
+        - block_days (int): 从 2003-01-01 锚定的非重叠日历 block 长度。
+        - replicates (int | None): bootstrap replicate 数；省略时读取 YAML。
+        - seed (int): 确定性随机种子。
+        - calendar_dates (Sequence[str | pd.Timestamp] | None): 完整抽样日历；省略时使用 daily 表日期。
+
+    返回:
+        - pd.DataFrame: 每个 scope、label、threshold 的 point 值、block bootstrap 区间，以及每个 metric 的 finite、infinite 和 undefined replicate 计数。
+
+    输出:
+        - 无；调用方负责持久化 bootstrap 表。
+
+    说明:
+        - cohort 和匹配资格在 bootstrap 前冻结；每个 replicate 对固定 daily sums 做 block-weight 矩阵乘法并重新计算 ratios。
+        - `degenerate_all_zero` 只表示原 matched 两臂阳性均为零；`nblocks < 2`、无病例或无定义 replicates 另外标记为信息不足。
+    """
+    if block_days <= 0:
+        raise ValueError('block_days must be positive.')
+    count = int(replicates if replicates is not None else ((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('bootstrap_replicates', 10000)))
+    if count <= 0:
+        raise ValueError('replicates must be positive.')
+    work = _ofes_scv_reverse_daily_from_input(frames, strata=strata, daily=daily, min_reference=min_reference)
+    if work.empty:
+        return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
+    anchor = pd.Timestamp('2003-01-01')
+    work['_block'] = ((work['date'] - anchor).dt.days // int(block_days)).astype(int)
+    dates = list(work['date']) if calendar_dates is None else list(pd.to_datetime(calendar_dates, errors='raise').normalize())
+    if not dates:
+        return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
+    calendar_blocks = ((pd.Series(pd.to_datetime(dates)) - anchor).dt.days // int(block_days)).astype(int)
+    block_ids = np.arange(int(calendar_blocks.min()), int(calendar_blocks.max()) + 1, dtype=int)
+    rng = np.random.default_rng(seed)
+    sampled = rng.choice(block_ids, size=(count, len(block_ids)), replace=True)
+    weights = np.zeros((count, len(block_ids)), dtype=float)
+    block_index = {int(block): index for index, block in enumerate(block_ids)}
+    for column, block in enumerate(block_ids):
+        weights[:, column] = np.count_nonzero(sampled == block, axis=1)
+
+    def metric_counts(values: np.ndarray, prefix: str) -> dict[str, Any]:
+        finite = np.isfinite(values)
+        infinite = np.isinf(values)
+        undefined = np.isnan(values)
+        return {
+            f'{prefix}_finite_replicates': int(finite.sum()),
+            f'{prefix}_infinite_replicates': int(infinite.sum()),
+            f'{prefix}_undefined_replicates': int(undefined.sum()),
+            f'{prefix}_ci_low': _ofes_scv_reverse_empirical_quantile(values, 0.025),
+            f'{prefix}_ci_high': _ofes_scv_reverse_empirical_quantile(values, 0.975),
+        }
+
+    rows: list[dict[str, Any]] = []
+    for key, part in work.groupby(['scope', 'label', 'threshold'], dropna=False, sort=True):
+        scope, label, threshold = key
+        block_values = np.zeros((len(block_ids), 8), dtype=float)
+        columns = ('_block', 'raw_a', 'raw_b', 'raw_c', 'raw_d', 'matched_case_n', 'matched_case_hits', 'matched_weighted_ref_hits', 'matched_ref_hits')
+        for block, raw_a, raw_b, raw_c, raw_d, ncase, case_hits, weighted_ref_hits, ref_hits in zip(*(part[column] for column in columns)):
+            index = block_index[int(block)]
+            block_values[index, 0] += float(ncase)
+            block_values[index, 1] += float(case_hits)
+            block_values[index, 2] += float(weighted_ref_hits)
+            block_values[index, 3] += float(ref_hits)
+            block_values[index, 4] += float(raw_a + raw_b)
+            block_values[index, 5] += float(raw_a)
+            block_values[index, 6] += float(raw_c)
+            block_values[index, 7] += float(raw_c + raw_d)
+        sums = weights @ block_values
+        metrics = _ofes_scv_reverse_metrics(sums[:, 1], sums[:, 0], sums[:, 2], sums[:, 0])
+        raw_metrics = _ofes_scv_reverse_metrics(sums[:, 5], sums[:, 4], sums[:, 6], sums[:, 7])
+        point = _ofes_scv_reverse_metrics(part['matched_case_hits'].sum(), part['matched_case_n'].sum(), part['matched_weighted_ref_hits'].sum(), part['matched_case_n'].sum())
+        raw_point = _ofes_scv_reverse_metrics(part['raw_a'].sum(), (part['raw_a'] + part['raw_b']).sum(), part['raw_c'].sum(), (part['raw_c'] + part['raw_d']).sum())
+        original_case_hits = float(part['matched_case_hits'].sum())
+        original_ref_hits = float(part['matched_weighted_ref_hits'].sum())
+        contributing_blocks = block_values[:, 0] > 0
+        positive_signal_blocks = contributing_blocks & ((block_values[:, 1] > 0) | (block_values[:, 2] > 0))
+        n_information_blocks = int(contributing_blocks.sum())
+        base = {
+            'scope': scope,
+            'label': label,
+            'threshold': int(threshold),
+            'block_days': int(block_days),
+            'replicates': count,
+            'nblocks': int(len(block_ids)),
+            'information_blocks': n_information_blocks,
+            'positive_signal_blocks': int(positive_signal_blocks.sum()),
+            'point_matched_case_n': int(part['matched_case_n'].sum()),
+            'point_matched_case_hits': int(part['matched_case_hits'].sum()),
+            'point_matched_weighted_ref_hits': float(part['matched_weighted_ref_hits'].sum()),
+            'point_matched_p_do_label': float(point['p_case'][()]),
+            'point_matched_p_do_reference': float(point['p_ref'][()]),
+            'point_matched_risk_difference': float(point['risk_difference'][()]),
+            'point_matched_risk_ratio': float(point['risk_ratio'][()]),
+            'point_matched_odds_ratio': float(point['odds_ratio'][()]),
+            'point_raw_p_do_label': float(raw_point['p_case'][()]),
+            'point_raw_p_do_reference': float(raw_point['p_ref'][()]),
+            'point_raw_risk_difference': float(raw_point['risk_difference'][()]),
+            'point_raw_risk_ratio': float(raw_point['risk_ratio'][()]),
+            'point_raw_odds_ratio': float(raw_point['odds_ratio'][()]),
+            'degenerate_all_zero': bool(part['matched_case_n'].sum() > 0 and original_case_hits == 0 and original_ref_hits == 0),
+            'no_matched_cases': bool(part['matched_case_n'].sum() == 0),
+        }
+        base.update(metric_counts(metrics['p_case'], 'p_do_label'))
+        base.update(metric_counts(metrics['p_ref'], 'p_do_reference'))
+        base.update(metric_counts(metrics['risk_difference'], 'risk_difference'))
+        base.update(metric_counts(metrics['risk_ratio'], 'risk_ratio'))
+        base.update(metric_counts(metrics['odds_ratio'], 'odds_ratio'))
+        base.update(metric_counts(raw_metrics['p_case'], 'raw_p_do_label'))
+        base.update(metric_counts(raw_metrics['p_ref'], 'raw_p_do_reference'))
+        base.update(metric_counts(raw_metrics['risk_difference'], 'raw_risk_difference'))
+        base.update(metric_counts(raw_metrics['risk_ratio'], 'raw_risk_ratio'))
+        base.update(metric_counts(raw_metrics['odds_ratio'], 'raw_odds_ratio'))
+        base['finite_replicates'] = base['risk_difference_finite_replicates']
+        base['rd_ci_low'] = base['risk_difference_ci_low']
+        base['rd_ci_high'] = base['risk_difference_ci_high']
+        base['rr_ci_low'] = base['risk_ratio_ci_low']
+        base['rr_ci_high'] = base['risk_ratio_ci_high']
+        base['or_ci_low'] = base['odds_ratio_ci_low']
+        base['or_ci_high'] = base['odds_ratio_ci_high']
+        base['uncertainty_uninformative'] = bool(base['degenerate_all_zero'] or base['no_matched_cases'] or n_information_blocks < 2 or base['risk_difference_finite_replicates'] == 0)
+        if np.any(np.isfinite(metrics['risk_difference']) & ((metrics['risk_difference'] < -1.0 - 1e-12) | (metrics['risk_difference'] > 1.0 + 1e-12))):
+            raise AssertionError('Bootstrap risk differences must lie in [-1, 1].')
+        for name in ('risk_ratio', 'odds_ratio'):
+            if np.any(np.isfinite(metrics[name]) & (metrics[name] < 0)):
+                raise AssertionError('Bootstrap ratios must be nonnegative.')
+        rows.append(base)
+    return pd.DataFrame(rows)
+
+
+def _ofes_scv_reverse_merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """合并同一源列中相交或相接的闭合垂向 slab。"""
+    valid = sorted((float(lo), float(hi)) for lo, hi in intervals if np.isfinite(lo) and np.isfinite(hi) and hi >= lo)
+    merged: list[list[float]] = []
+    for lo, hi in valid:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+def load_ofes_scv_reverse_analysis2_masks(
+    date: str | pd.Timestamp,
+    *,
+    scope: str = 'primary_300_1000',
+    s5_root: str | Path | None = None,
+) -> dict:
+    """读取单日 Tier-1 object mask 并合并重复源列 slab。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - scope (str): `primary_300_1000` 或 `deep_500_1000`。
+        - s5_root (str | Path | None): S5 日片根目录；省略时读取 YAML。
+
+    返回:
+        - dict: 含 objects、footprints、scope 与输入路径的 mask 结果。
+
+    输出:
+        - 无；调用方可将 objects 和 footprints 持久化为 Parquet。
+
+    说明:
+        - 只消费完成的 S5 片段和 authoritative object 表，不重新检测或去重对象。
+        - slab 使用闭合边界；同一 object/source column 的重复或相接区间先取并集。
+    """
+    d = pd.Timestamp(date).normalize()
+    zmin, zmax = _ofes_scv_reverse_scope(scope)
+    root = Path(s5_root) if s5_root is not None else _ofes_scv_reverse_paths()['s5']
+    days_root = root / 'days' if (root / 'days').is_dir() else root
+    day_dirs = sorted(days_root.glob(f'{d:%Y%m%d}_t*'))
+    authority = days_root.parent / 's5_objects.parquet'
+    manifest_path = days_root.parent / 'manifest.json'
+    if not day_dirs or not authority.exists() or not manifest_path.exists():
+        raise FileNotFoundError(f'Missing S5 inputs for {d:%Y-%m-%d}: {days_root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    expected_tiles = int(manifest.get('tile_count', 0))
+    if expected_tiles <= 0 or len(day_dirs) != expected_tiles:
+        raise RuntimeError(f'Incomplete S5 tile set for {d:%Y-%m-%d}: {len(day_dirs)} of {expected_tiles}.')
+    required_fragment_files = ('day_summary.json', 'objects.parquet', 'voxels.parquet')
+    for day_dir in day_dirs:
+        if any(not (day_dir / name).exists() for name in required_fragment_files):
+            raise RuntimeError(f'Incomplete S5 fragment: {day_dir}')
+        status = json.loads((day_dir / 'day_summary.json').read_text(encoding='utf-8')).get('status')
+        if status != 'complete':
+            raise RuntimeError(f'S5 fragment is not complete: {day_dir}')
+    authoritative_ids = set(pd.read_parquet(authority, columns=['object_id'])['object_id'].astype(str))
+    object_rows: list[dict[str, Any]] = []
+    interval_map: dict[tuple[str, int, int], list[tuple[float, float]]] = {}
+    invalid_voxel_count = 0
+    invalid_object_counts: dict[str, int] = {}
+    for day_dir in day_dirs:
+        summary_path, objects_path, voxels_path = (day_dir / name for name in ('day_summary.json', 'objects.parquet', 'voxels.parquet'))
+        if not summary_path.exists() or not objects_path.exists() or not voxels_path.exists():
+            continue
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        if summary.get('status') != 'complete':
+            continue
+        objects = pd.read_parquet(objects_path)
+        voxels = pd.read_parquet(voxels_path)
+        if objects.empty or voxels.empty or 'tier1_identity' not in objects:
+            continue
+        objects = objects.loc[objects['tier1_identity'].astype(str).eq('grid_lens')].copy()
+        objects['qualified_object_id'] = day_dir.name + '_' + objects['object_id'].astype(str)
+        objects = objects.loc[objects['qualified_object_id'].isin(authoritative_ids)]
+        required = {'object_id', 'lat_index', 'lon_index', 'depth_m', 'voxel_thickness_m'}
+        if objects.empty or not required.issubset(voxels.columns):
+            continue
+        object_rows.extend(objects.to_dict('records'))
+        local_ids = dict(zip(objects['object_id'].astype(str), objects['qualified_object_id'].astype(str)))
+        source_rows, source_cols = _ofes_scv_reverse_global_index(summary, voxels['lat_index'], voxels['lon_index'], d, source_lat=voxels['voxel_lat'] if 'voxel_lat' in voxels else None, source_lon=voxels['voxel_lon'] if 'voxel_lon' in voxels else None)
+        for local_id, row, col, depth, thickness in zip(voxels['object_id'].astype(str), source_rows, source_cols, voxels['depth_m'], voxels['voxel_thickness_m']):
+            object_id = local_ids.get(local_id)
+            if object_id is None:
+                continue
+            if not (np.isfinite(depth) and np.isfinite(thickness) and float(thickness) > 0):
+                invalid_voxel_count += 1
+                invalid_object_counts[object_id] = invalid_object_counts.get(object_id, 0) + 1
+                continue
+            low = float(depth) - float(thickness) / 2.0
+            high = float(depth) + float(thickness) / 2.0
+            if high < zmin or low > zmax:
+                continue
+            interval_map.setdefault((object_id, int(row), int(col)), []).append((max(low, zmin), min(high, zmax)))
+    objects = pd.DataFrame(object_rows)
+    if objects.empty:
+        objects = pd.DataFrame(columns=['object_id', 'tier1_identity', 'boundary_censored', 'weak_native_support', 'strong_native_support', 'well_resolved_grid_lens'])
+    else:
+        objects = objects.drop_duplicates('qualified_object_id').rename(columns={'qualified_object_id': 'object_id', 'object_id': 'local_object_id'}).reset_index(drop=True)
+        objects['date'] = d
+        objects['scope'] = scope
+        objects['tier1'] = objects['tier1_identity'].astype(str).eq('grid_lens')
+        objects['weak_native'] = objects['weak_native_support'].fillna(False).astype(bool)
+        objects['strong_native'] = objects['strong_native_support'].fillna(False).astype(bool)
+        objects['well_resolved'] = objects['well_resolved_grid_lens'].fillna(False).astype(bool)
+        objects['invalid_voxel_count'] = objects['object_id'].map(invalid_object_counts).fillna(0).astype(int)
+    footprint_rows = []
+    for (object_id, row, col), intervals in sorted(interval_map.items()):
+        for low, high in _ofes_scv_reverse_merge_intervals(intervals):
+            footprint_rows.append({'object_id': object_id, 'global_lat_index': row, 'global_lon_index': col, 'depth_low_m': low, 'depth_high_m': high, 'date': d, 'scope': scope})
+    footprints = pd.DataFrame(footprint_rows, columns=['object_id', 'global_lat_index', 'global_lon_index', 'depth_low_m', 'depth_high_m', 'date', 'scope'])
+    return {'date': d, 'scope': scope, 'objects': objects, 'footprints': footprints, 'source': str(days_root), 'diagnostics': {'invalid_voxel_count': int(invalid_voxel_count), 'authoritative_object_count': int(len(authoritative_ids))}}
+
+
+def _ofes_scv_reverse_evaluate_object_masks(objects: pd.DataFrame, footprints: pd.DataFrame, frame: pd.DataFrame) -> pd.DataFrame:
+    """在 profile frame 上评估完整 object mask 的 profile 与三维 DO carriage。"""
+    if objects.empty:
+        return objects.copy()
+    lookup = {(int(row.global_lat_index), int(row.global_lon_index)): row for row in frame.itertuples(index=False)}
+    result = []
+    for object_row in objects.itertuples(index=False):
+        record = object_row._asdict()
+        mask = footprints.loc[footprints['object_id'].astype(str).eq(str(object_row.object_id))]
+        keys = sorted(set(zip(mask['global_lat_index'].astype(int), mask['global_lon_index'].astype(int))))
+        invalid_voxels = int(getattr(object_row, 'invalid_voxel_count', 0))
+        record.update({'footprint_column_count': len(keys), 'object_evaluable': False, 'boundary_excluded_evaluable': False, 'object_exclusion_reason': 'invalid_voxel_thickness' if invalid_voxels else ('no_in_scope_mask' if not keys else ' ')})
+        if invalid_voxels:
+            result.append(record)
+            continue
+        profiles = [lookup.get(key) for key in keys]
+        if not keys:
+            result.append(record)
+            continue
+        if any(profile is None for profile in profiles):
+            record['object_exclusion_reason'] = 'missing_profile_frame'
+            result.append(record)
+            continue
+        if any(not bool(profile.do_evaluable) for profile in profiles):
+            record['object_exclusion_reason'] = 'profile_unavailable'
+            result.append(record)
+            continue
+        record.update({'object_evaluable': True, 'object_exclusion_reason': '', 'boundary_excluded_evaluable': not bool(getattr(object_row, 'boundary_censored', False))})
+        for threshold in (20, 35, 50):
+            profile_hit = False
+            colocated = False
+            colocated_columns = 0
+            for key, profile in zip(keys, profiles):
+                hit = bool(getattr(profile, f'do{threshold}', False))
+                profile_hit |= hit
+                if hit and np.isfinite(getattr(profile, 'peak_depth', np.nan)):
+                    slabs = mask.loc[(mask['global_lat_index'] == key[0]) & (mask['global_lon_index'] == key[1])]
+                    column_hit = bool(((slabs['depth_low_m'] <= float(profile.peak_depth)) & (slabs['depth_high_m'] >= float(profile.peak_depth))).any())
+                    colocated |= column_hit
+                    colocated_columns += int(column_hit)
+            record[f'do{threshold}_profile_carriage'] = profile_hit
+            record[f'do{threshold}_3d_carriage'] = colocated
+            record[f'do{threshold}_3d_fraction'] = float(colocated_columns / len(keys))
+        result.append(record)
+    return pd.DataFrame(result)
+
+
+def _ofes_scv_reverse_candidate_density(snapshot: Mapping[str, Any], row: int, col: int, target_depth: float) -> float:
+    """从 native T/S 在指定深度计算不外推的 sigma0。"""
+    try:
+        sigma = _ofes_sigma0_profile(snapshot['depth'], snapshot['salinity'][:, row, col], snapshot['temp'][:, row, col], float(snapshot['lon'][col]), float(snapshot['lat'][row]))
+    except (KeyError, ValueError, TypeError):
+        return np.nan
+    return _ofes_profile_value_at_depth(snapshot['depth'], sigma, float(target_depth))
+
+
+def _ofes_scv_reverse_object_control_outcome(mask: pd.DataFrame, lookup: dict[tuple[int, int], Any], threshold: int) -> tuple[bool, bool, float]:
+    """计算平移 mask 的 profile carriage 与闭合 slab co-location。"""
+    profile_hit = False
+    colocated = False
+    colocated_columns = 0
+    eligible_columns = 0
+    for key, part in mask.groupby(['global_lat_index', 'global_lon_index'], sort=True):
+        profile = lookup.get((int(key[0]), int(key[1])))
+        if profile is None or not bool(getattr(profile, 'do_evaluable', False)):
+            continue
+        eligible_columns += 1
+        profile_hit |= bool(getattr(profile, f'do{threshold}', False))
+        depth = getattr(profile, 'peak_depth', np.nan)
+        column_hit = bool(getattr(profile, f'do{threshold}', False))
+        if column_hit and np.isfinite(depth) and bool(((part['depth_low_m'] <= float(depth)) & (part['depth_high_m'] >= float(depth))).any()):
+            colocated = True
+            colocated_columns += 1
+    return profile_hit, colocated, float(colocated_columns / eligible_columns) if eligible_columns else np.nan
+
+
+def build_ofes_scv_reverse_analysis2_day(
+    date: str | pd.Timestamp,
+    *,
+    scope: str = 'primary_300_1000',
+    s5_root: str | Path | None = None,
+    do_catalog_root: str | Path | None = None,
+    max_controls: int | None = None,
+    min_controls: int | None = None,
+    read_raw_do: bool = True,
+    seed: int | None = None,
+    frame_result: Mapping[str, Any] | None = None,
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict:
+    """构建单日 Analysis 2 object carriage、控制候选和固定 matched controls。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - scope (str): `primary_300_1000` 或 `deep_500_1000`。
+        - s5_root (str | Path | None): S5 日片根目录；省略时读取 YAML。
+        - do_catalog_root (str | Path | None): 既有 DO catalog 根目录。
+        - max_controls (int | None): 每个 object 最多保留控制数；省略时读取 YAML。
+        - min_controls (int | None): 进入 matched inference 的最小控制数；省略时读取 YAML。
+        - read_raw_do (bool): 是否读取原始 DO/T/S。
+        - seed (int | None): 稳定控制抽样种子；省略时读取 YAML。
+        - frame_result (Mapping[str, Any] | None): 已完成的单日 frame 结果，用于复用 DO 读取。
+        - snapshot (Mapping[str, Any] | None): 已读取的 T/S snapshot，用于复用原始输入。
+
+    返回:
+        - dict: 含 objects、footprints、candidates、controls、frame 和 diagnostics。
+
+    输出:
+        - 无；调用方负责持久化逐日结果。
+
+    说明:
+        - 候选资格、mask 平移和控制抽样均在读取 DO outcome 前固定；全部拒绝原因保留。
+        - object case 只要求完整 footprint 的 DO-evaluable；controls 另要求 common classifier-assessable 与 DO-evaluable。
+    """
+    reverse_cfg = (_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {})
+    max_controls = int(reverse_cfg.get('control_max_count', 20) if max_controls is None else max_controls)
+    min_controls = int(reverse_cfg.get('control_min_count', 5) if min_controls is None else min_controls)
+    seed = int(reverse_cfg.get('control_random_seed', 20260831) if seed is None else seed)
+    if max_controls < min_controls or min_controls < 1:
+        raise ValueError('max_controls must be >= min_controls >= 1.')
+    d = pd.Timestamp(date).normalize()
+    base = frame_result if frame_result is not None else build_ofes_scv_reverse_day(d, scope=scope, s5_root=s5_root, do_catalog_root=do_catalog_root, read_raw_do=read_raw_do)
+    mask_result = load_ofes_scv_reverse_analysis2_masks(d, scope=scope, s5_root=s5_root)
+    objects = _ofes_scv_reverse_evaluate_object_masks(mask_result['objects'], mask_result['footprints'], base['frame'])
+    candidates = []
+    controls = []
+    if read_raw_do and not objects.empty:
+        snapshot = snapshot if snapshot is not None else load_ofes_snapshot(d, variables=['temp', 'salinity'])
+        settings = _ofes_mccoy_virtual_argo_settings()
+        settings['control_radii_km'] = tuple(float(value) for value in reverse_cfg.get('control_radii_km', settings['control_radii_km']))
+        settings['control_azimuth_count'] = int(reverse_cfg.get('control_azimuth_count', settings['control_azimuth_count']))
+        latitude_caliper = float(reverse_cfg.get('control_latitude_caliper_deg', 1.0))
+        density_caliper = float(reverse_cfg.get('control_density_caliper_kg_m3', 0.10))
+        area_caliper = float(reverse_cfg.get('control_area_caliper_fraction', 0.05))
+        areas = _ofes_tracer_cell_area_m2(np.asarray(snapshot['lat']), np.asarray(snapshot['lon']))
+        lookup = {(int(row.global_lat_index), int(row.global_lon_index)): row for row in base['frame'].itertuples(index=False)}
+        tier1_keys = set(zip(base['frame'].loc[base['frame']['tier1'].astype(bool), 'global_lat_index'].astype(int), base['frame'].loc[base['frame']['tier1'].astype(bool), 'global_lon_index'].astype(int)))
+        for object_row in objects.itertuples(index=False):
+            if not bool(getattr(object_row, 'object_evaluable', False)) or not bool(getattr(object_row, 'boundary_excluded_evaluable', False)):
+                continue
+            oid = str(object_row.object_id)
+            mask = mask_result['footprints'].loc[mask_result['footprints']['object_id'].astype(str).eq(oid)].copy()
+            center_row, center_col = _ofes_grid_nearest_index(snapshot['lon'], snapshot['lat'], float(object_row.center_lon), float(object_row.center_lat))
+            object_density = _ofes_scv_reverse_candidate_density(snapshot, center_row, center_col, float(object_row.centroid_depth_m))
+            objects.loc[objects['object_id'].astype(str).eq(oid), 'object_density'] = object_density
+            unique_cells = mask[['global_lat_index', 'global_lon_index']].drop_duplicates()
+            object_area = float(sum(areas[int(row.global_lat_index), int(row.global_lon_index)] for row in unique_cells.itertuples(index=False)))
+            accepted = []
+            points = _ofes_mccoy_sampling_points(float(object_row.center_lon), float(object_row.center_lat), 0.0, settings)
+            seen: set[tuple[int, int]] = set()
+            for point in points.loc[points['sample_role'].eq('background_control')].itertuples(index=False):
+                candidate = {'object_id': oid, 'date': d, 'scope': scope, 'candidate_id': str(point.sample_id), 'candidate_lat': float(point.sample_lat), 'candidate_lon': float(point.sample_lon), 'radius_km': float(point.radius_km), 'azimuth_deg': float(point.azimuth_deg), 'object_density': object_density, 'object_unique_cell_area_m2': object_area, 'translated_unique_cell_area_m2': np.nan, 'area_ratio': np.nan, 'reference_density': np.nan, 'source_lat': np.nan, 'source_lon': np.nan, 'center_latitude_difference_deg': np.nan, 'accepted': False, 'selected': False}
+                outside_geo = float(point.sample_lat) < float(snapshot['lat'].min()) or float(point.sample_lat) > float(snapshot['lat'].max()) or float(point.sample_lon) < float(snapshot['lon'].min()) or float(point.sample_lon) > float(snapshot['lon'].max())
+                if outside_geo:
+                    candidate.update({'source_lat_index': np.nan, 'source_lon_index': np.nan, 'offset_row': np.nan, 'offset_col': np.nan, 'rejection_reason': 'outside_grid'})
+                    candidates.append(candidate)
+                    continue
+                target_row, target_col = _ofes_grid_nearest_index(snapshot['lon'], snapshot['lat'], float(point.sample_lon), float(point.sample_lat))
+                offset = (target_row - center_row, target_col - center_col)
+                candidate.update({'offset_row': int(offset[0]), 'offset_col': int(offset[1]), 'source_lat_index': int(target_row), 'source_lon_index': int(target_col)})
+                reasons = []
+                if offset in seen:
+                    reasons.append('duplicate_integer_offset')
+                seen.add(offset)
+                translated = mask.assign(global_lat_index=mask['global_lat_index'] + offset[0], global_lon_index=mask['global_lon_index'] + offset[1])
+                cells = set(zip(translated['global_lat_index'].astype(int), translated['global_lon_index'].astype(int)))
+                if any(row < 0 or row >= len(snapshot['lat']) or col < 0 or col >= len(snapshot['lon']) for row, col in cells):
+                    reasons.append('outside_grid')
+                if not reasons and any(key not in lookup or not bool(lookup[key].classifier_assessable) or not bool(lookup[key].do_evaluable) for key in cells):
+                    reasons.append('outside_common_frame')
+                if not reasons and cells & tier1_keys:
+                    reasons.append('overlaps_tier1_footprint')
+                if abs(float(snapshot['lat'][target_row]) - float(object_row.center_lat)) > latitude_caliper:
+                    reasons.append('center_latitude_caliper')
+                candidate_density = _ofes_scv_reverse_candidate_density(snapshot, target_row, target_col, float(object_row.centroid_depth_m))
+                if not np.isfinite(object_density) or not np.isfinite(candidate_density):
+                    reasons.append('invalid_reference_density')
+                elif abs(candidate_density - object_density) > density_caliper:
+                    reasons.append('reference_density_caliper')
+                translated_cells = translated[['global_lat_index', 'global_lon_index']].drop_duplicates()
+                translated_area = np.nan if any(row < 0 or row >= len(snapshot['lat']) or col < 0 or col >= len(snapshot['lon']) for row, col in cells) else float(sum(areas[int(row.global_lat_index), int(row.global_lon_index)] for row in translated_cells.itertuples(index=False)))
+                if np.isfinite(object_area) and (not np.isfinite(translated_area) or abs(translated_area / object_area - 1.0) > area_caliper):
+                    reasons.append('horizontal_area_caliper')
+                candidate['reference_density'] = candidate_density
+                candidate['source_lat'] = float(snapshot['lat'][target_row])
+                candidate['source_lon'] = float(snapshot['lon'][target_col])
+                candidate['object_unique_cell_area_m2'] = object_area
+                candidate['translated_unique_cell_area_m2'] = translated_area
+                candidate['area_ratio'] = translated_area / object_area if np.isfinite(object_area) and object_area > 0 and np.isfinite(translated_area) else np.nan
+                candidate['center_latitude_difference_deg'] = abs(float(snapshot['lat'][target_row]) - float(object_row.center_lat))
+                candidate['rejection_reason'] = ';'.join(reasons) if reasons else 'accepted'
+                if not reasons:
+                    candidate['accepted'] = True
+                    accepted.append((candidate, translated))
+                candidates.append(candidate)
+            if len(accepted) < min_controls:
+                continue
+            rng = np.random.default_rng(int.from_bytes(hashlib.sha256(f'{d:%Y%m%d}|{oid}|{seed}'.encode()).digest()[:8], 'little'))
+            for index in rng.permutation(len(accepted))[:max_controls]:
+                candidate, translated = accepted[int(index)]
+                candidate['selected'] = True
+                control = dict(candidate)
+                control['selected'] = True
+                for threshold in (20, 35, 50):
+                    profile_hit, colocated, fraction = _ofes_scv_reverse_object_control_outcome(translated, lookup, threshold)
+                    control[f'do{threshold}_profile_carriage'] = profile_hit
+                    control[f'do{threshold}_3d_carriage'] = colocated
+                    control[f'do{threshold}_3d_fraction'] = fraction
+                controls.append(control)
+    candidates = pd.DataFrame(candidates)
+    controls = pd.DataFrame(controls)
+    if not objects.empty:
+        selected = controls.groupby('object_id').size() if not controls.empty else pd.Series(dtype=int)
+        accepted = candidates.loc[candidates['accepted'].astype(bool)].groupby('object_id').size() if not candidates.empty else pd.Series(dtype=int)
+        objects['selected_control_count'] = objects['object_id'].map(selected).fillna(0).astype(int)
+        objects['accepted_candidate_count'] = objects['object_id'].map(accepted).fillna(0).astype(int)
+        objects['matched_object_evaluable'] = objects['object_evaluable'].astype(bool) & objects['boundary_excluded_evaluable'].astype(bool) & objects['selected_control_count'].ge(min_controls)
+        objects['control_exclusion_reason'] = np.select([~objects['object_evaluable'].astype(bool), ~objects['boundary_excluded_evaluable'].astype(bool), objects['accepted_candidate_count'] < min_controls], ['object_not_evaluable', 'boundary_censored', 'insufficient_controls'], default='matched')
+    objects['scope'] = scope
+    diagnostics = {'object_count': int(len(objects)), 'candidate_count': int(len(candidates)), 'selected_control_count': int(len(controls)), 'min_controls': int(min_controls), 'max_controls': int(max_controls)}
+    diagnostics.update(mask_result.get('diagnostics', {}))
+    return {'date': d, 'scope': scope, 'objects': objects, 'footprints': mask_result['footprints'], 'candidates': candidates, 'controls': controls, 'frame': base['frame'], 'diagnostics': diagnostics}
+
+
+def summarize_ofes_scv_reverse_analysis2(objects: pd.DataFrame, controls: pd.DataFrame) -> pd.DataFrame:
+    """汇总 Analysis 2 的 object carriage 与等搜索体积 control 比较。
+
+    参数:
+        - objects (pd.DataFrame): Analysis 2 对象表。
+        - controls (pd.DataFrame): 已固定选择的 control 表。
+
+    返回:
+        - pd.DataFrame: 每个 scope、标签和阈值的 unconditional/matched 分母、control 均值及 paired RD、RR、OR。
+
+    输出:
+        - 无；调用方负责持久化返回表。
+
+    说明:
+        - controls 先在 object 内求均值，再在 object 间等权；3d carriage 是主 object outcome。
+    """
+    if not isinstance(objects, pd.DataFrame) or not isinstance(controls, pd.DataFrame):
+        raise TypeError('objects and controls must be pandas DataFrames.')
+    rows = []
+    scopes = sorted(objects['scope'].dropna().unique()) if 'scope' in objects else [None]
+    for scope in scopes:
+        obj = objects.loc[objects['scope'].eq(scope)] if scope is not None else objects
+        ctl = controls.loc[controls['scope'].eq(scope)] if 'scope' in controls and scope is not None else controls
+        for label in ('tier1', 'weak_native', 'strong_native', 'well_resolved'):
+            label_mask = obj[label].astype(bool) if label in obj else pd.Series(False, index=obj.index)
+            for threshold in (20, 35, 50):
+                outcome = f'do{threshold}_3d_carriage'
+                profile_outcome = f'do{threshold}_profile_carriage'
+                eligible = obj['object_evaluable'].astype(bool) & label_mask
+                matched = eligible & obj['matched_object_evaluable'].astype(bool)
+                unconditional = obj.loc[eligible]
+                matched_objects = obj.loc[matched]
+                rates = []
+                for object_id in matched_objects['object_id'].astype(str):
+                    group = ctl.loc[ctl['object_id'].astype(str).eq(object_id)]
+                    rates.append(float(group[outcome].mean()) if not group.empty and outcome in group else np.nan)
+                rates = np.asarray(rates, dtype=float)
+                p_control = float(np.nanmean(rates)) if np.isfinite(rates).any() else np.nan
+                p_object = float(matched_objects[outcome].mean()) if not matched_objects.empty and outcome in matched_objects else np.nan
+                fraction_column = f'do{threshold}_3d_fraction'
+                matched_fraction = float(matched_objects[fraction_column].mean()) if not matched_objects.empty and fraction_column in matched_objects else np.nan
+                ratio_metrics = _ofes_scv_reverse_metrics(p_object, 1.0 if np.isfinite(p_object) else 0.0, p_control, 1.0 if np.isfinite(p_control) else 0.0)
+                rows.append({'scope': scope, 'label': label, 'threshold': threshold, 'unconditional_object_n': int(len(unconditional)), 'unconditional_profile_hits': int(unconditional[profile_outcome].sum()) if not unconditional.empty and profile_outcome in unconditional else 0, 'unconditional_3d_hits': int(unconditional[outcome].sum()) if not unconditional.empty and outcome in unconditional else 0, 'unconditional_profile_rate': float(unconditional[profile_outcome].mean()) if not unconditional.empty and profile_outcome in unconditional else np.nan, 'unconditional_3d_rate': float(unconditional[outcome].mean()) if not unconditional.empty and outcome in unconditional else np.nan, 'matched_object_n': int(len(matched_objects)), 'matched_3d_hits': int(matched_objects[outcome].sum()) if not matched_objects.empty and outcome in matched_objects else 0, 'matched_control_object_n': int(np.isfinite(rates).sum()), 'matched_control_count': int(len(ctl.loc[ctl['object_id'].astype(str).isin(matched_objects['object_id'].astype(str))])) if not ctl.empty and outcome in ctl else 0, 'matched_object_rate': p_object, 'mean_within_object_control_rate': p_control, 'matched_mean_colocated_fraction': matched_fraction, 'paired_risk_difference': float(p_object - p_control) if np.isfinite(p_object) and np.isfinite(p_control) else np.nan, 'matched_risk_ratio': float(ratio_metrics['risk_ratio'][()]), 'matched_odds_ratio': float(ratio_metrics['odds_ratio'][()])})
+    return pd.DataFrame(rows)
+def bootstrap_ofes_scv_reverse_analysis2(
+    objects: pd.DataFrame,
+    controls: pd.DataFrame,
+    *,
+    block_days: int = 20,
+    replicates: int | None = None,
+    seed: int = 20260831,
+    calendar_dates: Sequence[str | pd.Timestamp] | None = None,
+) -> pd.DataFrame:
+    """对 matched object 与其 controls 执行锚定日历 block bootstrap。
+
+    参数:
+        - objects (pd.DataFrame): Analysis 2 对象表。
+        - controls (pd.DataFrame): 已固定选择并评估的 controls 表。
+        - block_days (int): 从 2003-01-01 锚定的非重叠日历 block 长度。
+        - replicates (int | None): bootstrap replicate 数；省略时读取 YAML。
+        - seed (int): 确定性随机种子。
+        - calendar_dates (Sequence[str | pd.Timestamp] | None): 完整抽样日历；省略时使用输入表日期。
+
+    返回:
+        - pd.DataFrame: 每个 scope、label 和阈值的 object/control point、CI、block 信息及零值计数。
+
+    输出:
+        - 无；调用方负责持久化 bootstrap 表。
+
+    说明:
+        - object 与其 controls 一起留在同一 block；控制先在 object 内取均值，随后 object 间等权。
+        - zero denominator 保留 infinity/undefined，不使用连续性修正。
+    """
+    if block_days <= 0:
+        raise ValueError('block_days must be positive.')
+    count = int(replicates if replicates is not None else ((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('bootstrap_replicates', 10000)))
+    if count <= 0:
+        raise ValueError('replicates must be positive.')
+    required = {'date', 'scope', 'object_id', 'matched_object_evaluable'}
+    if not required.issubset(objects.columns):
+        raise ValueError(f'Analysis2 objects missing columns: {sorted(required - set(objects.columns))}')
+    ctl_scope = controls.copy()
+    if not ctl_scope.empty:
+        ctl_scope['date'] = pd.to_datetime(ctl_scope['date'], errors='raise').dt.normalize()
+        ctl_scope['_block'] = ((ctl_scope['date'] - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
+    all_objects = objects.copy()
+    all_objects['date'] = pd.to_datetime(all_objects['date'], errors='raise').dt.normalize()
+    all_objects['_block'] = ((all_objects['date'] - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
+    obj = all_objects.loc[all_objects['matched_object_evaluable'].astype(bool)].copy()
+    if calendar_dates is None:
+        dates = list(all_objects['date']) + (list(ctl_scope['date']) if not ctl_scope.empty else [])
+    else:
+        dates = list(pd.to_datetime(calendar_dates, errors='raise').normalize())
+    if not dates:
+        return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
+    calendar_blocks = ((pd.Series(pd.to_datetime(dates)) - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
+    block_ids = np.arange(int(calendar_blocks.min()), int(calendar_blocks.max()) + 1, dtype=int)
+    rng = np.random.default_rng(seed)
+    sampled = rng.choice(block_ids, size=(count, len(block_ids)), replace=True)
+    weights = np.zeros((count, len(block_ids)), dtype=float)
+    for index, block in enumerate(block_ids):
+        weights[:, index] = np.count_nonzero(sampled == block, axis=1)
+    rows = []
+    scope_values = sorted(all_objects['scope'].dropna().unique())
+    for scope in scope_values:
+        scope_objects = obj.loc[obj['scope'].eq(scope)]
+        scope_controls = ctl_scope.loc[ctl_scope['scope'].eq(scope)] if 'scope' in ctl_scope else ctl_scope
+        for label in ('tier1', 'weak_native', 'strong_native', 'well_resolved'):
+            label_mask = scope_objects[label].astype(bool) if label in scope_objects else pd.Series(False, index=scope_objects.index)
+            for threshold in (20, 35, 50):
+                outcome = f'do{threshold}_3d_carriage'
+                selected_objects = scope_objects.loc[label_mask]
+                object_rates = scope_controls.groupby('object_id')[outcome].mean() if outcome in scope_controls else pd.Series(dtype=float)
+                selected_objects = selected_objects.loc[selected_objects['object_id'].astype(str).isin(object_rates.index.astype(str))]
+                if selected_objects.empty:
+                    empty_row = {'scope': scope, 'label': label, 'threshold': threshold, 'block_days': block_days, 'replicates': count, 'nblocks': len(block_ids), 'information_blocks': 0, 'point_object_rate': np.nan, 'point_control_rate': np.nan, 'point_risk_difference': np.nan, 'point_risk_ratio': np.nan, 'point_odds_ratio': np.nan, 'degenerate_all_zero': False, 'no_matched_objects': True, 'uncertainty_uninformative': True}
+                    for metric in ('risk_difference', 'risk_ratio', 'odds_ratio'):
+                        empty_row[f'{metric}_finite_replicates'] = 0
+                        empty_row[f'{metric}_infinite_replicates'] = 0
+                        empty_row[f'{metric}_undefined_replicates'] = count
+                        empty_row[f'{metric}_ci_low'] = np.nan
+                        empty_row[f'{metric}_ci_high'] = np.nan
+                    rows.append(empty_row)
+                    continue
+                block_values = np.zeros((len(block_ids), 3), dtype=float)
+                for block_value, object_row in zip(selected_objects['_block'], selected_objects.itertuples(index=False)):
+                    block = int(block_value)
+                    index = int(np.where(block_ids == block)[0][0])
+                    object_id = str(object_row.object_id)
+                    block_values[index, 0] += 1.0
+                    block_values[index, 1] += float(getattr(object_row, outcome))
+                    block_values[index, 2] += float(object_rates.loc[object_rates.index.astype(str) == object_id].iloc[0])
+                sums = weights @ block_values
+                metrics = _ofes_scv_reverse_metrics(sums[:, 1], sums[:, 0], sums[:, 2], sums[:, 0])
+                point = _ofes_scv_reverse_metrics(selected_objects[outcome].sum(), len(selected_objects), selected_objects['object_id'].astype(str).map(object_rates).sum(), len(selected_objects))
+                row = {'scope': scope, 'label': label, 'threshold': threshold, 'block_days': block_days, 'replicates': count, 'nblocks': len(block_ids), 'information_blocks': int(np.count_nonzero(block_values[:, 0] > 0)), 'point_object_rate': float(point['p_case'][()]), 'point_control_rate': float(point['p_ref'][()]), 'point_risk_difference': float(point['risk_difference'][()]), 'point_risk_ratio': float(point['risk_ratio'][()]), 'point_odds_ratio': float(point['odds_ratio'][()])}
+                for name in ('risk_difference', 'risk_ratio', 'odds_ratio'):
+                    values = metrics[name]
+                    row[f'{name}_finite_replicates'] = int(np.isfinite(values).sum())
+                    row[f'{name}_infinite_replicates'] = int(np.isinf(values).sum())
+                    row[f'{name}_undefined_replicates'] = int(np.isnan(values).sum())
+                    row[f'{name}_ci_low'] = _ofes_scv_reverse_empirical_quantile(values, 0.025)
+                    row[f'{name}_ci_high'] = _ofes_scv_reverse_empirical_quantile(values, 0.975)
+                row['degenerate_all_zero'] = bool(float(selected_objects[outcome].sum()) == 0.0 and float(object_rates.loc[object_rates.index.astype(str).isin(selected_objects['object_id'].astype(str))].sum()) == 0.0)
+                row['no_matched_objects'] = bool(len(selected_objects) == 0)
+                row['uncertainty_uninformative'] = bool(row['information_blocks'] < 2 or row['degenerate_all_zero'] or row['no_matched_objects'])
+                rows.append(row)
+    return pd.DataFrame(rows)
+def _ofes_scv_reverse_atomic_parquet(table: pd.DataFrame, path: Path) -> None:
+    """以同目录临时文件和 replace 原子写入 parquet。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.tmp')
+    table.to_parquet(temporary, index=False)
+    os.replace(temporary, path)
+
+
+def _ofes_scv_reverse_atomic_json(payload: Mapping[str, Any], path: Path) -> None:
+    """以同目录临时文件和 replace 原子写入 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + '\n', encoding='utf-8')
+    os.replace(temporary, path)
+
+
+def _ofes_scv_reverse_input_identity(
+    *,
+    s5_root: str | Path | None = None,
+    do_catalog_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """返回反向审计输入和 science configuration 的可比较身份。"""
+    paths = _ofes_scv_reverse_paths()
+    if s5_root is not None:
+        paths['s5'] = Path(s5_root)
+    if do_catalog_root is not None:
+        paths['do_catalog'] = Path(do_catalog_root)
+    cfg = (_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {})
+    source = {}
+    for name in ('s5', 'do_catalog'):
+        path = paths[name]
+        if path.exists():
+            stat = path.stat()
+            source[name] = {'path': str(path.resolve()), 'size': int(stat.st_size), 'mtime_ns': int(stat.st_mtime_ns)}
+        else:
+            source[name] = {'path': str(path), 'exists': False}
+    for relative in ('manifest.json', 's5_objects.parquet', 's5_summary.json'):
+        path = paths['s5'] / relative
+        if path.exists() and path.is_file():
+            stat = path.stat()
+            source[f's5_{relative}'] = {'path': str(path.resolve()), 'size': int(stat.st_size), 'mtime_ns': int(stat.st_mtime_ns), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    detection = make_detection_config('do', do_threshold=20.0, anomaly_min_depth=300.0, anomaly_max_depth=1000.0)
+    producer_schema_version = 'scv_reverse_enrichment_v1'
+    signature_payload = {'producer_schema_version': producer_schema_version, 'science_config': cfg, 'detection_config': vars(detection)}
+    science_signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True, default=str).encode()).hexdigest()
+    return {'sources': source, 'science_config': cfg, 'detection_config': vars(detection), 'producer_schema_version': producer_schema_version, 'track_code_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'science_signature': science_signature}
+
+
+def _ofes_scv_reverse_required_products(write_object_layer: bool) -> tuple[str, ...]:
+    """返回 producer completion 必须具备的固定产品清单。"""
+    products = ['profile_frame.parquet', 'analysis1_strata.parquet', 'analysis1_daily.parquet', 'analysis1_summary.parquet']
+    products.extend([f'analysis1_bootstrap_{days}d.parquet' for days in _ofes_scv_reverse_block_lengths()])
+    if write_object_layer:
+        products.extend(['analysis2_objects.parquet', 'analysis2_footprints.parquet', 'analysis2_candidates.parquet', 'analysis2_controls.parquet', 'analysis2_summary.parquet'])
+        products.extend([f'analysis2_bootstrap_{days}d.parquet' for days in _ofes_scv_reverse_block_lengths()])
+    return tuple(products)
+
+
+def _ofes_scv_reverse_validate_object_coverage(path: Path) -> None:
+    """拒绝仍含 missing_profile_frame 的旧 object cache。"""
+    if not path.exists():
+        return
+    reasons = pd.read_parquet(path, columns=['object_exclusion_reason'])['object_exclusion_reason'].astype(str)
+    if reasons.eq('missing_profile_frame').any():
+        raise RuntimeError(f'Object cache has missing_profile_frame case coverage; re-produce the fragment: {path}')
+
+
+def _ofes_scv_reverse_file_identity(path: Path) -> dict[str, Any]:
+    """返回一个输入或输出文件的 size/mtime/hash 身份。"""
+    stat = path.stat()
+    return {'path': str(path.resolve()), 'size': int(stat.st_size), 'mtime_ns': int(stat.st_mtime_ns), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _ofes_scv_reverse_stream_sha256(path: Path) -> str:
+    """以固定小块读取大输入文件并返回 SHA-256，避免额外占用快照内存。"""
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ofes_scv_reverse_date_source_identity(
+    date: pd.Timestamp,
+    *,
+    s5_root: str | Path | None = None,
+    do_catalog_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """记录指定日期的 OFES raw 与 DO catalog 文件身份。"""
+    paths = _ofes_scv_reverse_paths()
+    if s5_root is not None:
+        paths['s5'] = Path(s5_root)
+    if do_catalog_root is not None:
+        paths['do_catalog'] = Path(do_catalog_root)
+    files = {}
+    for variable in ('do2', 'temp', 'salinity'):
+        path = Path(_ofes_file_path(variable, date))
+        if path.exists():
+            stat = path.stat()
+            files[f'ofes_{variable}'] = {'path': str(path.resolve()), 'size': int(stat.st_size), 'mtime_ns': int(stat.st_mtime_ns), 'sha256': _ofes_scv_reverse_stream_sha256(path)}
+    catalog = paths['do_catalog'] / 'days' if (paths['do_catalog'] / 'days').is_dir() else paths['do_catalog']
+    for path in sorted(catalog.glob(f'*{date:%Y%m%d}*')):
+        if path.is_file():
+            files[f'do_catalog_{path.name}'] = _ofes_scv_reverse_file_identity(path)
+    detection = make_detection_config('do', do_threshold=20.0, anomaly_min_depth=300.0, anomaly_max_depth=1000.0)
+    return {'date': date.strftime('%Y-%m-%d'), 'files': files, 'detection_config': vars(detection)}
+
+
+def _ofes_scv_reverse_validate_approved_code_hashes(values: Sequence[str] | None) -> tuple[str, ...] | None:
+    """验证显式允许的 producer code SHA-256 集合。"""
+    if values is None:
+        return None
+    approved = tuple(dict.fromkeys(str(value).lower() for value in values))
+    if not approved or any(re.fullmatch(r'[0-9a-f]{64}', value) is None for value in approved):
+        raise ValueError('approved_code_sha256 must contain non-empty 64-character hexadecimal hashes.')
+    return approved
+
+
+def _ofes_scv_reverse_block_lengths() -> tuple[int, ...]:
+    """读取 Analysis 1/2 的预声明 calendar block 长度。"""
+    config = (_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {})
+    values = tuple(int(value) for value in config.get('block_lengths_days', (20, 40)))
+    if not values or any(value <= 0 for value in values):
+        raise ValueError('Reverse enrichment block lengths must be positive.')
+    return values
+
+
+def produce_ofes_scv_reverse_enrichment_day(
+    date: str | pd.Timestamp,
+    *,
+    scopes: Sequence[str] = ('primary_300_1000', 'deep_500_1000'),
+    output_dir: str | Path | None = None,
+    s5_root: str | Path | None = None,
+    do_catalog_root: str | Path | None = None,
+    write_object_layer: bool = True,
+) -> dict:
+    """原子写入单日两 scope 的反向富集 profile/object 片段。
+
+    参数:
+        - date (str | pd.Timestamp): OFES 日期。
+        - scopes (Sequence[str]): 要处理的垂向 scope。
+        - output_dir (str | Path | None): 独立输出根目录；省略时读取 YAML。
+        - s5_root (str | Path | None): S5 输入根目录。
+        - do_catalog_root (str | Path | None): DO catalog 根目录。
+        - write_object_layer (bool): 是否写入 Analysis 2 object/control 片段。
+
+    返回:
+        - dict: 日期、scope、完成状态、parity、输出路径和输入/science signature。
+
+    输出:
+        - output_dir/scope/YYYYMMDD/ 下的 profile、strata、daily、object、control 和 completion parquet/JSON 片段。
+
+    说明:
+        - 每个 scope 的完成标记最后原子写入；NetCDF snapshot 在同日两 scope 间复用，不把 profile frame 留到跨日内存。
+        - source parity 失败时不生成完成标记，调用方必须停止生产。
+    """
+    d = pd.Timestamp(date).normalize()
+    selected_scopes = tuple(scopes)
+    config = (_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {})
+    unknown = set(selected_scopes) - set(config.get('scopes', {}))
+    if unknown:
+        raise ValueError(f'Unknown reverse enrichment scopes: {sorted(unknown)}')
+    root = Path(output_dir) if output_dir is not None else _ofes_scv_reverse_paths()['output']
+    identity = _ofes_scv_reverse_input_identity(s5_root=s5_root, do_catalog_root=do_catalog_root)
+    date_identity = _ofes_scv_reverse_date_source_identity(d, s5_root=s5_root, do_catalog_root=do_catalog_root)
+    snapshot = None
+    outputs: dict[str, Any] = {}
+    for scope in selected_scopes:
+        scope_dir = root / scope / f'{d:%Y%m%d}'
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        marker = scope_dir / 'completion.json'
+        if marker.exists():
+            previous = json.loads(marker.read_text(encoding='utf-8'))
+            required = _ofes_scv_reverse_required_products(write_object_layer)
+            previous_outputs = previous.get('outputs', {})
+            previous_names = tuple(previous_outputs) if isinstance(previous_outputs, dict) else tuple(previous_outputs)
+            output_identity_ok = all((scope_dir / name).exists() and isinstance(previous_outputs, dict) and previous_outputs[name].get('size') == (scope_dir / name).stat().st_size and previous_outputs[name].get('sha256') == hashlib.sha256((scope_dir / name).read_bytes()).hexdigest() for name in required)
+            if write_object_layer and output_identity_ok:
+                _ofes_scv_reverse_validate_object_coverage(scope_dir / 'analysis2_objects.parquet')
+            if previous.get('status') == 'complete' and previous.get('date') == d.strftime('%Y-%m-%d') and previous.get('scope') == scope and previous.get('write_object_layer') == bool(write_object_layer) and previous.get('science_signature') == identity['science_signature'] and previous.get('input_identity', {}).get('sources') == identity['sources'] and previous.get('date_source_identity') == date_identity and set(previous_names) == set(required) and output_identity_ok:
+                outputs[scope] = previous
+                continue
+            raise RuntimeError(f'Existing incomplete or mismatched cache fragment: {scope_dir}')
+        if snapshot is None:
+            snapshot = load_ofes_snapshot(d, variables=['do2', 'temp', 'salinity'])
+        parity = validate_ofes_scv_reverse_do_parity(d, do_catalog_root=do_catalog_root, snapshot=snapshot)
+        if not parity.get('passed', False):
+            raise RuntimeError(f'DO source parity failed for {d:%Y-%m-%d}: {parity}')
+        day = build_ofes_scv_reverse_day(d, scope=scope, s5_root=s5_root, do_catalog_root=do_catalog_root, read_raw_do=True, snapshot=snapshot)
+        strata = build_ofes_scv_reverse_analysis1_strata(day['frame'])
+        daily = build_ofes_scv_reverse_analysis1_daily(strata)
+        paths = {}
+        for name, table in (('profile_frame', day['frame']), ('analysis1_strata', strata), ('analysis1_daily', daily)):
+            path = scope_dir / f'{name}.parquet'
+            _ofes_scv_reverse_atomic_parquet(table, path)
+            paths[name] = str(path)
+        analysis1_summary = summarize_ofes_scv_reverse_analysis1(daily=daily)
+        _ofes_scv_reverse_atomic_parquet(analysis1_summary, scope_dir / 'analysis1_summary.parquet')
+        for block_days in _ofes_scv_reverse_block_lengths():
+            boot = bootstrap_ofes_scv_reverse_analysis1(daily=daily, block_days=block_days, calendar_dates=[d])
+            _ofes_scv_reverse_atomic_parquet(boot, scope_dir / f'analysis1_bootstrap_{block_days}d.parquet')
+        object_diagnostics = {}
+        if write_object_layer:
+            object_result = build_ofes_scv_reverse_analysis2_day(d, scope=scope, s5_root=s5_root, do_catalog_root=do_catalog_root, read_raw_do=True, frame_result=day, snapshot=snapshot)
+            object_diagnostics = object_result['diagnostics']
+            for name in ('objects', 'footprints', 'candidates', 'controls'):
+                _ofes_scv_reverse_atomic_parquet(object_result[name], scope_dir / f'analysis2_{name}.parquet')
+            object_summary = summarize_ofes_scv_reverse_analysis2(object_result['objects'], object_result['controls'])
+            _ofes_scv_reverse_atomic_parquet(object_summary, scope_dir / 'analysis2_summary.parquet')
+            for block_days in _ofes_scv_reverse_block_lengths():
+                object_bootstrap = bootstrap_ofes_scv_reverse_analysis2(object_result['objects'], object_result['controls'], block_days=block_days, calendar_dates=[d])
+                _ofes_scv_reverse_atomic_parquet(object_bootstrap, scope_dir / f'analysis2_bootstrap_{block_days}d.parquet')
+        required = _ofes_scv_reverse_required_products(write_object_layer)
+        output_identity = {name: _ofes_scv_reverse_file_identity(scope_dir / name) for name in required}
+        completion = {'status': 'complete', 'date': d.strftime('%Y-%m-%d'), 'scope': scope, 'write_object_layer': bool(write_object_layer), 'science_signature': identity['science_signature'], 'input_identity': identity, 'date_source_identity': date_identity, 'do_parity': parity, 'diagnostics': {'profile': day['diagnostics'], 'object': object_diagnostics}, 'profile_rows': int(len(day['frame'])), 'strata_rows': int(len(strata)), 'daily_rows': int(len(daily)), 'outputs': output_identity}
+        _ofes_scv_reverse_atomic_json(completion, scope_dir / 'completion.json')
+        outputs[scope] = completion
+    return {'date': d, 'status': 'complete', 'scopes': outputs, 'input_identity': identity}
+
+
+def reduce_ofes_scv_reverse_enrichment_cache(
+    output_dir: str | Path,
+    *,
+    scopes: Sequence[str] | None = None,
+    dates: Sequence[str | pd.Timestamp] | None = None,
+    write_outputs: bool = True,
+    approved_code_sha256: Sequence[str] | None = None,
+) -> dict:
+    """仅从已完成片段重建 Analysis 1/2 summary 与 block CI。
+
+    参数:
+        - output_dir (str | Path): producer 输出根目录。
+        - scopes (Sequence[str] | None): scope 子目录；省略时读取已有目录。
+        - dates (Sequence[str | pd.Timestamp] | None): 完整 calendar dates；省略时读取 completion 标记。
+        - write_outputs (bool): 是否原子写入 reducer summary/CSV/manifest。
+        - approved_code_sha256 (Sequence[str] | None): 明确批准的 producer code SHA-256 集合；省略时要求所有 marker 完全同一 code hash。
+
+    返回:
+        - dict: cache-only summary、bootstrap、对象表和输出路径。
+
+    输出:
+        - output_dir/scope/analysis1_summary.parquet、CSV、20/40 日 CI 及 reducer manifest；有对象片段时另写 Analysis 2 表。
+
+    说明:
+        - 不读取 OFES NetCDF、不调用任何 producer；只读取 profile 之外的 compact sufficient tables 和 object/control tables。
+        - 缺少 completion、science signature 或输入 identity 不一致时直接失败，避免静默拼接不同实验。
+    """
+    root = Path(output_dir)
+    approved_hashes = _ofes_scv_reverse_validate_approved_code_hashes(approved_code_sha256)
+    if scopes is None:
+        configured_scopes = tuple((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('scopes', {}).keys())
+        scopes = tuple(scope for scope in configured_scopes if (root / scope).is_dir())
+        if not scopes:
+            raise RuntimeError(f'No configured reverse enrichment scope directories found: {root}')
+    selected_dates = [pd.Timestamp(value).normalize() for value in dates] if dates is not None else None
+    validated: dict[str, list[dict[str, Any]]] = {}
+    expected_date_tags = {value.strftime('%Y%m%d') for value in selected_dates} if selected_dates is not None else None
+    for scope in scopes:
+        scope_root = root / scope
+        if not scope_root.is_dir():
+            raise RuntimeError(f'Missing scope cache directory: {scope_root}')
+        found = []
+        for day_dir in sorted(scope_root.glob('20??????')):
+            marker = day_dir / 'completion.json'
+            if marker.exists():
+                item = json.loads(marker.read_text(encoding='utf-8'))
+                if item.get('status') != 'complete' or item.get('scope') != scope or item.get('date', '').replace('-', '') != day_dir.name:
+                    raise RuntimeError(f'Invalid completion marker: {marker}')
+                required = _ofes_scv_reverse_required_products(bool(item.get('write_object_layer', False)))
+                outputs = item.get('outputs', {})
+                if not isinstance(outputs, dict) or set(outputs) != set(required) or any(not (day_dir / name).exists() or outputs[name].get('size') != (day_dir / name).stat().st_size or outputs[name].get('sha256') != hashlib.sha256((day_dir / name).read_bytes()).hexdigest() for name in required):
+                    raise RuntimeError(f'Incomplete required products: {day_dir}')
+                if bool(item.get('write_object_layer', False)):
+                    _ofes_scv_reverse_validate_object_coverage(day_dir / 'analysis2_objects.parquet')
+                found.append(item)
+        if expected_date_tags is not None and {item.get('date', '').replace('-', '') for item in found} != expected_date_tags:
+            raise RuntimeError(f'Incomplete cache dates for scope {scope}.')
+        if not found:
+            raise RuntimeError(f'No completed cache fragments for scope {scope}.')
+        modes = {bool(item.get('write_object_layer', False)) for item in found}
+        if len(modes) != 1:
+            raise RuntimeError(f'Mixed object-layer modes for scope {scope}.')
+        validated[scope] = found
+    if selected_dates is None:
+        date_sets = [{item.get('date', '').replace('-', '') for item in validated[scope]} for scope in scopes]
+        if date_sets and any(date_set != date_sets[0] for date_set in date_sets[1:]):
+            raise RuntimeError('Scopes do not share the same completed date set.')
+    all_markers = [item for scope in scopes for item in validated[scope]]
+    raw_signatures = [item.get('science_signature') for item in all_markers]
+    if not raw_signatures or any(not isinstance(value, str) or not value.strip() for value in raw_signatures) or len(set(raw_signatures)) != 1:
+        raise RuntimeError('Completed cache markers have missing or inconsistent science signatures.')
+    if any(not item.get('input_identity', {}).get('science_signature') or item.get('input_identity', {}).get('science_signature') != item.get('science_signature') for item in all_markers):
+        raise RuntimeError('Completed cache markers have inconsistent top-level/input science signatures.')
+    code_hashes = []
+    comparable_input_identities = []
+    for item in all_markers:
+        identity = item.get('input_identity', {})
+        code_hash = identity.get('track_code_sha256') if isinstance(identity, dict) else None
+        if not isinstance(code_hash, str) or re.fullmatch(r'[0-9a-fA-F]{64}', code_hash) is None:
+            raise RuntimeError('Completed cache markers have missing or invalid track code SHA-256.')
+        code_hash = code_hash.lower()
+        code_hashes.append(code_hash)
+        if approved_hashes is not None and code_hash not in approved_hashes:
+            raise RuntimeError(f'Cache marker code hash is not in approved_code_sha256: {code_hash}')
+        comparable = dict(identity)
+        comparable.pop('track_code_sha256', None)
+        comparable_input_identities.append(json.dumps(comparable, sort_keys=True, default=str))
+    if approved_hashes is None and len(set(code_hashes)) != 1:
+        raise RuntimeError('Completed cache markers have inconsistent producer code hashes; pass explicit approved_code_sha256 to permit reviewed compatibility.')
+    input_identities = set(comparable_input_identities)
+    if len(input_identities) != 1:
+        raise RuntimeError('Completed cache markers have inconsistent common input identities.')
+    date_identity_by_date = {}
+    for item in all_markers:
+        tag = item.get('date', '')
+        identity = json.dumps(item.get('date_source_identity', {}), sort_keys=True, default=str)
+        if tag in date_identity_by_date and date_identity_by_date[tag] != identity:
+            raise RuntimeError(f'Completed cache markers have inconsistent date input identity: {tag}')
+        date_identity_by_date[tag] = identity
+    modes = {bool(item.get('write_object_layer', False)) for item in all_markers}
+    if len(modes) != 1:
+        raise RuntimeError('Completed cache markers mix object-layer modes.')
+    result: dict[str, Any] = {'output_dir': str(root), 'scopes': {}}
+    signatures: set[str] = set()
+    for scope in scopes:
+        scope_root = root / scope
+        completions = validated[scope]
+        signatures.update(item.get('science_signature') for item in completions)
+        input_signatures = set()
+        for item in completions:
+            identity = dict(item.get('input_identity', {}))
+            identity.pop('track_code_sha256', None)
+            input_signatures.add(json.dumps(identity, sort_keys=True, default=str))
+        if len(input_signatures) != 1:
+            raise RuntimeError(f'Inconsistent input identities for scope {scope}.')
+        if len({str(item.get('input_identity', {}).get('science_signature')) for item in completions}) != 1:
+            raise RuntimeError(f'Inconsistent science signatures for scope {scope}.')
+        daily = pd.concat([pd.read_parquet(scope_root / item['date'].replace('-', '') / 'analysis1_daily.parquet') for item in completions], ignore_index=True)
+        calendar = selected_dates if selected_dates is not None else [pd.Timestamp(item['date']) for item in completions]
+        summary = summarize_ofes_scv_reverse_analysis1(daily=daily)
+        scope_result = {'analysis1_summary': summary, 'analysis1_daily': daily}
+        if write_outputs:
+            _ofes_scv_reverse_atomic_parquet(summary, scope_root / 'analysis1_summary.parquet')
+            summary.to_csv(scope_root / 'analysis1_summary.csv', index=False)
+            _ofes_scv_reverse_atomic_parquet(daily, scope_root / 'analysis1_daily.parquet')
+        for block_days in _ofes_scv_reverse_block_lengths():
+            boot = bootstrap_ofes_scv_reverse_analysis1(daily=daily, block_days=block_days, calendar_dates=calendar)
+            scope_result[f'analysis1_bootstrap_{block_days}d'] = boot
+            if write_outputs:
+                _ofes_scv_reverse_atomic_parquet(boot, scope_root / f'analysis1_bootstrap_{block_days}d.parquet')
+        object_paths = [scope_root / item['date'].replace('-', '') / 'analysis2_objects.parquet' for item in completions]
+        control_paths = [scope_root / item['date'].replace('-', '') / 'analysis2_controls.parquet' for item in completions]
+        if all(path.exists() for path in object_paths + control_paths):
+            objects = pd.concat([pd.read_parquet(path) for path in object_paths], ignore_index=True)
+            controls = pd.concat([pd.read_parquet(path) for path in control_paths], ignore_index=True)
+            object_summary = summarize_ofes_scv_reverse_analysis2(objects, controls)
+            scope_result.update({'analysis2_objects': objects, 'analysis2_controls': controls, 'analysis2_summary': object_summary})
+            if write_outputs:
+                _ofes_scv_reverse_atomic_parquet(objects, scope_root / 'analysis2_objects.parquet')
+                _ofes_scv_reverse_atomic_parquet(controls, scope_root / 'analysis2_controls.parquet')
+                _ofes_scv_reverse_atomic_parquet(object_summary, scope_root / 'analysis2_summary.parquet')
+                object_summary.to_csv(scope_root / 'analysis2_summary.csv', index=False)
+            for block_days in _ofes_scv_reverse_block_lengths():
+                object_bootstrap = bootstrap_ofes_scv_reverse_analysis2(objects, controls, block_days=block_days, calendar_dates=calendar)
+                scope_result[f'analysis2_bootstrap_{block_days}d'] = object_bootstrap
+                if write_outputs:
+                    _ofes_scv_reverse_atomic_parquet(object_bootstrap, scope_root / f'analysis2_bootstrap_{block_days}d.parquet')
+        result['scopes'][scope] = scope_result
+    if len(signatures) != 1:
+        raise RuntimeError('Cache fragments have inconsistent science signatures.')
+    result['science_signature'] = next(iter(signatures))
+    result['code_hashes'] = sorted(set(code_hashes))
+    result['approved_code_sha256'] = list(approved_hashes) if approved_hashes is not None else None
+    if write_outputs:
+        manifest = {'status': 'complete', 'science_signature': result['science_signature'], 'scopes': list(scopes), 'calendar_dates': [value.strftime('%Y-%m-%d') for value in (selected_dates or calendar)], 'code_hashes': result['code_hashes'], 'approved_code_sha256': result['approved_code_sha256']}
+        _ofes_scv_reverse_atomic_json(manifest, root / 'reducer_manifest.json')
+        result['manifest'] = manifest
+    return result
+
+
+def load_ofes_scv_reverse_enrichment(
+    output_dir: str | Path | None = None,
+    *,
+    scopes: Sequence[str] | None = None,
+    block_days: int = 20,
+) -> dict:
+    """读取完成的 OFES SCV reverse-enrichment 汇总和区块区间。
+
+    参数:
+        - output_dir (str | Path | None): reducer 输出根目录；None 使用 YAML 路径。
+        - scopes (Sequence[str] | None): 要读取的垂向范围；None 读取 manifest 中的范围。
+        - block_days (int): 读取的 calendar-block bootstrap 长度，正式主口径为 20 日。
+    返回:
+        - dict: reducer manifest、各 scope 的 profile-day/object-day 汇总与 bootstrap 表。
+    说明:
+        - 只读取 compact reducer 产物，不读取 OFES 原始场或逐日 profile frame。
+    """
+    root = Path(output_dir) if output_dir is not None else _ofes_scv_reverse_paths()['output']
+    manifest_path = root / 'reducer_manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'SCV reverse-enrichment reducer manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('status') != 'complete':
+        raise ValueError(f'SCV reverse-enrichment reducer is incomplete: {manifest_path}')
+    selected_scopes = tuple(scopes or manifest.get('scopes', ()))
+    if not selected_scopes:
+        raise ValueError('SCV reverse-enrichment manifest declares no completed scope.')
+    allowed_blocks = _ofes_scv_reverse_block_lengths()
+    if int(block_days) not in allowed_blocks:
+        raise ValueError(
+            f'block_days must be one of the configured values {allowed_blocks}, got {block_days}.'
+        )
+    payload = {}
+    for scope in selected_scopes:
+        scope_root = root / scope
+        paths = {
+            'analysis1_summary': scope_root / 'analysis1_summary.parquet',
+            'analysis1_bootstrap': scope_root / f'analysis1_bootstrap_{int(block_days)}d.parquet',
+            'analysis2_summary': scope_root / 'analysis2_summary.parquet',
+            'analysis2_bootstrap': scope_root / f'analysis2_bootstrap_{int(block_days)}d.parquet',
+        }
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f'SCV reverse-enrichment scope {scope} lacks reducer tables: {missing}'
+            )
+        tables = {name: pd.read_parquet(path) for name, path in paths.items()}
+        for name, frame in tables.items():
+            if frame.empty or 'scope' not in frame or set(frame['scope'].astype(str)) != {scope}:
+                raise ValueError(f'SCV reverse-enrichment scope mismatch in {name}: {scope}')
+        payload[scope] = tables
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'block_days': int(block_days),
+        'scopes': payload,
+    }
+
+
+def plot_ofes_scv_reverse_risk_differences(
+    result: Mapping[str, Any] | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    scope: str = 'primary_300_1000',
+    block_days: int = 20,
+    show_fig: bool = True,
+    save_fig: bool = True,
+) -> dict:
+    """绘制 DO 阈值与 SCV-related 结构层级/属性的匹配风险差。
+
+    参数:
+        - result (Mapping | None): `load_ofes_scv_reverse_enrichment` 结果；None 时从磁盘读取。
+        - output_dir (str | Path | None): reducer 输出根目录；None 使用 YAML 路径。
+        - scope (str): 要展示的垂向范围，默认 300–1000 m 主范围。
+        - block_days (int): calendar-block bootstrap 长度，默认正式 20 日口径。
+        - show_fig (bool): 是否显示图形。
+        - save_fig (bool): 是否保存固定 PNG。
+    返回:
+        - dict: Matplotlib figure、figure path 和绘图长表。
+    输出:
+        - output_dir/scv_reverse_risk_differences.png，仅当 `save_fig=True`。
+    说明:
+        - 左图观察单位为 matched profile-day，右图为 matched object-day。
+        - weak、strong 与 well-resolved 是重叠属性，不能把行间差异解释为独立 tier 检验。
+    """
+    payload = result if result is not None else load_ofes_scv_reverse_enrichment(
+        output_dir, scopes=(scope,), block_days=block_days,
+    )
+    if int(payload.get('block_days', block_days)) != int(block_days):
+        raise ValueError('SCV reverse-enrichment result uses a different block_days value.')
+    if scope not in payload.get('scopes', {}):
+        raise KeyError(f'SCV reverse-enrichment result does not contain scope {scope}.')
+    scope_result = payload['scopes'][scope]
+    panels = (
+        ('Matched profile-days', 'analysis1',
+         ('tier0', 'tier1', 'weak_native', 'strong_native', 'well_resolved')),
+        ('Matched object-days', 'analysis2',
+         ('tier1', 'weak_native', 'strong_native', 'well_resolved')),
+    )
+    labels = {
+        'tier0': 'Tier 0 McCoy-compatible',
+        'tier1': 'Tier 1 closed lens',
+        'weak_native': 'Weak native support',
+        'strong_native': 'Strong native support',
+        'well_resolved': 'Well resolved',
+    }
+    plot_rows = []
+    for panel_title, prefix, order in panels:
+        summary = scope_result[f'{prefix}_summary'].copy()
+        bootstrap = scope_result[f'{prefix}_bootstrap'].copy()
+        estimate_column = (
+            'matched_risk_difference' if prefix == 'analysis1'
+            else 'paired_risk_difference'
+        )
+        denominator_column = (
+            'matched_case_n' if prefix == 'analysis1' else 'matched_object_n'
+        )
+        merged = summary.merge(
+            bootstrap[[
+                'scope', 'label', 'threshold',
+                'risk_difference_ci_low', 'risk_difference_ci_high',
+            ]],
+            on=['scope', 'label', 'threshold'],
+            how='inner',
+            validate='one_to_one',
+        )
+        for tier_index, label in enumerate(order):
+            values = merged[merged['label'].eq(label)]
+            for row in values.itertuples(index=False):
+                plot_rows.append({
+                    'panel': panel_title,
+                    'tier': label,
+                    'tier_label': labels[label],
+                    'tier_index': tier_index,
+                    'threshold': int(row.threshold),
+                    'estimate_pp': 100.0 * float(getattr(row, estimate_column)),
+                    'ci_low_pp': 100.0 * float(row.risk_difference_ci_low),
+                    'ci_high_pp': 100.0 * float(row.risk_difference_ci_high),
+                    'denominator': int(getattr(row, denominator_column)),
+                })
+    plot_data = pd.DataFrame(plot_rows)
+    if plot_data.empty:
+        raise ValueError('SCV reverse-enrichment plot has no matched risk-difference rows.')
+    thresholds = (20, 35, 50)
+    expected_rows = sum(len(order) for _, _, order in panels) * len(thresholds)
+    if len(plot_data) != expected_rows:
+        raise ValueError(
+            f'SCV reverse-enrichment plot has {len(plot_data)} rows, expected {expected_rows}.'
+        )
+    if not np.all(
+        (plot_data['ci_low_pp'] <= plot_data['estimate_pp'])
+        & (plot_data['estimate_pp'] <= plot_data['ci_high_pp'])
+    ):
+        raise ValueError('SCV reverse-enrichment point estimate lies outside its interval.')
+    colors = {20: '#1b9e77', 35: '#d95f02', 50: '#7570b3'}
+    markers = {20: 'o', 35: 's', 50: '^'}
+    offsets = {20: -0.20, 35: 0.0, 50: 0.20}
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.9), sharex=True)
+    for axis, (panel_title, _, order), panel_label in zip(axes, panels, ('a', 'b')):
+        subset = plot_data[plot_data['panel'].eq(panel_title)]
+        axis.axvline(0.0, color='#111827', lw=.8, zorder=0)
+        for threshold in thresholds:
+            values = subset[subset['threshold'].eq(threshold)].sort_values('tier_index')
+            y = values['tier_index'].to_numpy(float) + offsets[threshold]
+            estimate = values['estimate_pp'].to_numpy(float)
+            lower = values['ci_low_pp'].to_numpy(float)
+            upper = values['ci_high_pp'].to_numpy(float)
+            axis.errorbar(
+                estimate, y, xerr=[estimate - lower, upper - estimate],
+                fmt=markers[threshold], ms=5.2, color=colors[threshold],
+                ecolor=colors[threshold], elinewidth=1.0, capsize=2.2,
+                label=f'DO{threshold}', zorder=2,
+            )
+        axis.set_yticks(
+            np.arange(len(order)), [labels[label] for label in order],
+        )
+        axis.invert_yaxis()
+        axis.set_title(panel_title, fontsize=10.5)
+        axis.set_xlabel('Matched risk difference (percentage points)')
+        axis.grid(axis='x', color='#d1d5db', lw=.6, alpha=.65)
+        axis.spines[['top', 'right']].set_visible(False)
+        axis.text(-0.12, 1.04, panel_label, transform=axis.transAxes,
+                  fontsize=12, fontweight='bold', va='bottom')
+    all_lower = float(plot_data['ci_low_pp'].min())
+    all_upper = float(plot_data['ci_high_pp'].max())
+    span = max(all_upper - all_lower, 1.0)
+    axes[0].set_xlim(min(-1.0, all_lower - 0.05 * span), all_upper + 0.08 * span)
+    handles = [
+        Line2D([0], [0], marker=markers[value], color=colors[value], lw=1,
+               markersize=5.2, label=f'DO{value}')
+        for value in thresholds
+    ]
+    fig.legend(handles=handles, loc='upper center', ncol=3, frameon=False,
+               bbox_to_anchor=(0.5, 0.99))
+    scope_label = (
+        '300–1000 m primary scope' if scope == 'primary_300_1000'
+        else '500–1000 m deep scope' if scope == 'deep_500_1000'
+        else scope.replace('_', ' ')
+    )
+    fig.suptitle(
+        f'DO enrichment across SCV-related structure classes ({scope_label})',
+        fontsize=13, y=1.03,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    path = None
+    if save_fig:
+        root = Path(payload.get('output_dir', output_dir or _ofes_scv_reverse_paths()['output']))
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / 'scv_reverse_risk_differences.png'
+        dpi = int((_PROC_CFG.get('ofes', {}).get('scv_reverse_enrichment', {}) or {}).get('figure_dpi', 320))
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return {'figure': fig, 'figure_path': path, 'plot_data': plot_data}
