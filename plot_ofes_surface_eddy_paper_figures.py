@@ -369,7 +369,7 @@ def _plot_figure6(
     output_dir: Path,
     dpi: int,
 ) -> Path:
-    """Render Figure 6: surface Ro correspondence versus closed-SSH capture."""
+    """Render Figure 6: primary surface Ro correspondence versus closed-SSH capture."""
 
     _require_columns(
         association,
@@ -382,7 +382,7 @@ def _plot_figure6(
             "nearest_pet_center_distance_km",
             "nearest_pet_center_distance_over_effective_radius",
         ),
-        "strict surface association",
+        "primary-process surface association",
     )
     _require_columns(quality, ("pet_analysis_eligible",), "quality surface association")
     _require_columns(
@@ -400,17 +400,11 @@ def _plot_figure6(
     eligible = _true_mask(rotation["peak_core_analysis_eligible"])
     contained = _true_mask(rotation["peak_core_contained_by_actual_pet_effective_contour"])
     same_sign = _true_mask(rotation["surface_core_rotation_polarity_match"])
-    if len(rotation) != 29 or int(eligible.sum()) != 16:
-        raise ValueError(
-            f"Unexpected rotation denominator: n={len(rotation)}, eligible={int(eligible.sum())}"
-        )
-    if int(same_sign[eligible].sum()) != 15 or int(contained[eligible].sum()) != 0:
-        raise ValueError("Frozen 16-event surface/deep correspondence counts changed")
-
-    strict_eligible = _true_mask(association["peak_core_analysis_eligible"])
-    quality_eligible = _true_mask(quality["pet_analysis_eligible"])
-    if int(strict_eligible.sum()) != 31 or int(quality_eligible.sum()) != 58:
-        raise ValueError("Frozen PET eligibility counts changed")
+    rotation_eligible_count = int(eligible.sum())
+    rotation_same_sign_count = int(same_sign[eligible].sum())
+    rotation_contained_count = int(contained[eligible].sum())
+    if rotation_eligible_count <= 0:
+        raise ValueError("Primary rotation table has no PET-eligible events")
 
     case_assoc = association.loc[association["event_id"].eq("OFES_DO50_E000002")].iloc[0]
     local_audit = summary["local_ring_null"]
@@ -432,21 +426,27 @@ def _plot_figure6(
     )
     _plot_case_panel(axes[0], case, case_rows, pixels)
 
-    values = [15 / 16, 0 / 16]
+    values = [
+        rotation_same_sign_count / rotation_eligible_count,
+        rotation_contained_count / rotation_eligible_count,
+    ]
     labels = ["same-sign\nsurface Ro", "closed SSH\ncontained"]
     bars = axes[1].bar(np.arange(2), values, color=[BLUE, PURPLE], width=0.58)
-    for bar, count in zip(bars, (15, 0)):
+    for bar, count in zip(
+        bars,
+        (rotation_same_sign_count, rotation_contained_count),
+    ):
         axes[1].text(
             bar.get_x() + bar.get_width() / 2,
             max(bar.get_height() + 0.04, 0.05),
-            f"{count}/16",
+            f"{count}/{rotation_eligible_count}",
             ha="center",
             fontsize=8.0,
         )
     axes[1].set_xticks(np.arange(2), labels, fontsize=7.5)
     axes[1].set_ylim(0, 1.15)
     axes[1].set_ylabel("Fraction of eligible events")
-    axes[1].set_title("16-event subset", loc="right")
+    axes[1].set_title("Rotation events", loc="right", pad=4)
 
     null_rows = [
         ("local ring", local_audit, BLUE),

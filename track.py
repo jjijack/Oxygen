@@ -72546,7 +72546,7 @@ def run_ofes_surface_eddy_event_diagnostics(
             'wilcoxon_two_sided': _wilcoxon_two_sided(annual_values),
             'occupancy_table': str(outputs['annual']),
         },
-        'rotation_29': {
+        'rotation_events': {
             'n': int(len(rotation)),
             'analysis_eligible': int(rotation_eligible.sum()),
         },
