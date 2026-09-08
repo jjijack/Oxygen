@@ -80462,3 +80462,1471 @@ def plot_ofes_process_post_peak(event_dir: str | Path, output_path: str | Path) 
     fig.savefig(output_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
     return output_path
+
+
+def _ofes_process_review_km_survival(
+    positions: pd.DataFrame,
+    threshold_m: float,
+    requested_horizon_days: int,
+    data_start_date: pd.Timestamp,
+) -> dict:
+    """对一个事件和一个浅层阈值计算带删失标记的粒子生存摘要。
+
+    首次有效浅层通过是已观测事件；事件之后的轨迹不再承担该粒子的风险集支持。
+    未通过粒子只保留最后一个有效 active 观测作为删失时间；完全没有有效观测的粒子
+    不产生 terminal，不进入风险集或尾部支持。退出或无效后的占位行不延长支持窗。
+    RMST90 只有在 90 天尾部仍有有效终点支持，或生存曲线已经在
+    90 天前降为零时才返回数值；早期删失仍进入 KM 描述量，但其独立删失假设会
+    在结果中显式标记。
+    """
+    if positions.empty:
+        raise ValueError('OFES process-review survival requires non-empty particle positions.')
+    required = {'event_id', 'particle_id', 'lookback_days', 'date', 'status', 'depth_m'}
+    missing = sorted(required - set(positions.columns))
+    if missing:
+        raise KeyError(f'OFES process-review positions missing columns: {missing}')
+    event_id = str(positions['event_id'].iloc[0])
+    requested_horizon = float(requested_horizon_days)
+    data_start = pd.Timestamp(data_start_date).normalize()
+    particles = []
+    for particle_id, group in positions.groupby('particle_id', sort=False):
+        group = group.sort_values('lookback_days', kind='mergesort')
+        group = group.copy()
+        group['_lookback_days'] = pd.to_numeric(
+            group['lookback_days'], errors='coerce'
+        )
+        group = group.loc[group['_lookback_days'].notna()]
+        group = group.drop_duplicates('_lookback_days', keep='first')
+        if group.empty:
+            particles.append({
+                'particle_id': str(particle_id),
+                'first_passage_days': np.nan,
+                'terminal_days': np.nan,
+                'observed_max_days': np.nan,
+                'censor_reason': 'integration_invalid',
+            })
+            continue
+        group['date'] = pd.to_datetime(group['date'], errors='coerce').dt.normalize()
+        status = group['status'].astype(str)
+        active = status.eq('active')
+        depth = pd.to_numeric(group['depth_m'], errors='coerce')
+        valid_active = active & depth.notna() & np.isfinite(depth)
+        first = group.loc[valid_active & (depth < float(threshold_m))]
+        if not first.empty:
+            first_passage = float(first['_lookback_days'].iloc[0])
+            terminal = first_passage
+            observed_max = float(group.loc[valid_active, '_lookback_days'].max())
+            censor_reason = 'first_passage'
+        else:
+            first_passage = np.nan
+            valid_rows = group.loc[valid_active]
+            if valid_rows.empty:
+                terminal = np.nan
+                observed_max = np.nan
+                censor_reason = (
+                    'domain_exit' if status.eq('escaped').any()
+                    else 'integration_invalid'
+                )
+            else:
+                observed_max = float(valid_rows['_lookback_days'].max())
+                terminal = observed_max
+                rows_after_last_valid = group.loc[
+                    group['_lookback_days'] > observed_max + 1.0e-9
+                ]
+                active_missing_depth = (
+                    rows_after_last_valid['status'].astype(str).eq('active')
+                    & pd.to_numeric(
+                        rows_after_last_valid['depth_m'], errors='coerce'
+                    ).isna()
+                ).any()
+                if rows_after_last_valid['status'].astype(str).eq('escaped').any():
+                    censor_reason = 'domain_exit'
+                elif (
+                    rows_after_last_valid['status'].astype(str).eq('invalid').any()
+                    or active_missing_depth
+                ):
+                    censor_reason = 'integration_invalid'
+                else:
+                    last_valid_row = valid_rows.loc[valid_rows['_lookback_days'].idxmax()]
+                    last_valid_date = last_valid_row['date']
+                    if pd.notna(last_valid_date) and last_valid_date == data_start:
+                        censor_reason = 'data_start_censored'
+                    elif observed_max >= requested_horizon - 1.0e-9:
+                        censor_reason = 'max_horizon_censored'
+                    else:
+                        censor_reason = 'source_unavailable'
+        particles.append({
+            'particle_id': str(particle_id),
+            'first_passage_days': first_passage,
+            'terminal_days': terminal,
+            'observed_max_days': observed_max,
+            'censor_reason': censor_reason,
+        })
+    particle_table = pd.DataFrame(particles)
+    n_particles = int(len(particle_table))
+    event_times = particle_table.loc[
+        particle_table['first_passage_days'].notna(), 'first_passage_days'
+    ].to_numpy(dtype=float)
+    censor_times = particle_table.loc[
+        particle_table['first_passage_days'].isna(), 'terminal_days'
+    ].to_numpy(dtype=float)
+    all_times = sorted({
+        float(value)
+        for value in np.concatenate((event_times, censor_times))
+        if np.isfinite(value)
+    })
+
+    terminal_array = particle_table['terminal_days'].to_numpy(dtype=float)
+
+    def _km_at(tau: float) -> dict[str, Any]:
+        survival = 1.0
+        area = 0.0
+        last = 0.0
+        zero_time = np.nan
+        for time_value in all_times:
+            if time_value > float(tau):
+                break
+            area += survival * (float(time_value) - last)
+            risk = int(np.count_nonzero(terminal_array >= time_value - 1.0e-9))
+            events = int(np.count_nonzero(np.isclose(event_times, time_value)))
+            if risk:
+                survival *= 1.0 - events / risk
+            if survival <= 1.0e-12 and not np.isfinite(zero_time):
+                survival = 0.0
+                zero_time = float(time_value)
+            last = float(time_value)
+        support_mask = (
+            (particle_table['first_passage_days'].to_numpy(dtype=float)
+             <= float(tau) + 1.0e-9)
+            | (terminal_array >= float(tau) - 1.0e-9)
+        )
+        support_n = int(np.count_nonzero(support_mask))
+        risk_set_n = int(np.count_nonzero(terminal_array >= float(tau) - 1.0e-9))
+        censor_before_n = int(np.count_nonzero(
+            particle_table['first_passage_days'].isna().to_numpy()
+            & np.isfinite(terminal_array)
+            & (terminal_array < float(tau) - 1.0e-9)
+        ))
+        unknown_n = int(n_particles - support_n)
+        max_terminal = (
+            float(np.nanmax(terminal_array))
+            if np.isfinite(terminal_array).any() else np.nan
+        )
+        tail_supported = bool(
+            (np.isfinite(zero_time) and zero_time <= float(tau) + 1.0e-9)
+            or (np.isfinite(max_terminal) and max_terminal >= float(tau) - 1.0e-9)
+        )
+        if np.isfinite(zero_time) and zero_time <= float(tau) + 1.0e-9:
+            support_status = 'event_terminated_before_horizon'
+        elif np.isfinite(max_terminal) and max_terminal >= float(tau) - 1.0e-9:
+            support_status = 'full_support' if unknown_n == 0 else 'partial_support'
+        else:
+            support_status = 'no_support'
+        value = (
+            0.0 if np.isfinite(zero_time) and zero_time <= float(tau) + 1.0e-9
+            else (float(survival) if tail_supported else np.nan)
+        )
+        return {
+            'value': value,
+            'area': float(area),
+            'last_time': float(last),
+            'survival': float(survival),
+            'zero_time': zero_time,
+            'max_terminal': max_terminal,
+            'support_count': support_n,
+            'support_fraction': support_n / n_particles if n_particles else np.nan,
+            'risk_set_count': risk_set_n,
+            'censoring_before_count': censor_before_n,
+            'unknown_count': unknown_n,
+            'tail_supported': tail_supported,
+            'status': support_status,
+        }
+
+    def _rmst_at(tau: float) -> tuple[float, dict[str, Any]]:
+        details = _km_at(tau)
+        value = (
+            float(details['area'] + details['survival'] * (float(tau) - details['last_time']))
+            if details['tail_supported'] else np.nan
+        )
+        return value, details
+
+    row: dict[str, Any] = {
+        'event_id': event_id,
+        'threshold_m': float(threshold_m),
+        'particle_count': n_particles,
+        'requested_horizon_days': int(requested_horizon_days),
+        'available_horizon_days': (
+            float(particle_table['observed_max_days'].max())
+            if particle_table['observed_max_days'].notna().any() else np.nan
+        ),
+        'common_support_horizon_days': (
+            float(particle_table['observed_max_days'].min())
+            if particle_table['observed_max_days'].notna().all() else np.nan
+        ),
+        'first_passage_count': int(np.isfinite(particle_table['first_passage_days']).sum()),
+        'first_passage_fraction': float(particle_table['first_passage_days'].notna().mean()),
+        'shallow_encounter_fraction': float(particle_table['first_passage_days'].notna().mean()),
+    }
+    for reason in ('data_start_censored', 'domain_exit', 'integration_invalid',
+                   'source_unavailable', 'max_horizon_censored'):
+        row[f'{reason}_fraction'] = float(
+            particle_table['censor_reason'].eq(reason).mean()
+        )
+        row[f'{reason}_count'] = int(
+            particle_table['censor_reason'].eq(reason).sum()
+        )
+    row['valid_observation_without_passage_count'] = int(
+        particle_table['censor_reason'].isin(
+            {'max_horizon_censored', 'source_unavailable'}
+        ).sum()
+    )
+    row['unresolved_particle_count'] = int(
+        particle_table['observed_max_days'].isna().sum()
+    )
+    first_values = particle_table['first_passage_days'].dropna()
+    row['first_passage_q25_days'] = float(first_values.quantile(0.25)) if not first_values.empty else np.nan
+    row['first_passage_median_days'] = float(first_values.median()) if not first_values.empty else np.nan
+    row['first_passage_q75_days'] = float(first_values.quantile(0.75)) if not first_values.empty else np.nan
+    for horizon in (10, 30, 60, 90, 120, 150, 180):
+        details = _km_at(float(horizon))
+        row[f'S{horizon}'] = details['value']
+        row[f'S{horizon}_support_count'] = details['support_count']
+        row[f'S{horizon}_support_fraction'] = details['support_fraction']
+        row[f'S{horizon}_risk_set_count'] = details['risk_set_count']
+        row[f'S{horizon}_censoring_before_count'] = details['censoring_before_count']
+        row[f'S{horizon}_unknown_count'] = details['unknown_count']
+        row[f'S{horizon}_tail_support_days'] = details['max_terminal']
+        row[f'S{horizon}_status'] = details['status']
+        row[f'first_passage_count_by_{horizon}'] = int(
+            np.count_nonzero(event_times <= float(horizon))
+        )
+    common_horizon = float(row['common_support_horizon_days'])
+    common_rmst, common_details = _rmst_at(common_horizon) if common_horizon > 0 else (np.nan, {})
+    row['RMST_to_common_support_days'] = common_rmst
+    row['RMST_to_common_support_status'] = (
+        common_details.get('status', 'no_support') if common_horizon > 0 else 'no_support'
+    )
+    rmst90, rmst90_details = _rmst_at(90.0)
+    row['RMST90'] = rmst90
+    row['RMST90_status'] = (
+        (
+            'event_terminated_before_horizon_with_censoring'
+            if rmst90_details.get('unknown_count', n_particles) > 0
+            else 'event_terminated_before_horizon'
+        )
+        if rmst90_details.get('status') == 'event_terminated_before_horizon'
+        else (
+            'full_support' if rmst90_details.get('tail_supported')
+            and rmst90_details.get('unknown_count', n_particles) == 0
+            else (
+                'supported_with_censoring' if rmst90_details.get('tail_supported')
+                else 'unsupported_tail'
+            )
+        )
+    )
+    row['RMST90_supported'] = bool(rmst90_details.get('tail_supported', False))
+    row['RMST90_support_count'] = rmst90_details.get('support_count', 0)
+    row['RMST90_support_fraction'] = rmst90_details.get('support_fraction', np.nan)
+    row['RMST90_risk_set_count'] = rmst90_details.get('risk_set_count', 0)
+    row['RMST90_censoring_before_count'] = rmst90_details.get(
+        'censoring_before_count', 0
+    )
+    row['RMST90_unknown_tail_count'] = rmst90_details.get('unknown_count', n_particles)
+    row['RMST90_tail_support_days'] = rmst90_details.get('max_terminal', np.nan)
+    row['RMST90_event_termination_days'] = rmst90_details.get('zero_time', np.nan)
+    row['RMST90_support_rule'] = (
+        'finite_if_observed_terminal_reaches_90d_or_KM_survival_reaches_zero_before_90d; '
+        'otherwise_NA'
+    )
+    early_domain_exit = int(
+        particle_table.loc[
+            particle_table['censor_reason'].eq('domain_exit')
+            & particle_table['terminal_days'].lt(90.0),
+            'particle_id',
+        ].nunique()
+    )
+    row['RMST90_censoring_assumption'] = (
+        'KM_right_censoring; domain_exit_noninformative_not_verified'
+        if early_domain_exit else
+        ('KM_right_censoring; early_censoring_present' if row['RMST90_censoring_before_count'] else
+         'no_censoring_before_90d')
+    )
+    return row
+
+
+def _ofes_process_review_family_id(short_event_id: str) -> tuple[str, str]:
+    """返回任务指定的候选 family 与其角色，不依据 A/B 标签分组。"""
+    short = str(short_event_id).replace('OFES_DO50_', '')
+    families = {
+        'E225_E246': {'E000225', 'E000246'},
+        'E307_E308_E309': {'E000307', 'E000308', 'E000309'},
+        'E192_independent': {'E000192'},
+        'spicy_counterexamples': {'E000201', 'E000210'},
+        'minty_long_memory_counterexamples': {'E000172', 'E000193', 'E000194', 'E000291'},
+    }
+    for family, members in families.items():
+        if short in members:
+            role = (
+                'candidate_family' if family in {'E225_E246', 'E307_E308_E309', 'E192_independent'}
+                else 'counterexample'
+            )
+            return family, role
+    return 'unassigned_32_event', 'background_event'
+
+
+def _ofes_process_review_profile_margins(
+    profiles: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    lifecycle_daily: pd.DataFrame,
+    lifecycle_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """把已通过的 219 条 McCoy profile 缓存整理为连续量与审计缺口。"""
+    work = profiles.loc[
+        profiles['sample_role'].eq('event')
+        & profiles['mccoy_profile_compatible'].fillna(False).astype(bool)
+    ].copy()
+    if work.duplicated(['event_id', 'date', 'sample_id']).any():
+        raise ValueError('McCoy-compatible profile rows are not unique.')
+    if len(work) != 219:
+        raise ValueError(f'Expected 219 McCoy-compatible event profiles, found {len(work)}.')
+    work['date'] = pd.to_datetime(work['date']).dt.normalize()
+    summary_cols = [
+        'event_id', 'any_event_profile_velocity_confirmed',
+        'event_profile_velocity_confirmed_fraction', 'observed_day_count',
+        'eligible_day_count', 'rotation_day_count', 'rotation_day_fraction',
+        'center_scv_type',
+    ]
+    summary = event_summary[summary_cols].copy()
+    summary['legacy_ab_audit'] = np.where(
+        summary['any_event_profile_velocity_confirmed'].fillna(False), 'A', 'B'
+    )
+    work = work.merge(summary, on='event_id', how='left', validate='many_to_one')
+    lifecycle_cols = [
+        'event_id', 'date', 'vertical_max_rossby_number',
+        'vertical_max_rossby_depth_m', 'rotation_dominated',
+        'kinematic_regime', 'centroid_lon', 'centroid_lat',
+    ]
+    life = lifecycle_daily[lifecycle_cols].copy()
+    life['date'] = pd.to_datetime(life['date']).dt.normalize()
+    work = work.merge(life, on=['event_id', 'date'], how='left', validate='many_to_one')
+    life_summary = lifecycle_summary[
+        ['event_id', 'rotation_day_fraction', 'rotation_day_count', 'observed_day_count']
+    ].rename(columns={
+        'rotation_day_fraction': 'lifecycle_rotation_day_fraction',
+        'rotation_day_count': 'lifecycle_rotation_day_count',
+        'observed_day_count': 'lifecycle_observed_day_count',
+    })
+    work = work.merge(life_summary, on='event_id', how='left', validate='many_to_one')
+    work['local_velocity_support_depth_m'] = pd.to_numeric(
+        work['direct_velocity_depth_m'], errors='coerce'
+    )
+    global_max_depth = pd.to_numeric(
+        work['vertical_max_rossby_depth_m'], errors='coerce'
+    )
+    work['subsurface_max_rossby_depth_m'] = global_max_depth.where(
+        global_max_depth >= 200.0
+    )
+    work['subsurface_max_rossby_status'] = np.where(
+        global_max_depth >= 200.0,
+        'global_vertical_max_occurs_at_or_below_200m',
+        'unavailable_lifecycle_summary_does_not_retain_subsurface_only_max',
+    )
+
+    work['background_level_margin'] = pd.to_numeric(
+        work['background_qualified_level_count'], errors='coerce'
+    ) - 3.0
+    work['gaussian_r2_margin'] = pd.to_numeric(work['gaussian_r2'], errors='coerce') - 0.5
+    work['gaussian_nrmse_margin'] = 0.5 - pd.to_numeric(work['gaussian_nrmse'], errors='coerce')
+    work['gaussian_amplitude_margin'] = (
+        pd.to_numeric(work['gaussian_amplitude'], errors='coerce').abs() - 0.10
+    )
+    work['fitted_lens_thickness_dbar'] = (
+        pd.to_numeric(work['gaussian_deep_pressure_dbar'], errors='coerce')
+        - pd.to_numeric(work['gaussian_shallow_pressure_dbar'], errors='coerce')
+    )
+    work['lens_height_min_margin_dbar'] = work['fitted_lens_thickness_dbar'] - 150.0
+    work['lens_height_max_margin_dbar'] = 1200.0 - work['fitted_lens_thickness_dbar']
+    work['lens_shallow_margin_dbar'] = pd.to_numeric(
+        work['gaussian_shallow_pressure_dbar'], errors='coerce'
+    ) - 100.0
+    lat = pd.to_numeric(work['sample_lat'], errors='coerce').to_numpy(dtype=float)
+    for source, target in (
+        ('gaussian_peak_pressure_dbar', 'gaussian_peak_depth_m'),
+        ('gaussian_shallow_pressure_dbar', 'gaussian_shallow_depth_m'),
+        ('gaussian_deep_pressure_dbar', 'gaussian_deep_depth_m'),
+        ('gaussian_core_shallow_pressure_dbar', 'gaussian_core_shallow_depth_m'),
+        ('gaussian_core_deep_pressure_dbar', 'gaussian_core_deep_depth_m'),
+    ):
+        pressure = pd.to_numeric(work[source], errors='coerce').to_numpy(dtype=float)
+        depth = -np.asarray(gsw.z_from_p(pressure, lat), dtype=float)
+        work[target] = depth
+    work['fitted_lens_thickness_m'] = (
+        work['gaussian_deep_depth_m'] - work['gaussian_shallow_depth_m']
+    )
+    work['native_rotation_margin_abs_ro_minus_strain'] = (
+        pd.to_numeric(work['direct_rossby_number'], errors='coerce').abs()
+        - pd.to_numeric(work['direct_normalized_strain'], errors='coerce')
+    )
+    work['native_anticyclonic_sign'] = np.where(
+        pd.to_numeric(work['direct_rossby_number'], errors='coerce') < 0,
+        'anticyclonic', 'cyclonic_or_zero'
+    )
+    work['weak_n2_gate_margin'] = np.nan
+    work['weak_n2_gate_margin_status'] = 'unavailable_reference_quantiles_not_in_cached_table'
+    work['profile_offset_margin'] = np.nan
+    work['profile_offset_margin_status'] = 'unavailable_raw_background_profile_not_in_cached_table'
+    work['localized_spice_margin'] = np.nan
+    work['localized_spice_margin_status'] = 'unavailable_raw_background_profile_not_in_cached_table'
+    work['dynamic_height_margin'] = np.nan
+    work['dynamic_height_margin_status'] = 'unavailable_internal_edge_values_not_in_cached_table'
+    work['nearest_rotation_centre_distance_km'] = np.nan
+    work['nearest_rotation_centre_status'] = 'unavailable_no_independent_rotation_centre_product'
+    work['profile_id'] = (
+        work['event_id'].astype(str) + '|' + work['date'].dt.strftime('%Y-%m-%d')
+        + '|' + work['sample_id'].astype(str)
+    )
+    return work
+
+
+def build_ofes_process_review_synthesis(
+    mccoy_dir: str | Path,
+    ventilation_dir: str | Path,
+    extended_dir: str | Path,
+    post_peak_dir: str | Path,
+    lifecycle_dir: str | Path,
+    population_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    event_ids: Sequence[str] | None = None,
+    local_field_table: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """汇总既有产品的 32-event OFES 过程审查，不重新积分或重开检测器。
+
+    该入口固定 McCoy-compatible event/profile universe，从已有 adaptive backward
+    positions 计算带 data-start、产品 horizon、domain-exit 和 invalid 竞争删失的
+    `<300 m`/`<100 m` first-passage survival，并连接已有 post-peak material
+    spread、lifecycle dynamics 和 McCoy spicy/minty 类型。候选 family 只按任务
+    指定的事件清单作为审计标签，不用 future spread 定义 carrier。
+
+    参数:
+        - mccoy_dir (str | pathlib.Path): `primary_mccoy_virtual_argo` 目录。
+        - ventilation_dir (str | pathlib.Path): 已完成 90-day adaptive backward 目录。
+        - extended_dir (str | pathlib.Path): 已完成 180-day 扩展目录。
+        - post_peak_dir (str | pathlib.Path): 已完成 post-peak retention 目录。
+        - lifecycle_dir (str | pathlib.Path): 已完成 daily lifecycle 目录。
+        - population_dir (str | pathlib.Path): primary event population 目录。
+        - output_dir (str | pathlib.Path): 唯一当前交付目录。
+        - event_ids (Sequence[str] | None): 可选完整事件键；省略时从 McCoy 表固定 32 例。
+        - local_field_table (pandas.DataFrame | None): 可选独立局地 T/S+dynamics 可用性表。
+    返回:
+        - dict[str, Any]: 输出目录、五张核心表、图形路径和来源元数据。
+
+    输出:
+        - `source_survival_event32.csv`、`profile_gate_margins_219.csv`、`event_state_space_32.csv`。
+        - `family_clock_table.csv`、`counterexample_audit.csv` 和 `source_manifest.json`。
+        - `source_survival_32.png` 和 `event_state_space_32.png`。
+
+    说明:
+        - 32/219 的 universe 与输入 manifest 逐行核对；A/B 只落为 `legacy_ab_audit`。
+        - 180-day 目录中的裸事件 ID 仅接在其已有 prefixed 0–90-day rows 后，不把目录名当作身份。
+        - survival 的 S 值是 Kaplan–Meier 描述量；首次有效通过后不要求继续追踪该粒子，
+          未通过粒子只到最后一个有效 active 观测，退出或无效后的占位行不计为支持。
+        - RMST90 只有在 90 天仍有有效终点支持，或 KM 生存已在 90 天前降为零时才报告；
+          早期删失保留在风险集和计数中，domain exit 的非信息性删失假设不作未经验证的默认。
+          每行同时输出风险集支持、未知尾部和删失类型，未支持尾部保持缺失。
+        - 未提供 `local_field_table` 时，family 的局地场状态明确为未提供。
+        - `local_field_table` 必须来自局地场可用性入口；其 `local_field_status` 只说明
+          T/S/σ₀/N² 与 u/v、Ro/strain 是否可计算，不是独立结构连续性或 carrier 检验。
+    """
+    mccoy_root = Path(mccoy_dir)
+    vent_root = Path(ventilation_dir)
+    extended_root = Path(extended_dir)
+    post_root = Path(post_peak_dir)
+    life_root = Path(lifecycle_dir)
+    population_root = Path(population_dir)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    mccoy_events = pd.read_parquet(mccoy_root / 'event_summary.parquet')
+    profiles = pd.read_parquet(mccoy_root / 'virtual_profile_diagnostics.parquet')
+    population = pd.read_parquet(population_root / 'population_events.parquet')
+    population['start_date'] = pd.to_datetime(population['start_date']).dt.normalize()
+    population['end_date'] = pd.to_datetime(population['end_date']).dt.normalize()
+    population['peak_date'] = pd.to_datetime(population['peak_date']).dt.normalize()
+    if event_ids is None:
+        selected = mccoy_events.loc[
+            mccoy_events['any_event_profile_mccoy_compatible'].fillna(False).astype(bool),
+            'event_id',
+        ].astype(str).tolist()
+    else:
+        selected = [str(value) for value in event_ids]
+    selected = list(dict.fromkeys(selected))
+    if len(selected) != 32:
+        raise ValueError(f'OFES process-review event universe must contain 32 events, found {len(selected)}.')
+    if not set(selected).issubset(set(mccoy_events.event_id.astype(str))):
+        raise ValueError('OFES process-review event universe contains IDs absent from McCoy event summary.')
+    population = population[population.event_id.astype(str).isin(selected)].copy()
+    if len(population) != 32 or population.event_id.nunique() != 32:
+        raise ValueError('OFES process-review event universe does not map one-to-one to population events.')
+    peak_map = population.set_index('event_id')['peak_date']
+
+    ventilation = pd.read_parquet(
+        vent_root / 'daily_ventilation_diagnostics.parquet',
+        columns=['event_id', 'date', 'particle_id', 'particle_group', 'status', 'depth_m', 'lat', 'lon'],
+    )
+    ventilation = ventilation[
+        ventilation.event_id.astype(str).isin(selected)
+        & ventilation.particle_group.astype(str).eq('anomaly')
+    ].copy()
+    ventilation['event_id'] = ventilation['event_id'].astype(str)
+    ventilation['date'] = pd.to_datetime(ventilation['date']).dt.normalize()
+    ventilation['lookback_days'] = (
+        ventilation['event_id'].map(peak_map) - ventilation['date']
+    ).dt.days.astype(float)
+    extended_ids = {
+        'OFES_DO50_E000171', 'OFES_DO50_E000192', 'OFES_DO50_E000193',
+        'OFES_DO50_E000194', 'OFES_DO50_E000246', 'OFES_DO50_E000307',
+        'OFES_DO50_E000308', 'OFES_DO50_E000309',
+    }
+    extension = pd.read_parquet(
+        extended_root / 'daily_positions.parquet',
+        columns=['event_id', 'date', 'lookback_days', 'particle_id', 'particle_group', 'status', 'depth_m', 'lat', 'lon'],
+    )
+    extension = extension[
+        extension.event_id.astype(str).str.startswith('E')
+        & (pd.to_numeric(extension['lookback_days'], errors='coerce') > 90)
+    ].copy()
+    extension['event_id'] = 'OFES_DO50_' + extension['event_id'].astype(str)
+    extension = extension[extension.event_id.isin(extended_ids & set(selected))]
+    extension['particle_group'] = 'anomaly'
+    extension['date'] = pd.to_datetime(extension['date']).dt.normalize()
+    positions = pd.concat([ventilation, extension], ignore_index=True)
+    if positions.duplicated(['event_id', 'date', 'particle_id']).any():
+        raise ValueError('OFES process-review positions contain duplicate event/date/particle keys.')
+    if positions.event_id.nunique() != 32:
+        raise ValueError('OFES process-review positions do not cover all 32 events.')
+    data_start_date = pd.Timestamp(positions['date'].min()).normalize()
+    survival_rows = []
+    for event_id, group in positions.groupby('event_id', sort=True):
+        requested_horizon = 180 if event_id in extended_ids else 90
+        for threshold in (300, 100):
+            survival_rows.append(_ofes_process_review_km_survival(
+                group,
+                threshold,
+                requested_horizon,
+                data_start_date,
+            ))
+    survival = pd.DataFrame(survival_rows).sort_values(
+        ['event_id', 'threshold_m'], kind='mergesort'
+    ).reset_index(drop=True)
+    survival.to_csv(out / 'source_survival_event32.csv', index=False)
+
+    lifecycle_daily = pd.read_parquet(life_root / 'lifecycle_daily_diagnostics.parquet')
+    lifecycle_summary = pd.read_parquet(life_root / 'lifecycle_event_summary.parquet')
+    lifecycle_daily['date'] = pd.to_datetime(lifecycle_daily['date']).dt.normalize()
+    lifecycle_daily = lifecycle_daily[lifecycle_daily.event_id.astype(str).isin(selected)].copy()
+    lifecycle_summary = lifecycle_summary[lifecycle_summary.event_id.astype(str).isin(selected)].copy()
+    profiles_selected = profiles[profiles.event_id.astype(str).isin(selected)].copy()
+    profile_margins = _ofes_process_review_profile_margins(
+        profiles_selected, mccoy_events[mccoy_events.event_id.astype(str).isin(selected)],
+        lifecycle_daily, lifecycle_summary,
+    )
+    profile_margins.to_csv(out / 'profile_gate_margins_219.csv', index=False)
+
+    post = pd.read_parquet(post_root / 'daily_retention_summary.parquet')
+    post['date'] = pd.to_datetime(post['date']).dt.normalize()
+    post = post[
+        post.event_id.astype(str).isin(selected)
+        & post.integration_label.astype(str).eq('forward_peak_to_future')
+    ].copy()
+    post_rows = []
+    for event_id, group in post.groupby('event_id', sort=True):
+        for horizon in (0, 14, 30, 60, 90):
+            row = group.loc[group['day_since_peak'].eq(horizon)]
+            if row.empty:
+                post_rows.append({'event_id': event_id, 'post_peak_horizon_days': horizon})
+            else:
+                selected_row = row.iloc[0].to_dict()
+                selected_row['post_peak_horizon_days'] = horizon
+                post_rows.append(selected_row)
+    post_summary = pd.DataFrame(post_rows)
+
+    type_rows = profiles_selected.loc[
+        profiles_selected['sample_role'].eq('event')
+        & profiles_selected['mccoy_profile_compatible'].fillna(False).astype(bool)
+    ].groupby(['event_id', 'scv_type']).size().unstack(fill_value=0)
+    for name in ('spicy', 'minty'):
+        if name not in type_rows:
+            type_rows[name] = 0
+    type_rows['mccoy_type'] = type_rows[['spicy', 'minty']].idxmax(axis=1)
+    type_rows = type_rows[['spicy', 'minty', 'mccoy_type']].reset_index()
+    state = population[
+        ['event_id', 'start_date', 'end_date', 'peak_date', 'span_days', 'observed_days',
+         'missing_days', 'peak_depth_m', 'peak_lon', 'peak_lat', 'population_scope']
+    ].copy()
+    state = state.merge(type_rows, on='event_id', how='left', validate='one_to_one')
+    state['short_event_id'] = state.event_id.astype(str).str.replace('OFES_DO50_', '', regex=False)
+    state[['family_id', 'family_role']] = state['short_event_id'].apply(
+        lambda value: pd.Series(_ofes_process_review_family_id(value))
+    )
+    survival_300 = survival[survival.threshold_m.eq(300)].copy()
+    survival_300 = survival_300.add_prefix('source_')
+    survival_300 = survival_300.rename(columns={'source_event_id': 'event_id'})
+    state = state.merge(survival_300, on='event_id', how='left', validate='one_to_one')
+    for horizon in (0, 14, 30, 60, 90):
+        rows = post_summary[post_summary.post_peak_horizon_days.eq(horizon)].copy()
+        keep = [
+            'event_id', 'active_particle_count', 'valid_particle_count', 'median_do2',
+            'median_theta', 'median_salinity', 'median_sigma0', 'median_spiciness0',
+            'spread_q90_km', 'vertical_spread_q90_m', 'daily_diagnostic_passed',
+        ]
+        rows = rows[[c for c in keep if c in rows.columns]].rename(columns={
+            c: f'future_{c}_{horizon}d' for c in keep if c != 'event_id'
+        })
+        state = state.merge(rows, on='event_id', how='left', validate='one_to_one')
+    life_peak = lifecycle_daily.loc[
+        lifecycle_daily['is_event_peak_day'].fillna(False).astype(bool),
+        ['event_id', 'vertical_max_rossby_number', 'vertical_max_rossby_depth_m',
+         'rotation_dominated', 'kinematic_regime'],
+    ].drop_duplicates('event_id')
+    life_metrics = lifecycle_summary[[
+        'event_id', 'observed_day_count', 'eligible_day_count', 'rotation_day_count',
+        'rotation_day_fraction', 'anticyclonic_fraction_among_rotation_days',
+        'persistent_anticyclonic_rotational_carrier',
+    ]].rename(columns={
+        'observed_day_count': 'dynamical_observed_day_count',
+        'eligible_day_count': 'dynamical_eligible_day_count',
+        'rotation_day_count': 'dynamical_rotation_day_count',
+        'rotation_day_fraction': 'dynamical_rotation_day_fraction',
+    })
+    state = state.merge(life_peak, on='event_id', how='left', validate='one_to_one')
+    state = state.merge(life_metrics, on='event_id', how='left', validate='one_to_one')
+    state['dynamical_evidence_score'] = pd.to_numeric(
+        state['dynamical_rotation_day_fraction'], errors='coerce'
+    )
+    state['source_rmst_days'] = state['source_RMST90']
+    state['source_rmst_definition'] = 'KM_RMST90_supported_tail'
+    state['source_rmst_status'] = state['source_RMST90_status']
+    state['source_rmst_support_rule'] = state['source_RMST90_support_rule']
+    state['source_common_rmst_days'] = state['source_RMST_to_common_support_days']
+    state['source_common_rmst_definition'] = 'RMST_to_common_support_horizon'
+    state['future_spread_status'] = np.where(
+        pd.to_numeric(state.get('future_spread_q90_km_30d'), errors='coerce').notna(),
+        'available_30d', 'unavailable_no_post_peak_30d_support'
+    )
+    state.to_csv(out / 'event_state_space_32.csv', index=False)
+
+    family_rows = []
+    for family_id, group in state.groupby('family_id', sort=True):
+        group = group.sort_values('peak_date')
+        windows = group[['event_id', 'start_date', 'end_date', 'peak_date']].sort_values('start_date')
+        gaps = []
+        for left, right in zip(windows.iloc[:-1].itertuples(index=False), windows.iloc[1:].itertuples(index=False)):
+            gaps.append(max(0, int((right.start_date - left.end_date).days) - 1))
+        family_rows.append({
+            'family_id': family_id,
+            'family_role': str(group.family_role.iloc[0]),
+            'event_ids': ';'.join(group.event_id.astype(str)),
+            'event_count': int(len(group)),
+            'mccoy_types': ';'.join(sorted(group.mccoy_type.dropna().astype(str).unique())),
+            'peak_date_min': group.peak_date.min(),
+            'peak_date_max': group.peak_date.max(),
+            'visibility_gap_days': ';'.join(str(x) for x in gaps) if gaps else '',
+            'source_first_passage_median_days': float(group.source_first_passage_median_days.median()),
+            'source_RMST90_median_days': float(group.source_RMST90.median()) if group.source_RMST90.notna().any() else np.nan,
+            'source_common_RMST_median_days': float(group.source_RMST_to_common_support_days.median()),
+            'future_spread_q90_14d_median_km': float(group.future_spread_q90_km_14d.median()) if group.future_spread_q90_km_14d.notna().any() else np.nan,
+            'future_spread_q90_30d_median_km': float(group.future_spread_q90_km_30d.median()) if group.future_spread_q90_km_30d.notna().any() else np.nan,
+            'dynamical_rotation_fraction_median': float(group.dynamical_rotation_day_fraction.median()),
+            'local_field_table_status': (
+                'supplied_structure_not_tested'
+                if local_field_table is not None and not local_field_table.empty
+                else 'not_supplied'
+            ),
+            'family_interpretation': 'candidate_family_audit_only; no carrier identity inferred',
+        })
+    family_table = pd.DataFrame(family_rows)
+    local_field_summary = pd.DataFrame()
+    if local_field_table is not None and not local_field_table.empty:
+        local_field = local_field_table.copy()
+        if 'event_id' not in local_field:
+            raise KeyError('local_field_table must contain event_id.')
+        if not {'date', 'local_field_status'}.issubset(local_field.columns):
+            raise KeyError(
+                'local_field_table must contain date and local_field_status.'
+            )
+        local_field['date'] = pd.to_datetime(local_field['date']).dt.normalize()
+        local_field['local_field_status'] = local_field['local_field_status'].astype(str)
+        local_field_summary = (
+            local_field.assign(
+                _valid=local_field['local_field_status'].eq(
+                    'local_fields_available'
+                )
+            )
+            .groupby(['event_id', 'date'], as_index=False)['_valid']
+            .any()
+            .groupby('event_id', as_index=False)
+            .agg(
+                local_field_days=('date', 'nunique'),
+                local_field_available_days=('_valid', 'sum'),
+            )
+        )
+        local_field_summary['structure_continuity_status'] = 'not_tested'
+        state = state.merge(local_field_summary, on='event_id', how='left', validate='one_to_one')
+        state.to_csv(out / 'event_state_space_32.csv', index=False)
+        family_table['local_field_table_status'] = 'supplied_structure_not_tested'
+
+    if 'structure_continuity_status' not in state.columns:
+        state['structure_continuity_status'] = 'not_tested_without_local_field_table'
+        state.to_csv(out / 'event_state_space_32.csv', index=False)
+    family_table.to_csv(out / 'family_clock_table.csv', index=False)
+
+    counter_ids = {'E000201', 'E000210', 'E000172', 'E000193', 'E000194', 'E000291'}
+    counter = state[state.short_event_id.isin(counter_ids)].copy()
+    failure_counts = profiles_selected[
+        profiles_selected.event_id.isin(counter.event_id)
+    ].groupby(['event_id', 'mccoy_failure_stage']).size().unstack(fill_value=0).reset_index()
+    counter = counter.merge(failure_counts, on='event_id', how='left', validate='one_to_one')
+    counter['counterexample_audit_status'] = 'retain_for_audit_not_removed'
+    counter.to_csv(out / 'counterexample_audit.csv', index=False)
+
+    figure_paths = []
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.4), constrained_layout=True)
+    plot = survival[survival.threshold_m.isin([300, 100])]
+    for axis, threshold in zip(axes, (300, 100)):
+        sub = plot[plot.threshold_m.eq(threshold)].copy()
+        for _, row in sub.iterrows():
+            axis.plot([10, 30, 60, 90], [row.get(f'S{x}', np.nan) for x in (10, 30, 60, 90)], '-o', ms=3, alpha=.65)
+        axis.set_title(f'First-passage KM survival: z < {threshold} m')
+        axis.set_xlabel('lookback days'); axis.set_ylabel('S(t)')
+        axis.set_ylim(-.03, 1.03); axis.grid(alpha=.25)
+    fig.suptitle('32 McCoy-compatible events | censored source-history audit')
+    figure_path = out / 'source_survival_32.png'; fig.savefig(figure_path, dpi=180); plt.close(fig); figure_paths.append(figure_path)
+
+    state_plot = state.loc[
+        state['source_rmst_days'].notna()
+        & pd.to_numeric(state['future_spread_q90_km_30d'], errors='coerce').notna()
+    ].copy()
+    state_plot_event_ids = state_plot['event_id'].astype(str).tolist()
+    fig, axis = plt.subplots(figsize=(8.6, 6.2), constrained_layout=True)
+    markers = {'spicy': 'o', 'minty': 's'}
+    family_colors = {'E225_E246': '#d95f02', 'E307_E308_E309': '#1b9e77', 'E192_independent': '#7570b3'}
+    for mccoy_type, group in state_plot.groupby('mccoy_type', dropna=False):
+        for family_id, part in group.groupby('family_id', sort=False):
+            axis.scatter(
+                part['source_rmst_days'], part['future_spread_q90_km_30d'],
+                c=part['dynamical_evidence_score'], cmap='viridis', vmin=0, vmax=1,
+                marker=markers.get(str(mccoy_type), 'x'), s=62,
+                edgecolors=family_colors.get(family_id, '#4d4d4d'), linewidths=1.5,
+            )
+    axis.set_xlabel('source-history KM RMST90 (days; supported tail; censoring flagged)')
+    axis.set_ylabel('future material spread q90 at +30 d (km)')
+    axis.set_title('Spicy/minty descriptive state space; colour = rotation-day fraction')
+    axis.grid(alpha=.25)
+    figure_path = out / 'event_state_space_32.png'; fig.savefig(figure_path, dpi=180); plt.close(fig); figure_paths.append(figure_path)
+
+    source_paths = {
+        'mccoy_event_summary': mccoy_root / 'event_summary.parquet',
+        'mccoy_profile_diagnostics': mccoy_root / 'virtual_profile_diagnostics.parquet',
+        'population_events': population_root / 'population_events.parquet',
+        'ventilation_positions': vent_root / 'daily_ventilation_diagnostics.parquet',
+        'extended_positions': extended_root / 'daily_positions.parquet',
+        'post_peak_daily_summary': post_root / 'daily_retention_summary.parquet',
+        'lifecycle_daily': life_root / 'lifecycle_daily_diagnostics.parquet',
+        'lifecycle_summary': life_root / 'lifecycle_event_summary.parquet',
+    }
+    rmst90_support_summary = {}
+    for threshold in (300, 100):
+        subset = survival[survival['threshold_m'].eq(threshold)].copy()
+        rmst90_support_summary[str(threshold)] = {
+            'old_common_support_eligible_count': int(
+                subset['common_support_horizon_days'].ge(90.0).sum()
+            ),
+            'new_supported_count': int(subset['RMST90'].notna().sum()),
+            'new_status_counts': {
+                str(key): int(value)
+                for key, value in subset['RMST90_status'].value_counts().items()
+            },
+            'new_supported_event_ids': subset.loc[
+                subset['RMST90'].notna(), 'event_id'
+            ].astype(str).tolist(),
+            'support_rule': (
+                'finite_if_observed_terminal_reaches_90d_or_KM_survival_reaches_zero_before_90d; '
+                'otherwise_NA'
+            ),
+        }
+    existing_manifest = {}
+    manifest_path = out / 'source_manifest.json'
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(
+                manifest_path.read_text(encoding='utf-8')
+            )
+        except (OSError, json.JSONDecodeError):
+            existing_manifest = {}
+    survival_validation = {}
+    for threshold in (300, 100):
+        subset = survival[survival['threshold_m'].eq(threshold)].copy()
+        survival_validation[str(threshold)] = {
+            'event_rows': int(len(subset)),
+            'data_start_censored_particles': int(subset['data_start_censored_count'].sum()),
+            'domain_exit_particles': int(subset['domain_exit_count'].sum()),
+            'integration_invalid_particles': int(subset['integration_invalid_count'].sum()),
+            'valid_observation_without_passage_particles': int(
+                subset['valid_observation_without_passage_count'].sum()
+            ),
+            'S90_full_support_events': int((subset['S90_status'] == 'full_support').sum()),
+            'S90_partial_support_events': int((subset['S90_status'] == 'partial_support').sum()),
+            'S90_event_terminated_events': int(
+                (subset['S90_status'] == 'event_terminated_before_horizon').sum()
+            ),
+            'S90_no_support_events': int((subset['S90_status'] == 'no_support').sum()),
+            'RMST90_common_support_eligible_events': int(
+                subset['common_support_horizon_days'].ge(90.0).sum()
+            ),
+            'RMST90_supported_events': int(subset['RMST90'].notna().sum()),
+            'RMST90_status_counts': {
+                str(key): int(value)
+                for key, value in subset['RMST90_status'].value_counts().items()
+            },
+            'figure_rows_submitted': int(len(subset)),
+            'figure_events_with_any_finite_S10_to_S90': int(
+                subset[[f'S{x}' for x in (10, 30, 60, 90)]].notna().any(axis=1).sum()
+            ),
+            'figure_events_with_finite_S90': int(subset['S90'].notna().sum()),
+        }
+    validation_summary = {
+        'data_start_date_used_for_survival': str(data_start_date),
+        'survival_support': survival_validation,
+        'state_space_figure': {
+            'rows_submitted': int(len(state)),
+            'events_with_RMST90': int(state['source_rmst_days'].notna().sum()),
+            'events_with_spread30': int(state['future_spread_q90_km_30d'].notna().sum()),
+            'events_plotted_both': int(len(state_plot_event_ids)),
+            'omitted_missing_RMST90': state.loc[
+                state['source_rmst_days'].isna(), 'event_id'
+            ].astype(str).tolist(),
+            'omitted_missing_spread30': state.loc[
+                state['future_spread_q90_km_30d'].isna(), 'event_id'
+            ].astype(str).tolist(),
+        },
+        'profile_margin_availability': {
+            key: {
+                'non_null': int(profile_margins[key].notna().sum()),
+                'missing': int(profile_margins[key].isna().sum()),
+            }
+            for key in (
+                'weak_n2_gate_margin', 'dynamic_height_margin',
+                'profile_offset_margin', 'localized_spice_margin',
+                'nearest_rotation_centre_distance_km',
+            )
+        },
+        'local_field_status': {
+            str(key): int(value)
+            for key, value in (
+                local_field_table['local_field_status'].astype(str).value_counts()
+                if local_field_table is not None and 'local_field_status' in local_field_table
+                else pd.Series(dtype=int)
+            ).items()
+        },
+        'structure_continuity_status': 'not_tested',
+        'no_structure_tracker': True,
+    }
+    source_manifest = {
+        'analysis': 'ofes_process_review_synthesis',
+        'status': 'complete',
+        'event_count': int(len(selected)),
+        'profile_count': int(len(profile_margins)),
+        'event_ids': selected,
+        'extended_180d_event_ids': sorted(extended_ids & set(selected)),
+        'source_paths': {
+            key: {
+                'path': str(path.resolve()),
+                'size_bytes': int(path.stat().st_size),
+                'mtime_ns': int(path.stat().st_mtime_ns),
+            }
+            for key, path in source_paths.items()
+        },
+        'outputs': {
+            name: str((out / name).resolve())
+            for name in (
+                'source_survival_event32.csv', 'profile_gate_margins_219.csv',
+                'event_state_space_32.csv', 'family_clock_table.csv',
+                'counterexample_audit.csv', 'source_survival_32.png',
+                'event_state_space_32.png', 'source_manifest.json',
+            )
+        },
+        'no_reintegration': True,
+        'a_b_role': 'provenance_only',
+        'rmst90_support': rmst90_support_summary,
+        'validation_summary': validation_summary,
+        'state_space_plot_event_count': int(len(state_plot_event_ids)),
+        'state_space_plot_event_ids': state_plot_event_ids,
+        'local_field_table_supplied': bool(
+            local_field_table is not None and not local_field_table.empty
+        ),
+        'local_field_row_count': int(len(local_field_table)) if local_field_table is not None else 0,
+    }
+    if isinstance(existing_manifest.get('local_field_provenance'), dict):
+        source_manifest['local_field_provenance'] = existing_manifest[
+            'local_field_provenance'
+        ]
+    (out / 'source_manifest.json').write_text(json.dumps(source_manifest, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+    return {
+        'output_dir': out,
+        'event_ids': selected,
+        'source_survival': survival,
+        'profile_gate_margins': profile_margins,
+        'event_state_space': state,
+        'family_clock_table': family_table,
+        'counterexample_audit': counter,
+        'figure_paths': figure_paths,
+        'source_manifest': source_manifest,
+    }
+
+
+def _ofes_process_review_local_path_centres(
+    lifecycle_dir: str | Path,
+    ventilation_dir: str | Path,
+    extended_dir: str | Path,
+    post_peak_dir: str | Path,
+    event_ids: Sequence[str],
+) -> pd.DataFrame:
+    """从既有粒子位置构造每日 peak-seeded 集合中心，不寻找匹配对象。"""
+    event_ids = [str(value) for value in event_ids]
+    lifecycle = pd.read_parquet(
+        Path(lifecycle_dir) / 'lifecycle_daily_diagnostics.parquet',
+        columns=['event_id', 'date', 'peak_date'],
+    )
+    lifecycle['event_id'] = lifecycle['event_id'].astype(str)
+    lifecycle['date'] = pd.to_datetime(lifecycle['date']).dt.normalize()
+    lifecycle['peak_date'] = pd.to_datetime(lifecycle['peak_date']).dt.normalize()
+    peak_dates = lifecycle.drop_duplicates('event_id').set_index('event_id')['peak_date']
+
+    vent = pd.read_parquet(
+        Path(ventilation_dir) / 'daily_ventilation_diagnostics.parquet',
+        columns=['event_id', 'date', 'particle_id', 'particle_group', 'status',
+                 'depth_m', 'lat', 'lon'],
+    )
+    vent['event_id'] = vent['event_id'].astype(str)
+    vent = vent.loc[
+        vent['event_id'].isin(event_ids)
+        & vent['particle_group'].astype(str).eq('anomaly')
+    ].copy()
+    vent['date'] = pd.to_datetime(vent['date']).dt.normalize()
+    vent['path_role'] = 'backward_peak_seed'
+    vent['lookback_days'] = (
+        vent['event_id'].map(peak_dates) - vent['date']
+    ).dt.days.astype(float)
+
+    extension = pd.read_parquet(
+        Path(extended_dir) / 'daily_positions.parquet',
+        columns=['event_id', 'date', 'lookback_days', 'particle_id',
+                 'particle_group', 'status', 'depth_m', 'lat', 'lon'],
+    )
+    extension['event_id'] = extension['event_id'].astype(str)
+    extension = extension.loc[
+        extension['event_id'].str.startswith('E')
+        & (pd.to_numeric(extension['lookback_days'], errors='coerce') > 90)
+    ].copy()
+    extension['event_id'] = 'OFES_DO50_' + extension['event_id']
+    extension = extension.loc[
+        extension['event_id'].isin(event_ids)
+        & extension['particle_group'].astype(str).eq('anomaly')
+    ].copy()
+    extension['date'] = pd.to_datetime(extension['date']).dt.normalize()
+    extension['path_role'] = 'backward_peak_seed'
+    backward = pd.concat([vent, extension], ignore_index=True)
+
+    forward_frames = []
+    for event_id in event_ids:
+        path = (
+            Path(post_peak_dir) / 'events' / event_id / 'daily_positions.parquet'
+        )
+        if not path.exists():
+            continue
+        frame = pd.read_parquet(
+            path,
+            columns=['event_id', 'date', 'day_since_peak', 'particle_id',
+                     'status', 'depth_m', 'lat', 'lon'],
+        )
+        frame['event_id'] = frame['event_id'].astype(str)
+        frame['date'] = pd.to_datetime(frame['date']).dt.normalize()
+        frame['path_role'] = 'forward_peak_seed'
+        frame['lookback_days'] = -pd.to_numeric(
+            frame['day_since_peak'], errors='coerce'
+        )
+        forward_frames.append(frame)
+    forward = (
+        pd.concat(forward_frames, ignore_index=True)
+        if forward_frames else pd.DataFrame(columns=backward.columns)
+    )
+    positions = pd.concat([backward, forward], ignore_index=True)
+    positions = positions.loc[positions['event_id'].isin(event_ids)].copy()
+    if positions.empty:
+        raise ValueError('No local-field particle positions were found.')
+    positions['status'] = positions['status'].astype(str)
+    positions['active_for_centre'] = positions['status'].eq('active')
+    rows = []
+    for (event_id, path_role, date), group in positions.groupby(
+        ['event_id', 'path_role', 'date'], sort=True
+    ):
+        active = group.loc[
+            group['active_for_centre']
+            & pd.to_numeric(group['lon'], errors='coerce').notna()
+            & pd.to_numeric(group['lat'], errors='coerce').notna()
+            & pd.to_numeric(group['depth_m'], errors='coerce').notna()
+        ].copy()
+        if active.empty:
+            centre = {'lon': np.nan, 'lat': np.nan, 'depth_m': np.nan}
+        else:
+            centre = {
+                'lon': float(pd.to_numeric(active['lon'], errors='coerce').median()),
+                'lat': float(pd.to_numeric(active['lat'], errors='coerce').median()),
+                'depth_m': float(pd.to_numeric(active['depth_m'], errors='coerce').median()),
+            }
+        rows.append({
+            'event_id': str(event_id),
+            'path_role': str(path_role),
+            'date': pd.Timestamp(date).normalize(),
+            'lookback_days': float(pd.to_numeric(group['lookback_days'], errors='coerce').median()),
+            'particle_count': int(len(group)),
+            'active_particle_count': int(len(active)),
+            'centre_lon': centre['lon'],
+            'centre_lat': centre['lat'],
+            'centre_depth_m': centre['depth_m'],
+            'centre_status': 'active_ensemble_centre' if not active.empty else 'no_active_centre',
+        })
+    result = pd.DataFrame(rows).sort_values(
+        ['event_id', 'path_role', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    return result
+
+
+def _ofes_process_review_local_diagnostic_row(
+    path_row: dict,
+    settings: dict,
+) -> dict:
+    """对一个每日集合中心提取原场水团和动力量，失败时显式保留原因。"""
+    result = dict(path_row)
+    result.update({
+        'core_do_fixed_umol_kg': np.nan,
+        'core_theta_fixed_deg_c': np.nan,
+        'core_salinity_fixed_psu': np.nan,
+        'core_sigma0_kg_m3': np.nan,
+        'core_n2_s_2': np.nan,
+        'background_do_same_sigma_umol_kg': np.nan,
+        'water_mass_do_contrast_umol_kg': np.nan,
+        'core_u_m_s': np.nan,
+        'core_v_m_s': np.nan,
+        'core_speed_m_s': np.nan,
+        'core_rossby_number': np.nan,
+        'core_normalized_strain': np.nan,
+        'core_relative_vorticity_s_1': np.nan,
+        'core_vertical_structure_depth_m': np.nan,
+        'background_valid_columns': np.nan,
+        'background_annulus_within_delivery_window': False,
+        'local_do_valid': False,
+        'local_ts_valid': False,
+        'local_stratification_valid': False,
+        'local_dynamics_valid': False,
+        'local_field_status': 'not_evaluated',
+        'structure_continuity_status': 'not_tested',
+        'diagnostic_status': 'not_evaluated',
+        'diagnostic_error_type': '',
+        'diagnostic_error': '',
+    })
+    if path_row.get('centre_status') != 'active_ensemble_centre':
+        result['local_field_status'] = 'no_active_path_centre'
+        return result
+    try:
+        diagnostic = _ofes_diagnose_water_mass_day(
+            path_row['date'],
+            float(path_row['centre_lon']),
+            float(path_row['centre_lat']),
+            float(path_row['centre_depth_m']),
+            settings,
+        )
+        result.update({
+            'core_do_fixed_umol_kg': diagnostic['core_do_fixed'],
+            'core_theta_fixed_deg_c': diagnostic['core_theta_fixed'],
+            'core_salinity_fixed_psu': diagnostic['core_salinity_fixed'],
+            'core_sigma0_kg_m3': diagnostic['target_sigma0'],
+            'core_n2_s_2': diagnostic['core_n2_s_2'],
+            'background_do_same_sigma_umol_kg': diagnostic['background_do_same_sigma'],
+            'water_mass_do_contrast_umol_kg': diagnostic['water_mass_do_contrast'],
+            'core_u_m_s': diagnostic['u_m_s'],
+            'core_v_m_s': diagnostic['v_m_s'],
+            'core_speed_m_s': diagnostic['speed_m_s'],
+            'core_rossby_number': diagnostic['rossby_number'],
+            'core_normalized_strain': diagnostic['normalized_strain'],
+            'core_relative_vorticity_s_1': diagnostic['relative_vorticity_s_1'],
+            'core_vertical_structure_depth_m': diagnostic['kinematic_depth_m'],
+            'background_valid_columns': diagnostic['background_valid_columns'],
+            'background_annulus_within_delivery_window': diagnostic[
+                'background_annulus_within_delivery_window'
+            ],
+            'diagnostic_status': diagnostic['diagnostic_status'],
+        })
+        ts_values = np.asarray([
+            diagnostic['core_theta_fixed'], diagnostic['core_salinity_fixed'],
+            diagnostic['target_sigma0'],
+        ], dtype=float)
+        stratification_values = np.asarray([
+            diagnostic['core_n2_s_2'],
+        ], dtype=float)
+        dynamic_values = np.asarray([
+            diagnostic['u_m_s'], diagnostic['v_m_s'],
+            diagnostic['rossby_number'], diagnostic['normalized_strain'],
+        ], dtype=float)
+        result['local_do_valid'] = bool(np.isfinite(diagnostic['core_do_fixed']))
+        result['local_ts_valid'] = bool(np.all(np.isfinite(ts_values)))
+        result['local_stratification_valid'] = bool(
+            np.all(np.isfinite(stratification_values))
+        )
+        result['local_dynamics_valid'] = bool(np.all(np.isfinite(dynamic_values)))
+        if (
+            result['local_ts_valid']
+            and result['local_stratification_valid']
+            and result['local_dynamics_valid']
+        ):
+            result['local_field_status'] = 'local_fields_available'
+        elif result['local_ts_valid']:
+            result['local_field_status'] = 'thermohaline_available_dynamics_incomplete'
+        elif result['local_dynamics_valid']:
+            result['local_field_status'] = 'dynamics_available_thermohaline_incomplete'
+        else:
+            result['local_field_status'] = 'local_fields_incomplete'
+    except Exception as error:  # preserve a row-level audit trail for source gaps
+        result['local_field_status'] = 'source_or_diagnostic_error'
+        result['diagnostic_error_type'] = type(error).__name__
+        result['diagnostic_error'] = str(error)
+    return result
+
+
+def _ofes_process_review_local_pairwise(
+    daily: pd.DataFrame,
+    pairs: Sequence[tuple[str, str, str, str]],
+) -> pd.DataFrame:
+    """按日期比较候选路径的原场量；不把最近或相似路径强配为同一结构。"""
+    rows = []
+    for pair_name, left_event, right_event, right_role in pairs:
+        left = daily.loc[
+            (daily['event_id'] == left_event)
+            & daily['path_role'].eq(
+                'forward_peak_seed' if pair_name.startswith('E225_E246')
+                else 'backward_peak_seed'
+            )
+        ].set_index('date')
+        right = daily.loc[
+            (daily['event_id'] == right_event)
+            & daily['path_role'].eq(right_role)
+        ].set_index('date')
+        common = left.index.intersection(right.index)
+        for date in common:
+            lrow, rrow = left.loc[date], right.loc[date]
+            lon_l, lat_l = float(lrow['centre_lon']), float(lrow['centre_lat'])
+            lon_r, lat_r = float(rrow['centre_lon']), float(rrow['centre_lat'])
+            finite_position = np.all(np.isfinite([lon_l, lat_l, lon_r, lat_r]))
+            separation = (
+                float(great_circle_distance_m(lon_l, lat_l, lon_r, lat_r) / 1000.0)
+                if finite_position else np.nan
+            )
+            rows.append({
+                'pair_name': pair_name,
+                'left_event_id': left_event,
+                'right_event_id': right_event,
+                'date': pd.Timestamp(date).normalize(),
+                'left_local_field_status': lrow['local_field_status'],
+                'right_local_field_status': rrow['local_field_status'],
+                'centre_separation_km': separation,
+                'depth_difference_m': float(lrow['centre_depth_m'] - rrow['centre_depth_m']) if np.all(np.isfinite([lrow['centre_depth_m'], rrow['centre_depth_m']])) else np.nan,
+                'sigma0_difference_kg_m3': float(lrow['core_sigma0_kg_m3'] - rrow['core_sigma0_kg_m3']) if np.all(np.isfinite([lrow['core_sigma0_kg_m3'], rrow['core_sigma0_kg_m3']])) else np.nan,
+                'n2_difference_s_2': float(lrow['core_n2_s_2'] - rrow['core_n2_s_2']) if np.all(np.isfinite([lrow['core_n2_s_2'], rrow['core_n2_s_2']])) else np.nan,
+                'rossby_difference': float(lrow['core_rossby_number'] - rrow['core_rossby_number']) if np.all(np.isfinite([lrow['core_rossby_number'], rrow['core_rossby_number']])) else np.nan,
+                'comparison_status': 'descriptive_overlap_only_not_identity_test',
+            })
+    return pd.DataFrame(rows)
+
+
+def _ofes_process_review_local_input_signature(
+    lifecycle_dir: str | Path,
+    ventilation_dir: str | Path,
+    extended_dir: str | Path,
+    post_peak_dir: str | Path,
+    event_ids: Sequence[str],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe local-field inputs without hashing large source files."""
+    def _file_identity(path: Path) -> dict[str, Any]:
+        resolved = path.resolve()
+        if not path.is_file():
+            return {'path': str(resolved), 'exists': False}
+        stat = path.stat()
+        return {
+            'path': str(resolved),
+            'exists': True,
+            'size_bytes': int(stat.st_size),
+            'mtime_ns': int(stat.st_mtime_ns),
+        }
+
+    source_files = {
+        'lifecycle_daily': _file_identity(
+            Path(lifecycle_dir) / 'lifecycle_daily_diagnostics.parquet'
+        ),
+        'ventilation_daily': _file_identity(
+            Path(ventilation_dir) / 'daily_ventilation_diagnostics.parquet'
+        ),
+        'extension_daily': _file_identity(
+            Path(extended_dir) / 'daily_positions.parquet'
+        ),
+    }
+    for event_id in sorted(set(str(value) for value in event_ids)):
+        source_files[f'post_peak:{event_id}'] = _file_identity(
+            Path(post_peak_dir) / 'events' / event_id / 'daily_positions.parquet'
+        )
+    return {
+        'version': 1,
+        'event_ids': sorted(set(str(value) for value in event_ids)),
+        'settings': dict(settings),
+        'source_files': source_files,
+    }
+
+
+def build_ofes_process_review_local_field_availability(
+    lifecycle_dir: str | Path,
+    ventilation_dir: str | Path,
+    extended_dir: str | Path,
+    post_peak_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    event_ids: Sequence[str] | None = None,
+    overwrite: bool = False,
+    workers: int = 1,
+) -> dict[str, Any]:
+    """沿既有候选路径逐日抽取小窗口原场，审查局地场可用性。
+
+    该入口只读取已有 Lagrangian particle positions，将 active anomaly ensemble
+    的每日中位中心作为采样位置；不会在窗口内寻找或强迫匹配另一个 Eulerian
+    结构。每行独立保存 raw DO/T/S、TEOS-10 σ₀/N²、u/v、Ro/strain 和来源错误，
+    因而可把 detector gap 的缺测与局地场不可用分开；结构连续性仍不检验。
+
+    参数:
+        - lifecycle_dir (str | pathlib.Path): 已完成 daily lifecycle 目录。
+        - ventilation_dir (str | pathlib.Path): 已完成 90-day backward 目录。
+        - extended_dir (str | pathlib.Path): 已完成 180-day extension 目录。
+        - post_peak_dir (str | pathlib.Path): 已完成 post-peak retention 目录。
+        - output_dir (str | pathlib.Path): 当前 OFES 过程审查综合目录。
+        - event_ids (Sequence[str] | None): 目标 family 与反例；省略时使用固定 12 例。
+        - overwrite (bool): 是否覆盖现有逐日局地表；默认 False，支持断点续跑。
+        - workers (int): 同时读取独立日期快照的进程数；默认 1。
+
+    返回:
+        - dict[str, Any]: `daily`、`summary`、`pairwise` 和输出路径。
+
+    输出:
+        - `local_field_daily.parquet`、`local_field_summary.csv`、
+          `local_field_pairwise.csv`、`local_field_availability.png` 和 manifest。
+
+    说明:
+        - E225 的 forward path 与 E246 的 backward path 专门覆盖 15-day detector gap；
+          E307/E308/E309 使用共同的 long backward history。比较表是描述性重叠审计，
+          不把几何相近升级为 carrier identity。
+        - 断点续跑只复用输入文件 size/mtime、event_ids 和诊断参数均匹配的缓存；
+          局地场可用性不等于结构连续性，后者在本入口中保持 `not_tested`。
+    """
+    default_ids = [
+        'OFES_DO50_E000225', 'OFES_DO50_E000246',
+        'OFES_DO50_E000307', 'OFES_DO50_E000308', 'OFES_DO50_E000309',
+        'OFES_DO50_E000192', 'OFES_DO50_E000201', 'OFES_DO50_E000210',
+        'OFES_DO50_E000172', 'OFES_DO50_E000193', 'OFES_DO50_E000194',
+        'OFES_DO50_E000291',
+    ]
+    selected = list(dict.fromkeys(str(value) for value in (event_ids or default_ids)))
+    workers = int(workers)
+    if workers <= 0:
+        raise ValueError('Local field availability workers must be positive.')
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    daily_path = out / 'local_field_daily.parquet'
+    summary_path = out / 'local_field_summary.csv'
+    pairwise_path = out / 'local_field_pairwise.csv'
+    figure_path = out / 'local_field_availability.png'
+    manifest_path = out / 'local_field_manifest.json'
+    settings = _ofes_event_diagnostic_settings()
+    input_signature = _ofes_process_review_local_input_signature(
+        lifecycle_dir, ventilation_dir, extended_dir, post_peak_dir,
+        selected, settings,
+    )
+    centres = _ofes_process_review_local_path_centres(
+        lifecycle_dir, ventilation_dir, extended_dir, post_peak_dir, selected,
+    )
+    requested_keys = {
+        f"{row['event_id']}|{row['path_role']}|{pd.Timestamp(row['date']):%Y-%m-%d}"
+        for row in centres.to_dict('records')
+    }
+    source_paths = {
+        'lifecycle_dir': str(Path(lifecycle_dir).resolve()),
+        'ventilation_dir': str(Path(ventilation_dir).resolve()),
+        'extended_dir': str(Path(extended_dir).resolve()),
+        'post_peak_dir': str(Path(post_peak_dir).resolve()),
+    }
+
+    def _write_checkpoint(run_status: str, rows: list[dict[str, Any]]) -> None:
+        """原子保存当前逐日表，并立即写入对应的输入签名与运行状态。"""
+        frame = pd.DataFrame(rows)
+        _atomic_write_parquet(frame, daily_path)
+        _ofes_atomic_write_json(
+            {
+                'analysis': 'ofes_process_review_local_field_availability',
+                'run_status': str(run_status),
+                'event_ids': selected,
+                'requested_row_count': int(len(centres)),
+                'completed_row_count': int(len(frame)),
+                'input_signature': input_signature,
+                'settings': settings,
+                'source_paths': source_paths,
+                'checkpoint_manifest_version': 1,
+                'outputs': {daily_path.name: str(daily_path.resolve())},
+            },
+            manifest_path,
+        )
+
+    records = []
+    existing = pd.DataFrame()
+    if daily_path.exists() and not overwrite:
+        existing_manifest = {}
+        if manifest_path.exists():
+            try:
+                existing_manifest = json.loads(
+                    manifest_path.read_text(encoding='utf-8')
+                )
+            except (OSError, json.JSONDecodeError):
+                existing_manifest = {}
+        if existing_manifest.get('input_signature') == input_signature:
+            existing = pd.read_parquet(daily_path)
+    done_keys = set()
+    if not existing.empty:
+        existing = existing.loc[existing['event_id'].astype(str).isin(selected)].copy()
+        existing['_key'] = (
+            existing['event_id'].astype(str) + '|'
+            + existing['path_role'].astype(str) + '|'
+            + pd.to_datetime(existing['date']).dt.strftime('%Y-%m-%d')
+        )
+        existing = existing.loc[existing['_key'].isin(requested_keys)].drop(
+            columns='_key'
+        )
+        done_keys = set(
+            existing['event_id'].astype(str) + '|' + existing['path_role'].astype(str)
+            + '|' + pd.to_datetime(existing['date']).dt.strftime('%Y-%m-%d')
+        )
+        records.extend(existing.to_dict('records'))
+    pending = []
+    for row in centres.to_dict('records'):
+        key = f"{row['event_id']}|{row['path_role']}|{pd.Timestamp(row['date']):%Y-%m-%d}"
+        if key in done_keys:
+            continue
+        pending.append(row)
+    if pending:
+        # Establish a matching empty/partial parquet and in-progress manifest
+        # before the first worker starts, so an early interruption is resumable.
+        _write_checkpoint('in_progress', records)
+        with ProcessPoolExecutor(max_workers=min(workers, len(pending))) as executor:
+            futures = {
+                executor.submit(_ofes_process_review_local_diagnostic_row, row, settings): row
+                for row in pending
+            }
+            for future in futures_as_completed(futures):
+                row = futures[future]
+                print(
+                    f"[process-review local] {row['event_id']} {row['path_role']} "
+                    f"{pd.Timestamp(row['date']):%Y-%m-%d}", flush=True,
+                )
+                records.append(future.result())
+                if len(records) % 10 == 0:
+                    _write_checkpoint('in_progress', records)
+    daily = pd.DataFrame(records).sort_values(
+        ['event_id', 'path_role', 'date'], kind='mergesort'
+    ).reset_index(drop=True)
+    _atomic_write_parquet(daily, daily_path)
+
+    summary_rows = []
+    for (event_id, path_role), group in daily.groupby(['event_id', 'path_role'], sort=True):
+        group = group.sort_values('date')
+        valid = group['local_field_status'].eq('local_fields_available')
+        dates = pd.to_datetime(group['date']).dt.normalize()
+        valid_dates = dates[valid].sort_values().drop_duplicates()
+        longest = 0
+        run = 0
+        previous = None
+        for date in valid_dates:
+            run = run + 1 if previous is not None and (date - previous).days == 1 else 1
+            longest = max(longest, run)
+            previous = date
+        summary_rows.append({
+            'event_id': event_id,
+            'path_role': path_role,
+            'date_min': dates.min(),
+            'date_max': dates.max(),
+            'requested_day_count': int(len(group)),
+            'local_field_available_day_count': int(valid.sum()),
+            'thermohaline_valid_day_count': int(group['local_ts_valid'].sum()),
+            'dynamics_valid_day_count': int(group['local_dynamics_valid'].sum()),
+            'local_field_available_fraction': float(valid.mean()),
+            'longest_consecutive_local_field_run_days': int(longest),
+            'error_day_count': int(group['local_field_status'].eq('source_or_diagnostic_error').sum()),
+            'structure_continuity_status': 'not_tested',
+            'interpretation': 'local_raw_field_availability_audit_not_structure_continuity_or_carrier_proof',
+        })
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(summary_path, index=False)
+    pairs = [
+        ('E225_E246_gap', 'OFES_DO50_E000225', 'OFES_DO50_E000246', 'backward_peak_seed'),
+        ('E307_E308', 'OFES_DO50_E000307', 'OFES_DO50_E000308', 'backward_peak_seed'),
+        ('E307_E309', 'OFES_DO50_E000307', 'OFES_DO50_E000309', 'backward_peak_seed'),
+        ('E308_E309', 'OFES_DO50_E000308', 'OFES_DO50_E000309', 'backward_peak_seed'),
+    ]
+    pairwise = _ofes_process_review_local_pairwise(daily, pairs)
+    pairwise.to_csv(pairwise_path, index=False)
+
+    if not daily.empty:
+        fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True, constrained_layout=True)
+        for (event_id, path_role), group in daily.groupby(['event_id', 'path_role'], sort=True):
+            group = group.sort_values('date')
+            label = f"{event_id.replace('OFES_DO50_', '')} {path_role.replace('_peak_seed', '')}"
+            axes[0].plot(group['date'], group['core_sigma0_kg_m3'], marker='.', ms=2, lw=.8, label=label)
+            axes[1].plot(group['date'], group['core_n2_s_2'], marker='.', ms=2, lw=.8, label=label)
+            axes[2].plot(group['date'], group['core_rossby_number'], marker='.', ms=2, lw=.8, label=label)
+        axes[0].set_ylabel('core σ₀ (kg m⁻³)')
+        axes[1].set_ylabel('core N² (s⁻²)')
+        axes[2].set_ylabel('core Ro'); axes[2].set_xlabel('date')
+        axes[0].set_title('Local raw-field availability along existing candidate paths')
+        for axis in axes:
+            axis.grid(alpha=.2)
+        axes[0].legend(frameon=False, fontsize=6, ncol=3)
+        fig.savefig(figure_path, dpi=170, bbox_inches='tight')
+        plt.close(fig)
+
+    manifest = {
+        'analysis': 'ofes_process_review_local_field_availability',
+        'run_status': 'complete',
+        'event_ids': selected,
+        'requested_row_count': int(len(centres)),
+        'completed_row_count': int(len(daily)),
+        'daily_row_count': int(len(daily)),
+        'summary_row_count': int(len(summary)),
+        'pairwise_row_count': int(len(pairwise)),
+        'source_paths': source_paths,
+        'settings': settings,
+        'input_signature': input_signature,
+        'checkpoint_manifest_version': 1,
+        'no_reintegration': True,
+        'no_structure_matching': True,
+        'outputs': {
+            path.name: str(path.resolve())
+            for path in (daily_path, summary_path, pairwise_path, figure_path, manifest_path)
+            if path == manifest_path or path.exists()
+        },
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {'output_dir': out, 'daily': daily, 'summary': summary, 'pairwise': pairwise, 'manifest': manifest}
