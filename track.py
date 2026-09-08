@@ -36550,6 +36550,153 @@ def extract_ofes_profile_interp(
     return pd.DataFrame(records)
 
 
+def sample_ofes_particle_water_column(
+    path: pd.DataFrame,
+    *,
+    date_col: str = 'date',
+    lon_col: str = 'lon',
+    lat_col: str = 'lat',
+    particle_id_col: str = 'particle_id',
+    particle_depth_col: str = 'depth_m',
+    depth_bounds: tuple[float, float] = (0.0, 1000.0),
+) -> pd.DataFrame:
+    """沿固定粒子路径逐日提取原生层水柱 DO、温盐和 σ₀。
+
+    每个日期只读取覆盖该粒子经纬度的相邻示踪物网格柱，再在该位置做水平双线性剖面插值；垂向保持 OFES 交付的原生深度层，不把粒子单点属性扩展成水柱，也不调用事件背景或局地峰检测。输入应已筛选为一个固定 `particle_id` 的连续路径，返回表同时保留该粒子的当日位置与真实深度，供路径环境图直接消费。
+
+    参数:
+        - path (pd.DataFrame): 单个固定粒子的逐日路径，至少包含日期、经纬度、粒子 ID 和真实深度列；可选 `integration_label` 会原样保留。
+        - date_col (str): 路径日期列名，默认 `date`。
+        - lon_col (str): 路径经度列名，默认 `lon`。
+        - lat_col (str): 路径纬度列名，默认 `lat`。
+        - particle_id_col (str): 粒子身份列名，默认 `particle_id`。
+        - particle_depth_col (str): 粒子真实深度列名，默认 `depth_m`。
+        - depth_bounds (tuple[float, float]): 原生水柱读取范围（m，向下为正），默认 `(0.0, 1000.0)`。
+
+    返回:
+        - pd.DataFrame: 逐日逐原生层表，含 `date`、`particle_id`、`path_lon`、`path_lat`、`particle_depth_m`、`native_depth_m`、`do2_umol_kg`、`temp_potential_c`、`salinity_psu`、`sigma0_kg_m3`、`sample_status` 和来源方法列。
+
+    输出:
+        - 无文件输出；仅返回可由调用者保存的逐日逐深度取样表。
+
+    说明:
+        - 水平采样是相邻 tracer-center 网格柱的双线性插值；越过交付域或日期源文件缺失会显式报错，不静默夹取或补零。
+        - σ₀由实际路径位置的 OFES 位温/实用盐度按 TEOS-10 计算；不使用粒子缓存中的单点 DO/T/S 属性，也不产生独立 start→peak 路径。
+    """
+    required = {
+        date_col, lon_col, lat_col, particle_id_col, particle_depth_col,
+    }
+    missing = required.difference(path.columns)
+    if missing:
+        raise KeyError(f'Particle path is missing required columns: {sorted(missing)}')
+    if path.empty:
+        return pd.DataFrame(
+            columns=[
+                'date', 'particle_id', 'integration_label', 'path_lon',
+                'path_lat', 'particle_depth_m', 'native_depth_m',
+                'do2_umol_kg', 'temp_potential_c', 'salinity_psu',
+                'sigma0_kg_m3', 'sample_status', 'horizontal_sampling',
+                'depth_units', 'do_units', 'temperature_units',
+                'salinity_units', 'sigma0_units',
+            ]
+        )
+
+    records = path.copy()
+    records['sample_date'] = pd.to_datetime(records[date_col]).dt.normalize()
+    if records['sample_date'].isna().any():
+        raise ValueError('Particle path contains invalid dates.')
+    ids = records[particle_id_col].dropna().astype(str).unique()
+    if len(ids) != 1:
+        raise ValueError('sample_ofes_particle_water_column requires exactly one particle_id.')
+    if records.duplicated('sample_date').any():
+        raise ValueError('Particle path must contain at most one row per date for the selected particle.')
+    lower, upper = (float(depth_bounds[0]), float(depth_bounds[1]))
+    if not np.isfinite([lower, upper]).all() or lower < 0 or upper <= lower:
+        raise ValueError('depth_bounds must be finite, nonnegative, and increasing.')
+
+    def _bracket_bounds(values: np.ndarray, point: float, name: str) -> tuple[float, float]:
+        coords = np.asarray(values, dtype=float)
+        if not np.isfinite(point) or point < coords[0] or point > coords[-1]:
+            raise ValueError(f'Particle {name}={point:g} lies outside the OFES delivered grid.')
+        if coords.size < 2:
+            raise ValueError(f'OFES {name} grid needs at least two adjacent points for interpolation.')
+        upper_index = int(np.searchsorted(coords, point, side='right'))
+        left_index = max(0, min(upper_index - 1, coords.size - 2))
+        return float(coords[left_index]), float(coords[left_index + 1])
+
+    output_rows = []
+    keep_columns = [column for column in ('integration_label',) if column in records.columns]
+    for row in records.sort_values('sample_date', kind='mergesort').itertuples(index=False):
+        row_values = row._asdict()
+        date = pd.Timestamp(row_values['sample_date'])
+        path_lon = float(row_values[lon_col])
+        path_lat = float(row_values[lat_col])
+        snapshot_lon, snapshot_lat, _, _, _ = _ofes_tracer_coordinates(date)
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['do2', 'temp', 'salinity'],
+            lon_bounds=_bracket_bounds(snapshot_lon, path_lon, 'longitude'),
+            lat_bounds=_bracket_bounds(snapshot_lat, path_lat, 'latitude'),
+            depth_bounds=(lower, upper),
+        )
+        profile = extract_ofes_profile_interp(
+            snapshot, path_lon, path_lat, variables=['do2', 'temp', 'salinity']
+        )
+        native_depth = profile['Depth'].to_numpy(dtype=float)
+        salinity = profile['salinity'].to_numpy(dtype=float)
+        potential_temperature = profile['temp'].to_numpy(dtype=float)
+        pressure = gsw.p_from_z(-native_depth, np.full(native_depth.shape, path_lat))
+        absolute_salinity = gsw.SA_from_SP(
+            salinity,
+            pressure,
+            np.full(native_depth.shape, path_lon),
+            np.full(native_depth.shape, path_lat),
+        )
+        conservative_temperature = gsw.CT_from_pt(
+            absolute_salinity, potential_temperature
+        )
+        sigma0 = np.asarray(
+            gsw.sigma0(absolute_salinity, conservative_temperature),
+            dtype=float,
+        )
+        finite_any = np.isfinite(
+            np.column_stack((profile['do2'], potential_temperature, salinity, sigma0))
+        ).any(axis=1)
+        for index, depth in enumerate(native_depth):
+            record = {
+                'date': date,
+                'particle_id': str(row_values[particle_id_col]),
+                'path_lon': path_lon,
+                'path_lat': path_lat,
+                'particle_depth_m': float(row_values[particle_depth_col]),
+                'native_depth_m': float(depth),
+                'do2_umol_kg': float(profile['do2'].iloc[index]) if np.isfinite(profile['do2'].iloc[index]) else np.nan,
+                'temp_potential_c': float(potential_temperature[index]) if np.isfinite(potential_temperature[index]) else np.nan,
+                'salinity_psu': float(salinity[index]) if np.isfinite(salinity[index]) else np.nan,
+                'sigma0_kg_m3': float(sigma0[index]) if np.isfinite(sigma0[index]) else np.nan,
+                'sample_status': 'ok' if finite_any[index] else 'all_fields_missing',
+                'horizontal_sampling': 'bilinear_adjacent_tracer_centers',
+                'depth_units': 'm_downward_positive',
+                'do_units': 'umol_kg-1',
+                'temperature_units': 'degC_potential_temperature',
+                'salinity_units': 'PSS-78',
+                'sigma0_units': 'kg_m-3',
+            }
+            for column in keep_columns:
+                record[column] = row_values[column]
+            output_rows.append(record)
+
+    result = pd.DataFrame(output_rows)
+    ordered_columns = [
+        'date', 'particle_id', 'integration_label', 'path_lon', 'path_lat',
+        'particle_depth_m', 'native_depth_m', 'do2_umol_kg',
+        'temp_potential_c', 'salinity_psu', 'sigma0_kg_m3', 'sample_status',
+        'horizontal_sampling', 'depth_units', 'do_units',
+        'temperature_units', 'salinity_units', 'sigma0_units',
+    ]
+    return result[[column for column in ordered_columns if column in result.columns]]
+
+
 def detect_ofes_delta_do(
     snapshot: dict,
     lon: float,
@@ -40357,6 +40504,61 @@ def _ofes_masked_median_profiles(
         np.ma.median(masked, axis=1).filled(np.nan),
         dtype=float,
     )
+
+
+def _ofes_same_sigma_background_from_profile(
+    sigma0: np.ndarray,
+    background_sigma0_profile: np.ndarray,
+    background_field_profile: np.ndarray,
+    monotonic_tolerance: float = 1.0e-3,
+) -> np.ndarray:
+    """将环带背景的深度剖面按密度映射回三维原场，不做密度外推。
+
+    仅将不超过数值容差的微小反向压平；较大的非单调性保持为缺测。
+    """
+    density = np.asarray(sigma0, dtype=float)
+    sigma_profile = np.asarray(background_sigma0_profile, dtype=float)
+    field_profile = np.asarray(background_field_profile, dtype=float)
+    if (
+        density.ndim != 3
+        or sigma_profile.ndim != 1
+        or field_profile.ndim != 1
+        or density.shape[0] != sigma_profile.size
+        or sigma_profile.size != field_profile.size
+        or not np.isfinite(monotonic_tolerance)
+        or monotonic_tolerance < 0
+    ):
+        raise ValueError(
+            'OFES same-sigma background requires matching depth profiles '
+            'and a (depth, lat, lon) sigma0 field.'
+        )
+    valid = np.isfinite(sigma_profile) & np.isfinite(field_profile)
+    if np.count_nonzero(valid) < 2 or not np.all(valid):
+        return np.full(density.shape, np.nan, dtype=float)
+    sigma_values = sigma_profile[valid]
+    field_values = field_profile[valid]
+    differences = np.diff(sigma_values)
+    negative = differences[differences <= 0]
+    if negative.size and np.max(-negative) > float(monotonic_tolerance):
+        return np.full(density.shape, np.nan, dtype=float)
+    if negative.size:
+        sigma_values = np.maximum.accumulate(sigma_values)
+        unique_sigma, inverse = np.unique(sigma_values, return_inverse=True)
+        field_values = np.asarray(
+            [np.nanmedian(field_values[inverse == index]) for index in range(unique_sigma.size)],
+            dtype=float,
+        )
+        sigma_values = unique_sigma
+    mapped = np.full(density.shape, np.nan, dtype=float)
+    finite_density = np.isfinite(density)
+    mapped[finite_density] = np.interp(
+        density[finite_density],
+        sigma_values,
+        field_values,
+        left=np.nan,
+        right=np.nan,
+    )
+    return mapped
 
 
 def _ofes_nan_gaussian(
@@ -78705,3 +78907,1558 @@ def plot_ofes_scv_reverse_risk_differences(
         plt.show()
     plt.close(fig)
     return {'figure': fig, 'figure_path': path, 'plot_data': plot_data}
+
+
+def _ofes_dualtrack_read_table(path: str | Path, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    """Read an OFES dual-track parquet table and normalize date columns."""
+    df = pd.read_parquet(path, columns=list(columns) if columns else None)
+    for col in ("date", "start_date", "peak_date", "end_date"):
+        if col in df:
+            df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def _ofes_dualtrack_assert_unique(df: pd.DataFrame, keys: Sequence[str], table_name: str) -> None:
+    """Reject duplicate semantic keys instead of silently selecting a row."""
+    if df[list(keys)].isna().any().any():
+        raise ValueError(f"{table_name} has missing semantic keys: {list(keys)}")
+    if df.duplicated(list(keys)).any():
+        duplicate = df.loc[df.duplicated(list(keys), keep=False), list(keys)].head(4).to_dict("records")
+        raise ValueError(f"{table_name} has duplicate key {list(keys)}: {duplicate}")
+
+
+def _ofes_dualtrack_finite_pair_rows(df: pd.DataFrame, value_columns: Sequence[str]) -> pd.DataFrame:
+    """Retain rows finite in every requested numeric value column."""
+    if not value_columns:
+        return df.copy()
+    finite = np.isfinite(df[list(value_columns)].to_numpy(dtype=float)).all(axis=1)
+    return df.loc[finite].copy()
+
+
+def diagnose_ofes_paired_oxygen_background(
+    tracer_path: str | Path,
+    event_path: str | Path,
+    event_ids: Sequence[str] | None = None,
+    integration_label: str = "forward_observed_start_to_peak",
+    backgrounds: Mapping[str, str] | None = None,
+    daily_summary_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """计算事件起始日到峰值日的同成员原始 DO 与背景配对闭合。
+
+    每个事件的日期来自现有 primary 事件表；仅保留两个日期均出现且指定数值字段为 finite 的同一粒子。每个共同成员使用 `1/n_common` 固定等权，并分别对同密度交点背景和固定深度参考计算 `Δ(C−B)=ΔC−ΔB`。
+
+    参数:
+        - tracer_path (str | pathlib.Path): 现有粒子 tracer parquet 路径。
+        - event_path (str | pathlib.Path): 现有 primary 事件 parquet 路径。
+        - event_ids (Sequence[str] | None): 可选事件子集。
+        - integration_label (str): 使用的 tracer 积分标签。
+        - backgrounds (Mapping[str, str] | None): 输出背景名到 tracer 字段名的映射。
+        - daily_summary_path (str | pathlib.Path | None): 可选 daily summary；仅保留环带和日诊断均通过的日期。
+    返回:
+        - tuple[pandas.DataFrame, pandas.DataFrame]: 事件级分解表与逐成员审计表。
+    说明:
+        - 这是局地对比变化诊断，不是氧收支，也不建立物质边界或因果输送路径。
+        - `background_do2_same_sigma` 是 producer 的同密度交点参考；`background_do2_fixed` 只表示另一固定深度参考系。
+    """
+    if backgrounds is None:
+        backgrounds = {
+            "same_sigma": "background_do2_same_sigma",
+            "fixed_depth": "background_do2_fixed",
+        }
+    needed = ["event_id", "integration_label", "date", "particle_id", "do2", *backgrounds.values()]
+    tracer = _ofes_dualtrack_read_table(tracer_path, needed)
+    _ofes_dualtrack_assert_unique(tracer, ["event_id", "integration_label", "date", "particle_id"], "particle_tracer")
+    events = _ofes_dualtrack_read_table(event_path, ["event_id", "start_date", "peak_date", "peak_depth_m", "population_scope"])
+    _ofes_dualtrack_assert_unique(events, ["event_id"], "event_table")
+    if event_ids is not None:
+        wanted = set(event_ids)
+        tracer = tracer[tracer["event_id"].isin(wanted)]
+        events = events[events["event_id"].isin(wanted)]
+    tracer = tracer[tracer["integration_label"] == integration_label].copy()
+    if daily_summary_path is not None:
+        daily = _ofes_dualtrack_read_table(
+            daily_summary_path,
+            ["event_id", "integration_label", "date", "background_annulus_within_delivery_window", "daily_diagnostic_passed"],
+        )
+        daily = daily[daily.integration_label == integration_label]
+        _ofes_dualtrack_assert_unique(daily, ["event_id", "integration_label", "date"], "daily_tracer_summary")
+        tracer = tracer.merge(daily, on=["event_id", "integration_label", "date"], how="left", validate="many_to_one")
+        tracer = tracer[
+            tracer.background_annulus_within_delivery_window.eq(True)
+            & tracer.daily_diagnostic_passed.eq(True)
+        ].copy()
+    rows: list[dict] = []
+    pairs: list[pd.DataFrame] = []
+    for event in events.itertuples(index=False):
+        x = tracer[tracer.event_id == event.event_id]
+        t0 = x[x.date == event.start_date].copy()
+        t1 = x[x.date == event.peak_date].copy()
+        if t0.empty or t1.empty:
+            continue
+        left_cols = ["particle_id", "do2", *backgrounds.values()]
+        right_cols = ["particle_id", "do2", *backgrounds.values()]
+        t0 = t0[left_cols].rename(columns={c: f"{c}_t0" for c in left_cols if c != "particle_id"})
+        t1 = t1[right_cols].rename(columns={c: f"{c}_t1" for c in right_cols if c != "particle_id"})
+        n_initial = len(t0)
+        n_endpoint = len(t1)
+        pair = t0.merge(t1, on="particle_id", how="inner", validate="one_to_one")
+        value_cols = [c for c in pair.columns if c != "particle_id"]
+        pair = _ofes_dualtrack_finite_pair_rows(pair, value_cols)
+        n = len(pair)
+        if n == 0:
+            continue
+        d_c = pair["do2_t1"] - pair["do2_t0"]
+        base = {
+            "event_id": event.event_id,
+            "start_date": event.start_date,
+            "peak_date": event.peak_date,
+            "peak_depth_m": event.peak_depth_m,
+            "population_scope": event.population_scope,
+            "n_common": n,
+            "n_initial": n_initial,
+            "n_endpoint": n_endpoint,
+            "retention_from_initial": n / n_initial if n_initial else np.nan,
+            "retention_from_endpoint": n / n_endpoint if n_endpoint else np.nan,
+            "common_fraction_of_smaller_endpoint": n / min(n_initial, n_endpoint) if min(n_initial, n_endpoint) else np.nan,
+            "weight_scheme": "equal_1_over_n_common",
+            "raw_do_t0_mean": pair.do2_t0.mean(),
+            "raw_do_t1_mean": pair.do2_t1.mean(),
+            "raw_do_delta_mean": d_c.mean(),
+            "raw_do_delta_median": d_c.median(),
+        }
+        for name, col in backgrounds.items():
+            d_b = pair[f"{col}_t1"] - pair[f"{col}_t0"]
+            a0 = pair.do2_t0 - pair[f"{col}_t0"]
+            a1 = pair.do2_t1 - pair[f"{col}_t1"]
+            d_a = a1 - a0
+            closure = d_a - (d_c - d_b)
+            out = dict(base)
+            out.update(
+                {
+                    "background": name,
+                    "background_column": col,
+                    "background_t0_mean": pair[f"{col}_t0"].mean(),
+                    "background_t1_mean": pair[f"{col}_t1"].mean(),
+                    "background_delta_mean": d_b.mean(),
+                    "background_delta_median": d_b.median(),
+                    "contrast_t0_mean": a0.mean(),
+                    "contrast_t1_mean": a1.mean(),
+                    "contrast_delta_mean": d_a.mean(),
+                    "contrast_delta_median": d_a.median(),
+                    "closure_error_mean": closure.mean(),
+                    "closure_error_max_abs": np.abs(closure).max(),
+                    "raw_units": "umol_kg-1",
+                }
+            )
+            rows.append(out)
+            audit = pair[["particle_id"]].copy()
+            audit.insert(0, "event_id", event.event_id)
+            audit.insert(1, "start_date", event.start_date)
+            audit.insert(2, "peak_date", event.peak_date)
+            audit["background"] = name
+            audit["C_t0"] = pair.do2_t0
+            audit["C_t1"] = pair.do2_t1
+            audit["B_t0"] = pair[f"{col}_t0"]
+            audit["B_t1"] = pair[f"{col}_t1"]
+            audit["A_t0"] = a0
+            audit["A_t1"] = a1
+            audit["delta_C"] = d_c
+            audit["delta_B"] = d_b
+            audit["delta_A"] = d_a
+            audit["closure_error"] = closure
+            audit["weight"] = 1.0 / n
+            pairs.append(audit)
+    summary = pd.DataFrame(rows)
+    paired = pd.concat(pairs, ignore_index=True) if pairs else pd.DataFrame()
+    return summary, paired
+
+
+def diagnose_ofes_paired_oxygen_background_dates(
+    tracer_path: str | Path,
+    event_id: str,
+    start_date: str | pd.Timestamp,
+    endpoint_date: str | pd.Timestamp,
+    integration_label: str,
+    daily_summary_path: str | Path | None = None,
+    backgrounds: Mapping[str, str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """计算指定两个日期的同成员原始 DO/背景配对分解。
+
+    本入口用于已有 peak-seeded forward tracer，例如从 DO 峰值日到峰后第 14 天。它只保留两个日期都出现且所有指定数值字段均为 finite 的同一 `particle_id`，每个成员使用固定等权；daily summary 存在时两个端点还必须通过背景环带和 daily diagnostic gate。
+
+    参数:
+        - tracer_path (str | pathlib.Path): 含粒子原始 DO 与背景字段的 parquet 路径。
+        - event_id (str): 事件源键。
+        - start_date (str | pandas.Timestamp): 配对起始日期。
+        - endpoint_date (str | pandas.Timestamp): 配对终止日期。
+        - integration_label (str): tracer 表中的积分标签。
+        - daily_summary_path (str | pathlib.Path | None): 可选 daily tracer summary 路径。
+        - backgrounds (Mapping[str, str] | None): 输出背景名到字段名的映射。
+    返回:
+        - tuple[pandas.DataFrame, pandas.DataFrame]: 事件级分解表与逐成员审计表。
+    说明:
+        - `background_do2_same_sigma` 是 producer 的同日 active-particle 中心 120–240 km 环带背景剖面按粒子 sigma 最近交点；`background_do2_fixed` 仅作固定深度参考系敏感性。
+        - `Δ(C−B)` 的变化不等于结构装载/释放；没有独立结构成员定义时不作该机制判断。
+    """
+    if backgrounds is None:
+        backgrounds = {"same_sigma": "background_do2_same_sigma", "fixed_depth": "background_do2_fixed"}
+    needed = ["event_id", "integration_label", "date", "particle_id", "do2", *backgrounds.values()]
+    tracer = _ofes_dualtrack_read_table(tracer_path, needed)
+    _ofes_dualtrack_assert_unique(tracer, ["event_id", "integration_label", "date", "particle_id"], "particle_tracer")
+    tracer = tracer[(tracer.event_id == event_id) & (tracer.integration_label == integration_label)].copy()
+    t0_date = pd.Timestamp(start_date)
+    t1_date = pd.Timestamp(endpoint_date)
+    if daily_summary_path is not None:
+        daily = _ofes_dualtrack_read_table(
+            daily_summary_path,
+            ["event_id", "integration_label", "date", "background_annulus_within_delivery_window", "daily_diagnostic_passed"],
+        )
+        _ofes_dualtrack_assert_unique(daily, ["event_id", "integration_label", "date"], "daily_tracer_summary")
+        daily = daily[daily.integration_label == integration_label]
+        daily = daily[
+            daily.background_annulus_within_delivery_window.eq(True)
+            & daily.daily_diagnostic_passed.eq(True)
+        ]
+        valid_dates = set(daily.loc[daily.event_id == event_id, "date"])
+        if t0_date not in valid_dates or t1_date not in valid_dates:
+            return pd.DataFrame(), pd.DataFrame()
+    t0 = tracer[tracer.date == t0_date].copy()
+    t1 = tracer[tracer.date == t1_date].copy()
+    n_initial, n_endpoint = len(t0), len(t1)
+    left_cols = ["particle_id", "do2", *backgrounds.values()]
+    t0 = t0[left_cols].rename(columns={c: f"{c}_t0" for c in left_cols if c != "particle_id"})
+    t1 = t1[left_cols].rename(columns={c: f"{c}_t1" for c in left_cols if c != "particle_id"})
+    pair = t0.merge(t1, on="particle_id", how="inner", validate="one_to_one")
+    pair = _ofes_dualtrack_finite_pair_rows(pair, [c for c in pair.columns if c != "particle_id"])
+    n_common = len(pair)
+    if n_common == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    d_c = pair.do2_t1 - pair.do2_t0
+    rows = []
+    audit_rows = []
+    for name, col in backgrounds.items():
+        d_b = pair[f"{col}_t1"] - pair[f"{col}_t0"]
+        a0 = pair.do2_t0 - pair[f"{col}_t0"]
+        a1 = pair.do2_t1 - pair[f"{col}_t1"]
+        d_a = a1 - a0
+        closure = d_a - (d_c - d_b)
+        rows.append(
+            {
+                "event_id": event_id,
+                "start_date": t0_date,
+                "endpoint_date": t1_date,
+                "integration_label": integration_label,
+                "background": name,
+                "background_column": col,
+                "n_initial": n_initial,
+                "n_endpoint": n_endpoint,
+                "n_common": n_common,
+                "retention_from_initial": n_common / n_initial if n_initial else np.nan,
+                "retention_from_endpoint": n_common / n_endpoint if n_endpoint else np.nan,
+                "common_fraction_of_smaller_endpoint": n_common / min(n_initial, n_endpoint),
+                "weight_scheme": "equal_1_over_n_common",
+                "raw_do_delta_mean": d_c.mean(),
+                "background_delta_mean": d_b.mean(),
+                "contrast_delta_mean": d_a.mean(),
+                "contrast_delta_median": d_a.median(),
+                "contrast_t0_mean": a0.mean(),
+                "contrast_endpoint_mean": a1.mean(),
+                "normalized_contrast_change_by_abs_initial": d_a.mean() / abs(a0.mean()) if a0.mean() else np.nan,
+                "initial_reference_contrast_delta_mean": d_c.mean(),
+                "normalized_initial_reference_change_by_abs_initial": d_c.mean() / abs(a0.mean()) if a0.mean() else np.nan,
+                "closure_error_mean": closure.mean(),
+                "closure_error_max_abs": np.abs(closure).max(),
+                "raw_units": "umol_kg-1",
+            }
+        )
+        audit = pd.DataFrame({
+            "event_id": event_id, "particle_id": pair.particle_id,
+            "start_date": t0_date, "endpoint_date": t1_date, "background": name,
+            "C_t0": pair.do2_t0, "C_t1": pair.do2_t1,
+            "B_t0": pair[f"{col}_t0"], "B_t1": pair[f"{col}_t1"],
+            "A_initialref_t0": a0, "A_initialref_t1": pair.do2_t1 - pair[f"{col}_t0"],
+            "delta_C": d_c, "delta_B": d_b, "delta_A": d_a,
+            "delta_A_initialref": d_c,
+            "closure_error": closure, "weight": 1.0 / n_common,
+        })
+        audit_rows.append(audit)
+    return pd.DataFrame(rows), pd.concat(audit_rows, ignore_index=True)
+
+
+def diagnose_ofes_identity_locked_pair(
+    tracer_path: str | Path,
+    event_id: str,
+    start_date: str | pd.Timestamp,
+    endpoint_date: str | pd.Timestamp,
+    integration_label: str,
+    *,
+    output_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """锁定同一积分组的两端粒子身份并输出逐成员审计。
+
+    参数:
+        - tracer_path (str | pathlib.Path): 粒子 tracer parquet 路径。
+        - event_id (str): 事件完整键。
+        - start_date (str | pandas.Timestamp): 起始日期。
+        - endpoint_date (str | pandas.Timestamp): 终止日期。
+        - integration_label (str): 两端必须一致的积分标签。
+        - output_dir (str | pathlib.Path | None): 可选输出目录。
+    返回:
+        - pandas.DataFrame: 含两端身份、位置、深度、σ、原始 C 和固定权重的审计表。
+    输出:
+        - `<output_dir>/E000105_identity_audit.csv`（提供 output_dir 时）。
+    说明:
+        - 混入其他积分标签时在配对前抛错；不跨 integration 按 `particle_id` 合并，也不使用 `drop_duplicates`。
+    """
+    start = pd.Timestamp(start_date).normalize(); end = pd.Timestamp(endpoint_date).normalize()
+    cols = ["event_id", "integration_label", "date", "particle_id", "depth_m", "lat", "lon", "sigma0", "do2"]
+    tracer = _ofes_dualtrack_read_table(tracer_path, cols)
+    tracer["date"] = pd.to_datetime(tracer["date"]).dt.normalize()
+    selected = tracer[(tracer.event_id == event_id) & tracer.date.isin([start, end])].copy()
+    _ofes_dualtrack_assert_unique(selected, ["event_id", "integration_label", "date", "particle_id"], "identity_pair_input")
+    bad = selected[~selected.integration_label.eq(integration_label)]
+    if not bad.empty:
+        raise ValueError("identity-locked pair rejects mixed integration labels")
+    selected = selected[selected.integration_label.eq(integration_label)]
+    a = selected[selected.date == start].set_index("particle_id")
+    b = selected[selected.date == end].set_index("particle_id")
+    common = a.index.intersection(b.index)
+    if not len(common):
+        raise ValueError("identity-locked pair has no common members")
+    result = pd.DataFrame({
+        "event_id": event_id, "particle_id": common.astype(str),
+        "integration_label_t0": a.loc[common, "integration_label"].to_numpy(),
+        "integration_label_t1": b.loc[common, "integration_label"].to_numpy(),
+        "date_t0": start, "date_t1": end,
+        "depth_m_t0": a.loc[common, "depth_m"].to_numpy(), "depth_m_t1": b.loc[common, "depth_m"].to_numpy(),
+        "lat_t0": a.loc[common, "lat"].to_numpy(), "lat_t1": b.loc[common, "lat"].to_numpy(),
+        "lon_t0": a.loc[common, "lon"].to_numpy(), "lon_t1": b.loc[common, "lon"].to_numpy(),
+        "sigma0_t0": a.loc[common, "sigma0"].to_numpy(), "sigma0_t1": b.loc[common, "sigma0"].to_numpy(),
+        "C_t0": a.loc[common, "do2"].to_numpy(), "C_t1": b.loc[common, "do2"].to_numpy(),
+    })
+    result["delta_C"] = result["C_t1"] - result["C_t0"]; result["weight"] = 1.0 / len(result)
+    if output_dir is not None:
+        target = Path(output_dir); target.mkdir(parents=True, exist_ok=True); result.to_csv(target / "E000105_identity_audit.csv", index=False)
+    return result
+
+
+def _ofes_process_review_settings(overrides: dict | None = None) -> dict:
+    """读取并验证旁路过程案例参数，不更改任何冻结 producer 的设置。"""
+    settings = dict(_OFES_CFG.get('process_review', {}))
+    if overrides:
+        unknown = set(overrides).difference(settings)
+        if unknown:
+            raise ValueError(f'Unknown process-review settings: {sorted(unknown)}')
+        settings.update(overrides)
+    required = ('window_halfwidth_km', 'background_inner_km', 'background_outer_km',
+                'depth_bounds_m', 'kinematic_smoothing_sigma_pixels',
+                'local_peak_prominence_umol_kg', 'local_peak_min_width_levels',
+                'local_peak_min_distance_levels', 'oxygen_geometry_radius_km',
+                'scene_version')
+    if any(key not in settings for key in required):
+        raise ValueError('processing.yml lacks the OFES process_review contract.')
+    if not 0 < settings['background_inner_km'] < settings['background_outer_km'] < settings['window_halfwidth_km']:
+        raise ValueError('The background annulus must fit inside the scene window.')
+    if settings['kinematic_smoothing_sigma_pixels'] < 0:
+        raise ValueError('Velocity smoothing must be nonnegative.')
+    for key in ('local_peak_prominence_umol_kg', 'local_peak_min_width_levels',
+                'local_peak_min_distance_levels', 'oxygen_geometry_radius_km'):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(f'{key} must be positive and finite.')
+    return settings
+
+
+def _ofes_process_review_local_peaks(depth, contrast, raw_do, sigma0, settings):
+    """在连续有效原生层段中提取固定站C−B峰，不跨缺测拼接峰肩。"""
+    from scipy.signal import find_peaks
+    depth = np.asarray(depth, dtype=float)
+    contrast = np.asarray(contrast, dtype=float)
+    valid = np.flatnonzero(np.isfinite(contrast) & np.isfinite(raw_do) & np.isfinite(sigma0))
+    groups = np.split(valid, np.flatnonzero(np.diff(valid) != 1) + 1) if valid.size else []
+    rows = []
+    for indices in groups:
+        if indices.size < 3:
+            continue
+        peaks, properties = find_peaks(
+            contrast[indices], prominence=settings['local_peak_prominence_umol_kg'],
+            width=settings['local_peak_min_width_levels'],
+            distance=settings['local_peak_min_distance_levels'])
+        for number, offset in enumerate(peaks):
+            k = int(indices[offset])
+            left = float(np.interp(properties['left_ips'][number], np.arange(indices.size), depth[indices]))
+            right = float(np.interp(properties['right_ips'][number], np.arange(indices.size), depth[indices]))
+            rows.append({'level_index': k, 'depth_m': float(depth[k]),
+                'contrast_umol_kg': float(contrast[k]), 'raw_do_umol_kg': float(raw_do[k]),
+                'sigma0': float(sigma0[k]), 'prominence_umol_kg': float(properties['prominences'][number]),
+                'half_prominence_width_m': right-left,
+                'half_prominence_width_levels': float(properties['widths'][number]),
+                'finite_segment_levels': int(indices.size), 'branch_id': None})
+    return rows
+
+
+def build_ofes_process_review_scene(
+    date: str | pd.Timestamp,
+    event_id: str,
+    reference_lon: float,
+    reference_lat: float,
+    reference_depth_m: float,
+    target_sigma0: float,
+    settings: dict | None = None,
+    snapshot: dict | None = None,
+) -> dict:
+    """构造固定地理参照的OFES原始场、等密度面与过程剖面。
+
+    该旁路入口复用现有loader、TEOS-10 N²和逐z层动力算子。原始C、固定z背景B、
+    C−B、按局地σ₀映射的同密度背景差与逐柱等密度交点的背景各自保存，独立于冻结DO
+    检测幅度。返回完整原场，让图形与局部机制检验消费同一份数据。可传入已完成缓存
+    中的loader快照，避免重复I/O。
+
+    参数:
+        - date (str | pd.Timestamp): 真实OFES源日期。
+        - event_id (str): DO事件完整源键，或含日期的独立结构键。
+        - reference_lon (float): 跨日期固定的地理参考经度。
+        - reference_lat (float): 跨日期固定的地理参考纬度；固定东西剖面经过最近交付纬线。
+        - reference_depth_m (float): 跨日期固定的深度参考，向下正，单位m。
+        - target_sigma0 (float): 跨日期固定的TEOS-10密度异常参考，kg/m³。
+        - settings (dict | None): processing.yml中process_review参数的显式覆盖。
+        - snapshot (dict | None): 可选已加载快照，含原始物理单位数组及loader metadata；None时局地读取。
+
+    返回:
+        - dict: 完整原始/派生数组、固定站与剖面、局部峰和metadata_json；由调用者负责原子缓存写入。
+
+    说明:
+        - 图面同密度B是逐柱交点C的环带中位数；粒子缓存的中位背景剖面交点是不同估计量。
+        - 三维同密度背景差由环带中位σ₀和DO剖面建立单值背景曲线，再按每个原场点的σ₀线性插值；密度范围外不外推。
+        - N²来自现有TEOS-10算子；Ro与strain先在每个fixed-z物理网格计算，再取剖面。外圈差分halo不展示为有效诊断。
+        - w保留独立下层界；最接近参考层界的w仅为明确标注的地图背景。氧质心属于固定研究窗的正C−B权重，不是独立结构中心。
+        - 局部峰仅指固定站剖面中的可分辨C−B峰，不代表全域峰谱系。闭合或阈值体素本身不证明物质屏障。
+    """
+    cfg = _ofes_process_review_settings(settings)
+    date_ts = pd.Timestamp(date).normalize()
+    if not all(np.isfinite([reference_lon, reference_lat, reference_depth_m, target_sigma0])):
+        raise ValueError('Process scene references must be finite.')
+    if snapshot is None:
+        scale = approximate_degree_length(float(reference_lat))
+        half_lon = cfg['window_halfwidth_km'] * 1000 / scale['meters_per_degree_lon']
+        half_lat = cfg['window_halfwidth_km'] * 1000 / scale['meters_per_degree_lat']
+        snapshot = load_ofes_snapshot(
+            date_ts, variables=['do2', 'temp', 'salinity', 'u', 'v', 'w'],
+            lon_bounds=(reference_lon-half_lon, reference_lon+half_lon),
+            lat_bounds=(reference_lat-half_lat, reference_lat+half_lat),
+            depth_bounds=tuple(cfg['depth_bounds_m']))
+    if pd.Timestamp(snapshot['date']).normalize() != date_ts:
+        raise ValueError('Cached snapshot date differs from requested scene date.')
+    metadata = snapshot.get('metadata', {})
+    if metadata.get('horizontal_location') != 'tracer_center':
+        raise ValueError('Process scenes require loader-validated tracer-centered u/v.')
+    lon, lat, depth = [np.asarray(snapshot[key], dtype=float) for key in ('lon', 'lat', 'depth')]
+    offsets = _minimal_lon_diff_deg(lon, reference_lon)
+    if not (np.min(offsets) <= 0 <= np.max(offsets) and lat[0] <= reference_lat <= lat[-1]):
+        raise ValueError('Fixed reference station is outside the available raw tile.')
+    if depth.size < 3 or not depth[0] <= reference_depth_m <= depth[-1]:
+        raise ValueError('Reference depth lacks delivered vertical support.')
+    tile_edge = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(reference_lon),
+            np.asarray(reference_lat),
+            float(lon[0]),
+            float(lon[-1]),
+            float(lat[0]),
+            float(lat[-1]),
+        )
+    )
+    full_lon, full_lat, _, _, _ = _ofes_tracer_coordinates(date_ts)
+    delivery_edge = float(
+        _ofes_delivery_edge_distance_km(
+            np.asarray(reference_lon),
+            np.asarray(reference_lat),
+            float(full_lon[0]),
+            float(full_lon[-1]),
+            float(full_lat[0]),
+            float(full_lat[-1]),
+        )
+    )
+    cell_lengths = approximate_degree_length(reference_lat)
+    grid_tolerance_km = max(
+        abs(np.median(np.diff(lon))) * float(cell_lengths['meters_per_degree_lon']),
+        abs(np.median(np.diff(lat))) * float(cell_lengths['meters_per_degree_lat']),
+    ) / 1000.0
+    window_km = float(cfg['window_halfwidth_km'])
+    half_lon_deg = window_km * 1000.0 / float(cell_lengths['meters_per_degree_lon'])
+    half_lat_deg = window_km * 1000.0 / float(cell_lengths['meters_per_degree_lat'])
+    # Use the same great-circle metric for the requested threshold and the
+    # loaded tile; the loader's local WGS84 conversion otherwise leaves a
+    # sub-grid false negative at the fixed 300 km window.
+    requested_edge_km = min(
+        float(
+            great_circle_distance_m(
+                reference_lon,
+                reference_lat,
+                reference_lon - half_lon_deg,
+                reference_lat,
+            )
+        ),
+        float(
+            great_circle_distance_m(
+                reference_lon,
+                reference_lat,
+                reference_lon + half_lon_deg,
+                reference_lat,
+            )
+        ),
+        float(
+            great_circle_distance_m(
+                reference_lon,
+                reference_lat,
+                reference_lon,
+                reference_lat - half_lat_deg,
+            )
+        ),
+        float(
+            great_circle_distance_m(
+                reference_lon,
+                reference_lat,
+                reference_lon,
+                reference_lat + half_lat_deg,
+            )
+        ),
+    ) / 1000.0
+    if tile_edge + grid_tolerance_km < min(requested_edge_km, delivery_edge):
+        raise ValueError('Snapshot is smaller than the configured fixed study window; reload the local source tile.')
+    expected = (depth.size, lat.size, lon.size)
+    raw = {key: np.asarray(snapshot[key], dtype=np.float32) for key in ('do2','temp','salinity','u','v')}
+    if any(value.shape != expected for value in raw.values()):
+        raise ValueError('Raw process fields must share the tracer depth/lat/lon grid.')
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    iso = _ofes_fields_on_sigma0(depth, sigma0, target_sigma0, reference_depth_m, raw)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance = adaptive_distance_m(lon_grid, lat_grid, reference_lon, reference_lat)/1000.0
+    annulus = (distance >= cfg['background_inner_km']) & (distance <= cfg['background_outer_km'])
+    backgrounds = {key: _ofes_masked_median_profiles(raw[key], annulus) for key in ('do2','temp','salinity')}
+    background_sigma0_profile = _ofes_masked_median_profiles(sigma0, annulus)
+    same_sigma_monotonic_tolerance = 1.0e-3
+    same_sigma_background_do2 = _ofes_same_sigma_background_from_profile(
+        sigma0,
+        background_sigma0_profile,
+        backgrounds['do2'],
+        monotonic_tolerance=same_sigma_monotonic_tolerance,
+    )
+    same_sigma_do_contrast = raw['do2'] - same_sigma_background_do2
+    same_sigma_profile_finite = (
+        np.isfinite(background_sigma0_profile)
+        & np.isfinite(backgrounds['do2'])
+    )
+    if np.count_nonzero(same_sigma_profile_finite) < 2:
+        same_sigma_background_status = 'profile_insufficient'
+    elif not np.all(same_sigma_profile_finite):
+        same_sigma_background_status = 'profile_gap'
+    else:
+        sigma_differences = np.diff(background_sigma0_profile)
+        negative_sigma_differences = sigma_differences[sigma_differences <= 0]
+        if negative_sigma_differences.size and np.max(-negative_sigma_differences) > same_sigma_monotonic_tolerance:
+            same_sigma_background_status = 'nonmonotonic'
+        elif negative_sigma_differences.size:
+            same_sigma_background_status = 'valid_with_monotonic_tolerance'
+        else:
+            same_sigma_background_status = 'valid'
+    iso_valid = np.isfinite(iso['do2']) & np.isfinite(iso['temp']) & np.isfinite(iso['salinity'])
+    iso_support = annulus & iso_valid
+    iso_background = float(np.nanmedian(iso['do2'][iso_support])) if np.any(iso_support) else np.nan
+    level = int(np.argmin(abs(depth-reference_depth_m)))
+    j, i = int(np.argmin(abs(lat-reference_lat))), int(np.argmin(abs(offsets)))
+    n2 = _ofes_grid_n2_zlevel(depth, raw['salinity'], raw['temp'], lon, lat)
+    n2[[0, -1]] = np.nan
+    halo = int(np.ceil(4*cfg['kinematic_smoothing_sigma_pixels'])) + 1
+    kinematic = {key: np.full(expected, np.nan, dtype=np.float32) for key in ('rossby_3d','normalized_strain_3d','total_strain_3d')}
+    for k, z in enumerate(depth):
+        diagnostic = _ofes_fixed_depth_kinematic_fields(snapshot, float(z), cfg['kinematic_smoothing_sigma_pixels'])
+        for key, source_key in [('rossby_3d','rossby_number'),('normalized_strain_3d','normalized_strain'),('total_strain_3d','total_strain')]:
+            values = diagnostic[source_key].copy()
+            values[:halo] = values[-halo:] = np.nan
+            values[:, :halo] = values[:, -halo:] = np.nan
+            kinematic[key][k] = values
+    contrast = raw['do2']-backgrounds['do2'][:, None, None]
+    peaks = _ofes_process_review_local_peaks(depth, contrast[:,j,i], raw['do2'][:,j,i], sigma0[:,j,i], cfg)
+    geometry_roi = distance <= cfg['oxygen_geometry_radius_km']
+    positive = geometry_roi & np.isfinite(contrast[level]) & (contrast[level] > 0)
+    cell_scale = approximate_degree_length(lat)
+    area = np.asarray(cell_scale['meters_per_degree_lon'])*np.asarray(cell_scale['meters_per_degree_lat'])*abs(np.median(np.diff(lon))*np.median(np.diff(lat)))
+    weights = np.where(positive, contrast[level]*area[:,None], 0.)
+    if weights.sum() > 0:
+        centroid_lon = float(reference_lon + np.sum(weights*_minimal_lon_diff_deg(lon_grid,reference_lon))/weights.sum())
+        centroid_lat = float(np.sum(weights*lat_grid)/weights.sum())
+    else:
+        centroid_lon = centroid_lat = None
+    max_support = geometry_roi & np.isfinite(raw['do2'][level])
+    if np.any(max_support):
+        jj, ii = np.unravel_index(np.argmax(np.where(max_support,raw['do2'][level],-np.inf)),max_support.shape)
+        maximum = {'lon':float(lon[ii]),'lat':float(lat[jj]),'raw_do_umol_kg':float(raw['do2'][level,jj,ii])}
+    else:
+        maximum = None
+    fields = {**raw, **kinematic, 'lon':lon,'lat':lat,'depth':depth,
+        'sigma0':sigma0.astype(np.float32),'n2':n2.astype(np.float32),
+        'do_bg_profile':backgrounds['do2'],'temp_bg_profile':backgrounds['temp'],'sal_bg_profile':backgrounds['salinity'],
+        'background_sigma0_profile':background_sigma0_profile,
+        'same_sigma_background_do2':same_sigma_background_do2.astype(np.float32),
+        'same_sigma_do_contrast':same_sigma_do_contrast.astype(np.float32),
+        'annulus_mask':annulus,'geometry_roi_mask':geometry_roi,'do_fixed':contrast[level],
+        'temp_fixed':raw['temp'][level]-backgrounds['temp'][level],
+        'sal_fixed':raw['salinity'][level]-backgrounds['salinity'][level],
+        'iso_depth':iso['depth'],'iso_do2':iso['do2'],'iso_temp':iso['temp'],'iso_salinity':iso['salinity'],
+        'iso_u':iso['u'],'iso_v':iso['v'],'iso_do_contrast':iso['do2']-iso_background,
+        'iso_background_do2':np.asarray(iso_background),'iso_crossing_count':iso['crossing_count'],
+        'iso_valid':iso_valid,'iso_no_crossing':iso['crossing_count']==0,'iso_multiple_crossing':iso['crossing_count']>1,
+        'fixed_depth_m':np.asarray(depth[level]),'reference_depth_m':np.asarray(reference_depth_m),
+        'target_sigma0':np.asarray(target_sigma0),'center_lon':np.asarray(reference_lon),'center_lat':np.asarray(reference_lat),
+        'station_i':np.asarray(i),'station_j':np.asarray(j),'station_lon':np.asarray(lon[i]),'station_lat':np.asarray(lat[j]),
+        'station_do_profile':contrast[:,j,i],'station_raw_do2':raw['do2'][:,j,i],
+        'station_temp_profile':raw['temp'][:,j,i],'station_salinity_profile':raw['salinity'][:,j,i],
+        'station_sigma0_profile':sigma0[:,j,i],'station_n2':n2[:,j,i],
+        'station_rossby':kinematic['rossby_3d'][:,j,i],'station_normalized_strain':kinematic['normalized_strain_3d'][:,j,i],
+        'rossby':kinematic['rossby_3d'][level],'total_strain':kinematic['total_strain_3d'][level],
+        'section_lon':lon,'section_lat':np.asarray(lat[j]),
+        'section_x':_minimal_lon_diff_deg(lon,lon[i])*approximate_degree_length(float(lat[j]))['meters_per_degree_lon']/1000.,
+        'section_raw_do2':raw['do2'][:,j,:],'section_do':contrast[:,j,:],
+        'section_same_sigma_do':same_sigma_do_contrast[:,j,:],
+        'section_temp':raw['temp'][:,j,:],'section_salinity':raw['salinity'][:,j,:],
+        'section_sigma0':sigma0[:,j,:],'section_n2':n2[:,j,:],
+        'section_rossby':kinematic['rossby_3d'][:,j,:],
+        'section_normalized_strain':kinematic['normalized_strain_3d'][:,j,:],
+        'local_peak_depths':np.asarray([p['depth_m'] for p in peaks]),
+        'local_peak_values':np.asarray([p['contrast_umol_kg'] for p in peaks]),
+        'local_peak_prominence':np.asarray([p['prominence_umol_kg'] for p in peaks])}
+    if 'w' in snapshot:
+        w, zw = np.asarray(snapshot['w'],dtype=np.float32), np.asarray(snapshot['depth_w'],dtype=float)
+        if w.shape != (zw.size,lat.size,lon.size) or metadata.get('vertical_velocity_positive')!='up' or metadata.get('w_vertical_location')!='lower_interface':
+            raise ValueError('w shape/sign/interface metadata are not validated.')
+        wi = int(np.argmin(abs(zw-reference_depth_m)))
+        fields.update(w=w,depth_w=zw,w_reference=w[wi],w_reference_depth_m=np.asarray(zw[wi]),
+                      station_w_profile=w[:,j,i],section_w=w[:,j,:])
+    files = {}
+    for key in (*raw.keys(), *(['w'] if 'w' in snapshot else [])):
+        path = _ofes_file_path(key,date_ts).resolve()
+        stat = path.stat()
+        files[key] = {'path':str(path),'size_bytes':int(stat.st_size),'mtime_ns':int(stat.st_mtime_ns)}
+    fields['metadata_json'] = {'event_id':str(event_id),'source_date':date_ts.strftime('%Y-%m-%d'),
+        'scene_version':cfg['scene_version'],'source_files':files,'source_metadata':metadata,
+        'fixed_reference':{'lon':float(reference_lon),'lat':float(reference_lat),'depth_m':float(reference_depth_m),'sigma0':float(target_sigma0)},
+        'actual_station':{'lon':float(lon[i]),'lat':float(lat[j])},'settings':cfg,
+        'bounds':{'lon':[float(lon[0]),float(lon[-1])],'lat':[float(lat[0]),float(lat[-1])],'depth':[float(depth[0]),float(depth[-1])]},
+        'time_support':'actual dated files; time bounds and cell_methods absent in source headers',
+        'operators':{'sigma_mapping':'linear native-layer crossing nearest fixed reference depth', 'w_location':'lower_interface', 'w_positive':'up'},
+        'fixed_z_background':'median DO/T/S at each delivered z over fixed 120–240 km annulus; radius values in settings',
+        'same_sigma_background':'median annulus sigma0 and DO profiles at each delivered z, then pointwise linear DO interpolation in local sigma0; no density extrapolation',
+        'same_sigma_background_status':same_sigma_background_status,
+        'same_sigma_background_valid_depth_levels':int(np.count_nonzero(np.isfinite(background_sigma0_profile) & np.isfinite(backgrounds['do2']))),
+        'same_sigma_background_sigma0_range':[float(np.nanmin(background_sigma0_profile)), float(np.nanmax(background_sigma0_profile))] if np.any(np.isfinite(background_sigma0_profile)) else [np.nan, np.nan],
+        'isopycnal_background':'median of columnwise nearest-reference-depth isopycnal DO crossings in the annulus; differs from cached particle median-profile reference',
+        'background_annulus_complete':bool(_ofes_delivery_edge_distance_km(np.asarray(reference_lon),np.asarray(reference_lat),float(lon[0]),float(lon[-1]),float(lat[0]),float(lat[-1]))>=cfg['background_outer_km']),
+        'kinematics':'existing fixed-z physical-gradient helper; outer halo invalid; no independent structure inferred',
+        'gradient_halo_pixels':halo,'local_peaks':peaks,'local_peak_scope':'fixed geographic station C-minus-fixed-z-background profile; no branch linking',
+        'minimum_tile_edge_distance_km':tile_edge,'minimum_delivery_edge_distance_km':delivery_edge,
+        'background_valid_columns_by_depth':np.count_nonzero(np.isfinite(raw['do2']) & annulus[None,:,:],axis=(1,2)).tolist(),
+        'isopycnal_background_valid_columns':int(np.count_nonzero(iso_support)),
+        'raw_oxygen_maximum_fixed_z':maximum,'positive_contrast_centroid_fixed_z':{'lon':centroid_lon,'lat':centroid_lat,'weight':'positive C-B times horizontal cell area in fixed ROI'},
+        'independent_deep_structure_center':None,'surface_pet_center':None,
+        'volume_visual_definition':'raw 3-D C minus fixed-z annulus background above configured threshold; not the DO35/DO50 detector',
+        'no_crossing_columns':int(np.count_nonzero(iso['crossing_count']==0)),
+        'multiple_crossing_pairs_columns':int(np.count_nonzero(iso['crossing_count']>1))}
+    return fields
+
+
+def _ofes_process_common_box(snapshots, reference_lon):
+    """Return the actual common geographic box, with longitude wrap handling."""
+    offsets = [_minimal_lon_diff_deg(np.asarray(s['lon']), reference_lon) for s in snapshots]
+    west = max(float(np.min(x)) for x in offsets)
+    east = min(float(np.max(x)) for x in offsets)
+    south = max(float(np.min(s['lat'])) for s in snapshots)
+    north = min(float(np.max(s['lat'])) for s in snapshots)
+    if not (west < east and south < north):
+        raise ValueError('Raw scene tiles have no common geographic window.')
+    return {'lon_min': reference_lon + west, 'lon_max': reference_lon + east,
+            'lat_min': south, 'lat_max': north}
+
+
+def _ofes_process_sigma_surface(snapshot, target_sigma0, reference_depth):
+    """Map raw tracer fields and interface ``w`` to one real sigma crossing."""
+    depth = np.asarray(snapshot["depth"], dtype=float)
+    lat = np.asarray(snapshot["lat"], dtype=float)
+    lon = np.asarray(snapshot["lon"], dtype=float)
+    sigma0 = np.asarray(snapshot["sigma0"], dtype=float)
+    fields = {
+        name: np.asarray(snapshot[name], dtype=float)
+        for name in ("do2", "temp", "salinity", "u", "v")
+    }
+    mapped = _ofes_fields_on_sigma0(
+        depth, sigma0, float(target_sigma0), float(reference_depth), fields,
+    )
+    # ``_ofes_fields_on_sigma0`` supplies the selected native-layer crossing;
+    # use its exact interpolated depth for interface w through the public
+    # trilinear helper, retaining NaN outside the native w tile.
+    depth_iso = np.asarray(mapped["depth"], dtype=float)
+    lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")
+    w_iso = np.full(depth_iso.shape, np.nan, dtype=float)
+    valid = np.isfinite(depth_iso)
+    if valid.any():
+        points = np.column_stack((
+            depth_iso[valid], lat_grid[valid], lon_grid[valid],
+        ))
+        w_iso[valid] = _ofes_interp3d(
+            np.asarray(snapshot["w"], dtype=float),
+            np.asarray(snapshot["depth_w"], dtype=float), lat, lon, points,
+        )
+    mapped["w"] = w_iso
+    mapped["valid"] = np.isfinite(depth_iso)
+    mapped["multiple_crossing"] = mapped["crossing_count"] > 1
+    mapped["no_crossing"] = mapped["crossing_count"] == 0
+    return mapped
+
+
+def diagnose_ofes_material_phase_timeline(
+    tracer_path: str | Path,
+    event_id: str,
+    start_date: str | pd.Timestamp,
+    endpoint_date: str | pd.Timestamp,
+    *,
+    integration_label: str = "forward_observed_start_to_peak",
+    daily_summary_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """整理固定标签材料的连续位置、深度、密度和原始氧时序。
+
+    该入口只消费已有粒子缓存，保留窗口内每个日期的 active/valid 分母和共同成员，
+    并以窗口首日共同成员为固定参考计算成员级变化。粒子缓存没有 `w` 时不会补零，
+    而是在输出中明确标记其不可用；真实位置上的 `w` 应由原始 scene 单独采样。
+
+    参数:
+        - tracer_path (str | pathlib.Path): 粒子 tracer parquet 路径。
+        - event_id (str): 事件完整键，例如 `OFES_DO50_E000073`。
+        - start_date (str | pandas.Timestamp): 连续窗口起始日期。
+        - endpoint_date (str | pandas.Timestamp): 连续窗口结束日期。
+        - integration_label (str): 粒子积分标签。
+        - daily_summary_path (str | pathlib.Path | None): 可选 daily summary 路径。
+    返回:
+        - tuple[pandas.DataFrame, pandas.DataFrame]: 逐日材料汇总表和固定成员审计表。
+    说明:
+        - 日期缺失、粒子 inactive 或数值缺失均保留为分母信息，不通过删成员制造下沉脉冲。
+        - 深度变化是向下为正；仅凭稀疏端点不能替代原积分器的连续位移。
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(endpoint_date).normalize()
+    dates = pd.date_range(start, end, freq="D")
+    if end < start:
+        raise ValueError("endpoint_date must be on or after start_date")
+    cols = ["event_id", "integration_label", "date", "particle_id", "depth_m", "lat", "lon", "do2", "sigma0"]
+    tracer = _ofes_dualtrack_read_table(tracer_path, cols)
+    tracer["date"] = pd.to_datetime(tracer["date"]).dt.normalize()
+    tracer = tracer[(tracer.event_id == event_id) & (tracer.integration_label == integration_label)].copy()
+    _ofes_dualtrack_assert_unique(tracer, ["event_id", "integration_label", "date", "particle_id"], "material_phase_tracer")
+    daily = None
+    if daily_summary_path is not None:
+        daily = _ofes_dualtrack_read_table(
+            daily_summary_path,
+            ["event_id", "integration_label", "date", "background_annulus_within_delivery_window", "daily_diagnostic_passed"],
+        )
+        daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
+        daily = daily[(daily.event_id == event_id) & (daily.integration_label == integration_label)]
+        _ofes_dualtrack_assert_unique(daily, ["event_id", "integration_label", "date"], "material_phase_daily")
+    rows = []
+    for date in dates:
+        x = tracer[tracer.date == date]
+        passed = np.nan
+        if daily is not None:
+            d = daily[daily.date == date]
+            passed = bool(len(d) and bool(d.iloc[0].background_annulus_within_delivery_window) and bool(d.iloc[0].daily_diagnostic_passed))
+        finite = np.isfinite(x[["depth_m", "lat", "lon", "do2", "sigma0"]].to_numpy(dtype=float)).all(axis=1) if len(x) else np.array([], dtype=bool)
+        rows.append({
+            "event_id": event_id, "integration_label": integration_label, "date": date,
+            "particle_count": int(x["particle_id"].nunique()), "valid_particle_count": int(finite.sum()),
+            "daily_gate_passed": passed, "w_available": False,
+            "median_depth_m": float(x.loc[finite, "depth_m"].median()) if finite.any() else np.nan,
+            "median_sigma0": float(x.loc[finite, "sigma0"].median()) if finite.any() else np.nan,
+            "median_do2_umol_kg": float(x.loc[finite, "do2"].median()) if finite.any() else np.nan,
+        })
+    summary = pd.DataFrame(rows)
+    first = tracer[tracer.date == start].set_index("particle_id")
+    members = tracer[tracer.date.isin(dates)].copy()
+    members = members.merge(first[["depth_m", "lat", "lon", "do2", "sigma0"]].rename(columns=lambda c: f"{c}_start"), left_on="particle_id", right_index=True, how="left", validate="many_to_one")
+    members["depth_change_m"] = members["depth_m"] - members["depth_m_start"]
+    members["sigma0_change"] = members["sigma0"] - members["sigma0_start"]
+    members["do2_change_umol_kg"] = members["do2"] - members["do2_start"]
+    members["w_m_per_day"] = np.nan
+    members["w_status"] = "unavailable_in_particle_cache"
+    return summary, members
+
+
+def diagnose_ofes_particle_isopycnal_membership(
+    scene_root: str | Path,
+    event_id: str,
+    dates: Sequence[str | pd.Timestamp],
+    particle_path: str | Path,
+    output_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """核对粒子是否实际位于指定等密度面及其交点深度差。
+
+    对每个 scene 在粒子真实位置插值 `sigma0`，并与该日期固定参考等密度面的唯一交点深度比较。
+
+    参数:
+        - scene_root (str | pathlib.Path): 完整 scene 根目录。
+        - event_id (str): 短事件键，例如 `E000073`。
+        - dates (Sequence): 要核查的实际日期。
+        - particle_path (str | pathlib.Path): 粒子 tracer parquet 路径。
+        - output_dir (str | pathlib.Path | None): 可选输出目录。
+    返回:
+        - pandas.DataFrame: 逐粒子等密度面成员关系审计表。
+    输出:
+        - `<output_dir>/<event_id>_particle_isopycnal_membership.csv`（提供 output_dir 时）。
+    说明:
+        - 水平投影落在同一地图上不等于粒子位于该等密度面；无交点、多交点或插值无效均显式保留。
+    """
+    import json
+    from scipy.interpolate import RegularGridInterpolator
+    root = Path(scene_root)
+    particle = pd.read_parquet(particle_path)
+    particle["date"] = pd.to_datetime(particle["date"]).dt.normalize()
+    particle = particle[(particle.event_id == f"OFES_DO50_{event_id}") & (particle.integration_label == "forward_observed_start_to_peak")]
+    out_rows = []
+    for value in dates:
+        date = pd.Timestamp(value).normalize()
+        path = root / event_id / f"scene_{date:%Y%m%d}.npz"
+        with np.load(path, allow_pickle=False) as saved:
+            snap = {n: np.asarray(saved[n]) for n in saved.files if n != "metadata_json"}
+            meta = json.loads(str(saved["metadata_json"].item()))
+        ref = float(meta["fixed_reference"]["sigma0"])
+        mapped = _ofes_process_sigma_surface(snap, ref, float(meta["fixed_reference"]["depth_m"]))
+        depth_interpolator = RegularGridInterpolator(
+            (np.asarray(snap["lat"], dtype=float), np.asarray(snap["lon"], dtype=float)),
+            np.asarray(mapped["depth"], dtype=float), bounds_error=False, fill_value=np.nan,
+        )
+        p = particle[particle.date == date]
+        if p.empty:
+            continue
+        points = p[["depth_m", "lat", "lon"]].to_numpy(dtype=float)
+        sigma_p = _ofes_interp3d(np.asarray(snap["sigma0"], dtype=float), np.asarray(snap["depth"], dtype=float), np.asarray(snap["lat"], dtype=float), np.asarray(snap["lon"], dtype=float), points)
+        for i, row in enumerate(p.itertuples(index=False)):
+            j = int(np.nanargmin(np.abs(snap["lon"] - row.lon)))
+            k = int(np.nanargmin(np.abs(snap["lat"] - row.lat)))
+            count = int(mapped["crossing_count"][k, j])
+            zref_interp = float(depth_interpolator([[row.lat, row.lon]])[0])
+            zref = zref_interp if count == 1 else np.nan
+            out_rows.append({"event_id": event_id, "date": date, "particle_id": str(row.particle_id), "particle_sigma0": float(sigma_p[i]), "sigma0_ref": ref, "sigma0_minus_ref": float(sigma_p[i] - ref) if np.isfinite(sigma_p[i]) else np.nan, "particle_depth_m": float(row.depth_m), "sigma_surface_depth_m_nearest_grid": zref, "particle_minus_sigma_surface_depth_m": float(row.depth_m - zref) if np.isfinite(zref) else np.nan, "crossing_count_nearest_grid": count, "sigma_surface_status": "unique" if count == 1 else ("multiple" if count > 1 else "none"), "particle_sigma_interpolation_valid": bool(np.isfinite(sigma_p[i]))})
+    result = pd.DataFrame(out_rows)
+    if output_dir is not None:
+        target = Path(output_dir); target.mkdir(parents=True, exist_ok=True); result.to_csv(target / f"{event_id}_particle_isopycnal_membership.csv", index=False)
+    return result
+
+
+def diagnose_ofes_material_raw_scene_timeline(
+    scene_root: str | Path,
+    event_id: str,
+    dates: Sequence[str | pd.Timestamp],
+    particle_path: str | Path,
+    output_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """在真实粒子位置采样连续 raw scene 的示踪剂和动力变量。
+
+    对每个固定标签粒子逐日以其真实经纬度和深度采样 C、T、S、u、v 及独立
+    `depth_w` 网格上的 w，同时保留 active/valid 分母和缺失日期。输出的 w 是
+    原场瞬时采样值，不用日末深度差替代；深度差只作为同符号和量级的一致性检查。
+
+    参数:
+        - scene_root (str | pathlib.Path): 完整共享 scene 根目录。
+        - event_id (str): 短事件键，例如 `E000073`。
+        - dates (Sequence): 要采样的连续实际日期。
+        - particle_path (str | pathlib.Path): 粒子 tracer parquet 路径。
+        - output_dir (str | pathlib.Path | None): 可选输出目录。
+    返回:
+        - tuple[pandas.DataFrame, pandas.DataFrame]: 逐日汇总和逐成员 raw 采样表。
+    输出:
+        - `<output_dir>/<event_id>_raw_particle_samples.csv` 与 `_raw_daily_summary.csv`（提供 output_dir 时）。
+    说明:
+        - w 向上为正，向下为负；缺失 scene 或越界采样保留为 NaN，不改成零。
+        - 该入口只做材料过程诊断，不定义结构边界、物质入口或因果氧输送。
+    """
+    import json
+    root = Path(scene_root)
+    particle = pd.read_parquet(particle_path)
+    particle["date"] = pd.to_datetime(particle["date"]).dt.normalize()
+    particle = particle[(particle.event_id == f"OFES_DO50_{event_id}") & (particle.integration_label == "forward_observed_start_to_peak")].copy()
+    _ofes_dualtrack_assert_unique(particle, ["event_id", "integration_label", "date", "particle_id"], "raw_material_particles")
+    samples = []
+    daily = []
+    for value in dates:
+        date = pd.Timestamp(value).normalize()
+        p = particle[particle.date == date].copy()
+        path = root / event_id / f"scene_{date:%Y%m%d}.npz"
+        if not path.exists() or not path.with_suffix(".COMPLETE").exists():
+            daily.append({"event_id": event_id, "date": date, "scene_available": False, "particle_count": int(len(p)), "valid_raw_count": 0})
+            continue
+        with np.load(path, allow_pickle=False) as saved:
+            snap = {n: np.asarray(saved[n]) for n in saved.files if n != "metadata_json"}
+            json.loads(str(saved["metadata_json"].item()))
+        points = p[["depth_m", "lat", "lon"]].to_numpy(dtype=float)
+        vals = {}
+        for name in ("do2", "temp", "salinity", "u", "v"):
+            vals[name] = _ofes_interp3d(snap[name], snap["depth"], snap["lat"], snap["lon"], points)
+        vals["w"] = _ofes_interp3d(snap["w"], snap["depth_w"], snap["lat"], snap["lon"], points)
+        valid = np.isfinite(np.column_stack([vals[n] for n in ("do2", "temp", "salinity", "u", "v", "w")])).all(axis=1)
+        for i, row in enumerate(p.itertuples(index=False)):
+            samples.append({"event_id": event_id, "date": date, "particle_id": str(row.particle_id), "particle_lon": float(row.lon), "particle_lat": float(row.lat), "particle_depth_m": float(row.depth_m), "raw_do2_umol_kg": float(vals["do2"][i]), "raw_temp": float(vals["temp"][i]), "raw_salinity": float(vals["salinity"][i]), "raw_u_m_s": float(vals["u"][i]), "raw_v_m_s": float(vals["v"][i]), "raw_w_m_s": float(vals["w"][i]), "raw_w_m_per_day": float(vals["w"][i] * 86400.0), "raw_valid": bool(valid[i])})
+        daily.append({"event_id": event_id, "date": date, "scene_available": True, "particle_count": int(len(p)), "valid_raw_count": int(valid.sum()), "mean_w_m_per_day": float(np.nanmean(vals["w"] * 86400.0)) if np.isfinite(vals["w"]).any() else np.nan, "median_w_m_per_day": float(np.nanmedian(vals["w"] * 86400.0)) if np.isfinite(vals["w"]).any() else np.nan, "down_count_w_le_minus1": int(np.sum(vals["w"] * 86400.0 <= -1.0)), "up_count_w_ge_plus1": int(np.sum(vals["w"] * 86400.0 >= 1.0)), "weak_count": int(np.sum(np.isfinite(vals["w"]) & (np.abs(vals["w"] * 86400.0) < 1.0)) )})
+    member = pd.DataFrame(samples)
+    summary = pd.DataFrame(daily)
+    if not member.empty:
+        member["date"] = pd.to_datetime(member["date"]).dt.normalize()
+        depth_by_date = member.groupby("date")["particle_depth_m"].median()
+        summary["median_depth_m"] = summary["date"].map(depth_by_date)
+        summary["median_depth_change_m_from_previous_date"] = summary["date"].map(depth_by_date.diff())
+        summary["max_instantaneous_downward_w_m_per_day"] = summary["date"].map(member.groupby("date")["raw_w_m_per_day"].min()) * -1.0
+        summary["max_instantaneous_upward_w_m_per_day"] = summary["date"].map(member.groupby("date")["raw_w_m_per_day"].max())
+    if output_dir is not None:
+        target = Path(output_dir); target.mkdir(parents=True, exist_ok=True); member.to_csv(target / f"{event_id}_raw_particle_samples.csv", index=False); summary.to_csv(target / f"{event_id}_raw_daily_summary.csv", index=False)
+    return summary, member
+
+
+def diagnose_ofes_isopycnal_w_phase(
+    scene_root: str | Path,
+    event_id: str,
+    dates: Sequence[str | pd.Timestamp],
+    particle_path: str | Path,
+    output_dir: str | Path,
+    *,
+    settings: dict | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """检验同一密度面上原始氧与升降流分支的局地相位。
+
+    三个实际日期使用同一峰值参考密度、固定中心和原始窗口交集。
+    仅接受唯一密度交点，w 从原生界面层插值到同一交点。
+    分支统计采用水平格点面积权重；背景由固定环带内唯一交点的氧中位数定义。
+
+    参数:
+        - scene_root (str | Path): 含事件子目录的完整共享 scene 根目录。
+        - event_id (str): E000073 形式的短事件键。
+        - dates (Sequence): 三个不同的实际日期。
+        - particle_path (str | Path): 已有 observed-start-to-peak 粒子样本表。
+        - output_dir (str | Path): 表格与相位图输出目录。
+        - settings (dict | None): process_review YAML 参数的显式覆盖。
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: 分支汇总、场覆盖审计和逐粒子插值审计。
+    输出:
+        - `{output_dir}/{event_id}_isopycnal_phase_summary.csv`：分支数值表。
+        - `{output_dir}/{event_id}_isopycnal_field_qa.csv`：交点和背景有效性。
+        - `{output_dir}/{event_id}_particle_raw_parity.csv` 与 `_particle_parity_summary.csv`：粒子插值审计。
+        - `{output_dir}/{event_id}_isopycnal_phase_map.png`：三日期共同色标图。
+    说明:
+        - 多交点、缺交点、缺测和窗口外粒子不进入有效样本；背景不足时保留原始氧统计，背景诊断为 NaN。
+        - 空间格点不视作独立统计重复；该描述性相位检验不定义涡边界、物质成员或因果输送。
+        - 同日标量背景相减后分支均值差与原始氧差相等，不构成第二份独立证据。
+    """
+    from pathlib import Path
+    import json
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    cfg = _ofes_process_review_settings(settings)
+    min_branch_columns = int(cfg['branch_min_columns'])
+    rich_threshold = float(cfg['isopycnal_contrast_threshold_umol_kg'])
+    branch_threshold_m_per_day = float(cfg['w_branch_min_abs_m_per_day'])
+    background_min_columns = int(cfg['background_min_valid_columns'])
+    if min(min_branch_columns, background_min_columns, rich_threshold, branch_threshold_m_per_day) <= 0:
+        raise ValueError('Phase thresholds and minimum counts must be positive.')
+    root = Path(scene_root)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    dates = [pd.Timestamp(value).normalize() for value in dates]
+    if len(dates) != 3 or len(set(dates)) != 3:
+        raise ValueError("isopycnal phase test requires three unique real dates")
+    scene_paths = [root / event_id / f"scene_{date:%Y%m%d}.npz" for date in dates]
+    snapshots = []
+    for path in scene_paths:
+        marker = path.with_suffix(".COMPLETE")
+        if not marker.exists() or not path.exists():
+            raise FileNotFoundError(f"complete raw scene is missing: {path}")
+        with np.load(path, allow_pickle=False) as saved:
+            snapshot = {name: np.asarray(saved[name]) for name in saved.files if name != "metadata_json"}
+            snapshot["metadata"] = json.loads(str(saved["metadata_json"].item()))
+        required = {"lon", "lat", "depth", "do2", "temp", "salinity", "sigma0", "u", "v", "w", "depth_w"}
+        missing = sorted(required.difference(snapshot))
+        if missing:
+            raise KeyError(f"raw scene {path} is missing {missing}")
+        snapshots.append(snapshot)
+    references = [s['metadata']['fixed_reference'] for s in snapshots]
+    for date, snapshot, reference in zip(dates, snapshots, references):
+        meta = snapshot['metadata']
+        if pd.Timestamp(meta['source_date']).normalize() != date:
+            raise ValueError('Scene source date does not match requested date.')
+        # 仅兼容同一 v3 scene 格式的旧名称，不放宽其他版本检查。
+        version_aliases = {'process_review_scene_v3': 'ofes_process_scene_v3'}
+        scene_version = version_aliases.get(meta['scene_version'], meta['scene_version'])
+        expected_version = version_aliases.get(cfg['scene_version'], cfg['scene_version'])
+        if meta['event_id'] != f'OFES_DO50_{event_id}' or scene_version != expected_version:
+            raise ValueError('Scene event/version mismatch.')
+        if any(not np.isclose(reference[k], references[0][k], rtol=0, atol=1e-8) for k in references[0]):
+            raise ValueError('All phase dates must use the same fixed reference.')
+        if not np.isclose(float(snapshot['center_lon']), reference['lon']) or not np.isclose(float(snapshot['center_lat']), reference['lat']):
+            raise ValueError('Scene center and fixed reference differ.')
+        for key in ('window_halfwidth_km', 'background_inner_km', 'background_outer_km'):
+            if not np.isclose(meta['settings'][key], cfg[key]):
+                raise ValueError(f'Scene settings mismatch: {key}')
+    box = _ofes_process_common_box(snapshots, references[0]['lon'])
+    target_sigma0 = float(references[0]['sigma0'])
+    reference_depth = float(references[0]['depth_m'])
+    if not np.isfinite(target_sigma0) or not np.isfinite(reference_depth):
+        raise ValueError("peak target_sigma0/reference_depth are unavailable")
+    branch_cut = float(branch_threshold_m_per_day) / 86400.0
+    up_name = f"upward_w_ge_{branch_threshold_m_per_day:g}m_day"
+    down_name = f"downward_w_le_minus{branch_threshold_m_per_day:g}m_day"
+    summaries = []
+    field_rows = []
+    particle_rows = []
+    map_frames = []
+    for date, snapshot, scene_path in zip(dates, snapshots, scene_paths):
+        lon = np.asarray(snapshot["lon"], dtype=float)
+        lat = np.asarray(snapshot["lat"], dtype=float)
+        mapped = _ofes_process_sigma_surface(snapshot, target_sigma0, reference_depth)
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        center_lon = float(np.asarray(snapshot["center_lon"]).squeeze())
+        center_lat = float(np.asarray(snapshot["center_lat"]).squeeze())
+        distance_km = np.asarray(great_circle_distance_m(
+            lon_grid, lat_grid, center_lon, center_lat,
+        ), dtype=float) / 1000.0
+        annulus = (distance_km >= cfg['background_inner_km']) & (distance_km <= cfg['background_outer_km'])
+        annulus_values = mapped["do2"][annulus & (mapped["crossing_count"] == 1) & np.isfinite(mapped["do2"])]
+        background = float(np.nanmedian(annulus_values)) if annulus_values.size else np.nan
+        annulus_clipped = bool(
+            np.nanmin(np.concatenate((distance_km[0, :], distance_km[-1, :], distance_km[:, 0], distance_km[:, -1]))) < cfg['background_outer_km']
+        )
+        background_valid = bool(not annulus_clipped and annulus_values.size >= background_min_columns and np.isfinite(background))
+        if not background_valid:
+            background = np.nan
+        degree = approximate_degree_length(lat)
+        dx = degree['meters_per_degree_lon'][:, None] * np.abs(np.gradient(lon))[None, :]
+        dy = degree['meters_per_degree_lat'][:, None] * np.abs(np.gradient(lat))[:, None]
+        area = dx * dy
+        in_box = (
+            _region_lon_mask(lon_grid, box["lon_min"], box["lon_max"]) &
+            (lat_grid >= box["lat_min"]) & (lat_grid <= box["lat_max"])
+        )
+        c = mapped["do2"]
+        a = c - background
+        base_valid = in_box & (mapped["crossing_count"] == 1) & np.isfinite(c) & np.isfinite(mapped["temp"]) & np.isfinite(mapped["salinity"]) & np.isfinite(mapped["w"])
+        branches = {
+            up_name: base_valid & (mapped["w"] >= branch_cut),
+            down_name: base_valid & (mapped["w"] <= -branch_cut),
+        }
+        branch_results = {}
+        for branch, mask in branches.items():
+            n = int(mask.sum())
+            weight = np.where(mask, area, 0.0)
+            total = float(weight.sum())
+            evaluable = n >= int(min_branch_columns)
+            branch_results[branch] = {
+                "n_columns": n,
+                "status": "evaluable" if evaluable else "not_evaluable",
+                "horizontal_area_m2": total,
+                "c_mean_umol_kg": float(np.sum(np.where(mask, weight * c, 0.0)) / total) if total else np.nan,
+                "temp_mean": float(np.sum(np.where(mask, weight * mapped["temp"], 0.0)) / total) if total else np.nan,
+                "salinity_mean": float(np.sum(np.where(mask, weight * mapped["salinity"], 0.0)) / total) if total else np.nan,
+                "contrast_mean_umol_kg": float(np.sum(weight[mask] * a[mask]) / total) if total and background_valid else np.nan,
+                "rich_area_fraction": float(np.sum(weight[mask] * (a[mask] >= rich_threshold)) / total) if total and background_valid else np.nan,
+                "background_diagnostic_status": "evaluable" if evaluable and background_valid else "not_evaluable",
+            }
+            summaries.append({
+                "event_id": event_id, "date": date, "branch": branch,
+                "target_sigma0": target_sigma0, "reference_depth_m": reference_depth,
+                "branch_threshold_m_per_day": branch_threshold_m_per_day,
+                "rich_threshold_umol_kg": rich_threshold, "background_same_sigma_umol_kg": background,
+                "annulus_n_columns": int(annulus.sum()), "annulus_n_valid_crossing": int(annulus_values.size),
+                "annulus_n_no_crossing": int((mapped["crossing_count"] == 0)[annulus].sum()),
+                "annulus_n_multiple_crossing": int((mapped["crossing_count"] > 1)[annulus].sum()),
+                "annulus_clipped_by_tile_edge": annulus_clipped, "background_valid": background_valid,
+                "common_box_lon_min": box["lon_min"], "common_box_lon_max": box["lon_max"],
+                "common_box_lat_min": box["lat_min"], "common_box_lat_max": box["lat_max"],
+                **branch_results[branch],
+            })
+        up = branch_results[up_name]
+        down = branch_results[down_name]
+        delta = down["c_mean_umol_kg"] - up["c_mean_umol_kg"] if up["status"] == down["status"] == "evaluable" else np.nan
+        for row in summaries[-2:]:
+            row["down_minus_up_c_mean_umol_kg"] = delta
+        field_rows.append({
+            "event_id": event_id, "date": date, "scene_path": str(scene_path),
+            "target_sigma0": target_sigma0, "reference_depth_m": reference_depth,
+            "common_box_lon_min": box["lon_min"], "common_box_lon_max": box["lon_max"],
+            "common_box_lat_min": box["lat_min"], "common_box_lat_max": box["lat_max"],
+            "common_box_n_columns": int(in_box.sum()),
+            "n_valid_sigma_crossing": int((in_box & np.isfinite(mapped["depth"])).sum()),
+            "n_no_crossing": int((in_box & (mapped["crossing_count"] == 0)).sum()),
+            "n_multiple_crossing": int((in_box & (mapped["crossing_count"] > 1)).sum()),
+            "background_same_sigma_umol_kg": background,
+            "annulus_n_columns": int(annulus.sum()), "annulus_n_valid_crossing": int(annulus_values.size),
+            "annulus_clipped_by_tile_edge": annulus_clipped, "background_valid": background_valid,
+        })
+        map_frames.append((date, lon, lat, in_box, mapped, center_lon, center_lat, background))
+
+    particle = pd.read_parquet(particle_path)
+    particle["date"] = pd.to_datetime(particle["date"]).dt.normalize()
+    _ofes_dualtrack_assert_unique(particle, ['event_id', 'integration_label', 'date', 'particle_id'], 'phase_particle_samples')
+    if "integration_label" in particle:
+        particle = particle[particle.integration_label == "forward_observed_start_to_peak"]
+    particle = particle[(particle.event_id == f"OFES_DO50_{event_id}") & particle.date.isin(dates)].copy()
+    _ofes_dualtrack_assert_unique(particle, ['event_id', 'date', 'particle_id'], 'phase_particle_samples')
+    for date, snapshot in zip(dates, snapshots):
+        p = particle[particle.date == date].copy()
+        if p.empty:
+            continue
+        lon = np.asarray(snapshot["lon"], dtype=float); lat = np.asarray(snapshot["lat"], dtype=float)
+        depth = np.asarray(snapshot["depth"], dtype=float); depth_w = np.asarray(snapshot["depth_w"], dtype=float)
+        points = p[["depth_m", "lat", "lon"]].to_numpy(dtype=float)
+        values = {}
+        for name in ("do2", "temp", "salinity", "u", "v"):
+            values[name] = _ofes_interp3d(np.asarray(snapshot[name], dtype=float), depth, lat, lon, points)
+        values["w"] = _ofes_interp3d(np.asarray(snapshot["w"], dtype=float), depth_w, lat, lon, points)
+        for i, row in enumerate(p.itertuples(index=False)):
+            raw_do = float(values["do2"][i])
+            source_do = float(row.do2) if np.isfinite(row.do2) else np.nan
+            particle_rows.append({
+                "event_id": event_id, "date": date, "particle_id": str(row.particle_id),
+                "integration_label": getattr(row, "integration_label", ""),
+                "particle_lon": float(row.lon), "particle_lat": float(row.lat), "particle_depth_m": float(row.depth_m),
+                "raw_do2_umol_kg": raw_do, "raw_temp": float(values["temp"][i]), "raw_salinity": float(values["salinity"][i]),
+                "raw_u_m_s": float(values["u"][i]), "raw_v_m_s": float(values["v"][i]), "raw_w_m_s": float(values["w"][i]),
+                "raw_tile_member": bool(np.isfinite(values["do2"][i]) & np.isfinite(values["temp"][i]) & np.isfinite(values["salinity"][i]) & np.isfinite(values["w"][i]) & np.isfinite(values["u"][i]) & np.isfinite(values["v"][i])),
+                "source_do2_umol_kg": source_do, "do2_parity_error_umol_kg": raw_do - source_do if np.isfinite(raw_do) and np.isfinite(source_do) else np.nan,
+            })
+    summary = pd.DataFrame(summaries)
+    field = pd.DataFrame(field_rows)
+    particles = pd.DataFrame(particle_rows)
+    summary.to_csv(out / f"{event_id}_isopycnal_phase_summary.csv", index=False)
+    field.to_csv(out / f"{event_id}_isopycnal_field_qa.csv", index=False)
+    particles.to_csv(out / f"{event_id}_particle_raw_parity.csv", index=False)
+    if not particles.empty:
+        particles.groupby("date", as_index=False).agg(
+            n_particles=("particle_id", "size"), n_raw_tile_members=("raw_tile_member", "sum"),
+            n_parity=("do2_parity_error_umol_kg", lambda x: int(x.notna().sum())),
+            do2_parity_max_abs=("do2_parity_error_umol_kg", lambda x: float(np.nanmax(np.abs(x))) if x.notna().any() else np.nan),
+        ).to_csv(out / f"{event_id}_particle_parity_summary.csv", index=False)
+    from matplotlib.lines import Line2D
+    pooled = np.concatenate([m['do2'][inside & (m['crossing_count'] == 1) & np.isfinite(m['do2'])]
+                             for _, _, _, inside, m, _, _, _ in map_frames])
+    limits = np.percentile(pooled, [2, 98]) if pooled.size else [0., 1.]
+    if limits[0] == limits[1]:
+        limits = [limits[0] - .5, limits[1] + .5]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), constrained_layout=True)
+    for ax, (date, lon, lat, in_box, mapped, center_lon, center_lat, background) in zip(axes, map_frames):
+        unique = in_box & (mapped['crossing_count'] == 1)
+        c = np.where(unique, mapped['do2'], np.nan)
+        image = ax.pcolormesh(lon, lat, c, shading='auto', cmap='viridis', vmin=limits[0], vmax=limits[1])
+        w_day = np.where(unique, mapped['w'] * 86400., np.nan)
+        if np.isfinite(w_day).any():
+            ax.contour(lon, lat, w_day, levels=[-branch_threshold_m_per_day, branch_threshold_m_per_day],
+                       colors=['#32b3ff', '#f03d3e'], linewidths=.65)
+        p = particle[particle.date == date]
+        ax.scatter(p.lon, p.lat, s=18, facecolors='none', edgecolors='black', linewidths=.65)
+        ax.scatter([center_lon], [center_lat], marker='+', c='white', s=55)
+        ax.set_title(f'{date:%Y-%m-%d}; B={background:.1f}')
+        ax.set_xlabel('longitude (°E)'); ax.set_ylabel('latitude (°N)')
+        ax.set_aspect(1. / np.cos(np.deg2rad(center_lat)))
+    fig.colorbar(image, ax=axes.tolist(), label='Raw C at fixed sigma0 (µmol kg⁻¹)', shrink=.83, extend='both')
+    axes[0].legend(handles=[
+        Line2D([], [], color='#f03d3e', lw=1, label=f'up w = +{branch_threshold_m_per_day:g} m/day'),
+        Line2D([], [], color='#32b3ff', lw=1, label=f'down w = −{branch_threshold_m_per_day:g} m/day'),
+        Line2D([], [], color='black', marker='o', markerfacecolor='none', lw=0, label='particle positions')],
+        loc='lower left', fontsize=8, framealpha=.9)
+    fig.suptitle(f'{event_id} | fixed sigma0={target_sigma0:.4f} | unique crossings; common raw window')
+    fig.savefig(out / f'{event_id}_isopycnal_phase_map.png', dpi=300)
+    plt.close(fig)
+    return summary, field, particles
+
+
+def diagnose_ofes_do_relative_geometry(
+    tracer_path: str | Path,
+    lifecycle_path: str | Path,
+    event_path: str | Path,
+    event_ids: Sequence[str] | None = None,
+    integration_label: str = "forward_observed_start_to_peak",
+    daily_summary_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """生成基于 DO 对象相对几何的粒子通过性预筛。
+
+    该入口只把粒子与每日 DO 对象中心的球面距离除以当日等效半径，形成
+    `core ≤1R`、`edge 1R–2R` 和 `outside >2R` 三个带，并比较同一成员从
+    起始日到峰值日的 DO 对比变化。它不使用 DO-independent 结构边界，也
+    不识别物质边界、结构成员或 M1/M2 机制。
+
+    参数:
+        - tracer_path (str | pathlib.Path): 粒子 tracer parquet 路径。
+        - lifecycle_path (str | pathlib.Path): 每日 DO 对象中心与半径表路径。
+        - event_path (str | pathlib.Path): primary 事件表路径。
+        - event_ids (Sequence[str] | None): 可选事件子集。
+        - integration_label (str): 要使用的轨迹积分标签。
+        - daily_summary_path (str | pathlib.Path | None): 可选每日背景质量表。
+    返回:
+        - tuple[pandas.DataFrame, pandas.DataFrame]: 每带汇总表与逐成员审计表。
+    说明:
+        - 等效半径 `R` 必须为正；R≤0 的记录会被剔除，避免无效半径落入 core。
+        - 结果仅是 DO-relative geometry prescreen，不能断言涡缘输送、装载/释放或材料身份。
+    """
+    tracer_cols = [
+        "event_id", "integration_label", "date", "particle_id", "lon", "lat",
+        "same_sigma_do_contrast", "do2", "background_do2_same_sigma",
+    ]
+    tracer = _ofes_dualtrack_read_table(tracer_path, tracer_cols)
+    _ofes_dualtrack_assert_unique(
+        tracer, ["event_id", "integration_label", "date", "particle_id"], "particle_tracer"
+    )
+    life_cols = [
+        "event_id", "date", "centroid_lon", "centroid_lat", "equivalent_radius_km",
+        "rotation_dominated", "kinematic_regime", "daily_class", "r_share",
+    ]
+    life = _ofes_dualtrack_read_table(lifecycle_path, life_cols)
+    _ofes_dualtrack_assert_unique(life, ["event_id", "date"], "daily_lifecycle")
+    events = _ofes_dualtrack_read_table(
+        event_path,
+        ["event_id", "start_date", "peak_date", "peak_depth_m", "peak_lon", "peak_lat"],
+    )
+    _ofes_dualtrack_assert_unique(events, ["event_id"], "event_table")
+    if event_ids is not None:
+        wanted = set(event_ids)
+        tracer = tracer[tracer.event_id.isin(wanted)]
+        life = life[life.event_id.isin(wanted)]
+        events = events[events.event_id.isin(wanted)]
+    tracer = tracer[tracer.integration_label == integration_label].copy()
+    if daily_summary_path is not None:
+        daily = _ofes_dualtrack_read_table(
+            daily_summary_path,
+            ["event_id", "integration_label", "date", "background_annulus_within_delivery_window", "daily_diagnostic_passed"],
+        )
+        daily = daily[daily.integration_label == integration_label]
+        _ofes_dualtrack_assert_unique(daily, ["event_id", "integration_label", "date"], "daily_tracer_summary")
+        tracer = tracer.merge(
+            daily, on=["event_id", "integration_label", "date"], how="left", validate="many_to_one"
+        )
+        tracer = tracer[
+            tracer.background_annulus_within_delivery_window.eq(True)
+            & tracer.daily_diagnostic_passed.eq(True)
+        ].copy()
+    geom = tracer.merge(life, on=["event_id", "date"], how="inner", validate="many_to_one")
+    geom = geom[np.isfinite(geom.equivalent_radius_km) & (geom.equivalent_radius_km > 0)].copy()
+    geom["radius_km"] = great_circle_distance_m(
+        geom.lon, geom.lat, geom.centroid_lon, geom.centroid_lat
+    ) / 1000.0
+    geom["r_over_R"] = geom.radius_km / geom.equivalent_radius_km
+    geom["radial_band"] = pd.cut(
+        geom.r_over_R,
+        bins=[0.0, 1.0, 2.0, np.inf],
+        labels=["core_le_1R", "edge_1R_2R", "outside_gt_2R"],
+        include_lowest=True,
+    )
+    geom = _ofes_dualtrack_finite_pair_rows(
+        geom,
+        ["lon", "lat", "centroid_lon", "centroid_lat", "equivalent_radius_km",
+         "radius_km", "r_over_R", "same_sigma_do_contrast"],
+    )
+
+    pair_rows: list[dict] = []
+    band_rows: list[dict] = []
+    for event in events.itertuples(index=False):
+        x = geom[geom.event_id == event.event_id]
+        t0 = x[x.date == event.start_date].copy()
+        t1 = x[x.date == event.peak_date].copy()
+        if t0.empty or t1.empty:
+            continue
+        t0 = t0.set_index("particle_id")
+        t1 = t1.set_index("particle_id")
+        common = t0.index.intersection(t1.index)
+        if len(common) == 0:
+            continue
+        n_initial, n_endpoint = len(t0), len(t1)
+        a0 = t0.loc[common, "same_sigma_do_contrast"]
+        a1 = t1.loc[common, "same_sigma_do_contrast"]
+        pair = pd.DataFrame({
+            "event_id": event.event_id,
+            "particle_id": common.astype(str),
+            "r_over_R_start": t0.loc[common, "r_over_R"].to_numpy(),
+            "r_over_R_peak": t1.loc[common, "r_over_R"].to_numpy(),
+            "radial_change_R": (t1.loc[common, "r_over_R"] - t0.loc[common, "r_over_R"]).to_numpy(),
+            "contrast_start": a0.to_numpy(),
+            "contrast_peak": a1.to_numpy(),
+            "contrast_change": (a1 - a0).to_numpy(),
+            "peak_radial_band": t1.loc[common, "radial_band"].astype(str).to_numpy(),
+            "peak_kinematic_regime": t1.loc[common, "kinematic_regime"].astype(str).to_numpy(),
+            "peak_daily_class": t1.loc[common, "daily_class"].astype(str).to_numpy(),
+        })
+        pair = _ofes_dualtrack_finite_pair_rows(
+            pair,
+            ["r_over_R_start", "r_over_R_peak", "radial_change_R", "contrast_start", "contrast_peak", "contrast_change"],
+        )
+        pair_rows.extend(pair.to_dict("records"))
+        for band, group in pair.groupby("peak_radial_band", dropna=False):
+            band_rows.append({
+                "event_id": event.event_id,
+                "start_date": event.start_date,
+                "peak_date": event.peak_date,
+                "peak_depth_m": event.peak_depth_m,
+                "peak_radial_band": band,
+                "n_common": len(pair),
+                "n_initial": n_initial,
+                "n_endpoint": n_endpoint,
+                "common_fraction_of_smaller_endpoint": len(pair) / min(n_initial, n_endpoint),
+                "contrast_start_mean": group.contrast_start.mean(),
+                "contrast_peak_mean": group.contrast_peak.mean(),
+                "contrast_change_mean": group.contrast_change.mean(),
+                "contrast_change_median": group.contrast_change.median(),
+                "r_over_R_peak_median": group.r_over_R_peak.median(),
+                "radial_change_R_mean": group.radial_change_R.mean(),
+                "raw_units": "umol_kg-1",
+            })
+    return pd.DataFrame(band_rows), pd.DataFrame(pair_rows)
+
+
+def diagnose_ofes_strongest_peak_identity(
+    lifecycle_path: str | Path,
+    tracer_path: str | Path,
+    event_path: str | Path,
+) -> pd.DataFrame:
+    """描述每日最强 DO 峰的深度记录变化并标注 M6 解释边界。
+
+    同时记录真实相邻日和跨缺日的相邻记录跳变，并只比较起始与峰值日共同有效的粒子。
+
+    参数:
+        - lifecycle_path (str | pathlib.Path): 每日最强 DO 峰生命周期表路径。
+        - tracer_path (str | pathlib.Path): 粒子轨迹样本表路径。
+        - event_path (str | pathlib.Path): primary 事件表路径。
+    返回:
+        - pandas.DataFrame: 每个事件一行的峰深度和同成员深度诊断表。
+    说明:
+        - `max_consecutive_peak_depth_jump_m` 只在相邻真实日期且两端深度 finite 时计算。
+        - `max_successive_record_depth_jump_m` 保留缺日跨越的相邻记录跳变，二者不能混用。
+        - 每日最强峰记录不等于完整多峰场，不能推断峰分支接力或材料输送。
+    """
+    life = _ofes_dualtrack_read_table(
+        lifecycle_path,
+        ["event_id", "date", "peak_depth_at_max", "delta_do_max", "daily_object_key"],
+    )
+    _ofes_dualtrack_assert_unique(life, ["event_id", "date"], "daily_lifecycle")
+    events = _ofes_dualtrack_read_table(
+        event_path, ["event_id", "start_date", "peak_date", "end_date", "peak_depth_m"]
+    )
+    _ofes_dualtrack_assert_unique(events, ["event_id"], "event_table")
+    tracer = _ofes_dualtrack_read_table(
+        tracer_path, ["event_id", "integration_label", "date", "depth_m", "particle_id"]
+    )
+    _ofes_dualtrack_assert_unique(
+        tracer, ["event_id", "integration_label", "date", "particle_id"], "particle_tracer"
+    )
+    tracer = tracer[tracer.integration_label == "forward_observed_start_to_peak"]
+    rows: list[dict] = []
+    for event in events.itertuples(index=False):
+        record = life[life.event_id == event.event_id].sort_values("date")
+        if record.empty:
+            continue
+        dates = record.date.to_numpy(dtype="datetime64[ns]")
+        depths = record.peak_depth_at_max.to_numpy(dtype=float)
+        date_diff = np.diff(dates).astype("timedelta64[D]").astype(float)
+        finite_pair = np.isfinite(depths[:-1]) & np.isfinite(depths[1:])
+        jumps = np.abs(np.diff(depths))
+        consecutive = finite_pair & (date_diff == 1.0)
+        successive = finite_pair
+        t = tracer[tracer.event_id == event.event_id]
+        t0 = t[t.date == event.start_date][["particle_id", "depth_m"]]
+        t1 = t[t.date == event.peak_date][["particle_id", "depth_m"]]
+        n_initial, n_endpoint = len(t0), len(t1)
+        pair = t0.merge(t1, on="particle_id", how="inner", suffixes=("_t0", "_t1"), validate="one_to_one")
+        pair = _ofes_dualtrack_finite_pair_rows(pair, ["depth_m_t0", "depth_m_t1"])
+        n_common = len(pair)
+        rows.append({
+            "event_id": event.event_id,
+            "observed_daily_max_rows": len(record),
+            "unique_daily_object_keys": record.daily_object_key.nunique(),
+            "strongest_peak_depth_range_m": float(np.ptp(depths[np.isfinite(depths)])) if np.isfinite(depths).any() else np.nan,
+            "max_consecutive_peak_depth_jump_m": float(np.nanmax(jumps[consecutive])) if consecutive.any() else np.nan,
+            "max_successive_record_depth_jump_m": float(np.nanmax(jumps[successive])) if successive.any() else np.nan,
+            "observed_date_gap_max_days": float(np.nanmax(date_diff)) if date_diff.size else np.nan,
+            "observed_dates_are_continuous": bool(date_diff.size == 0 or np.all(date_diff == 1.0)),
+            "n_initial": n_initial,
+            "n_endpoint": n_endpoint,
+            "n_common": n_common,
+            "common_fraction_of_smaller_endpoint": n_common / min(n_initial, n_endpoint) if min(n_initial, n_endpoint) else np.nan,
+            "start_to_peak_particle_median_depth_change_m": (pair.depth_m_t1 - pair.depth_m_t0).median() if n_common else np.nan,
+            "m6_status": (
+                "diagnostic_only_one_strongest_DO_peak_per_day_continuous_dates"
+                if date_diff.size == 0 or np.all(date_diff == 1.0)
+                else "diagnostic_only_one_strongest_DO_peak_per_day_with_date_gaps"
+            ),
+            "cannot_infer": "secondary_peak_branch_identity_or_material_relay",
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_ofes_do_relative_geometry(
+    band_summary: pd.DataFrame,
+    paired_members: pd.DataFrame,
+    classification_path: str | Path,
+) -> pd.DataFrame:
+    """聚合 DO-relative 预筛为每个事件一行并合并现有轨迹验证分类。
+
+    同一成员只计一次，带计数和成员分母经一致性核对后与现有分类表连接。
+
+    参数:
+        - band_summary (pandas.DataFrame): `diagnose_ofes_do_relative_geometry` 的带汇总表。
+        - paired_members (pandas.DataFrame): 同一入口返回的逐成员审计表。
+        - classification_path (str | pathlib.Path): 现有轨迹验证分类 parquet 路径。
+    返回:
+        - pandas.DataFrame: 每个事件一行的 core/edge/outside 计数、变化和分类字段。
+    说明:
+        - event_id 与 particle_id 是主键；缺失键或重复键立即抛错。
+        - 汇总是 DO-relative geometry prescreen，不能升级为独立结构成员或 M1/M2 机制结论。
+    """
+    required_band = {"event_id", "peak_radial_band", "n_initial", "n_endpoint", "n_common", "common_fraction_of_smaller_endpoint"}
+    required_pair = {"event_id", "particle_id", "r_over_R_start", "r_over_R_peak", "peak_radial_band", "contrast_change"}
+    missing_band = sorted(required_band.difference(band_summary.columns))
+    missing_pair = sorted(required_pair.difference(paired_members.columns))
+    if missing_band or missing_pair:
+        raise KeyError(f"Missing summary columns: band={missing_band}, paired={missing_pair}")
+    _ofes_dualtrack_assert_unique(band_summary, ["event_id", "peak_radial_band"], "geometry_band_summary")
+    _ofes_dualtrack_assert_unique(paired_members, ["event_id", "particle_id"], "paired_geometry_members")
+    if band_summary[["event_id"]].isna().any().any() or paired_members[["event_id", "particle_id"]].isna().any().any():
+        raise ValueError("Geometry summary keys must not be missing")
+    classification = _ofes_dualtrack_read_table(
+        classification_path,
+        ["event_id", "event_validation_passed", "forward_ensemble_to_observed_core_median_km", "kinematic_regime"],
+    )
+    _ofes_dualtrack_assert_unique(classification, ["event_id"], "event_classification")
+    count_keys = ['n_initial', 'n_endpoint', 'n_common', 'common_fraction_of_smaller_endpoint']
+    if (band_summary.groupby('event_id')[count_keys].nunique(dropna=False) > 1).any().any():
+        raise ValueError('Geometry bands disagree on member denominators.')
+    expected_counts = band_summary.groupby('event_id').n_common.first()
+    observed_counts = paired_members.groupby('event_id').size()
+    if set(expected_counts.index) != set(observed_counts.index) or not expected_counts.eq(observed_counts).all():
+        raise ValueError('Geometry band/member denominators disagree.')
+    counts = band_summary.groupby("event_id", as_index=False)[
+        ["n_initial", "n_endpoint", "common_fraction_of_smaller_endpoint"]
+    ].first()
+    rows: list[dict] = []
+    for event_id, group in paired_members.groupby("event_id", sort=False):
+        row = {
+            "event_id": event_id,
+            "n_common": len(group),
+            "median_r_over_R_start": group.r_over_R_start.median(),
+            "median_r_over_R_peak": group.r_over_R_peak.median(),
+        }
+        for band in ("core_le_1R", "edge_1R_2R", "outside_gt_2R"):
+            subset = group[group.peak_radial_band == band]
+            row[f"n_{band}"] = len(subset)
+            row[f"fraction_{band}"] = len(subset) / len(group) if len(group) else np.nan
+            row[f"contrast_change_mean_{band}"] = subset.contrast_change.mean() if len(subset) else np.nan
+        core = group[group.peak_radial_band == "core_le_1R"].contrast_change
+        edge = group[group.peak_radial_band == "edge_1R_2R"].contrast_change
+        row["edge_minus_core_change_mean"] = edge.mean() - core.mean() if len(core) and len(edge) else np.nan
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    result = result.merge(counts, on="event_id", how="left", validate="one_to_one")
+    result = result.merge(classification, on="event_id", how="left", validate="one_to_one")
+    return result
+
+
+def _ofes_process_read_post_peak(event_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    positions = pd.read_parquet(event_dir / "daily_positions.parquet")
+    summary = pd.read_parquet(event_dir / "daily_tracer_summary.parquet")
+    positions["date"] = pd.to_datetime(positions["date"]).dt.normalize()
+    summary["date"] = pd.to_datetime(summary["date"]).dt.normalize()
+    _ofes_dualtrack_assert_unique(positions, ['event_id', 'date', 'particle_id'], 'post_peak_positions')
+    _ofes_dualtrack_assert_unique(summary, ['event_id', 'integration_label', 'date'], 'post_peak_summary')
+    if positions.empty or summary.empty:
+        raise ValueError('Post-peak inputs must contain an event and real dates.')
+    if positions.event_id.nunique() != 1 or summary.event_id.nunique() != 1 or set(positions.event_id) != set(summary.event_id):
+        raise ValueError('Post-peak positions and summary must describe the same single event.')
+    if summary.integration_label.nunique() != 1:
+        raise ValueError('Position cache lacks an integration key; ambiguous mixed integrations are rejected.')
+    return positions, summary.sort_values(["integration_label", "date"])
+
+
+def plot_ofes_process_post_peak(event_dir: str | Path, output_path: str | Path) -> Path:
+    """展示已有峰后粒子的路径、温盐氧与成员有效性。
+
+    读取一个事件的峰后位置和 producer 日摘要，不产生新轨迹或原始场。
+    每条路径保留原粒子ID与初始深度分组，非active位置留白；日摘要是当日有效集合的既有统计，不是共同成员配对收支。
+
+    参数:
+        - event_dir (str | Path): 含 `daily_positions.parquet` 与 `daily_tracer_summary.parquet` 的已有事件目录。
+        - output_path (str | Path): PNG图的输出文件路径。
+    返回:
+        - pathlib.Path: 实际图件路径。
+    输出:
+        - `output_path`：2×4面板，展示路径、深度、C、T、S、σ₀、两种对比参考和成员数。
+    说明:
+        - 背景资格未通过的对比值留白；原始C/T/S摘要与背景资格分开。
+        - 图中状态累计量单位是particle-days，逐日active/valid数独立绘制。
+        - 每次仅消费一个明确积分标签；源位置表缺积分键时不合并不同实验。
+    """
+    from matplotlib.lines import Line2D
+    event_dir = Path(event_dir)
+    output_path = Path(output_path)
+    positions, summary = _ofes_process_read_post_peak(event_dir)
+    event_id = str(summary.event_id.iloc[0])
+    integrations = list(summary["integration_label"].dropna().astype(str).unique())
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9), constrained_layout=True)
+
+    # Every parcel line is one particle.  depth_offset_index controls colour,
+    # while integration labels remain separate in the summary panels.
+    offsets = sorted(positions["depth_offset_index"].dropna().unique())
+    colors = plt.cm.viridis(np.linspace(.1, .9, max(1, len(offsets))))
+    color_by_offset = dict(zip(offsets, colors))
+    for _, group in positions.groupby(["depth_offset_index", "particle_id"], sort=False):
+        group = group.sort_values("date").copy()
+        group.loc[~group.status.eq('active'), ['lon', 'lat', 'depth_m']] = np.nan
+        color = color_by_offset.get(group.depth_offset_index.iloc[0], "0.5")
+        axes[0, 0].plot(group.lon, group.lat, color=color, lw=.7, alpha=.65)
+        axes[0, 1].plot(group.date, group.depth_m, color=color, lw=.7, alpha=.65)
+    axes[0, 0].set(xlabel="longitude", ylabel="latitude", title=f"{event_id} parcels; initial depth group colour")
+    axes[0, 1].invert_yaxis(); axes[0, 1].set(xlabel="date", ylabel="depth (m)", title="cached parcel depth-time")
+    axes[0, 0].legend([Line2D([0], [0], color=color_by_offset[o], lw=2) for o in offsets], [f"depth_offset={o:g}" for o in offsets], frameon=False, fontsize=7, title="initial group")
+
+    # Summary columns are already calculated by the existing producer.  Keep
+    # each integration on its own line and retain producer status columns.
+    for integration, group in summary.groupby("integration_label", sort=False):
+        group = group.sort_values("date")
+        label = str(integration)
+        group = group.copy()
+        passed = group.background_annulus_within_delivery_window.eq(True) & group.daily_diagnostic_passed.eq(True)
+        group.loc[~passed, ['median_same_sigma_do_contrast', 'median_fixed_depth_do_contrast']] = np.nan
+        axes[0, 2].plot(group.date, group.median_do2, marker="o", ms=2.5, label=label)
+        axes[0, 2].fill_between(group.date, group.q25_do2, group.q75_do2, alpha=.15)
+        axes[0, 3].plot(group.date, group.median_theta, marker="o", ms=2.5, label=label)
+        axes[1, 0].plot(group.date, group.median_salinity, marker="o", ms=2.5, label=label)
+        axes[1, 1].plot(group.date, group.median_sigma0, marker="o", ms=2.5, label=label)
+        axes[1, 2].plot(group.date, group.median_same_sigma_do_contrast, marker="o", ms=2.5, label=f"same-sigma {label}")
+        axes[1, 2].plot(group.date, group.median_fixed_depth_do_contrast, marker="^", ms=2.5, ls="--", label=f"fixed-z {label}")
+
+    axes[0, 2].set(xlabel="date", ylabel="median C raw DO (µmol kg$^{-1}$)", title="C median + IQR")
+    axes[0, 3].set(xlabel="date", ylabel="median T (°C)", title="temperature")
+    axes[1, 0].set(xlabel="date", ylabel="median S (PSS-78)", title="salinity")
+    axes[1, 1].set(xlabel="date", ylabel="median sigma0 (kg m$^{-3}$)", title="sigma0")
+    axes[1, 2].legend(frameon=False, fontsize=6)
+    axes[1, 2].set(xlabel="date", ylabel="DO contrast (µmol kg$^{-1}$)", title="same-sigma vs fixed-z reference")
+
+    # Producer n/status fields are shown without treating unknown status as 0.
+    axn = axes[1, 3]
+    for integration, group in summary.groupby("integration_label", sort=False):
+        group = group.sort_values("date")
+        axn.plot(group.date, group.active_particle_count, label=f"active n {integration}")
+        axn.plot(group.date, group.valid_particle_count, ls="--", label=f"valid n {integration}")
+    exit_counts = positions.assign(exit_status=positions.status.fillna("unknown_status").where(positions.status.ne("active"))).dropna(subset=["exit_status"]).groupby(["date", "exit_status"]).size().unstack(fill_value=0)
+    for status in exit_counts.columns:
+        axn.plot(exit_counts.index, exit_counts[status], ls=":", label=f"exit count: {status}")
+    axn.set(xlabel="date", ylabel="count", title="active / valid n; source status exits")
+    axn.legend(frameon=False, fontsize=6)
+    for axis in axes.ravel():
+        axis.grid(alpha=.2)
+        axis.tick_params(axis="x", rotation=35)
+    start, end = positions.date.min(), positions.date.max()
+    status_text = ", ".join(f"{k}={int(v)}" for k, v in positions.status.fillna("unknown_status").value_counts().items())
+    fig.suptitle(f"{event_id} | post-peak parcels from existing retention cache | {start:%Y-%m-%d}–{end:%Y-%m-%d}\nactive ensemble membership can change; integration={', '.join(integrations)}; particle-day status counts: {status_text}; no new integration", fontsize=12)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+    return output_path

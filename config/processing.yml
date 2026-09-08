@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.33 变更：
+#   - 新增 OFES 过程审查 scene、局部峰、可视化与等密度面升降流相位参数；冻结 producer 参数不变。
+#   - 清理未消费的探索占位参数并统一命名为 process_review；scene_version 改用 ofes_process_scene_v3，并兼容旧缓存标识。
 # version 1.32 变更：
 #   - 新增冻结的 OFES S5 反向 DO 富集审计参数与 control caliper/抽样设置；
 #     仅消费既有 S5/DO 产物。
@@ -122,7 +125,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.32
+version: 1.33
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -253,6 +256,21 @@ processing:
     random_seed: 42               # bootstrap 随机种子
 
 ofes:
+  process_review:
+    scene_version: ofes_process_scene_v3
+    window_halfwidth_km: 300.0
+    background_inner_km: 120.0
+    background_outer_km: 240.0
+    depth_bounds_m: [0.0, 1100.0]
+    kinematic_smoothing_sigma_pixels: 0.0
+    local_peak_prominence_umol_kg: 5.0
+    local_peak_min_width_levels: 2.0
+    local_peak_min_distance_levels: 2
+    oxygen_geometry_radius_km: 80.0
+    w_branch_min_abs_m_per_day: 1.0
+    branch_min_columns: 25
+    background_min_valid_columns: 100
+    isopycnal_contrast_threshold_umol_kg: 10.0
   horizontal_grid: arakawa_b      # MOM3 B-grid：u/v 同处角点，均需四角平均到示踪物中心
   depth_scale: 1.0                # JAMSTEC 公开页说明 DODS 的 mbar 为通用错误 attribute；结合交付层位按 z-level 深度（m）解释
   depth_units: m
