@@ -40669,6 +40669,293 @@ def _ofes_fixed_depth_kinematic_fields(
     }
 
 
+def _ofes_velocity_ring_pilot(
+    snapshot: dict,
+    thermohaline_lon: float,
+    thermohaline_lat: float,
+    target_depth: float,
+    *,
+    smoothing_sigma_pixels: float,
+    center_search_radius_km: float = 60.0,
+    profile_max_radius_km: float = 80.0,
+    radial_bin_width_km: float = 5.0,
+    angular_sector_count: int = 12,
+    background_inner_radius_km: float = 60.0,
+    background_outer_radius_km: float = 80.0,
+    local_maximum_window_pixels: int = 5,
+    center_dominance_margin: float = 0.10,
+) -> dict:
+    """从独立 u/v 场试估速度中心、切向速度剖面和幅值 Ro_v。
+
+    该内部试验入口不使用 DO 或候选异常幅值来定义速度中心；它在指定热盐核心
+    周围以相对涡度绝对值局地极值寻找速度支持中心，再以固定外环中位流速去除
+    背景平移，并按角向覆盖计算方位平均切向速度。中心竞争、边界极值、背景不足
+    或环带覆盖不足时不强行给出 Ro_v。
+    """
+    if smoothing_sigma_pixels < 0:
+        raise ValueError('Velocity-ring smoothing must be nonnegative.')
+    if not (
+        center_search_radius_km > 0
+        and profile_max_radius_km > 0
+        and radial_bin_width_km > 0
+        and 0 < background_inner_radius_km < background_outer_radius_km
+        and background_outer_radius_km <= profile_max_radius_km
+        and angular_sector_count >= 4
+        and local_maximum_window_pixels > 0
+        and local_maximum_window_pixels % 2 == 1
+        and 0 < center_dominance_margin < 1
+    ):
+        raise ValueError('Invalid velocity-ring pilot geometry settings.')
+    fields = _ofes_fixed_depth_kinematic_fields(
+        snapshot,
+        target_depth,
+        smoothing_sigma_pixels,
+    )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    distance_to_thermohaline_km = local_xy_distance_m(
+        lon_grid,
+        lat_grid,
+        thermohaline_lon,
+        thermohaline_lat,
+    ) / 1000.0
+    relative_vorticity = np.asarray(fields['relative_vorticity'], dtype=float)
+    finite = np.isfinite(relative_vorticity)
+    search_mask = finite & (
+        distance_to_thermohaline_km <= center_search_radius_km
+    )
+    abs_vorticity = np.where(search_mask, np.abs(relative_vorticity), np.nan)
+    local_maximum = search_mask & (
+        abs_vorticity
+        >= -minimum_filter(
+            np.where(search_mask, -abs_vorticity, np.inf),
+            size=local_maximum_window_pixels,
+            mode='nearest',
+        )
+    )
+    peak_indices = np.argwhere(local_maximum)
+    peak_indices = sorted(
+        peak_indices.tolist(),
+        key=lambda item: float(abs_vorticity[item[0], item[1]]),
+        reverse=True,
+    )
+    center_candidates = []
+    for row_index, column_index in peak_indices[:8]:
+        center_candidates.append(
+            {
+                'row_index': int(row_index),
+                'column_index': int(column_index),
+                'lon': float(lon[column_index]),
+                'lat': float(lat[row_index]),
+                'distance_to_thermohaline_km': float(
+                    distance_to_thermohaline_km[row_index, column_index]
+                ),
+                'relative_vorticity_s_1': float(
+                    relative_vorticity[row_index, column_index]
+                ),
+                'abs_relative_vorticity_s_1': float(
+                    abs_vorticity[row_index, column_index]
+                ),
+            }
+        )
+    if not center_candidates:
+        center_status = 'no_local_velocity_extremum'
+        selected_center = None
+    else:
+        selected_center = center_candidates[0]
+        half_window = local_maximum_window_pixels // 2 + 2
+        boundary_maximum = (
+            selected_center['row_index'] < half_window
+            or selected_center['column_index'] < half_window
+            or selected_center['row_index'] >= lat.size - half_window
+            or selected_center['column_index'] >= lon.size - half_window
+        )
+        second_ratio = (
+            center_candidates[1]['abs_relative_vorticity_s_1']
+            / selected_center['abs_relative_vorticity_s_1']
+            if len(center_candidates) > 1
+            and selected_center['abs_relative_vorticity_s_1'] > 0
+            else 0.0
+        )
+        if boundary_maximum:
+            center_status = 'boundary_velocity_extremum'
+        elif second_ratio >= 1.0 - center_dominance_margin:
+            center_status = 'ambiguous_velocity_extrema'
+        else:
+            center_status = 'unique_velocity_extremum'
+
+    radial_profile = []
+    result = {
+        'target_depth_m': float(fields['depth_m']),
+        'thermohaline_center_lon': float(thermohaline_lon),
+        'thermohaline_center_lat': float(thermohaline_lat),
+        'smoothing_sigma_pixels': float(smoothing_sigma_pixels),
+        'center_search_radius_km': float(center_search_radius_km),
+        'profile_max_radius_km': float(profile_max_radius_km),
+        'radial_bin_width_km': float(radial_bin_width_km),
+        'angular_sector_count': int(angular_sector_count),
+        'background_inner_radius_km': float(background_inner_radius_km),
+        'background_outer_radius_km': float(background_outer_radius_km),
+        'center_status': center_status,
+        'center_candidate_count': int(len(center_candidates)),
+        'center_candidates': center_candidates,
+        'velocity_center_lon': np.nan,
+        'velocity_center_lat': np.nan,
+        'velocity_center_offset_km': np.nan,
+        'velocity_center_relative_vorticity_s_1': np.nan,
+        'velocity_center_signed_zeta_over_f': np.nan,
+        'background_u_m_s': np.nan,
+        'background_v_m_s': np.nan,
+        'background_sample_count': 0,
+        'background_angular_sector_count': 0,
+        'background_status': 'not_assessed',
+        'valid_profile_bin_count': 0,
+        'profile_status': 'not_estimable_velocity_center',
+        'vmax_m_s': np.nan,
+        'rmax_km': np.nan,
+        'ro_v': np.nan,
+        'ro_v_definition': 'max_abs_mean_azimuthal_vtheta_div_abs_f_times_rmax',
+        'rmax_is_dynamical_radius': False,
+    }
+    if selected_center is None:
+        return {**result, 'radial_profile': pd.DataFrame(radial_profile)}
+
+    center_lon = selected_center['lon']
+    center_lat = selected_center['lat']
+    result['velocity_center_lon'] = center_lon
+    result['velocity_center_lat'] = center_lat
+    result['velocity_center_offset_km'] = float(
+        great_circle_distance_m(
+            center_lon,
+            center_lat,
+            thermohaline_lon,
+            thermohaline_lat,
+        ) / 1000.0
+    )
+    center_row = selected_center['row_index']
+    center_column = selected_center['column_index']
+    center_f = float(gsw.f(center_lat))
+    center_zeta = float(relative_vorticity[center_row, center_column])
+    result['velocity_center_relative_vorticity_s_1'] = center_zeta
+    result['velocity_center_signed_zeta_over_f'] = (
+        center_zeta / center_f if abs(center_f) > 0 else np.nan
+    )
+
+    distance_to_center_km = local_xy_distance_m(
+        lon_grid,
+        lat_grid,
+        center_lon,
+        center_lat,
+    ) / 1000.0
+    scale = approximate_degree_length(center_lat)
+    dx_m = _minimal_lon_diff_deg(lon_grid, center_lon) * float(
+        scale['meters_per_degree_lon']
+    )
+    dy_m = (lat_grid - center_lat) * float(scale['meters_per_degree_lat'])
+    theta = np.arctan2(dy_m, dx_m)
+    u = np.asarray(fields['u'], dtype=float)
+    v = np.asarray(fields['v'], dtype=float)
+    background_mask = (
+        np.isfinite(u)
+        & np.isfinite(v)
+        & (distance_to_center_km >= background_inner_radius_km)
+        & (distance_to_center_km < background_outer_radius_km)
+    )
+    background_u = float(np.nanmedian(u[background_mask])) if background_mask.any() else np.nan
+    background_v = float(np.nanmedian(v[background_mask])) if background_mask.any() else np.nan
+    background_angles = theta[background_mask]
+    background_sector_count = int(
+        np.unique(
+            np.floor(
+                (np.mod(background_angles, 2 * np.pi) / (2 * np.pi))
+                * angular_sector_count
+            ).astype(int)
+        ).size
+        if background_angles.size else 0
+    )
+    result['background_u_m_s'] = background_u
+    result['background_v_m_s'] = background_v
+    result['background_sample_count'] = int(background_mask.sum())
+    result['background_angular_sector_count'] = background_sector_count
+    if not background_mask.any():
+        result['background_status'] = 'background_annulus_empty'
+    elif background_sector_count < max(4, angular_sector_count // 2):
+        result['background_status'] = 'background_annulus_angular_coverage_insufficient'
+    else:
+        result['background_status'] = 'background_annulus_supported'
+
+    if np.isfinite(background_u) and np.isfinite(background_v):
+        vtheta = (
+            -(u - background_u) * np.sin(theta)
+            + (v - background_v) * np.cos(theta)
+        )
+    else:
+        vtheta = np.full(u.shape, np.nan, dtype=float)
+    radial_edges = np.arange(
+        0.0,
+        profile_max_radius_km + radial_bin_width_km,
+        radial_bin_width_km,
+    )
+    for inner, outer in zip(radial_edges[:-1], radial_edges[1:]):
+        ring_mask = (
+            np.isfinite(vtheta)
+            & (distance_to_center_km >= inner)
+            & (distance_to_center_km < outer)
+        )
+        angles = theta[ring_mask]
+        sector_ids = (
+            np.floor(
+                (np.mod(angles, 2 * np.pi) / (2 * np.pi))
+                * angular_sector_count
+            ).astype(int)
+            if angles.size else np.asarray([], dtype=int)
+        )
+        sector_count = int(np.unique(sector_ids).size)
+        radial_profile.append(
+            {
+                'radius_inner_km': float(inner),
+                'radius_outer_km': float(outer),
+                'radius_center_km': float((inner + outer) / 2.0),
+                'mean_azimuthal_vtheta_m_s': float(np.nanmean(vtheta[ring_mask]))
+                if ring_mask.any() else np.nan,
+                'sample_count': int(ring_mask.sum()),
+                'angular_sector_count': sector_count,
+                'angular_coverage_fraction': float(
+                    sector_count / angular_sector_count
+                ),
+                'profile_bin_valid': bool(
+                    ring_mask.sum() >= angular_sector_count
+                    and sector_count >= int(np.ceil(0.75 * angular_sector_count))
+                ),
+            }
+        )
+    profile_table = pd.DataFrame(radial_profile)
+    valid = profile_table.loc[
+        profile_table['profile_bin_valid']
+        & profile_table['mean_azimuthal_vtheta_m_s'].notna()
+    ]
+    result['valid_profile_bin_count'] = int(len(valid))
+    if center_status != 'unique_velocity_extremum':
+        result['profile_status'] = 'not_estimable_center_status'
+    elif result['background_status'] != 'background_annulus_supported':
+        result['profile_status'] = 'not_estimable_background_status'
+    elif len(valid) < 3:
+        result['profile_status'] = 'not_estimable_angular_coverage'
+    else:
+        max_row = valid.iloc[
+            int(np.nanargmax(np.abs(valid['mean_azimuthal_vtheta_m_s'].to_numpy(float))))
+        ]
+        result['vmax_m_s'] = float(abs(max_row['mean_azimuthal_vtheta_m_s']))
+        result['rmax_km'] = float(max_row['radius_center_km'])
+        result['ro_v'] = float(
+            result['vmax_m_s']
+            / (abs(center_f) * result['rmax_km'] * 1000.0)
+        )
+        result['profile_status'] = 'estimable_conditional_velocity_ring'
+    return {**result, 'radial_profile': profile_table}
+
+
 def _ofes_kinematics_at_point(
     fields: dict,
     lon: np.ndarray,
@@ -79268,6 +79555,1849 @@ def _ofes_process_review_settings(overrides: dict | None = None) -> dict:
     return settings
 
 
+def _ofes_structure_continuity_settings(
+    overrides: dict | None = None,
+) -> dict:
+    """读取并校验独立温盐—动力结构连续性判据。"""
+    process_cfg = _OFES_CFG.get('process_review', {}) or {}
+    raw = dict(process_cfg.get('structure_continuity', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides).difference(raw))
+        if unknown:
+            raise KeyError(
+                'Unknown OFES structure-continuity settings: '
+                f'{unknown}'
+            )
+        raw.update(overrides)
+    settings = {
+        'search_buffer_km': float(raw.get('search_buffer_km', 200.0)),
+        'depth_bounds_m': tuple(
+            float(value) for value in raw.get(
+                'depth_bounds_m', (300.0, 650.0)
+            )
+        ),
+        'thermohaline_smoothing_sigma_pixels': float(
+            raw.get('thermohaline_smoothing_sigma_pixels', 7.0)
+        ),
+        'kinematic_smoothing_sigma_pixels': float(
+            raw.get('kinematic_smoothing_sigma_pixels', 1.5)
+        ),
+        'spiciness_anomaly_min': float(
+            raw.get('spiciness_anomaly_min', 0.15)
+        ),
+        'n2_ratio_low_max': float(
+            raw.get('n2_ratio_low_max', 0.8)
+        ),
+        'minimum_component_cells': int(
+            raw.get('minimum_component_cells', 5)
+        ),
+        'local_maximum_window_pixels': int(
+            raw.get('local_maximum_window_pixels', 9)
+        ),
+        'candidate_edge_exclusion_pixels': int(
+            raw.get('candidate_edge_exclusion_pixels', 10)
+        ),
+        'candidate_min_separation_km': float(
+            raw.get('candidate_min_separation_km', 35.0)
+        ),
+        'candidate_merge_max_vertical_gap_m': float(
+            raw.get('candidate_merge_max_vertical_gap_m', 40.0)
+        ),
+        'candidate_merge_require_same_spiciness_sign': bool(
+            raw.get('candidate_merge_require_same_spiciness_sign', True)
+        ),
+        'candidate_merge_require_same_rossby_sign': bool(
+            raw.get('candidate_merge_require_same_rossby_sign', True)
+        ),
+        'endpoint_association_radius_km': float(
+            raw.get('endpoint_association_radius_km', 30.0)
+        ),
+        'maximum_translation_km_per_day': float(
+            raw.get('maximum_translation_km_per_day', 50.0)
+        ),
+        'maximum_depth_change_m_per_day': float(
+            raw.get('maximum_depth_change_m_per_day', 40.0)
+        ),
+        'maximum_spiciness_change_per_day': float(
+            raw.get('maximum_spiciness_change_per_day', 0.15)
+        ),
+        'maximum_sigma0_change_per_day': float(
+            raw.get('maximum_sigma0_change_per_day', 0.15)
+        ),
+        'maximum_n2_ratio_change': float(
+            raw.get('maximum_n2_ratio_change', 0.60)
+        ),
+        'maximum_rossby_change': float(
+            raw.get('maximum_rossby_change', 0.70)
+        ),
+        'require_same_spiciness_sign': bool(
+            raw.get('require_same_spiciness_sign', True)
+        ),
+        'require_same_rossby_sign': bool(
+            raw.get('require_same_rossby_sign', True)
+        ),
+        'vertical_profile_radius_km': float(
+            raw.get('vertical_profile_radius_km', 20.0)
+        ),
+        'vertical_min_anomaly_levels': int(
+            raw.get('vertical_min_anomaly_levels', 2)
+        ),
+        'maximum_match_gap_days': int(
+            raw.get('maximum_match_gap_days', 1)
+        ),
+        'max_paths_to_enumerate': int(
+            raw.get('max_paths_to_enumerate', 2000)
+        ),
+    }
+    if (
+        len(settings['depth_bounds_m']) != 2
+        or not np.all(np.isfinite(settings['depth_bounds_m']))
+        or settings['depth_bounds_m'][0] >= settings['depth_bounds_m'][1]
+    ):
+        raise ValueError(
+            'OFES structure-continuity depth_bounds_m must be ordered.'
+        )
+    positive_keys = (
+        'search_buffer_km',
+        'thermohaline_smoothing_sigma_pixels',
+        'spiciness_anomaly_min',
+        'n2_ratio_low_max',
+        'candidate_min_separation_km',
+        'candidate_merge_max_vertical_gap_m',
+        'endpoint_association_radius_km',
+        'maximum_translation_km_per_day',
+        'maximum_depth_change_m_per_day',
+        'maximum_spiciness_change_per_day',
+        'maximum_sigma0_change_per_day',
+        'maximum_n2_ratio_change',
+        'maximum_rossby_change',
+        'vertical_profile_radius_km',
+    )
+    if any(
+        not np.isfinite(settings[key]) or settings[key] <= 0
+        for key in positive_keys
+    ):
+        raise ValueError(
+            'OFES structure-continuity thresholds must be finite and positive.'
+        )
+    if settings['kinematic_smoothing_sigma_pixels'] < 0:
+        raise ValueError(
+            'OFES structure-continuity kinematic smoothing must be nonnegative.'
+        )
+    integer_keys = (
+        'minimum_component_cells',
+        'local_maximum_window_pixels',
+        'candidate_edge_exclusion_pixels',
+        'vertical_min_anomaly_levels',
+        'maximum_match_gap_days',
+        'max_paths_to_enumerate',
+    )
+    if any(settings[key] <= 0 for key in integer_keys):
+        raise ValueError(
+            'OFES structure-continuity integer settings must be positive.'
+        )
+    if settings['local_maximum_window_pixels'] % 2 == 0:
+        raise ValueError(
+            'OFES structure-continuity local maximum window must be odd.'
+        )
+    if settings['maximum_match_gap_days'] != 1:
+        raise ValueError(
+            'The current structure-continuity matcher only supports daily edges.'
+        )
+    return settings
+
+
+
+
+def _ofes_structure_continuity_scale_sensitivity_design(design: dict) -> dict:
+    """校验调用方给出的独立结构尺度敏感性设计。
+
+    参数:
+        - design (dict): 案例规格的 `scale_sensitivity` 项；必需。
+
+    返回:
+        - dict: 规范化的设计，含 `design_version`、`baseline_label`、
+          `horizontal_grid_spacing_km`、`delivered_depth_levels_baseline` 与 `variants`。
+
+    说明:
+        - 变体参数必须是 `_ofes_structure_continuity_settings` 支持的键。
+        - 缺少标识字段时报错，不内置任何案例默认值。
+    """
+    if not isinstance(design, dict) or not design.get('variants'):
+        raise ValueError(
+            'OFES scale-sensitivity design must provide a nonempty variants list.'
+        )
+    raw = design
+    for key in ('design_version', 'baseline_label'):
+        if not raw.get(key):
+            raise ValueError(
+                f'OFES scale-sensitivity design is missing {key!r}.'
+            )
+    variants = raw.get('variants') or []
+    allowed_parameters = {
+        'kinematic_smoothing_sigma_pixels',
+        'vertical_profile_radius_km',
+        'candidate_min_separation_km',
+        'thermohaline_smoothing_sigma_pixels',
+        'depth_bounds_m',
+    }
+    seen_ids: set[str] = set()
+    normalized = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            raise ValueError(
+                'OFES scale-sensitivity variants must be mappings.'
+            )
+        variant_id = str(variant.get('id', '')).strip()
+        parameter = str(variant.get('parameter', '')).strip()
+        if not variant_id or variant_id in seen_ids:
+            raise ValueError(
+                'OFES scale-sensitivity variant IDs must be nonempty and unique.'
+            )
+        if parameter not in allowed_parameters:
+            raise KeyError(
+                'OFES scale-sensitivity parameter is not an allowed '
+                f'structure setting: {parameter!r}'
+            )
+        if 'value' not in variant:
+            raise ValueError(
+                f'OFES scale-sensitivity variant {variant_id!r} lacks value.'
+            )
+        value = variant['value']
+        if parameter == 'depth_bounds_m':
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError(
+                    f'OFES scale-sensitivity variant {variant_id!r} depth '
+                    'value must contain two bounds.'
+                )
+            value = tuple(float(item) for item in value)
+            if not np.all(np.isfinite(value)) or value[0] >= value[1]:
+                raise ValueError(
+                    f'OFES scale-sensitivity variant {variant_id!r} depth '
+                    'bounds must be finite and increasing.'
+                )
+        else:
+            value = float(value)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f'OFES scale-sensitivity variant {variant_id!r} value '
+                    'must be finite and positive.'
+                )
+        seen_ids.add(variant_id)
+        normalized.append(
+            {
+                'id': variant_id,
+                'parameter': parameter,
+                'value': value,
+                'rationale': str(variant.get('rationale', '')).strip(),
+                'display_name': str(variant.get('display_name', '')).strip(),
+                'override': {parameter: value},
+            }
+        )
+    return {
+        'design_version': str(raw['design_version']),
+        'baseline_label': str(raw['baseline_label']),
+        'horizontal_grid_spacing_km': tuple(
+            float(item)
+            for item in raw.get('horizontal_grid_spacing_km', ())
+        ),
+        'delivered_depth_levels_baseline': int(
+            raw.get('delivered_depth_levels_baseline', 0)
+        ),
+        'variants': normalized,
+    }
+
+
+
+
+def _ofes_structure_spiciness_volume(snapshot: dict) -> np.ndarray:
+    """由 OFES 位温和实用盐度计算三维 TEOS-10 spiciness0。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    salinity = np.asarray(snapshot['salinity'], dtype=float)
+    temperature = np.asarray(snapshot['temp'], dtype=float)
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    pressure = gsw.p_from_z(
+        -depth[:, None, None],
+        lat[None, :, None],
+    )
+    absolute_salinity = gsw.SA_from_SP(
+        salinity,
+        pressure,
+        lon_grid[None, :, :],
+        lat_grid[None, :, :],
+    )
+    conservative_temperature = gsw.CT_from_pt(
+        absolute_salinity,
+        temperature,
+    )
+    return np.asarray(
+        gsw.spiciness0(
+            absolute_salinity,
+            conservative_temperature,
+        ),
+        dtype=float,
+    )
+
+
+def _ofes_structure_contiguous_depth_segment(
+    valid: np.ndarray,
+    level_index: int,
+) -> np.ndarray:
+    """返回包含指定层的连续有效深度索引。"""
+    valid_arr = np.asarray(valid, dtype=bool)
+    if (
+        level_index < 0
+        or level_index >= valid_arr.size
+        or not valid_arr[level_index]
+    ):
+        return np.asarray([level_index], dtype=int)
+    indices = np.flatnonzero(valid_arr)
+    groups = np.split(
+        indices,
+        np.flatnonzero(np.diff(indices) != 1) + 1,
+    )
+    for group in groups:
+        if level_index in group:
+            return group.astype(int)
+    return np.asarray([level_index], dtype=int)
+
+
+def _ofes_structure_vertical_profile(
+    spiciness_anomaly_volume: np.ndarray,
+    n2_ratio_volume: np.ndarray,
+    profile_roi: np.ndarray,
+    depth: np.ndarray,
+    level_index: int,
+    cfg: dict,
+) -> dict:
+    """从已完成的异常体中提取一个候选的垂向剖面范围。"""
+    profile_pi = np.full(depth.size, np.nan, dtype=float)
+    profile_n2_ratio = np.full(depth.size, np.nan, dtype=float)
+    for profile_index in range(depth.size):
+        pi_values = spiciness_anomaly_volume[profile_index, profile_roi]
+        n2_values = n2_ratio_volume[profile_index, profile_roi]
+        pi_values = pi_values[np.isfinite(pi_values)]
+        n2_values = n2_values[np.isfinite(n2_values)]
+        if pi_values.size:
+            profile_pi[profile_index] = float(np.median(pi_values))
+        if n2_values.size:
+            profile_n2_ratio[profile_index] = float(np.median(n2_values))
+    profile_valid = (
+        np.isfinite(profile_pi)
+        & (np.abs(profile_pi) >= cfg['spiciness_anomaly_min'])
+    )
+    segment = _ofes_structure_contiguous_depth_segment(
+        profile_valid,
+        level_index,
+    )
+    vertical_status = 'profile_not_contiguous'
+    if (
+        segment.size >= cfg['vertical_min_anomaly_levels']
+        and level_index in segment
+    ):
+        vertical_status = 'vertically_coherent_at_native_levels'
+    return {
+        'profile_pi': profile_pi,
+        'profile_n2_ratio': profile_n2_ratio,
+        'segment': segment,
+        'vertical_status': vertical_status,
+    }
+
+
+def _ofes_structure_vertical_relation(
+    left: pd.Series,
+    right: pd.Series,
+    cfg: dict,
+) -> dict:
+    """判断水平邻近候选是否是同一垂向结构的重复峰。"""
+    horizontal_distance_km = float(
+        great_circle_distance_m(
+            float(left['lon']),
+            float(left['lat']),
+            float(right['lon']),
+            float(right['lat']),
+        )
+        / 1000.0
+    )
+    left_shallow = float(left['vertical_shallow_depth_m'])
+    left_deep = float(left['vertical_deep_depth_m'])
+    right_shallow = float(right['vertical_shallow_depth_m'])
+    right_deep = float(right['vertical_deep_depth_m'])
+    finite_vertical = np.all(
+        np.isfinite(
+            [left_shallow, left_deep, right_shallow, right_deep]
+        )
+    )
+    if finite_vertical:
+        overlap_m = max(
+            0.0,
+            min(left_deep, right_deep)
+            - max(left_shallow, right_shallow),
+        )
+        separation_m = max(
+            0.0,
+            max(left_shallow, right_shallow)
+            - min(left_deep, right_deep),
+        )
+    else:
+        overlap_m = np.nan
+        separation_m = np.nan
+    same_spiciness_sign = (
+        int(np.sign(float(left['spiciness_sign'])))
+        == int(np.sign(float(right['spiciness_sign'])))
+    )
+    same_rossby_sign = (
+        int(np.sign(float(left['rossby_sign'])))
+        == int(np.sign(float(right['rossby_sign'])))
+    )
+    vertical_close = (
+        finite_vertical
+        and separation_m <= cfg['candidate_merge_max_vertical_gap_m']
+    )
+    same_structure = (
+        horizontal_distance_km < cfg['candidate_min_separation_km']
+        and vertical_close
+        and (
+            same_spiciness_sign
+            or not cfg['candidate_merge_require_same_spiciness_sign']
+        )
+        and (
+            same_rossby_sign
+            or not cfg['candidate_merge_require_same_rossby_sign']
+        )
+    )
+    if horizontal_distance_km >= cfg['candidate_min_separation_km']:
+        relation = 'not_horizontally_adjacent'
+        reason = 'horizontal_separation_at_or_above_candidate_threshold'
+    elif same_structure:
+        relation = 'same_structure_duplicate'
+        reason = 'horizontal_overlap_and_vertical_interval_and_signs_agree'
+    elif finite_vertical and separation_m > cfg['candidate_merge_max_vertical_gap_m']:
+        relation = 'distinct_vertical_structure'
+        reason = 'vertical_intervals_separated_beyond_merge_gap'
+    else:
+        relation = 'uncertain_multilayer'
+        reason = 'horizontal_overlap_but_vertical_or_sign_evidence_conflicts'
+    return {
+        'horizontal_separation_km': horizontal_distance_km,
+        'vertical_overlap_m': float(overlap_m),
+        'vertical_separation_m': float(separation_m),
+        'same_spiciness_sign': bool(same_spiciness_sign),
+        'same_rossby_sign': bool(same_rossby_sign),
+        'merge_relation': relation,
+        'merge_reason': reason,
+    }
+
+
+def extract_ofes_structure_candidates(
+    snapshot: dict,
+    *,
+    settings: dict | None = None,
+) -> dict:
+    """在单日 OFES T/S 与动力场中识别全部独立次表层候选。
+
+    该入口只消费 `temp`、`salinity`、`u` 和 `v`，在同一示踪物中心网格上计算
+    TEOS-10 sigma0、spiciness0、N²、相对涡度和归一化应变。先以固定尺度的
+    水平高通热盐异常和旋转占优条件寻找局部候选，再按水平邻近、垂向异常区间
+    和符号证据区分同结构重复峰、独立垂向层与不确定多层候选；不读取 DO，也
+    不使用粒子路径或前一日中心来生成候选。
+
+    参数:
+        - snapshot (dict): `load_ofes_snapshot` 返回的单日快照，必须含 T/S/u/v。
+        - settings (dict | None): `processing.yml` 中 structure_continuity 的覆盖项。
+
+    返回:
+        - dict: 含 `candidates`（保留候选表）、`merge_audit`/`merge_relations`（合并峰与水平邻近判别）、`fields`（绘图派生场）、`metadata`（网格、单位、门槛与独立输入变量）。
+
+    输出:
+        - 无文件输出；调用者负责保存表格、图和 manifest。
+
+    说明:
+        - |δspiciness0| 门槛沿用现有次表层透镜诊断的 0.15 kg m⁻³ 标度，N² 低于局地平滑背景只作辅助标记；动力 gate 要求 |Ro| >= 归一化应变且 |Ro| >= 0.05。
+        - 同一垂向异常区间内的水平重复峰只保留最强代表；垂向区间分离或符号证据冲突时保留候选并标记为独立/不确定多层。
+        - 所有候选仍是结构候选，不是已经确认的同一涡旋、同一水团或同一材料载体。
+    """
+    cfg = _ofes_structure_continuity_settings(settings)
+    required = {'temp', 'salinity', 'u', 'v'}
+    missing = sorted(required.difference(snapshot))
+    if missing:
+        raise KeyError(
+            'Independent OFES structure extraction lacks variables: '
+            f'{missing}'
+        )
+    metadata = snapshot.get('metadata', {}) or {}
+    if metadata.get('horizontal_location') != 'tracer_center':
+        raise ValueError(
+            'Independent structure extraction requires tracer-centered u/v.'
+        )
+    if set(metadata.get('variable_dims', {})).intersection({'do2', 'w'}):
+        raise ValueError(
+            'Independent structure extraction must not be given DO or w fields.'
+        )
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    if (
+        lon.ndim != 1
+        or lat.ndim != 1
+        or depth.ndim != 1
+        or lon.size < 20
+        or lat.size < 20
+        or depth.size < 3
+        or not np.all(np.diff(lon) > 0)
+        or not np.all(np.diff(lat) > 0)
+        or not np.all(np.diff(depth) > 0)
+    ):
+        raise ValueError(
+            'Independent structure extraction requires increasing 1-D coordinates.'
+        )
+    depth_support_tolerance = max(
+        25.0,
+        1.5 * float(np.median(np.diff(depth))),
+    )
+    if (
+        depth[0] > cfg['depth_bounds_m'][0] + depth_support_tolerance
+        or depth[-1] < cfg['depth_bounds_m'][1] - depth_support_tolerance
+    ):
+        raise ValueError(
+            'Independent structure snapshot does not span configured depth bounds.'
+        )
+    expected = (depth.size, lat.size, lon.size)
+    raw = {
+        key: np.asarray(snapshot[key], dtype=float)
+        for key in ('temp', 'salinity', 'u', 'v')
+    }
+    if any(value.shape != expected for value in raw.values()):
+        raise ValueError(
+            'Independent structure T/S/u/v arrays must share the tracer grid.'
+        )
+
+    sigma0 = _ofes_sigma0_volume(snapshot)
+    spiciness0 = _ofes_structure_spiciness_volume(snapshot)
+    n2 = _ofes_grid_n2_zlevel(
+        depth,
+        raw['salinity'],
+        raw['temp'],
+        lon,
+        lat,
+    )
+    rossby = np.full(expected, np.nan, dtype=float)
+    normalized_strain = np.full(expected, np.nan, dtype=float)
+    for level_index, level_depth in enumerate(depth):
+        kinematics = _ofes_fixed_depth_kinematic_fields(
+            snapshot,
+            float(level_depth),
+            cfg['kinematic_smoothing_sigma_pixels'],
+        )
+        rossby[level_index] = kinematics['rossby_number']
+        normalized_strain[level_index] = kinematics['normalized_strain']
+
+    scale = approximate_degree_length(lat)
+    cell_area_km2 = (
+        abs(float(np.median(np.diff(lon))))
+        * abs(float(np.median(np.diff(lat))))
+        * np.asarray(scale['meters_per_degree_lon'], dtype=float)[:, None]
+        * np.asarray(scale['meters_per_degree_lat'], dtype=float)[:, None]
+        / 1.0e6
+    )
+    cell_area_km2 = np.broadcast_to(
+        cell_area_km2,
+        (lat.size, lon.size),
+    )
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    spiciness_anomaly_volume = np.full(expected, np.nan, dtype=float)
+    sigma_anomaly_volume = np.full(expected, np.nan, dtype=float)
+    n2_ratio_volume = np.full(expected, np.nan, dtype=float)
+    rows: list[dict] = []
+    for level_index, level_depth in enumerate(depth):
+        pi_anomaly = spiciness0[level_index] - _ofes_nan_gaussian(
+            spiciness0[level_index],
+            cfg['thermohaline_smoothing_sigma_pixels'],
+        )
+        sigma_anomaly = sigma0[level_index] - _ofes_nan_gaussian(
+            sigma0[level_index],
+            cfg['thermohaline_smoothing_sigma_pixels'],
+        )
+        n2_background = _ofes_nan_gaussian(
+            n2[level_index],
+            cfg['thermohaline_smoothing_sigma_pixels'],
+        )
+        n2_ratio = np.full(n2_background.shape, np.nan, dtype=float)
+        np.divide(
+            n2[level_index],
+            n2_background,
+            out=n2_ratio,
+            where=(
+                np.isfinite(n2[level_index])
+                & np.isfinite(n2_background)
+                & (n2[level_index] > 0)
+                & (n2_background > 0)
+            ),
+        )
+        spiciness_anomaly_volume[level_index] = pi_anomaly
+        sigma_anomaly_volume[level_index] = sigma_anomaly
+        n2_ratio_volume[level_index] = n2_ratio
+
+    for level_index, level_depth in enumerate(depth):
+        pi_anomaly = spiciness_anomaly_volume[level_index]
+        sigma_anomaly = sigma_anomaly_volume[level_index]
+        n2_ratio = n2_ratio_volume[level_index]
+        thermo_mask = (
+            np.isfinite(pi_anomaly)
+            & np.isfinite(sigma_anomaly)
+            & np.isfinite(n2_ratio)
+            & (n2[level_index] > 0)
+            & (np.abs(pi_anomaly) >= cfg['spiciness_anomaly_min'])
+        )
+        dynamic_mask = (
+            np.isfinite(rossby[level_index])
+            & np.isfinite(normalized_strain[level_index])
+            & (np.abs(rossby[level_index]) >= 0.05)
+            & (
+                np.abs(rossby[level_index])
+                >= normalized_strain[level_index]
+            )
+        )
+        candidate_mask = thermo_mask & dynamic_mask
+        score = np.where(candidate_mask, np.abs(pi_anomaly), np.nan)
+        finite_score = np.isfinite(score)
+        local_window = cfg['local_maximum_window_pixels']
+        local_max = finite_score & (
+            score
+            >= -minimum_filter(
+                np.where(finite_score, -score, np.inf),
+                size=local_window,
+                mode='nearest',
+            )
+        )
+        component_labels, _ = ndimage_label(
+            thermo_mask,
+            structure=np.ones((3, 3), dtype=np.int8),
+        )
+        for row_index, column_index in zip(*np.where(local_max)):
+            edge_distance = min(
+                row_index,
+                column_index,
+                lat.size - 1 - row_index,
+                lon.size - 1 - column_index,
+            )
+            if edge_distance < cfg['candidate_edge_exclusion_pixels']:
+                continue
+            component_id = int(component_labels[row_index, column_index])
+            if component_id == 0:
+                continue
+            component = component_labels == component_id
+            component_count = int(np.count_nonzero(component))
+            if component_count < cfg['minimum_component_cells']:
+                continue
+            component_weights = np.abs(pi_anomaly[component])
+            component_weights = np.where(
+                np.isfinite(component_weights),
+                component_weights,
+                0.0,
+            )
+            if float(np.sum(component_weights)) <= 0:
+                component_weights = np.ones(component_count, dtype=float)
+            component_lat, component_lon = np.where(component)
+            lon_offset = _minimal_lon_diff_deg(
+                lon[component_lon],
+                float(lon[column_index]),
+            )
+            centroid_lon = float(
+                lon[column_index]
+                + np.average(lon_offset, weights=component_weights)
+            )
+            centroid_lat = float(
+                np.average(
+                    lat[component_lat],
+                    weights=component_weights,
+                )
+            )
+            distance_to_peak = adaptive_distance_m(
+                lon_grid,
+                lat_grid,
+                float(lon[column_index]),
+                float(lat[row_index]),
+            ) / 1000.0
+            profile_roi = distance_to_peak <= cfg['vertical_profile_radius_km']
+            if np.count_nonzero(profile_roi) < cfg['minimum_component_cells']:
+                profile_roi = np.zeros(distance_to_peak.shape, dtype=bool)
+                profile_roi[row_index, column_index] = True
+            profile = _ofes_structure_vertical_profile(
+                spiciness_anomaly_volume,
+                n2_ratio_volume,
+                profile_roi,
+                depth,
+                level_index,
+                cfg,
+            )
+            profile_pi = profile['profile_pi']
+            profile_n2_ratio = profile['profile_n2_ratio']
+            segment = profile['segment']
+            vertical_status = profile['vertical_status']
+            component_n2 = n2_ratio[component]
+            component_ro = rossby[level_index][component]
+            component_strain = normalized_strain[level_index][component]
+            rows.append(
+                {
+                    'date': pd.Timestamp(snapshot['date']).normalize(),
+                    'level_index': int(level_index),
+                    'depth_m': float(level_depth),
+                    'lat_index': int(row_index),
+                    'lon_index': int(column_index),
+                    'lon': float(lon[column_index]),
+                    'lat': float(lat[row_index]),
+                    'temp_core_deg_c': float(
+                        raw['temp'][level_index, row_index, column_index]
+                    ),
+                    'salinity_core_psu': float(
+                        raw['salinity'][level_index, row_index, column_index]
+                    ),
+                    'sigma0_core_kg_m3': float(
+                        sigma0[level_index, row_index, column_index]
+                    ),
+                    'spiciness0_core': float(
+                        spiciness0[level_index, row_index, column_index]
+                    ),
+                    'n2_core_s_2': float(
+                        n2[level_index, row_index, column_index]
+                    ),
+                    'thermohaline_centroid_lon': centroid_lon,
+                    'thermohaline_centroid_lat': centroid_lat,
+                    'spiciness_anomaly': float(pi_anomaly[row_index, column_index]),
+                    'sigma0_anomaly_kg_m3': float(sigma_anomaly[row_index, column_index]),
+                    'n2_ratio': float(n2_ratio[row_index, column_index]),
+                    'low_n2_support': bool(
+                        np.isfinite(n2_ratio[row_index, column_index])
+                        and n2_ratio[row_index, column_index]
+                        <= cfg['n2_ratio_low_max']
+                    ),
+                    'rossby_number': float(rossby[level_index, row_index, column_index]),
+                    'normalized_strain': float(
+                        normalized_strain[level_index, row_index, column_index]
+                    ),
+                    'rotation_dominated': True,
+                    'rossby_sign': int(np.sign(rossby[level_index, row_index, column_index])),
+                    'spiciness_sign': int(np.sign(pi_anomaly[row_index, column_index])),
+                    'thermohaline_component_cells': component_count,
+                    'thermohaline_component_area_km2': float(
+                        np.sum(cell_area_km2[component])
+                    ),
+                    'thermohaline_component_radius_km': float(
+                        np.sqrt(np.sum(cell_area_km2[component]) / np.pi)
+                    ),
+                    'component_dynamic_fraction': float(
+                        np.mean(dynamic_mask[component])
+                    ),
+                    'component_spiciness_median': float(
+                        np.nanmedian(pi_anomaly[component])
+                    ),
+                    'component_sigma0_anomaly_median_kg_m3': float(
+                        np.nanmedian(sigma_anomaly[component])
+                    ),
+                    'component_n2_ratio_median': float(np.nanmedian(component_n2)),
+                    'component_abs_rossby_median': float(
+                        np.nanmedian(np.abs(component_ro))
+                    ),
+                    'component_normalized_strain_median': float(
+                        np.nanmedian(component_strain)
+                    ),
+                    'vertical_anomaly_level_count': int(segment.size),
+                    'vertical_shallow_depth_m': float(depth[segment[0]]),
+                    'vertical_deep_depth_m': float(depth[segment[-1]]),
+                    'vertical_thickness_m': float(
+                        depth[segment[-1]] - depth[segment[0]]
+                    ),
+                    'vertical_spiciness_median': float(
+                        np.nanmedian(profile_pi[segment])
+                    ),
+                    'vertical_n2_ratio_median': float(
+                        np.nanmedian(profile_n2_ratio[segment])
+                    ),
+                    'vertical_low_n2_support': bool(
+                        np.isfinite(profile_n2_ratio[segment]).any()
+                        and np.nanmedian(profile_n2_ratio[segment])
+                        <= cfg['n2_ratio_low_max']
+                    ),
+                    'vertical_status': vertical_status,
+                }
+            )
+
+    raw_candidates = pd.DataFrame(rows)
+    merge_relation_rows: list[dict] = []
+    if raw_candidates.empty:
+        candidates = pd.DataFrame(
+            columns=[
+                'date', 'candidate_id', 'level_index', 'depth_m',
+                'lat_index', 'lon_index', 'lon', 'lat',
+                'candidate_merge_group', 'vertical_separation_m',
+                'vertical_overlap_m', 'candidate_merge_decision',
+                'candidate_merge_reason', 'candidate_retained',
+                'merge_target_candidate_id',
+            ]
+        )
+        merge_audit = candidates.copy()
+        merge_relations = pd.DataFrame(
+            columns=[
+                'date', 'left_raw_candidate_id', 'right_raw_candidate_id',
+                'horizontal_separation_km', 'vertical_overlap_m',
+                'vertical_separation_m', 'same_spiciness_sign',
+                'same_rossby_sign', 'merge_relation', 'merge_reason',
+            ]
+        )
+    else:
+        raw_candidates = raw_candidates.reset_index(drop=True)
+        raw_candidates['_raw_index'] = np.arange(len(raw_candidates), dtype=int)
+        raw_candidates['_abs_spiciness'] = raw_candidates[
+            'spiciness_anomaly'
+        ].abs()
+        raw_candidates['raw_candidate_id'] = [
+            f"{pd.Timestamp(row.date):%Y%m%d}_raw_{index:04d}"
+            for index, row in raw_candidates.iterrows()
+        ]
+        raw_candidates['candidate_merge_group'] = None
+        raw_candidates['candidate_merge_decision'] = None
+        raw_candidates['candidate_merge_reason'] = None
+        raw_candidates['candidate_retained'] = False
+        raw_candidates['merge_target_raw_candidate_id'] = None
+        raw_candidates['vertical_separation_m'] = np.nan
+        raw_candidates['vertical_overlap_m'] = np.nan
+        retained_by_date: dict[pd.Timestamp, list[int]] = {}
+        for date, date_rows in raw_candidates.groupby('date', sort=True):
+            ordered = date_rows.sort_values(
+                ['_abs_spiciness', 'level_index', 'lat_index', 'lon_index'],
+                ascending=[False, True, True, True],
+                kind='mergesort',
+            )['_raw_index'].astype(int).tolist()
+            accepted: list[int] = []
+            group_number = 0
+            for raw_index in ordered:
+                row = raw_candidates.loc[raw_index]
+                nearby: list[tuple[int, dict]] = []
+                for accepted_index in accepted:
+                    accepted_row = raw_candidates.loc[accepted_index]
+                    relation = _ofes_structure_vertical_relation(
+                        row,
+                        accepted_row,
+                        cfg,
+                    )
+                    if relation['merge_relation'] != 'not_horizontally_adjacent':
+                        nearby.append((accepted_index, relation))
+                        merge_relation_rows.append(
+                            {
+                                'date': pd.Timestamp(date),
+                                'left_raw_candidate_id': str(
+                                    row['raw_candidate_id']
+                                ),
+                                'right_raw_candidate_id': str(
+                                    accepted_row['raw_candidate_id']
+                                ),
+                                **relation,
+                            }
+                        )
+                if not nearby:
+                    group_id = f'{pd.Timestamp(date):%Y%m%d}_G{group_number:03d}'
+                    group_number += 1
+                    decision = 'retained_independent_structure'
+                    reason = 'no_retained_candidate_within_horizontal_threshold'
+                    target_index = None
+                    relation = None
+                    accepted.append(raw_index)
+                else:
+                    same_structure = [
+                        item for item in nearby
+                        if item[1]['merge_relation']
+                        == 'same_structure_duplicate'
+                    ]
+                    if same_structure:
+                        target_index, relation = min(
+                            same_structure,
+                            key=lambda item: item[1]['horizontal_separation_km'],
+                        )
+                        group_id = raw_candidates.loc[
+                            target_index, 'candidate_merge_group'
+                        ]
+                        decision = 'merged_same_structure_duplicate'
+                        reason = relation['merge_reason']
+                    else:
+                        relation = min(
+                            nearby,
+                            key=lambda item: item[1]['horizontal_separation_km'],
+                        )[1]
+                        group_id = f'{pd.Timestamp(date):%Y%m%d}_G{group_number:03d}'
+                        group_number += 1
+                        target_index = None
+                        if any(
+                            item[1]['merge_relation'] == 'uncertain_multilayer'
+                            for item in nearby
+                        ):
+                            decision = 'retained_uncertain_multilayer'
+                            reason = (
+                                'at_least_one_horizontal_neighbor_has_vertical_or_sign_conflict'
+                            )
+                        else:
+                            decision = 'retained_distinct_vertical_structure'
+                            reason = relation['merge_reason']
+                        accepted.append(raw_index)
+                raw_candidates.loc[raw_index, 'candidate_merge_group'] = group_id
+                raw_candidates.loc[raw_index, 'candidate_merge_decision'] = decision
+                raw_candidates.loc[raw_index, 'candidate_merge_reason'] = reason
+                raw_candidates.loc[raw_index, 'candidate_retained'] = (
+                    decision != 'merged_same_structure_duplicate'
+                )
+                if target_index is not None:
+                    raw_candidates.loc[
+                        raw_index, 'merge_target_raw_candidate_id'
+                    ] = raw_candidates.loc[
+                        target_index, 'raw_candidate_id'
+                    ]
+                if relation is not None:
+                    raw_candidates.loc[
+                        raw_index, 'vertical_separation_m'
+                    ] = relation['vertical_separation_m']
+                    raw_candidates.loc[raw_index, 'vertical_overlap_m'] = relation[
+                        'vertical_overlap_m'
+                    ]
+            retained_by_date[pd.Timestamp(date)] = accepted
+
+        raw_candidates['candidate_id'] = None
+        candidate_id_by_raw: dict[int, str] = {}
+        for date, indices in retained_by_date.items():
+            for number, raw_index in enumerate(indices):
+                candidate_id = f'{date:%Y%m%d}_{number:03d}'
+                candidate_id_by_raw[raw_index] = candidate_id
+                raw_candidates.loc[raw_index, 'candidate_id'] = candidate_id
+        target_ids = []
+        for raw_index in raw_candidates.index:
+            target_raw = raw_candidates.loc[
+                raw_index, 'merge_target_raw_candidate_id'
+            ]
+            if pd.isna(target_raw) or target_raw is None:
+                target_ids.append(None)
+                continue
+            target_index = raw_candidates.index[
+                raw_candidates['raw_candidate_id'].eq(target_raw)
+            ]
+            target_ids.append(
+                candidate_id_by_raw.get(int(target_index[0]))
+                if len(target_index) else None
+            )
+        raw_candidates['merge_target_candidate_id'] = target_ids
+        raw_candidates = raw_candidates.drop(
+            columns=['_abs_spiciness', 'merge_target_raw_candidate_id'],
+        )
+        candidates = raw_candidates.loc[
+            raw_candidates['candidate_retained']
+        ].drop(columns=['_raw_index']).copy()
+        candidates = candidates.sort_values(
+            ['date', 'candidate_id'],
+            kind='mergesort',
+        ).reset_index(drop=True)
+        merge_audit = raw_candidates.drop(columns=['_raw_index']).copy()
+        merge_relations = pd.DataFrame(merge_relation_rows)
+        if merge_relations.empty:
+            merge_relations = pd.DataFrame(
+                columns=[
+                    'date', 'left_raw_candidate_id', 'right_raw_candidate_id',
+                    'horizontal_separation_km', 'vertical_overlap_m',
+                    'vertical_separation_m', 'same_spiciness_sign',
+                    'same_rossby_sign', 'merge_relation', 'merge_reason',
+                ]
+            )
+        raw_id_to_candidate_id = raw_candidates.set_index(
+            'raw_candidate_id'
+        )['candidate_id'].to_dict()
+        for column in ('left_raw_candidate_id', 'right_raw_candidate_id'):
+            merge_relations[column.replace(
+                '_raw_candidate_id', '_candidate_id'
+            )] = merge_relations[column].map(raw_id_to_candidate_id)
+    fields = {
+        'lon': lon.astype(np.float32),
+        'lat': lat.astype(np.float32),
+        'depth': depth.astype(np.float32),
+        'sigma0': sigma0.astype(np.float32),
+        'spiciness0': spiciness0.astype(np.float32),
+        'n2': n2.astype(np.float32),
+        'rossby_number': rossby.astype(np.float32),
+        'normalized_strain': normalized_strain.astype(np.float32),
+    }
+    if not candidates.empty:
+        fields['spiciness_anomaly'] = spiciness_anomaly_volume.astype(np.float32)
+        fields['sigma0_anomaly'] = sigma_anomaly_volume.astype(np.float32)
+    else:
+        fields['spiciness_anomaly'] = np.full(expected, np.nan, dtype=np.float32)
+        fields['sigma0_anomaly'] = np.full(expected, np.nan, dtype=np.float32)
+    source_units = metadata.get('output_units', {})
+    result_metadata = {
+        'analysis': 'ofes_independent_structure_candidates',
+        'date': pd.Timestamp(snapshot['date']).strftime('%Y-%m-%d'),
+        'input_variables': ['temp', 'salinity', 'u', 'v'],
+        'input_units': {
+            key: str(source_units.get(key, 'unknown'))
+            for key in ('temp', 'salinity', 'u', 'v')
+        },
+        'grid': {
+            'horizontal_location': metadata.get('horizontal_location'),
+            'horizontal_grid': metadata.get('horizontal_grid'),
+            'lon_bounds': [float(lon[0]), float(lon[-1])],
+            'lat_bounds': [float(lat[0]), float(lat[-1])],
+            'depth_bounds_m': [float(depth[0]), float(depth[-1])],
+            'shape': list(expected),
+            'median_lon_spacing_deg': float(np.median(np.diff(lon))),
+            'median_lat_spacing_deg': float(np.median(np.diff(lat))),
+        },
+        'settings': cfg,
+        'candidate_count': int(len(candidates)),
+        'raw_candidate_count': int(len(raw_candidates)),
+        'merged_same_structure_duplicate_count': int(
+            (~merge_audit['candidate_retained']).sum()
+            if 'candidate_retained' in merge_audit
+            else 0
+        ),
+        'retained_uncertain_multilayer_count': int(
+            merge_audit['candidate_merge_decision'].eq(
+                'retained_uncertain_multilayer'
+            ).sum()
+            if 'candidate_merge_decision' in merge_audit
+            else 0
+        ),
+        'candidate_merge_relation_count': int(len(merge_relations)),
+        'do_loaded': False,
+        'particle_path_used': False,
+    }
+    return {
+        'candidates': candidates,
+        'merge_audit': merge_audit,
+        'merge_relations': merge_relations,
+        'fields': fields,
+        'metadata': result_metadata,
+    }
+
+
+def match_ofes_structure_candidates(
+    candidates: pd.DataFrame,
+    *,
+    settings: dict | None = None,
+) -> dict:
+    """枚举相邻日期的独立结构对应，不强制选择最近候选。
+
+    参数:
+        - candidates (pd.DataFrame): `extract_ofes_structure_candidates` 返回的逐日候选表。
+        - settings (dict | None): structure_continuity 判据覆盖项。
+
+    返回:
+        - dict: 含 `edges`（通过门槛的有向边）、`candidates`（增出入边数与歧义标记）、`date_summary`（逐日搜索摘要）。
+
+    输出:
+        - 无文件输出。
+
+    说明:
+        - 只连接相邻实际日期；任一候选没有合格边就保留为中断，不以最近邻补边。
+        - 边表是候选结构的对应关系，不是同一水团或材料载体的证明。
+    """
+    cfg = _ofes_structure_continuity_settings(settings)
+    required = {
+        'date', 'candidate_id', 'depth_m', 'lon', 'lat',
+        'spiciness_anomaly', 'sigma0_anomaly_kg_m3', 'n2_ratio',
+        'rossby_number',
+    }
+    missing = sorted(required.difference(candidates.columns))
+    if missing:
+        raise KeyError(
+            f'OFES structure candidates lack columns: {missing}'
+        )
+    table = candidates.copy()
+    table['date'] = pd.to_datetime(table['date']).dt.normalize()
+    table['candidate_id'] = table['candidate_id'].astype(str)
+    if table['candidate_id'].duplicated().any():
+        raise ValueError('OFES structure candidate IDs must be unique.')
+    dates = sorted(table['date'].dropna().unique())
+    edge_rows: list[dict] = []
+    for left_date, right_date in zip(dates[:-1], dates[1:]):
+        gap_days = int((pd.Timestamp(right_date) - pd.Timestamp(left_date)).days)
+        if gap_days > cfg['maximum_match_gap_days']:
+            continue
+        left = table[table['date'].eq(left_date)]
+        right = table[table['date'].eq(right_date)]
+        for left_row in left.itertuples(index=False):
+            for right_row in right.itertuples(index=False):
+                horizontal_distance = float(
+                    great_circle_distance_m(
+                        left_row.lon,
+                        left_row.lat,
+                        right_row.lon,
+                        right_row.lat,
+                    )
+                    / 1000.0
+                )
+                depth_change = abs(float(left_row.depth_m) - float(right_row.depth_m))
+                spiciness_change = abs(
+                    float(left_row.spiciness_anomaly)
+                    - float(right_row.spiciness_anomaly)
+                )
+                sigma_change = abs(
+                    float(left_row.sigma0_anomaly_kg_m3)
+                    - float(right_row.sigma0_anomaly_kg_m3)
+                )
+                n2_change = abs(
+                    float(left_row.n2_ratio) - float(right_row.n2_ratio)
+                )
+                rossby_change = abs(
+                    float(left_row.rossby_number)
+                    - float(right_row.rossby_number)
+                )
+                same_spiciness_sign = (
+                    np.sign(float(left_row.spiciness_anomaly))
+                    == np.sign(float(right_row.spiciness_anomaly))
+                )
+                same_rossby_sign = (
+                    np.sign(float(left_row.rossby_number))
+                    == np.sign(float(right_row.rossby_number))
+                )
+                gate_translation = (
+                    horizontal_distance
+                    <= cfg['maximum_translation_km_per_day'] * gap_days
+                )
+                gate_depth = (
+                    depth_change
+                    <= cfg['maximum_depth_change_m_per_day'] * gap_days
+                )
+                gate_spiciness = (
+                    spiciness_change
+                    <= cfg['maximum_spiciness_change_per_day'] * gap_days
+                )
+                gate_sigma = (
+                    sigma_change
+                    <= cfg['maximum_sigma0_change_per_day'] * gap_days
+                )
+                gate_n2 = n2_change <= cfg['maximum_n2_ratio_change']
+                gate_rossby = rossby_change <= cfg['maximum_rossby_change']
+                gate_spiciness_sign = (
+                    same_spiciness_sign
+                    or not cfg['require_same_spiciness_sign']
+                )
+                gate_rossby_sign = (
+                    same_rossby_sign
+                    or not cfg['require_same_rossby_sign']
+                )
+                passed = all(
+                    (
+                        gate_translation,
+                        gate_depth,
+                        gate_spiciness,
+                        gate_sigma,
+                        gate_n2,
+                        gate_rossby,
+                        gate_spiciness_sign,
+                        gate_rossby_sign,
+                    )
+                )
+                if not passed:
+                    continue
+                normalized_terms = [
+                    horizontal_distance
+                    / (cfg['maximum_translation_km_per_day'] * gap_days),
+                    depth_change
+                    / (cfg['maximum_depth_change_m_per_day'] * gap_days),
+                    spiciness_change
+                    / (cfg['maximum_spiciness_change_per_day'] * gap_days),
+                    sigma_change
+                    / (cfg['maximum_sigma0_change_per_day'] * gap_days),
+                    n2_change / cfg['maximum_n2_ratio_change'],
+                    rossby_change / cfg['maximum_rossby_change'],
+                ]
+                edge_rows.append(
+                    {
+                        'from_date': pd.Timestamp(left_date),
+                        'to_date': pd.Timestamp(right_date),
+                        'from_candidate_id': str(left_row.candidate_id),
+                        'to_candidate_id': str(right_row.candidate_id),
+                        'gap_days': gap_days,
+                        'horizontal_distance_km': horizontal_distance,
+                        'depth_change_m': depth_change,
+                        'spiciness_change': spiciness_change,
+                        'sigma0_change_kg_m3': sigma_change,
+                        'n2_ratio_change': n2_change,
+                        'rossby_change': rossby_change,
+                        'same_spiciness_sign': bool(same_spiciness_sign),
+                        'same_rossby_sign': bool(same_rossby_sign),
+                        'match_score': float(np.mean(normalized_terms)),
+                        'match_status': 'candidate_edge',
+                    }
+                )
+    edges = pd.DataFrame(edge_rows)
+    if edges.empty:
+        edges = pd.DataFrame(
+            columns=[
+                'from_date', 'to_date', 'from_candidate_id',
+                'to_candidate_id', 'gap_days',
+                'horizontal_distance_km', 'depth_change_m',
+                'spiciness_change', 'sigma0_change_kg_m3',
+                'n2_ratio_change', 'rossby_change',
+                'same_spiciness_sign', 'same_rossby_sign',
+                'match_score', 'match_status',
+            ]
+        )
+    incoming = (
+        edges.groupby('to_candidate_id').size()
+        if not edges.empty else pd.Series(dtype=int)
+    )
+    outgoing = (
+        edges.groupby('from_candidate_id').size()
+        if not edges.empty else pd.Series(dtype=int)
+    )
+    table['incoming_edge_count'] = table['candidate_id'].map(incoming).fillna(0).astype(int)
+    table['outgoing_edge_count'] = table['candidate_id'].map(outgoing).fillna(0).astype(int)
+    table['correspondence_status'] = np.select(
+        [
+            (table['incoming_edge_count'] > 1)
+            | (table['outgoing_edge_count'] > 1),
+            (table['incoming_edge_count'] == 0)
+            & (table['outgoing_edge_count'] == 0),
+        ],
+        [
+            'ambiguous_multiple_correspondences',
+            'isolated_candidate',
+        ],
+        default='at_least_one_candidate_correspondence',
+    )
+    date_summary_rows = []
+    for date in dates:
+        subset = table[table['date'].eq(date)]
+        date_summary_rows.append(
+            {
+                'date': pd.Timestamp(date),
+                'candidate_count': int(len(subset)),
+                'candidate_with_incoming_edge_count': int(
+                    (subset['incoming_edge_count'] > 0).sum()
+                ),
+                'candidate_with_outgoing_edge_count': int(
+                    (subset['outgoing_edge_count'] > 0).sum()
+                ),
+                'ambiguous_candidate_count': int(
+                    subset['correspondence_status'].eq(
+                        'ambiguous_multiple_correspondences'
+                    ).sum()
+                ),
+                'isolated_candidate_count': int(
+                    subset['correspondence_status'].eq(
+                        'isolated_candidate'
+                    ).sum()
+                ),
+                'valid_edge_count_to_next_day': int(
+                    edges['from_date'].eq(date).sum()
+                    if not edges.empty else 0
+                ),
+                'valid_edge_count_from_previous_day': int(
+                    edges['to_date'].eq(date).sum()
+                    if not edges.empty else 0
+                ),
+            }
+        )
+    return {
+        'candidates': table,
+        'edges': edges,
+        'date_summary': pd.DataFrame(date_summary_rows),
+        'metadata': {
+            'analysis': 'ofes_structure_candidate_correspondence',
+            'settings': cfg,
+            'nearest_candidate_forcing': False,
+            'edge_count': int(len(edges)),
+        },
+    }
+
+
+def summarize_ofes_structure_continuity_paths(
+    candidates: pd.DataFrame,
+    edges: pd.DataFrame,
+    *,
+    start_date: str | pd.Timestamp,
+    start_lon: float,
+    start_lat: float,
+    end_date: str | pd.Timestamp,
+    end_lon: float,
+    end_lat: float,
+    settings: dict | None = None,
+) -> dict:
+    """枚举端点附近候选之间的全部逐日路径并保留分支歧义。
+
+    参数:
+        - candidates (pd.DataFrame): 带 candidate_id/date/lon/lat 的候选表。
+        - edges (pd.DataFrame): `match_ofes_structure_candidates` 返回的有向边表。
+        - start_date (str | pd.Timestamp): 左端观测窗口末日。
+        - start_lon (float): 左端独立关联位置经度。
+        - start_lat (float): 左端独立关联位置纬度。
+        - end_date (str | pd.Timestamp): 右端观测窗口首日。
+        - end_lon (float): 右端独立关联位置经度。
+        - end_lat (float): 右端独立关联位置纬度。
+        - settings (dict | None): structure_continuity 判据覆盖项。
+
+    返回:
+        - dict: 端点候选表、所有完整路径成员表和 summary；路径数量大于一时明确标记歧义。
+
+    输出:
+        - 无文件输出。
+
+    说明:
+        - 端点半径只用于把独立候选与两段观测窗口作标签关联；中间日期不使用 DO 位置或粒子路径。
+        - 不在多个合法边中选择最短或最近的一条；完整路径全部枚举，超过配置上限则报告截断。
+    """
+    cfg = _ofes_structure_continuity_settings(settings)
+    required_candidates = {'candidate_id', 'date', 'lon', 'lat', 'depth_m'}
+    missing = sorted(required_candidates.difference(candidates.columns))
+    if missing:
+        raise KeyError(
+            f'OFES path candidates lack columns: {missing}'
+        )
+    table = candidates.copy()
+    table['date'] = pd.to_datetime(table['date']).dt.normalize()
+    table['candidate_id'] = table['candidate_id'].astype(str)
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    if end_ts < start_ts:
+        raise ValueError('OFES structure path end_date must not precede start_date.')
+    table['start_endpoint_distance_km'] = np.nan
+    table['end_endpoint_distance_km'] = np.nan
+    start_mask = table['date'].eq(start_ts)
+    end_mask = table['date'].eq(end_ts)
+    if start_mask.any():
+        table.loc[start_mask, 'start_endpoint_distance_km'] = [
+            float(
+                great_circle_distance_m(
+                    row.lon,
+                    row.lat,
+                    float(start_lon),
+                    float(start_lat),
+                )
+                / 1000.0
+            )
+            for row in table.loc[start_mask].itertuples()
+        ]
+    if end_mask.any():
+        table.loc[end_mask, 'end_endpoint_distance_km'] = [
+            float(
+                great_circle_distance_m(
+                    row.lon,
+                    row.lat,
+                    float(end_lon),
+                    float(end_lat),
+                )
+                / 1000.0
+            )
+            for row in table.loc[end_mask].itertuples()
+        ]
+    start_candidates = table.loc[
+        start_mask
+        & table['start_endpoint_distance_km'].le(
+            cfg['endpoint_association_radius_km']
+        ),
+        'candidate_id',
+    ].astype(str).tolist()
+    end_candidates = table.loc[
+        end_mask
+        & table['end_endpoint_distance_km'].le(
+            cfg['endpoint_association_radius_km']
+        ),
+        'candidate_id',
+    ].astype(str).tolist()
+    edge_table = edges.copy()
+    if not edge_table.empty:
+        edge_table['from_candidate_id'] = edge_table[
+            'from_candidate_id'
+        ].astype(str)
+        edge_table['to_candidate_id'] = edge_table[
+            'to_candidate_id'
+        ].astype(str)
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for row in edge_table.itertuples(index=False):
+        adjacency[str(row.from_candidate_id)].append(
+            str(row.to_candidate_id)
+        )
+    ordered_dates = sorted(
+        pd.Timestamp(value)
+        for value in table.loc[
+            table['date'].between(start_ts, end_ts),
+            'date',
+        ].unique()
+    )
+    expected_dates = list(pd.date_range(start_ts, end_ts, freq='D'))
+    complete_daily_dates = ordered_dates == expected_dates
+    path_members: list[dict] = []
+    path_count = 0
+    truncated = False
+    end_set = set(end_candidates)
+    date_by_candidate = table.set_index('candidate_id')['date'].to_dict()
+
+    def _walk(
+        current: str,
+        path: list[str],
+    ) -> None:
+        nonlocal path_count, truncated
+        if path_count >= cfg['max_paths_to_enumerate']:
+            truncated = True
+            return
+        current_date = pd.Timestamp(date_by_candidate[current])
+        if current_date == end_ts:
+            if current in end_set:
+                path_count += 1
+                path_id = f'path_{path_count:04d}'
+                for step, candidate_id in enumerate(path):
+                    path_members.append(
+                        {
+                            'path_id': path_id,
+                            'step': step,
+                            'date': pd.Timestamp(date_by_candidate[candidate_id]),
+                            'candidate_id': candidate_id,
+                        }
+                    )
+            return
+        next_candidates = []
+        for candidate_id in adjacency.get(current, []):
+            if candidate_id in path:
+                continue
+            candidate_date = pd.Timestamp(date_by_candidate[candidate_id])
+            if candidate_date > current_date and candidate_date <= end_ts:
+                next_candidates.append(candidate_id)
+        for candidate_id in sorted(next_candidates):
+            _walk(candidate_id, path + [candidate_id])
+
+    for candidate_id in sorted(start_candidates):
+        _walk(candidate_id, [candidate_id])
+        if truncated:
+            break
+    paths = pd.DataFrame(path_members)
+    if paths.empty:
+        paths = pd.DataFrame(
+            columns=['path_id', 'step', 'date', 'candidate_id']
+        )
+    if not paths.empty:
+        path_stats = (
+            paths.groupby('path_id', sort=True)
+            .agg(
+                path_start_date=('date', 'min'),
+                path_end_date=('date', 'max'),
+                path_day_count=('date', 'nunique'),
+                path_candidate_count=('candidate_id', 'nunique'),
+            )
+            .reset_index()
+        )
+        paths = paths.merge(path_stats, on='path_id', how='left', validate='many_to_one')
+    if not start_candidates:
+        path_status = 'start_candidate_not_detected'
+    elif not end_candidates:
+        path_status = 'end_candidate_not_detected'
+    elif path_count == 0:
+        path_status = 'no_full_daily_candidate_path'
+    elif truncated:
+        path_status = 'full_paths_enumeration_capped'
+    elif path_count == 1:
+        path_status = 'one_full_daily_candidate_path'
+    else:
+        path_status = 'multiple_full_daily_candidate_paths'
+    summary = {
+        'start_date': start_ts.strftime('%Y-%m-%d'),
+        'end_date': end_ts.strftime('%Y-%m-%d'),
+        'expected_daily_date_count': int(len(expected_dates)),
+        'searched_daily_date_count': int(len(ordered_dates)),
+        'complete_daily_search_dates': bool(complete_daily_dates),
+        'start_endpoint_candidate_count': int(len(start_candidates)),
+        'end_endpoint_candidate_count': int(len(end_candidates)),
+        'full_path_count': int(path_count),
+        'path_enumeration_truncated': bool(truncated),
+        'path_status': path_status,
+        'particle_path_used': False,
+        'do_loaded': False,
+        'endpoint_radius_km': float(cfg['endpoint_association_radius_km']),
+    }
+    return {
+        'candidates': table,
+        'paths': paths,
+        'summary': summary,
+        'start_candidate_ids': start_candidates,
+        'end_candidate_ids': end_candidates,
+    }
+
+
+def _ofes_sc_endpoint_object_members(
+    peak_pixels: pd.DataFrame,
+    object_row,
+    threshold: int = 50,
+    *,
+    expected_event_id: str | None = None,
+    expected_daily_object_key: str | None = None,
+) -> dict:
+    """校验端点对象身份并取出其阈值专属峰像素成员。
+
+    参数:
+        - peak_pixels (pd.DataFrame): 原始 peak-pixel 表。
+        - object_row (Mapping | pd.Series): 端点对象行，需含 `date`、`threshold`、`daily_object_id`、`daily_object_key`、`event_id`、`pixel_count`、`depth_min`、`depth_max`。
+        - threshold (int): DO 阈值，决定 `object_id_do{threshold}` 列。
+        - expected_event_id (str | None): 期望事件 ID；给出时核对。
+        - expected_daily_object_key (str | None): 期望对象键；给出时核对。
+
+    返回:
+        - dict: `members`（成员表）、`member_depth`（峰深数组）、
+          `object_date`、`daily_object_id`、`daily_object_key`、`actual_event_id`、
+          `object_pixel_count` 与 `checks`（本次核对的逐项事实）。
+
+    说明:
+        - 对象字段缺失、阈值不符、`daily_object_key` 格式或日期/阈值/对象 ID 不一致、
+          事件 ID 缺失或与期望不符、缺阈值专属列、成员数与 `pixel_count` 不一致、
+          成员为空、像素索引重复、峰深非有限或与 `depth_min/depth_max` 不一致时，
+          **一律直接报错**；不返回空表，也不静默降级。
+        - 无候选是合法结果，与成员数据缺失或损坏是两件事；本函数只负责成员读取与核对。
+    """
+    if hasattr(object_row, '_asdict'):
+        object_row = object_row._asdict()
+    elif isinstance(object_row, pd.Series):
+        object_row = object_row.to_dict()
+    required_object = {
+        'date', 'threshold', 'daily_object_id', 'daily_object_key',
+        'event_id', 'pixel_count', 'depth_min', 'depth_max',
+    }
+    missing_object = sorted(
+        name for name in required_object if name not in object_row
+    )
+    if missing_object:
+        raise KeyError(f'OFES endpoint object lacks fields: {missing_object}')
+    threshold = int(threshold)
+    if threshold <= 0:
+        raise ValueError('OFES endpoint threshold must be positive.')
+    object_date = pd.Timestamp(object_row['date']).normalize()
+    object_threshold = float(object_row['threshold'])
+    if not np.isfinite(object_threshold) or int(object_threshold) != threshold:
+        raise ValueError(
+            'Endpoint object threshold does not match the requested threshold: '
+            f'{object_threshold} != {threshold}'
+        )
+    try:
+        daily_object_id = int(object_row['daily_object_id'])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'Endpoint object daily_object_id must be an integer.'
+        ) from exc
+    raw_daily_object_key = object_row['daily_object_key']
+    if pd.isna(raw_daily_object_key):
+        raise ValueError('Endpoint object has no daily_object_key.')
+    daily_object_key = str(raw_daily_object_key).strip()
+    if not daily_object_key:
+        raise ValueError('Endpoint object has no daily_object_key.')
+    key_match = re.fullmatch(
+        r'(?P<date>\d{8})_DO(?P<threshold>\d+)_(?P<object_id>\d+)',
+        daily_object_key,
+    )
+    if key_match is None:
+        raise ValueError(
+            'Endpoint object daily_object_key has an invalid format: '
+            f'{daily_object_key}'
+        )
+    try:
+        key_date = pd.to_datetime(key_match.group('date'), format='%Y%m%d')
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'Endpoint object daily_object_key contains an invalid date: '
+            f'{daily_object_key}'
+        ) from exc
+    if key_date.normalize() != object_date:
+        raise ValueError(
+            'Endpoint object daily_object_key date does not match the object date: '
+            f'{daily_object_key} != {object_date:%Y-%m-%d}'
+        )
+    if int(key_match.group('threshold')) != threshold:
+        raise ValueError(
+            'Endpoint object daily_object_key threshold does not match the '
+            f'requested threshold: {daily_object_key} != DO{threshold}'
+        )
+    if int(key_match.group('object_id')) != daily_object_id:
+        raise ValueError(
+            'Endpoint object daily_object_key object ID does not match '
+            f'daily_object_id: {daily_object_key} != {daily_object_id}'
+        )
+    raw_event_id = object_row['event_id']
+    if pd.isna(raw_event_id):
+        raise ValueError('Endpoint object has no complete event_id.')
+    actual_event_id = str(raw_event_id).strip()
+    if not actual_event_id:
+        raise ValueError('Endpoint object has no complete event_id.')
+    if expected_event_id is not None and actual_event_id != str(expected_event_id):
+        raise ValueError(
+            'Endpoint object event_id does not match the expected event: '
+            f'{actual_event_id} != {expected_event_id}'
+        )
+    if (
+        expected_daily_object_key is not None
+        and daily_object_key != str(expected_daily_object_key)
+    ):
+        raise ValueError(
+            'Endpoint object daily_object_key does not match the expected key: '
+            f'{daily_object_key} != {expected_daily_object_key}'
+        )
+    object_id_column = f'object_id_do{threshold}'
+    required_pixels = {'date', 'lon', 'lat', 'peak_depth', object_id_column}
+    missing_pixels = sorted(required_pixels.difference(peak_pixels.columns))
+    if missing_pixels:
+        raise KeyError(
+            f'Endpoint peak-pixel table lacks fields: {missing_pixels}'
+        )
+    pixels = peak_pixels.copy()
+    pixels['date'] = pd.to_datetime(pixels['date']).dt.normalize()
+    members = pixels.loc[
+        pixels['date'].eq(object_date)
+        & pd.to_numeric(pixels[object_id_column], errors='coerce').eq(
+            daily_object_id
+        )
+    ].copy()
+    index_columns = [
+        name for name in ('lat_index', 'lon_index') if name in members.columns
+    ]
+    pixel_index_unique = True
+    if len(index_columns) == 2:
+        pixel_index_unique = not members.duplicated(subset=index_columns).any()
+        if not pixel_index_unique:
+            raise ValueError(
+                'Endpoint object has duplicated peak-pixel indices '
+                f'({index_columns}): {daily_object_key}'
+            )
+    expected_pixel_count = int(object_row['pixel_count'])
+    if len(members) != expected_pixel_count:
+        raise ValueError(
+            'Endpoint object pixel count does not match its threshold-specific '
+            f'peak-pixel members: {len(members)} != {expected_pixel_count}'
+        )
+    if members.empty:
+        raise ValueError('Endpoint object has no peak-pixel members.')
+    member_depth = pd.to_numeric(
+        members['peak_depth'], errors='coerce'
+    ).to_numpy(float)
+    if not np.isfinite(member_depth).all():
+        raise ValueError('Endpoint object has nonfinite peak depths.')
+    for field_name in ('depth_min', 'depth_max'):
+        value = float(object_row[field_name])
+        if not np.isfinite(value):
+            raise ValueError(
+                f'Endpoint object field {field_name} is not finite.'
+            )
+    if not np.isclose(member_depth.min(), float(object_row['depth_min'])):
+        raise ValueError('Endpoint object depth_min is inconsistent with peak pixels.')
+    if not np.isclose(member_depth.max(), float(object_row['depth_max'])):
+        raise ValueError('Endpoint object depth_max is inconsistent with peak pixels.')
+    return {
+        'members': members,
+        'member_depth': member_depth,
+        'object_date': object_date,
+        'daily_object_id': daily_object_id,
+        'daily_object_key': daily_object_key,
+        'actual_event_id': actual_event_id,
+        'object_pixel_count': int(len(members)),
+        'checks': {
+            'object_identity_status': (
+                'date_threshold_object_key_fields_and_complete_event_id_verified'
+            ),
+            'object_identity_fields': [
+                'date', 'threshold', 'daily_object_id', 'daily_object_key',
+                'event_id',
+            ],
+            'threshold_specific_object_id_column': object_id_column,
+            'threshold_column_present': True,
+            'expected_pixel_count': expected_pixel_count,
+            'member_count': int(len(members)),
+            'pixel_count_consistent': True,
+            'pixel_index_columns': index_columns,
+            'pixel_index_unique': bool(pixel_index_unique),
+            'member_depth_finite': True,
+            'member_depth_range_consistent': True,
+        },
+    }
+
+
+def _ofes_endpoint_object_registration(
+    candidate: Mapping[str, Any],
+    object_row: Mapping[str, Any],
+    peak_pixels: pd.DataFrame,
+    *,
+    threshold: int,
+    expected_event_id: str | None = None,
+    expected_daily_object_key: str | None = None,
+    depth_tolerance_m: float = 1e-4,
+) -> dict:
+    """按真实日期、阈值、对象键字段和峰像素核对端点对象配准。
+
+    该内部 helper 只把对象峰像素与候选水平圆/候选峰深区间作登记，不能把对象
+    depth_min/depth_max 当作氧异常层上下边界。
+    """
+    if hasattr(candidate, '_asdict'):
+        candidate = candidate._asdict()
+    elif isinstance(candidate, pd.Series):
+        candidate = candidate.to_dict()
+    if hasattr(object_row, '_asdict'):
+        object_row = object_row._asdict()
+    elif isinstance(object_row, pd.Series):
+        object_row = object_row.to_dict()
+    required_candidate = {
+        'date', 'candidate_id', 'lon', 'lat',
+        'thermohaline_component_radius_km',
+        'vertical_shallow_depth_m', 'vertical_deep_depth_m',
+    }
+    required_object = {
+        'date', 'threshold', 'daily_object_id', 'daily_object_key',
+        'event_id', 'pixel_count', 'depth_min', 'depth_max',
+        'peak_depth_at_max',
+    }
+    missing_candidate = sorted(
+        name for name in required_candidate if name not in candidate
+    )
+    missing_object = sorted(
+        name for name in required_object if name not in object_row
+    )
+    if missing_candidate:
+        raise KeyError(
+            f'OFES endpoint candidate lacks fields: {missing_candidate}'
+        )
+    if missing_object:
+        raise KeyError(
+            f'OFES endpoint object lacks fields: {missing_object}'
+        )
+    threshold = int(threshold)
+    if threshold <= 0:
+        raise ValueError('OFES endpoint threshold must be positive.')
+    candidate_date = pd.Timestamp(candidate['date']).normalize()
+    object_date = pd.Timestamp(object_row['date']).normalize()
+    if candidate_date != object_date:
+        raise ValueError(
+            'Endpoint candidate and object dates differ: '
+            f'{candidate_date.date()} != {object_date.date()}'
+        )
+    object_threshold = float(object_row['threshold'])
+    if not np.isfinite(object_threshold) or int(object_threshold) != threshold:
+        raise ValueError(
+            'Endpoint object threshold does not match the requested threshold: '
+            f'{object_threshold} != {threshold}'
+        )
+    member_scan = _ofes_sc_endpoint_object_members(
+        peak_pixels,
+        object_row,
+        threshold,
+        expected_event_id=expected_event_id,
+        expected_daily_object_key=expected_daily_object_key,
+    )
+    members = member_scan['members']
+    member_depth = member_scan['member_depth']
+    object_date = member_scan['object_date']
+    daily_object_id = member_scan['daily_object_id']
+    daily_object_key = member_scan['daily_object_key']
+    actual_event_id = member_scan['actual_event_id']
+
+    candidate_shallow = float(candidate['vertical_shallow_depth_m'])
+    candidate_deep = float(candidate['vertical_deep_depth_m'])
+    if not np.all(np.isfinite([candidate_shallow, candidate_deep])):
+        raise ValueError('Endpoint candidate vertical bounds must be finite.')
+    if candidate_deep < candidate_shallow:
+        raise ValueError('Endpoint candidate vertical bounds are reversed.')
+    candidate_lon = float(candidate['lon'])
+    candidate_lat = float(candidate['lat'])
+    candidate_radius = float(candidate['thermohaline_component_radius_km'])
+    if not np.all(np.isfinite([candidate_lon, candidate_lat, candidate_radius])):
+        raise ValueError('Endpoint candidate horizontal fields must be finite.')
+    if candidate_radius < 0:
+        raise ValueError('Endpoint candidate radius must be nonnegative.')
+    distances_km = great_circle_distance_m(
+        members['lon'].to_numpy(float),
+        members['lat'].to_numpy(float),
+        candidate_lon,
+        candidate_lat,
+    ) / 1000.0
+    horizontal = np.isfinite(distances_km) & (distances_km <= candidate_radius)
+    peak_depth_inside = (
+        member_depth >= candidate_shallow - float(depth_tolerance_m)
+    ) & (
+        member_depth <= candidate_deep + float(depth_tolerance_m)
+    )
+    peak_points_in_envelope = horizontal & peak_depth_inside
+    object_depth_min = float(object_row['depth_min'])
+    object_depth_max = float(object_row['depth_max'])
+    peak_depth_range_intersection = max(
+        0.0,
+        min(candidate_deep, object_depth_max)
+        - max(candidate_shallow, object_depth_min),
+    )
+    horizontal_count = int(horizontal.sum())
+    peak_depth_inside_count = int(peak_depth_inside.sum())
+    peak_points_in_envelope_count = int(peak_points_in_envelope.sum())
+    if horizontal_count == len(members):
+        horizontal_status = 'all_object_peak_pixels_in_candidate_radius'
+    elif horizontal_count > 0:
+        horizontal_status = 'partial_object_peak_pixels_in_candidate_radius'
+    else:
+        horizontal_status = 'no_object_peak_pixels_in_candidate_radius'
+    if peak_points_in_envelope_count == len(members):
+        peak_point_status = 'all_object_peak_points_in_candidate_envelope'
+    elif peak_points_in_envelope_count > 0:
+        peak_point_status = 'partial_object_peak_points_in_candidate_envelope'
+    else:
+        peak_point_status = 'no_object_peak_points_in_candidate_envelope'
+    return {
+        'candidate_id': str(candidate['candidate_id']),
+        'date': candidate_date,
+        'threshold': threshold,
+        'daily_object_id': daily_object_id,
+        'daily_object_key': daily_object_key,
+        'actual_event_id': actual_event_id,
+        'object_identity_status': (
+            'date_threshold_object_key_fields_and_complete_event_id_verified'
+        ),
+        'object_pixel_count': int(len(members)),
+        'object_peak_depth_min_m': object_depth_min,
+        'object_peak_depth_max_m': object_depth_max,
+        'object_peak_depth_m': float(object_row['peak_depth_at_max']),
+        'member_half_amplitude_thickness_min_m': float(
+            pd.to_numeric(
+                members['half_amplitude_thickness_m'], errors='coerce'
+            ).min()
+        ) if 'half_amplitude_thickness_m' in members else np.nan,
+        'member_half_amplitude_thickness_max_m': float(
+            pd.to_numeric(
+                members['half_amplitude_thickness_m'], errors='coerce'
+            ).max()
+        ) if 'half_amplitude_thickness_m' in members else np.nan,
+        'candidate_shallow_m': candidate_shallow,
+        'candidate_deep_m': candidate_deep,
+        'candidate_radius_km': candidate_radius,
+        'object_member_distance_min_km': float(np.nanmin(distances_km)),
+        'object_member_distance_max_km': float(np.nanmax(distances_km)),
+        'horizontal_member_support_count': horizontal_count,
+        'horizontal_member_support_fraction': float(
+            horizontal_count / len(members)
+        ),
+        'horizontal_member_support_status': horizontal_status,
+        'peak_depth_inside_candidate_count': peak_depth_inside_count,
+        'peak_points_in_candidate_envelope_count': peak_points_in_envelope_count,
+        'peak_points_in_candidate_envelope_fraction': float(
+            peak_points_in_envelope_count / len(members)
+        ),
+        'peak_point_candidate_support_status': peak_point_status,
+        'peak_depth_range_interval_intersection_m': float(
+            peak_depth_range_intersection
+        ),
+        'peak_depth_range_interval_intersection_semantics': (
+            'object_peak_depth_min_max_not_oxygen_layer_boundaries'
+        ),
+        'oxygen_layer_overlap_m': np.nan,
+        'oxygen_layer_overlap_status': (
+            'unknown_true_per_pixel_upper_lower_edges_not_saved'
+        ),
+        'object_id_in_candidate_envelope': bool(
+            peak_points_in_envelope_count > 0
+        ),
+        'association_status': (
+            f'{horizontal_status};{peak_point_status};'
+            'oxygen_layer_overlap_unknown'
+        ),
+        'members': members,
+    }
+
+
 def _ofes_process_review_local_peaks(depth, contrast, raw_do, sigma0, settings):
     """在连续有效原生层段中提取固定站C−B峰，不跨缺测拼接峰肩。"""
     from scipy.signal import find_peaks
@@ -79294,6 +81424,6130 @@ def _ofes_process_review_local_peaks(depth, contrast, raw_do, sigma0, settings):
                 'half_prominence_width_levels': float(properties['widths'][number]),
                 'finite_segment_levels': int(indices.size), 'branch_id': None})
     return rows
+
+
+
+
+def _ofes_sc_validate_case_spec(case_spec: dict) -> dict:
+    """校验结构连续性案例规格，返回规范化副本。
+
+    参数:
+        - case_spec (dict): 调用方提供的案例规格。
+
+    返回:
+        - dict: 规范化的案例规格。
+
+    说明:
+        - 缺少必需字段时报错，不回落到任何内置案例。
+        - 每个事件必须给出 label、event_id、endpoint_date 与 gap_side。
+    """
+    if not isinstance(case_spec, dict):
+        raise TypeError('OFES structure-continuity case_spec must be a dict.')
+    missing = [
+        key
+        for key in ('case_id', 'output_subdir', 'events', 'structure_dates')
+        if not case_spec.get(key)
+    ]
+    if missing:
+        raise ValueError(
+            'OFES structure-continuity case_spec is missing required fields: '
+            f'{missing}'
+        )
+    events = []
+    for raw_event in case_spec['events']:
+        absent = [
+            key
+            for key in ('label', 'event_id', 'endpoint_date', 'gap_side')
+            if not raw_event.get(key)
+        ]
+        if absent:
+            raise ValueError(
+                f'case_spec event is missing required fields {absent}: '
+                f'{raw_event!r}'
+            )
+        if raw_event['gap_side'] not in ('before', 'after'):
+            raise ValueError(
+                "case_spec event gap_side must be 'before' or 'after', got "
+                f"{raw_event['gap_side']!r}"
+            )
+        events.append(dict(raw_event))
+    labels = [event['label'] for event in events]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f'case_spec event labels must be unique: {labels}')
+    before_events = [event for event in events if event['gap_side'] == 'before']
+    after_events = [event for event in events if event['gap_side'] == 'after']
+    if len(events) != 2 or len(before_events) != 1 or len(after_events) != 1:
+        raise ValueError(
+            'case_spec must contain exactly two events: one with gap_side='
+            f"'before' and one with 'after'; got {len(events)} events "
+            f'({len(before_events)} before, {len(after_events)} after).'
+        )
+    boundary_dates = list(case_spec['structure_dates'])
+    if len(boundary_dates) != 2:
+        raise ValueError(
+            'case_spec structure_dates must give two inclusive bounds, got '
+            f'{boundary_dates!r}'
+        )
+    normalized = dict(case_spec)
+    normalized['events'] = events
+    normalized['structure_dates'] = boundary_dates
+    return normalized
+
+
+def _ofes_sc_context(
+    synthesis_dir: str | Path,
+    case_spec: dict,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """绑定既有输入、案例规格与本次输出；不依赖结果目录中的 Python 模块。
+
+    参数:
+        - synthesis_dir (str | Path): 既有 `process_review_synthesis` 输入目录。
+        - case_spec (dict): 调用方给出的案例规格；必需参数。
+        - output_dir (str | Path | None): 输出根目录；None 时用输入目录下的案例子目录。
+
+    返回:
+        - dict: 输入路径、输出路径、案例事件与日期。
+
+    说明:
+        - 案例身份只来自 `case_spec`，本函数不内置任何案例常量。
+        - 事件端点日期由 `endpoint_date` 显式给出；`gap_side` 决定从事件目录取
+          `end_date`（`before`）还是 `start_date`（`after`）做一致性核对。
+    """
+    spec = _ofes_sc_validate_case_spec(case_spec)
+    synthesis = Path(synthesis_dir).resolve()
+    output = (
+        Path(output_dir).resolve() if output_dir is not None
+        else synthesis / str(spec['output_subdir'])
+    )
+    events = spec['events']
+    event_ids = {event['label']: event['event_id'] for event in events}
+    endpoint_dates = {
+        event['label']: pd.Timestamp(event['endpoint_date']).normalize()
+        for event in events
+    }
+    endpoint_fields = {
+        event['label']: (
+            'end_date' if event['gap_side'] == 'before' else 'start_date'
+        )
+        for event in events
+    }
+    endpoint_roles = {
+        event['label']: (
+            f"{event['label']}_"
+            f"{'end' if event['gap_side'] == 'before' else 'start'}"
+        )
+        for event in events
+    }
+    start_label = next(
+        event['label'] for event in events if event['gap_side'] == 'before'
+    )
+    end_label = next(
+        event['label'] for event in events if event['gap_side'] == 'after'
+    )
+    ctx = {}
+    ctx['case_spec'] = spec
+    ctx['case_id'] = str(spec['case_id'])
+    ctx['base_events'] = events
+    ctx['base_event_labels'] = [event['label'] for event in events]
+    ctx['base_event_ids'] = event_ids
+    ctx['base_endpoint_dates'] = endpoint_dates
+    ctx['base_endpoint_fields'] = endpoint_fields
+    ctx['base_endpoint_roles'] = endpoint_roles
+    ctx['start_label'] = start_label
+    ctx['end_label'] = end_label
+    ctx['start_event_id'] = event_ids[start_label]
+    ctx['end_event_id'] = event_ids[end_label]
+    ctx['start_endpoint_role'] = endpoint_roles[start_label]
+    ctx['end_endpoint_role'] = endpoint_roles[end_label]
+    ctx['start_endpoint_field'] = endpoint_fields[start_label]
+    ctx['end_endpoint_field'] = endpoint_fields[end_label]
+    ctx['start_endpoint_date'] = endpoint_dates[start_label]
+    ctx['end_endpoint_date'] = endpoint_dates[end_label]
+    ctx['base_root'] = output
+    ctx['base_synthesis_root'] = synthesis
+    ctx['base_event_catalog_root'] = ctx['base_synthesis_root'].parent / 'event_catalog'
+    ctx['base_event_catalog_path'] = ctx['base_event_catalog_root'] / 'event_catalog.parquet'
+    ctx['base_daily_object_path'] = ctx['base_event_catalog_root'] / 'daily_objects.parquet'
+    ctx['base_profile_gate_path'] = ctx['base_synthesis_root'] / 'profile_gate_margins_219.csv'
+    ctx['base_primary_trajectory_root'] = ctx['base_synthesis_root'].parent / 'primary_trajectory_3d_population'
+    ctx['base_post_peak_root'] = ctx['base_synthesis_root'].parent / 'primary_post_peak_retention'
+    ctx['base_peak_pixel_root'] = ctx['base_event_catalog_root'] / 'days'
+    ctx['base_structure_dates'] = pd.date_range(*spec['structure_dates'], freq='D')
+    ctx['base_figure_dates'] = pd.to_datetime(list(spec.get('figure_dates') or []))
+    ctx['base_native_variables'] = list(
+        spec.get('native_variables') or ['temp', 'salinity', 'u', 'v']
+    )
+    ctx['baseline_variant_label'] = str(
+        spec.get('baseline_variant_label') or 'baseline_cached'
+    )
+    ctx['display_path_id'] = spec.get('display_path_id')
+    ctx['scale_root'] = output / 'scale_sensitivity'
+    ctx['scale_baseline_dir'] = ctx['scale_root'] / 'baseline'
+    ctx['scale_original_root'] = ctx['scale_root'].parent
+    ctx['scale_design_path'] = ctx['scale_root'] / 'scale_sensitivity_design.json'
+    ctx['scale_design'] = (
+        _ofes_structure_continuity_scale_sensitivity_design(
+            spec['scale_sensitivity']
+        )
+        if spec.get('scale_sensitivity') else None
+    )
+    ctx['scale_outputs'] = {
+        'candidate': ctx['scale_root'] / 'scale_sensitivity_candidates.csv',
+        'merge_audit': ctx['scale_root'] / 'scale_sensitivity_merge_audit.csv',
+        'merge_relations': ctx['scale_root'] / 'scale_sensitivity_merge_relations.csv',
+        'path': ctx['scale_root'] / 'scale_sensitivity_path_members.csv',
+        'daily': ctx['scale_root'] / 'scale_sensitivity_daily_state.csv',
+        'summary': ctx['scale_root'] / 'scale_sensitivity_variant_summary.csv',
+        'endpoint_registration': ctx['scale_root'] / 'scale_sensitivity_endpoint_registration.csv',
+        'endpoint_association': ctx['scale_root'] / 'scale_sensitivity_endpoint_association.csv',
+        'gap': ctx['scale_root'] / 'scale_sensitivity_detection_gap.csv',
+        'formal_peak': ctx['scale_root'] / 'scale_sensitivity_formal_peak_pixel_audit.csv',
+        'formal_support': ctx['scale_root'] / 'scale_sensitivity_formal_support_audit.csv',
+        'formal_objects': ctx['scale_root'] / 'scale_sensitivity_formal_object_audit.csv',
+        'formal_events': ctx['scale_root'] / 'scale_sensitivity_formal_event_audit.csv',
+        'material_members': ctx['scale_root'] / 'scale_sensitivity_material_members.csv',
+        'material_daily': ctx['scale_root'] / 'scale_sensitivity_material_daily.csv',
+        'source_manifest': ctx['scale_root'] / 'scale_sensitivity_input_manifest.json',
+        'validation': ctx['scale_root'] / 'scale_sensitivity_validation.json',
+        'comparison_png': ctx['scale_root'] / 'scale_sensitivity_comparison.png',
+        'gap_png': ctx['scale_root'] / 'scale_sensitivity_detection_gap.png',
+        'verdict': ctx['scale_root'] / 'scale_sensitivity_verdict_zh.md',
+    }
+    ctx['freeze_root'] = output / 'scale_sensitivity'
+    ctx['freeze_parent'] = ctx['freeze_root'].parent
+    ctx['freeze_baseline_dir'] = ctx['freeze_root'] / 'baseline'
+    ctx['pilot_root'] = output / 'scale_sensitivity'
+    ctx['pilot_pilot_dates'] = pd.to_datetime(list(spec.get('pilot_dates') or []))
+    ctx['pilot_smoothing_values'] = tuple(spec.get('pilot_smoothing_values') or ())
+    ctx['pilot_output_summary'] = ctx['pilot_root'] / 'ro_v_pilot_summary.csv'
+    ctx['pilot_output_profiles'] = ctx['pilot_root'] / 'ro_v_pilot_radial_profiles.csv'
+    ctx['pilot_output_centres'] = ctx['pilot_root'] / 'ro_v_pilot_center_candidates.csv'
+    ctx['pilot_output_manifest'] = ctx['pilot_root'] / 'ro_v_pilot_manifest.json'
+    ctx['pilot_output_figure'] = ctx['pilot_root'] / 'ro_v_pilot_radial_profiles.png'
+    ctx['refresh_root'] = output / 'scale_sensitivity'
+    ctx['refresh_summary_path'] = ctx['refresh_root'] / 'scale_sensitivity_variant_summary.csv'
+    ctx['refresh_association_path'] = ctx['refresh_root'] / 'scale_sensitivity_endpoint_association.csv'
+    ctx['refresh_validation_path'] = ctx['refresh_root'] / 'scale_sensitivity_validation.json'
+    ctx['refresh_manifest_path'] = ctx['refresh_root'] / 'scale_sensitivity_input_manifest.json'
+    ctx['finalize_root'] = output / 'scale_sensitivity'
+    ctx['finalize_summary_path'] = ctx['finalize_root'] / 'scale_sensitivity_variant_summary.csv'
+    ctx['finalize_candidate_path'] = ctx['finalize_root'] / 'scale_sensitivity_candidates.csv'
+    ctx['finalize_validation_path'] = ctx['finalize_root'] / 'scale_sensitivity_validation.json'
+    ctx['finalize_manifest_path'] = ctx['finalize_root'] / 'scale_sensitivity_input_manifest.json'
+    ctx['finalize_pilot_summary_path'] = ctx['finalize_root'] / 'ro_v_pilot_summary.csv'
+    ctx['finalize_pilot_manifest_path'] = ctx['finalize_root'] / 'ro_v_pilot_manifest.json'
+    ctx['finalize_verdict_path'] = ctx['finalize_root'] / 'scale_sensitivity_verdict_zh.md'
+    ctx['audit_root'] = output / 'object_registration_audit'
+    ctx['audit_parent'] = ctx['audit_root'].parent
+    ctx['audit_scale'] = ctx['audit_parent'] / 'scale_sensitivity'
+    ctx['audit_catalog'] = synthesis.parent / 'event_catalog'
+    ctx['audit_association_path'] = ctx['audit_scale'] / 'scale_sensitivity_endpoint_association.csv'
+    ctx['audit_candidate_path'] = ctx['audit_scale'] / 'scale_sensitivity_candidates.csv'
+    ctx['audit_object_path'] = ctx['audit_catalog'] / 'daily_objects.parquet'
+    ctx['audit_event_ids'] = event_ids
+    ctx['audit_endpoint_peak_dates'] = {
+        endpoint_dates[event['label']]: (
+            ctx['audit_catalog']
+            / 'days'
+            / f"peak_pixels_{endpoint_dates[event['label']]:%Y%m%d}.parquet"
+        )
+        for event in events
+    }
+    return ctx
+
+
+
+
+def _ofes_sc_jsonable(value):
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return [_ofes_sc_jsonable(item) for item in value.tolist()]
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _ofes_sc_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_ofes_sc_jsonable(item) for item in value]
+    return value
+
+
+def _ofes_sc_write_json(path: Path, payload: dict) -> None:
+    path.write_text(
+        json.dumps(_ofes_sc_jsonable(payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _ofes_sc_event_row(events: pd.DataFrame, event_id: str) -> pd.Series:
+    rows = events.loc[events["event_id"].astype(str).eq(event_id)]
+    if len(rows) != 1:
+        raise RuntimeError(f"Expected one event-catalog row for {event_id}.")
+    row = rows.iloc[0].copy()
+    for column in ("start_date", "end_date", "peak_date"):
+        row[column] = pd.Timestamp(row[column]).normalize()
+    return row
+
+
+def _ofes_sc_daily_object_point(
+    objects: pd.DataFrame,
+    event_id: str,
+    date: pd.Timestamp,
+) -> tuple[float, float]:
+    rows = objects.loc[
+        objects["event_id"].astype(str).eq(event_id)
+        & pd.to_datetime(objects["date"]).dt.normalize().eq(date)
+    ]
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"Expected one daily-object row for {event_id} on {date:%Y-%m-%d}."
+        )
+    row = rows.iloc[0]
+    return float(row["centroid_lon"]), float(row["centroid_lat"])
+
+
+def _ofes_sc_search_bounds(
+    start_lon: float,
+    start_lat: float,
+    end_lon: float,
+    end_lat: float,
+    buffer_km: float,
+) -> tuple[float, float, float, float]:
+    mid_lat = float(np.mean([start_lat, end_lat]))
+    scale = approximate_degree_length(mid_lat)
+    lon_buffer = buffer_km * 1000.0 / float(scale["meters_per_degree_lon"])
+    lat_buffer = buffer_km * 1000.0 / float(scale["meters_per_degree_lat"])
+    return (
+        min(start_lon, end_lon) - lon_buffer,
+        max(start_lon, end_lon) + lon_buffer,
+        min(start_lat, end_lat) - lat_buffer,
+        max(start_lat, end_lat) + lat_buffer,
+    )
+
+
+def _ofes_sc_load_snapshots(
+    ctx: dict,
+    dates: pd.DatetimeIndex,
+    bounds: tuple[float, float, float, float],
+    settings: dict,
+) -> tuple[dict[pd.Timestamp, dict], list[dict]]:
+    snapshots: dict[pd.Timestamp, dict] = {}
+    source_rows: list[dict] = []
+    for date in dates:
+        date = pd.Timestamp(date).normalize()
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=ctx['base_native_variables'],
+            lon_bounds=(bounds[0], bounds[1]),
+            lat_bounds=(bounds[2], bounds[3]),
+            depth_bounds=tuple(settings["depth_bounds_m"]),
+        )
+        snapshots[date] = snapshot
+        metadata = snapshot.get("metadata", {})
+        source_files = {}
+        for variable in ctx['base_native_variables']:
+            path = _ofes_file_path(variable, date).resolve()
+            stat = path.stat()
+            source_files[variable] = {
+                "path": str(path),
+                "size_bytes": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        source_rows.append(
+            {
+                "date": date,
+                "lon_min": float(snapshot["lon"][0]),
+                "lon_max": float(snapshot["lon"][-1]),
+                "lat_min": float(snapshot["lat"][0]),
+                "lat_max": float(snapshot["lat"][-1]),
+                "depth_min_m": float(snapshot["depth"][0]),
+                "depth_max_m": float(snapshot["depth"][-1]),
+                "lon_count": int(len(snapshot["lon"])),
+                "lat_count": int(len(snapshot["lat"])),
+                "depth_count": int(len(snapshot["depth"])),
+                "horizontal_grid": metadata.get("horizontal_grid"),
+                "horizontal_location": metadata.get("horizontal_location"),
+                "output_units": metadata.get("output_units", {}),
+                "read_slices": metadata.get("read_slices", {}),
+                "source_files": source_files,
+            }
+        )
+    return snapshots, source_rows
+
+
+def _ofes_sc_extract_all(
+    snapshots: dict[pd.Timestamp, dict],
+    settings_overrides: dict | None = None,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[pd.Timestamp, dict],
+]:
+    candidate_rows = []
+    merge_audit_rows = []
+    merge_relation_rows = []
+    results: dict[pd.Timestamp, dict] = {}
+    for date in sorted(snapshots):
+        result = extract_ofes_structure_candidates(
+            snapshots[pd.Timestamp(date)],
+            settings=settings_overrides,
+        )
+        results[pd.Timestamp(date)] = result
+        if not result["candidates"].empty:
+            candidate_rows.append(result["candidates"])
+        if not result["merge_audit"].empty:
+            merge_audit_rows.append(result["merge_audit"])
+        if not result["merge_relations"].empty:
+            merge_relation_rows.append(result["merge_relations"])
+    candidates = (
+        pd.concat(candidate_rows, ignore_index=True)
+        if candidate_rows else pd.DataFrame()
+    )
+    merge_audit = (
+        pd.concat(merge_audit_rows, ignore_index=True)
+        if merge_audit_rows else pd.DataFrame()
+    )
+    merge_relations = (
+        pd.concat(merge_relation_rows, ignore_index=True)
+        if merge_relation_rows else pd.DataFrame()
+    )
+    return candidates, merge_audit, merge_relations, results
+
+
+def _ofes_sc_run_vertical_profile_regression(settings: dict) -> dict:
+    """用合成多层异常验证垂向范围不依赖候选遍历顺序。"""
+    depth = np.asarray([300.0, 350.0, 400.0, 450.0, 500.0, 550.0])
+    spiciness = np.zeros((depth.size, 3, 3), dtype=float)
+    n2_ratio = np.ones_like(spiciness)
+    spiciness[:, 1, 1] = np.asarray([0.21, 0.28, 0.31, 0.27, 0.22, 0.19])
+    n2_ratio[:, 1, 1] = 0.5
+    profile_roi = np.zeros((3, 3), dtype=bool)
+    profile_roi[1, 1] = True
+    segment_orders = []
+    for level_index in (0, 2, 4, 5, 1, 3):
+        profile = _ofes_structure_vertical_profile(
+            spiciness,
+            n2_ratio,
+            profile_roi,
+            depth,
+            level_index,
+            settings,
+        )
+        segment_orders.append(tuple(profile['segment'].tolist()))
+    expected = tuple(range(depth.size))
+    passed = bool(segment_orders) and all(
+        segment == expected for segment in segment_orders
+    )
+    return {
+        'passed': passed,
+        'level_iteration_order': [0, 2, 4, 5, 1, 3],
+        'expected_native_level_indices': list(expected),
+        'observed_segments': [list(segment) for segment in segment_orders],
+        'expected_shallow_depth_m': float(depth[0]),
+        'expected_deep_depth_m': float(depth[-1]),
+    }
+
+
+def _ofes_sc_formal_detection_audit(
+    ctx: dict,
+    candidates: pd.DataFrame,
+    events: pd.DataFrame,
+    objects: pd.DataFrame,
+) -> dict:
+    """在候选结构支撑内按真实 object key 审计 DO20/35/50 产品。"""
+    thresholds = (20, 35, 50)
+    candidates = candidates.copy()
+    candidates['date'] = pd.to_datetime(candidates['date']).dt.normalize()
+    objects = objects.copy()
+    objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+    events = events.copy()
+    event_by_id = events.set_index(events['event_id'].astype(str), drop=False)
+    support_rows = []
+    peak_pixel_rows = []
+    filtered_products = list(ctx['base_peak_pixel_root'].glob('filtered*'))
+    for date in ctx['base_structure_dates']:
+        date = pd.Timestamp(date).normalize()
+        path = ctx['base_peak_pixel_root'] / f'peak_pixels_{date:%Y%m%d}.parquet'
+        if not path.exists():
+            for candidate_id in candidates.loc[
+                candidates['date'].eq(date), 'candidate_id'
+            ].astype(str):
+                for threshold in thresholds:
+                    peak_pixel_rows.append(
+                        {
+                            'date': date,
+                            'candidate_id': candidate_id,
+                            'threshold': threshold,
+                            'peak_pixels_product_status': 'peak_pixels_product_missing',
+                            'support_row_count': 0,
+                            'retained_object_id_row_count': 0,
+                            'unique_retained_object_id_count': 0,
+                            'filtered_peak_product_present': bool(filtered_products),
+                        }
+                    )
+            continue
+        pixels = pd.read_parquet(path)
+        day_candidates = candidates.loc[candidates['date'].eq(date)]
+        for candidate in day_candidates.itertuples(index=False):
+            distance_km = great_circle_distance_m(
+                pixels['lon'].to_numpy(float),
+                pixels['lat'].to_numpy(float),
+                float(candidate.lon),
+                float(candidate.lat),
+            ) / 1000.0
+            support = pixels.loc[
+                (distance_km <= float(candidate.thermohaline_component_radius_km))
+                & pixels['peak_depth'].between(
+                    float(candidate.vertical_shallow_depth_m),
+                    float(candidate.vertical_deep_depth_m),
+                )
+            ].copy()
+            for threshold in thresholds:
+                object_column = f'object_id_do{threshold}'
+                retained = support.loc[
+                    support[object_column].ge(0), object_column
+                ].astype(int)
+                object_ids = sorted(retained.unique().tolist())
+                peak_pixel_rows.append(
+                    {
+                        'date': date,
+                        'candidate_id': str(candidate.candidate_id),
+                        'threshold': threshold,
+                        'peak_pixels_product_status': 'peak_pixels_product_present',
+                        'support_row_count': int(len(support)),
+                        'retained_object_id_row_count': int(len(retained)),
+                        'unique_retained_object_id_count': int(len(object_ids)),
+                        'retained_object_ids': ','.join(str(value) for value in object_ids),
+                        'max_delta_do_umol_kg': float(support['delta_do'].max())
+                        if not support.empty else np.nan,
+                        'peak_depth_min_m': float(support['peak_depth'].min())
+                        if not support.empty else np.nan,
+                        'peak_depth_max_m': float(support['peak_depth'].max())
+                        if not support.empty else np.nan,
+                        'filtered_peak_product_present': bool(filtered_products),
+                    }
+                )
+                if not object_ids:
+                    support_rows.append(
+                        {
+                            'date': date,
+                            'candidate_id': str(candidate.candidate_id),
+                            'threshold': threshold,
+                            'daily_object_id': None,
+                            'daily_object_key': None,
+                            'actual_event_id': None,
+                            'support_pixel_row_count': int(len(support)),
+                            'retained_object_id_row_count': 0,
+                            'object_id_status': 'no_retained_object_id_in_candidate_support',
+                            'event_identity_status': 'unresolved_no_object_key',
+                            'filtered_peak_product_present': bool(filtered_products),
+                        }
+                    )
+                    continue
+                for object_id in object_ids:
+                    matching_objects = objects.loc[
+                        objects['date'].eq(date)
+                        & objects['threshold'].eq(float(threshold))
+                        & objects['daily_object_id'].eq(int(object_id))
+                    ]
+                    pixel_subset = support.loc[
+                        support[object_column].eq(int(object_id))
+                    ]
+                    if matching_objects.empty:
+                        support_rows.append(
+                            {
+                                'date': date,
+                                'candidate_id': str(candidate.candidate_id),
+                                'threshold': threshold,
+                                'daily_object_id': int(object_id),
+                                'daily_object_key': None,
+                                'actual_event_id': None,
+                                'support_pixel_row_count': int(len(pixel_subset)),
+                                'retained_object_id_row_count': int(len(pixel_subset)),
+                                'object_id_status': 'peak_pixel_object_id_missing_from_daily_objects',
+                                'event_identity_status': 'unresolved_missing_daily_object_key',
+                                'filtered_peak_product_present': bool(filtered_products),
+                            }
+                        )
+                        continue
+                    for object_row in matching_objects.itertuples(index=False):
+                        actual_event_id = (
+                            None if pd.isna(object_row.event_id)
+                            else str(object_row.event_id)
+                        )
+                        event_present = actual_event_id in event_by_id.index
+                        event_identity_status = (
+                            'actual_daily_object_key_mapped_to_event_catalog'
+                            if event_present
+                            else 'daily_object_key_present_event_unassigned_or_missing'
+                        )
+                        support_rows.append(
+                            {
+                                'date': date,
+                                'candidate_id': str(candidate.candidate_id),
+                                'threshold': threshold,
+                                'daily_object_id': int(object_id),
+                                'daily_object_key': str(object_row.daily_object_key),
+                                'actual_event_id': actual_event_id,
+                                'support_pixel_row_count': int(len(pixel_subset)),
+                                'retained_object_id_row_count': int(len(pixel_subset)),
+                                'object_id_status': 'actual_daily_object_key_found',
+                                'event_identity_status': event_identity_status,
+                                'centroid_lon': float(object_row.centroid_lon),
+                                'centroid_lat': float(object_row.centroid_lat),
+                                'peak_lon': float(object_row.peak_lon),
+                                'peak_lat': float(object_row.peak_lat),
+                                'peak_depth_at_max_m': float(object_row.peak_depth_at_max),
+                                'depth_min_m': float(object_row.depth_min),
+                                'depth_max_m': float(object_row.depth_max),
+                                'link_status': object_row.link_status,
+                                'predecessor_daily_object_key': object_row.predecessor_daily_object_key,
+                                'link_gap_days': object_row.link_gap_days,
+                                'link_distance_km': object_row.link_distance_km,
+                                'link_depth_difference_m': object_row.link_depth_difference_m,
+                                'filtered_peak_product_present': bool(filtered_products),
+                            }
+                        )
+    support = pd.DataFrame(support_rows)
+    support_objects = support.loc[
+        support['daily_object_key'].notna()
+    ].copy() if not support.empty else pd.DataFrame()
+    event_audit_rows = []
+    if not support_objects.empty:
+        for actual_event_id, event_support in support_objects.loc[
+            support_objects['actual_event_id'].notna()
+        ].groupby('actual_event_id', sort=True):
+            event_matches = event_by_id.loc[[str(actual_event_id)]] if str(actual_event_id) in event_by_id.index else pd.DataFrame()
+            event_row = event_matches.iloc[0] if not event_matches.empty else None
+            event_audit_rows.append(
+                {
+                    'actual_event_id': str(actual_event_id),
+                    'reference_case_label': next(
+                        (
+                            label for label, event_id in ctx['base_event_ids'].items()
+                            if event_id == str(actual_event_id)
+                        ),
+                        None,
+                    ),
+                    'threshold': ','.join(
+                        str(int(value)) for value in sorted(event_support['threshold'].unique())
+                    ),
+                    'support_date_min': event_support['date'].min(),
+                    'support_date_max': event_support['date'].max(),
+                    'support_candidate_count': int(event_support['candidate_id'].nunique()),
+                    'support_object_key_count': int(event_support['daily_object_key'].nunique()),
+                    'event_catalog_status': 'actual_event_id_row_present' if event_row is not None else 'actual_event_id_row_missing',
+                    'catalog_start_date': event_row['start_date'] if event_row is not None else None,
+                    'catalog_end_date': event_row['end_date'] if event_row is not None else None,
+                    'catalog_peak_date': event_row['peak_date'] if event_row is not None else None,
+                    'catalog_observed_days': event_row['observed_days'] if event_row is not None else None,
+                    'catalog_missing_days': event_row['missing_days'] if event_row is not None else None,
+                    'catalog_peak_daily_object_key': event_row['peak_daily_object_key'] if event_row is not None else None,
+                    'event_identity_status': 'actual_key_to_event_mapping_audited_not_case_identity',
+                }
+            )
+    return {
+        'events': pd.DataFrame(event_audit_rows),
+        'objects': support,
+        'support': support,
+        'peak_pixels': pd.DataFrame(peak_pixel_rows),
+        'status': 'support_scoped_object_key_audit_complete_event_identity_unresolved',
+        'formal_detection_audit_complete': False,
+        'threshold_event_id_prefix_reconstruction_used': False,
+        'actual_event_catalog_rows_all_present': bool(
+            event_audit_rows
+            and all(
+                row['event_catalog_status'] == 'actual_event_id_row_present'
+                for row in event_audit_rows
+            )
+        ),
+        'filtered_peak_product_present': bool(filtered_products),
+        'support_candidate_date_threshold_rows': int(len(peak_pixel_rows)),
+        'support_object_association_rows': int(len(support)),
+        'actual_event_id_count': int(
+            support['actual_event_id'].dropna().nunique()
+            if not support.empty else 0
+        ),
+    }
+
+
+
+
+
+
+def _ofes_sc_overlap_summary_key(ctx: dict) -> str:
+    """返回末端事件路径端点配准摘要在 case_summary 中的键名。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    返回:
+        - str: 由末端事件标签派生的键名。
+    """
+    return f"{ctx['end_label'].lower()}_path_endpoint_overlap_summary"
+
+
+def _ofes_sc_pilot_smoothing_colors(ctx: dict) -> dict:
+    """为案例规格给出的平滑值分配稳定的绘图配色。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    返回:
+        - dict: `{平滑值: 颜色}`；覆盖 `pilot_smoothing_values` 的全部取值。
+    """
+    palette = ["#1764ab", "#222222", "#d95f02", "#7570b3", "#1b9e77", "#e7298a"]
+    return {
+        float(value): palette[index % len(palette)]
+        for index, value in enumerate(
+            sorted(float(item) for item in ctx['pilot_smoothing_values'])
+        )
+    }
+
+
+def _ofes_sc_candidate_envelope_gap_summary(
+    peak_pixels: pd.DataFrame,
+    gap_dates: pd.DatetimeIndex,
+) -> dict:
+    """汇总案例缺口日期内、候选近似包络的 DO50 峰像素记录。
+
+    说明:
+        - 逐日表按完整 `gap_dates` 补齐：没有保存记录的日期保留为
+          `no_saved_peak_pixel_record`，与"有记录但无有效支撑"区分；
+          缺记录日期的计数字段为 NaN（不补零）。
+    """
+    scoped = peak_pixels.copy()
+    scoped["date"] = pd.to_datetime(scoped["date"]).dt.normalize()
+    scoped = scoped.loc[
+        scoped["date"].isin(gap_dates)
+        & scoped["threshold"].eq(50)
+    ].copy()
+    if scoped.empty:
+        raise RuntimeError("The saved candidate-support DO50 peak audit is empty.")
+    summary = (
+        scoped.groupby("date", as_index=False)
+        .agg(
+            candidate_envelope_do50_peak_record_count=(
+                "support_row_count",
+                lambda values: int((values > 0).sum()),
+            ),
+            candidate_envelope_do50_peak_pixel_row_count=(
+                "support_row_count",
+                "sum",
+            ),
+            candidate_envelope_do50_max_delta_umol_kg=(
+                "max_delta_do_umol_kg",
+                "max",
+            ),
+            candidate_envelope_do50_retained_object_id_count=(
+                "unique_retained_object_id_count",
+                "sum",
+            ),
+        )
+    )
+    summary["candidate_envelope_do50_gap_status"] = np.select(
+        [
+            summary["candidate_envelope_do50_retained_object_id_count"].eq(0)
+            & summary["candidate_envelope_do50_max_delta_umol_kg"].ge(50),
+            summary["candidate_envelope_do50_retained_object_id_count"].eq(0)
+            & summary["candidate_envelope_do50_max_delta_umol_kg"].lt(50),
+        ],
+        [
+            "max_delta_do50_ge50_no_retained_object_id",
+            "max_delta_do50_lt50_no_retained_object_id",
+        ],
+        default="candidate_support_status_requires_review",
+    )
+    summary = (
+        summary.set_index("date")
+        .reindex(gap_dates)
+        .rename_axis("date")
+        .reset_index()
+    )
+    missing_record = summary["candidate_envelope_do50_peak_record_count"].isna()
+    summary.loc[missing_record, "candidate_envelope_do50_gap_status"] = (
+        "no_saved_peak_pixel_record"
+    )
+    high_dates = summary.loc[
+        summary["candidate_envelope_do50_gap_status"].eq(
+            "max_delta_do50_ge50_no_retained_object_id"
+        ),
+        "date",
+    ]
+    low_dates = summary.loc[
+        summary["candidate_envelope_do50_gap_status"].eq(
+            "max_delta_do50_lt50_no_retained_object_id"
+        ),
+        "date",
+    ]
+    unclassified_dates = summary.loc[
+        summary["candidate_envelope_do50_gap_status"].eq(
+            "candidate_support_status_requires_review"
+        ),
+        "date",
+    ]
+    missing_dates = summary.loc[missing_record, "date"]
+    return {
+        "daily": summary,
+        "gap_start": gap_dates[0],
+        "gap_end": gap_dates[-1],
+        "high_dates": high_dates.tolist(),
+        "low_dates": low_dates.tolist(),
+        "unclassified_dates": unclassified_dates.tolist(),
+        "missing_record_dates": missing_dates.tolist(),
+        "high_count": int(len(high_dates)),
+        "low_count": int(len(low_dates)),
+        "unclassified_count": int(len(unclassified_dates)),
+        "missing_record_count": int(len(missing_dates)),
+        "scope": (
+            "candidate_center_radius_vertical_interval_approximation_saved_peak_pixels"
+        ),
+    }
+
+
+
+
+
+
+
+
+
+
+def _ofes_sc_end_path_endpoint_overlap_summary(
+    ctx: dict,
+    peak_pixels: pd.DataFrame,
+    candidates: pd.DataFrame,
+    objects: pd.DataFrame,
+    paths: pd.DataFrame,
+) -> dict:
+    """登记末端事件路径端点的水平成员与峰点支持，保留氧层重叠未知。
+
+    参数:
+        - ctx (dict): 案例上下文。
+        - peak_pixels (pd.DataFrame): 已保存的逐像素峰审计表。
+        - candidates (pd.DataFrame): 缓存候选表。
+        - objects (pd.DataFrame): DO50 逐日对象表。
+        - paths (pd.DataFrame): 完整路径成员表；必须包含全部路径分支。
+
+    返回:
+        - dict: 端点配准结果。`execution_status` 区分执行状态
+          （`registered` / `no_display_path_candidate` / `no_display_path_configured`）；
+          未配准时数值字段为 NaN、支持计数字段为 NaN（**不补零**）。
+          `status` 保留共享配准 helper 的语义字符串（`association_status`）。
+
+    说明:
+        - 展示路径只是汇总视图的选择，不改变完整路径集合。
+        - 路径表契约要求 `path_id + date` 唯一；同一展示路径在端点日出现多行
+          属于冲突，直接报错，不做排序吞并。
+    """
+    unknown_overlap_status = (
+        'unknown_true_per_pixel_upper_lower_edges_not_saved'
+    )
+
+    def empty_result(execution_status: str) -> dict:
+        return {
+            'date': ctx['end_endpoint_date'],
+            'execution_status': execution_status,
+            'status': f'not_registered_{execution_status}',
+            'display_path_id': ctx['display_path_id'],
+            'candidate_id': None,
+            'candidate_vertical_shallow_depth_m': np.nan,
+            'candidate_vertical_deep_depth_m': np.nan,
+            'object_daily_object_key': None,
+            'object_depth_min_m': np.nan,
+            'object_depth_max_m': np.nan,
+            'object_peak_depth_m': np.nan,
+            'object_pixel_count': np.nan,
+            'horizontal_distance_km': np.nan,
+            'candidate_radius_km': np.nan,
+            'horizontal_member_support_count': np.nan,
+            'peak_depth_inside_candidate_count': np.nan,
+            'peak_points_in_candidate_envelope_count': np.nan,
+            'peak_depth_range_interval_intersection_m': np.nan,
+            'oxygen_layer_overlap_m': np.nan,
+            'oxygen_layer_overlap_status': unknown_overlap_status,
+            'object_id_in_candidate_envelope': np.nan,
+            'note': (
+                'No display-path candidate was registered on the endpoint '
+                'date; support counts are NaN (not zero), and the complete '
+                'path set is unaffected.'
+            ),
+        }
+
+    if not ctx['display_path_id']:
+        return empty_result('no_display_path_configured')
+    endpoint_date = ctx['end_endpoint_date']
+    path_rows = paths.loc[
+        paths['path_id'].eq(ctx['display_path_id'])
+        & pd.to_datetime(paths['date']).dt.normalize().eq(endpoint_date)
+    ]
+    if path_rows.empty:
+        return empty_result('no_display_path_candidate')
+    if len(path_rows) > 1:
+        raise RuntimeError(
+            'Path table contract violated: '
+            f'{len(path_rows)} rows for path_id={ctx["display_path_id"]!r} '
+            f'on {endpoint_date.date()}; path_id + date must be unique.'
+        )
+    path_row = path_rows.iloc[0]
+    candidate_id = str(path_row['candidate_id'])
+    candidate_rows = candidates.loc[candidates['candidate_id'].eq(candidate_id)]
+    if len(candidate_rows) != 1:
+        raise RuntimeError(f'Expected one cached candidate row for {candidate_id}.')
+    candidate = candidate_rows.iloc[0]
+    endpoint_objects = objects.loc[
+        objects['event_id'].astype(str).eq(ctx['end_event_id'])
+        & pd.to_datetime(objects['date']).dt.normalize().eq(endpoint_date)
+        & pd.to_numeric(objects['threshold'], errors='coerce').eq(50)
+    ]
+    if len(endpoint_objects) != 1:
+        raise RuntimeError(
+            f"Expected one {ctx['end_label']} DO50 endpoint object."
+        )
+    object_row = endpoint_objects.iloc[0]
+    raw_peak_path = (
+        ctx['base_peak_pixel_root'] / f'peak_pixels_{endpoint_date:%Y%m%d}.parquet'
+    )
+    if not raw_peak_path.exists():
+        raise FileNotFoundError(raw_peak_path)
+    raw_peak_pixels = pd.read_parquet(raw_peak_path)
+    registration = _ofes_endpoint_object_registration(
+        candidate,
+        object_row,
+        raw_peak_pixels,
+        threshold=50,
+        expected_event_id=ctx['end_event_id'],
+        expected_daily_object_key=str(object_row['daily_object_key']),
+    )
+    horizontal_distance = float(
+        great_circle_distance_m(
+            float(candidate['lon']),
+            float(candidate['lat']),
+            float(object_row['peak_lon']),
+            float(object_row['peak_lat']),
+        )
+        / 1000.0
+    )
+    audit_rows = peak_pixels.loc[
+        pd.to_datetime(peak_pixels['date']).dt.normalize().eq(endpoint_date)
+        & peak_pixels['candidate_id'].astype(str).eq(candidate_id)
+        & peak_pixels['threshold'].eq(50)
+    ]
+    if len(audit_rows) != 1:
+        raise RuntimeError(
+            f'Expected one saved DO50 peak audit row for {candidate_id}.'
+        )
+    return {
+        'date': endpoint_date,
+        'execution_status': 'registered',
+        'status': registration['association_status'],
+        'display_path_id': ctx['display_path_id'],
+        'candidate_id': candidate_id,
+        'candidate_vertical_shallow_depth_m': registration['candidate_shallow_m'],
+        'candidate_vertical_deep_depth_m': registration['candidate_deep_m'],
+        'object_daily_object_key': str(object_row['daily_object_key']),
+        'object_depth_min_m': registration['object_peak_depth_min_m'],
+        'object_depth_max_m': registration['object_peak_depth_max_m'],
+        'object_peak_depth_m': registration['object_peak_depth_m'],
+        'object_pixel_count': registration['object_pixel_count'],
+        'horizontal_distance_km': horizontal_distance,
+        'candidate_radius_km': registration['candidate_radius_km'],
+        'horizontal_member_support_count': registration[
+            'horizontal_member_support_count'
+        ],
+        'peak_depth_inside_candidate_count': registration[
+            'peak_depth_inside_candidate_count'
+        ],
+        'peak_points_in_candidate_envelope_count': registration[
+            'peak_points_in_candidate_envelope_count'
+        ],
+        'peak_depth_range_interval_intersection_m': registration[
+            'peak_depth_range_interval_intersection_m'
+        ],
+        'oxygen_layer_overlap_m': registration['oxygen_layer_overlap_m'],
+        'oxygen_layer_overlap_status': registration[
+            'oxygen_layer_overlap_status'
+        ],
+        'object_id_in_candidate_envelope': registration[
+            'object_id_in_candidate_envelope'
+        ],
+        'note': (
+            'The object table stores peak-depth range and half-amplitude '
+            'thickness, not true per-pixel oxygen-layer upper/lower edges; '
+            'oxygen-layer overlap remains unknown.'
+        ),
+    }
+
+
+
+
+
+
+
+
+def _ofes_sc_formal_catalog_window_status(
+    date: pd.Timestamp,
+    event_rows: dict[str, pd.Series],
+    observed_dates: dict[str, set[pd.Timestamp]],
+    start_label: str,
+    end_label: str,
+    event_labels: Sequence[str],
+) -> str:
+    """把日期映射到已审计的 DO50 目录窗口状态。"""
+    date = pd.Timestamp(date).normalize()
+    for label in event_labels:
+        row = event_rows[label]
+        if row['start_date'] <= date <= row['end_date']:
+            return (
+                f'{label}_DO50_catalog_object_present'
+                if date in observed_dates[label]
+                else f'{label}_DO50_catalog_window_missing_object'
+            )
+    if (
+        event_rows[start_label]['end_date']
+        < date
+        < event_rows[end_label]['start_date']
+    ):
+        return f'between_{start_label}_{end_label}_DO50_catalog_windows'
+    return f'outside_audited_{start_label}_{end_label}_DO50_catalog_windows'
+
+
+def _ofes_sc_check_endpoint_dates(
+    ctx: dict,
+    event_rows: dict[str, pd.Series],
+) -> None:
+    """核对案例规格的显式端点日期与事件目录端点日期一致。"""
+    for label in ctx['base_event_labels']:
+        catalog_date = pd.Timestamp(
+            event_rows[label][ctx['base_endpoint_fields'][label]]
+        ).normalize()
+        spec_date = pd.Timestamp(ctx['base_endpoint_dates'][label]).normalize()
+        if catalog_date != spec_date:
+            raise RuntimeError(
+                f'case_spec endpoint_date for {label} is {spec_date.date()} '
+                f'but the event catalog gives {catalog_date.date()}; '
+                'explicit dates and catalog endpoints must agree.'
+            )
+
+
+def _ofes_sc_format_date_ranges(dates) -> str:
+    """把日期列表格式化为连续区间文字（首个区间带年份）。"""
+    normalized = sorted(pd.Timestamp(d).normalize() for d in dates)
+    if not normalized:
+        return '(no dates)'
+    ranges = []
+    start = prev = normalized[0]
+    for current in normalized[1:]:
+        if (current - prev).days == 1:
+            prev = current
+            continue
+        ranges.append((start, prev))
+        start = prev = current
+    ranges.append((start, prev))
+    parts = []
+    for index, (lo, hi) in enumerate(ranges):
+        lo_text = f'{lo:%Y-%m-%d}' if index == 0 else f'{lo:%m-%d}'
+        parts.append(lo_text if lo == hi else f'{lo_text}\u2013{hi:%m-%d}')
+    return '\u3001'.join(parts)
+
+
+
+
+def _ofes_sc_endpoint_registration(
+    ctx: dict,
+    events: dict[str, pd.Series],
+    objects: pd.DataFrame,
+    profile_gate: pd.DataFrame,
+    candidates: pd.DataFrame,
+    endpoint_points: dict[str, tuple[float, float]],
+    settings: dict,
+) -> pd.DataFrame:
+    """登记 DO 峰、McCoy 热盐核心和独立动力候选的端点位置与垂向范围。"""
+    rows: list[dict] = []
+    for label, event_id in ctx['base_event_ids'].items():
+        event = events[label]
+        endpoint_date = event[ctx['base_endpoint_fields'][label]]
+        endpoint_lon, endpoint_lat = endpoint_points[
+            ctx['base_endpoint_roles'][label]
+        ]
+        event_objects = objects.loc[
+            objects['event_id'].astype(str).eq(event_id)
+        ].copy()
+        peak_rows = event_objects.loc[
+            event_objects['daily_object_key'].astype(str).eq(
+                str(event['peak_daily_object_key'])
+            )
+        ]
+        endpoint_rows = event_objects.loc[
+            pd.to_datetime(event_objects['date']).dt.normalize().eq(endpoint_date)
+        ]
+
+        def add_row(
+            role: str,
+            source_product: str,
+            source_id: str,
+            date: pd.Timestamp,
+            lon: float,
+            lat: float,
+            depth_m: float,
+            shallow_m: float,
+            deep_m: float,
+            horizontal_radius_km: float,
+            rossby: float | None = None,
+            strain: float | None = None,
+            dynamic_fraction: float | None = None,
+            component_cells: float | None = None,
+            candidate_merge_decision: str | None = None,
+            status: str = 'finite_position_and_vertical_range',
+            notes: str = '',
+        ) -> None:
+            finite_lateral = bool(
+                np.all(
+                    np.isfinite(
+                        [
+                            lon,
+                            lat,
+                            depth_m,
+                            shallow_m,
+                            deep_m,
+                            horizontal_radius_km,
+                        ]
+                    )
+                )
+                and dynamic_fraction is not None
+                and np.isfinite(dynamic_fraction)
+                and rossby is not None
+                and strain is not None
+                and np.all(np.isfinite([rossby, strain]))
+            )
+            if dynamic_fraction is not None and finite_lateral:
+                lateral_status = 'finite_component_rotation_support'
+            elif role.startswith('McCoy_T_S_core'):
+                lateral_status = 'single_point_rotation_only_no_lateral_component'
+            elif role.startswith('DO_'):
+                lateral_status = 'formal_object_lateral_rotation_not_available'
+            else:
+                lateral_status = 'lateral_rotation_support_not_available'
+            distance = float(
+                great_circle_distance_m(
+                    lon,
+                    lat,
+                    endpoint_lon,
+                    endpoint_lat,
+                )
+                / 1000.0
+            )
+            rows.append(
+                {
+                    'case_label': label,
+                    'event_id': event_id,
+                    'endpoint_role': ctx['base_endpoint_roles'][label],
+                    'endpoint_date': endpoint_date,
+                    'registration_role': role,
+                    'source_product': source_product,
+                    'source_id': source_id,
+                    'date': date,
+                    'lon': lon,
+                    'lat': lat,
+                    'depth_m': depth_m,
+                    'vertical_shallow_depth_m': shallow_m,
+                    'vertical_deep_depth_m': deep_m,
+                    'vertical_thickness_m': deep_m - shallow_m,
+                    'horizontal_radius_km': horizontal_radius_km,
+                    'distance_to_DO_endpoint_km': distance,
+                    'rossby_number': rossby,
+                    'normalized_strain': strain,
+                    'component_dynamic_fraction': dynamic_fraction,
+                    'thermohaline_component_cells': component_cells,
+                    'finite_lateral_rotation_support': finite_lateral,
+                    'lateral_rotation_support_status': lateral_status,
+                    'candidate_merge_decision': candidate_merge_decision,
+                    'registration_status': status,
+                    'notes': notes,
+                }
+            )
+
+        for source_role, source_rows in (
+            ('DO_peak_object', peak_rows),
+            ('DO_endpoint_object', endpoint_rows),
+        ):
+            for row in source_rows.itertuples(index=False):
+                add_row(
+                    source_role,
+                    'formal_DO50_daily_objects',
+                    str(row.daily_object_key),
+                    pd.Timestamp(row.date),
+                    float(row.peak_lon if source_role == 'DO_peak_object' else row.centroid_lon),
+                    float(row.peak_lat if source_role == 'DO_peak_object' else row.centroid_lat),
+                    float(row.peak_depth_at_max),
+                    float(row.depth_min),
+                    float(row.depth_max),
+                    float(row.equivalent_radius_km),
+                    status='formal_daily_object_position_and_depth',
+                    notes='retained catalog object; connection fields are in formal_detection_object_audit.csv',
+                )
+
+        mccoy_rows = profile_gate.loc[
+            profile_gate['event_id'].astype(str).eq(event_id)
+            & profile_gate['stage'].astype(str).eq('peak')
+            & profile_gate['sample_role'].astype(str).eq('event')
+        ]
+        preferred = mccoy_rows.loc[
+            mccoy_rows['sample_id'].astype(str).eq('event_000')
+        ]
+        peak_reference = (
+            preferred.iloc[0]
+            if not preferred.empty
+            else (mccoy_rows.iloc[0] if not mccoy_rows.empty else None)
+        )
+        same_day_rows = mccoy_rows.loc[
+            pd.to_datetime(mccoy_rows['date']).dt.normalize().eq(endpoint_date)
+        ]
+        if not same_day_rows.empty:
+            row = same_day_rows.iloc[0]
+            add_row(
+                'McCoy_T_S_core_endpoint',
+                'profile_gate_margins_219.csv',
+                f'{event_id}|{row["profile_id"]}',
+                endpoint_date,
+                float(row['centroid_lon']),
+                float(row['centroid_lat']),
+                float(row['event_peak_depth_m']),
+                float(row['gaussian_core_shallow_depth_m']),
+                float(row['gaussian_core_deep_depth_m']),
+                float(row['event_equivalent_radius_km']),
+                float(row['direct_rossby_number']),
+                float(row['direct_normalized_strain']),
+                status='same_day_McCoy_endpoint_record',
+                notes='same-day McCoy profile; still not a material-identity proof',
+            )
+        else:
+            add_row(
+                'McCoy_T_S_core_endpoint',
+                'profile_gate_margins_219.csv',
+                'none_same_day_endpoint_profile',
+                endpoint_date,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                status='endpoint_day_McCoy_record_missing',
+                notes='no McCoy T/S core on the endpoint date; peak-day reference is kept separately and is not endpoint registration',
+            )
+        if peak_reference is not None:
+            add_row(
+                'McCoy_T_S_core_peak_reference',
+                'profile_gate_margins_219.csv',
+                f'{event_id}|{peak_reference["profile_id"]}',
+                pd.Timestamp(peak_reference['date']),
+                float(peak_reference['centroid_lon']),
+                float(peak_reference['centroid_lat']),
+                float(peak_reference['event_peak_depth_m']),
+                float(peak_reference['gaussian_core_shallow_depth_m']),
+                float(peak_reference['gaussian_core_deep_depth_m']),
+                float(peak_reference['event_equivalent_radius_km']),
+                float(peak_reference['direct_rossby_number']),
+                float(peak_reference['direct_normalized_strain']),
+                status='peak_day_reference_not_endpoint_registration',
+                notes='peak-day McCoy reference retained; date differs from endpoint and is not used as same-day registration',
+            )
+
+        candidate_rows = candidates.loc[
+            candidates['date'].eq(endpoint_date)
+        ].copy()
+        if not candidate_rows.empty:
+            candidate_rows['endpoint_distance_km'] = [
+                float(
+                    great_circle_distance_m(
+                        row.lon,
+                        row.lat,
+                        endpoint_lon,
+                        endpoint_lat,
+                    )
+                    / 1000.0
+                )
+                for row in candidate_rows.itertuples(index=False)
+            ]
+            candidate_rows = candidate_rows.loc[
+                candidate_rows['endpoint_distance_km'].le(
+                    settings['endpoint_association_radius_km']
+                )
+            ]
+        if candidate_rows.empty:
+            add_row(
+                'independent_velocity_support_candidate',
+                'native_T_S_u_v_structure_candidates',
+                'none_within_endpoint_association_radius',
+                endpoint_date,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                status='no_candidate_within_endpoint_association_radius',
+                notes='absence of a retained candidate is not interpreted as no physical structure',
+            )
+        else:
+            for row in candidate_rows.itertuples(index=False):
+                add_row(
+                    'independent_velocity_support_candidate',
+                    'native_T_S_u_v_structure_candidates',
+                    str(row.candidate_id),
+                    pd.Timestamp(row.date),
+                    float(row.lon),
+                    float(row.lat),
+                    float(row.depth_m),
+                    float(row.vertical_shallow_depth_m),
+                    float(row.vertical_deep_depth_m),
+                    float(row.thermohaline_component_radius_km),
+                    float(row.rossby_number),
+                    float(row.normalized_strain),
+                    float(row.component_dynamic_fraction),
+                    float(row.thermohaline_component_cells),
+                    candidate_merge_decision=str(row.candidate_merge_decision),
+                    status='finite_component_rotation_and_vertical_range',
+                    notes='lateral component summary and vertical range are retained; no single-point Ro-only registration',
+                )
+    return pd.DataFrame(rows)
+
+
+def _ofes_sc_release_group_label(integration_label: str) -> str:
+    """保留轨迹积分标签，同时给出可读的释放/控制组。"""
+    label = str(integration_label)
+    if 'fixed_depth' in label:
+        return 'fixed_depth_control'
+    if 'replay' in label:
+        return 'forward_replay'
+    if 'backward' in label:
+        return 'backward_peak_to_start'
+    if 'observed_start' in label:
+        return 'forward_observed_start_to_peak'
+    if 'peak_to_future' in label:
+        return 'forward_peak_to_future'
+    return label
+
+
+def _ofes_sc_material_registration(
+    ctx: dict,
+    candidates: pd.DataFrame,
+    paths: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """只用既有轨迹登记位置，并分开候选包络、路径归属和材料身份。"""
+    registration_rows: list[dict] = []
+    summary_rows: list[dict] = []
+    path_members = paths.copy()
+    if not path_members.empty:
+        path_members['date'] = pd.to_datetime(path_members['date']).dt.normalize()
+        candidate_to_paths = (
+            path_members.groupby('candidate_id')['path_id']
+            .apply(lambda values: sorted(set(values.astype(str))))
+            .to_dict()
+        )
+    else:
+        candidate_to_paths = {}
+    for label, event_id in ctx['base_event_ids'].items():
+        primary_path = ctx['base_primary_trajectory_root'] / 'events' / event_id / 'trajectories.parquet'
+        post_peak_path = ctx['base_post_peak_root'] / 'events' / event_id / 'daily_tracer_samples.parquet'
+        source_frames = []
+        if primary_path.exists():
+            primary = pd.read_parquet(primary_path)
+            primary['date'] = pd.to_datetime(primary['time']).dt.normalize()
+            primary = primary.loc[
+                primary['time'].dt.hour.eq(0)
+                & primary['date'].isin(ctx['base_structure_dates'])
+            ].copy()
+            primary['trajectory_source'] = str(primary_path)
+            primary['source_status'] = primary['status'].astype(str)
+            source_frames.append(
+                primary[
+                    [
+                        'integration_label', 'date', 'particle_index',
+                        'particle_id', 'depth_m', 'lat', 'lon', 'status',
+                        'trajectory_source', 'source_status',
+                    ]
+                ]
+            )
+        if post_peak_path.exists():
+            post_peak = pd.read_parquet(post_peak_path)
+            post_peak['date'] = pd.to_datetime(post_peak['date']).dt.normalize()
+            post_peak = post_peak.loc[
+                post_peak['date'].isin(ctx['base_structure_dates'])
+            ].copy()
+            post_peak['status'] = 'active_sample_row'
+            post_peak['trajectory_source'] = str(post_peak_path)
+            post_peak['source_status'] = 'active_sample_row'
+            source_frames.append(
+                post_peak[
+                    [
+                        'integration_label', 'date', 'particle_index',
+                        'particle_id', 'depth_m', 'lat', 'lon', 'status',
+                        'trajectory_source', 'source_status',
+                    ]
+                ]
+            )
+        if not source_frames:
+            continue
+        source = pd.concat(source_frames, ignore_index=True)
+        source = source.sort_values(
+            ['integration_label', 'date', 'particle_id', 'trajectory_source'],
+            kind='mergesort',
+        ).drop_duplicates(
+            ['integration_label', 'date', 'particle_id'],
+            keep='first',
+        )
+        metadata_path = ctx['base_primary_trajectory_root'] / 'particle_metadata.parquet'
+        if metadata_path.exists():
+            metadata = pd.read_parquet(metadata_path)
+            metadata = metadata.loc[
+                metadata['event_id'].astype(str).eq(event_id)
+            ]
+        else:
+            metadata = pd.DataFrame()
+        observed_groups = sorted(source['integration_label'].astype(str).unique())
+        for integration_label in observed_groups:
+            group = source.loc[
+                source['integration_label'].astype(str).eq(integration_label)
+            ].copy()
+            group_dates = pd.date_range(
+                group['date'].min(),
+                group['date'].max(),
+                freq='D',
+            )
+            if not metadata.empty:
+                expected_ids = metadata['particle_id'].astype(str).drop_duplicates().tolist()
+                particle_index_by_id = metadata.set_index(
+                    metadata['particle_id'].astype(str)
+                )['particle_index'].to_dict()
+            else:
+                expected_ids = sorted(group['particle_id'].astype(str).unique())
+                particle_index_by_id = {
+                    str(row.particle_id): int(row.particle_index)
+                    for row in group.itertuples(index=False)
+                }
+            for date in group_dates:
+                date = pd.Timestamp(date).normalize()
+                day = group.loc[group['date'].eq(date)].copy()
+                day['particle_id'] = day['particle_id'].astype(str)
+                day_by_particle = day.set_index('particle_id', drop=False)
+                candidate_day = candidates.loc[
+                    candidates['date'].eq(date)
+                ].copy()
+                active_count = int(
+                    day['status'].astype(str).str.contains('active').sum()
+                )
+                valid_count = 0
+                invalid_count = 0
+                unobserved_count = 0
+                inside_any_count = 0
+                inside_path_count = 0
+                matched_nonpath_count = 0
+                outside_count = 0
+                for particle_id in expected_ids:
+                    if particle_id not in day_by_particle.index:
+                        position_validity = 'unobserved_member'
+                        inside_any_envelope = None
+                        inside_path_envelope = None
+                        candidate_ids = ''
+                        candidate_path_ids = ''
+                        path_association_status = 'unobserved_member'
+                        envelope_basis = 'candidate_center_radius_vertical_interval_approximation'
+                        reason = 'no_existing_trajectory_row_for_date_and_particle'
+                        particle_index = particle_index_by_id.get(particle_id)
+                        unobserved_count += 1
+                    else:
+                        row = day_by_particle.loc[particle_id]
+                        finite_position = bool(
+                            np.all(
+                                np.isfinite(
+                                    [
+                                        float(row['lon']),
+                                        float(row['lat']),
+                                        float(row['depth_m']),
+                                    ]
+                                )
+                            )
+                        )
+                        active_status = 'active' in str(row['status'])
+                        if finite_position and active_status:
+                            position_validity = 'valid_active_position'
+                            valid_count += 1
+                            particle_index = int(row['particle_index'])
+                            matches = []
+                            matched_path_ids = set()
+                            for candidate in candidate_day.itertuples(index=False):
+                                radius = float(candidate.thermohaline_component_radius_km)
+                                distance = float(
+                                    great_circle_distance_m(
+                                        float(row['lon']),
+                                        float(row['lat']),
+                                        float(candidate.lon),
+                                        float(candidate.lat),
+                                    )
+                                    / 1000.0
+                                )
+                                in_horizontal = (
+                                    np.isfinite(radius) and distance <= radius
+                                )
+                                in_vertical = (
+                                    float(candidate.vertical_shallow_depth_m)
+                                    <= float(row['depth_m'])
+                                    <= float(candidate.vertical_deep_depth_m)
+                                )
+                                if in_horizontal and in_vertical:
+                                    matches.append(str(candidate.candidate_id))
+                                    matched_path_ids.update(
+                                        candidate_to_paths.get(
+                                            str(candidate.candidate_id), []
+                                        )
+                                    )
+                            candidate_path_ids = ''
+                            path_association_status = 'no_candidate_match'
+                            envelope_basis = 'candidate_center_radius_vertical_interval_approximation'
+                            if not candidate_day.empty and matches:
+                                inside_any_envelope = True
+                                inside_any_count += 1
+                                if matched_path_ids:
+                                    inside_path_envelope = True
+                                    inside_path_count += 1
+                                    path_association_status = 'matched_enumerated_path_candidate'
+                                    reason = 'matched_candidate_envelope_with_enumerated_path_membership'
+                                else:
+                                    inside_path_envelope = False
+                                    matched_nonpath_count += 1
+                                    path_association_status = 'matched_retained_candidate_not_in_enumerated_path'
+                                    reason = 'matched_candidate_envelope_but_not_enumerated_path'
+                            elif candidate_day.empty:
+                                inside_any_envelope = None
+                                inside_path_envelope = None
+                                path_association_status = 'no_retained_structure_candidate_on_date'
+                                envelope_basis = 'candidate_center_radius_vertical_interval_approximation'
+                                reason = 'no_retained_structure_candidate_on_date'
+                            else:
+                                inside_any_envelope = False
+                                inside_path_envelope = False
+                                path_association_status = 'outside_all_candidate_envelopes'
+                                outside_count += 1
+                                reason = 'outside_all_retained_candidate_envelopes'
+                            candidate_ids = ';'.join(matches)
+                            candidate_path_ids = ';'.join(sorted(matched_path_ids))
+                        else:
+                            position_validity = 'invalid_position'
+                            invalid_count += 1
+                            particle_index = int(row['particle_index'])
+                            inside_any_envelope = None
+                            inside_path_envelope = None
+                            candidate_ids = ''
+                            candidate_path_ids = ''
+                            path_association_status = 'invalid_position'
+                            envelope_basis = 'candidate_center_radius_vertical_interval_approximation'
+                            reason = 'nonfinite_position_or_nonactive_status'
+                    registration_rows.append(
+                        {
+                            'case_label': label,
+                            'event_id': event_id,
+                            'date': date,
+                            'integration_label': integration_label,
+                            'release_group': _ofes_sc_release_group_label(integration_label),
+                            'particle_index': particle_index,
+                            'particle_id': particle_id,
+                            'position_validity': position_validity,
+                            'expected_particle_count': int(len(expected_ids)),
+                            'active_count': active_count,
+                            'valid_position_count': valid_count,
+                            'invalid_position_count': invalid_count,
+                            'unobserved_member_count': unobserved_count,
+                            'inside_structure': inside_any_envelope,
+                            'inside_structure_semantics': (
+                                'deprecated_alias_inside_any_candidate_envelope_not_target_structure'
+                            ),
+                            'inside_any_candidate_envelope': inside_any_envelope,
+                            'inside_enumerated_path_envelope': inside_path_envelope,
+                            'candidate_match_ids': candidate_ids,
+                            'candidate_match_path_ids': candidate_path_ids,
+                            'path_association_status': path_association_status,
+                            'envelope_basis': envelope_basis,
+                            'candidate_match_count': int(
+                                len(candidate_ids.split(';')) if candidate_ids else 0
+                            ),
+                            'candidate_ids': candidate_ids,
+                            'trajectory_source': (
+                                str(day.iloc[0]['trajectory_source'])
+                                if not day.empty else str(primary_path)
+                            ),
+                            'source_status': (
+                                str(day.iloc[0]['source_status'])
+                                if not day.empty else 'unobserved_member'
+                            ),
+                            'registration_reason': reason,
+                            'material_continuity_status': (
+                                'position_registration_only_not_material_identity'
+                            ),
+                        }
+                    )
+                summary_rows.append(
+                    {
+                        'case_label': label,
+                        'event_id': event_id,
+                        'date': date,
+                        'integration_label': integration_label,
+                        'release_group': _ofes_sc_release_group_label(integration_label),
+                        'expected_particle_count': int(len(expected_ids)),
+                        'observed_row_count': int(len(day)),
+                        'active_count': active_count,
+                        'valid_position_count': valid_count,
+                        'invalid_position_count': invalid_count,
+                        'unobserved_member_count': unobserved_count,
+                        'inside_any_candidate_envelope_count': inside_any_count,
+                        'inside_enumerated_path_envelope_count': inside_path_count,
+                        'matched_nonpath_candidate_count': matched_nonpath_count,
+                        'outside_candidate_envelope_count': outside_count,
+                        'envelope_basis': 'candidate_center_radius_vertical_interval_approximation',
+                        'path_membership_available': bool(candidate_to_paths),
+                        'structure_candidate_count': int(len(candidate_day)),
+                        'material_continuity_status': (
+                            'position_registration_only_not_material_identity'
+                        ),
+                    }
+                )
+    registration = pd.DataFrame(registration_rows)
+    if not registration.empty:
+        group_keys = ['event_id', 'date', 'integration_label']
+        grouped = registration.groupby(group_keys, sort=False)
+        count_maps = {
+            'valid_position_count': grouped['position_validity'].agg(
+                lambda values: int(values.eq('valid_active_position').sum())
+            ),
+            'invalid_position_count': grouped['position_validity'].agg(
+                lambda values: int(values.eq('invalid_position').sum())
+            ),
+            'unobserved_member_count': grouped['position_validity'].agg(
+                lambda values: int(values.eq('unobserved_member').sum())
+            ),
+        }
+        for column, values in count_maps.items():
+            registration[column] = [
+                int(values.loc[(row.event_id, row.date, row.integration_label)])
+                for row in registration.itertuples(index=False)
+            ]
+    return registration, pd.DataFrame(summary_rows)
+
+
+def _ofes_sc_perturbation_path_state(
+    ctx: dict,
+    variant: str,
+    variant_candidates: pd.DataFrame,
+    variant_matching: dict,
+    variant_path: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """展开每个扰动的逐日位置、深度、结构范围和分支状态。"""
+    date_summary = variant_matching['date_summary'].copy()
+    date_summary['date'] = pd.to_datetime(date_summary['date']).dt.normalize()
+    branch_by_date = date_summary.set_index('date').to_dict(orient='index')
+    members = variant_path['paths'].copy()
+    if not members.empty:
+        members['date'] = pd.to_datetime(members['date']).dt.normalize()
+        members = members.merge(
+            variant_candidates,
+            on=['date', 'candidate_id'],
+            how='left',
+            validate='many_to_one',
+        )
+    state_rows = []
+    if members.empty:
+        for date in ctx['base_structure_dates']:
+            branch = branch_by_date.get(pd.Timestamp(date), {})
+            state_rows.append(
+                {
+                    'variant': variant,
+                    'path_id': None,
+                    'date': pd.Timestamp(date),
+                    'step': np.nan,
+                    'candidate_id': None,
+                    'path_status': variant_path['summary']['path_status'],
+                    'path_member_present': False,
+                    'candidate_count': int(branch.get('candidate_count', 0)),
+                    'ambiguous_candidate_count': int(
+                        branch.get('ambiguous_candidate_count', 0)
+                    ),
+                    'branch_state': (
+                        'ambiguous' if branch.get('ambiguous_candidate_count', 0) else 'no_path_member'
+                    ),
+                }
+            )
+    else:
+        for row in members.itertuples(index=False):
+            branch = branch_by_date.get(pd.Timestamp(row.date), {})
+            state_rows.append(
+                {
+                    'variant': variant,
+                    'path_id': str(row.path_id),
+                    'date': pd.Timestamp(row.date),
+                    'step': int(row.step),
+                    'candidate_id': str(row.candidate_id),
+                    'lon': float(row.lon),
+                    'lat': float(row.lat),
+                    'depth_m': float(row.depth_m),
+                    'vertical_shallow_depth_m': float(row.vertical_shallow_depth_m),
+                    'vertical_deep_depth_m': float(row.vertical_deep_depth_m),
+                    'vertical_thickness_m': float(row.vertical_thickness_m),
+                    'horizontal_extent_radius_km': float(
+                        row.thermohaline_component_radius_km
+                    ),
+                    'path_status': variant_path['summary']['path_status'],
+                    'path_member_present': True,
+                    'candidate_count': int(branch.get('candidate_count', 0)),
+                    'ambiguous_candidate_count': int(
+                        branch.get('ambiguous_candidate_count', 0)
+                    ),
+                    'branch_state': (
+                        'ambiguous' if branch.get('ambiguous_candidate_count', 0) else 'path_member'
+                    ),
+                }
+            )
+    state = pd.DataFrame(state_rows)
+    valid = state.loc[state['path_member_present'].eq(True)]
+    summary = {
+        'variant': variant,
+        'candidate_count': int(len(variant_candidates)),
+        'candidate_date_count': int(
+            variant_candidates['date'].nunique()
+            if not variant_candidates.empty else 0
+        ),
+        'edge_count': int(len(variant_matching['edges'])),
+        'start_endpoint_candidate_count': int(
+            variant_path['summary']['start_endpoint_candidate_count']
+        ),
+        'end_endpoint_candidate_count': int(
+            variant_path['summary']['end_endpoint_candidate_count']
+        ),
+        'full_path_count': int(variant_path['summary']['full_path_count']),
+        'path_status': variant_path['summary']['path_status'],
+        'path_member_count_all_paths': int(len(valid)),
+        'path_member_date_count_all_paths': int(valid['date'].nunique()),
+        'ambiguous_branch_date_count': int(
+            state['branch_state'].eq('ambiguous').sum()
+        ),
+        'median_path_depth_m_all_paths': float(valid['depth_m'].median())
+        if not valid.empty else np.nan,
+        'median_vertical_thickness_m_all_paths': float(
+            valid['vertical_thickness_m'].median()
+        ) if not valid.empty else np.nan,
+        'median_horizontal_extent_radius_km_all_paths': float(
+            valid['horizontal_extent_radius_km'].median()
+        ) if not valid.empty else np.nan,
+        'path_positions_compared_without_path_selection': True,
+    }
+    return state, summary
+
+
+def _ofes_sc_path_candidate_by_date(
+    paths: pd.DataFrame,
+    date: pd.Timestamp,
+    *,
+    path_id: str | None = None,
+) -> str | None:
+    rows = paths.loc[
+        paths["date"].eq(date)
+        & paths["path_id"].eq(path_id)
+    ]
+    if rows.empty:
+        return None
+    return str(rows.iloc[0]["candidate_id"])
+
+
+def _ofes_sc_plot_maps(
+    ctx: dict,
+    candidates: pd.DataFrame,
+    results: dict[pd.Timestamp, dict],
+    endpoint_points: dict[str, tuple[float, float]],
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=False, sharey=False)
+    vmax = 0.55
+    for ax, date in zip(axes.ravel(), ctx['base_figure_dates']):
+        result = results[pd.Timestamp(date)]
+        fields = result["fields"]
+        depth = np.asarray(fields["depth"], dtype=float)
+        level = int(np.argmin(abs(depth - 450.0)))
+        mesh = ax.pcolormesh(
+            fields["lon"],
+            fields["lat"],
+            fields["spiciness_anomaly"][level],
+            shading="auto",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+        )
+        day_candidates = candidates.loc[candidates["date"].eq(date)].copy()
+        if not day_candidates.empty:
+            marker_colors = np.where(
+                day_candidates["rossby_number"].to_numpy(float) < 0,
+                "#1764ab",
+                "#d95f02",
+            )
+            marker_sizes = 12.0 + 42.0 * np.minimum(
+                day_candidates["spiciness_anomaly"].abs().to_numpy(float),
+                0.5,
+            )
+            ax.scatter(
+                day_candidates["lon"],
+                day_candidates["lat"],
+                c=marker_colors,
+                s=marker_sizes,
+                edgecolor="black",
+                linewidth=0.25,
+                alpha=0.78,
+                label="all retained candidates",
+            )
+        if date == ctx['base_figure_dates'][0]:
+            ax.scatter(
+                *endpoint_points[ctx['start_endpoint_role']],
+                marker="*",
+                s=160,
+                c="black",
+                label=f"{ctx['start_label']} observed end",
+                zorder=5,
+            )
+        if date == ctx['base_figure_dates'][-1]:
+            ax.scatter(
+                *endpoint_points[ctx['end_endpoint_role']],
+                marker="*",
+                s=160,
+                c="gold",
+                edgecolor="black",
+                label=f"{ctx['end_label']} observed start",
+                zorder=5,
+            )
+        ax.set_title(f"{date:%Y-%m-%d} | z={depth[level]:.1f} m")
+        ax.set_xlabel("Longitude (°E)")
+        ax.set_ylabel("Latitude (°N)")
+        ax.grid(alpha=0.25)
+    fig.colorbar(mesh, ax=axes.ravel().tolist(), label="high-pass spiciness anomaly")
+    handles, labels = axes.ravel()[0].get_legend_handles_labels()
+    if handles:
+        axes.ravel()[0].legend(handles, labels, fontsize=8, loc="upper left")
+    fig.suptitle(
+        "E225–E246 independent OFES structure candidates\n"
+        "T/S-derived spiciness anomaly; marker color: Ro sign; all candidates retained",
+        fontsize=13,
+    )
+    fig.savefig(ctx['base_root'] / "structure_candidate_maps.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ofes_sc_plot_sections(
+    ctx: dict,
+    candidates: pd.DataFrame,
+    results: dict[pd.Timestamp, dict],
+    paths: pd.DataFrame,
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey=True)
+    vmax = 0.55
+    for ax, date in zip(axes.ravel(), ctx['base_figure_dates']):
+        result = results[pd.Timestamp(date)]
+        fields = result["fields"]
+        candidate_id = _ofes_sc_path_candidate_by_date(
+            paths, pd.Timestamp(date), path_id=ctx["display_path_id"]
+        )
+        day_candidates = candidates.loc[candidates["date"].eq(date)]
+        if candidate_id is None and not day_candidates.empty:
+            candidate_id = str(day_candidates.iloc[0]["candidate_id"])
+        selected = (
+            day_candidates.loc[day_candidates["candidate_id"].eq(candidate_id)].iloc[0]
+            if candidate_id is not None
+            and not day_candidates.loc[day_candidates["candidate_id"].eq(candidate_id)].empty
+            else None
+        )
+        if selected is None:
+            lat_index = len(fields["lat"]) // 2
+            selected_lon = np.nan
+            selected_depth = np.nan
+        else:
+            lat_index = int(selected["lat_index"])
+            selected_lon = float(selected["lon"])
+            selected_depth = float(selected["depth_m"])
+        mesh = ax.pcolormesh(
+            fields["lon"],
+            fields["depth"],
+            fields["spiciness_anomaly"][:, lat_index, :],
+            shading="auto",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+        )
+        if np.isfinite(selected_lon):
+            ax.scatter(
+                [selected_lon],
+                [selected_depth],
+                marker="*",
+                s=120,
+                c="black",
+                zorder=5,
+            )
+        ax.invert_yaxis()
+        ax.set_title(
+            f"{date:%Y-%m-%d} | section lat={float(fields['lat'][lat_index]):.2f}°N"
+        )
+        ax.set_xlabel("Longitude (°E)")
+        ax.grid(alpha=0.2)
+    axes[0, 0].set_ylabel("Depth (m)")
+    axes[1, 0].set_ylabel("Depth (m)")
+    fig.colorbar(mesh, ax=axes.ravel().tolist(), label="high-pass spiciness anomaly")
+    fig.suptitle(
+        "Independent thermohaline vertical sections\n"
+        "black stars mark the one enumerated path only when a full path exists",
+        fontsize=13,
+    )
+    fig.savefig(ctx['base_root'] / "structure_vertical_sections.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ofes_sc_plot_timeline(
+    ctx: dict,
+    date_summary: pd.DataFrame,
+    event_rows: dict[str, pd.Series],
+    observed_dates: dict[str, set[pd.Timestamp]],
+) -> None:
+    full_dates = pd.date_range(
+        event_rows[ctx['start_label']]['start_date'],
+        event_rows[ctx['end_label']]['end_date'],
+        freq='D',
+    )
+    timeline = pd.DataFrame({"date": full_dates})
+    timeline = timeline.merge(date_summary, on="date", how="left")
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(14, 7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.4, 1]},
+    )
+    axes[0].plot(
+        timeline["date"],
+        timeline["candidate_count"],
+        marker="o",
+        ms=3,
+        label="candidate count",
+    )
+    axes[0].plot(
+        timeline["date"],
+        timeline["valid_edge_count_to_next_day"],
+        marker="s",
+        ms=3,
+        label="valid outgoing edges",
+    )
+    axes[0].axvspan(
+        ctx['start_endpoint_date'] + pd.Timedelta(days=1),
+        ctx['end_endpoint_date'] - pd.Timedelta(days=1),
+        color='0.8',
+        alpha=0.45,
+        label='between formal catalog windows',
+    )
+    axes[0].set_ylabel("independent structure count")
+    axes[0].legend(loc="upper left", fontsize=8)
+    axes[0].grid(alpha=0.25)
+    for label, event_id, color in (
+        (f"{ctx['start_label']} observed", ctx['start_label'], "#1b9e77"),
+        (f"{ctx['end_label']} observed", ctx['end_label'], "#7570b3"),
+    ):
+        observed = sorted(observed_dates[event_id])
+        axes[1].scatter(
+            observed,
+            np.full(len(observed), 1 if event_id == ctx['start_label'] else 0),
+            marker="|",
+            s=100,
+            linewidths=2,
+            color=color,
+            label=label,
+        )
+    axes[1].axvspan(
+        ctx['start_endpoint_date'] + pd.Timedelta(days=1),
+        ctx['end_endpoint_date'] - pd.Timedelta(days=1),
+        color="0.8",
+        alpha=0.45,
+    )
+    axes[1].set_yticks([0, 1], [ctx['end_label'], ctx['start_label']])
+    axes[1].set_ylabel("DO detection")
+    axes[1].set_ylim(-0.5, 1.5)
+    axes[1].legend(loc="upper left", fontsize=8)
+    axes[1].grid(alpha=0.25)
+    axes[1].xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+    axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    fig.suptitle(
+        "E225–E246: independent structure search versus formal DO catalog windows\n"
+        "gray interval is between catalog windows, not a claim of structural absence",
+        fontsize=13,
+    )
+    fig.savefig(ctx['base_root'] / "structure_vs_do_timeline.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ofes_sc_assert_output_case_isolation(ctx: dict) -> None:
+    """拒绝把当前案例的结果写进属于其他案例的输出目录。
+
+    说明:
+        - 以 manifest 记录的案例身份（事件 ID 与端点日期）核对归属：
+          `case_spec.events` 优先，退回顶层 `events` 段。
+        - 没有可用身份记录的旧 manifest 无法判定归属，直接报错而不是放行。
+        - `case_id` 只作附加核对；同名 case_id 不能代替事件身份核对。
+    """
+    manifest_path = ctx['base_root'] / 'input_source_manifest.json'
+    if not manifest_path.exists():
+        return
+    existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+    existing_case = (existing.get('case_spec') or {}).get('case_id')
+    if existing_case and existing_case != ctx['case_id']:
+        raise RuntimeError(
+            f'Output directory {ctx["base_root"]} belongs to case '
+            f'{existing_case!r}; refusing to write case {ctx["case_id"]!r} '
+            'results into it.'
+        )
+    recorded = {}
+    for event in (existing.get('case_spec') or {}).get('events') or []:
+        recorded[str(event.get('label'))] = {
+            'event_id': event.get('event_id'),
+            'endpoint_date': event.get('endpoint_date'),
+        }
+    if not recorded:
+        for label, payload in (existing.get('events') or {}).items():
+            recorded[str(label)] = {
+                'event_id': payload.get('event_id'),
+                'endpoint_date': payload.get('endpoint_object_date'),
+            }
+    if not recorded:
+        raise RuntimeError(
+            f'Output directory {ctx["base_root"]} records no case identity '
+            '(neither case_spec.events nor events); refusing to write without '
+            'ownership verification.'
+        )
+    for label, event_id in ctx['base_event_ids'].items():
+        entry = recorded.get(label)
+        if entry is None or entry.get('event_id') != event_id:
+            raise RuntimeError(
+                f'Output directory {ctx["base_root"]} belongs to a different '
+                f'case (event {label}: recorded '
+                f'{entry.get("event_id") if entry else None!r}, requested '
+                f'{event_id!r}); refusing to write.'
+            )
+        recorded_date = entry.get('endpoint_date')
+        if recorded_date is None:
+            continue
+        if pd.Timestamp(recorded_date).normalize() != pd.Timestamp(
+            ctx['base_endpoint_dates'][label]
+        ).normalize():
+            raise RuntimeError(
+                f'Output directory {ctx["base_root"]} recorded endpoint date '
+                f'{pd.Timestamp(recorded_date).date()} for {label}, requested '
+                f'{pd.Timestamp(ctx["base_endpoint_dates"][label]).date()}; '
+                'refusing to write.'
+            )
+
+
+def _ofes_sc_load_cached_structure_products(
+    ctx: dict,
+    expected_bounds=None,
+) -> tuple[dict, list[dict]]:
+    """读取既有结构候选、边和路径表，不重新读取或计算 native 场。
+
+    说明:
+        - 除算法设置与日期外，还核对缓存的案例身份：case_id（若记录）、
+          各事件 event_id、端点日期；`expected_bounds` 给出时还核对搜索范围。
+        - 旧缓存没有 `case_spec` 字段时，以 manifest 的 `events` 段核对身份；
+          两者都缺失的缓存没有可用身份，直接拒绝（不靠跳过检查兼容）。
+    """
+    cache_root = ctx.get('cache_root', ctx['base_root'])
+    manifest_path = cache_root / 'input_source_manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    expected = _ofes_sc_jsonable(_ofes_structure_continuity_settings())
+    if _ofes_sc_jsonable(manifest['settings']) != expected:
+        raise ValueError('Cached structure settings differ from processing.yml; regenerate explicitly.')
+    recorded_spec = manifest.get('case_spec')
+    if recorded_spec and recorded_spec.get('case_id') != ctx['case_id']:
+        raise ValueError(
+            f"Cached structure products belong to case "
+            f"{recorded_spec.get('case_id')!r}, not {ctx['case_id']!r}; "
+            'regenerate explicitly.'
+        )
+    manifest_events = manifest.get('events')
+    if not manifest_events and not recorded_spec:
+        raise ValueError(
+            'Cached structure manifest carries no case identity '
+            '(neither events nor case_spec); regenerate explicitly.'
+        )
+    for label, event_id in ctx['base_event_ids'].items():
+        if manifest_events:
+            recorded = manifest_events.get(label)
+            if not recorded or recorded.get('event_id') != event_id:
+                raise ValueError(
+                    'Cached structure products were generated for a different '
+                    f'event set ({label}: {recorded}); regenerate explicitly.'
+                )
+            recorded_date = pd.Timestamp(
+                recorded.get('endpoint_object_date')
+            ).normalize()
+            expected_date = pd.Timestamp(
+                ctx['base_endpoint_dates'][label]
+            ).normalize()
+            if recorded_date != expected_date:
+                raise ValueError(
+                    f'Cached structure endpoint date for {label} is '
+                    f'{recorded_date.date()}, expected {expected_date.date()}; '
+                    'regenerate explicitly.'
+                )
+        if recorded_spec:
+            recorded_events = {
+                event['label']: event
+                for event in recorded_spec.get('events', [])
+            }
+            recorded_event = recorded_events.get(label)
+            if not recorded_event or recorded_event.get('event_id') != event_id:
+                raise ValueError(
+                    f'Cached case_spec event identity differs for {label}; '
+                    'regenerate explicitly.'
+                )
+    source_dates = {pd.Timestamp(row['date']).normalize() for row in manifest['source_rows']}
+    if source_dates != set(ctx['base_structure_dates']):
+        raise ValueError('Cached native field dates do not cover the configured case window.')
+    if expected_bounds is not None:
+        recorded_bounds = (
+            manifest.get('structure_search') or {}
+        ).get('bounds_requested')
+        if recorded_bounds is None:
+            raise ValueError(
+                'Cached structure manifest lacks the recorded search bounds; '
+                'regenerate explicitly.'
+            )
+        recorded_flat = [
+            float(x) for x in np.asarray(recorded_bounds, dtype=float).ravel()
+        ]
+        expected_flat = [
+            float(x) for x in np.asarray(expected_bounds, dtype=float).ravel()
+        ]
+        if len(recorded_flat) != len(expected_flat) or any(
+            abs(a - b) > 1e-6 for a, b in zip(recorded_flat, expected_flat)
+        ):
+            raise ValueError(
+                'Cached structure search bounds differ from the current case '
+                'endpoints; regenerate explicitly.'
+            )
+    candidates = pd.read_csv(cache_root / 'daily_structure_candidates.csv')
+    candidates['date'] = pd.to_datetime(candidates['date']).dt.normalize()
+    edges = pd.read_csv(cache_root / 'structure_match_edges.csv')
+    for column in ('from_date', 'to_date'):
+        edges[column] = pd.to_datetime(edges[column]).dt.normalize()
+    date_summary = pd.read_csv(cache_root / 'daily_structure_correspondence.csv')
+    date_summary['date'] = pd.to_datetime(date_summary['date']).dt.normalize()
+    paths = pd.read_csv(cache_root / 'structure_path_members.csv')
+    if not paths.empty:
+        paths['date'] = pd.to_datetime(paths['date']).dt.normalize()
+    merge_audit = pd.read_csv(cache_root / 'candidate_merge_audit.csv')
+    merge_relations = pd.read_csv(cache_root / 'candidate_merge_relations.csv')
+    source_rows = manifest['source_rows']
+    return {
+        'candidates': candidates,
+        'edges': edges,
+        'date_summary': date_summary,
+        'paths': paths,
+        'merge_audit': merge_audit,
+        'merge_relations': merge_relations,
+    }, source_rows
+
+
+def _ofes_sc_run(ctx: dict) -> dict:
+    """复跑案例的结构连续性审计：路径汇总、正式 DO 审计、时间线与判定。"""
+    settings = _ofes_structure_continuity_settings()
+    events = pd.read_parquet(ctx['base_event_catalog_path'])
+    objects = pd.read_parquet(ctx['base_daily_object_path'])
+    profile_gate = pd.read_csv(ctx['base_profile_gate_path'])
+    event_rows = {
+        label: _ofes_sc_event_row(events, event_id)
+        for label, event_id in ctx['base_event_ids'].items()
+    }
+    _ofes_sc_check_endpoint_dates(ctx, event_rows)
+    start_endpoint_date = event_rows[ctx['start_label']][ctx['start_endpoint_field']]
+    end_endpoint_date = event_rows[ctx['end_label']][ctx['end_endpoint_field']]
+    start_point = _ofes_sc_daily_object_point(
+        objects, ctx['start_event_id'], start_endpoint_date
+    )
+    end_point = _ofes_sc_daily_object_point(
+        objects, ctx['end_event_id'], end_endpoint_date
+    )
+    endpoint_points = {
+        ctx['start_endpoint_role']: start_point,
+        ctx['end_endpoint_role']: end_point,
+    }
+    bounds = _ofes_sc_search_bounds(
+        start_point[0],
+        start_point[1],
+        end_point[0],
+        end_point[1],
+        settings["search_buffer_km"],
+    )
+    cached, source_rows = _ofes_sc_load_cached_structure_products(
+        ctx, expected_bounds=bounds
+    )
+    base_candidates = cached['candidates']
+    base_merge_audit = cached['merge_audit']
+    base_merge_relations = cached['merge_relations']
+    if base_candidates.empty:
+        raise RuntimeError("No independent structure candidates were detected.")
+    formal_audit = _ofes_sc_formal_detection_audit(ctx,
+        base_candidates,
+        events,
+        objects,
+    )
+    matching = {
+        'candidates': base_candidates,
+        'edges': cached['edges'],
+        'date_summary': cached['date_summary'],
+    }
+    path_result = summarize_ofes_structure_continuity_paths(
+        matching["candidates"],
+        matching["edges"],
+        start_date=start_endpoint_date,
+        start_lon=start_point[0],
+        start_lat=start_point[1],
+        end_date=end_endpoint_date,
+        end_lon=end_point[0],
+        end_lat=end_point[1],
+    )
+    candidates = path_result["candidates"]
+    edges = matching["edges"]
+    date_summary = matching["date_summary"]
+    paths = path_result["paths"]
+    gap_summary = _ofes_sc_candidate_envelope_gap_summary(
+        formal_audit['peak_pixels'],
+        pd.date_range(ctx['start_endpoint_date'] + pd.Timedelta(days=1), ctx['end_endpoint_date'] - pd.Timedelta(days=1), freq='D'),
+    )
+    endpoint_overlap = _ofes_sc_end_path_endpoint_overlap_summary(ctx,
+        formal_audit['peak_pixels'],
+        candidates,
+        objects,
+        paths,
+    )
+    gap_day_count = int(
+        (ctx['end_endpoint_date'] - ctx['start_endpoint_date']).days
+    ) - 1
+    endpoint_registration = _ofes_sc_endpoint_registration(ctx,
+        event_rows,
+        objects,
+        profile_gate,
+        candidates,
+        endpoint_points,
+        settings,
+    )
+    material_registration, material_daily = _ofes_sc_material_registration(ctx,
+        candidates,
+        paths,
+    )
+    date_summary["native_scene_status"] = "complete_native_scene"
+    date_summary["search_area_status"] = "sufficient_for_configured_window"
+    date_summary["structure_detection_status"] = np.where(
+        date_summary["candidate_count"].gt(0),
+        "candidates_detected",
+        "structure_not_detected",
+    )
+    date_summary["matching_status"] = np.select(
+        [
+            date_summary["ambiguous_candidate_count"].gt(0),
+            date_summary["candidate_with_incoming_edge_count"].gt(0)
+            | date_summary["candidate_with_outgoing_edge_count"].gt(0),
+        ],
+        [
+            "ambiguous_multiple_correspondences",
+            "at_least_one_candidate_correspondence",
+        ],
+        default="no_candidate_correspondence",
+    )
+    endpoint_candidates = candidates.loc[
+        candidates["start_endpoint_distance_km"].notna()
+        | candidates["end_endpoint_distance_km"].notna()
+    ].copy()
+
+    observed_dates = {}
+    for label, event_id in ctx['base_event_ids'].items():
+        event_object_dates = pd.to_datetime(
+            objects.loc[
+                objects["event_id"].astype(str).eq(event_id),
+                "date",
+            ]
+        ).dt.normalize()
+        observed_dates[label] = set(event_object_dates.tolist())
+
+    date_summary.to_csv(ctx['base_root'] / "daily_structure_correspondence.csv", index=False)
+    candidates.to_csv(ctx['base_root'] / "daily_structure_candidates.csv", index=False)
+    base_merge_audit.to_csv(ctx['base_root'] / "candidate_merge_audit.csv", index=False)
+    base_merge_relations.to_csv(ctx['base_root'] / "candidate_merge_relations.csv", index=False)
+    edges.to_csv(ctx['base_root'] / "structure_match_edges.csv", index=False)
+    paths.to_csv(ctx['base_root'] / "structure_path_members.csv", index=False)
+    endpoint_candidates.to_csv(ctx['base_root'] / "endpoint_candidate_associations.csv", index=False)
+    endpoint_registration.to_csv(ctx['base_root'] / "endpoint_registration.csv", index=False)
+    formal_audit['events'].to_csv(ctx['base_root'] / "formal_detection_event_audit.csv", index=False)
+    formal_audit['objects'].to_csv(ctx['base_root'] / "formal_detection_object_audit.csv", index=False)
+    formal_audit['support'].to_csv(ctx['base_root'] / "formal_detection_support_audit.csv", index=False)
+    formal_audit['peak_pixels'].to_csv(ctx['base_root'] / "formal_peak_pixel_audit.csv", index=False)
+    material_registration.to_csv(ctx['base_root'] / "material_registration_members.csv", index=False)
+    material_daily.to_csv(ctx['base_root'] / "material_registration_daily.csv", index=False)
+
+    timeline = pd.DataFrame({'date': pd.date_range(
+        event_rows[ctx['start_label']]['start_date'],
+        event_rows[ctx['end_label']]['end_date'],
+        freq='D',
+    )})
+    timeline = timeline.merge(date_summary, on="date", how="left")
+    timeline["candidate_count"] = timeline["candidate_count"].fillna(0).astype(int)
+    timeline["valid_edge_count_to_next_day"] = timeline[
+        "valid_edge_count_to_next_day"
+    ].fillna(0).astype(int)
+    timeline["formal_catalog_window_status"] = [
+        _ofes_sc_formal_catalog_window_status(
+            date,
+            event_rows,
+            observed_dates,
+            ctx['start_label'],
+            ctx['end_label'],
+            ctx['base_event_labels'],
+        )
+        for date in timeline["date"]
+    ]
+    timeline["detector_status"] = timeline["formal_catalog_window_status"]
+    timeline["formal_detection_audit_status"] = formal_audit['status']
+    timeline = timeline.merge(gap_summary['daily'], on='date', how='left')
+    gap_dates = pd.date_range(gap_summary['gap_start'], gap_summary['gap_end'], freq='D')
+    timeline['candidate_envelope_do50_gap_status'] = timeline[
+        'candidate_envelope_do50_gap_status'
+    ].fillna(
+        f"not_in_{gap_day_count}_day_"
+        f"{ctx['start_label']}_{ctx['end_label']}_gap"
+    )
+    timeline['candidate_envelope_support_scope'] = np.where(
+        timeline['date'].isin(gap_dates),
+        gap_summary['scope'],
+        'not_applicable',
+    )
+    timeline['candidate_envelope_gap_finding'] = np.select(
+        [
+            timeline['candidate_envelope_do50_gap_status'].eq(
+                'max_delta_do50_ge50_no_retained_object_id'
+            ),
+            timeline['candidate_envelope_do50_gap_status'].eq(
+                'max_delta_do50_lt50_no_retained_object_id'
+            ),
+        ],
+        [
+            'saved_candidate_support_peak_records_max_delta_do_ge50_no_retained_do50_object',
+            'saved_candidate_support_peak_records_max_delta_do_lt50_no_retained_do50_object',
+        ],
+        default='not_applicable',
+    )
+    timeline['candidate_envelope_gap_scope_note'] = np.where(
+        timeline['date'].isin(gap_dates),
+        'current_candidate_center_radius_vertical_interval_approximation_and_saved_peak_records;_filtering_reason_unresolved',
+        'not_applicable',
+    )
+    endpoint_registered = endpoint_overlap['execution_status'] == 'registered'
+    if endpoint_registered:
+        endpoint_peak_3d_status = (
+            'saved_object_peak_point_3d_overlap_with_candidate_envelope'
+            if endpoint_overlap['peak_points_in_candidate_envelope_count'] > 0
+            else 'no_saved_object_peak_point_3d_overlap_with_candidate_envelope'
+        )
+        endpoint_object_id_status = (
+            f"{ctx['end_label'].lower()}_do50_object_id_in_candidate_envelope"
+            if endpoint_overlap['object_id_in_candidate_envelope']
+            else f"no_{ctx['end_label'].lower()}_do50_object_id_in_candidate_envelope"
+        )
+    else:
+        endpoint_peak_3d_status = (
+            f"endpoint_{endpoint_overlap['execution_status']}"
+        )
+        endpoint_object_id_status = endpoint_peak_3d_status
+    endpoint_mask = timeline['date'].eq(endpoint_overlap['date'])
+    timeline[f"{ctx['end_label'].lower()}_path_candidate_id"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['candidate_id'],
+        None,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_candidate_vertical_shallow_depth_m"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['candidate_vertical_shallow_depth_m'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_candidate_vertical_deep_depth_m"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['candidate_vertical_deep_depth_m'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_do50_object_peak_depth_m"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['object_peak_depth_m'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_peak_depth_range_intersection_m"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['peak_depth_range_interval_intersection_m'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_oxygen_layer_overlap_m"] = np.nan
+    timeline[f"{ctx['end_label'].lower()}_path_do50_oxygen_layer_overlap_status"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['oxygen_layer_overlap_status'],
+        f"not_{ctx['end_label'].lower()}_endpoint_date",
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_horizontal_member_support_count"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['horizontal_member_support_count'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_peak_points_in_candidate_envelope_count"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['peak_points_in_candidate_envelope_count'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_object_id_in_candidate_envelope"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['object_id_in_candidate_envelope'],
+        np.nan,
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_3d_peak_point_overlap_status"] = np.where(
+        endpoint_mask,
+        endpoint_peak_3d_status,
+        'not_applicable',
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_object_id_support_status"] = np.where(
+        endpoint_mask,
+        endpoint_object_id_status,
+        'not_applicable',
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_overlap_sensitivity_note"] = np.where(
+        endpoint_mask,
+        'not_different_structure_proof_sensitive_to_candidate_envelope_and_vertical_resolution;_true_oxygen_layer_edges_not_saved',
+        'not_applicable',
+    )
+    timeline[f"{ctx['end_label'].lower()}_path_do50_overlap_note"] = np.where(
+        endpoint_mask,
+        endpoint_overlap['note'],
+        'not_applicable',
+    )
+    material_status_by_date = (
+        material_daily.groupby('date')['valid_position_count'].max().to_dict()
+        if not material_daily.empty else {}
+    )
+    timeline["material_continuity_status"] = [
+        'position_registration_only_not_material_identity'
+        if int(material_status_by_date.get(date, 0)) > 0
+        else 'no_existing_trajectory_registration_for_date'
+        for date in timeline['date']
+    ]
+    timeline["material_registration_uses_existing_trajectories"] = True
+    timeline["particle_path_used_by_structure_test"] = False
+    timeline.to_csv(ctx['base_root'] / "structure_vs_do_timeline.csv", index=False)
+
+    base_cfg = settings
+    validation = pd.read_csv(ctx.get('cache_root', ctx['base_root']) / 'parameter_perturbation_validation.csv')
+    perturbation_state = pd.read_csv(
+        ctx.get('cache_root', ctx['base_root']) / 'parameter_perturbation_daily_state.csv'
+    )
+    perturbation_state['date'] = pd.to_datetime(
+        perturbation_state['date']
+    ).dt.normalize()
+
+    if not edges.empty:
+        edge_checks = {
+            "all_edges_are_one_day": bool((edges["gap_days"] == 1).all()),
+            "all_edges_within_translation_limit": bool(
+                (edges["horizontal_distance_km"] <= base_cfg["maximum_translation_km_per_day"]).all()
+            ),
+            "all_edges_within_depth_limit": bool(
+                (edges["depth_change_m"] <= base_cfg["maximum_depth_change_m_per_day"]).all()
+            ),
+            "all_edges_same_spiciness_sign": bool(edges["same_spiciness_sign"].all()),
+            "all_edges_same_rossby_sign": bool(edges["same_rossby_sign"].all()),
+        }
+    else:
+        edge_checks = {"edge_table_empty": True}
+    vertical_profile_regression = _ofes_sc_run_vertical_profile_regression(settings)
+    if not vertical_profile_regression['passed']:
+        raise AssertionError(
+            'The vertical-profile order-independence regression failed.'
+        )
+    _ofes_sc_write_json(
+        ctx['base_root'] / "vertical_profile_regression.json",
+        vertical_profile_regression,
+    )
+    merge_decisions = set(
+        base_merge_audit['candidate_merge_decision'].dropna().astype(str)
+    ) if not base_merge_audit.empty else set()
+    validation_checks = {
+        **edge_checks,
+        "candidate_ids_unique": bool(candidates["candidate_id"].is_unique),
+        "path_dates_unique": bool(
+            paths.groupby(["path_id", "date"]).size().le(1).all()
+        ) if not paths.empty else True,
+        "do_loaded": False,
+        "particle_path_used": False,
+        "daily_field_status_is_not_structure_evidence": True,
+        "vertical_profile_order_independence_regression_passed": bool(
+            vertical_profile_regression['passed']
+        ),
+        "candidate_merge_contract_present": {
+            'retained_independent_structure',
+            'retained_distinct_vertical_structure',
+            'retained_uncertain_multilayer',
+        }.intersection(merge_decisions) == {
+            'retained_independent_structure',
+            'retained_distinct_vertical_structure',
+        } or 'retained_uncertain_multilayer' in merge_decisions,
+        "horizontal_only_dedup_removed": 'merged_same_structure_duplicate' in merge_decisions,
+        "merge_relations_include_vertical_separation": 'vertical_separation_m' in base_merge_relations,
+        "formal_detection_audit_status": formal_audit['status'],
+        "formal_detection_audit_complete": bool(
+            formal_audit['formal_detection_audit_complete']
+        ),
+        "formal_detection_event_identity_status": (
+            'unresolved_actual_object_key_to_event_identity'
+        ),
+        "threshold_event_id_prefix_reconstruction_used": bool(
+            formal_audit['threshold_event_id_prefix_reconstruction_used']
+        ),
+        "actual_event_catalog_rows_all_present": bool(
+            formal_audit['actual_event_catalog_rows_all_present']
+        ),
+        "material_registration_retains_integration_release_particle": all(
+            column in material_registration.columns
+            for column in ('integration_label', 'release_group', 'particle_id')
+        ),
+        "material_registration_separates_position_validity_and_inside_structure": all(
+            column in material_registration.columns
+            for column in (
+                'position_validity', 'inside_any_candidate_envelope',
+                'inside_enumerated_path_envelope', 'candidate_match_ids',
+                'candidate_match_path_ids', 'envelope_basis', 'active_count',
+            )
+        ),
+        "perturbations_compare_daily_structure_extent_and_path_state": all(
+            column in perturbation_state.columns
+            for column in (
+                'date', 'depth_m', 'vertical_thickness_m',
+                'horizontal_extent_radius_km', 'branch_state', 'path_status',
+            )
+        ),
+        "candidate_envelope_gap_high_max_delta_ge50_day_count": int(
+            gap_summary['high_count']
+        ),
+        "candidate_envelope_gap_low_max_delta_lt50_day_count": int(
+            gap_summary['low_count']
+        ),
+        "candidate_envelope_gap_unclassified_day_count": int(
+            gap_summary['unclassified_count']
+        ),
+        "candidate_envelope_gap_missing_record_day_count": int(
+            gap_summary['missing_record_count']
+        ),
+        "candidate_envelope_gap_has_no_retained_do50_object_ids": bool(
+            gap_summary['daily'][
+                'candidate_envelope_do50_retained_object_id_count'
+            ].eq(0).all()
+        ),
+        "candidate_envelope_gap_is_not_uniformly_below_do50_threshold": bool(
+            gap_summary['high_count'] > 0 and gap_summary['low_count'] > 0
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_registration_status": (
+            endpoint_overlap['execution_status']
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_oxygen_layer_overlap_is_unknown": bool(
+            pd.isna(endpoint_overlap['oxygen_layer_overlap_m'])
+            and endpoint_overlap['oxygen_layer_overlap_status']
+            == 'unknown_true_per_pixel_upper_lower_edges_not_saved'
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_horizontal_member_support_count": (
+            int(endpoint_overlap['horizontal_member_support_count'])
+            if endpoint_overlap['execution_status'] == 'registered' else None
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_object_pixel_count": (
+            int(endpoint_overlap['object_pixel_count'])
+            if endpoint_overlap['execution_status'] == 'registered' else None
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_peak_point_support_count": (
+            int(endpoint_overlap['peak_points_in_candidate_envelope_count'])
+            if endpoint_overlap['execution_status'] == 'registered' else None
+        ),
+        f"{ctx['end_label'].lower()}_path_endpoint_do50_object_id_in_candidate_envelope": (
+            bool(endpoint_overlap['object_id_in_candidate_envelope'])
+            if endpoint_overlap['execution_status'] == 'registered' else None
+        ),
+    }
+    _ofes_sc_write_json(ctx['base_root'] / "validation_checks.json", validation_checks)
+
+    manifest = {
+        "analysis": f"{ctx['case_id']}_independent_structure_continuity",
+        "case_spec": _ofes_sc_jsonable(ctx['case_spec']),
+        "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "cached_structure_products_dir": str(ctx.get("cache_root", ctx["base_root"])),
+        "event_catalog": str(ctx['base_event_catalog_path'].resolve()),
+        "daily_objects": str(ctx['base_daily_object_path'].resolve()),
+        "profile_gate_margins": str(ctx['base_profile_gate_path'].resolve()),
+        "endpoint_registration_semantics": {
+            "shared_helper": "track._ofes_endpoint_object_registration",
+            "horizontal_support": "threshold_specific_object_peak_pixels_within_candidate_radius",
+            "peak_point_support": "object_peak_depth_within_candidate_vertical_interval_and_horizontal_radius",
+            "oxygen_layer_overlap": "unknown_true_per_pixel_upper_lower_edges_not_saved",
+            "peak_depth_range_intersection_is_not_oxygen_layer_overlap": True,
+        },
+        "formal_detection_audit_status": formal_audit['status'],
+        "formal_detection_audit_complete": formal_audit['formal_detection_audit_complete'],
+        "formal_detection_event_identity_status": "unresolved_actual_object_key_to_event_identity",
+        "threshold_event_id_prefix_reconstruction_used": formal_audit[
+            'threshold_event_id_prefix_reconstruction_used'
+        ],
+        "actual_event_catalog_rows_all_present": formal_audit[
+            'actual_event_catalog_rows_all_present'
+        ],
+        "native_structure_recomputed": ctx.get("native_structure_recomputed", False),
+        "cached_structure_products_reused": not ctx.get("native_structure_recomputed", False),
+        "formal_detection_audit_outputs": {
+            "events": str((ctx['base_root'] / 'formal_detection_event_audit.csv').resolve()),
+            "objects": str((ctx['base_root'] / 'formal_detection_object_audit.csv').resolve()),
+            "support": str((ctx['base_root'] / 'formal_detection_support_audit.csv').resolve()),
+            "peak_pixels": str((ctx['base_root'] / 'formal_peak_pixel_audit.csv').resolve()),
+        },
+        "material_registration_outputs": {
+            "members": str((ctx['base_root'] / 'material_registration_members.csv').resolve()),
+            "daily": str((ctx['base_root'] / 'material_registration_daily.csv').resolve()),
+            "used_existing_trajectory_rows": True,
+            "reintegration_performed": False,
+            "candidate_envelope_is_approximation": True,
+            "path_membership_registered_separately": True,
+        },
+        "candidate_merge_outputs": {
+            "audit": str((ctx['base_root'] / 'candidate_merge_audit.csv').resolve()),
+            "relations": str((ctx['base_root'] / 'candidate_merge_relations.csv').resolve()),
+        },
+        "events": {
+            label: {
+                "event_id": event_id,
+                "start_date": event_rows[label]["start_date"],
+                "end_date": event_rows[label]["end_date"],
+                "peak_date": event_rows[label]["peak_date"],
+                "observed_days": int(event_rows[label]["observed_days"]),
+                "missing_days": int(event_rows[label]["missing_days"]),
+                "endpoint_object_date": event_rows[label][ctx['base_endpoint_fields'][label]],
+                "endpoint_point": endpoint_points[ctx['base_endpoint_roles'][label]],
+            }
+            for label, event_id in ctx['base_event_ids'].items()
+        },
+        "structure_search": {
+            "dates": list(ctx['base_structure_dates']),
+            "date_count": len(ctx['base_structure_dates']),
+            "bounds_requested": bounds,
+            "depth_bounds_requested_m": settings["depth_bounds_m"],
+            "endpoint_association_radius_km": settings["endpoint_association_radius_km"],
+            "input_variables": ctx['base_native_variables'],
+            "do_loaded": False,
+            "particle_path_used": False,
+            "cached_structure_products_reused": not ctx.get("native_structure_recomputed", False),
+            "native_structure_recomputed": ctx.get("native_structure_recomputed", False),
+        },
+        "settings": settings,
+        "source_rows": source_rows,
+        "path_summary": path_result["summary"],
+        "vertical_profile_regression": vertical_profile_regression,
+        "perturbation_summary": validation.to_dict(orient='records'),
+        "validation": validation_checks,
+    }
+    _ofes_sc_write_json(ctx['base_root'] / "input_source_manifest.json", manifest)
+
+    _ofes_sc_plot_timeline(ctx, date_summary, event_rows, observed_dates)
+
+    summary = path_result["summary"]
+    eo = endpoint_overlap
+    if isinstance(eo, dict) and eo.get('execution_status') == 'registered':
+        endpoint_registered = True
+        endpoint_summary_lines = (
+            f"{eo['date']:%Y-%m-%d} 的 `{eo['display_path_id']}` 候选 "
+            f"`{eo['candidate_id']}` 对 {ctx['end_label']} DO50 对象有 "
+            f"{eo['horizontal_member_support_count']}/{eo['object_pixel_count']} 个峰像素"
+            "进入水平圆，但对象峰深约 "
+            f"{eo['object_peak_depth_m']:.1f} m，候选垂向范围为 "
+            f"{eo['candidate_vertical_shallow_depth_m']:.1f}"
+            f"–{eo['candidate_vertical_deep_depth_m']:.1f} m，峰点进入候选垂向区间为 "
+            f"{eo['peak_points_in_candidate_envelope_count']}/{eo['object_pixel_count']}。"
+        )
+        endpoint_conclusion = (
+            "因此在当前保存的峰像素与候选水平圆—垂向区间近似包络下，"
+            + (
+                "该端点对象与该路径候选存在保存的 3-D 峰点重叠"
+                if eo['peak_points_in_candidate_envelope_count'] > 0
+                else "该端点对象与该路径候选没有保存的 3-D 峰点重叠"
+            )
+            + "，且候选包络内"
+            + (
+                "存在" if eo['object_id_in_candidate_envelope'] else "没有"
+            )
+            + f" {ctx['end_label']} DO50 object ID。"
+        )
+    else:
+        endpoint_registered = False
+        endpoint_summary_lines = (
+            f"{ctx['end_endpoint_date']:%Y-%m-%d} 未找到展示路径 "
+            f"`{ctx['display_path_id']}` 的端点候选；端点配准登记为 "
+            f"{eo.get('execution_status', 'not_registered') if isinstance(eo, dict) else 'not_registered'}，"
+            "完整路径集合不受影响，端点特异的峰点重叠与 object ID 支持未登记。"
+        )
+        endpoint_conclusion = endpoint_summary_lines
+
+    mccoy_statuses = set(
+        endpoint_registration.loc[
+            endpoint_registration["registration_role"]
+            .astype(str)
+            .str.startswith("McCoy_T_S_core_endpoint"),
+            "registration_status",
+        ].astype(str)
+    )
+    if mccoy_statuses == {"endpoint_day_McCoy_record_missing"}:
+        mccoy_text = (
+            f"本轮\n{ctx['start_label']}/{ctx['end_label']} 端点日没有同日 McCoy 核心，"
+            "因此只保留峰日参考，并显式登记 `endpoint_day_McCoy_record_missing`，不把峰日"
+        )
+        mccoy_short_text = (
+            f"{ctx['start_label']}/{ctx['end_label']} 端点缺少同日 McCoy 核心；"
+            "峰日资料仅作参考。"
+        )
+    elif "same_day_McCoy_endpoint_record" in mccoy_statuses:
+        mccoy_text = (
+            f"本轮\n{ctx['start_label']}/{ctx['end_label']} 端点日存在同日 McCoy 核心记录，"
+            "登记为 `same_day_McCoy_endpoint_record`；它仍不是材料身份证据，不把峰日"
+        )
+        mccoy_short_text = (
+            f"{ctx['start_label']}/{ctx['end_label']} 端点日存在同日 McCoy 核心记录；"
+            "其仍不是材料身份证据。"
+        )
+    else:
+        mccoy_text = (
+            f"本轮\n{ctx['start_label']}/{ctx['end_label']} 端点日 McCoy 核心记录状态为 "
+            f"{sorted(mccoy_statuses)}，不把峰日"
+        )
+        mccoy_short_text = (
+            f"{ctx['start_label']}/{ctx['end_label']} 端点日 McCoy 记录状态为 "
+            f"{sorted(mccoy_statuses)}。"
+        )
+    high_date_text = _ofes_sc_format_date_ranges(gap_summary['high_dates'])
+    low_date_text = _ofes_sc_format_date_ranges(gap_summary['low_dates'])
+
+    recomputed_native = bool(ctx.get("native_structure_recomputed", False))
+    native_reuse_text = (
+        f"本轮重算了 native 结构搜索：{len(ctx['base_structure_dates'])} 天 "
+        "`daily_structure_candidates.csv`、对应边和路径表由本次运行生成。"
+        if recomputed_native
+        else f"本轮**不重做 native 结构搜索**，复用已有 {len(ctx['base_structure_dates'])} 天 "
+        "`daily_structure_candidates.csv`、对应边和路径表。"
+    )
+    full_path_count = int(summary["full_path_count"])
+    path_claim = _ofes_sc_path_claim_text(full_path_count)
+    path_opening_text = (
+        f"复用既有 native 结构结果：{len(ctx['base_structure_dates'])} 天候选表、"
+        f"{len(edges)} 条边和 {full_path_count} 条完整候选路径彼此一致。\n"
+        f"{path_claim}；"
+        f"{int(date_summary['ambiguous_candidate_count'].gt(0).sum())}/{len(ctx['base_structure_dates'])}"
+        " 个日期仍有多入/多出歧义。"
+    )
+    if full_path_count:
+        final_conclusion_text = (
+            ("因此当前可保留的最强结论是：存在一条可复核的候选对应路径"
+             if full_path_count == 1
+             else f"因此当前可保留的最强结论是：存在 {full_path_count} 条可复核的候选对应路径")
+            + "；真实 detector-off、两端结构身份和材料保持均尚未判明。当前不进入机制分解，"
+            "也不把粒子位置落入任意候选包络解释为材料连续性。"
+        )
+    else:
+        final_conclusion_text = (
+            "因此当前不能保留“存在可复核的候选对应路径”这一结论：本次设置未得到完整候选路径；"
+            "真实 detector-off、两端结构身份和材料保持均尚未判明。当前不进入机制分解，"
+            "也不把粒子位置落入任意候选包络解释为材料连续性。"
+        )
+    gap_fact_text = _ofes_sc_gap_fact_text(
+        gap_summary, high_date_text, low_date_text, gap_day_count
+    )
+    gap_conclusion_text = _ofes_sc_gap_conclusion_text(gap_summary)
+    gap_verdict_text = gap_fact_text + gap_conclusion_text
+    method_path_claim = _ofes_sc_path_claim_text(full_path_count, style="method")
+
+    method_text = f"""# {ctx['start_label']}–{ctx['end_label']} 独立结构连续性检验
+
+## 本轮边界
+
+- {native_reuse_text}
+  现有结果为 {len(base_candidates)} 个保留候选、{len(edges)} 条边、{summary['full_path_count']} 条完整候选路径；
+  {int(date_summary['ambiguous_candidate_count'].gt(0).sum())}/{len(date_summary)} 个日期存在分支歧义。
+- {method_path_claim}，不支持 {ctx['start_label']}/{ctx['end_label']} 的真实结构身份、detector-off 机制或材料保持。
+
+## 候选结构
+
+候选提取和垂向范围来自前一轮固定 T/S—层结—动力流程：全部原生深度层异常体先完成，再提取连续剖面；
+水平邻近峰按垂向区间和符号证据区分重复、独立垂向层和不确定多层。候选表保留
+`candidate_merge_group`、`candidate_merge_decision`、`candidate_merge_reason`、`vertical_separation_m`。
+
+## 正式 DO 产品审计
+
+- 审计从每个日期、每个保留候选的近似结构支撑出发：峰像素必须同时满足候选中心的组件等效半径和候选垂向范围。
+- 对 DO20/35/50 分别读取峰像素中的真实 `object_id_do20/35/50`，再按日期、阈值和
+  `daily_objects.parquet` 的真实 `daily_object_key` 连接；不把同号 DO20/35/50 事件拼成一个对象。
+- 审计同时保存实际事件 ID、对象连接字段和未映射 ID。当前状态为
+  `{formal_audit['status']}`，`formal_detection_audit_complete=false`；事件身份和 detector-off 解释仍未判明。
+- 没有独立 filtered-peak 产品时，缺失 object key 只登记为支撑内未保留对象 ID，不解释为无峰或结构消失。
+- 在当前候选中心—组件半径—垂向区间近似包络和已保存峰像素记录中，{gap_fact_text}{gap_conclusion_text}
+  这只说明候选支撑内的峰记录分层，具体过滤/保留原因仍未解析。
+
+## 端点配准
+
+DO 峰日对象和 DO 端点日对象分别登记。McCoy T/S 资料只在实际日期匹配时作为端点资料；{mccoy_text}
+位置/深度当作端点配准。{endpoint_summary_lines}
+该结果不单独证明两者是不同结构，并且对候选包络定义和垂向分辨率敏感；
+对象表没有保存真实氧异常层逐像素上下边界，因此真实氧层重叠仍为 `NaN/unknown`，峰深区间交集只作历史字段核对。
+独立 native 候选仍按端点日期登记，并保留组件级横向动力支持及垂向范围。
+
+## 材料登记边界
+
+材料表只读取已有 3-D 轨迹/峰后示踪样本，保留 `integration_label`、`release_group`、`particle_id`，分开
+`position_validity`、`active_count`、未观测/无效成员、候选 ID、候选路径 ID 和两种包络状态：
+`inside_any_candidate_envelope` 与 `inside_enumerated_path_envelope`。包络仅是
+`candidate_center_radius_vertical_interval_approximation`，不是完整结构几何；任何计数都不能解释为目标结构材料占据、
+交换、供给、释放或同一水团保持。
+
+## 交付文件
+
+- `daily_structure_candidates.csv`、`candidate_merge_audit.csv`、`candidate_merge_relations.csv`：候选和垂向判别。
+- `structure_match_edges.csv`、`structure_path_members.csv`、`endpoint_candidate_associations.csv`：边、路径和端点候选。
+- `formal_detection_support_audit.csv`、`formal_detection_object_audit.csv`、`formal_detection_event_audit.csv`、
+  `formal_peak_pixel_audit.csv`：候选支撑内真实对象 ID、事件映射和连接审计。
+- `endpoint_registration.csv`：DO 端点、McCoy 峰日参考/同日缺失、独立候选配准。
+- `material_registration_members.csv`、`material_registration_daily.csv`：位置、候选/路径归属和包络近似状态。
+- `validation_checks.json`、`input_source_manifest.json`、`verdict_zh.md`：验证、来源和裁决。
+"""
+    (ctx['base_root'] / "methods_and_limits.md").write_text(method_text, encoding="utf-8")
+    verdict_text = f"""# {ctx['start_label']}–{ctx['end_label']} 判定（≤1800 字）
+
+{path_opening_text}
+
+本轮将正式 DO 审计改为候选支撑内的逐日峰像素 → 阈值专属 object ID → 真实 `daily_object_key` → 实际事件 ID
+连接。不同阈值的同号事件没有再被视为同一对象。审计状态为 `{formal_audit['status']}`，但
+`formal_detection_audit_complete=false`，因为实际对象到 {ctx['start_label']}/{ctx['end_label']} 结构身份的解释仍未完成。
+
+{gap_verdict_text}
+
+{endpoint_summary_lines}
+{endpoint_conclusion}
+这不单独证明两端是不同结构，并且对候选包络/垂向分辨率敏感；真实氧层上下边界未保存，
+因此真实氧层重叠为 `NaN/unknown`，不据此裁决结构身份或 detector-off。
+
+证据分类：
+
+- (a) 真实 detector-off：未判明。当前结果不能从两个目录窗口或支撑内 object ID 缺失推出高阈值间歇机制。
+- (b) 目录连接/过滤间歇：未判明。候选支撑内的 ≥50 与 <50 峰记录分层已登记，但真实 object key、连接字段和过滤/保留原因尚不能归因于同一结构的过滤或断链。
+- (c) 两端是不同结构/共享背景流：未判明。保留的不同垂向候选是候选集合事实，不是 {ctx['start_label']} 与 {ctx['end_label']} 身份或共享背景流证据。
+- (d) 候选/身份/材料歧义：仍是当前裁决。{mccoy_short_text}材料表区分任意候选包络、枚举路径包络、候选 ID 和路径 ID，包络为近似登记，不是目标结构材料占据。
+
+{final_conclusion_text}
+"""
+    (ctx['base_root'] / "verdict_zh.md").write_text(verdict_text, encoding="utf-8")
+    _ofes_sc_write_json(ctx['base_root'] / "case_summary.json", {
+        "path_summary": summary,
+        "candidate_count": len(base_candidates),
+        "raw_candidate_count": len(base_merge_audit),
+        "merged_duplicate_count": int(
+            (~base_merge_audit['candidate_retained']).sum()
+        ),
+        "edge_count": len(edges),
+        "formal_detection_audit_status": formal_audit['status'],
+        "formal_detection_audit_complete": formal_audit['formal_detection_audit_complete'],
+        "threshold_event_id_prefix_reconstruction_used": formal_audit[
+            'threshold_event_id_prefix_reconstruction_used'
+        ],
+        "formal_detection_support_candidate_date_threshold_rows": formal_audit[
+            'support_candidate_date_threshold_rows'
+        ],
+        "formal_detection_support_object_association_rows": formal_audit[
+            'support_object_association_rows'
+        ],
+        "actual_event_id_count": formal_audit['actual_event_id_count'],
+        "candidate_envelope_gap_summary": {
+            "scope": gap_summary['scope'],
+            "gap_start": gap_summary['gap_start'],
+            "gap_end": gap_summary['gap_end'],
+            "high_max_delta_ge50_days": gap_summary['high_count'],
+            "low_max_delta_lt50_days": gap_summary['low_count'],
+            "high_dates": gap_summary['high_dates'],
+            "low_dates": gap_summary['low_dates'],
+        },
+        f"{ctx['end_label'].lower()}_path_endpoint_overlap_summary": endpoint_overlap,
+        "native_structure_recomputed": ctx.get("native_structure_recomputed", False),
+        "material_registration_member_rows": len(material_registration),
+        "date_summary": date_summary.to_dict(orient="records"),
+        "parameter_perturbations": validation.to_dict(orient="records"),
+    })
+    return {
+        'output_dir': ctx['base_root'],
+        'case_summary': json.loads((ctx['base_root'] / 'case_summary.json').read_text()),
+        'validation': validation_checks,
+        'timeline': timeline,
+    }
+
+
+def _ofes_sc_scale_concat(frames: list[pd.DataFrame], columns: list[str] | None = None) -> pd.DataFrame:
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=columns or [])
+
+
+
+
+def _ofes_sc_scale_load_endpoint_peak_pixels(
+    ctx: dict,
+    event_rows: dict[str, pd.Series],
+) -> dict[pd.Timestamp, pd.DataFrame]:
+    """读取两个端点日期的原始 peak-pixel 表，供对象配准共用。"""
+    dates = {
+        pd.Timestamp(
+            event_rows[ctx['start_label']][ctx['start_endpoint_field']]
+        ).normalize(),
+        pd.Timestamp(
+            event_rows[ctx['end_label']][ctx['end_endpoint_field']]
+        ).normalize(),
+    }
+    out = {}
+    for date in sorted(dates):
+        path = ctx['base_peak_pixel_root'] / f'peak_pixels_{date:%Y%m%d}.parquet'
+        if not path.exists():
+            raise FileNotFoundError(path)
+        out[date] = pd.read_parquet(path)
+    return out
+
+
+
+
+def _ofes_sc_scale_value_label(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(f"{float(item):g}" for item in value) + "]"
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):g}"
+    return str(value)
+
+
+def _ofes_sc_scale_load_context(ctx: dict) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame, dict]:
+    events = pd.read_parquet(ctx['base_event_catalog_path'])
+    objects = pd.read_parquet(ctx['base_daily_object_path'])
+    profile_gate = pd.read_csv(ctx['base_profile_gate_path'])
+    event_rows = {
+        label: _ofes_sc_event_row(events, event_id)
+        for label, event_id in ctx['base_event_ids'].items()
+    }
+    _ofes_sc_check_endpoint_dates(ctx, event_rows)
+    start_point = _ofes_sc_daily_object_point(
+        objects,
+        ctx['start_event_id'],
+        event_rows[ctx['start_label']][ctx['start_endpoint_field']],
+    )
+    end_point = _ofes_sc_daily_object_point(
+        objects,
+        ctx['end_event_id'],
+        event_rows[ctx['end_label']][ctx['end_endpoint_field']],
+    )
+    endpoint_points = {
+        ctx['start_endpoint_role']: start_point,
+        ctx['end_endpoint_role']: end_point,
+    }
+    return events, objects, event_rows, profile_gate, endpoint_points
+
+
+def _ofes_sc_scale_load_snapshot(
+    date: pd.Timestamp,
+    bounds: tuple[float, float, float, float],
+    depth_bounds: tuple[float, float],
+) -> tuple[dict, dict]:
+    snapshot = load_ofes_snapshot(
+        date,
+        variables=["temp", "salinity", "u", "v"],
+        lon_bounds=(bounds[0], bounds[1]),
+        lat_bounds=(bounds[2], bounds[3]),
+        depth_bounds=depth_bounds,
+    )
+    metadata = snapshot.get("metadata", {}) or {}
+    source_files = {}
+    for variable in ("temp", "salinity", "u", "v"):
+        path = _ofes_file_path(variable, date).resolve()
+        stat = path.stat()
+        source_files[variable] = {
+            "path": str(path),
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    source_row = {
+        "date": pd.Timestamp(date),
+        "lon_min": float(snapshot["lon"][0]),
+        "lon_max": float(snapshot["lon"][-1]),
+        "lat_min": float(snapshot["lat"][0]),
+        "lat_max": float(snapshot["lat"][-1]),
+        "depth_min_m": float(snapshot["depth"][0]),
+        "depth_max_m": float(snapshot["depth"][-1]),
+        "lon_count": int(len(snapshot["lon"])),
+        "lat_count": int(len(snapshot["lat"])),
+        "depth_count": int(len(snapshot["depth"])),
+        "horizontal_grid": metadata.get("horizontal_grid"),
+        "horizontal_location": metadata.get("horizontal_location"),
+        "read_slices": metadata.get("read_slices", {}),
+        "source_files": source_files,
+    }
+    return snapshot, source_row
+
+
+
+
+def _ofes_sc_scale_formal_gap_summary(
+    peak_pixels: pd.DataFrame,
+    variant_id: str,
+    gap_dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Aggregate saved peak pixels within the case's candidate support gap.
+
+    说明:
+        - 结果按完整 `gap_dates` 补齐：没有保存记录的日期保留为
+          `no_saved_peak_pixel_record`，计数字段为 NaN（不补零），
+          与"有记录但无有效支撑"及"已有保留对象"区分。
+    """
+    scoped = peak_pixels.copy()
+    if scoped.empty:
+        return pd.DataFrame(
+            {
+                "variant_id": [variant_id],
+                "gap_date": [pd.NaT],
+                "gap_status": ["no_candidate_support_audit_rows"],
+            }
+        )
+    scoped["date"] = pd.to_datetime(scoped["date"], format="mixed").dt.normalize()
+    scoped["threshold"] = pd.to_numeric(scoped["threshold"], errors="coerce")
+    scoped = scoped.loc[
+        scoped["date"].isin(gap_dates) & scoped["threshold"].eq(50)
+    ].copy()
+    if scoped.empty:
+        return pd.DataFrame(
+            {
+                "variant_id": [variant_id],
+                "gap_date": [pd.NaT],
+                "gap_status": ["no_DO50_candidate_support_rows"],
+            }
+        )
+    result = (
+        scoped.groupby("date", as_index=False)
+        .agg(
+            candidate_support_peak_record_count=(
+                "support_row_count",
+                lambda values: int((values > 0).sum()),
+            ),
+            candidate_support_peak_pixel_row_count=("support_row_count", "sum"),
+            max_delta_do50_umol_kg=("max_delta_do_umol_kg", "max"),
+            retained_do50_object_id_association_count=(
+                "unique_retained_object_id_count",
+                "sum",
+            ),
+        )
+        .rename(columns={"date": "gap_date"})
+    )
+    result = (
+        result.set_index("gap_date")
+        .reindex(gap_dates)
+        .rename_axis("gap_date")
+        .reset_index()
+    )
+    result["variant_id"] = variant_id
+    result["gap_status"] = np.select(
+        [
+            result["candidate_support_peak_record_count"].isna(),
+            result["retained_do50_object_id_association_count"].eq(0)
+            & result["max_delta_do50_umol_kg"].ge(50),
+            result["retained_do50_object_id_association_count"].eq(0)
+            & result["max_delta_do50_umol_kg"].lt(50),
+            result["retained_do50_object_id_association_count"].gt(0),
+        ],
+        [
+            "no_saved_peak_pixel_record",
+            "max_delta_do50_ge50_no_retained_object_id",
+            "max_delta_do50_lt50_no_retained_object_id",
+            "retained_do50_object_id_present",
+        ],
+        default="candidate_support_status_unresolved",
+    )
+    result["support_scope"] = (
+        "candidate_center_radius_vertical_interval_approximation_saved_peak_pixels"
+    )
+    result["filtered_peak_product_present"] = bool(
+        scoped.get("filtered_peak_product_present", pd.Series(dtype=bool)).any()
+    )
+    return result
+
+
+
+
+def _ofes_sc_scale_network_state(
+    candidates: pd.DataFrame,
+    edges: pd.DataFrame,
+    paths: pd.DataFrame,
+    start_candidate_ids: list[str],
+    end_candidate_ids: list[str],
+) -> pd.DataFrame:
+    """Add complete-path, partial-reachability, branch and unmatched states."""
+    table = candidates.copy()
+    table["candidate_id"] = table["candidate_id"].astype(str)
+    edge_table = edges.copy()
+    if edge_table.empty:
+        edge_table = pd.DataFrame(
+            columns=["from_candidate_id", "to_candidate_id"]
+        )
+    edge_table["from_candidate_id"] = edge_table["from_candidate_id"].astype(str)
+    edge_table["to_candidate_id"] = edge_table["to_candidate_id"].astype(str)
+    outgoing = (
+        edge_table.groupby("from_candidate_id").size()
+        if not edge_table.empty else pd.Series(dtype=int)
+    )
+    incoming = (
+        edge_table.groupby("to_candidate_id").size()
+        if not edge_table.empty else pd.Series(dtype=int)
+    )
+    table["incoming_edge_count"] = table["candidate_id"].map(incoming).fillna(0).astype(int)
+    table["outgoing_edge_count"] = table["candidate_id"].map(outgoing).fillna(0).astype(int)
+    adjacency: dict[str, list[str]] = {}
+    reverse: dict[str, list[str]] = {}
+    for row in edge_table.itertuples(index=False):
+        adjacency.setdefault(str(row.from_candidate_id), []).append(
+            str(row.to_candidate_id)
+        )
+        reverse.setdefault(str(row.to_candidate_id), []).append(
+            str(row.from_candidate_id)
+        )
+
+    def _closure(seeds: list[str], graph: dict[str, list[str]]) -> set[str]:
+        visited = set(str(value) for value in seeds)
+        stack = list(visited)
+        while stack:
+            current = stack.pop()
+            for next_id in graph.get(current, []):
+                if next_id not in visited:
+                    visited.add(next_id)
+                    stack.append(next_id)
+        return visited
+
+    forward = _closure(start_candidate_ids, adjacency)
+    backward = _closure(end_candidate_ids, reverse)
+    path_members = set(paths["candidate_id"].astype(str)) if not paths.empty else set()
+    table["reachable_from_start_endpoint"] = table["candidate_id"].isin(forward)
+    table["reachable_to_end_endpoint"] = table["candidate_id"].isin(backward)
+    table["complete_path_member"] = table["candidate_id"].isin(path_members)
+    table["branch_state"] = np.select(
+        [
+            (table["incoming_edge_count"] > 1)
+            | (table["outgoing_edge_count"] > 1),
+            (table["incoming_edge_count"] == 0)
+            & (table["outgoing_edge_count"] == 0),
+        ],
+        ["ambiguous_branch_or_merge", "isolated_candidate"],
+        default="nonbranching_or_endpoint",
+    )
+    table["path_state"] = np.select(
+        [
+            table["complete_path_member"],
+            table["reachable_from_start_endpoint"]
+            | table["reachable_to_end_endpoint"],
+            table["branch_state"].eq("isolated_candidate"),
+        ],
+        ["complete_path_member", "partial_endpoint_reachable", "isolated_candidate"],
+        default="unmatched_to_endpoint_path",
+    )
+    return table
+
+
+def _ofes_sc_scale_daily_state(
+    network: pd.DataFrame,
+    paths: pd.DataFrame,
+    summary: dict,
+    *,
+    path_id: str | None = None,
+) -> pd.DataFrame:
+    rows = []
+    primary = (
+        paths.loc[paths["path_id"].eq(path_id)]
+        if not paths.empty and "path_id" in paths
+        else pd.DataFrame()
+    )
+    primary = primary.set_index("date") if not primary.empty else pd.DataFrame()
+    for date, group in network.groupby("date", sort=True):
+        path_row = primary.loc[date] if not primary.empty and date in primary.index else None
+        if path_row is not None and isinstance(path_row, pd.DataFrame):
+            path_row = path_row.iloc[0]
+        row = {
+            "date": pd.Timestamp(date),
+            "candidate_count": int(len(group)),
+            "edge_count_incoming": int(group["incoming_edge_count"].sum()),
+            "edge_count_outgoing": int(group["outgoing_edge_count"].sum()),
+            "ambiguous_candidate_count": int(
+                group["branch_state"].eq("ambiguous_branch_or_merge").sum()
+            ),
+            "isolated_candidate_count": int(
+                group["branch_state"].eq("isolated_candidate").sum()
+            ),
+            "complete_path_member_count": int(group["complete_path_member"].sum()),
+            "partial_endpoint_reachable_count": int(
+                group["path_state"].eq("partial_endpoint_reachable").sum()
+            ),
+            "unmatched_to_endpoint_count": int(
+                group["path_state"].eq("unmatched_to_endpoint_path").sum()
+            ),
+            "path_status": summary["path_status"],
+            "full_path_count": summary["full_path_count"],
+        }
+        if path_row is None:
+            row.update(
+                {
+                    "path_candidate_id": None,
+                    "path_lon": np.nan,
+                    "path_lat": np.nan,
+                    "path_depth_m": np.nan,
+                    "path_vertical_shallow_depth_m": np.nan,
+                    "path_vertical_deep_depth_m": np.nan,
+                    "path_vertical_thickness_m": np.nan,
+                    "path_horizontal_radius_km": np.nan,
+                    "path_rossby_number": np.nan,
+                    "path_normalized_strain": np.nan,
+                }
+            )
+        else:
+            candidate_row = group.loc[
+                group["candidate_id"].eq(str(path_row["candidate_id"]))
+            ].iloc[0]
+            row.update(
+                {
+                    "path_candidate_id": str(path_row["candidate_id"]),
+                    "path_lon": float(candidate_row["lon"]),
+                    "path_lat": float(candidate_row["lat"]),
+                    "path_depth_m": float(candidate_row["depth_m"]),
+                    "path_vertical_shallow_depth_m": float(
+                        candidate_row["vertical_shallow_depth_m"]
+                    ),
+                    "path_vertical_deep_depth_m": float(
+                        candidate_row["vertical_deep_depth_m"]
+                    ),
+                    "path_vertical_thickness_m": float(
+                        candidate_row["vertical_thickness_m"]
+                    ),
+                    "path_horizontal_radius_km": float(
+                        candidate_row["thermohaline_component_radius_km"]
+                    ),
+                    "path_rossby_number": float(candidate_row["rossby_number"]),
+                    "path_normalized_strain": float(
+                        candidate_row["normalized_strain"]
+                    ),
+                }
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _ofes_sc_scale_endpoint_association(
+    ctx: dict,
+    candidates: pd.DataFrame,
+    paths: pd.DataFrame,
+    peak_pixels: pd.DataFrame,
+    raw_peak_pixels_by_date: dict[pd.Timestamp, pd.DataFrame],
+    objects: pd.DataFrame,
+    event_rows: dict[str, pd.Series],
+    endpoint_points: dict[str, tuple[float, float]],
+    settings: dict,
+    variant_id: str,
+) -> pd.DataFrame:
+    """登记端点对象的水平成员支持、峰点支持和未知氧层重叠状态。"""
+    rows: list[dict] = []
+    candidates = candidates.copy()
+    candidates["date"] = pd.to_datetime(candidates["date"], format="mixed").dt.normalize()
+    peak_pixels = peak_pixels.copy()
+    peak_pixels["date"] = pd.to_datetime(peak_pixels["date"], format="mixed").dt.normalize()
+    objects = objects.copy()
+    objects["date"] = pd.to_datetime(objects["date"], format="mixed").dt.normalize()
+    path_ids = (
+        paths.groupby("candidate_id")["path_id"]
+        .apply(lambda values: ";".join(sorted(set(values.astype(str)))))
+        .to_dict()
+        if not paths.empty else {}
+    )
+    canonical_endpoint_keys: dict[str, dict[int, str]] = {}
+    for label, event_id in ctx['base_event_ids'].items():
+        endpoint_date = event_rows[label][ctx['base_endpoint_fields'][label]]
+        endpoint_objects = objects.loc[
+            objects["event_id"].astype(str).eq(event_id)
+            & pd.to_datetime(objects["date"], format="mixed").dt.normalize().eq(
+                endpoint_date
+            )
+            & pd.to_numeric(objects["threshold"], errors="coerce").eq(50)
+        ]
+        if endpoint_objects["daily_object_id"].duplicated().any():
+            raise RuntimeError(
+                f"Expected unique endpoint DO50 object IDs for {label}."
+            )
+        canonical_endpoint_keys[label] = {
+            int(row.daily_object_id): str(row.daily_object_key)
+            for row in endpoint_objects.itertuples(index=False)
+        }
+    for label, event_id in ctx['base_event_ids'].items():
+        endpoint_date = event_rows[label][ctx['base_endpoint_fields'][label]]
+        endpoint_key = ctx['base_endpoint_roles'][label]
+        endpoint_lon, endpoint_lat = endpoint_points[endpoint_key]
+        candidate_day = candidates.loc[candidates["date"].eq(endpoint_date)].copy()
+        if not candidate_day.empty:
+            candidate_day["endpoint_distance_km"] = [
+                float(
+                    great_circle_distance_m(
+                        row.lon,
+                        row.lat,
+                        endpoint_lon,
+                        endpoint_lat,
+                    )
+                    / 1000.0
+                )
+                for row in candidate_day.itertuples(index=False)
+            ]
+            candidate_day = candidate_day.loc[
+                candidate_day["endpoint_distance_km"].le(
+                    settings["endpoint_association_radius_km"]
+                )
+            ]
+        endpoint_objects = objects.loc[
+            objects["event_id"].astype(str).eq(event_id)
+            & pd.to_datetime(objects["date"], format="mixed").dt.normalize().eq(endpoint_date)
+            & pd.to_numeric(objects["threshold"], errors="coerce").eq(50)
+        ].copy()
+        if candidate_day.empty or endpoint_objects.empty:
+            object_key = None
+            object_id = np.nan
+            object_pixel_count = np.nan
+            object_depth_min = np.nan
+            object_depth_max = np.nan
+            if len(endpoint_objects) == 1:
+                only_object = endpoint_objects.iloc[0]
+                object_key = str(only_object["daily_object_key"])
+                object_id = int(only_object["daily_object_id"])
+                object_pixel_count = int(only_object["pixel_count"])
+                object_depth_min = float(only_object["depth_min"])
+                object_depth_max = float(only_object["depth_max"])
+            rows.append(
+                {
+                    "variant_id": variant_id,
+                    "case_label": label,
+                    "endpoint_date": endpoint_date,
+                    "candidate_id": None,
+                    "path_ids": "",
+                    "daily_object_key": object_key,
+                    "daily_object_id": object_id,
+                    "candidate_endpoint_distance_km": np.nan,
+                    "candidate_object_horizontal_distance_km": np.nan,
+                    "candidate_vertical_shallow_depth_m": np.nan,
+                    "candidate_vertical_deep_depth_m": np.nan,
+                    "object_depth_min_m": object_depth_min,
+                    "object_depth_max_m": object_depth_max,
+                    "object_pixel_count": object_pixel_count,
+                    "candidate_radius_km": np.nan,
+                    "horizontal_in_candidate_envelope": False,
+                    "horizontal_member_support_count": np.nan,
+                    "peak_depth_inside_candidate_count": np.nan,
+                    "peak_points_in_candidate_envelope_count": np.nan,
+                    "peak_depth_range_interval_intersection_m": np.nan,
+                    "oxygen_layer_overlap_m": np.nan,
+                    "oxygen_layer_overlap_status": (
+                        "unknown_missing_candidate_or_endpoint_object"
+                    ),
+                    "object_id_in_candidate_envelope": pd.NA,
+                    "retained_object_ids_in_audit": "",
+                    "object_identity_status": (
+                        "not_verified_missing_candidate_or_endpoint_object"
+                    ),
+                    "status": (
+                        "no_candidate_or_endpoint_DO50_object;oxygen_layer_overlap_unknown"
+                    ),
+                    "envelope_basis": (
+                        "candidate_center_radius_vertical_interval_approximation"
+                    ),
+                }
+            )
+            continue
+        for candidate in candidate_day.itertuples(index=False):
+            candidate_audit = peak_pixels.loc[
+                pd.to_datetime(peak_pixels["date"], format="mixed").dt.normalize().eq(endpoint_date)
+                & peak_pixels["candidate_id"].astype(str).eq(str(candidate.candidate_id))
+                & pd.to_numeric(peak_pixels["threshold"], errors="coerce").eq(50)
+            ]
+            for obj in endpoint_objects.itertuples(index=False):
+                expected_endpoint_key = canonical_endpoint_keys[label].get(
+                    int(obj.daily_object_id)
+                )
+                if expected_endpoint_key is None:
+                    raise RuntimeError(
+                        "No canonical endpoint daily_object_key for "
+                        f"{label} object ID {obj.daily_object_id}."
+                    )
+                registration = _ofes_endpoint_object_registration(
+                    candidate,
+                    obj._asdict(),
+                    raw_peak_pixels_by_date[endpoint_date],
+                    threshold=50,
+                    expected_event_id=event_id,
+                    expected_daily_object_key=expected_endpoint_key,
+                )
+                if len(candidate_audit) != 1:
+                    raise RuntimeError(
+                        "Expected one saved endpoint peak-pixel audit row for "
+                        f"{candidate.candidate_id}."
+                    )
+                audit_row = candidate_audit.iloc[0]
+                horizontal_distance = float(
+                    great_circle_distance_m(
+                        float(candidate.lon),
+                        float(candidate.lat),
+                        float(obj.peak_lon),
+                        float(obj.peak_lat),
+                    )
+                    / 1000.0
+                )
+                rows.append(
+                    {
+                        "variant_id": variant_id,
+                        "case_label": label,
+                        "endpoint_date": endpoint_date,
+                        "candidate_id": str(candidate.candidate_id),
+                        "path_ids": path_ids.get(str(candidate.candidate_id), ""),
+                        "daily_object_key": str(obj.daily_object_key),
+                        "daily_object_id": int(obj.daily_object_id),
+                        "candidate_endpoint_distance_km": float(
+                            candidate.endpoint_distance_km
+                        ),
+                        "candidate_object_horizontal_distance_km": horizontal_distance,
+                        "candidate_vertical_shallow_depth_m": registration[
+                            "candidate_shallow_m"
+                        ],
+                        "candidate_vertical_deep_depth_m": registration[
+                            "candidate_deep_m"
+                        ],
+                        "object_depth_min_m": registration[
+                            "object_peak_depth_min_m"
+                        ],
+                        "object_depth_max_m": registration[
+                            "object_peak_depth_max_m"
+                        ],
+                        "object_pixel_count": registration["object_pixel_count"],
+                        "candidate_radius_km": registration["candidate_radius_km"],
+                        "horizontal_in_candidate_envelope": bool(
+                            registration["horizontal_member_support_count"] > 0
+                        ),
+                        "horizontal_member_support_count": registration[
+                            "horizontal_member_support_count"
+                        ],
+                        "peak_depth_inside_candidate_count": registration[
+                            "peak_depth_inside_candidate_count"
+                        ],
+                        "peak_points_in_candidate_envelope_count": registration[
+                            "peak_points_in_candidate_envelope_count"
+                        ],
+                        "peak_depth_range_interval_intersection_m": registration[
+                            "peak_depth_range_interval_intersection_m"
+                        ],
+                        "oxygen_layer_overlap_m": registration[
+                            "oxygen_layer_overlap_m"
+                        ],
+                        "oxygen_layer_overlap_status": registration[
+                            "oxygen_layer_overlap_status"
+                        ],
+                        "object_id_in_candidate_envelope": registration[
+                            "object_id_in_candidate_envelope"
+                        ],
+                        "retained_object_ids_in_audit": str(
+                            audit_row.get("retained_object_ids", "")
+                        ),
+                        "object_identity_status": registration[
+                            "object_identity_status"
+                        ],
+                        "status": registration["association_status"],
+                        "envelope_basis": (
+                            "candidate_center_radius_vertical_interval_approximation"
+                        ),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _ofes_sc_scale_variant_summary(
+    ctx: dict,
+    spec: dict,
+    candidates: pd.DataFrame,
+    merge_audit: pd.DataFrame,
+    edges: pd.DataFrame,
+    paths: pd.DataFrame,
+    path_summary: dict,
+    daily: pd.DataFrame,
+    endpoint_assoc: pd.DataFrame,
+    gap: pd.DataFrame,
+    formal: dict,
+    material_members: pd.DataFrame,
+) -> dict:
+    """汇总单个尺度变体的候选、路径、端点支持、缺口分层与审计计数。"""
+    path = candidates.loc[candidates["complete_path_member"]].copy()
+    e246 = endpoint_assoc.loc[endpoint_assoc["case_label"].eq(ctx['end_label'])]
+    path_e246 = e246.loc[
+        e246["path_ids"].fillna("").astype(str).str.split(";").map(
+            lambda values: ctx["display_path_id"] in values
+        )
+    ]
+    high_gap = int(
+        gap["gap_status"].eq("max_delta_do50_ge50_no_retained_object_id").sum()
+    )
+    low_gap = int(
+        gap["gap_status"].eq("max_delta_do50_lt50_no_retained_object_id").sum()
+    )
+    retained_gap = int(
+        gap["gap_status"].eq("retained_do50_object_id_present").sum()
+    )
+    path_overlap_status = (
+        ";".join(
+            sorted(
+                path_e246["oxygen_layer_overlap_status"]
+                .dropna()
+                .astype(str)
+                .unique()
+            )
+        )
+        if not path_e246.empty
+        else f"no_{ctx['end_label']}_path_endpoint_association"
+    )
+    path_object_id_values = (
+        path_e246["object_id_in_candidate_envelope"].dropna()
+        if not path_e246.empty
+        else pd.Series(dtype="boolean")
+    )
+    path_object_id_in_envelope = (
+        pd.NA
+        if path_object_id_values.empty
+        else bool(path_object_id_values.astype(bool).any())
+    )
+    row = {
+        "variant_id": spec["id"],
+        "parameter": spec["parameter"],
+        "value": _ofes_sc_scale_value_label(spec["value"]),
+        "rationale": spec.get("rationale", ""),
+        "candidate_count": int(len(candidates)),
+        "raw_candidate_count": int(len(merge_audit)),
+        "merged_same_structure_duplicate_count": int(
+            (~merge_audit["candidate_retained"]).sum()
+            if not merge_audit.empty and "candidate_retained" in merge_audit else 0
+        ),
+        "edge_count": int(len(edges)),
+        "searched_date_count": int(candidates["date"].nunique()),
+        "start_endpoint_candidate_count": int(
+            path_summary["start_endpoint_candidate_count"]
+        ),
+        "end_endpoint_candidate_count": int(
+            path_summary["end_endpoint_candidate_count"]
+        ),
+        "full_path_count": int(path_summary["full_path_count"]),
+        "path_status": path_summary["path_status"],
+        "path_enumeration_truncated": bool(path_summary["path_enumeration_truncated"]),
+        "ambiguous_date_count": int(
+            daily["ambiguous_candidate_count"].gt(0).sum()
+        ),
+        "isolated_candidate_total": int(daily["isolated_candidate_count"].sum()),
+        "partial_endpoint_reachable_total": int(
+            daily["partial_endpoint_reachable_count"].sum()
+        ),
+        "unmatched_to_endpoint_total": int(
+            daily["unmatched_to_endpoint_count"].sum()
+        ),
+        "complete_path_member_count": int(len(path)),
+        "path_day_count": int(path["date"].nunique()) if not path.empty else 0,
+        "path_depth_median": float(path["depth_m"].median()) if not path.empty else np.nan,
+        "path_vertical_shallow_min_m": float(path["vertical_shallow_depth_m"].min()) if not path.empty else np.nan,
+        "path_vertical_deep_max_m": float(path["vertical_deep_depth_m"].max()) if not path.empty else np.nan,
+        "path_vertical_thickness_median": float(path["vertical_thickness_m"].median()) if not path.empty else np.nan,
+        "path_horizontal_radius_median_km": float(path["thermohaline_component_radius_km"].median()) if not path.empty else np.nan,
+        "path_abs_rossby_median": float(path["rossby_number"].abs().median()) if not path.empty else np.nan,
+        f"endpoint_{ctx['end_label'].lower()}_path_scope": _ofes_sc_endpoint_scope_value(ctx),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_rows": int(len(path_e246)),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_oxygen_layer_overlap_status": path_overlap_status,
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope": path_object_id_in_envelope,
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_depth_range_intersection_m": float(
+            path_e246["peak_depth_range_interval_intersection_m"].max()
+        ) if not path_e246.empty else np.nan,
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_horizontal_member_support_count": int(
+            path_e246["horizontal_member_support_count"].max()
+        ) if not path_e246.empty else np.nan,
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_points_in_candidate_envelope_count": int(
+            path_e246["peak_points_in_candidate_envelope_count"].max()
+        ) if not path_e246.empty else np.nan,
+        "gap_high_max_delta_ge50_days": high_gap,
+        "gap_low_max_delta_lt50_days": low_gap,
+        "gap_retained_object_days": retained_gap,
+        "gap_days_with_support_rows": int(
+            gap["candidate_support_peak_record_count"].gt(0).sum()
+        ),
+        "formal_detection_audit_status": formal["status"],
+        "formal_detection_audit_complete": bool(
+            formal["formal_detection_audit_complete"]
+        ),
+        "formal_support_candidate_date_threshold_rows": int(
+            formal["support_candidate_date_threshold_rows"]
+        ),
+        "formal_support_object_association_rows": int(
+            formal["support_object_association_rows"]
+        ),
+        "actual_event_id_count": int(formal["actual_event_id_count"]),
+        "material_member_rows": int(len(material_members)),
+    }
+    return row
+
+
+def _ofes_sc_scale_baseline_frames(ctx: dict) -> dict[str, pd.DataFrame | dict]:
+    if not (ctx['scale_baseline_dir'] / "baseline_manifest.json").exists():
+        raise FileNotFoundError(
+            "Compact baseline is missing; run freeze_baseline.py first."
+        )
+    candidates = pd.read_csv(ctx['scale_original_root'] / "daily_structure_candidates.csv")
+    candidates["date"] = pd.to_datetime(candidates["date"], format="mixed").dt.normalize()
+    candidates["variant_id"] = ctx["baseline_variant_label"]
+    merge_audit = pd.read_csv(ctx['scale_original_root'] / "candidate_merge_audit.csv")
+    merge_audit["variant_id"] = ctx["baseline_variant_label"]
+    relations = pd.read_csv(ctx['scale_original_root'] / "candidate_merge_relations.csv")
+    relations["variant_id"] = ctx["baseline_variant_label"]
+    paths = pd.read_csv(ctx['scale_original_root'] / "structure_path_members.csv")
+    paths["date"] = pd.to_datetime(paths["date"], format="mixed").dt.normalize()
+    paths["variant_id"] = ctx["baseline_variant_label"]
+    daily_path = pd.read_csv(ctx['scale_original_root'] / "daily_structure_correspondence.csv")
+    daily_path["date"] = pd.to_datetime(daily_path["date"], format="mixed").dt.normalize()
+    daily_path["variant_id"] = ctx["baseline_variant_label"]
+    endpoint_registration = pd.read_csv(ctx['scale_original_root'] / "endpoint_registration.csv")
+    endpoint_registration["variant_id"] = ctx["baseline_variant_label"]
+    peak = pd.read_csv(ctx['scale_original_root'] / "formal_peak_pixel_audit.csv")
+    peak["variant_id"] = ctx["baseline_variant_label"]
+    support = pd.read_csv(ctx['scale_original_root'] / "formal_detection_support_audit.csv")
+    support["variant_id"] = ctx["baseline_variant_label"]
+    objects = pd.read_csv(ctx['scale_original_root'] / "formal_detection_object_audit.csv")
+    objects["variant_id"] = ctx["baseline_variant_label"]
+    events = pd.read_csv(ctx['scale_original_root'] / "formal_detection_event_audit.csv")
+    events["variant_id"] = ctx["baseline_variant_label"]
+    material_members = pd.read_csv(ctx['scale_original_root'] / "material_registration_members.csv")
+    material_members["variant_id"] = ctx["baseline_variant_label"]
+    material_daily = pd.read_csv(ctx['scale_original_root'] / "material_registration_daily.csv")
+    material_daily["variant_id"] = ctx["baseline_variant_label"]
+    return {
+        "candidate": candidates,
+        "merge_audit": merge_audit,
+        "merge_relations": relations,
+        "path": paths,
+        "daily_source": daily_path,
+        "endpoint_registration": endpoint_registration,
+        "formal_peak": peak,
+        "formal_support": support,
+        "formal_objects": objects,
+        "formal_events": events,
+        "material_members": material_members,
+        "material_daily": material_daily,
+        "manifest": json.loads(
+            (ctx['scale_baseline_dir'] / "baseline_manifest.json").read_text(encoding="utf-8")
+        ),
+    }
+
+
+def _ofes_sc_scale_baseline_summary(
+    ctx: dict,
+    frames: dict,
+    objects: pd.DataFrame,
+    event_rows: dict[str, pd.Series],
+    endpoint_points: dict[str, tuple[float, float]],
+    raw_peak_pixels_by_date: dict[pd.Timestamp, pd.DataFrame],
+) -> dict:
+    """汇总缓存基线的候选、路径、端点支持、缺口分层与审计计数。"""
+    manifest = frames["manifest"]
+    path = frames["candidate"].loc[
+        frames["candidate"]["candidate_id"].isin(
+            frames["path"]["candidate_id"].astype(str)
+        )
+    ]
+    source_summary = frames["daily_source"].copy()
+    endpoint_assoc = _ofes_sc_scale_endpoint_association(ctx,
+        frames["candidate"],
+        frames["path"],
+        frames["formal_peak"],
+        raw_peak_pixels_by_date,
+        objects,
+        event_rows,
+        endpoint_points,
+        _ofes_structure_continuity_settings(),
+        ctx["baseline_variant_label"],
+    )
+    path_end_assoc = endpoint_assoc.loc[
+        endpoint_assoc["case_label"].eq(ctx['end_label'])
+        & endpoint_assoc["path_ids"].fillna("").astype(str).str.split(";").map(
+            lambda values: ctx["display_path_id"] in values
+        )
+    ]
+    if len(path_end_assoc) > 1:
+        raise RuntimeError(
+            f"Expected at most one baseline {ctx['end_label']} path endpoint "
+            f"association, got {len(path_end_assoc)}."
+        )
+    has_path_endpoint = len(path_end_assoc) == 1
+    path_end_row = path_end_assoc.iloc[0] if has_path_endpoint else None
+    gap = _ofes_sc_scale_formal_gap_summary(
+        frames["formal_peak"],
+        ctx["baseline_variant_label"],
+        pd.date_range(ctx['start_endpoint_date'] + pd.Timedelta(days=1), ctx['end_endpoint_date'] - pd.Timedelta(days=1), freq='D'),
+    )
+    summary = {
+        "variant_id": ctx["baseline_variant_label"],
+        "parameter": "baseline",
+        "value": ctx['scale_design']['baseline_label'],
+        "rationale": (
+            f"Existing authoritative {ctx['start_label']}--{ctx['end_label']} "
+            "output before scale refresh."
+        ),
+        "candidate_count": int(manifest["candidate_count"]),
+        "raw_candidate_count": int(
+            (ctx['scale_original_root'] / "candidate_merge_audit.csv").read_text().count("\n") - 1
+        ),
+        "merged_same_structure_duplicate_count": int(
+            manifest["candidate_count"]
+            and pd.read_csv(ctx['scale_original_root'] / "candidate_merge_audit.csv")[
+                "candidate_retained"
+            ].eq(False).sum()
+        ),
+        "edge_count": int(manifest["edge_count"]),
+        "searched_date_count": int(source_summary["date"].nunique()),
+        "start_endpoint_candidate_count": int(manifest["path_summary"]["start_endpoint_candidate_count"]),
+        "end_endpoint_candidate_count": int(manifest["path_summary"]["end_endpoint_candidate_count"]),
+        "full_path_count": int(manifest["path_summary"]["full_path_count"]),
+        "path_status": manifest["path_summary"]["path_status"],
+        "path_enumeration_truncated": bool(manifest["path_summary"]["path_enumeration_truncated"]),
+        "ambiguous_date_count": int(
+            source_summary["ambiguous_candidate_count"].gt(0).sum()
+        ),
+        "isolated_candidate_total": int(source_summary["isolated_candidate_count"].sum()),
+        "partial_endpoint_reachable_total": np.nan,
+        "unmatched_to_endpoint_total": np.nan,
+        "complete_path_member_count": int(len(path)),
+        "path_day_count": int(path["date"].nunique()),
+        "path_depth_median": float(path["depth_m"].median()),
+        "path_vertical_shallow_min_m": float(path["vertical_shallow_depth_m"].min()),
+        "path_vertical_deep_max_m": float(path["vertical_deep_depth_m"].max()),
+        "path_vertical_thickness_median": float(path["vertical_thickness_m"].median()),
+        "path_horizontal_radius_median_km": float(path["thermohaline_component_radius_km"].median()),
+        "path_abs_rossby_median": float(path["rossby_number"].abs().median()),
+        f"endpoint_{ctx['end_label'].lower()}_path_scope": _ofes_sc_endpoint_scope_value(ctx),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_rows": int(
+            len(path_end_assoc)
+        ),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_oxygen_layer_overlap_status": (
+            str(path_end_row["oxygen_layer_overlap_status"])
+            if has_path_endpoint
+            else f"no_{ctx['end_label']}_path_endpoint_association"
+        ),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope": (
+            bool(path_end_row["object_id_in_candidate_envelope"])
+            if has_path_endpoint
+            else pd.NA
+        ),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_depth_range_intersection_m": (
+            float(path_end_row["peak_depth_range_interval_intersection_m"])
+            if has_path_endpoint
+            else np.nan
+        ),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_horizontal_member_support_count": (
+            int(path_end_row["horizontal_member_support_count"])
+            if has_path_endpoint
+            else np.nan
+        ),
+        f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_points_in_candidate_envelope_count": (
+            int(path_end_row["peak_points_in_candidate_envelope_count"])
+            if has_path_endpoint
+            else np.nan
+        ),
+        "gap_high_max_delta_ge50_days": int(gap["gap_status"].eq("max_delta_do50_ge50_no_retained_object_id").sum()),
+        "gap_low_max_delta_lt50_days": int(gap["gap_status"].eq("max_delta_do50_lt50_no_retained_object_id").sum()),
+        "gap_retained_object_days": int(gap["gap_status"].eq("retained_do50_object_id_present").sum()),
+        "gap_days_with_support_rows": int(gap["candidate_support_peak_record_count"].gt(0).sum()),
+        "formal_detection_audit_status": manifest["formal_detection_audit_status"],
+        "formal_detection_audit_complete": bool(manifest["formal_detection_audit_complete"]),
+        "formal_support_candidate_date_threshold_rows": int(
+            len(frames["formal_peak"])
+        ),
+        "formal_support_object_association_rows": int(
+            len(frames["formal_support"])
+        ),
+        "actual_event_id_count": int(
+            frames["formal_support"]["actual_event_id"].dropna().nunique()
+            if "actual_event_id" in frames["formal_support"] else 0
+        ),
+        "material_member_rows": int(len(frames["material_members"])),
+    }
+    return summary
+
+
+def _ofes_sc_scale_plot_comparison(ctx: dict, summary: pd.DataFrame) -> None:
+    labels = summary["variant_id"].astype(str).tolist()
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+    baseline_color = "#222222"
+    variant_colors = [
+        baseline_color if label == ctx["baseline_variant_label"] else "#1764ab"
+        for label in labels
+    ]
+    axes[0, 0].bar(x, summary["candidate_count"], color=variant_colors, alpha=0.85)
+    axes[0, 0].set_ylabel("retained candidates")
+    axes[0, 0].set_title("Candidate count")
+    axes[0, 0].grid(axis="y", alpha=0.25)
+
+    axes[0, 1].plot(
+        x,
+        summary["edge_count"],
+        marker="o",
+        color="#d95f02",
+        label="one-day edges",
+    )
+    axes[0, 1].plot(
+        x,
+        summary["full_path_count"],
+        marker="s",
+        color="#1b9e77",
+        label="complete paths",
+    )
+    axes[0, 1].set_ylabel("count")
+    axes[0, 1].set_title("Correspondence and endpoint-constrained paths")
+    axes[0, 1].legend(frameon=False, fontsize=8)
+    axes[0, 1].grid(axis="y", alpha=0.25)
+
+    for index, row in summary.iterrows():
+        if not np.isfinite(row["path_vertical_shallow_min_m"]):
+            continue
+        axes[1, 0].plot(
+            [index, index],
+            [row["path_vertical_shallow_min_m"], row["path_vertical_deep_max_m"]],
+            color=variant_colors[index],
+            lw=4,
+            solid_capstyle="round",
+        )
+        axes[1, 0].scatter(
+            [index],
+            [row["path_depth_median"]],
+            color=variant_colors[index],
+            edgecolor="white",
+            zorder=3,
+        )
+    axes[1, 0].invert_yaxis()
+    axes[1, 0].set_ylabel("path depth (m)")
+    axes[1, 0].set_title("Primary complete-path vertical support")
+    axes[1, 0].grid(axis="y", alpha=0.25)
+
+    width = 0.24
+    axes[1, 1].bar(
+        x - width,
+        summary["gap_high_max_delta_ge50_days"],
+        width,
+        label="max ΔDO ≥50, no object",
+        color="#d95f02",
+    )
+    axes[1, 1].bar(
+        x,
+        summary["gap_low_max_delta_lt50_days"],
+        width,
+        label="max ΔDO <50, no object",
+        color="#7570b3",
+    )
+    axes[1, 1].bar(
+        x + width,
+        summary["gap_retained_object_days"],
+        width,
+        label="retained DO50 object",
+        color="#1b9e77",
+    )
+    axes[1, 1].set_ylabel("days in 15-day gap")
+    axes[1, 1].set_title("Candidate-support DO50 state")
+    axes[1, 1].legend(frameon=False, fontsize=7)
+    axes[1, 1].grid(axis="y", alpha=0.25)
+
+    for axis in axes.ravel():
+        axis.set_xticks(x)
+        axis.set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
+        axis.spines[["top", "right"]].set_visible(False)
+    fig.suptitle(
+        "E225–E246 scale sensitivity: one-factor variants versus cached baseline\n"
+        "Bars/lines are deterministic audit outputs; no confidence intervals or dynamical scale inference",
+        fontsize=13,
+    )
+    fig.savefig(ctx['scale_outputs']["comparison_png"], dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ofes_sc_scale_plot_gap(ctx: dict, gap: pd.DataFrame) -> None:
+    table = gap.loc[gap["gap_date"].notna()].copy()
+    if table.empty:
+        return
+    table["gap_date"] = pd.to_datetime(table["gap_date"]).dt.strftime("%m-%d")
+    order = ["max_delta_do50_ge50_no_retained_object_id", "max_delta_do50_lt50_no_retained_object_id", "retained_do50_object_id_present"]
+    table["state_code"] = table["gap_status"].map({name: index for index, name in enumerate(order)}).fillna(3)
+    variants = table["variant_id"].drop_duplicates().tolist()
+    dates = table["gap_date"].drop_duplicates().tolist()
+    matrix = (
+        table.pivot_table(index="variant_id", columns="gap_date", values="state_code", aggfunc="first")
+        .reindex(index=variants, columns=dates)
+    )
+    fig, ax = plt.subplots(figsize=(14, max(4.5, 0.48 * len(variants) + 2)), constrained_layout=True)
+    cmap = ListedColormap(["#d95f02", "#7570b3", "#1b9e77", "#bdbdbd"])
+    image = ax.imshow(matrix.to_numpy(dtype=float), aspect="auto", cmap=cmap, vmin=-0.5, vmax=3.5)
+    ax.set_xticks(np.arange(len(dates)), dates)
+    ax.set_yticks(np.arange(len(variants)), variants)
+    ax.set_xlabel("date within E225–E246 catalog gap")
+    ax.set_ylabel("variant")
+    ax.set_title(
+        "Candidate-support DO50 state by scale variant\n"
+        "Approximate center-radius/vertical-interval envelope; no cross-threshold identity reconstruction"
+    )
+    for row_index in range(matrix.shape[0]):
+        for col_index in range(matrix.shape[1]):
+            value = matrix.iloc[row_index, col_index]
+            if np.isfinite(value):
+                ax.text(
+                    col_index,
+                    row_index,
+                    ["≥50", "<50", "ID", "?"][int(value)],
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color="white" if value in (0, 1, 2) else "black",
+                )
+    ax.spines[:].set_visible(False)
+    colorbar = fig.colorbar(image, ax=ax, ticks=[0, 1, 2, 3])
+    colorbar.ax.set_yticklabels(["≥50/no ID", "<50/no ID", "DO50 ID", "unresolved"])
+    colorbar.set_label("candidate-support DO50 state")
+    fig.savefig(ctx['scale_outputs']["gap_png"], dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ofes_sc_scale_run_variant(
+    ctx: dict,
+    spec: dict,
+    bounds: tuple[float, float, float, float],
+    events: pd.DataFrame,
+    objects: pd.DataFrame,
+    event_rows: dict[str, pd.Series],
+    profile_gate: pd.DataFrame,
+    endpoint_points: dict[str, tuple[float, float]],
+    raw_peak_pixels_by_date: dict[pd.Timestamp, pd.DataFrame],
+    dates: pd.DatetimeIndex,
+) -> dict:
+    override = dict(spec["override"])
+    settings = _ofes_structure_continuity_settings(override)
+    candidate_frames = []
+    merge_frames = []
+    relation_frames = []
+    source_rows = []
+    depth_bounds = tuple(settings["depth_bounds_m"])
+    for date in dates:
+        snapshot, source_row = _ofes_sc_scale_load_snapshot(date, bounds, depth_bounds)
+        source_row["variant_id"] = spec["id"]
+        source_row["requested_depth_bounds_m"] = list(depth_bounds)
+        source_rows.append(source_row)
+        result = extract_ofes_structure_candidates(
+            snapshot,
+            settings=override,
+        )
+        if not result["candidates"].empty:
+            candidate_frames.append(result["candidates"])
+        if not result["merge_audit"].empty:
+            merge_frames.append(result["merge_audit"])
+        if not result["merge_relations"].empty:
+            relation_frames.append(result["merge_relations"])
+    candidates = _ofes_sc_scale_concat(candidate_frames)
+    merge_audit = _ofes_sc_scale_concat(merge_frames)
+    merge_relations = _ofes_sc_scale_concat(relation_frames)
+    if candidates.empty:
+        raise RuntimeError(f"Scale variant {spec['id']} produced no candidates.")
+    matching = match_ofes_structure_candidates(candidates, settings=override)
+    path_result = summarize_ofes_structure_continuity_paths(
+        matching["candidates"],
+        matching["edges"],
+        start_date=event_rows[ctx['start_label']][ctx['start_endpoint_field']],
+        start_lon=endpoint_points[ctx['start_endpoint_role']][0],
+        start_lat=endpoint_points[ctx['start_endpoint_role']][1],
+        end_date=event_rows[ctx['end_label']][ctx['end_endpoint_field']],
+        end_lon=endpoint_points[ctx['end_endpoint_role']][0],
+        end_lat=endpoint_points[ctx['end_endpoint_role']][1],
+        settings=override,
+    )
+    network = _ofes_sc_scale_network_state(
+        path_result["candidates"],
+        matching["edges"],
+        path_result["paths"],
+        path_result["start_candidate_ids"],
+        path_result["end_candidate_ids"],
+    )
+    daily = _ofes_sc_scale_daily_state(
+        network, path_result["paths"], path_result["summary"],
+        path_id=ctx["display_path_id"],
+    )
+    formal = _ofes_sc_formal_detection_audit(ctx, network, events, objects)
+    gap = _ofes_sc_scale_formal_gap_summary(
+        formal["peak_pixels"],
+        spec["id"],
+        pd.date_range(ctx['start_endpoint_date'] + pd.Timedelta(days=1), ctx['end_endpoint_date'] - pd.Timedelta(days=1), freq='D'),
+    )
+    endpoint_registration = _ofes_sc_endpoint_registration(ctx,
+        event_rows,
+        objects,
+        profile_gate,
+        network,
+        endpoint_points,
+        settings,
+    )
+    endpoint_assoc = _ofes_sc_scale_endpoint_association(ctx,
+        network,
+        path_result["paths"],
+        formal["peak_pixels"],
+        raw_peak_pixels_by_date,
+        objects,
+        event_rows,
+        endpoint_points,
+        settings,
+        spec["id"],
+    )
+    material_members, material_daily = _ofes_sc_material_registration(ctx,
+        network,
+        path_result["paths"],
+    )
+    network["variant_id"] = spec["id"]
+    for frame in (
+        network,
+        merge_audit,
+        merge_relations,
+        path_result["paths"],
+        daily,
+        endpoint_registration,
+        endpoint_assoc,
+        gap,
+        material_members,
+        material_daily,
+    ):
+        frame["variant_id"] = spec["id"]
+    for frame in (
+        formal["peak_pixels"],
+        formal["support"],
+        formal["objects"],
+        formal["events"],
+    ):
+        frame["variant_id"] = spec["id"]
+    return {
+        "spec": spec,
+        "settings": settings,
+        "source_rows": source_rows,
+        "candidates": network,
+        "merge_audit": merge_audit,
+        "merge_relations": merge_relations,
+        "paths": path_result["paths"],
+        "daily": daily,
+        "endpoint_registration": endpoint_registration,
+        "endpoint_association": endpoint_assoc,
+        "gap": gap,
+        "formal": formal,
+        "material_members": material_members,
+        "material_daily": material_daily,
+        "summary": _ofes_sc_scale_variant_summary(
+            ctx,
+            spec,
+            network,
+            merge_audit,
+            matching["edges"],
+            path_result["paths"],
+            path_result["summary"],
+            daily,
+            endpoint_assoc,
+            gap,
+            formal,
+            material_members,
+        ),
+        "edges": matching["edges"].assign(variant_id=spec["id"]),
+    }
+
+
+def _ofes_sc_scale_run(ctx: dict) -> None:
+    if ctx['scale_design'] is None:
+        raise ValueError(
+            'case_spec must provide scale_sensitivity before running '
+            'scale variants.'
+        )
+    design = ctx['scale_design']
+    events, objects, event_rows, profile_gate, endpoint_points = _ofes_sc_scale_load_context(ctx)
+    raw_peak_pixels_by_date = _ofes_sc_scale_load_endpoint_peak_pixels(ctx, event_rows)
+    bounds = _ofes_sc_search_bounds(
+        endpoint_points[ctx['start_endpoint_role']][0],
+        endpoint_points[ctx['start_endpoint_role']][1],
+        endpoint_points[ctx['end_endpoint_role']][0],
+        endpoint_points[ctx['end_endpoint_role']][1],
+        _ofes_structure_continuity_settings()["search_buffer_km"],
+    )
+    dates = ctx['base_structure_dates'].copy()
+    selected = design["variants"]
+    baseline = _ofes_sc_scale_baseline_frames(ctx)
+    baseline_summary = _ofes_sc_scale_baseline_summary(ctx,
+        baseline,
+        objects,
+        event_rows,
+        endpoint_points,
+        raw_peak_pixels_by_date,
+    )
+    design_payload = {
+        **design,
+        "question": "Do candidate/path, endpoint and candidate-support DO states depend materially on declared numerical scales?",
+        "unit": "one daily OFES candidate and its one-day correspondence network; formal support is one candidate-date-threshold audit unit",
+        "design": (
+            "cached baseline plus one-factor variants; no Cartesian products; "
+            f"no tuning to connect {ctx['end_label']}"
+        ),
+        "evidence": "candidate centres/extents, rotation-gradient summaries, branch/path states, real object keys, material envelope registration",
+        "message_target": "identify stable versus scale-dependent findings without upgrading a candidate path to structure or material identity",
+        "delivery": "PNG comparison figures and CSV/JSON audit tables; no PDF or native cache copy",
+        "requested_search_bounds": bounds,
+        "dates": [pd.Timestamp(date) for date in dates],
+    }
+    _ofes_sc_write_json(ctx['scale_design_path'], design_payload)
+    results = []
+    for spec in selected:
+        print(f"running {spec['id']}", flush=True)
+        results.append(
+            _ofes_sc_scale_run_variant(ctx,
+                spec,
+                bounds,
+                events,
+                objects,
+                event_rows,
+                profile_gate,
+                endpoint_points,
+                raw_peak_pixels_by_date,
+                dates,
+            )
+        )
+
+    candidate_frames = [baseline["candidate"]]
+    merge_frames = [baseline["merge_audit"]]
+    relation_frames = [baseline["merge_relations"]]
+    path_frames = [baseline["path"]]
+    daily_frames = []
+    endpoint_registration_frames = [baseline["endpoint_registration"]]
+    endpoint_assoc_frames = [
+        _ofes_sc_scale_endpoint_association(ctx,
+            baseline["candidate"],
+            baseline["path"],
+            baseline["formal_peak"],
+            raw_peak_pixels_by_date,
+            objects,
+            event_rows,
+            endpoint_points,
+            _ofes_structure_continuity_settings(),
+            ctx["baseline_variant_label"],
+        )
+    ]
+    gap_frames = [_ofes_sc_scale_formal_gap_summary(
+        baseline["formal_peak"],
+        ctx["baseline_variant_label"],
+        pd.date_range(ctx['start_endpoint_date'] + pd.Timedelta(days=1), ctx['end_endpoint_date'] - pd.Timedelta(days=1), freq='D'),
+    )]
+    formal_peak_frames = [baseline["formal_peak"]]
+    formal_support_frames = [baseline["formal_support"]]
+    formal_object_frames = [baseline["formal_objects"]]
+    formal_event_frames = [baseline["formal_events"]]
+    material_member_frames = [baseline["material_members"]]
+    material_daily_frames = [baseline["material_daily"]]
+    edge_frames = []
+    summary_rows = [baseline_summary]
+    baseline_daily = _ofes_sc_scale_network_state(
+        baseline["candidate"],
+        pd.read_csv(ctx['scale_original_root'] / "structure_match_edges.csv"),
+        baseline["path"],
+        baseline["path"].loc[
+            baseline["path"]["date"].eq(baseline["path"]["date"].min()), "candidate_id"
+        ].astype(str).tolist(),
+        baseline["path"].loc[
+            baseline["path"]["date"].eq(baseline["path"]["date"].max()), "candidate_id"
+        ].astype(str).tolist(),
+    )
+    baseline_daily_frame = _ofes_sc_scale_daily_state(
+        baseline_daily,
+        baseline["path"],
+        baseline["manifest"]["path_summary"],
+        path_id=ctx["display_path_id"],
+    )
+    baseline_daily_frame["variant_id"] = ctx["baseline_variant_label"]
+    daily_frames.append(baseline_daily_frame)
+    for result in results:
+        candidate_frames.append(result["candidates"])
+        merge_frames.append(result["merge_audit"])
+        relation_frames.append(result["merge_relations"])
+        path_frames.append(result["paths"])
+        daily_frames.append(result["daily"])
+        endpoint_registration_frames.append(result["endpoint_registration"])
+        endpoint_assoc_frames.append(result["endpoint_association"])
+        gap_frames.append(result["gap"])
+        formal_peak_frames.append(result["formal"]["peak_pixels"])
+        formal_support_frames.append(result["formal"]["support"])
+        formal_object_frames.append(result["formal"]["objects"])
+        formal_event_frames.append(result["formal"]["events"])
+        material_member_frames.append(result["material_members"])
+        material_daily_frames.append(result["material_daily"])
+        edge_frames.append(result["edges"])
+        summary_rows.append(result["summary"])
+
+    outputs = {
+        "candidate": _ofes_sc_scale_concat(candidate_frames),
+        "merge_audit": _ofes_sc_scale_concat(merge_frames),
+        "merge_relations": _ofes_sc_scale_concat(relation_frames),
+        "path": _ofes_sc_scale_concat(path_frames),
+        "daily": _ofes_sc_scale_concat(daily_frames),
+        "summary": pd.DataFrame(summary_rows),
+        "endpoint_registration": _ofes_sc_scale_concat(endpoint_registration_frames),
+        "endpoint_association": _ofes_sc_scale_concat(endpoint_assoc_frames),
+        "gap": _ofes_sc_scale_concat(gap_frames),
+        "formal_peak": _ofes_sc_scale_concat(formal_peak_frames),
+        "formal_support": _ofes_sc_scale_concat(formal_support_frames),
+        "formal_objects": _ofes_sc_scale_concat(formal_object_frames),
+        "formal_events": _ofes_sc_scale_concat(formal_event_frames),
+        "material_members": _ofes_sc_scale_concat(material_member_frames),
+        "material_daily": _ofes_sc_scale_concat(material_daily_frames),
+    }
+    for key, frame in outputs.items():
+        if key in ctx['scale_outputs']:
+            frame.to_csv(ctx['scale_outputs'][key], index=False)
+    _ofes_sc_scale_plot_comparison(ctx, outputs["summary"])
+    _ofes_sc_scale_plot_gap(ctx, outputs["gap"])
+
+    summary = outputs["summary"]
+    validation = {
+        "design_variant_count": int(len(selected)),
+        "design_is_one_factor": all(
+            len(spec["override"]) == 1 for spec in selected
+        ),
+        "baseline_compact_manifest_present": (ctx['scale_baseline_dir'] / "baseline_manifest.json").exists(),
+        "dates_complete_for_all_variants": bool(
+            summary["searched_date_count"].eq(len(ctx['base_structure_dates'])).all()
+        ),
+        "no_particle_reintegration": True,
+        "do_loaded_by_structure_search": False,
+        "formal_audit_uses_real_threshold_object_columns": True,
+        "cross_threshold_event_id_prefix_reconstruction_used": False,
+        "material_registration_uses_existing_trajectory_rows": True,
+        "candidate_envelope_is_approximation": True,
+        "candidate_path_membership_registered_separately": True,
+        "gap_high_low_columns_present": all(
+            column in outputs["gap"].columns
+            for column in (
+                "max_delta_do50_umol_kg",
+                "retained_do50_object_id_association_count",
+                "gap_status",
+            )
+        ),
+        "endpoint_association_uses_daily_object_key": (
+            "daily_object_key" in outputs["endpoint_association"].columns
+        ),
+        "endpoint_association_uses_shared_track_registration": True,
+        "endpoint_association_reports_horizontal_and_peak_support": all(
+            column in outputs["endpoint_association"].columns
+            for column in (
+                "horizontal_member_support_count",
+                "peak_points_in_candidate_envelope_count",
+            )
+        ),
+        "oxygen_layer_overlap_is_unknown_not_zero_or_false": bool(
+            outputs["endpoint_association"]["oxygen_layer_overlap_m"].isna().all()
+            and outputs["endpoint_association"][
+                "oxygen_layer_overlap_status"
+            ].astype(str).str.contains("unknown").all()
+        ),
+        "all_variant_summary_rows_present": int(len(summary)) == len(selected) + 1,
+        "candidate_table_variant_ids_complete": set(
+            outputs["candidate"]["variant_id"].dropna().astype(str)
+        ) == set([ctx["baseline_variant_label"]] + [spec["id"] for spec in selected]),
+        "all_native_variant_outputs_recomputed": bool(results),
+    }
+    _ofes_sc_write_json(ctx['scale_outputs']["validation"], validation)
+    source_manifest = {
+        "analysis": f"{ctx['case_id']}_scale_sensitivity_audit",
+        "case_spec": _ofes_sc_jsonable(
+            {
+                "case_id": ctx['case_id'],
+                "events": ctx['case_spec'].get("events", []),
+            }
+        ),
+        "variant_ids": [spec["id"] for spec in selected],
+        "display_path_id": ctx['display_path_id'],
+        "pilot_dates": list(ctx['pilot_pilot_dates']),
+        "pilot_smoothing_values": [float(v) for v in ctx['pilot_smoothing_values']],
+        "requested_search_bounds": bounds,
+        "design": design_payload,
+        "baseline_manifest": str((ctx['scale_baseline_dir'] / "baseline_manifest.json").resolve()),
+        "native_structure_recomputed_for_variants": True,
+        "cached_baseline_reused": True,
+        "particle_reintegration": False,
+        "annual_detection_rerun": False,
+        "endpoint_registration_semantics": {
+            "shared_helper": "track._ofes_endpoint_object_registration",
+            "variant_summary_endpoint_scope": _ofes_sc_endpoint_scope_value(ctx),
+            "horizontal_support": "threshold_specific_object_peak_pixels_within_candidate_radius",
+            "peak_point_support": "object_peak_depth_within_candidate_vertical_interval_and_horizontal_radius",
+            "oxygen_layer_overlap": "unknown_true_per_pixel_upper_lower_edges_not_saved",
+            "peak_depth_range_intersection_is_not_oxygen_layer_overlap": True,
+        },
+        "source_rows": [row for result in results for row in result["source_rows"]],
+        "variant_settings": {
+            result["spec"]["id"]: result["settings"] for result in results
+        },
+        "outputs": {
+            key: str(path.resolve())
+            for key, path in ctx['scale_outputs'].items()
+            if path.exists()
+        },
+        "validation": validation,
+    }
+    _ofes_sc_write_json(ctx['scale_outputs']["source_manifest"], source_manifest)
+
+    baseline_settings = _ofes_structure_continuity_settings()
+    gap_day_count = int(
+        (ctx['end_endpoint_date'] - ctx['start_endpoint_date']).days
+    ) - 1
+    baseline_row = summary.loc[
+        summary["variant_id"].eq(ctx["baseline_variant_label"])
+    ].iloc[0]
+    stable = summary.loc[
+        summary["full_path_count"].eq(int(baseline_row["full_path_count"]))
+        & summary["gap_high_max_delta_ge50_days"].eq(
+            int(baseline_row["gap_high_max_delta_ge50_days"])
+        )
+        & summary["gap_low_max_delta_lt50_days"].eq(
+            int(baseline_row["gap_low_max_delta_lt50_days"])
+        )
+    ]
+    end_stable = summary.loc[
+        summary[f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope"].eq(False)
+    ]
+    verdict = f"""# {ctx['start_label']}–{ctx['end_label']} 尺度敏感性审计（≤1800 字）
+
+本轮在既有缓存基线之外，按案例规格中预注册的 {len(selected)} 个单因素变体重算 {len(ctx['base_structure_dates'])} 天 T/S—u/v 候选；没有做参数笛卡尔积、年度扫描、粒子重积分或 DO detector 重跑。水平网格约 {design['horizontal_grid_spacing_km'][0]}–{design['horizontal_grid_spacing_km'][1]} km；基线深度交付层按设计记录为 {design['delivered_depth_levels_baseline']} 层，逐变体深度窗见变体表。
+
+稳定性摘要：{len(stable)}/{len(summary)} 个基线/变体同时保留基线的 {int(baseline_row['full_path_count'])} 条完整端点约束路径，并保持 {gap_day_count} 天候选支撑内“{int(baseline_row['gap_high_max_delta_ge50_days'])} 天最大 ΔDO≥50、{int(baseline_row['gap_low_max_delta_lt50_days'])} 天最大 ΔDO<50，均无保留 DO50 object ID”的分层；{len(end_stable)}/{len(summary)} 个结果的 {ctx['end_label']} 路径端点没有目标 DO50 object ID 进入候选峰点包络。所有结果的真实氧层上下边界均未保存，氧层重叠状态保持 unknown，不能被写成 0 m 或 False。其余候选数、边数、分支数和路径几何随尺度变化，不能被压缩为唯一数值。
+
+尺度解释边界：动力平滑、热盐背景平滑、垂向采样半径和水平合并距离是搜索/关联尺度，不是涡旋的动力半径、厚度或最大尺度。深度窗变体用于检查交付边界截断；候选等效半径没有被用作 Rmax，也没有把异常厚度当作动力 H。
+
+正式 DO 审计继续按日期、阈值专属 peak-pixel object ID、真实 daily_object_key 和实际事件 ID 连接；跨阈值事件身份没有重建。材料登记继续只使用既有轨迹，分开任意候选包络与具体枚举路径包络，因此不支持材料边界、保持、交换、供给或释放结论。
+
+小型 Ro_v pilot：本轮先完成候选尺度审计；只有在独立速度中心、角向覆盖和背景处理均满足预设门槛时才报告数值。若中心或环带支持不足，将保留为不可估计，不以任意 Ro 区间分类亚中尺度动力。
+
+复用建议：基线 {baseline_settings['kinematic_smoothing_sigma_pixels']} 像元动力平滑、{baseline_settings['vertical_profile_radius_km']} km 垂向采样、{baseline_settings['candidate_min_separation_km']} km 水平合并加垂向/符号合并规则和 {int(baseline_settings['depth_bounds_m'][0])}–{int(baseline_settings['depth_bounds_m'][1])} m 窗可作为当前案例的工作设置；任何跨案例复用前仍需检查局地网格覆盖、交付深度边界和候选分支。尺度敏感性不构成不同物理机制的证据。
+"""
+    ctx['scale_outputs']["verdict"].write_text(verdict, encoding="utf-8")
+
+
+def _ofes_sc_freeze_run(ctx: dict) -> None:
+    import subprocess
+
+    ctx['freeze_baseline_dir'].mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(
+        (ctx['freeze_parent'] / "input_source_manifest.json").read_text(encoding="utf-8")
+    )
+    case_summary = json.loads(
+        (ctx['freeze_parent'] / "case_summary.json").read_text(encoding="utf-8")
+    )
+    candidates = pd.read_csv(ctx['freeze_parent'] / "daily_structure_candidates.csv")
+    candidates["date"] = pd.to_datetime(candidates["date"]).dt.normalize()
+    daily = pd.read_csv(ctx['freeze_parent'] / "daily_structure_correspondence.csv")
+    daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
+    paths = pd.read_csv(ctx['freeze_parent'] / "structure_path_members.csv")
+    paths["date"] = pd.to_datetime(paths["date"]).dt.normalize()
+    endpoint = pd.read_csv(ctx['freeze_parent'] / "endpoint_registration.csv")
+    timeline = pd.read_csv(ctx['freeze_parent'] / "structure_vs_do_timeline.csv")
+    timeline["date"] = pd.to_datetime(timeline["date"]).dt.normalize()
+
+    candidate_summary = (
+        candidates.groupby("date", as_index=False)
+        .agg(
+            candidate_count=("candidate_id", "size"),
+            vertical_shallow_min_m=("vertical_shallow_depth_m", "min"),
+            vertical_deep_max_m=("vertical_deep_depth_m", "max"),
+            median_vertical_thickness_m=("vertical_thickness_m", "median"),
+            median_horizontal_radius_km=(
+                "thermohaline_component_radius_km",
+                "median",
+            ),
+            median_abs_rossby=("rossby_number", lambda values: np.median(np.abs(values))),
+            candidate_merge_decisions=(
+                "candidate_merge_decision",
+                lambda values: ";".join(sorted(set(values.astype(str)))),
+            ),
+        )
+        .merge(
+            daily[
+                [
+                    "date",
+                    "ambiguous_candidate_count",
+                    "isolated_candidate_count",
+                    "valid_edge_count_to_next_day",
+                    "valid_edge_count_from_previous_day",
+                ]
+            ],
+            on="date",
+            how="left",
+            validate="one_to_one",
+        )
+    )
+    candidate_summary.to_csv(
+        ctx['freeze_baseline_dir'] / "baseline_candidate_date_summary.csv",
+        index=False,
+    )
+
+    path = paths.loc[paths["path_id"].eq(ctx["display_path_id"])].copy()
+    path = path.merge(
+        candidates[
+            [
+                "candidate_id",
+                "lon",
+                "lat",
+                "depth_m",
+                "vertical_shallow_depth_m",
+                "vertical_deep_depth_m",
+                "vertical_thickness_m",
+                "thermohaline_component_radius_km",
+                "rossby_number",
+                "normalized_strain",
+                "spiciness_anomaly",
+                "candidate_merge_decision",
+            ]
+        ],
+        on="candidate_id",
+        how="left",
+        validate="one_to_one",
+    )
+    path.to_csv(ctx['freeze_baseline_dir'] / f"baseline_{ctx['display_path_id']}.csv", index=False)
+
+    endpoint.to_csv(ctx['freeze_baseline_dir'] / "baseline_endpoint_registration.csv", index=False)
+    timeline.loc[
+        timeline["date"].between(
+        ctx['start_endpoint_date'] + pd.Timedelta(days=1),
+        ctx['end_endpoint_date'],
+    )
+    ].to_csv(ctx['freeze_baseline_dir'] / "baseline_detection_timeline.csv", index=False)
+
+    baseline_payload = {
+        "baseline_id": f"{ctx['case_id']}_{ctx['scale_design']['baseline_label']}_before_scale_audit",
+        "source": "existing_cached_outputs_only",
+        "git_head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+        ).strip(),
+        "settings": manifest["settings"],
+        "grid_source_rows": [
+            {
+                "date": row["date"],
+                "lon_count": row["lon_count"],
+                "lat_count": row["lat_count"],
+                "depth_count": row["depth_count"],
+                "lon_min": row["lon_min"],
+                "lon_max": row["lon_max"],
+                "lat_min": row["lat_min"],
+                "lat_max": row["lat_max"],
+                "depth_min_m": row["depth_min_m"],
+                "depth_max_m": row["depth_max_m"],
+                "horizontal_grid": row["horizontal_grid"],
+                "horizontal_location": row["horizontal_location"],
+            }
+            for row in manifest["source_rows"]
+        ],
+        "path_summary": case_summary["path_summary"],
+        "candidate_count": case_summary["candidate_count"],
+        "edge_count": case_summary["edge_count"],
+        "formal_detection_audit_status": case_summary[
+            "formal_detection_audit_status"
+        ],
+        "formal_detection_audit_complete": case_summary[
+            "formal_detection_audit_complete"
+        ],
+        "candidate_envelope_gap_summary": case_summary[
+            "candidate_envelope_gap_summary"
+        ],
+        _ofes_sc_overlap_summary_key(ctx): case_summary[
+            _ofes_sc_overlap_summary_key(ctx)
+        ],
+        "endpoint_registration_semantics": {
+            "shared_helper": "track._ofes_endpoint_object_registration",
+            "horizontal_support": "threshold_specific_object_peak_pixels_within_candidate_radius",
+            "peak_point_support": "object_peak_depth_within_candidate_vertical_interval_and_horizontal_radius",
+            "oxygen_layer_overlap": "unknown_true_per_pixel_upper_lower_edges_not_saved",
+            "peak_depth_range_intersection_is_not_oxygen_layer_overlap": True,
+        },
+        "compact_outputs": {
+            "candidate_date_summary": "baseline/baseline_candidate_date_summary.csv",
+            "path": f"baseline/baseline_{ctx['display_path_id']}.csv",
+            "endpoint_registration": "baseline/baseline_endpoint_registration.csv",
+            "detection_timeline": "baseline/baseline_detection_timeline.csv",
+        },
+        "native_structure_recomputed": ctx.get("native_structure_recomputed", False),
+        "particle_reintegrated": False,
+    }
+    _ofes_sc_write_json(ctx['freeze_baseline_dir'] / "baseline_manifest.json", baseline_payload)
+
+
+def _ofes_sc_write_pilot_not_run(ctx: dict, reason: str) -> None:
+    """记录条件性 Ro_v pilot 未执行，不写出任何数值结果。
+
+    参数:
+        - ctx (dict): 案例上下文。
+        - reason (str): 未执行原因，写入 manifest 供后续核对。
+
+    说明:
+        - pilot 依赖展示路径在 pilot 日期上的基线候选；条件不满足时保留未登记状态，
+          不写出补零的 Ro_v/Rmax，也不阻断尺度流程的其他结果。
+    """
+    pd.DataFrame(
+        columns=[
+            "date",
+            "smoothing_sigma_pixels",
+            "profile_status",
+            "ro_v",
+            "rmax_km",
+            "velocity_center_offset_km",
+        ]
+    ).to_csv(ctx['pilot_output_summary'], index=False)
+    pd.DataFrame().to_csv(ctx['pilot_output_profiles'], index=False)
+    pd.DataFrame().to_csv(ctx['pilot_output_centres'], index=False)
+    _ofes_sc_write_json(
+        ctx['pilot_output_manifest'],
+        {
+            "analysis": f"{ctx['case_id']}_conditional_velocity_ring_ro_v_pilot",
+            "pilot_status": f"not_run_{reason}",
+            "reason": reason,
+            "dates": list(ctx['pilot_pilot_dates']),
+            "smoothing_sigma_pixels": list(ctx['pilot_smoothing_values']),
+            "estimable_row_count": 0,
+            "rmax_is_dynamical_radius": False,
+        },
+    )
+
+
+def _ofes_sc_pilot_run(ctx: dict) -> None:
+    settings = _ofes_structure_continuity_settings()
+    events = pd.read_parquet(ctx['base_event_catalog_path'])
+    event_rows = {
+        label: _ofes_sc_event_row(events, event_id)
+        for label, event_id in ctx['base_event_ids'].items()
+    }
+    objects = pd.read_parquet(ctx['base_daily_object_path'])
+    _ofes_sc_check_endpoint_dates(ctx, event_rows)
+    start_point = _ofes_sc_daily_object_point(
+        objects,
+        ctx['start_event_id'],
+        event_rows[ctx['start_label']][ctx['start_endpoint_field']],
+    )
+    end_point = _ofes_sc_daily_object_point(
+        objects,
+        ctx['end_event_id'],
+        event_rows[ctx['end_label']][ctx['end_endpoint_field']],
+    )
+    bounds = _ofes_sc_search_bounds(
+        start_point[0],
+        start_point[1],
+        end_point[0],
+        end_point[1],
+        settings["search_buffer_km"],
+    )
+    path = pd.read_csv(ctx['base_root'] / "structure_path_members.csv")
+    path["date"] = pd.to_datetime(path["date"]).dt.normalize()
+    candidates = pd.read_csv(ctx['base_root'] / "daily_structure_candidates.csv")
+    candidates["date"] = pd.to_datetime(candidates["date"]).dt.normalize()
+    candidate_path = path.loc[
+        path["path_id"].eq(ctx["display_path_id"]) & path["date"].isin(ctx['pilot_pilot_dates'])
+    ].merge(
+        candidates,
+        on=["date", "candidate_id"],
+        how="left",
+        validate="one_to_one",
+    )
+    if not ctx['display_path_id']:
+        _ofes_sc_write_pilot_not_run(ctx, 'no_display_path_configured')
+        return
+    if len(candidate_path) != len(ctx['pilot_pilot_dates']):
+        _ofes_sc_write_pilot_not_run(ctx, 'baseline_path_missing_on_pilot_dates')
+        return
+
+    summary_rows = []
+    profile_frames = []
+    center_frames = []
+    source_rows = []
+    for date in ctx['pilot_pilot_dates']:
+        candidate = candidate_path.loc[candidate_path["date"].eq(date)].iloc[0]
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=["temp", "salinity", "u", "v"],
+            lon_bounds=(bounds[0], bounds[1]),
+            lat_bounds=(bounds[2], bounds[3]),
+            depth_bounds=tuple(settings["depth_bounds_m"]),
+        )
+        metadata = snapshot.get("metadata", {}) or {}
+        source_rows.append(
+            {
+                "date": date,
+                "depth_min_m": float(snapshot["depth"][0]),
+                "depth_max_m": float(snapshot["depth"][-1]),
+                "depth_count": int(len(snapshot["depth"])),
+                "lon_count": int(len(snapshot["lon"])),
+                "lat_count": int(len(snapshot["lat"])),
+                "horizontal_location": metadata.get("horizontal_location"),
+            }
+        )
+        for smoothing in ctx['pilot_smoothing_values']:
+            result = _ofes_velocity_ring_pilot(
+                snapshot,
+                float(candidate["lon"]),
+                float(candidate["lat"]),
+                float(candidate["depth_m"]),
+                smoothing_sigma_pixels=smoothing,
+            )
+            row = {
+                key: value
+                for key, value in result.items()
+                if key not in ("center_candidates", "radial_profile")
+            }
+            row.update(
+                {
+                    "date": date,
+                    "candidate_id": str(candidate["candidate_id"]),
+                    "candidate_vertical_shallow_depth_m": float(
+                        candidate["vertical_shallow_depth_m"]
+                    ),
+                    "candidate_vertical_deep_depth_m": float(
+                        candidate["vertical_deep_depth_m"]
+                    ),
+                    "candidate_horizontal_radius_km": float(
+                        candidate["thermohaline_component_radius_km"]
+                    ),
+                    "candidate_rossby_number": float(candidate["rossby_number"]),
+                    "candidate_normalized_strain": float(
+                        candidate["normalized_strain"]
+                    ),
+                }
+            )
+            summary_rows.append(row)
+            radial = result["radial_profile"].copy()
+            if not radial.empty:
+                radial["date"] = date
+                radial["candidate_id"] = str(candidate["candidate_id"])
+                radial["smoothing_sigma_pixels"] = smoothing
+                radial["center_status"] = result["center_status"]
+                radial["profile_status"] = result["profile_status"]
+                profile_frames.append(radial)
+            centres = pd.DataFrame(result["center_candidates"])
+            if not centres.empty:
+                centres["date"] = date
+                centres["candidate_id"] = str(candidate["candidate_id"])
+                centres["smoothing_sigma_pixels"] = smoothing
+                centres["center_status"] = result["center_status"]
+                center_frames.append(centres)
+
+    summary = pd.DataFrame(summary_rows)
+    profiles = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame()
+    centres = pd.concat(center_frames, ignore_index=True) if center_frames else pd.DataFrame()
+    summary.to_csv(ctx['pilot_output_summary'], index=False)
+    profiles.to_csv(ctx['pilot_output_profiles'], index=False)
+    centres.to_csv(ctx['pilot_output_centres'], index=False)
+
+    fig, axes = plt.subplots(1, len(ctx['pilot_pilot_dates']), figsize=(15, 4.8), sharey=True, constrained_layout=True)
+    colors = _ofes_sc_pilot_smoothing_colors(ctx)
+    for axis, date in zip(np.atleast_1d(axes), ctx['pilot_pilot_dates']):
+        subset = profiles.loc[profiles["date"].eq(date)] if not profiles.empty else pd.DataFrame()
+        date_summary = summary.loc[summary["date"].eq(date)]
+        for smoothing in ctx['pilot_smoothing_values']:
+            profile = subset.loc[subset["smoothing_sigma_pixels"].eq(smoothing)]
+            if profile.empty:
+                continue
+            axis.plot(
+                profile["radius_center_km"],
+                profile["mean_azimuthal_vtheta_m_s"] * 100.0,
+                marker="o",
+                ms=3,
+                lw=1.2,
+                color=colors[smoothing],
+                label=f"σ={smoothing:g} px",
+            )
+        for row in date_summary.itertuples(index=False):
+            if np.isfinite(row.ro_v) and np.isfinite(row.rmax_km):
+                axis.axvline(row.rmax_km, color=colors[row.smoothing_sigma_pixels], alpha=0.35, lw=1)
+        center_labels = {
+            "unique_velocity_extremum": "center unique",
+            "ambiguous_velocity_extrema": "center ambiguous",
+            "boundary_velocity_extremum": "center boundary",
+        }
+        profile_labels = {
+            "estimable_conditional_velocity_ring": "ring estimable",
+            "not_estimable_angular_coverage": "ring coverage-limited",
+        }
+        status_text = "; ".join(
+            sorted(
+                {
+                    center_labels.get(row.center_status, row.center_status),
+                    profile_labels.get(row.profile_status, row.profile_status),
+                }
+            )
+        )
+        axis.set_title(f"{date:%Y-%m-%d}", fontsize=10)
+        axis.text(
+            0.02,
+            0.97,
+            status_text,
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 2},
+        )
+        axis.set_xlabel("radius from velocity centre (km)")
+        axis.grid(alpha=0.25)
+        axis.spines[["top", "right"]].set_visible(False)
+    np.atleast_1d(axes)[0].set_ylabel("mean azimuthal Vθ (cm s⁻¹)\n(background vector removed)")
+    np.atleast_1d(axes)[0].legend(frameon=False, fontsize=8, loc="upper right")
+    fig.suptitle(
+        "Conditional Ro_v pilot on three baseline-path dates\n"
+        "velocity-centre search is independent of DO; vertical lines mark Rmax only when the ring is estimable",
+        fontsize=12,
+    )
+    fig.savefig(ctx['pilot_output_figure'], dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+    estimable = summary.loc[summary["profile_status"].eq("estimable_conditional_velocity_ring")]
+    manifest = {
+        "analysis": f"{ctx['case_id']}_conditional_velocity_ring_ro_v_pilot",
+        "pilot_status": "completed",
+        "dates": list(ctx['pilot_pilot_dates']),
+        "smoothing_sigma_pixels": list(ctx['pilot_smoothing_values']),
+        "candidate_source": f"baseline {ctx['display_path_id']} thermohaline candidates",
+        "input_variables": ["u", "v"],
+        "do_loaded": False,
+        "particle_path_used": False,
+        "center_definition": "local maximum of absolute relative vorticity within 60 km of thermohaline centre",
+        "background_definition": "median u/v in 60-80 km annulus around velocity centre",
+        "profile_definition": "12-sector, 5 km radial bins to 80 km; valid bin requires >=12 samples and >=75% angular sectors",
+        "ro_v_definition": "max(abs(mean azimuthal Vtheta)) / (abs(f) * Rmax)",
+        "signed_zeta_f_kept_separately": True,
+        "rmax_is_dynamical_radius": False,
+        "estimable_row_count": int(len(estimable)),
+        "non_estimability_reasons": summary.loc[
+            ~summary["profile_status"].eq("estimable_conditional_velocity_ring"),
+            "profile_status",
+        ].value_counts().to_dict(),
+        "source_rows": source_rows,
+        "outputs": {
+            "summary": str(ctx['pilot_output_summary'].resolve()),
+            "profiles": str(ctx['pilot_output_profiles'].resolve()),
+            "centres": str(ctx['pilot_output_centres'].resolve()),
+            "figure": str(ctx['pilot_output_figure'].resolve()),
+        },
+    }
+    _ofes_sc_write_json(ctx['pilot_output_manifest'], manifest)
+
+
+def _ofes_sc_refresh_endpoint_summary(
+    ctx: dict,
+    association: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    for variant_id, group in association.groupby("variant_id", sort=False):
+        path_rows = group.loc[
+            group['case_label'].eq(ctx['end_label'])
+            & group["path_ids"].fillna("").astype(str).str.split(";").map(
+                lambda values: ctx["display_path_id"] in values
+            )
+        ]
+        statuses = sorted(
+            path_rows["oxygen_layer_overlap_status"].dropna().astype(str).unique()
+        )
+        object_id_values = path_rows["object_id_in_candidate_envelope"].dropna()
+        rows.append(
+            {
+                "variant_id": variant_id,
+                f"endpoint_{ctx['end_label'].lower()}_path_scope": _ofes_sc_endpoint_scope_value(ctx),
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_rows": int(len(path_rows)),
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_oxygen_layer_overlap_status": (
+                    ";".join(statuses)
+                    if statuses else f"no_{ctx['end_label']}_path_endpoint_association"
+                ),
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope": (
+                    pd.NA
+                    if object_id_values.empty
+                    else bool(object_id_values.astype(bool).any())
+                ),
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_depth_range_intersection_m": float(
+                    path_rows[
+                        "peak_depth_range_interval_intersection_m"
+                    ].max()
+                ) if not path_rows.empty else np.nan,
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_horizontal_member_support_count": int(
+                    path_rows["horizontal_member_support_count"].max()
+                ) if not path_rows.empty else np.nan,
+                f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_points_in_candidate_envelope_count": int(
+                    path_rows["peak_points_in_candidate_envelope_count"].max()
+                ) if not path_rows.empty else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ofes_sc_refresh_run(ctx: dict) -> None:
+    events, objects, event_rows, profile_gate, endpoint_points = _ofes_sc_scale_load_context(ctx)
+    raw_peak_pixels_by_date = _ofes_sc_scale_load_endpoint_peak_pixels(ctx, event_rows)
+    candidates = pd.read_csv(ctx['refresh_root'] / "scale_sensitivity_candidates.csv")
+    candidates["date"] = pd.to_datetime(candidates["date"], format="mixed").dt.normalize()
+    paths = pd.read_csv(ctx['refresh_root'] / "scale_sensitivity_path_members.csv")
+    if not paths.empty:
+        paths["date"] = pd.to_datetime(paths["date"], format="mixed").dt.normalize()
+    formal_peak = pd.read_csv(ctx['refresh_root'] / "scale_sensitivity_formal_peak_pixel_audit.csv")
+    formal_peak["date"] = pd.to_datetime(formal_peak["date"], format="mixed").dt.normalize()
+    manifest = json.loads(ctx['refresh_manifest_path'].read_text(encoding="utf-8"))
+    variant_settings = manifest.get("variant_settings", {})
+    variant_ids = candidates["variant_id"].dropna().astype(str).drop_duplicates().tolist()
+
+    associations = []
+    for variant_id in variant_ids:
+        variant_candidates = candidates.loc[
+            candidates["variant_id"].eq(variant_id)
+        ].copy()
+        variant_paths = paths.loc[paths["variant_id"].eq(variant_id)].copy()
+        variant_peak = formal_peak.loc[
+            formal_peak["variant_id"].eq(variant_id)
+        ].copy()
+        settings = _ofes_structure_continuity_settings(
+            variant_settings.get(variant_id, {})
+            if variant_id != ctx["baseline_variant_label"] else None
+        )
+        association = _ofes_sc_scale_endpoint_association(ctx,
+            variant_candidates,
+            variant_paths,
+            variant_peak,
+            raw_peak_pixels_by_date,
+            objects,
+            event_rows,
+            endpoint_points,
+            settings,
+            variant_id,
+        )
+        associations.append(association)
+    association = pd.concat(associations, ignore_index=True)
+    association.to_csv(ctx['refresh_association_path'], index=False)
+
+    summary = pd.read_csv(ctx['refresh_summary_path'])
+    summary = summary.drop(
+        columns=[
+            "endpoint_e246_path_rows",
+            "endpoint_e246_path_rows_x",
+            "endpoint_e246_path_rows_y",
+            "endpoint_e246_path_3d_overlap",
+            "endpoint_e246_path_vertical_overlap_m",
+            "endpoint_e246_path_oxygen_layer_overlap_status",
+            "endpoint_e246_path_object_id_in_envelope",
+            "endpoint_e246_path_peak_depth_range_intersection_m",
+            "endpoint_e246_path_horizontal_member_support_count",
+            "endpoint_e246_path_peak_points_in_candidate_envelope_count",
+            f"endpoint_{ctx['end_label'].lower()}_path_scope",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_rows",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_oxygen_layer_overlap_status",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_depth_range_intersection_m",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_horizontal_member_support_count",
+            f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_points_in_candidate_envelope_count",
+        ],
+        errors="ignore",
+    )
+    summary = summary.merge(
+        _ofes_sc_refresh_endpoint_summary(ctx, association),
+        on="variant_id",
+        how="left",
+        validate="one_to_one",
+    )
+    summary.to_csv(ctx['refresh_summary_path'], index=False)
+
+    validation = json.loads(ctx['refresh_validation_path'].read_text(encoding="utf-8"))
+    validation.update(
+        {
+            "cached_endpoint_registration_refresh": True,
+            "native_structure_recomputed_for_cached_refresh": False,
+            "detector_rerun_for_cached_refresh": False,
+            "path_search_rerun_for_cached_refresh": False,
+            "endpoint_association_uses_shared_track_registration": True,
+            "endpoint_association_reports_horizontal_and_peak_support": all(
+                column in association.columns
+                for column in (
+                    "horizontal_member_support_count",
+                    "peak_points_in_candidate_envelope_count",
+                )
+            ),
+            "oxygen_layer_overlap_is_unknown_not_zero_or_false": bool(
+                association["oxygen_layer_overlap_m"].isna().all()
+                and association["oxygen_layer_overlap_status"]
+                .astype(str)
+                .str.contains("unknown")
+                .all()
+            ),
+            "endpoint_association_uses_daily_object_key": True,
+        }
+    )
+    ctx['refresh_validation_path'].write_text(
+        json.dumps(_ofes_sc_jsonable(validation), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    manifest["cached_endpoint_registration_refresh"] = {
+        "native_structure_recomputed": ctx.get("native_structure_recomputed", False),
+        "detector_rerun": False,
+        "path_search_rerun": False,
+        "shared_helper": "track._ofes_endpoint_object_registration",
+        "variant_summary_endpoint_scope": _ofes_sc_endpoint_scope_value(ctx),
+        "association_output": str(ctx['refresh_association_path'].resolve()),
+        "raw_peak_pixel_sources": [
+            str(
+                (
+                    ctx['base_peak_pixel_root']
+                    / f"peak_pixels_{pd.Timestamp(date):%Y%m%d}.parquet"
+                ).resolve()
+            )
+            for date in sorted(raw_peak_pixels_by_date)
+        ],
+        "oxygen_layer_overlap_status": (
+            "unknown_true_per_pixel_upper_lower_edges_not_saved"
+        ),
+        "peak_depth_range_intersection_is_not_oxygen_layer_overlap": True,
+    }
+    manifest["validation"] = validation
+    ctx['refresh_manifest_path'].write_text(
+        json.dumps(_ofes_sc_jsonable(manifest), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _ofes_sc_path_claim_text(full_path_count: int, style: str = "verdict") -> str:
+    """按完整候选路径条数生成路径结论文字。
+
+    参数:
+        - full_path_count (int): 完整候选路径条数。
+        - style (str): `verdict` 用于裁决正文，`method` 用于方法文档。
+
+    返回:
+        - str: 由实际路径条数决定的结论文字。
+
+    说明:
+        - 0 条时两种写法都**不得**声称存在可复核的候选对应路径。
+    """
+    if full_path_count == 1:
+        return "这只支持“存在一条可复核的候选对应路径”"
+    if full_path_count > 1:
+        return f"这只支持“存在 {full_path_count} 条可复核的候选对应路径”"
+    if style == "method":
+        return "本次设置未得到完整候选路径，因此不支持“存在可复核的候选对应路径”"
+    return "不支持“存在可复核的候选对应路径”"
+
+
+def _ofes_sc_endpoint_scope_value(ctx: dict) -> str | None:
+    """返回端点汇总作用域标记；未指定展示路径时为 None（不是 "None_only"）。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    返回:
+        - str | None: 展示路径作用域标记；未指定展示路径时 None。
+    """
+    if not ctx['display_path_id']:
+        return None
+    return f"{ctx['display_path_id']}_only"
+
+
+def _ofes_sc_count_text(value) -> str:
+    """把端点支持计数格式化为整数文字；缺失时明确写未登记，不补零。
+
+    参数:
+        - value (float): 支持计数；可为 NaN。
+
+    返回:
+        - str: 计数文字或明确的未登记说明。
+    """
+    if pd.isna(value):
+        return "未登记（该端点没有配准记录，不是 0）"
+    return str(int(value))
+
+
+def _ofes_sc_range_text(low, high, spec=".3f") -> str:
+    """把数值区间格式化为 `a–b`；全部缺失时写不可用，不输出 nan。
+
+    参数:
+        - low (float): 下界；可为 NaN。
+        - high (float): 上界；可为 NaN。
+        - spec (str): 数值格式。
+
+    返回:
+        - str: 区间文字或不可用说明。
+    """
+    if pd.isna(low) or pd.isna(high):
+        return "不可用（本次结果无完整路径成员）"
+    return f"{float(low):{spec}}–{float(high):{spec}}"
+
+
+def _ofes_sc_gap_fact_text(
+    gap_summary: dict,
+    high_date_text: str,
+    low_date_text: str,
+    gap_day_count: int,
+) -> str:
+    """缺口日期的实际分层事实；保留未归类与缺记录，不做推广。
+
+    参数:
+        - gap_summary (dict): 缺口分层汇总。
+        - high_date_text (str): 最大 ΔDO≥50 日期区间文字。
+        - low_date_text (str): 最大 ΔDO<50 日期区间文字。
+        - gap_day_count (int): 缺口天数。
+
+    返回:
+        - str: 只陈述计数与日期的事实段。
+    """
+    return (
+        f"{gap_day_count} 天间隔在已保存峰像素记录中："
+        f"{gap_summary['high_count']} 天最大 ΔDO ≥50 且无保留 DO50 object ID（{high_date_text}）；"
+        f"{gap_summary['low_count']} 天最大 ΔDO <50 且无保留 DO50 object ID（{low_date_text}）；"
+        f"未归类 {gap_summary['unclassified_count']} 天、"
+        f"缺记录 {gap_summary['missing_record_count']} 天（逐日状态见 daily 表）。"
+    )
+
+
+def _ofes_sc_gap_conclusion_text(gap_summary: dict) -> str:
+    """由实际分层给出可保留的结论；存在未归类或缺记录时不得推广到整个间隔。
+
+    参数:
+        - gap_summary (dict): 缺口分层汇总。
+
+    返回:
+        - str: 结论段文字。
+
+    说明:
+        - 只有两类并存时才能写“不是均匀的”；
+        - 只出现一类但仍有未归类/缺记录日期时，不得从部分日期推广到整个间隔；
+        - 只出现一类且无未归类/缺记录时，才能写该间隔在此记录内是均匀的。
+    """
+    unresolved = (
+        int(gap_summary['unclassified_count'])
+        + int(gap_summary['missing_record_count'])
+    )
+    if gap_summary['high_count'] and gap_summary['low_count']:
+        return (
+            "两类并存，因此该间隔在已保存记录内不是均匀的“无 DO50 阈值峰”；"
+            "但仍不能把 detector-off、结构消失或过滤原因中的任何一个单独判定出来，"
+            "过滤/保留原因未解析。"
+        )
+    if (gap_summary['high_count'] or gap_summary['low_count']) and unresolved:
+        return (
+            "只出现其中一类，且仍有 "
+            f"{gap_summary['unclassified_count']} 天未归类、"
+            f"{gap_summary['missing_record_count']} 天缺记录，"
+            "因此**不能**从这部分日期推广到整个间隔，"
+            "也不能单独判定 detector-off、结构消失或过滤原因。"
+        )
+    if gap_summary['high_count']:
+        return (
+            "全部已保存日期都属于“最大 ΔDO≥50 且无保留 object ID”，且无未归类/缺记录日期，"
+            "因此本轮不能声称该间隔呈非均匀分布，"
+            "也不能单独判定 detector-off 或过滤原因。"
+        )
+    if gap_summary['low_count']:
+        return (
+            "全部已保存日期都属于“最大 ΔDO<50 且无保留 object ID”，且无未归类/缺记录日期，"
+            "因此该间隔在已保存记录内是均匀的“无 DO50 阈值峰”；"
+            "本轮不能据此单独判定 detector-off、结构消失或过滤原因。"
+        )
+    return (
+        "没有出现上述任一分层，因此不能把 gap 解释为统一 detector-off，"
+        "也不能单独判定过滤/保留原因。"
+    )
+
+
+
+
+def _ofes_sc_read_pilot_design(ctx: dict) -> tuple | None:
+    """读取已落盘的 Ro_v pilot 设计（日期与平滑值）。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    返回:
+        - tuple | None: `(日期列表, 平滑值列表)`；两个来源都缺失时返回 None。
+
+    说明:
+        - 优先读尺度 manifest 的 `pilot_dates` / `pilot_smoothing_values`；旧缓存
+          可能没有这两个字段，此时回读 `ro_v_pilot_manifest.json` 的
+          `dates` / `smoothing_sigma_pixels`。
+        - 缺字段**不等于**无需核对：调用方必须对 None 明确处理。
+    """
+    manifest_path = ctx['scale_outputs']['source_manifest']
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if 'pilot_dates' in manifest and 'pilot_smoothing_values' in manifest:
+            return (
+                [
+                    pd.Timestamp(item).normalize()
+                    for item in manifest['pilot_dates']
+                ],
+                [float(item) for item in manifest['pilot_smoothing_values']],
+            )
+    pilot_path = ctx['pilot_output_manifest']
+    if pilot_path.exists():
+        pilot = json.loads(pilot_path.read_text(encoding='utf-8'))
+        if 'dates' in pilot and 'smoothing_sigma_pixels' in pilot:
+            return (
+                [pd.Timestamp(item).normalize() for item in pilot['dates']],
+                [float(item) for item in pilot['smoothing_sigma_pixels']],
+            )
+    return None
+
+
+def _ofes_sc_finalize_run(ctx: dict) -> None:
+    """合并尺度汇总的路径应变、pilot 清单与最终尺度敏感性判定。"""
+    design = ctx['scale_design']
+    selected = design['variants']
+    summary = pd.read_csv(ctx['finalize_summary_path'])
+    candidates = pd.read_csv(ctx['finalize_candidate_path'])
+    candidates["complete_path_member"] = (
+        candidates["complete_path_member"].astype("boolean").fillna(False).astype(bool)
+    )
+    path_strain = (
+        candidates.loc[candidates["complete_path_member"]]
+        .groupby("variant_id")["normalized_strain"]
+        .median()
+        .rename("path_normalized_strain_median")
+    )
+    baseline_candidates = pd.read_csv(ctx['base_root'] / "daily_structure_candidates.csv")
+    baseline_path = pd.read_csv(ctx['base_root'] / "structure_path_members.csv")
+    baseline_path_ids = set(
+        baseline_path.loc[baseline_path["path_id"].eq(ctx["display_path_id"]), "candidate_id"]
+        .astype(str)
+    )
+    path_strain.loc[ctx["baseline_variant_label"]] = baseline_candidates.loc[
+        baseline_candidates["candidate_id"].astype(str).isin(baseline_path_ids),
+        "normalized_strain",
+    ].median()
+    summary = summary.drop(columns=["path_normalized_strain_median"], errors="ignore")
+    summary = summary.merge(path_strain, on="variant_id", how="left", validate="one_to_one")
+    summary.to_csv(ctx['finalize_summary_path'], index=False)
+    validation = json.loads(ctx['finalize_validation_path'].read_text(encoding="utf-8"))
+    manifest = json.loads(ctx['finalize_manifest_path'].read_text(encoding="utf-8"))
+    pilot_summary = pd.read_csv(ctx['finalize_pilot_summary_path'], parse_dates=["date"])
+    pilot_manifest = json.loads(ctx['finalize_pilot_manifest_path'].read_text(encoding="utf-8"))
+    pilot_status = str(
+        pilot_manifest.get("pilot_status")
+        or ("completed" if len(pilot_summary) else "unknown")
+    )
+    pilot_ran = pilot_status == "completed" and len(pilot_summary) > 0
+    baseline = summary.loc[summary["variant_id"].eq(ctx["baseline_variant_label"])].iloc[0]
+    stable_gap = summary.loc[
+        summary["gap_high_max_delta_ge50_days"].eq(
+            baseline["gap_high_max_delta_ge50_days"]
+        )
+        & summary["gap_low_max_delta_lt50_days"].eq(
+            baseline["gap_low_max_delta_lt50_days"]
+        )
+    ]
+    one_path = summary.loc[summary["full_path_count"].eq(1)]
+    no_object_id = summary.loc[
+        summary[f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_object_id_in_envelope"].eq(False)
+    ]
+    oxygen_overlap_unknown = summary.loc[
+        summary[f"endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_oxygen_layer_overlap_status"].astype(str).str.contains(
+            "unknown"
+        )
+    ]
+    baseline_e246 = summary.loc[
+        summary["variant_id"].eq(ctx["baseline_variant_label"])
+    ].iloc[0]
+    if pilot_ran:
+        max_ro = float(pilot_summary["ro_v"].max())
+        min_ro = float(pilot_summary["ro_v"].min())
+        max_offset = float(pilot_summary["velocity_center_offset_km"].max())
+        min_rmax = float(pilot_summary["rmax_km"].min())
+        max_rmax = float(pilot_summary["rmax_km"].max())
+    else:
+        min_ro = max_ro = max_offset = min_rmax = max_rmax = float("nan")
+    min_path_rossby = float(summary["path_abs_rossby_median"].min())
+    max_path_rossby = float(summary["path_abs_rossby_median"].max())
+    min_path_strain = float(summary["path_normalized_strain_median"].min())
+    max_path_strain = float(summary["path_normalized_strain_median"].max())
+    validation.update(
+        {
+            (
+                f"variant_summary_endpoint_scope_is_{ctx['display_path_id']}_only"
+                if ctx['display_path_id']
+                else "variant_summary_endpoint_scope_is_unscoped"
+            ): bool(
+                summary[f"endpoint_{ctx['end_label'].lower()}_path_scope"]
+                .fillna("")
+                .astype(str)
+                .eq(_ofes_sc_endpoint_scope_value(ctx) or "")
+                .all()
+            ),
+            "pilot_status": pilot_status,
+            "ro_v_pilot_manifest_present": ctx['finalize_pilot_manifest_path'].exists(),
+            "ro_v_pilot_all_selected_rows_estimable": bool(
+                len(pilot_summary)
+                == len(ctx['pilot_pilot_dates'])
+                * len(ctx['pilot_smoothing_values'])
+                and pilot_summary["profile_status"].eq(
+                    "estimable_conditional_velocity_ring"
+                ).all()
+            ),
+            "ro_v_pilot_keeps_signed_zeta_over_f_separate": bool(
+                "velocity_center_signed_zeta_over_f" in pilot_summary.columns
+            ),
+            "ro_v_pilot_does_not_use_candidate_radius_as_rmax": bool(
+                pilot_manifest.get("rmax_is_dynamical_radius") is not True
+            ),
+            "endpoint_oxygen_layer_overlap_unknown_not_zero_or_false": bool(
+                len(oxygen_overlap_unknown) == len(summary)
+            ),
+        }
+    )
+    manifest["ro_v_pilot"] = {
+        "manifest": str(ctx['finalize_pilot_manifest_path'].resolve()),
+        "summary": str(ctx['finalize_pilot_summary_path'].resolve()),
+        "profile_figure": str(
+            (ctx['finalize_root'] / "ro_v_pilot_radial_profiles.png").resolve()
+        ),
+        "estimable_row_count": int(pilot_manifest["estimable_row_count"]),
+        "pilot_status": pilot_status,
+        "ro_v_range": [
+            None if not np.isfinite(min_ro) else float(min_ro),
+            None if not np.isfinite(max_ro) else float(max_ro),
+        ],
+        "velocity_center_offset_max_km": (
+            None if not np.isfinite(max_offset) else float(max_offset)
+        ),
+        "rmax_range_km": [
+            None if not np.isfinite(min_rmax) else float(min_rmax),
+            None if not np.isfinite(max_rmax) else float(max_rmax),
+        ],
+        "rmax_is_dynamical_radius": False,
+    }
+    manifest["validation"] = validation
+    ctx['finalize_validation_path'].write_text(
+        json.dumps(_ofes_sc_jsonable(validation), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    ctx['finalize_manifest_path'].write_text(
+        json.dumps(_ofes_sc_jsonable(manifest), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if pilot_ran:
+        pilot_verdict_text = (
+            f"Ro_v pilot 只在 {'、'.join(f'{d:%Y-%m-%d}' for d in ctx['pilot_pilot_dates'])}"
+            " 这些 baseline-path 日期进行。速度中心由热盐核心周围 60 km 内的独立 |ζ| 局地极值确定，"
+            f"背景为中心 60–80 km 环带中位 u/v；覆盖门通过"
+            f" {int(pilot_summary['profile_status'].eq('estimable_conditional_velocity_ring').sum())}/{len(pilot_summary)}"
+            f" 行。Ro_v 为 {min_ro:.3f}–{max_ro:.3f}，Rmax 为 {min_rmax:.1f}–{max_rmax:.1f} km，"
+            f"速度中心偏离热盐核心最多 {max_offset:.1f} km；signed ζ/f 单独保存，"
+            "且不把 Ro_v 分类为平衡、亚中尺度或材料相干证据。平滑改变 Ro_v，故该 pilot 仅是条件性速度组织诊断。"
+        )
+    else:
+        pilot_verdict_text = (
+            f"Ro_v pilot 未运行（pilot_status={pilot_status}），因此本轮不报告 Ro_v、Rmax 与速度中心偏移；"
+            "该 pilot 依赖展示路径在 pilot 日期上的基线候选，条件不满足时不以缺省值参与裁决。"
+        )
+
+    verdict = f"""# {ctx['start_label']}–{ctx['end_label']} 尺度敏感性审计（≤1800 字）
+
+本轮在缓存基线之外，按预注册设计完成 {len(selected)} 个单因素变体，读取 {len(ctx['base_structure_dates'])} 天局地 OFES `temp/salinity/u/v`；不做参数笛卡尔积、年度扫描、粒子重积分或 DO detector 重跑。水平网格约 {design['horizontal_grid_spacing_km'][0]}–{design['horizontal_grid_spacing_km'][1]} km；基线深度交付层按设计记录为 {design['delivered_depth_levels_baseline']} 层，逐变体深度窗见变体表。
+
+稳定结果：{len(summary)} 个基线/变体全部完成 {len(ctx['base_structure_dates'])} 天搜索；其中 {int(summary['full_path_count'].ge(1).sum())} 个至少得到 1 条端点约束完整候选路径，{len(one_path)} 个只有 1 条完整路径，故“存在完整候选路径”的稳定性与“唯一对应”需区分。下列 {ctx['end_label']} 端点汇总字段明确只统计 `{ctx['display_path_id']}`：基线对象的水平成员支持为 {_ofes_sc_count_text(baseline_e246[f'endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_horizontal_member_support_count'])}、峰点进入候选区间为 {_ofes_sc_count_text(baseline_e246[f'endpoint_{ctx['end_label'].lower()}_{ctx['display_path_id']}_peak_points_in_candidate_envelope_count'])}；{len(summary)}/{len(summary)} 个结果的真实氧层上下边界均未保存，氧层重叠状态保持 NaN/unknown，不能解释为 0 m 或 False。
+
+参数依赖结果：候选数为 {int(summary['candidate_count'].min())}–{int(summary['candidate_count'].max())}，逐日边为 {int(summary['edge_count'].min())}–{int(summary['edge_count'].max())}；主路径垂向范围、分支数和 formal 支撑行数均随尺度改变，路径 |Ro| 中位数为 {_ofes_sc_range_text(min_path_rossby, max_path_rossby)}、归一化应变中位数为 {_ofes_sc_range_text(min_path_strain, max_path_strain)}。缺口内“最大 ΔDO≥50 且无保留 object ID”与“最大 ΔDO<50 且无保留 object ID”的分层与基线一致的结果为 {len(stable_gap)}/{len(summary)} 个；逐变体明细见 scale_sensitivity_variant_summary.csv与 detection_gap 表，因此不能把 gap 解释为统一 detector-off。{ctx['end_label']} 候选包络内没有 DO50 object ID 的结果为 {len(no_object_id)}/{len(summary)}；峰点/object ID 支持对包络定义敏感，但这不改变氧层重叠仍为 unknown 的字段语义。
+
+{pilot_verdict_text}
+
+正式 DO 审计仍按日期、阈值专属 peak-pixel object ID、真实 `daily_object_key` 和实际事件 ID 连接；材料登记只使用既有轨迹，并分开任意候选包络与具体路径包络。共享结构身份、真实 detector-off、过滤/断链原因和材料连续性仍未判明。
+"""
+    if len(verdict) > 1800:
+        raise AssertionError(f"Chinese verdict exceeds 1800 characters: {len(verdict)}")
+    ctx['finalize_verdict_path'].write_text(verdict, encoding="utf-8")
+
+
+def _ofes_sc_audit_peak_pixels(ctx: dict, date: pd.Timestamp, cache: dict) -> pd.DataFrame:
+    date = pd.Timestamp(date).normalize()
+    if date not in cache:
+        path = ctx['audit_endpoint_peak_dates'][date]
+        if not path.exists():
+            raise FileNotFoundError(path)
+        cache[date] = pd.read_parquet(path)
+    return cache[date]
+
+
+def _ofes_sc_append_unmatched_endpoint_members(
+    ctx: dict,
+    objects: pd.DataFrame,
+    canonical_endpoint_keys: dict,
+    member_frames: list,
+    peak_cache: dict,
+) -> dict:
+    """核对每个规范端点对象的成员，并把未被配准覆盖的成员补入成员表。
+
+    参数:
+        - ctx (dict): 案例上下文。
+        - objects (pd.DataFrame): 以 `daily_object_key` 为索引的 DO50 对象表。
+        - canonical_endpoint_keys (dict): `{label: daily_object_key}`；None 即缺规范端点。
+        - member_frames (list): 已收集的成员表列表，原地追加。
+        - peak_cache (dict): 日期到 peak-pixel 表的缓存。
+
+    返回:
+        - dict: `{label: 核对事实}`，事实来自共享的
+          `_ofes_sc_endpoint_object_members`。
+
+    说明:
+        - 端点对象的原始成员独立于是否找到候选：没有候选时也必须保存，
+          不能因为无候选就丢掉对象信息。
+        - 缺规范端点、对象不在对象表、peak-pixel 文件缺失或成员数据损坏时**直接报错**，
+          不返回空结果、也不跳过；无候选是合法结果，与成员数据缺失不是一回事。
+        - 已由配准写入的成员不会被覆盖（按 `daily_object_key` 加像素索引去重，
+          先写入的配准结果保留），但该端点对象仍要重新核对一遍。
+    """
+    recorded_keys: set[str] = set()
+    for frame in member_frames:
+        if "daily_object_key" in frame.columns:
+            recorded_keys |= set(
+                frame["daily_object_key"].dropna().astype(str)
+            )
+    endpoint_checks: dict = {}
+    for label, key in canonical_endpoint_keys.items():
+        if key is None:
+            raise RuntimeError(
+                f"Endpoint {label} has no canonical DO50 object; member "
+                "verification cannot be completed."
+            )
+        key = str(key)
+        if key not in objects.index:
+            raise RuntimeError(
+                f"Endpoint object {key} for {label} is absent from the object table."
+            )
+        object_row = objects.loc[key].to_dict()
+        # 对象表以 daily_object_key 为索引，取出的行不含该字段；显式补回，
+        # 让共享校验器能核对完整身份。
+        object_row["daily_object_key"] = key
+        date = pd.Timestamp(object_row["date"]).normalize()
+        pixels = _ofes_sc_audit_peak_pixels(ctx, date, peak_cache)
+        scan = _ofes_sc_endpoint_object_members(
+            pixels,
+            object_row,
+            threshold=50,
+            expected_event_id=ctx["audit_event_ids"].get(label),
+            expected_daily_object_key=key,
+        )
+        endpoint_checks[label] = dict(
+            scan["checks"],
+            endpoint_object_key=key,
+            member_source=(
+                "endpoint_object_registration"
+                if key in recorded_keys
+                else "independent_endpoint_member_scan"
+            ),
+        )
+        if key in recorded_keys:
+            continue
+        members = scan["members"]
+        members["daily_object_key"] = key
+        members["actual_event_id"] = scan["actual_event_id"]
+        members["variant_id"] = ctx["baseline_variant_label"]
+        members["case_label"] = label
+        members["candidate_id"] = None
+        member_frames.append(members)
+    return endpoint_checks
+
+
+
+
+def _ofes_sc_empty_endpoint_member_frame(ctx: dict) -> pd.DataFrame:
+    """构造空成员表，列契约与有成员时一致（没有可用峰像素文件时退化为标识列）。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    返回:
+        - pd.DataFrame: 空成员表。
+
+    说明:
+        - 只有两个端点日期的 peak-pixel 表都不可读时才退化为仅标识列；
+          此时不臆造像素字段。
+    """
+    identity = [
+        "daily_object_key",
+        "actual_event_id",
+        "variant_id",
+        "case_label",
+        "candidate_id",
+    ]
+    for path in ctx["audit_endpoint_peak_dates"].values():
+        if path.exists():
+            columns = list(pd.read_parquet(path).columns)
+            return pd.DataFrame(columns=columns + identity)
+    return pd.DataFrame(columns=identity)
+
+
+def _ofes_sc_audit_run(ctx: dict) -> None:
+    """重放端点候选—对象配准，校验身份一致性与支持计数一致性。
+
+    参数:
+        - ctx (dict): 案例上下文。
+
+    说明:
+        - 强制检查：端点对象唯一、键唯一、配对完整、事件身份与日期一致、
+          尺度表与共享配准 helper 的支持计数一致；不一致即报错。
+        - 历史数值（如特定案例的 41 行、12/13 像素）不属于本函数；
+          它们属于针对旧案例的回归验证。
+    """
+    assoc = pd.read_csv(ctx['audit_association_path'])
+    candidates = pd.read_csv(ctx['audit_candidate_path'])
+    candidates["date"] = pd.to_datetime(candidates["date"], format="mixed").dt.normalize()
+    candidates = candidates.set_index(["variant_id", "candidate_id"])
+    objects = pd.read_parquet(ctx['audit_object_path'])
+    objects["date"] = pd.to_datetime(objects["date"], format="mixed").dt.normalize()
+    canonical_endpoint_keys = {}
+    for label, event_id in ctx['audit_event_ids'].items():
+        endpoint_date = ctx['base_endpoint_dates'][label]
+        endpoint_rows = objects.loc[
+            objects["event_id"].astype(str).eq(event_id)
+            & objects["date"].eq(endpoint_date)
+            & pd.to_numeric(objects["threshold"], errors="coerce").eq(50)
+        ]
+        if len(endpoint_rows) != 1:
+            raise RuntimeError(
+                f"Expected one canonical {label} DO50 endpoint object at "
+                f"{endpoint_date.date()} for event {event_id}."
+            )
+        canonical_endpoint_keys[label] = str(
+            endpoint_rows.iloc[0]["daily_object_key"]
+        )
+    objects = objects.set_index("daily_object_key")
+    if not (candidates.index.is_unique and objects.index.is_unique):
+        raise RuntimeError(
+            "Endpoint audit requires unique candidate and object keys."
+        )
+
+    peak_cache = {}
+    rows = []
+    member_frames = []
+    missing_identity_status = 'not_verified_missing_candidate_or_endpoint_object'
+    for pair in assoc.itertuples(index=False):
+        if pd.isna(pair.candidate_id) or pd.isna(pair.daily_object_key):
+            identity_status = str(getattr(pair, 'object_identity_status', ''))
+            if identity_status != missing_identity_status:
+                raise RuntimeError(
+                    'Endpoint association contains an unresolved pair; only '
+                    'rows explicitly recorded as missing a candidate or '
+                    'endpoint object may omit the identifiers.'
+                )
+            rows.append(
+                {
+                    'variant_id': pair.variant_id,
+                    'case_label': pair.case_label,
+                    'date': str(pd.Timestamp(pair.endpoint_date).normalize().date()),
+                    'candidate_id': None,
+                    'path_ids': '' if pd.isna(pair.path_ids) else str(pair.path_ids),
+                    'daily_object_key': None,
+                    'actual_event_id': ctx['audit_event_ids'][str(pair.case_label)],
+                    'object_pixel_count': np.nan,
+                    'object_peak_depth_min_m': np.nan,
+                    'object_peak_depth_max_m': np.nan,
+                    'member_half_amplitude_thickness_min_m': np.nan,
+                    'member_half_amplitude_thickness_max_m': np.nan,
+                    'candidate_shallow_m': np.nan,
+                    'candidate_deep_m': np.nan,
+                    'candidate_native_level_count': np.nan,
+                    'candidate_vertical_status': 'unknown_missing_candidate',
+                    'candidate_radius_km': np.nan,
+                    'object_member_distance_min_km': np.nan,
+                    'object_member_distance_max_km': np.nan,
+                    'horizontal_member_support_count': np.nan,
+                    'peak_depth_inside_candidate_count': np.nan,
+                    'peak_points_in_candidate_envelope_count': np.nan,
+                    'peak_depth_range_interval_intersection_m': np.nan,
+                    'legacy_vertical_overlap_m': np.nan,
+                    'legacy_overlap_valid_as_oxygen_layer_overlap': False,
+                    'peak_depth_range_interval_semantics': (
+                        'peak_depth_range_only_not_oxygen_layer_overlap'
+                    ),
+                    'oxygen_layer_overlap_m': np.nan,
+                    'oxygen_layer_overlap_status': str(
+                        getattr(pair, 'oxygen_layer_overlap_status', None)
+                        or 'unknown_missing_candidate_or_endpoint_object'
+                    ),
+                    'object_identity_status': identity_status,
+                    'object_id_in_candidate_envelope': pd.NA,
+                    'material_identity_status': 'not_established',
+                }
+            )
+            continue
+        candidate = candidates.loc[(pair.variant_id, str(pair.candidate_id))]
+        candidate = candidate.copy()
+        candidate["candidate_id"] = str(pair.candidate_id)
+        object_row = objects.loc[str(pair.daily_object_key)]
+        object_row = object_row.copy()
+        object_row["daily_object_key"] = str(pair.daily_object_key)
+        expected_event_id = ctx['audit_event_ids'][str(pair.case_label)]
+        expected_daily_object_key = canonical_endpoint_keys[str(pair.case_label)]
+        if str(pair.daily_object_key) != expected_daily_object_key:
+            raise RuntimeError(
+                "Endpoint association used a noncanonical endpoint daily_object_key."
+            )
+        date = pd.Timestamp(pair.endpoint_date).normalize()
+        registration = _ofes_endpoint_object_registration(
+            candidate,
+            object_row,
+            _ofes_sc_audit_peak_pixels(ctx, date, peak_cache),
+            threshold=50,
+            expected_event_id=expected_event_id,
+            expected_daily_object_key=expected_daily_object_key,
+        )
+        if str(object_row["event_id"]) != expected_event_id:
+            raise RuntimeError("Endpoint association used the wrong complete event ID.")
+        if pd.Timestamp(object_row["date"]).normalize() != date:
+            raise RuntimeError("Endpoint association used the wrong object date.")
+        if int(object_row["threshold"]) != 50:
+            raise RuntimeError("Endpoint association used a non-DO50 object.")
+        if int(pair.horizontal_member_support_count) != registration[
+            "horizontal_member_support_count"
+        ]:
+            raise RuntimeError("Scale table disagrees with shared horizontal support.")
+        if int(pair.peak_points_in_candidate_envelope_count) != registration[
+            "peak_points_in_candidate_envelope_count"
+        ]:
+            raise RuntimeError(
+                "Scale table disagrees with shared peak-point support."
+            )
+        if str(pair.oxygen_layer_overlap_status) != registration[
+            "oxygen_layer_overlap_status"
+        ]:
+            raise RuntimeError(
+                "Scale table disagrees with unknown oxygen-layer status."
+            )
+        row = {
+            "variant_id": pair.variant_id,
+            "case_label": pair.case_label,
+            "date": str(date.date()),
+            "candidate_id": str(pair.candidate_id),
+            "path_ids": "" if pd.isna(pair.path_ids) else str(pair.path_ids),
+            "daily_object_key": registration["daily_object_key"],
+            "actual_event_id": registration["actual_event_id"],
+            "object_pixel_count": registration["object_pixel_count"],
+            "object_peak_depth_min_m": registration["object_peak_depth_min_m"],
+            "object_peak_depth_max_m": registration["object_peak_depth_max_m"],
+            "member_half_amplitude_thickness_min_m": registration[
+                "member_half_amplitude_thickness_min_m"
+            ],
+            "member_half_amplitude_thickness_max_m": registration[
+                "member_half_amplitude_thickness_max_m"
+            ],
+            "candidate_shallow_m": registration["candidate_shallow_m"],
+            "candidate_deep_m": registration["candidate_deep_m"],
+            "candidate_native_level_count": candidate.get(
+                "vertical_anomaly_level_count", np.nan
+            ),
+            "candidate_vertical_status": candidate.get(
+                "vertical_status", "unknown"
+            ),
+            "candidate_radius_km": registration["candidate_radius_km"],
+            "object_member_distance_min_km": registration[
+                "object_member_distance_min_km"
+            ],
+            "object_member_distance_max_km": registration[
+                "object_member_distance_max_km"
+            ],
+            "horizontal_member_support_count": registration[
+                "horizontal_member_support_count"
+            ],
+            "peak_depth_inside_candidate_count": registration[
+                "peak_depth_inside_candidate_count"
+            ],
+            "peak_points_in_candidate_envelope_count": registration[
+                "peak_points_in_candidate_envelope_count"
+            ],
+            "peak_depth_range_interval_intersection_m": registration[
+                "peak_depth_range_interval_intersection_m"
+            ],
+            "legacy_vertical_overlap_m": registration[
+                "peak_depth_range_interval_intersection_m"
+            ],
+            "legacy_overlap_valid_as_oxygen_layer_overlap": False,
+            "peak_depth_range_interval_semantics": registration[
+                "peak_depth_range_interval_intersection_semantics"
+            ],
+            "oxygen_layer_overlap_m": registration["oxygen_layer_overlap_m"],
+            "oxygen_layer_overlap_status": registration[
+                "oxygen_layer_overlap_status"
+            ],
+            "object_identity_status": registration["object_identity_status"],
+            "object_id_in_candidate_envelope": registration[
+                "object_id_in_candidate_envelope"
+            ],
+            "material_identity_status": "not_established",
+        }
+        rows.append(row)
+        if pair.variant_id == ctx["baseline_variant_label"]:
+            members = registration["members"].copy()
+            members["daily_object_key"] = registration["daily_object_key"]
+            members["actual_event_id"] = registration["actual_event_id"]
+            members["variant_id"] = pair.variant_id
+            members["case_label"] = pair.case_label
+            members["candidate_id"] = pair.candidate_id
+            member_frames.append(members)
+
+    audit = pd.DataFrame(rows)
+    audit.to_csv(ctx['audit_root'] / "endpoint_registration_reassessment.csv", index=False)
+    member_check_results = _ofes_sc_append_unmatched_endpoint_members(
+        ctx, objects, canonical_endpoint_keys, member_frames, peak_cache
+    )
+    member_verification_ok = (
+        bool(member_check_results)
+        and set(member_check_results) == set(ctx['audit_event_ids'])
+        and all(
+            result['object_identity_status']
+            == 'date_threshold_object_key_fields_and_complete_event_id_verified'
+            and result['threshold_column_present']
+            and result['pixel_count_consistent']
+            and result['pixel_index_unique']
+            and result['member_depth_finite']
+            and result['member_depth_range_consistent']
+            for result in member_check_results.values()
+        )
+    )
+    if member_frames:
+        members = pd.concat(member_frames, ignore_index=True).drop_duplicates(
+            ["daily_object_key", "lat_index", "lon_index"]
+        )
+        member_source = "endpoint_object_registration_or_independent_scan"
+    else:
+        members = _ofes_sc_empty_endpoint_member_frame(ctx)
+        member_verification_ok = False
+        member_source = "empty_member_contract_guard"
+    members.to_csv(ctx['audit_root'] / "endpoint_object_peak_members.csv", index=False)
+
+    featured_spec = ctx['case_spec'].get('audit_featured') or {}
+    design_display_names = {
+        variant['id']: variant.get('display_name') or variant['id']
+        for variant in (ctx['scale_design'] or {'variants': []})['variants']
+    }
+    on_complete_path = audit["path_ids"].fillna("").astype(str).ne("")
+    featured = audit.loc[
+        on_complete_path
+        & audit.apply(
+            lambda row: row["variant_id"]
+            in [ctx["baseline_variant_label"]]
+            + list(featured_spec.get(row["case_label"], [])),
+            axis=1,
+        )
+    ]
+    path_support = {}
+    for row in featured.itertuples(index=False):
+        key = f"{row.case_label}/{row.variant_id}/{row.candidate_id}"
+        if key in path_support:
+            raise RuntimeError(f"Duplicate endpoint support record for {key}.")
+        path_support[key] = {
+            "variant_id": str(row.variant_id),
+            "candidate_id": str(row.candidate_id),
+            "path_ids": row.path_ids,
+            "object_pixel_count": (
+                None if pd.isna(row.object_pixel_count)
+                else int(row.object_pixel_count)
+            ),
+            "horizontal_member_support_count": int(
+                row.horizontal_member_support_count
+            ),
+            "peak_points_in_candidate_envelope_count": int(
+                row.peak_points_in_candidate_envelope_count
+            ),
+        }
+
+    sources = [
+        ctx['audit_association_path'],
+        ctx['audit_candidate_path'],
+        ctx['audit_object_path'],
+        *ctx['audit_endpoint_peak_dates'].values(),
+    ]
+    checks = {
+        "status": "passed" if member_verification_ok else "incomplete",
+        "case_id": ctx['case_id'],
+        "endpoint_pair_rows": int(len(audit)),
+        "complete_path_endpoint_pair_rows": int(audit["path_ids"].ne("").sum()),
+        "endpoint_unique_object_pixels": int(len(members)),
+        "endpoint_member_verification_status": (
+            "verified" if member_verification_ok else "incomplete"
+        ),
+        "endpoint_member_verification_source": member_source,
+        "endpoint_member_checks": member_check_results,
+        "full_event_id_date_threshold_and_object_key_verified": (
+            member_verification_ok
+        ),
+        "threshold_specific_peak_pixel_columns_verified": (
+            bool(member_check_results)
+            and all(
+                result["threshold_column_present"]
+                for result in member_check_results.values()
+            )
+        ),
+        "endpoint_object_pixel_count_matches_members": (
+            bool(member_check_results)
+            and all(
+                result["pixel_count_consistent"]
+                for result in member_check_results.values()
+            )
+        ),
+        "endpoint_peak_pixel_indices_unique": (
+            bool(member_check_results)
+            and all(
+                result["pixel_index_unique"]
+                for result in member_check_results.values()
+            )
+        ),
+        "horizontal_member_support_is_separate_from_peak_point_support": True,
+        "endpoint_featured_pixel_support": path_support,
+        "oxygen_layer_overlap_is_nan_unknown_all_rows": bool(
+            audit["oxygen_layer_overlap_m"].isna().all()
+        ),
+        "oxygen_layer_overlap_status_all_unknown": bool(
+            audit["oxygen_layer_overlap_status"]
+            .eq("unknown_true_per_pixel_upper_lower_edges_not_saved")
+            .all()
+        ),
+        "half_amplitude_thickness_not_used_as_layer_boundary": True,
+        "legacy_peak_depth_intersection_not_used_as_layer_overlap": True,
+        "field_reads": 0,
+        "detector_runs": 0,
+        "path_search_runs": 0,
+        "sources": [
+            {"path": str(path.resolve()), "bytes": path.stat().st_size}
+            for path in sources
+        ],
+    }
+    verdict_lines = [
+        f"# {ctx['start_label']}–{ctx['end_label']}：对象配准裁决",
+        "",
+        (
+            f"核对 {len(audit)} 个端点候选—对象组合，其中 "
+            f"{checks['complete_path_endpoint_pair_rows']} 个属于已枚举完整路径；"
+            f"端点对象共 {len(members)} 个唯一水平像素。"
+            + (
+                "身份核对使用完整事件 ID、日期、阈值专属 object ID 和 "
+                "daily_object_key；成员计数与像素索引唯一性均已核对，保留所有分支。"
+                if member_verification_ok
+                else "端点成员核对为 incomplete：身份、阈值专属列、成员计数或"
+                "像素索引唯一性存在未完成项，本次裁决不视为已验证。"
+            )
+        ),
+        "",
+        "| 端点与设置 | 水平成员支持 | 水平且峰深落在候选内 |",
+        "|---|---:|---:|",
+    ]
+    for label in ctx['audit_event_ids']:
+        label_rows = featured.loc[featured["case_label"].eq(label)]
+        variant_order = [ctx["baseline_variant_label"]] + list(
+            featured_spec.get(label, [])
+        )
+        ordered = label_rows.assign(
+            _featured_order=label_rows["variant_id"].map(
+                lambda variant_id: variant_order.index(variant_id)
+            )
+        ).sort_values(["_featured_order", "candidate_id"], kind="stable")
+        for row in ordered.itertuples(index=False):
+            display_name = (
+                "基线"
+                if row.variant_id == ctx["baseline_variant_label"]
+                else design_display_names.get(row.variant_id, row.variant_id)
+            )
+            verdict_lines.append(
+                f"| {label} {display_name} "
+                f"| {_ofes_sc_count_text(row.horizontal_member_support_count)}/{_ofes_sc_count_text(row.object_pixel_count)} "
+                f"| {_ofes_sc_count_text(row.peak_points_in_candidate_envelope_count)}/{_ofes_sc_count_text(row.object_pixel_count)} |"
+            )
+    verdict_lines += [
+        "",
+        (
+            "depth_min/depth_max 是对象成员峰深范围，不是氧异常层上下边界。"
+            "half_amplitude_thickness_m 仅保存连续半振幅核宽度，不保证峰深对称，"
+            "不能用峰深 ± 半厚度恢复边界。旧峰深区间长度交集为 0 不等于整个氧层不重叠。"
+        ),
+        "",
+        (
+            "水平支持和峰点支持均限于近似候选圆包络及候选垂向区间。"
+            "真实氧层重叠保持 NaN/unknown；峰点支持受采样半径和垂向分辨率影响，"
+            "不能据此单独判定不同结构、共同承氧 SCV 或材料连续性。"
+        ),
+        "",
+        (
+            "正式入口为 track.build_ofes_structure_scale_sensitivity，"
+            "默认只刷新缓存并调用共享 track._ofes_endpoint_object_registration。"
+            "逐组合结果见 endpoint_registration_reassessment.csv，"
+            "端点对象成员见 endpoint_object_peak_members.csv，"
+            "字段与检查结果见 validation.json。"
+        ),
+    ]
+    verdict = "\n".join(verdict_lines) + "\n"
+    (ctx['audit_root'] / 'verdict_zh.md').write_text(verdict, encoding='utf-8')
+    (ctx['audit_root'] / "validation.json").write_text(
+        json.dumps(checks, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+
+
+
+
+def _ofes_sc_native_products(ctx: dict, dates: pd.DatetimeIndex) -> dict:
+    """从指定日期的原生 T/S/u/v 生成候选；窄日期验证不写正式报告。"""
+    settings = _ofes_structure_continuity_settings()
+    _, _, event_rows, _, endpoints = _ofes_sc_scale_load_context(ctx)
+    start_label = ctx['start_label']
+    end_label = ctx['end_label']
+    start_role = ctx['start_endpoint_role']
+    end_role = ctx['end_endpoint_role']
+    bounds = _ofes_sc_search_bounds(
+        *endpoints[start_role], *endpoints[end_role], settings['search_buffer_km'],
+    )
+    snapshots, source_rows = _ofes_sc_load_snapshots(ctx, dates, bounds, settings)
+    candidates, merge_audit, merge_relations, results = _ofes_sc_extract_all(snapshots)
+    matching = match_ofes_structure_candidates(candidates)
+    path = summarize_ofes_structure_continuity_paths(
+        matching['candidates'], matching['edges'],
+        start_date=event_rows[start_label][ctx['start_endpoint_field']],
+        start_lon=endpoints[start_role][0], start_lat=endpoints[start_role][1],
+        end_date=event_rows[end_label][ctx['end_endpoint_field']],
+        end_lon=endpoints[end_role][0], end_lat=endpoints[end_role][1],
+    )
+    return {
+        'candidates': path['candidates'], 'edges': matching['edges'],
+        'date_summary': matching['date_summary'], 'paths': path['paths'],
+        'merge_audit': merge_audit, 'merge_relations': merge_relations,
+        'results': results, 'snapshots': snapshots, 'source_rows': source_rows,
+        'matching': matching, 'path': path, 'endpoints': endpoints,
+        'event_rows': event_rows,
+        'bounds': bounds,
+    }
+
+
+def _ofes_sc_native_perturbations(ctx: dict, products: dict) -> None:
+    """复现案例规格给出的扰动，并保存逐日路径状态；不为连接端点挑选路径。"""
+    variants = [{'id': 'base', 'overrides': {}}] + list(
+        ctx['case_spec'].get('perturbations') or []
+    )
+    start_label = ctx['start_label']
+    end_label = ctx['end_label']
+    start_role = ctx['start_endpoint_role']
+    end_role = ctx['end_endpoint_role']
+    summaries, states = [], []
+    for spec in variants:
+        overrides = spec['overrides']
+        candidates = products['matching']['candidates']
+        if 'thermohaline_smoothing_sigma_pixels' in overrides:
+            candidates = _ofes_sc_extract_all(products['snapshots'], overrides)[0]
+        matching = match_ofes_structure_candidates(candidates, settings=overrides)
+        endpoints, events = products['endpoints'], products['event_rows']
+        path = summarize_ofes_structure_continuity_paths(
+            matching['candidates'], matching['edges'],
+            start_date=events[start_label][ctx['start_endpoint_field']],
+            start_lon=endpoints[start_role][0], start_lat=endpoints[start_role][1],
+            end_date=events[end_label][ctx['end_endpoint_field']],
+            end_lon=endpoints[end_role][0], end_lat=endpoints[end_role][1],
+            settings=overrides,
+        )
+        state, summary = _ofes_sc_perturbation_path_state(
+            ctx, spec['id'], candidates, matching, path,
+        )
+        summary['overrides'] = json.dumps(overrides)
+        summaries.append(summary)
+        states.append(state)
+    pd.DataFrame(summaries).to_csv(ctx['base_root'] / 'parameter_perturbation_validation.csv', index=False)
+    pd.concat(states, ignore_index=True).to_csv(ctx['base_root'] / 'parameter_perturbation_daily_state.csv', index=False)
+
+
+
+
+
+
+def build_ofes_structure_continuity(
+    synthesis_dir: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    case_spec: dict,
+) -> dict:
+    """生成案例指定的原生结构候选、对应路径和独立 DO 对象审计。
+
+    显式运行案例日期窗口内的 T/S/u/v producer，并复现案例规格给出的参数扰动。
+    DO 对象和粒子位置只在结构候选生成后用于配准审计。
+
+    参数:
+        - synthesis_dir (str | Path): 既有 `process_review_synthesis` 输入目录。
+        - output_dir (str | Path | None): 输出目录；None 时用输入目录下的案例子目录。
+        - case_spec (dict): 案例规格，必需；必需 `case_id`、`output_subdir`、`events`（每项含 label、event_id、endpoint_date、gap_side）与 `structure_dates`，`figure_dates`、`pilot_dates`、`pilot_smoothing_values`、`perturbations` 与 `scale_sensitivity` 按入口选用。
+    返回:
+        - dict: 输出目录、case_summary、validation 和时间线表。
+    输出:
+        - `daily_structure_candidates.csv`、`structure_match_edges.csv`、`structure_path_members.csv` 及候选合并审计。
+        - `parameter_perturbation_*.csv`、`structure_vs_do_timeline.csv`、DO/粒子配准表、PNG 和来源清单。
+    说明:
+        - 这是昂贵 producer；缓存审计使用 `audit_ofes_structure_continuity`。
+        - 完整候选路径不证明材料连续性；半振幅核上下边界尚未恢复。
+    """
+    ctx = _ofes_sc_context(synthesis_dir, case_spec, output_dir)
+    ctx['base_root'].mkdir(parents=True, exist_ok=True)
+    _ofes_sc_assert_output_case_isolation(ctx)
+    products = _ofes_sc_native_products(ctx, ctx['base_structure_dates'])
+    names = {
+        'candidates': 'daily_structure_candidates.csv',
+        'edges': 'structure_match_edges.csv',
+        'date_summary': 'daily_structure_correspondence.csv',
+        'paths': 'structure_path_members.csv',
+        'merge_audit': 'candidate_merge_audit.csv',
+        'merge_relations': 'candidate_merge_relations.csv',
+    }
+    for key, filename in names.items():
+        products[key].to_csv(ctx['base_root'] / filename, index=False)
+    _ofes_sc_write_json(ctx['base_root'] / 'input_source_manifest.json', {
+        'analysis': f"{ctx['case_id']}_independent_structure_continuity",
+        'settings': _ofes_structure_continuity_settings(),
+        'case_spec': _ofes_sc_jsonable(ctx['case_spec']),
+        'events': {
+            label: {
+                'event_id': event_id,
+                'endpoint_object_date': products['event_rows'][label][
+                    ctx['base_endpoint_fields'][label]
+                ],
+            }
+            for label, event_id in ctx['base_event_ids'].items()
+        },
+        'structure_search': {
+            'dates': list(ctx['base_structure_dates']),
+            'date_count': len(ctx['base_structure_dates']),
+            'bounds_requested': products['bounds'],
+            'native_structure_recomputed': True,
+            'cached_structure_products_reused': False,
+        },
+        'source_rows': products['source_rows'],
+        'native_structure_recomputed': True,
+    })
+    _ofes_sc_native_perturbations(ctx, products)
+    ctx['native_structure_recomputed'] = True
+    result = _ofes_sc_run(ctx)
+    _ofes_sc_plot_maps(ctx, products['candidates'], products['results'], products['endpoints'])
+    _ofes_sc_plot_sections(ctx, products['candidates'], products['results'], products['paths'])
+    return result
+
+
+def audit_ofes_structure_continuity(
+    synthesis_dir: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    case_spec: dict,
+    cache_dir: str | Path | None = None,
+) -> dict:
+    """从既有候选缓存复跑案例指定的缺口与对象配准审计。
+
+    读取正式候选、边、扰动和对象表，重新汇总路径与时间线；不读取 native 场。
+    独立输出目录可用于迁移回归检查，输入目录通过参数显式绑定。
+
+    参数:
+        - synthesis_dir (str | Path): 既有 `process_review_synthesis` 输入目录。
+        - output_dir (str | Path | None): 审计输出目录；None 时用标准结构连续性子目录。
+        - case_spec (dict): 案例规格，必需；须与生成候选缓存时一致。
+        - cache_dir (str | Path | None): 候选缓存目录，默认与输出目录相同。
+    返回:
+        - dict: 输出目录、case_summary、validation 和时间线表。
+    输出:
+        - 结构路径、DO 对象和粒子配准 CSV、时间线 PNG、JSON 清单及中文判定。
+    说明:
+        - 只检查近似候选包络；氧层重叠保持未知，过滤原因不由此解析。
+    """
+    ctx = _ofes_sc_context(synthesis_dir, case_spec, output_dir)
+    ctx['cache_root'] = Path(cache_dir).resolve() if cache_dir is not None else ctx['base_root']
+    # Fail before writing when the scientific cache does not match current settings.
+    _ofes_sc_load_cached_structure_products(ctx)
+    ctx['base_root'].mkdir(parents=True, exist_ok=True)
+    _ofes_sc_assert_output_case_isolation(ctx)
+    result = _ofes_sc_run(ctx)
+    if ctx['cache_root'] != ctx['base_root']:
+        for name in ('parameter_perturbation_validation.csv', 'parameter_perturbation_daily_state.csv'):
+            shutil.copy2(ctx['cache_root'] / name, ctx['base_root'] / name)
+    return result
+
+
+def build_ofes_structure_scale_sensitivity(
+    synthesis_dir: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    case_spec: dict,
+    recompute_native: bool = False,
+) -> dict:
+    """运行或刷新案例指定的固定尺度敏感性及端点对象审计。
+
+    默认只消费已有尺度候选与速度环 pilot；显式开启 native 模式才重新计算。
+    变体设计来自案例规格，处理顺序为冻结基线、逐项扰动、pilot 和统一对象字段裁决。
+
+    参数:
+        - synthesis_dir (str | Path): 既有 `process_review_synthesis` 输入目录。
+        - output_dir (str | Path | None): 结构连续性根目录，尺度表位于其 `scale_sensitivity` 子目录。
+        - case_spec (dict): 案例规格，必需；`scale_sensitivity` 给出变体设计。
+        - recompute_native (bool): 默认 False，只刷新缓存；True 运行案例规格中的尺度变体和 pilot。
+    返回:
+        - dict: output_dir、尺度 summary、validation 和端点审计 validation。
+    输出:
+        - `scale_sensitivity/*.csv`、JSON、PNG 和判定文本，以及 `object_registration_audit/*.csv`、JSON。
+    说明:
+        - 尺度依赖和峰点支持不等于氧层重叠或同一材料结构。
+        - native 模式依赖已完成的基线 producer；缓存模式不读取原生场。
+    """
+    ctx = _ofes_sc_context(synthesis_dir, case_spec, output_dir)
+    if ctx['scale_design'] is None:
+        raise ValueError(
+            'case_spec must provide scale_sensitivity for the scale '
+            'sensitivity entry point.'
+        )
+    _ofes_sc_load_cached_structure_products(ctx)
+    if not recompute_native:
+        manifest = json.loads(ctx['scale_outputs']['source_manifest'].read_text())
+        raw_variant_ids = manifest.get('variant_ids')
+        cached_variant_ids = sorted(
+            raw_variant_ids
+            if raw_variant_ids is not None
+            else list(manifest['variant_settings'].keys())
+        )
+        requested_variant_ids = sorted(
+            spec['id'] for spec in ctx['scale_design']['variants']
+        )
+        if cached_variant_ids != requested_variant_ids:
+            raise ValueError(
+                'Cached scale variant set differs from the requested design: '
+                f'cached={cached_variant_ids}, requested={requested_variant_ids}.'
+            )
+        for spec in ctx['scale_design']['variants']:
+            expected = _ofes_structure_continuity_settings({spec['parameter']: spec['value']})
+            if manifest['variant_settings'].get(spec['id']) != _ofes_sc_jsonable(expected):
+                raise ValueError(f"Cached scale settings differ for {spec['id']}.")
+        if 'display_path_id' in manifest:
+            # 显式记录（含 None）优先：不能把显式空值当成字段缺失去猜。
+            cached_display_path = manifest['display_path_id']
+        else:
+            cached_display_path = None
+            scope = (
+                manifest.get('cached_endpoint_registration_refresh') or {}
+            ).get('variant_summary_endpoint_scope')
+            if isinstance(scope, str) and scope.endswith('_only'):
+                cached_display_path = scope[: -len('_only')]
+        if cached_display_path is not None and (
+            cached_display_path != ctx['display_path_id']
+        ):
+            raise ValueError(
+                'Cached scale display path differs from the requested case_spec: '
+                f'{cached_display_path!r} vs {ctx["display_path_id"]!r}.'
+            )
+        cached_pilot_design = _ofes_sc_read_pilot_design(ctx)
+        if cached_pilot_design is None:
+            raise ValueError(
+                'Cached scale outputs record no pilot design (neither the '
+                'scale manifest nor ro_v_pilot_manifest.json); regenerate '
+                'explicitly or rerun with recompute_native=True.'
+            )
+        cached_pilot, cached_smoothing = cached_pilot_design
+        requested_pilot = [
+            pd.Timestamp(item).normalize() for item in ctx['pilot_pilot_dates']
+        ]
+        if cached_pilot != requested_pilot:
+            raise ValueError(
+                'Cached scale pilot dates differ from the requested case_spec: '
+                f'cached={[str(item.date()) for item in cached_pilot]}, '
+                f'requested={[str(item.date()) for item in requested_pilot]}.'
+            )
+        requested_smoothing = [
+            float(item) for item in ctx['pilot_smoothing_values']
+        ]
+        if cached_smoothing != requested_smoothing:
+            raise ValueError(
+                'Cached scale pilot smoothing values differ from the '
+                f'requested case_spec: cached={cached_smoothing}, '
+                f'requested={requested_smoothing}.'
+            )
+        cached_case = (manifest.get('case_spec') or {}).get('case_id')
+        if cached_case and cached_case != ctx['case_id']:
+            raise ValueError(
+                f'Cached scale outputs belong to case {cached_case!r}, '
+                f'not {ctx["case_id"]!r}.'
+            )
+        cached_design_version = (manifest.get('design') or {}).get('design_version')
+        if (
+            cached_design_version is not None
+            and cached_design_version != ctx['scale_design']['design_version']
+        ):
+            raise ValueError(
+                'Cached scale design_version differs from the requested design: '
+                f'{cached_design_version!r} vs '
+                f'{ctx["scale_design"]["design_version"]!r}.'
+            )
+    ctx['scale_root'].mkdir(parents=True, exist_ok=True)
+    ctx['audit_root'].mkdir(parents=True, exist_ok=True)
+    _ofes_sc_assert_output_case_isolation(ctx)
+    _ofes_sc_freeze_run(ctx)
+    if recompute_native:
+        _ofes_sc_scale_run(ctx)
+        _ofes_sc_pilot_run(ctx)
+    _ofes_sc_refresh_run(ctx)
+    _ofes_sc_finalize_run(ctx)
+    _ofes_sc_audit_run(ctx)
+    summary = pd.read_csv(ctx['scale_outputs']['summary'])
+    _ofes_sc_scale_plot_comparison(ctx, summary)
+    return {
+        'output_dir': ctx['base_root'], 'summary': summary,
+        'validation': json.loads(ctx['scale_outputs']['validation'].read_text()),
+        'object_registration_validation': json.loads((ctx['audit_root'] / 'validation.json').read_text()),
+    }
+
+
+
+
+def load_ofes_structure_continuity(output_dir: str | Path) -> dict:
+    """读取结构连续性现有摘要和时间线，不运行 producer 或写文件。
+
+    Notebook 可直接展示这些已验证的轻量结果，并保留各层证据的限定。
+
+    参数:
+        - output_dir (str | Path): 结构连续性结果根目录。
+    返回:
+        - dict: case_summary、validation、timeline 及存在时的 scale_summary。
+    说明:
+        - 这是保存结果的读取接口；输入陈旧与否应结合来源清单判断。
+    """
+    root = Path(output_dir)
+    result = {
+        'case_summary': json.loads((root / 'case_summary.json').read_text()),
+        'validation': json.loads((root / 'validation_checks.json').read_text()),
+        'timeline': pd.read_csv(root / 'structure_vs_do_timeline.csv', parse_dates=['date']),
+    }
+    scale = root / 'scale_sensitivity' / 'scale_sensitivity_variant_summary.csv'
+    if scale.exists():
+        result['scale_summary'] = pd.read_csv(scale)
+    return result
 
 
 def build_ofes_process_review_scene(

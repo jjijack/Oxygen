@@ -1,4 +1,17 @@
 # 处理与算法参数配置
+# version 1.34 变更：
+#   - 将结构连续性、尺度敏感性和对象配准的正式入口归入 track.py；三个入口均要求显式
+#     case_spec，案例事件身份、端点日期、展示窗口、扰动设计与尺度变体由 Notebook
+#     调用处给出，track.py 不保存案例默认身份（缺字段即报错，不回落到旧案例）。
+#   - 新增 process_review.structure_continuity 小节，用温盐/层结/动力判据识别 OFES
+#     次表层候选并枚举跨日对应；不读取 DO、不使用粒子路径作连续性证据。
+#   - 结构候选先完成全部原生深度层的异常体计算，再提取垂向范围；同一水平邻域按垂向
+#     区间和旋转/温盐符号区分重复候选、独立层与不确定多层候选。
+#   - 尺度敏感性采用单因素变体（动力平滑、垂向采样、候选合并、热盐背景平滑、交付
+#     深度窗），不做笛卡尔积，也不为连接端点调参；变体集合、pilot 日期/平滑值与展示
+#     路径随案例规格记录，并参与尺度缓存核对。
+#   - 缓存核对包含案例身份（事件 ID、端点日期、搜索范围）与输出目录归属隔离；
+#     尺度汇总与裁决由当前数据生成，历史回归期望不进入生产函数。
 # version 1.33 变更：
 #   - 新增 OFES 过程审查 scene、局部峰、可视化与等密度面升降流相位参数；冻结 producer 参数不变。
 #   - 清理未消费的探索占位参数并统一命名为 process_review；scene_version 改用 ofes_process_scene_v3，并兼容旧缓存标识。
@@ -125,7 +138,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.33
+version: 1.34
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -267,6 +280,34 @@ ofes:
     local_peak_min_width_levels: 2.0
     local_peak_min_distance_levels: 2
     oxygen_geometry_radius_km: 80.0
+    # E225--E246 独立结构连续性旁路：固定参数，不参与冻结 DO producer。
+    structure_continuity:
+      search_buffer_km: 200.0
+      depth_bounds_m: [300.0, 650.0]
+      thermohaline_smoothing_sigma_pixels: 7.0   # 约 25 km，高于网格尺度而小于大范围背景
+      kinematic_smoothing_sigma_pixels: 1.5      # 约 5--6 km，抑制单网格梯度噪声
+      spiciness_anomaly_min: 0.15                # 沿用 subsurface_lens 的 TEOS-10 |δπ| 门槛
+      n2_ratio_low_max: 0.8                       # N² 低于局地平滑背景的辅助标记，不单独作 gate
+      minimum_component_cells: 5
+      local_maximum_window_pixels: 9
+      candidate_edge_exclusion_pixels: 10
+      candidate_min_separation_km: 35.0
+      candidate_merge_max_vertical_gap_m: 40.0
+      candidate_merge_require_same_spiciness_sign: true
+      candidate_merge_require_same_rossby_sign: true
+      endpoint_association_radius_km: 30.0        # 只用于端点标记，不用于中间匹配
+      maximum_translation_km_per_day: 50.0
+      maximum_depth_change_m_per_day: 40.0
+      maximum_spiciness_change_per_day: 0.15
+      maximum_sigma0_change_per_day: 0.15
+      maximum_n2_ratio_change: 0.60
+      maximum_rossby_change: 0.70
+      require_same_spiciness_sign: true
+      require_same_rossby_sign: true
+      vertical_profile_radius_km: 20.0
+      vertical_min_anomaly_levels: 2
+      maximum_match_gap_days: 1
+      max_paths_to_enumerate: 2000
     w_branch_min_abs_m_per_day: 1.0
     branch_min_columns: 25
     background_min_valid_columns: 100
