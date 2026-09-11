@@ -143,6 +143,7 @@ _mccoy_scv_source_archive = Path(
     )
 )
 _OFES_CFG = _PROC_CFG.get('ofes', {})
+_OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M = 1e-4
 
 # 用下划线隐藏内部配置值，提供 getter 避免随处写死名称
 circle_enlargement_factor = float(
@@ -81220,7 +81221,7 @@ def _ofes_endpoint_object_registration(
     threshold: int,
     expected_event_id: str | None = None,
     expected_daily_object_key: str | None = None,
-    depth_tolerance_m: float = 1e-4,
+    depth_tolerance_m: float = _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
 ) -> dict:
     """按真实日期、阈值、对象键字段和峰像素核对端点对象配准。
 
@@ -81396,6 +81397,294 @@ def _ofes_endpoint_object_registration(
         ),
         'members': members,
     }
+
+
+def _ofes_read_native_do_profile(
+    date: str | pd.Timestamp,
+    source_lat_index: int,
+    source_lon_index: int,
+) -> dict[str, Any]:
+    """按全局 source 索引读取单条原生 OFES DO 剖面及其坐标。"""
+    date_ts = pd.Timestamp(date).normalize()
+    try:
+        lat_index = int(source_lat_index)
+        lon_index = int(source_lon_index)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('OFES source indices must be integers.') from exc
+    if float(source_lat_index) != lat_index or float(source_lon_index) != lon_index:
+        raise ValueError('OFES source indices must not contain fractional values.')
+    _, _, depth, depth_attr_units, reference_path = _ofes_tracer_coordinates(
+        date_ts
+    )
+    path = _ofes_file_path('do2', date_ts)
+    if not path.exists():
+        raise FileNotFoundError(f'OFES DO2 file not found: {path}')
+    with Dataset(str(path), 'r') as dataset:
+        variable = dataset.variables['do2']
+        if variable.ndim != 4 or variable.shape[0] != 1:
+            raise ValueError(
+                f'OFES DO2 source shape is not (1, depth, lat, lon): '
+                f'{variable.shape}'
+            )
+        if not (0 <= lat_index < variable.shape[2]):
+            raise IndexError(f'OFES source latitude index is out of bounds: {lat_index}')
+        if not (0 <= lon_index < variable.shape[3]):
+            raise IndexError(f'OFES source longitude index is out of bounds: {lon_index}')
+        source_depth = np.asarray(dataset.variables['lev'][:], dtype=float) * float(
+            _OFES_CFG.get('depth_scale', 1.0)
+        )
+        depth_coordinate_error_m = _ofes_assert_coordinate_match(
+            source_depth, depth, 'DO2 native profile depth'
+        )
+        source_lat = float(dataset.variables['lat'][lat_index])
+        source_lon = float(dataset.variables['lon'][lon_index])
+        profile = _ofes_subset_to_float32(
+            variable, (0, slice(None), lat_index, lon_index)
+        )
+        source_units = str(getattr(variable, 'units', '') or '')
+    scale = float(_OFES_CFG.get('variable_scale', {}).get('do2', 1.0))
+    return {
+        'date': date_ts,
+        'depth_m': depth,
+        'do2_umol_kg': np.asarray(profile * scale, dtype=np.float64),
+        'source_lat_index': lat_index,
+        'source_lon_index': lon_index,
+        'source_lat': source_lat,
+        'source_lon': source_lon,
+        'source_path': str(path.resolve()),
+        'reference_coordinate_path': str(reference_path.resolve()),
+        'depth_attribute_units': str(depth_attr_units),
+        'source_do2_units': source_units,
+        'output_do2_units': str(
+            _OFES_CFG.get('output_units', {}).get('do2', 'umol kg-1')
+        ),
+        'do2_scale': scale,
+        'depth_coordinate_max_abs_error_m': float(depth_coordinate_error_m),
+    }
+
+
+def _ofes_recover_half_amplitude_core(
+    do_profile: Sequence[float],
+    depth: Sequence[float],
+    selected_peak_level_index: int,
+    *,
+    detection_config: DetectionConfig | None = None,
+    saved_delta_do: float | None = None,
+    saved_peak_depth: float | None = None,
+    saved_half_amplitude_thickness_m: float | None = None,
+) -> dict[str, Any]:
+    """沿固定已选峰恢复 producer 定义的离散半振幅核边界。"""
+    cfg = detection_config or make_detection_config('do')
+    if cfg.method != 'do':
+        raise ValueError('Half-amplitude recovery requires a DO DetectionConfig.')
+    values = np.asarray(do_profile, dtype=np.float64)
+    depth_arr = np.asarray(depth, dtype=np.float64)
+    if values.ndim != 1 or depth_arr.ndim != 1 or values.size != depth_arr.size:
+        raise ValueError('DO profile and depth must be one-dimensional and aligned.')
+    if not np.all(np.isfinite(depth_arr)) or not np.all(np.diff(depth_arr) > 0):
+        raise ValueError('OFES native depth must be finite and strictly increasing.')
+    peak_index = int(selected_peak_level_index)
+    if not 0 <= peak_index < depth_arr.size:
+        raise IndexError(f'Selected OFES peak level is out of bounds: {peak_index}')
+    near_zero_threshold = float(cfg.do_near_zero_threshold)
+    finite = np.isfinite(values)
+    near_zero_count = int(np.count_nonzero(finite & (values <= near_zero_threshold)))
+    max_near_zero = cfg.do_near_zero_max_count
+    profile_rejected = bool(
+        max_near_zero is not None
+        and int(max_near_zero) >= 0
+        and near_zero_count > int(max_near_zero)
+    )
+    valid = finite & (values > near_zero_threshold)
+    levels = np.flatnonzero(valid)
+    result: dict[str, Any] = {
+        'selected_peak_level_index': peak_index,
+        'selected_peak_depth_m': float(depth_arr[peak_index]),
+        'valid_layer_count': int(levels.size),
+        'near_zero_count': near_zero_count,
+        'near_zero_threshold': near_zero_threshold,
+        'near_zero_max_count': (
+            int(max_near_zero) if max_near_zero is not None else None
+        ),
+        'profile_rejected_by_near_zero_rule': profile_rejected,
+        'reference_shallow_level_index': None,
+        'reference_deep_level_index': None,
+        'reference_shallow_depth_m': np.nan,
+        'reference_deep_depth_m': np.nan,
+        'reference_shallow_do_umol_kg': np.nan,
+        'reference_deep_do_umol_kg': np.nan,
+        'peak_delta_do_umol_kg': np.nan,
+        'core_native_shallow_level_index': None,
+        'core_native_deep_level_index': None,
+        'core_shallow_edge_m': np.nan,
+        'core_deep_edge_m': np.nan,
+        'core_thickness_m': np.nan,
+        'core_upper_boundary_status': None,
+        'core_lower_boundary_status': None,
+        'core_edge_method': (
+            'adjacent_native_layer_midpoint_or_segment_native_edge'
+        ),
+        'recovery_definition': (
+            'fixed_selected_peak_valid_mask_reference_endpoints_contiguous_half_amplitude_core'
+        ),
+        'reproduction_status': 'not_comparable',
+        'saved_delta_do_difference_umol_kg': np.nan,
+        'saved_peak_depth_difference_m': np.nan,
+        'saved_half_amplitude_thickness_difference_m': np.nan,
+        'saved_delta_do_match': None,
+        'saved_peak_depth_match': None,
+        'saved_half_amplitude_thickness_match': None,
+        'recovery_status': 'not_recovered',
+    }
+    if profile_rejected:
+        result['recovery_status'] = 'profile_rejected_by_original_near_zero_rule'
+        return result
+    if peak_index not in set(levels.tolist()):
+        result['recovery_status'] = 'selected_peak_level_invalid_under_original_mask'
+        return result
+    if levels.size < 5:
+        result['recovery_status'] = 'fewer_than_five_valid_native_levels'
+        return result
+
+    local_peak_index = int(np.flatnonzero(levels == peak_index)[0])
+    pattern_depth = depth_arr[levels]
+    pattern_values = values[levels]
+    target_depth = float(pattern_depth[local_peak_index])
+    if (
+        cfg.anomaly_min_depth > 0
+        and target_depth < float(cfg.anomaly_min_depth)
+    ) or (
+        cfg.anomaly_max_depth > 0
+        and target_depth > float(cfg.anomaly_max_depth)
+    ):
+        result['recovery_status'] = 'selected_peak_outside_original_depth_gate'
+        return result
+    half_window = float(cfg.depth_interval)
+    lower = int(np.searchsorted(
+        pattern_depth,
+        max(0.0, target_depth - half_window),
+        side='left',
+    ))
+    upper = int(np.searchsorted(
+        pattern_depth,
+        target_depth + half_window,
+        side='right',
+    ) - 1)
+    if lower >= upper:
+        result['recovery_status'] = 'original_reference_endpoints_not_separated'
+        return result
+    fraction = (
+        (target_depth - pattern_depth[lower])
+        / (pattern_depth[upper] - pattern_depth[lower])
+    )
+    reference_at_peak = (
+        pattern_values[lower]
+        + fraction * (pattern_values[upper] - pattern_values[lower])
+    )
+    segment_depth = pattern_depth[lower:upper + 1]
+    segment_values = pattern_values[lower:upper + 1]
+    segment_fraction = (
+        (segment_depth - pattern_depth[lower])
+        / (pattern_depth[upper] - pattern_depth[lower])
+    )
+    segment_reference = (
+        pattern_values[lower]
+        + segment_fraction
+        * (pattern_values[upper] - pattern_values[lower])
+    )
+    peak_delta = float(pattern_values[local_peak_index] - reference_at_peak)
+    above_half = segment_values - segment_reference >= 0.5 * peak_delta
+    peak_in_segment = local_peak_index - lower
+    if not above_half[peak_in_segment]:
+        result['recovery_status'] = 'selected_peak_not_inside_recomputed_half_core'
+        return result
+    start = peak_in_segment
+    stop = peak_in_segment
+    while start > 0 and above_half[start - 1]:
+        start -= 1
+    while stop + 1 < above_half.size and above_half[stop + 1]:
+        stop += 1
+    if start > 0:
+        upper_edge = 0.5 * (
+            segment_depth[start - 1] + segment_depth[start]
+        )
+        upper_boundary_status = 'adjacent_native_layer_midpoint'
+    else:
+        upper_edge = segment_depth[start]
+        upper_boundary_status = 'reference_segment_native_edge'
+    if stop + 1 < segment_depth.size:
+        lower_edge = 0.5 * (
+            segment_depth[stop] + segment_depth[stop + 1]
+        )
+        lower_boundary_status = 'adjacent_native_layer_midpoint'
+    else:
+        lower_edge = segment_depth[stop]
+        lower_boundary_status = 'reference_segment_native_edge'
+
+    result.update({
+        'reference_shallow_level_index': int(levels[lower]),
+        'reference_deep_level_index': int(levels[upper]),
+        'reference_shallow_depth_m': float(pattern_depth[lower]),
+        'reference_deep_depth_m': float(pattern_depth[upper]),
+        'reference_shallow_do_umol_kg': float(pattern_values[lower]),
+        'reference_deep_do_umol_kg': float(pattern_values[upper]),
+        'peak_delta_do_umol_kg': peak_delta,
+        'core_native_shallow_level_index': int(levels[lower + start]),
+        'core_native_deep_level_index': int(levels[lower + stop]),
+        'core_shallow_edge_m': float(upper_edge),
+        'core_deep_edge_m': float(lower_edge),
+        'core_thickness_m': float(max(0.0, lower_edge - upper_edge)),
+        'core_upper_boundary_status': upper_boundary_status,
+        'core_lower_boundary_status': lower_boundary_status,
+        'recovery_status': 'recovered_producer_discrete_half_amplitude_core',
+    })
+
+    def _float32_tolerance(value: float | None) -> float:
+        if value is None or not np.isfinite(value):
+            return np.nan
+        return float(
+            max(1.0, abs(float(value)))
+            * np.finfo(np.float32).eps
+            * 4.0
+        )
+
+    comparisons = []
+    if saved_delta_do is not None and np.isfinite(saved_delta_do):
+        difference = float(peak_delta - float(saved_delta_do))
+        tolerance = _float32_tolerance(float(saved_delta_do))
+        result['saved_delta_do_difference_umol_kg'] = difference
+        result['saved_delta_do_tolerance_umol_kg'] = tolerance
+        result['saved_delta_do_match'] = bool(abs(difference) <= tolerance)
+        comparisons.append(result['saved_delta_do_match'])
+    if saved_peak_depth is not None and np.isfinite(saved_peak_depth):
+        difference = float(target_depth - float(saved_peak_depth))
+        tolerance = _float32_tolerance(float(saved_peak_depth))
+        result['saved_peak_depth_difference_m'] = difference
+        result['saved_peak_depth_tolerance_m'] = tolerance
+        result['saved_peak_depth_match'] = bool(abs(difference) <= tolerance)
+        comparisons.append(result['saved_peak_depth_match'])
+    if (
+        saved_half_amplitude_thickness_m is not None
+        and np.isfinite(saved_half_amplitude_thickness_m)
+    ):
+        difference = float(
+            result['core_thickness_m'] - float(saved_half_amplitude_thickness_m)
+        )
+        tolerance = _float32_tolerance(float(saved_half_amplitude_thickness_m))
+        result['saved_half_amplitude_thickness_difference_m'] = difference
+        result['saved_half_amplitude_thickness_tolerance_m'] = tolerance
+        result['saved_half_amplitude_thickness_match'] = bool(
+            abs(difference) <= tolerance
+        )
+        comparisons.append(result['saved_half_amplitude_thickness_match'])
+    if comparisons:
+        result['reproduction_status'] = (
+            'saved_peak_and_thickness_reproduced_within_float32_storage_tolerance'
+            if all(comparisons) else 'saved_peak_or_thickness_reproduction_mismatch'
+        )
+    else:
+        result['reproduction_status'] = 'recovered_without_saved_comparison'
+    return result
 
 
 def _ofes_process_review_local_peaks(depth, contrast, raw_do, sigma0, settings):
@@ -90184,3 +90473,1431 @@ def build_ofes_process_review_local_field_availability(
     }
     _ofes_atomic_write_json(manifest, manifest_path)
     return {'output_dir': out, 'daily': daily, 'summary': summary, 'pairwise': pairwise, 'manifest': manifest}
+
+
+def _ofes_ha_normalise_dates(
+    frame: pd.DataFrame,
+    column: str = 'date',
+) -> pd.DataFrame:
+    """把日期列规范化为去时刻的时间戳。"""
+    output = frame.copy()
+    output[column] = pd.to_datetime(output[column]).dt.normalize()
+    return output
+
+
+def _ofes_ha_validate_case_label_sets(
+    members: pd.DataFrame,
+    reassessment: pd.DataFrame,
+) -> set[str]:
+    """校验端点成员表与候选配准表覆盖同一组案例标签。"""
+    member_labels = set(members['case_label'].astype(str).unique())
+    reassessment_labels = set(reassessment['case_label'].astype(str).unique())
+    if member_labels != reassessment_labels:
+        raise ValueError(
+            'Endpoint members and reassessment must cover the same case_label '
+            f'set: members={sorted(member_labels)!r}, '
+            f'reassessment={sorted(reassessment_labels)!r}.'
+        )
+    return member_labels
+
+
+def _ofes_ha_detection_threshold_identity(do_threshold: Any) -> dict[str, Any]:
+    """返回 DO 阈值对应的规范标签与峰像素对象列名。"""
+    try:
+        threshold_value = float(do_threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f'Half-amplitude DO threshold must be a positive integer, got {do_threshold!r}.'
+        ) from exc
+    if (
+        not np.isfinite(threshold_value)
+        or threshold_value <= 0
+        or threshold_value != int(threshold_value)
+    ):
+        raise ValueError(
+            f'Half-amplitude DO threshold must be a positive integer, got {do_threshold!r}.'
+        )
+    threshold = int(threshold_value)
+    threshold_tag = f'DO{threshold}'
+    return {
+        'value': threshold,
+        'tag': threshold_tag,
+        'object_id_column': f'object_id_do{threshold}',
+    }
+
+
+def _ofes_ha_validate_case_threshold_identity(
+    case_spec: dict,
+    detection_config: DetectionConfig,
+) -> dict[str, Any]:
+    """核对案例规格、解析配置和所有端点身份使用同一 DO 阈值。"""
+    case_identity = _ofes_ha_detection_threshold_identity(
+        case_spec.get('do_threshold')
+    )
+    config_identity = _ofes_ha_detection_threshold_identity(
+        detection_config.do_threshold
+    )
+    if detection_config.method != 'do':
+        raise ValueError('Half-amplitude recovery requires the DO detection method.')
+    if case_identity != config_identity:
+        raise ValueError(
+            'Half-amplitude case threshold differs from the resolved detection '
+            f'configuration: case={case_identity["tag"]}, '
+            f'config={config_identity["tag"]}.'
+        )
+    for case in case_spec['cases']:
+        label = str(case['label'])
+        for identity_field in ('event_id', 'daily_object_key'):
+            value = str(case[identity_field]).strip()
+            threshold_tokens = re.findall(r'(?:^|_)DO(\d+)(?:_|$)', value)
+            if threshold_tokens != [str(case_identity['value'])]:
+                raise ValueError(
+                    f'{label} {identity_field} does not use the declared '
+                    f'{case_identity["tag"]} threshold: {value!r}.'
+                )
+    return case_identity
+
+
+def _ofes_ha_resolve_detection_config(case_spec: dict) -> DetectionConfig:
+    """用案例声明的 DO 阈值覆盖全局默认值并核对阈值身份。"""
+    if 'do_threshold' not in case_spec:
+        raise ValueError(
+            'Half-amplitude case_spec must declare do_threshold explicitly.'
+        )
+    requested = _ofes_ha_detection_threshold_identity(case_spec['do_threshold'])
+    detection_config = make_detection_config(
+        'do',
+        do_threshold=float(requested['value']),
+    )
+    _ofes_ha_validate_case_threshold_identity(case_spec, detection_config)
+    return detection_config
+
+
+def _ofes_ha_load_inputs(
+    case_spec: dict,
+    detection_config: DetectionConfig,
+) -> tuple:
+    """读取半振幅核恢复所需的端点成员、候选—对象配准与候选表。
+
+    只做身份一致性与连接唯一性检查：每个案例的端点日期、事件身份、对象键必须与
+    调用方声明一致，成员须共享一个声明阈值对应的 DO 对象，候选表须能唯一补回原始候选层。
+    固定行数、每端点像素数等历史回归期望不在本函数中校验。
+
+    参数:
+        - case_spec (dict): 案例规格，须含 `do_threshold`、`cases`（每项 `label`、`date`、`event_id`、`daily_object_key`）与 `inputs`（`endpoint_members`、`endpoint_reassessment`、`candidate_table` 三个路径）。
+        - detection_config (DetectionConfig): 已按案例阈值解析的正式 DO 检测配置。
+
+    返回:
+        - tuple: `(members, reassessment)`，reassessment 已补回候选层列。
+
+    说明:
+        - 缺字段即报错，不回落到任何内置案例身份。
+    """
+    threshold_identity = _ofes_ha_validate_case_threshold_identity(
+        case_spec,
+        detection_config,
+    )
+    object_id_column = threshold_identity['object_id_column']
+    threshold_tag = threshold_identity['tag']
+    inputs = case_spec['inputs']
+    cases = case_spec['cases']
+    members = _ofes_ha_normalise_dates(pd.read_csv(inputs['endpoint_members']))
+    reassessment = _ofes_ha_normalise_dates(
+        pd.read_csv(inputs['endpoint_reassessment'])
+    )
+    candidates = _ofes_ha_normalise_dates(
+        pd.read_csv(inputs['candidate_table'])
+    )
+    members['case_label'] = members['case_label'].astype(str)
+    reassessment['case_label'] = reassessment['case_label'].astype(str)
+    reassessment['path_ids'] = reassessment['path_ids'].fillna('').astype(str)
+    input_case_labels = _ofes_ha_validate_case_label_sets(
+        members, reassessment
+    )
+    declared_case_labels = {str(case['label']) for case in cases}
+    if input_case_labels != declared_case_labels:
+        raise ValueError(
+            'Declared cases and endpoint input tables must cover the same '
+            f'case_label set: declared={sorted(declared_case_labels)!r}, '
+            f'inputs={sorted(input_case_labels)!r}.'
+        )
+    if object_id_column not in members.columns:
+        raise KeyError(
+            f'Endpoint member table lacks the declared threshold column: '
+            f'{object_id_column}'
+        )
+    for case in cases:
+        label = str(case['label'])
+        date = pd.Timestamp(case['date']).normalize()
+        subset = members.loc[members['case_label'].eq(label)]
+        if subset.empty:
+            raise ValueError(f'No endpoint members for case {label!r}.')
+        combinations = reassessment.loc[reassessment['case_label'].eq(label)]
+        if combinations.empty:
+            raise ValueError(f'No endpoint combinations for case {label!r}.')
+        for name, frame in (('members', subset), ('combinations', combinations)):
+            if not frame['date'].eq(date).all():
+                raise ValueError(
+                    f'{label} {name} do not use the declared endpoint date.'
+                )
+            if not frame['actual_event_id'].astype(str).eq(
+                str(case['event_id'])
+            ).all():
+                raise ValueError(
+                    f'{label} {name} do not map to the declared event ID.'
+                )
+            if not frame['daily_object_key'].astype(str).eq(
+                str(case['daily_object_key'])
+            ).all():
+                raise ValueError(
+                    f'{label} {name} do not map to the declared object key.'
+                )
+        object_ids = pd.to_numeric(subset[object_id_column], errors='coerce')
+        key_object_ids = pd.to_numeric(
+            subset['daily_object_key']
+            .astype(str)
+            .str.rsplit('_', n=1)
+            .str[-1],
+            errors='coerce',
+        )
+        if (
+            object_ids.isna().any()
+            or not np.equal(object_ids, np.floor(object_ids)).all()
+            or key_object_ids.isna().any()
+            or not np.equal(key_object_ids, np.floor(key_object_ids)).all()
+            or object_ids.astype(int).nunique() != 1
+        ):
+            raise ValueError(
+                f'{label} members do not share one {threshold_tag} object ID.'
+            )
+        if not np.equal(object_ids, key_object_ids).all():
+            raise ValueError(
+                f'{label} member object IDs do not match the IDs encoded in '
+                'daily_object_key.'
+            )
+    if not reassessment['oxygen_layer_overlap_m'].isna().all():
+        raise ValueError('The historical oxygen-layer overlap field is not NaN.')
+    if not reassessment['oxygen_layer_overlap_status'].astype(str).str.contains(
+        'unknown'
+    ).all():
+        raise ValueError('The historical oxygen-layer overlap status is not unknown.')
+
+    candidate_columns = [
+        'variant_id',
+        'candidate_id',
+        'date',
+        'level_index',
+        'depth_m',
+        'lon',
+        'lat',
+        'thermohaline_component_radius_km',
+    ]
+    candidate_lookup = candidates[candidate_columns].copy()
+    if candidate_lookup.duplicated(['variant_id', 'candidate_id', 'date']).any():
+        raise ValueError('Candidate lookup is not unique by variant/candidate/date.')
+    reassessment = reassessment.merge(
+        candidate_lookup,
+        on=['variant_id', 'candidate_id', 'date'],
+        how='left',
+        validate='one_to_one',
+        suffixes=('', '_candidate'),
+    )
+    if reassessment['level_index'].isna().any():
+        raise ValueError(
+            'Some endpoint combinations lack their original candidate level.'
+        )
+    reassessment = reassessment.rename(
+        columns={
+            'level_index': 'candidate_level_index',
+            'depth_m': 'candidate_level_depth_m',
+            'lon': 'candidate_center_lon',
+            'lat': 'candidate_center_lat',
+            'thermohaline_component_radius_km':
+                'candidate_radius_km_from_candidate_table',
+        }
+    )
+    if not np.allclose(
+        pd.to_numeric(reassessment['candidate_radius_km'], errors='coerce'),
+        pd.to_numeric(
+            reassessment['candidate_radius_km_from_candidate_table'],
+            errors='coerce',
+        ),
+        rtol=0.0,
+        atol=1e-4,
+    ):
+        raise ValueError(
+            'Reassessment and candidate-table radii do not agree.'
+        )
+    reassessment['candidate_level_index'] = reassessment[
+        'candidate_level_index'
+    ].astype(int)
+    return members, reassessment
+
+
+
+def _ofes_ha_detection_config_record(
+    detection_config: DetectionConfig,
+) -> dict:
+    """返回半振幅恢复实际解析使用的 DO 检测配置。"""
+    threshold_identity = _ofes_ha_detection_threshold_identity(
+        detection_config.do_threshold
+    )
+    return {
+        'method': str(detection_config.method),
+        'do_threshold': float(detection_config.do_threshold),
+        'threshold_tag': threshold_identity['tag'],
+        'object_id_column': threshold_identity['object_id_column'],
+        'depth_interval': float(detection_config.depth_interval),
+        'anomaly_min_depth': (
+            float(detection_config.anomaly_min_depth)
+            if detection_config.anomaly_min_depth is not None else None
+        ),
+        'anomaly_max_depth': (
+            float(detection_config.anomaly_max_depth)
+            if detection_config.anomaly_max_depth is not None else None
+        ),
+        'do_near_zero_threshold': float(detection_config.do_near_zero_threshold),
+        'do_near_zero_max_count': (
+            int(detection_config.do_near_zero_max_count)
+            if detection_config.do_near_zero_max_count is not None else None
+        ),
+        'base_config_source': "processing.yml via make_detection_config('do')",
+        'do_threshold_source': (
+            "case_spec['do_threshold'] override passed to "
+            "make_detection_config"
+        ),
+    }
+
+
+def _ofes_ha_recover_native_profiles(
+    members: pd.DataFrame,
+    detection_config: DetectionConfig,
+) -> pd.DataFrame:
+    """使用正式 DO 检测配置恢复固定端点成员的原生半振幅核。"""
+    detection_config = _resolve_detection_config(detection_config)
+    if detection_config.method != 'do':
+        raise ValueError('Half-amplitude recovery requires the DO detection method.')
+    rows = []
+    for number, member in enumerate(
+        members.sort_values(["case_label", "source_lat_index", "source_lon_index"]).itertuples(
+            index=False
+        ),
+        start=1,
+    ):
+        native = _ofes_read_native_do_profile(
+            member.date,
+            int(member.source_lat_index),
+            int(member.source_lon_index),
+        )
+        recovered = _ofes_recover_half_amplitude_core(
+            native["do2_umol_kg"],
+            native["depth_m"],
+            int(member.peak_level_index),
+            detection_config=detection_config,
+            saved_delta_do=float(member.delta_do),
+            saved_peak_depth=float(member.peak_depth),
+            saved_half_amplitude_thickness_m=float(member.half_amplitude_thickness_m),
+        )
+        coordinate_lat_difference = float(native["source_lat"] - member.lat)
+        coordinate_lon_difference = float(native["source_lon"] - member.lon)
+        if max(abs(coordinate_lat_difference), abs(coordinate_lon_difference)) > 3e-5:
+            raise ValueError(
+                f"Source coordinate mismatch for fixed profile {number}: "
+                f"{coordinate_lat_difference}, {coordinate_lon_difference}"
+            )
+        row = {
+            "profile_id": f"{member.case_label}_{int(member.source_lat_index):03d}_{int(member.source_lon_index):03d}",
+            "case_label": member.case_label,
+            "event_id": member.actual_event_id,
+            "date": member.date,
+            "daily_object_key": member.daily_object_key,
+            "source_lat_index": int(member.source_lat_index),
+            "source_lon_index": int(member.source_lon_index),
+            "lat": float(member.lat),
+            "lon": float(member.lon),
+            "source_lat": native["source_lat"],
+            "source_lon": native["source_lon"],
+            "source_coordinate_lat_difference_deg": coordinate_lat_difference,
+            "source_coordinate_lon_difference_deg": coordinate_lon_difference,
+            "saved_delta_do_umol_kg": float(member.delta_do),
+            "saved_peak_level_index": int(member.peak_level_index),
+            "saved_peak_depth_m": float(member.peak_depth),
+            "saved_half_amplitude_thickness_m": float(
+                member.half_amplitude_thickness_m
+            ),
+            "source_path": native["source_path"],
+            "reference_coordinate_path": native["reference_coordinate_path"],
+            "depth_attribute_units": native["depth_attribute_units"],
+            "source_do2_units": native["source_do2_units"],
+            "output_do2_units": native["output_do2_units"],
+            "do2_scale": native["do2_scale"],
+            "depth_coordinate_max_abs_error_m": native[
+                "depth_coordinate_max_abs_error_m"
+            ],
+        }
+        row.update(recovered)
+        rows.append(row)
+    profiles = pd.DataFrame(rows)
+    if profiles["profile_id"].duplicated().any():
+        raise ValueError("Fixed endpoint source indices are not unique.")
+    if not profiles["recovery_status"].eq(
+        "recovered_producer_discrete_half_amplitude_core"
+    ).all():
+        raise ValueError("At least one fixed profile could not recover its half-amplitude core.")
+    if not profiles["reproduction_status"].eq(
+        "saved_peak_and_thickness_reproduced_within_float32_storage_tolerance"
+    ).all():
+        raise ValueError("At least one fixed profile failed producer-value reproduction.")
+    return profiles
+
+
+def _ofes_ha_candidate_level_boundary_status(
+    candidate_depth: float,
+    core_shallow: float,
+    core_deep: float,
+    tolerance_m: float,
+) -> tuple[bool | None, str]:
+    """按共享深度容差判断候选中心层与恢复核的边界关系。"""
+    if not np.all(np.isfinite([candidate_depth, core_shallow, core_deep])):
+        return None, "unknown_profile_recovery"
+    if candidate_depth < core_shallow - tolerance_m:
+        return False, "candidate_level_shallower_than_core"
+    if candidate_depth > core_deep + tolerance_m:
+        return False, "candidate_level_deeper_than_core"
+    if abs(candidate_depth - core_shallow) <= tolerance_m:
+        return True, "candidate_level_upper_boundary_contact"
+    if abs(candidate_depth - core_deep) <= tolerance_m:
+        return True, "candidate_level_lower_boundary_contact"
+    return True, "candidate_level_inside_core"
+
+
+def _ofes_ha_core_candidate_geometry(
+    candidate: pd.Series,
+    profile: pd.Series,
+) -> dict:
+    """计算单个候选与单条恢复半振幅核的垂向几何关系。"""
+    core_shallow = float(profile["core_shallow_edge_m"])
+    core_deep = float(profile["core_deep_edge_m"])
+    candidate_shallow = float(candidate["candidate_shallow_m"])
+    candidate_deep = float(candidate["candidate_deep_m"])
+    candidate_depth = float(candidate["candidate_level_depth_m"])
+    finite_vertical = bool(
+        np.all(
+            np.isfinite(
+                [core_shallow, core_deep, candidate_shallow, candidate_deep]
+            )
+        )
+    )
+    vertical_tolerance_m = _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M
+    if finite_vertical:
+        interval_intersection = max(
+            0.0,
+            min(core_deep, candidate_deep) - max(core_shallow, candidate_shallow),
+        )
+        interval_gap = max(
+            0.0,
+            max(core_shallow, candidate_shallow)
+            - min(core_deep, candidate_deep),
+        )
+    else:
+        interval_intersection = np.nan
+        interval_gap = np.nan
+    level_inside, level_status = _ofes_ha_candidate_level_boundary_status(
+        candidate_depth,
+        core_shallow,
+        core_deep,
+        vertical_tolerance_m,
+    )
+    candidate_level_count = int(candidate["candidate_native_level_count"])
+    if not finite_vertical:
+        geometry_status = "unknown_profile_recovery"
+    elif candidate_level_count == 1:
+        if level_status == "candidate_level_inside_core":
+            geometry_status = "candidate_one_level_inside_half_amplitude_core"
+        elif level_status.endswith("boundary_contact"):
+            geometry_status = "candidate_one_level_boundary_contact"
+        else:
+            geometry_status = "candidate_one_level_outside_half_amplitude_core"
+    elif interval_intersection > vertical_tolerance_m:
+        geometry_status = "positive_length_core_candidate_interval_overlap"
+    elif interval_gap <= vertical_tolerance_m:
+        geometry_status = "core_candidate_interval_boundary_contact"
+    else:
+        geometry_status = "core_candidate_interval_separated"
+    return {
+        "candidate_level_inside_half_amplitude_core": level_inside,
+        "candidate_level_boundary_status": level_status,
+        "candidate_level_depth_m": candidate_depth,
+        "candidate_level_index": int(candidate["candidate_level_index"]),
+        "candidate_native_level_count": candidate_level_count,
+        "half_amplitude_core_candidate_interval_intersection_m": interval_intersection,
+        "half_amplitude_core_candidate_interval_gap_m": interval_gap,
+        "half_amplitude_core_candidate_geometry_status": geometry_status,
+        "half_amplitude_core_candidate_geometry_semantics": (
+            "discrete_producer_half_amplitude_core_vs_existing_candidate_depth_interval"
+        ),
+        "candidate_vertical_tolerance_m": vertical_tolerance_m,
+    }
+
+
+def _ofes_ha_build_geometry(
+    members: pd.DataFrame,
+    reassessment: pd.DataFrame,
+    profiles: pd.DataFrame,
+) -> pd.DataFrame:
+    """展开端点候选与成员像素，生成逐像素水平和垂向几何登记。"""
+    case_labels = _ofes_ha_validate_case_label_sets(members, reassessment)
+    profiles_by_id = profiles.set_index("profile_id", drop=False)
+    member_profiles = members.copy()
+    member_profiles["case_label"] = member_profiles["case_label"].astype(str)
+    member_profiles["profile_id"] = [
+        f"{row.case_label}_{int(row.source_lat_index):03d}_{int(row.source_lon_index):03d}"
+        for row in member_profiles.itertuples(index=False)
+    ]
+    candidate_rows = reassessment.copy()
+    candidate_rows["case_label"] = candidate_rows["case_label"].astype(str)
+    rows = []
+    for candidate in candidate_rows.itertuples(index=False):
+        candidate_series = pd.Series(candidate._asdict())
+        endpoint_members = member_profiles.loc[
+            member_profiles["case_label"].eq(candidate.case_label)
+        ]
+        for member in endpoint_members.itertuples(index=False):
+            profile = profiles_by_id.loc[member.profile_id]
+            geometry = _ofes_ha_core_candidate_geometry(candidate_series, profile)
+            horizontal_distance_km = float(
+                great_circle_distance_m(
+                    float(member.lon),
+                    float(member.lat),
+                    float(candidate.candidate_center_lon),
+                    float(candidate.candidate_center_lat),
+                )
+                / 1000.0
+            )
+            candidate_radius = float(candidate.candidate_radius_km)
+            horizontal_inside = bool(horizontal_distance_km <= candidate_radius)
+            peak_depth_inside = bool(
+                float(member.peak_depth)
+                >= float(candidate.candidate_shallow_m)
+                - _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M
+                and float(member.peak_depth)
+                <= float(candidate.candidate_deep_m)
+                + _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M
+            )
+            row = {
+                "variant_id": candidate.variant_id,
+                "case_label": str(candidate.case_label),
+                "endpoint_date": candidate.date,
+                "candidate_id": candidate.candidate_id,
+                "path_ids": candidate.path_ids,
+                "path_scope": (
+                    "complete_path_endpoint_candidate"
+                    if candidate.path_ids
+                    else "non_path_endpoint_candidate"
+                ),
+                "daily_object_key": candidate.daily_object_key,
+                "actual_event_id": candidate.actual_event_id,
+                "object_pixel_count": int(candidate.object_pixel_count),
+                "source_profile_id": member.profile_id,
+                "source_lat_index": int(member.source_lat_index),
+                "source_lon_index": int(member.source_lon_index),
+                "pixel_lat": float(member.lat),
+                "pixel_lon": float(member.lon),
+                "pixel_peak_depth_m": float(member.peak_depth),
+                "pixel_saved_half_amplitude_thickness_m": float(
+                    member.half_amplitude_thickness_m
+                ),
+                "recovered_core_shallow_edge_m": float(
+                    profile.core_shallow_edge_m
+                ),
+                "recovered_core_deep_edge_m": float(profile.core_deep_edge_m),
+                "recovered_core_thickness_m": float(profile.core_thickness_m),
+                "recovered_core_upper_boundary_status": profile.core_upper_boundary_status,
+                "recovered_core_lower_boundary_status": profile.core_lower_boundary_status,
+                "profile_recovery_status": profile.recovery_status,
+                "profile_reproduction_status": profile.reproduction_status,
+                "candidate_center_lon": float(candidate.candidate_center_lon),
+                "candidate_center_lat": float(candidate.candidate_center_lat),
+                "candidate_shallow_m": float(candidate.candidate_shallow_m),
+                "candidate_deep_m": float(candidate.candidate_deep_m),
+                "candidate_radius_km": candidate_radius,
+                "candidate_vertical_status": candidate.candidate_vertical_status,
+                "candidate_center_level_depth_m": float(candidate.candidate_level_depth_m),
+                "candidate_horizontal_distance_km": horizontal_distance_km,
+                "pixel_inside_candidate_horizontal_radius": horizontal_inside,
+                "pixel_peak_depth_inside_candidate_interval": peak_depth_inside,
+                "pixel_inside_candidate_envelope": bool(
+                    horizontal_inside and peak_depth_inside
+                ),
+                "peak_depth_interval_tolerance_m": _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+                "legacy_vertical_overlap_m": float(
+                    candidate.legacy_vertical_overlap_m
+                ),
+                "legacy_overlap_valid_as_oxygen_layer_overlap": bool(
+                    candidate.legacy_overlap_valid_as_oxygen_layer_overlap
+                ),
+                "oxygen_layer_overlap_m": np.nan,
+                "oxygen_layer_overlap_status": candidate.oxygen_layer_overlap_status,
+                "object_identity_status": candidate.object_identity_status,
+                "material_identity_status": candidate.material_identity_status,
+            }
+            row.update(geometry)
+            rows.append(row)
+    geometry = pd.DataFrame(rows)
+    member_case_labels = members['case_label'].astype(str)
+    reassessment_case_labels = reassessment['case_label'].astype(str)
+    expected = sum(
+        int(reassessment_case_labels.eq(label).sum())
+        * int(member_case_labels.eq(label).sum())
+        for label in sorted(case_labels)
+    )
+    if len(geometry) != expected:
+        raise ValueError(f"Expected {expected} per-pixel geometry rows, found {len(geometry)}.")
+    return geometry
+
+
+def _ofes_ha_status_counts(frame: pd.DataFrame, column: str) -> str:
+    """将指定状态列的计数稳定编码为 JSON 字符串。"""
+    counts = frame[column].astype(str).value_counts().sort_index().to_dict()
+    return json.dumps(counts, ensure_ascii=False, sort_keys=True)
+
+
+def _ofes_ha_build_endpoint_summary(geometry: pd.DataFrame) -> pd.DataFrame:
+    """按端点候选汇总逐像素支持和半振幅几何状态。"""
+    rows = []
+    group_columns = ["variant_id", "case_label", "candidate_id", "path_ids", "path_scope"]
+    for keys, group in geometry.groupby(group_columns, dropna=False, sort=True):
+        variant_id, case_label, candidate_id, path_ids, path_scope = keys
+        rows.append(
+            {
+                "variant_id": variant_id,
+                "case_label": case_label,
+                "candidate_id": candidate_id,
+                "path_ids": path_ids,
+                "path_scope": path_scope,
+                "member_row_count": int(len(group)),
+                "horizontal_member_support_count": int(
+                    group["pixel_inside_candidate_horizontal_radius"].sum()
+                ),
+                "peak_depth_inside_candidate_count": int(
+                    group["pixel_peak_depth_inside_candidate_interval"].sum()
+                ),
+                "peak_points_in_candidate_envelope_count": int(
+                    group["pixel_inside_candidate_envelope"].sum()
+                ),
+                "candidate_level_inside_core_count": int(
+                    group["candidate_level_inside_half_amplitude_core"].fillna(False).sum()
+                ),
+                "positive_length_overlap_count": int(
+                    group["half_amplitude_core_candidate_geometry_status"].eq(
+                        "positive_length_core_candidate_interval_overlap"
+                    ).sum()
+                ),
+                "boundary_contact_count": int(
+                    group["half_amplitude_core_candidate_geometry_status"].astype(str).str.contains(
+                        "boundary_contact"
+                    ).sum()
+                ),
+                "separated_count": int(
+                    group["half_amplitude_core_candidate_geometry_status"].astype(str).str.contains(
+                        "separated|outside_half_amplitude_core", regex=True
+                    ).sum()
+                ),
+                "unknown_count": int(
+                    group["half_amplitude_core_candidate_geometry_status"].eq(
+                        "unknown_profile_recovery"
+                    ).sum()
+                ),
+                "geometry_status_counts": _ofes_ha_status_counts(
+                    group, "half_amplitude_core_candidate_geometry_status"
+                ),
+                "candidate_level_boundary_status_counts": _ofes_ha_status_counts(
+                    group, "candidate_level_boundary_status"
+                ),
+                "oxygen_layer_overlap_status": "unknown_true_per_pixel_upper_lower_edges_not_saved",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ofes_ha_verify_peak_support_against_part1(
+    reassessment: pd.DataFrame,
+    endpoint_summary: pd.DataFrame,
+) -> dict:
+    """把新增峰点支持计数与端点对象配准表逐个端点组合逐值核对。
+
+    该检查是硬门：半振幅流程的峰深区间判定必须复用端点对象配准的共享容差，任何
+    组合的新旧峰点支持计数不一致都说明两侧口径分叉，直接抛错而不是记录。
+    """
+    key_columns = ["variant_id", "case_label", "candidate_id"]
+    metrics = [
+        "horizontal_member_support_count",
+        "peak_depth_inside_candidate_count",
+        "peak_points_in_candidate_envelope_count",
+    ]
+    part1 = reassessment[key_columns + metrics].copy()
+    new = endpoint_summary[key_columns + metrics].copy()
+    for name, frame in (("Part-1", part1), ("New", new)):
+        if frame.duplicated(key_columns).any():
+            raise ValueError(
+                f"{name} peak-support table is not unique by variant/case/candidate."
+            )
+    merged = part1.merge(
+        new,
+        on=key_columns,
+        how="outer",
+        validate="one_to_one",
+        suffixes=("_part1", "_new"),
+        indicator=True,
+    )
+    if not merged["_merge"].eq("both").all():
+        raise ValueError(
+            "Part-1 and new endpoint peak-support tables do not cover the same "
+            "combinations."
+        )
+    mismatches: dict[str, list] = {}
+    for metric in metrics:
+        part1_values = pd.to_numeric(merged[f"{metric}_part1"], errors="coerce")
+        new_values = pd.to_numeric(merged[f"{metric}_new"], errors="coerce")
+        disagree = merged.loc[part1_values.ne(new_values)]
+        if len(disagree):
+            mismatches[metric] = [
+                {
+                    "variant_id": row.variant_id,
+                    "case_label": row.case_label,
+                    "candidate_id": row.candidate_id,
+                    "part1": int(part1_values.loc[index]),
+                    "new": int(new_values.loc[index]),
+                }
+                for index, row in disagree.iterrows()
+            ]
+    if mismatches:
+        raise ValueError(
+            "New peak-point support counts disagree with the part-1 registration "
+            "table: " + json.dumps(_ofes_sc_jsonable(mismatches), ensure_ascii=False)
+        )
+    return {
+        "checked_endpoint_combination_count": int(len(merged)),
+        "shared_registration_depth_tolerance_m": _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+        "horizontal_member_support_count_agrees": True,
+        "peak_depth_inside_candidate_count_agrees": True,
+        "peak_points_in_candidate_envelope_count_agrees": True,
+    }
+
+
+def _ofes_ha_expand_path_ids(frame: pd.DataFrame) -> pd.DataFrame:
+    """将上游允许的分号连接 `path_ids` 展开为逐路径行。"""
+    expanded = frame.copy()
+    expanded['case_label'] = expanded['case_label'].astype(str)
+    expanded['path_id'] = expanded['path_ids'].fillna('').astype(str).map(
+        lambda value: [
+            path_id.strip()
+            for path_id in value.split(';')
+            if path_id.strip()
+        ]
+    )
+    expanded = expanded.explode('path_id', ignore_index=True)
+    return expanded.loc[
+        expanded['path_id'].notna() & expanded['path_id'].ne('')
+    ].copy()
+
+
+def _ofes_ha_build_path_summary(
+    reassessment: pd.DataFrame,
+    endpoint_summary: pd.DataFrame,
+    labels: list,
+) -> pd.DataFrame:
+    """按同一 `variant_id` + `path_id` 配对完整路径端点，保留全部分支。"""
+    labels = [str(label) for label in labels]
+    path_rows = _ofes_ha_expand_path_ids(reassessment)
+    endpoint_path_rows = _ofes_ha_expand_path_ids(endpoint_summary)
+    rows = []
+    for (variant_id, path_id), group in path_rows.groupby(
+        ['variant_id', 'path_id'], sort=True
+    ):
+        if set(group['case_label']) != set(labels) or len(group) != len(labels):
+            raise ValueError(
+                f'Path {variant_id}/{path_id} is not a same-variant '
+                f'{len(labels)}-endpoint pair.'
+            )
+        summary_rows = endpoint_path_rows.loc[
+            endpoint_path_rows['variant_id'].eq(variant_id)
+            & endpoint_path_rows['path_id'].eq(path_id)
+        ]
+        if (
+            set(summary_rows['case_label']) != set(labels)
+            or len(summary_rows) != len(labels)
+        ):
+            raise ValueError(
+                f'Missing endpoint geometry for path {variant_id}/{path_id}.'
+            )
+        summaries = summary_rows.set_index('case_label')
+        row = {
+            'variant_id': variant_id,
+            'path_id': path_id,
+            'path_pairing_status':
+                'same_variant_id_and_path_id_complete_endpoint_pair',
+        }
+        for label in labels:
+            summary = summaries.loc[label]
+            prefix = str(label).lower()
+            row.update(
+                {
+                    f'{prefix}_candidate_id': summary['candidate_id'],
+                    f'{prefix}_member_row_count': int(
+                        summary['member_row_count']
+                    ),
+                    f'{prefix}_candidate_level_inside_core_count': int(
+                        summary['candidate_level_inside_core_count']
+                    ),
+                    f'{prefix}_positive_length_overlap_count': int(
+                        summary['positive_length_overlap_count']
+                    ),
+                    f'{prefix}_boundary_contact_count': int(
+                        summary['boundary_contact_count']
+                    ),
+                    f'{prefix}_separated_count': int(summary['separated_count']),
+                    f'{prefix}_unknown_count': int(summary['unknown_count']),
+                    f'{prefix}_geometry_status_counts': summary[
+                        'geometry_status_counts'
+                    ],
+                    f'{prefix}_candidate_level_boundary_status_counts': summary[
+                        'candidate_level_boundary_status_counts'
+                    ],
+                }
+            )
+        rows.append(row)
+    columns = ['variant_id', 'path_id', 'path_pairing_status']
+    for label in labels:
+        prefix = label.lower()
+        columns.extend(
+            [
+                f'{prefix}_candidate_id',
+                f'{prefix}_member_row_count',
+                f'{prefix}_candidate_level_inside_core_count',
+                f'{prefix}_positive_length_overlap_count',
+                f'{prefix}_boundary_contact_count',
+                f'{prefix}_separated_count',
+                f'{prefix}_unknown_count',
+                f'{prefix}_geometry_status_counts',
+                f'{prefix}_candidate_level_boundary_status_counts',
+            ]
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _ofes_ha_endpoint_identity(case_spec: dict) -> dict[str, dict[str, str]]:
+    """将案例规格中的端点身份规范化为可比较的稳定映射。"""
+    identity = {}
+    for case in case_spec['cases']:
+        label = str(case['label'])
+        if label in identity:
+            raise ValueError(f'Duplicate endpoint case label: {label!r}.')
+        identity[label] = {
+            'date': pd.Timestamp(case['date']).normalize().isoformat(),
+            'event_id': str(case['event_id']),
+            'daily_object_key': str(case['daily_object_key']),
+        }
+    return identity
+
+
+def _ofes_ha_normalise_endpoint_identity(definitions: Any) -> dict:
+    """兼容旧版列表或字典格式的 manifest 端点身份。"""
+    if isinstance(definitions, Mapping):
+        entries = [(str(label), value) for label, value in definitions.items()]
+    elif isinstance(definitions, list):
+        entries = []
+        for value in definitions:
+            if not isinstance(value, Mapping) or 'label' not in value:
+                raise ValueError('Manifest endpoint definitions lack a label.')
+            entries.append((str(value['label']), value))
+    else:
+        raise ValueError('Manifest endpoint definitions have an unsupported format.')
+    identity = {}
+    for label, value in entries:
+        if not isinstance(value, Mapping):
+            raise ValueError(f'Manifest endpoint definition {label!r} is not a mapping.')
+        identity[label] = {
+            'date': pd.Timestamp(value['date']).normalize().isoformat(),
+            'event_id': str(value['event_id']),
+            'daily_object_key': str(value['daily_object_key']),
+        }
+    return identity
+
+
+def _ofes_ha_validate_output_identity(
+    output_root: Path,
+    case_spec: dict,
+) -> None:
+    """在写出前拒绝与已有案例身份不一致的输出目录。"""
+    if not output_root.exists():
+        return
+    if not output_root.is_dir():
+        raise ValueError(f'Output path is not a directory: {output_root}')
+    manifest_path = output_root / 'manifest.json'
+    if not manifest_path.exists():
+        if any(output_root.iterdir()):
+            raise ValueError(
+                f'Output directory exists without a manifest: {output_root}'
+            )
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f'Existing output manifest cannot be read: {manifest_path}'
+        ) from exc
+    expected_case_id = str(case_spec['case_id'])
+    existing_case_id = manifest.get('case_id')
+    if existing_case_id is None:
+        suffix = '_selected_half_amplitude_core_recovery'
+        analysis = str(manifest.get('analysis', ''))
+        if analysis.endswith(suffix):
+            existing_case_id = analysis[:-len(suffix)]
+    if str(existing_case_id) != expected_case_id:
+        raise ValueError(
+            f'Output directory case_id mismatch: existing={existing_case_id!r}, '
+            f'requested={expected_case_id!r}.'
+        )
+    definitions = manifest.get('fixed_endpoint_definitions')
+    if definitions is None:
+        definitions = manifest.get('endpoint_definitions')
+    try:
+        existing_identity = _ofes_ha_normalise_endpoint_identity(definitions)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f'Existing output manifest lacks valid endpoint identity: {manifest_path}'
+        ) from exc
+    expected_identity = _ofes_ha_endpoint_identity(case_spec)
+    if existing_identity != expected_identity:
+        raise ValueError(
+            'Output directory endpoint identity differs from the requested case.'
+        )
+    existing_detection_config = manifest.get('detection_config')
+    if existing_detection_config is not None:
+        if not isinstance(existing_detection_config, Mapping):
+            raise ValueError(
+                f'Existing output manifest has invalid detection config: {manifest_path}'
+            )
+        try:
+            existing_threshold_identity = _ofes_ha_detection_threshold_identity(
+                existing_detection_config['do_threshold']
+            )
+            expected_threshold_identity = _ofes_ha_detection_threshold_identity(
+                case_spec['do_threshold']
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f'Existing output manifest lacks valid detection threshold: {manifest_path}'
+            ) from exc
+        if existing_threshold_identity != expected_threshold_identity:
+            raise ValueError(
+                'Output directory detection threshold differs from the requested case.'
+            )
+
+
+def _ofes_ha_build_validation(
+    case_spec: dict,
+    members: pd.DataFrame,
+    reassessment: pd.DataFrame,
+    profiles: pd.DataFrame,
+    geometry: pd.DataFrame,
+    path_summary: pd.DataFrame,
+    peak_support_check: dict,
+    detection_config: DetectionConfig,
+    output_paths: Mapping[str, Path],
+) -> dict:
+    """构造半振幅几何验证记录，不执行文件写出。"""
+    labels = [str(case['label']) for case in case_spec['cases']]
+    case_id = str(case_spec['case_id'])
+    profile_reproduction = profiles['reproduction_status'].astype(str)
+    geometry_status = geometry[
+        'half_amplitude_core_candidate_geometry_status'
+    ].astype(str)
+    pairing_validation = (
+        'not_applicable'
+        if path_summary.empty
+        else bool(
+            path_summary['path_pairing_status'].eq(
+                'same_variant_id_and_path_id_complete_endpoint_pair'
+            ).all()
+        )
+    )
+    outputs = {
+        key: str(Path(path).resolve())
+        for key, path in output_paths.items()
+    }
+    return {
+        'status': 'passed',
+        'case_id': case_id,
+        'task_scope': 'endpoint_half_amplitude_core_geometry',
+        'native_profile_row_count': int(len(profiles)),
+        'endpoint_member_counts': {
+            label: int(members['case_label'].eq(label).sum())
+            for label in labels
+        },
+        'fixed_endpoint_event_and_object_identity_verified': True,
+        'source_indices_are_global_and_coordinate_checked': True,
+        'endpoint_combination_count': int(len(reassessment)),
+        'endpoint_combination_counts': {
+            label: int(reassessment['case_label'].eq(label).sum())
+            for label in labels
+        },
+        'geometry_row_count': int(len(geometry)),
+        'complete_path_endpoint_combination_count': int(
+            reassessment['path_ids'].ne('').sum()
+        ),
+        'non_path_endpoint_combination_count': int(
+            reassessment['path_ids'].eq('').sum()
+        ),
+        'complete_path_pair_count': int(len(path_summary)),
+        'complete_path_pairs_use_same_variant_and_path': pairing_validation,
+        'profile_recovery_status_counts': {
+            str(key): int(value)
+            for key, value in profiles['recovery_status'].value_counts().items()
+        },
+        'profile_reproduction_status_counts': {
+            str(key): int(value)
+            for key, value in profile_reproduction.value_counts().items()
+        },
+        'all_profiles_reproduced': bool(
+            profile_reproduction.eq(
+                'saved_peak_and_thickness_reproduced_within_float32_storage_tolerance'
+            ).all()
+        ),
+        'all_source_coordinates_match_saved_members': bool(
+            np.all(
+                np.maximum(
+                    profiles['source_coordinate_lat_difference_deg'].abs(),
+                    profiles['source_coordinate_lon_difference_deg'].abs(),
+                )
+                <= 3e-5
+            )
+        ),
+        'geometry_status_counts': {
+            str(key): int(value)
+            for key, value in geometry_status.value_counts().items()
+        },
+        'candidate_level_field_present': all(
+            column in geometry.columns
+            for column in (
+                'candidate_level_inside_half_amplitude_core',
+                'candidate_level_boundary_status',
+            )
+        ),
+        'detection_config': _ofes_ha_detection_config_record(detection_config),
+        'peak_depth_interval_tolerance_m': _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+        'peak_depth_interval_tolerance_source': (
+            'track._ofes_endpoint_object_registration.depth_tolerance_m_default'
+        ),
+        'part1_peak_support_agreement': peak_support_check,
+        'single_native_level_geometry_row_count': int(
+            geometry['candidate_native_level_count'].eq(1).sum()
+        ),
+        'single_native_level_inside_geometry_row_count': int(
+            geometry.loc[
+                geometry['candidate_native_level_count'].eq(1),
+                'candidate_level_inside_half_amplitude_core',
+            ].eq(True).sum()
+        ),
+        'single_native_level_inside_rows_not_classified_as_separated': bool(
+            not geometry.loc[
+                geometry['candidate_native_level_count'].eq(1)
+                & geometry['candidate_level_inside_half_amplitude_core'].eq(True),
+                'half_amplitude_core_candidate_geometry_status',
+            ].astype(str).str.contains('separated|outside', regex=True).any()
+        ),
+        'historical_oxygen_layer_overlap_remains_nan_unknown': bool(
+            geometry['oxygen_layer_overlap_m'].isna().all()
+            and geometry['oxygen_layer_overlap_status']
+            .astype(str)
+            .str.contains('unknown')
+            .all()
+        ),
+        'half_amplitude_thickness_not_used_as_boundary': True,
+        'peak_depth_plus_minus_half_thickness_not_used': True,
+        'peak_selection_changed': False,
+        'detector_rerun': False,
+        'candidate_search_rerun': False,
+        'path_search_rerun': False,
+        'particle_reintegration': False,
+        'source_members_path': str(Path(case_spec['inputs']['endpoint_members']).resolve()),
+        'source_reassessment_path': str(Path(case_spec['inputs']['endpoint_reassessment']).resolve()),
+        'outputs': outputs,
+    }
+
+
+def _ofes_ha_build_verdict(
+    case_spec: dict,
+    members: pd.DataFrame,
+    reassessment: pd.DataFrame,
+    profiles: pd.DataFrame,
+    geometry: pd.DataFrame,
+    path_summary: pd.DataFrame,
+    peak_support_check: dict,
+    detection_config: DetectionConfig,
+) -> str:
+    """构造半振幅几何审计的稳定中文裁决文本。"""
+    labels = [str(case['label']) for case in case_spec['cases']]
+    title = str(case_spec.get('title', case_spec['case_id']))
+    threshold_label = f"DO{_format_detection_value(detection_config.do_threshold)}"
+    member_text = '、'.join(
+        f"{label} {int(members['case_label'].eq(label).sum())} 个"
+        for label in labels
+    )
+    combination_text = ' + '.join(
+        f"{int(reassessment['case_label'].eq(label).sum())}×"
+        f"{int(members['case_label'].eq(label).sum())}"
+        for label in labels
+    )
+    return f"""# {title} 半振幅核边界恢复与几何配准裁决
+
+该入口处理 {len(members)} 个既有 {threshold_label} peak pixels（{member_text}）。按全局 source 索引仅切片读取相关日期的原生 DO 剖面；不重跑 detector、候选搜索、路径搜索或粒子积分。
+
+{int(profiles['recovery_status'].eq('recovered_producer_discrete_half_amplitude_core').sum())}/{len(profiles)} 条剖面按原 producer 定义恢复：原配置有效层掩码、固定已选 peak、原参考线端点、连续半振幅核，以及相邻原生层中点边缘。保存的 `delta_do`、`peak_depth` 和 `half_amplitude_thickness_m` 均在 float32 保存精度容差内复现。恢复的是离散半振幅核边缘，不是完整氧异常层边界；没有使用 `peak_depth ± thickness/2`。
+
+{len(reassessment)} 个既有端点候选—对象组合全部保留，展开为 {combination_text} = {len(geometry)} 条逐像素几何记录；其中 {int(reassessment['path_ids'].ne('').sum())} 个组合属于完整路径端点、{int(reassessment['path_ids'].eq('').sum())} 个不属于完整路径。完整路径只按同一 `variant_id + path_id` 配对，共 {len(path_summary)} 对，未跨分支拼接或挑选最有利分支。
+
+峰深是否落入候选区间，使用与端点对象配准**完全相同**的深度容差（`{_OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M:g} m`，直接取自共享 helper 的默认参数）。`horizontal_member_support_count`、`peak_depth_inside_candidate_count` 和 `peak_points_in_candidate_envelope_count` 已与端点对象配准表逐组合逐值核对，{peak_support_check['checked_endpoint_combination_count']} 个组合全部一致。
+
+新增指标只表示恢复半振幅核与既有候选垂向区间的近似几何关系，并分别记录正长度交集、边界接触、分离、单层候选的中心层是否落入核内和未知状态。历史 `oxygen_layer_overlap_m` 仍为 `NaN/unknown`；该结果不能证明整个氧异常层重叠、共同结构身份或材料连续性。
+
+结论范围是几何相容性审计，不进入 detector 间歇、补给/释放或机制解释。
+"""
+
+
+def _ofes_ha_build_manifest(
+    case_spec: dict,
+    profiles: pd.DataFrame,
+    detection_config: DetectionConfig,
+    validation: dict,
+) -> dict:
+    """构造半振幅几何审计 manifest，不执行文件写出。"""
+    case_id = str(case_spec['case_id'])
+    return {
+        'analysis': 'endpoint_half_amplitude_core_geometry',
+        'case_id': case_id,
+        'task_scope': 'endpoint_half_amplitude_core_geometry',
+        'created_at_utc': pd.Timestamp.now(tz='UTC'),
+        'input_paths': {
+            'endpoint_members': str(Path(case_spec['inputs']['endpoint_members']).resolve()),
+            'endpoint_reassessment': str(Path(case_spec['inputs']['endpoint_reassessment']).resolve()),
+            'candidate_table': str(Path(case_spec['inputs']['candidate_table']).resolve()),
+        },
+        'fixed_endpoint_definitions': case_spec['cases'],
+        'endpoint_identity': _ofes_ha_endpoint_identity(case_spec),
+        'native_profile_read': {
+            'profile_count': int(len(profiles)),
+            'variable': 'do2',
+            'read_mode': 'one_profile_by_global_source_lat_lon_index',
+            'full_day_3d_read': False,
+            'detector_recomputed': False,
+            'peak_selection_recomputed': False,
+        },
+        'detection_config': _ofes_ha_detection_config_record(detection_config),
+        'recovery_definition': {
+            'valid_mask': 'finite_and_do_greater_than_original_near_zero_threshold',
+            'reference_line': 'original_selected_peak_depth_plus_or_minus_original_depth_interval_on_valid_native_levels',
+            'core': 'contiguous_native_levels_from_fixed_peak_with_excess_at_least_half_peak_delta',
+            'edges': 'adjacent_native_layer_midpoints_or_reference_segment_native_edge',
+            'forbidden_proxy': 'peak_depth_plus_or_minus_half_amplitude_thickness',
+        },
+        'geometry_definition': {
+            'horizontal': 'great_circle_pixel_to_candidate_center_distance_vs_existing_candidate_radius',
+            'vertical': 'recovered_discrete_half_amplitude_core_vs_existing_candidate_interval',
+            'single_level_candidate': 'candidate_level_inside_and_boundary_status_are_reported_separately',
+            'historical_oxygen_layer_overlap': 'preserved_nan_unknown',
+        },
+        'shared_registration_depth_tolerance_m': _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+        'peak_depth_interval_tolerance_source': (
+            'track._ofes_endpoint_object_registration.depth_tolerance_m_default'
+        ),
+        'validation': validation,
+        'outputs': validation['outputs'],
+    }
+
+
+def _ofes_ha_write_outputs(
+    case_spec: dict,
+    output_root: Path,
+    members: pd.DataFrame,
+    reassessment: pd.DataFrame,
+    profiles: pd.DataFrame,
+    geometry: pd.DataFrame,
+    endpoint_summary: pd.DataFrame,
+    path_summary: pd.DataFrame,
+    detection_config: DetectionConfig,
+    peak_support_check: dict,
+) -> dict:
+    """写出半振幅几何 CSV、验证 JSON、裁决文本和 manifest。"""
+    output_root.mkdir(parents=True, exist_ok=True)
+    profiles_path = output_root / 'native_profile_recovery.csv'
+    geometry_path = output_root / 'half_amplitude_geometry_members.csv'
+    endpoint_summary_path = output_root / 'endpoint_geometry_summary.csv'
+    path_summary_path = output_root / 'path_endpoint_geometry.csv'
+    output_paths = {
+        'native_profiles': profiles_path,
+        'geometry_members': geometry_path,
+        'endpoint_summary': endpoint_summary_path,
+        'path_summary': path_summary_path,
+    }
+    profiles.to_csv(profiles_path, index=False)
+    geometry.to_csv(geometry_path, index=False)
+    endpoint_summary.to_csv(endpoint_summary_path, index=False)
+    path_summary.to_csv(path_summary_path, index=False)
+
+    validation = _ofes_ha_build_validation(
+        case_spec,
+        members,
+        reassessment,
+        profiles,
+        geometry,
+        path_summary,
+        peak_support_check,
+        detection_config,
+        output_paths,
+    )
+    validation_path = output_root / 'validation.json'
+    _ofes_atomic_write_json(validation, validation_path)
+
+    verdict = _ofes_ha_build_verdict(
+        case_spec,
+        members,
+        reassessment,
+        profiles,
+        geometry,
+        path_summary,
+        peak_support_check,
+        detection_config,
+    )
+    verdict_path = output_root / 'verdict_zh.md'
+    verdict_path.write_text(verdict, encoding='utf-8')
+
+    manifest = _ofes_ha_build_manifest(
+        case_spec,
+        profiles,
+        detection_config,
+        validation,
+    )
+    manifest_path = output_root / 'manifest.json'
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'profiles': profiles,
+        'geometry': geometry,
+        'endpoint_summary': endpoint_summary,
+        'path_summary': path_summary,
+        'validation': validation,
+        'verdict_path': verdict_path,
+        'manifest_path': manifest_path,
+    }
+
+
+def build_ofes_half_amplitude_core_registration(
+    case_spec: dict,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """恢复指定案例端点峰像素的 producer 半振幅核，并登记与既有候选的几何关系。
+
+    流程按原 producer 定义读取每个真实峰像素的**原生单剖面**，恢复固定已选 peak 的
+    连续半振幅核与相邻原生层中点边缘，再把这些核与既有候选的垂向区间、以及像素到
+    候选中心的水平距离逐一登记。全程不重跑 detector、候选搜索、路径搜索或粒子积分，
+    也不使用 `peak_depth ± half_amplitude_thickness` 反推边界。
+
+    参数:
+        - case_spec (dict): 案例规格，须含 `case_id`、`do_threshold`、`cases`、`inputs`；未传 `output_dir` 时还须含 `output_dir`，可选 `title`。
+        - output_dir (str | Path | None): 覆盖 `case_spec['output_dir']` 的输出目录；省略时该字段必需。
+
+    返回:
+        - dict: 含 `profiles`、`geometry`、`endpoint_summary`、`path_summary`、`validation`、`verdict_path` 与 `manifest_path`。
+
+    输出:
+        - `<output_root>/native_profile_recovery.csv`、`half_amplitude_geometry_members.csv`、
+          `endpoint_geometry_summary.csv`、`path_endpoint_geometry.csv`、
+          `validation.json`、`manifest.json` 与 `verdict_zh.md`。
+
+    说明:
+        - 恢复的是离散半振幅核边缘，**不是**完整氧异常层边界；历史
+          `oxygen_layer_overlap_m` 保持 `NaN/unknown`。
+        - 峰深是否落入候选区间复用端点对象配准的共享深度容差。
+        - 完整路径端点只按同一 `variant_id` + `path_id` 配对，全部分支保留；
+          零路径与多路径都形成正常结果。
+        - 历史回归期望（固定行数、每端点像素数）不在本入口校验，由针对旧案例的
+          回归验证单独承担。
+    """
+    if output_dir is None and not case_spec.get('output_dir'):
+        raise ValueError(
+            'case_spec must declare output_dir, or pass output_dir explicitly.'
+        )
+    output_root = Path(output_dir or case_spec['output_dir'])
+    detection_config = _ofes_ha_resolve_detection_config(case_spec)
+    _ofes_ha_validate_output_identity(output_root, case_spec)
+    members, reassessment = _ofes_ha_load_inputs(case_spec, detection_config)
+    profiles = _ofes_ha_recover_native_profiles(members, detection_config)
+    geometry = _ofes_ha_build_geometry(members, reassessment, profiles)
+    endpoint_summary = _ofes_ha_build_endpoint_summary(geometry)
+    peak_support_check = _ofes_ha_verify_peak_support_against_part1(
+        reassessment, endpoint_summary
+    )
+    path_summary = _ofes_ha_build_path_summary(
+        reassessment,
+        endpoint_summary,
+        [str(case['label']) for case in case_spec['cases']],
+    )
+    return _ofes_ha_write_outputs(
+        case_spec,
+        output_root,
+        members,
+        reassessment,
+        profiles,
+        geometry,
+        endpoint_summary,
+        path_summary,
+        detection_config,
+        peak_support_check,
+    )
+
+
+def load_ofes_half_amplitude_core_registration(
+    output_dir: str | Path,
+) -> dict:
+    """读取已完成的半振幅核几何登记输出，不访问原生场或重新计算。
+
+    该轻量读取器核对正式产物的分析标识、端点身份和完成状态，然后读取剖面恢复、
+    逐像素几何、端点汇总、路径端点汇总及中文裁决。它只消费 producer 已保存的
+    表格和 JSON/Markdown 文件，适合在 Notebook 中展示已验收结果。
+
+    参数:
+        - output_dir (str | pathlib.Path): 已完成的半振幅核几何登记目录。
+
+    返回:
+        - dict: 含 `manifest`、`validation`、四张结果表、`case_identity`、`complete`
+          和 `verdict` 的读取结果。
+
+    输出:
+        - 无文件输出；读取器不会修改 output_dir。
+
+    说明:
+        - 必需文件缺失、分析标识不符、端点身份不完整或验证未完成时直接报错。
+        - `profiles`、`geometry`、`endpoint_summary` 和 `path_summary` 是对应结果表的
+          便捷别名；读取器不读取 OFES native profile 或其他上游场文件。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(
+            f'Half-amplitude output is not a directory: {root}'
+        )
+    required_paths = {
+        'manifest': root / 'manifest.json',
+        'validation': root / 'validation.json',
+        'native_profile_recovery': root / 'native_profile_recovery.csv',
+        'half_amplitude_geometry_members': (
+            root / 'half_amplitude_geometry_members.csv'
+        ),
+        'endpoint_geometry_summary': root / 'endpoint_geometry_summary.csv',
+        'path_endpoint_geometry': root / 'path_endpoint_geometry.csv',
+        'verdict': root / 'verdict_zh.md',
+    }
+    missing = [
+        name for name, path in required_paths.items() if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'Half-amplitude output lacks required files: {missing}'
+        )
+    try:
+        manifest = json.loads(
+            required_paths['manifest'].read_text(encoding='utf-8')
+        )
+        validation = json.loads(
+            required_paths['validation'].read_text(encoding='utf-8')
+        )
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            f'Half-amplitude manifest or validation is unreadable: {root}'
+        ) from exc
+    if not isinstance(manifest, Mapping) or not isinstance(validation, Mapping):
+        raise ValueError('Half-amplitude manifest and validation must be mappings.')
+    analysis = str(manifest.get('analysis', ''))
+    suffix = '_selected_half_amplitude_core_recovery'
+    if not analysis.endswith(suffix):
+        raise ValueError(
+            'Unexpected half-amplitude analysis identity: '
+            f'{analysis!r}'
+        )
+    definitions = manifest.get('fixed_endpoint_definitions')
+    if definitions is None:
+        definitions = manifest.get('endpoint_definitions')
+    try:
+        case_identity = _ofes_ha_normalise_endpoint_identity(definitions)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            'Half-amplitude manifest lacks valid fixed endpoint identity.'
+        ) from exc
+    if len(case_identity) < 2:
+        raise ValueError(
+            'Half-amplitude manifest must contain at least two endpoint identities.'
+        )
+    case_id = str(manifest.get('case_id') or analysis[:-len(suffix)]).strip()
+    if not case_id:
+        raise ValueError('Half-amplitude manifest lacks a case identity.')
+    validation_status = str(validation.get('status', '')).lower()
+    complete_value = validation.get('complete')
+    if complete_value is not None and not isinstance(complete_value, bool):
+        raise ValueError('Half-amplitude validation complete flag is not boolean.')
+    complete = (
+        complete_value is True
+        if complete_value is not None
+        else validation_status in {'passed', 'complete'}
+    )
+    manifest_validation = manifest.get('validation')
+    if manifest_validation is not None:
+        if not isinstance(manifest_validation, Mapping):
+            raise ValueError('Half-amplitude manifest validation is invalid.')
+        manifest_status = str(manifest_validation.get('status', '')).lower()
+        if manifest_status and manifest_status not in {'passed', 'complete'}:
+            raise ValueError(
+                f'Half-amplitude manifest validation is not complete: {manifest_status}'
+            )
+        manifest_complete = manifest_validation.get('complete')
+        if manifest_complete is not None and not isinstance(manifest_complete, bool):
+            raise ValueError(
+                'Half-amplitude manifest validation complete flag is not boolean.'
+            )
+        if manifest_complete is False:
+            complete = False
+    if not complete:
+        raise ValueError(
+            'Half-amplitude output validation is incomplete or failed: '
+            f'{root}'
+        )
+    profiles = pd.read_csv(required_paths['native_profile_recovery'])
+    geometry = pd.read_csv(required_paths['half_amplitude_geometry_members'])
+    endpoint_summary = pd.read_csv(required_paths['endpoint_geometry_summary'])
+    path_summary = pd.read_csv(required_paths['path_endpoint_geometry'])
+    expected_profiles = validation.get('native_profile_row_count')
+    if expected_profiles is not None and int(expected_profiles) != len(profiles):
+        raise ValueError('Half-amplitude native profile row count does not match validation.')
+    expected_geometry = validation.get('geometry_row_count')
+    if expected_geometry is not None and int(expected_geometry) != len(geometry):
+        raise ValueError('Half-amplitude geometry row count does not match validation.')
+    verdict = required_paths['verdict'].read_text(encoding='utf-8')
+    return {
+        'output_dir': root,
+        'analysis': analysis,
+        'case_id': case_id,
+        'case_identity': case_identity,
+        'complete': complete,
+        'manifest': dict(manifest),
+        'validation': dict(validation),
+        'native_profile_recovery': profiles,
+        'half_amplitude_geometry_members': geometry,
+        'endpoint_geometry_summary': endpoint_summary,
+        'path_endpoint_geometry': path_summary,
+        'profiles': profiles,
+        'geometry': geometry,
+        'endpoint_summary': endpoint_summary,
+        'path_summary': path_summary,
+        'verdict': verdict,
+        'verdict_path': required_paths['verdict'],
+    }
