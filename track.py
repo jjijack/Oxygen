@@ -91757,7 +91757,6 @@ def build_ofes_half_amplitude_core_registration(
         peak_support_check,
     )
 
-
 def load_ofes_half_amplitude_core_registration(
     output_dir: str | Path,
 ) -> dict:
@@ -91901,3 +91900,2573 @@ def load_ofes_half_amplitude_core_registration(
         'verdict': verdict,
         'verdict_path': required_paths['verdict'],
     }
+
+
+def _ofes_dual_endpoint_distance_km(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """按 (lat, lon) 顺序计算两点大圆距离（km）。"""
+    distance_km = float(
+        great_circle_distance_m(
+            np.asarray([float(lon1)], dtype=float),
+            np.asarray([float(lat1)], dtype=float),
+            float(lon2),
+            float(lat2),
+        )[0]
+        / 1000.0
+    )
+    earth_radius_m = 6371000.0
+    lat1_rad = np.radians(float(lat1))
+    lat2_rad = np.radians(float(lat2))
+    delta_lat = lat2_rad - lat1_rad
+    delta_lon = np.radians(
+        float(_minimal_lon_diff_deg(float(lon2), float(lon1)))
+    )
+    haversine_a = (
+        np.sin(delta_lat / 2.0) ** 2
+        + np.cos(lat1_rad)
+        * np.cos(lat2_rad)
+        * np.sin(delta_lon / 2.0) ** 2
+    )
+    haversine_km = float(
+        earth_radius_m
+        * 2.0
+        * np.arcsin(np.sqrt(np.minimum(1.0, haversine_a)))
+        / 1000.0
+    )
+    if abs(distance_km - haversine_km) > 0.05:
+        raise ValueError(
+            'OFES dual-endpoint distance helper failed its independent '
+            f'haversine check: {distance_km:.9f} vs {haversine_km:.9f} km.'
+        )
+    return distance_km
+
+
+def _ofes_dual_endpoint_bearing_deg(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """计算从第一点到第二点的初始方位角（度，正北为 0，顺时针）。"""
+    lat_a = np.radians(float(lat1))
+    lat_b = np.radians(float(lat2))
+    delta_lon = np.radians(float(lon2) - float(lon1))
+    east = np.sin(delta_lon) * np.cos(lat_b)
+    north = np.cos(lat_a) * np.sin(lat_b) - np.sin(lat_a) * np.cos(
+        lat_b
+    ) * np.cos(delta_lon)
+    return float((np.degrees(np.arctan2(east, north)) + 360.0) % 360.0)
+
+
+def _ofes_dual_endpoint_offset_point(
+    lat: float,
+    lon: float,
+    distance_km: float,
+    bearing_deg: float,
+) -> tuple[float, float]:
+    """按局地经纬度尺度把方位角与距离换算成目标点，用于构造候选环带。"""
+    scale = approximate_degree_length(float(lat))
+    delta_lat = float(distance_km) * 1000.0 / float(
+        scale['meters_per_degree_lat']
+    )
+    delta_lon = float(distance_km) * 1000.0 / float(
+        scale['meters_per_degree_lon']
+    )
+    bearing = np.radians(float(bearing_deg))
+    return (
+        float(lat + delta_lat * np.cos(bearing)),
+        float(lon + delta_lon * np.sin(bearing)),
+    )
+
+
+def _ofes_dual_endpoint_build_target_support(
+    members_path: str | Path,
+    recovery_path: str | Path,
+) -> pd.DataFrame:
+    """合并端点峰成员表与原生剖面恢复表，得到逐像素的目标支撑。
+
+    峰成员表提供每个真实峰像素的水平位置与全局索引，原生剖面恢复表提供同一像素
+    恢复出的 producer 离散半振幅核上下界。两者按
+    `daily_object_key` 与 `lat_index` / `lon_index` 一对一合并，缺核边缘即视为
+    目标支撑不完整并直接报错——不允许回退到整体深度区间。
+
+    参数:
+        - members_path (str | Path): 端点峰成员 CSV 路径。
+        - recovery_path (str | Path): 原生剖面恢复 CSV 路径。
+
+    返回:
+        - pd.DataFrame: 逐像素目标支撑，含位置、索引、峰深与
+          `core_shallow_edge_m` / `core_deep_edge_m` / `core_thickness_m`。
+
+    说明:
+        - 返回的核上下界是**逐像素**的，不同像素的核边可以不同；任何判定都不得
+          用全体像素的极值区间代替。
+    """
+    members = pd.read_csv(members_path)
+    recovery = pd.read_csv(recovery_path)
+    recovery_columns = recovery[
+        [
+            'daily_object_key',
+            'source_lat_index',
+            'source_lon_index',
+            'core_shallow_edge_m',
+            'core_deep_edge_m',
+            'core_thickness_m',
+        ]
+    ].rename(
+        columns={
+            'source_lat_index': 'lat_index',
+            'source_lon_index': 'lon_index',
+        }
+    )
+    merged = members.merge(
+        recovery_columns,
+        on=['daily_object_key', 'lat_index', 'lon_index'],
+        how='left',
+        validate='one_to_one',
+    )
+    if merged['core_shallow_edge_m'].isna().any():
+        raise RuntimeError(
+            'OFES dual-endpoint target support is missing per-pixel '
+            'half-amplitude core edges.'
+        )
+    return merged
+
+
+def _ofes_dual_endpoint_attach_cell_bounds(
+    support: pd.DataFrame,
+    grid_cell_size_deg: float,
+) -> pd.DataFrame:
+    """为目标支撑追加每个像素自身的水平单元边界。
+
+    参数:
+        - support (pd.DataFrame): `_ofes_dual_endpoint_build_target_support` 的输出。
+        - grid_cell_size_deg (float): 网格纬向步长（度）；经向按同一数值处理。
+
+    返回:
+        - pd.DataFrame: 追加 `cell_lat_min` / `cell_lat_max` /
+          `cell_lon_min` / `cell_lon_max` 四列后的副本。
+
+    说明:
+        - 像素单元取像元中心 ± 半格；等效半径等汇总量**不得**代替该单元参与判定。
+    """
+    output = support.copy()
+    half = float(grid_cell_size_deg) / 2.0
+    output['cell_lat_min'] = output['lat'] - half
+    output['cell_lat_max'] = output['lat'] + half
+    output['cell_lon_min'] = output['lon'] - half
+    output['cell_lon_max'] = output['lon'] + half
+    return output
+
+
+def _ofes_dual_endpoint_register_arrival(
+    group: str,
+    arm: str,
+    seeds: np.ndarray,
+    result: dict,
+    target_cells: pd.DataFrame,
+    depth_tolerance_m: float = _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+) -> pd.DataFrame:
+    """把积分终点逐粒子登记到对侧端点对象的逐像素目标支撑上。
+
+    到达定义为：终点时刻粒子水平位置落在某个目标像素**自身的单元**内，且终点深度落在
+    **该像素自己的半振幅核上下界**内（按共享容差放宽）。非 active 粒子保留其状态，
+    不得静默计为未到达。
+
+    参数:
+        - group (str): 分组标签，写入登记表的 `group` 列。
+        - arm (str): 臂标签，写入登记表的 `arm` 列。
+        - seeds (np.ndarray): 种子位置 (N, 3)，列顺序 [depth, lat, lon]。
+        - result (dict): `advect_ofes_particles` 的返回，取其 `positions` 与 `final_status`。
+        - target_cells (pd.DataFrame): 已追加单元边界的目标支撑。
+        - depth_tolerance_m (float): 核上下界的共享容差（米）。
+
+    返回:
+        - pd.DataFrame: 逐粒子终点登记，含终点深度/经纬度、`final_status`、
+          `arrived`、`matched_pixel_index`、水平与垂直判定标志，以及到目标质心的距离。
+
+    说明:
+        - 到达判定是逐像素三维支撑：水平落在某像素自身单元内**且**深度落在该像素
+          自己的核内，只检查同时满足两者的像素。
+        - 多个像素同时满足时，按 `(lat_index, lon_index)` 字典序取第一个作为命中记录，
+          因此结果**不随目标表行序变化**；同时记录水平候选数与支撑像素数。
+        - `final_status` 非 `active` 的粒子终点记 NaN 且 `arrived = 0`；
+          其中状态为 `active` 但终点非有限的矛盾输入单独记为 `nonfinite_endpoint`，
+          必须在汇总中单独计数，**不得**进入有效粒子分母。
+    """
+    positions = np.asarray(result['positions'], dtype=float)
+    final_positions = positions[-1]
+    final_status = np.asarray(result['final_status'])
+    target_lat = target_cells['lat'].to_numpy(dtype=float)
+    target_lon = target_cells['lon'].to_numpy(dtype=float)
+    lat_min = target_cells['cell_lat_min'].to_numpy(dtype=float)
+    lat_max = target_cells['cell_lat_max'].to_numpy(dtype=float)
+    lon_min = target_cells['cell_lon_min'].to_numpy(dtype=float)
+    lon_max = target_cells['cell_lon_max'].to_numpy(dtype=float)
+    shallow = target_cells['core_shallow_edge_m'].to_numpy(dtype=float)
+    deep = target_cells['core_deep_edge_m'].to_numpy(dtype=float)
+    pixel_lat_index = target_cells['lat_index'].to_numpy(dtype=np.int64)
+    pixel_lon_index = target_cells['lon_index'].to_numpy(dtype=np.int64)
+    centroid_lat = float(target_lat.mean())
+    centroid_lon = float(target_lon.mean())
+    tolerance = float(depth_tolerance_m)
+    rows = []
+    for index in range(final_positions.shape[0]):
+        status = str(final_status[index])
+        depth, lat, lon = final_positions[index]
+        base = {
+            'group': group,
+            'arm': arm,
+            'particle_index': index,
+            'seed_depth_m': float(seeds[index, 0]),
+            'seed_lat': float(seeds[index, 1]),
+            'seed_lon': float(seeds[index, 2]),
+        }
+        if status == 'active' and not np.all(np.isfinite(final_positions[index])):
+            status = 'nonfinite_endpoint'
+        if status != 'active':
+            rows.append(
+                {
+                    **base,
+                    'final_depth_m': np.nan,
+                    'final_lat': np.nan,
+                    'final_lon': np.nan,
+                    'final_status': status,
+                    'arrived': 0,
+                    'matched_pixel_index': -1,
+                    'matched_pixel_lat_index': -1,
+                    'matched_pixel_lon_index': -1,
+                    'horizontal_inside_any_pixel': 0,
+                    'vertical_inside_matched_core': 0,
+                    'horizontal_candidate_pixel_count': 0,
+                    'supported_pixel_count': 0,
+                    'distance_to_target_centroid_km': np.nan,
+                }
+            )
+            continue
+        horizontal = (
+            (lat >= lat_min)
+            & (lat <= lat_max)
+            & (lon >= lon_min)
+            & (lon <= lon_max)
+        )
+        vertical = (depth >= shallow - tolerance) & (
+            depth <= deep + tolerance
+        )
+        supported = horizontal & vertical
+        matched = -1
+        if supported.any():
+            candidates = np.flatnonzero(supported)
+            order = np.lexsort(
+                (
+                    pixel_lon_index[candidates],
+                    pixel_lat_index[candidates],
+                )
+            )
+            matched = int(candidates[order[0]])
+        rows.append(
+            {
+                **base,
+                'final_depth_m': float(depth),
+                'final_lat': float(lat),
+                'final_lon': float(lon),
+                'final_status': status,
+                'arrived': int(matched >= 0),
+                'matched_pixel_index': matched,
+                'matched_pixel_lat_index': (
+                    int(pixel_lat_index[matched]) if matched >= 0 else -1
+                ),
+                'matched_pixel_lon_index': (
+                    int(pixel_lon_index[matched]) if matched >= 0 else -1
+                ),
+                'horizontal_inside_any_pixel': int(horizontal.any()),
+                'vertical_inside_matched_core': int(matched >= 0),
+                'horizontal_candidate_pixel_count': int(horizontal.sum()),
+                'supported_pixel_count': int(supported.sum()),
+                'distance_to_target_centroid_km': _ofes_dual_endpoint_distance_km(
+                    lat, lon, centroid_lat, centroid_lon
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ofes_dual_endpoint_summarize_groups(
+    particles: pd.DataFrame,
+    minimum_active_fraction: float = 0.75,
+) -> pd.DataFrame:
+    """按臂与分组统计种子、有效、退出、无效与到达数，并显式给出比例分母。
+
+    参数:
+        - particles (pd.DataFrame): `_ofes_dual_endpoint_register_arrival` 的合并结果。
+        - minimum_active_fraction (float): 有效粒子占种子数的最低比例门槛。
+
+    返回:
+        - pd.DataFrame: 每组一行，含 `seed_count`、`final_active_count`、
+          `escaped_count`、`invalid_count`、`arrived_count`、三种比例与
+          `arrival_denominator`。
+
+    说明:
+        - 主到达比例的分母是**终点有效粒子数**；退出、无效与
+          `nonfinite_endpoint` 单独计数，不得并入"未到达"后按种子数取比例。
+        - `nonfinite_endpoint_count` 记录状态为 `active` 但终点位置非有限的矛盾输入，
+          与 `escaped_count` / `invalid_count` 一样**不得**进入有效粒子分母。
+        - 这里的比例是**种子计数比例**，不是输送体积或氧通量。
+    """
+    rows = []
+    for (arm, group), subset in particles.groupby(['arm', 'group'], sort=True):
+        seed_count = int(len(subset))
+        active = int((subset['final_status'] == 'active').sum())
+        escaped = int((subset['final_status'] == 'escaped').sum())
+        invalid = int((subset['final_status'] == 'invalid').sum())
+        nonfinite = int(
+            (subset['final_status'] == 'nonfinite_endpoint').sum()
+        )
+        other = seed_count - active - escaped - invalid - nonfinite
+        arrived = int(subset['arrived'].sum())
+        rows.append(
+            {
+                'arm': arm,
+                'group': group,
+                'seed_count': seed_count,
+                'final_active_count': active,
+                'escaped_count': escaped,
+                'invalid_count': invalid,
+                'nonfinite_endpoint_count': nonfinite,
+                'other_status_count': other,
+                'arrived_count': arrived,
+                'active_fraction_of_seeds': round(active / seed_count, 6),
+                'arrival_fraction_of_active': (
+                    round(arrived / active, 6) if active else None
+                ),
+                'arrival_fraction_of_seeds': round(arrived / seed_count, 6),
+                'arrival_denominator': 'final_active_count',
+                'active_fraction_meets_minimum': bool(
+                    active / seed_count >= float(minimum_active_fraction)
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ofes_dual_endpoint_select_controls(
+    object_pixels: pd.DataFrame,
+    target_pixels: pd.DataFrame,
+    release_date: str | pd.Timestamp,
+    arm: str,
+    seed_depth_m: float,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """按预注册的可比性准则筛选背景对照种子，并给出完整候选审计。
+
+    候选取自以目标质心为中心、半径落在端点间距 ±`distance_band_fraction` 的环带，
+    逐条判定距离带、方位、等密度、流速比、流向一致性、是否落在对象足迹外、
+    以及是否存在同号强 DO / spice 指纹；全部通过者按 `abs_sigma0_difference`、
+    方位差与候选序排序后取前 `len(object_pixels)` 个。
+
+    参数:
+        - object_pixels (pd.DataFrame): 该臂的对象真实峰像素。
+        - target_pixels (pd.DataFrame): 该臂的目标真实峰像素。
+        - release_date (str | pd.Timestamp): 对照的释放日期，与对象臂同日。
+        - arm (str): 臂标签。
+        - seed_depth_m (float): 对照的释放深度（米）。
+        - settings (dict): 预注册准则，键含 `distance_band_fraction`、
+          `bearing_tolerance_deg`、`sigma0_max_difference`、`` `speed_ratio_min` ``、
+          `` `speed_ratio_max` ``、`direction_dot_min`、`exclusion_radius_km`、
+          `same_sign_do_max`、`same_sign_spice_max`、`radius_step_km`、
+          `azimuth_step_deg`、`background_inner_km`、`background_outer_km`。
+
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame, dict]: 选中的对照、全部候选审计与
+          本次筛选的汇总（含 `control_status`）。
+
+    说明:
+        - 合格候选不足时返回的 `control_status` 为 `no_qualified_control`，
+          选中集合可能少于所需数量；调用方**不得**放宽准则后重新挑选。
+        - 筛选只看释放日的几何与水文，不涉及任何轨迹结果；也**不得**在看到
+          对照去向后再按结果重选。
+    """
+    object_lat = float(object_pixels['lat'].mean())
+    object_lon = float(object_pixels['lon'].mean())
+    target_lat = float(target_pixels['lat'].mean())
+    target_lon = float(target_pixels['lon'].mean())
+    separation_km = _ofes_dual_endpoint_distance_km(
+        object_lat, object_lon, target_lat, target_lon
+    )
+    reference_bearing = _ofes_dual_endpoint_bearing_deg(
+        object_lat, object_lon, target_lat, target_lon
+    )
+    band = float(settings['distance_band_fraction'])
+    load_radius_km = separation_km * (1.0 + band) + 60.0
+    scale = approximate_degree_length(0.5 * (object_lat + target_lat))
+    lon_margin = load_radius_km * 1000.0 / float(
+        scale['meters_per_degree_lon']
+    )
+    lat_margin = load_radius_km * 1000.0 / float(
+        scale['meters_per_degree_lat']
+    )
+    snapshot = load_ofes_snapshot(
+        release_date,
+        variables=['do2', 'temp', 'salinity', 'u', 'v'],
+        lon_bounds=(
+            min(object_lon, target_lon) - lon_margin,
+            max(object_lon, target_lon) + lon_margin,
+        ),
+        lat_bounds=(
+            min(object_lat, target_lat) - lat_margin,
+            max(object_lat, target_lat) + lat_margin,
+        ),
+        depth_bounds=None,
+    )
+    depth_axis = np.asarray(snapshot['depth'], dtype=float)
+    level = int(np.argmin(np.abs(depth_axis - float(seed_depth_m))))
+    lat_axis = np.asarray(snapshot['lat'], dtype=float)
+    lon_axis = np.asarray(snapshot['lon'], dtype=float)
+
+    radii = np.arange(
+        separation_km * (1.0 - band),
+        separation_km * (1.0 + band) + 1e-9,
+        float(settings['radius_step_km']),
+    )
+    azimuths = np.arange(
+        0.0, 360.0, float(settings['azimuth_step_deg'])
+    )
+    candidate_lat = []
+    candidate_lon = []
+    for radius in radii:
+        for azimuth in azimuths:
+            lat_i, lon_i = _ofes_dual_endpoint_offset_point(
+                target_lat, target_lon, float(radius), float(azimuth)
+            )
+            candidate_lat.append(lat_i)
+            candidate_lon.append(lon_i)
+    candidate_lat = np.asarray(candidate_lat, dtype=float)
+    candidate_lon = np.asarray(candidate_lon, dtype=float)
+
+    candidate_profiles = _ofes_ventilation_profile_samples(
+        snapshot, candidate_lon, candidate_lat
+    )
+    object_profiles = _ofes_ventilation_profile_samples(
+        snapshot,
+        object_pixels['lon'].to_numpy(dtype=float),
+        object_pixels['lat'].to_numpy(dtype=float),
+    )
+
+    def level_value(profiles: dict, key: str) -> np.ndarray:
+        return np.asarray(profiles[key], dtype=float)[:, level]
+
+    candidate_sigma = level_value(candidate_profiles, 'sigma0')
+    candidate_do = level_value(candidate_profiles, 'do2')
+    candidate_spice = level_value(candidate_profiles, 'spiciness0')
+    object_sigma = float(np.mean(level_value(object_profiles, 'sigma0')))
+    object_do = float(np.mean(level_value(object_profiles, 'do2')))
+    object_spice = float(np.mean(level_value(object_profiles, 'spiciness0')))
+
+    u_values = np.asarray(snapshot['u'], dtype=float)
+    v_values = np.asarray(snapshot['v'], dtype=float)
+
+    def flow_at(lat: float, lon: float) -> tuple[float, float]:
+        row = int(np.argmin(np.abs(lat_axis - lat)))
+        column = int(np.argmin(np.abs(lon_axis - lon)))
+        return (
+            float(u_values[level, row, column]),
+            float(v_values[level, row, column]),
+        )
+
+    object_u, object_v = flow_at(object_lat, object_lon)
+    object_speed = float(np.hypot(object_u, object_v))
+    if object_speed > 0:
+        object_direction = np.array([object_u, object_v]) / object_speed
+    else:
+        object_direction = np.array([np.nan, np.nan])
+
+    background = _ofes_trajectory_tracer_background(
+        snapshot,
+        object_lon,
+        object_lat,
+        {
+            'background_inner_radius_km': float(
+                settings['background_inner_km']
+            ),
+            'background_outer_radius_km': float(
+                settings['background_outer_km']
+            ),
+        },
+    )
+    background_profiles = background['profiles']
+    background_sigma = np.asarray(background['sigma0'], dtype=float)
+    background_depth = np.asarray(background['depth'], dtype=float)
+    background_index = int(np.argmin(np.abs(background_sigma - object_sigma)))
+
+    def background_value(key: str) -> float:
+        if not isinstance(background_profiles, dict):
+            return np.nan
+        if key == 'spiciness0':
+            theta = float(
+                np.asarray(background_profiles['theta'], dtype=float)[
+                    background_index
+                ]
+            )
+            salinity = float(
+                np.asarray(background_profiles['salinity'], dtype=float)[
+                    background_index
+                ]
+            )
+            pressure = gsw.p_from_z(
+                -float(background_depth[background_index]), object_lat
+            )
+            absolute_salinity = gsw.SA_from_SP(
+                salinity, pressure, object_lon, object_lat
+            )
+            conservative = gsw.CT_from_pt(absolute_salinity, theta)
+            return float(gsw.spiciness0(absolute_salinity, conservative))
+        return float(
+            np.asarray(background_profiles[key], dtype=float)[
+                background_index
+            ]
+        )
+
+    background_do = background_value('do2')
+    background_spice = background_value('spiciness0')
+    object_do_contrast = object_do - background_do
+    object_spice_contrast = object_spice - background_spice
+
+    records = []
+    for index in range(candidate_lat.size):
+        lat_i = float(candidate_lat[index])
+        lon_i = float(candidate_lon[index])
+        distance_to_target = _ofes_dual_endpoint_distance_km(
+            lat_i, lon_i, target_lat, target_lon
+        )
+        bearing = _ofes_dual_endpoint_bearing_deg(
+            lat_i, lon_i, target_lat, target_lon
+        )
+        bearing_difference = abs(
+            (bearing - reference_bearing + 180.0) % 360.0 - 180.0
+        )
+        distance_to_object = float(
+            np.min(
+                great_circle_distance_m(
+                    object_pixels['lon'].to_numpy(dtype=float),
+                    object_pixels['lat'].to_numpy(dtype=float),
+                    lon_i,
+                    lat_i,
+                )
+                / 1000.0
+            )
+        )
+        speed_u, speed_v = flow_at(lat_i, lon_i)
+        speed = float(np.hypot(speed_u, speed_v))
+        ratio = speed / object_speed if object_speed > 0 else np.nan
+        if speed > 0:
+            dot = float(
+                np.dot(np.array([speed_u, speed_v]) / speed, object_direction)
+            )
+        else:
+            dot = np.nan
+        do_contrast = float(candidate_do[index]) - background_do
+        spice_contrast = float(candidate_spice[index]) - background_spice
+        same_sign_do = bool(
+            np.sign(do_contrast) == np.sign(object_do_contrast)
+            and abs(do_contrast) > float(settings['same_sign_do_max'])
+        )
+        same_sign_spice = bool(
+            np.sign(spice_contrast) == np.sign(object_spice_contrast)
+            and abs(spice_contrast) > float(settings['same_sign_spice_max'])
+        )
+        records.append(
+            {
+                'arm': arm,
+                'release_date': str(pd.Timestamp(release_date).date()),
+                'candidate_index': index,
+                'lat': lat_i,
+                'lon': lon_i,
+                'depth_m': float(seed_depth_m),
+                'sigma0': float(candidate_sigma[index]),
+                'sigma0_object': object_sigma,
+                'abs_sigma0_difference': abs(
+                    float(candidate_sigma[index]) - object_sigma
+                ),
+                'distance_to_target_km': distance_to_target,
+                'bearing_to_target_deg': bearing,
+                'reference_bearing_deg': reference_bearing,
+                'abs_bearing_difference_deg': bearing_difference,
+                'distance_to_object_km': distance_to_object,
+                'speed_m_s': speed,
+                'object_speed_m_s': object_speed,
+                'speed_ratio': ratio,
+                'direction_dot': dot,
+                'do_contrast_vs_background': do_contrast,
+                'spice_contrast_vs_background': spice_contrast,
+                'pass_distance_band': bool(
+                    separation_km * (1.0 - band) - 1e-6
+                    <= distance_to_target
+                    <= separation_km * (1.0 + band) + 1e-6
+                ),
+                'pass_bearing': bool(
+                    bearing_difference
+                    <= float(settings['bearing_tolerance_deg'])
+                ),
+                'pass_sigma0': bool(
+                    abs(float(candidate_sigma[index]) - object_sigma)
+                    <= float(settings['sigma0_max_difference'])
+                ),
+                'pass_speed': bool(
+                    np.isfinite(ratio)
+                    and float(settings['speed_ratio_min'])
+                    <= ratio
+                    <= float(settings['speed_ratio_max'])
+                ),
+                'pass_direction': bool(
+                    np.isfinite(dot)
+                    and dot >= float(settings['direction_dot_min'])
+                ),
+                'pass_outside_object': bool(
+                    distance_to_object
+                    >= float(settings['exclusion_radius_km'])
+                ),
+                'pass_no_same_sign_fingerprint': bool(
+                    not same_sign_do and not same_sign_spice
+                ),
+            }
+        )
+    audit = pd.DataFrame(records)
+    audit['pass_all'] = (
+        audit['pass_distance_band']
+        & audit['pass_bearing']
+        & audit['pass_sigma0']
+        & audit['pass_speed']
+        & audit['pass_direction']
+        & audit['pass_outside_object']
+        & audit['pass_no_same_sign_fingerprint']
+    )
+    qualified = audit[audit['pass_all']].copy().sort_values(
+        ['abs_sigma0_difference', 'abs_bearing_difference_deg', 'candidate_index']
+    ).reset_index(drop=True)
+    required = int(len(object_pixels))
+    qualified['selected'] = False
+    qualified.loc[qualified.index[:required], 'selected'] = True
+    qualified['selection_rank'] = qualified.index + 1
+    summary = {
+        'arm': arm,
+        'release_date': str(pd.Timestamp(release_date).date()),
+        'endpoint_separation_km': separation_km,
+        'reference_bearing_deg': reference_bearing,
+        'candidate_count': int(len(audit)),
+        'qualified_count': int(audit['pass_all'].sum()),
+        'required_count': required,
+        'selected_count': int(qualified['selected'].sum()),
+        'control_status': (
+            'qualified'
+            if int(qualified['selected'].sum()) == required
+            else 'no_qualified_control'
+        ),
+        'object_sigma0': object_sigma,
+        'object_do_contrast': object_do_contrast,
+        'object_spice_contrast': object_spice_contrast,
+        'background_do': background_do,
+        'background_spice': background_spice,
+    }
+    return qualified[qualified['selected']].copy(), audit, summary
+
+
+def _ofes_dual_endpoint_check_pixel_core_boundary(
+    target_cells: pd.DataFrame,
+    depth_tolerance_m: float = _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+) -> dict:
+    """用有区分力的合成位置检验到达判定是否真的使用逐像素核上下界。
+
+    对每个核边界互不相同且可构造反例的目标像素，在像元中心放置四个合成位置：
+    核上界之上、核下界之下（两者都仍落在全体像素的极值区间内，因此误用统一区间的
+    实现会把它们判为核内）、核内中点（正对照），以及水平移出像元的位置（水平负对照）。
+
+    参数:
+        - target_cells (pd.DataFrame): 已追加单元边界的目标支撑。
+        - depth_tolerance_m (float): 与到达判定相同的共享容差（米）。
+
+    返回:
+        - dict: 含逐条用例、期望与实际、`global_core_range_m` 与 `passed`。
+
+    说明:
+        - 该检查是唯一能区分"逐像素核边界"与"统一深度区间"的验证：
+          实际到达记录的深度可能全部落在各核的共同交集内，故仅凭终点记录无法区分。
+        - 若某个像素无法在全局极值区间内构造反例，则跳过该像素并在
+          `skipped_pixel_count` 中计数。
+    """
+    shallow_all = float(target_cells['core_shallow_edge_m'].min())
+    deep_all = float(target_cells['core_deep_edge_m'].max())
+    offset_m = 10.0
+    cell_size_deg = float(
+        target_cells['cell_lat_max'].iloc[0]
+        - target_cells['cell_lat_min'].iloc[0]
+    )
+    outside_lat = float(
+        target_cells['cell_lat_max'].max() + 2.0 * cell_size_deg
+    )
+    cases = []
+    skipped = 0
+    distinct = target_cells[
+        ['core_shallow_edge_m', 'core_deep_edge_m']
+    ].drop_duplicates()
+    for _, edges in distinct.iterrows():
+        shallow = float(edges['core_shallow_edge_m'])
+        deep = float(edges['core_deep_edge_m'])
+        pixel = target_cells[
+            target_cells['core_shallow_edge_m'].eq(shallow)
+            & target_cells['core_deep_edge_m'].eq(deep)
+        ].iloc[0]
+        lat = float(pixel['lat'])
+        lon = float(pixel['lon'])
+        midpoint = 0.5 * (shallow + deep)
+        probes = []
+        if shallow - offset_m >= shallow_all:
+            probes.append(
+                (
+                    'above_core_still_in_global_range',
+                    shallow - offset_m,
+                    lat,
+                    lon,
+                    0,
+                )
+            )
+        if deep + offset_m <= deep_all:
+            probes.append(
+                (
+                    'below_core_still_in_global_range',
+                    deep + offset_m,
+                    lat,
+                    lon,
+                    0,
+                )
+            )
+        probes.append(
+            ('inside_own_core_positive_control', midpoint, lat, lon, 1)
+        )
+        probes.append(
+            (
+                'outside_all_pixel_cells_horizontal_control',
+                midpoint,
+                outside_lat,
+                lon,
+                0,
+            )
+        )
+        for label, depth, probe_lat, probe_lon, expected in probes:
+            seeds = np.array([[depth, probe_lat, probe_lon]], dtype=float)
+            synthetic = {
+                'positions': np.array(
+                    [[[depth, probe_lat, probe_lon]]], dtype=float
+                ),
+                'final_status': np.array(['active'], dtype=object),
+            }
+            registered = _ofes_dual_endpoint_register_arrival(
+                'boundary_check',
+                'synthetic',
+                seeds,
+                synthetic,
+                target_cells,
+                depth_tolerance_m=depth_tolerance_m,
+            )
+            row = registered.iloc[0]
+            cases.append(
+                {
+                    'case': label,
+                    'pixel_lat_index': int(pixel['lat_index']),
+                    'pixel_lon_index': int(pixel['lon_index']),
+                    'pixel_core_shallow_edge_m': shallow,
+                    'pixel_core_deep_edge_m': deep,
+                    'probe_depth_m': float(depth),
+                    'probe_lat': float(probe_lat),
+                    'probe_lon': float(probe_lon),
+                    'horizontal_inside_any_pixel': int(
+                        row['horizontal_inside_any_pixel']
+                    ),
+                    'vertical_inside_matched_core': int(
+                        row['vertical_inside_matched_core']
+                    ),
+                    'arrived': int(row['arrived']),
+                    'expected_arrived': int(expected),
+                    'passed': bool(int(row['arrived']) == int(expected)),
+                }
+            )
+        if not any('still_in_global_range' in probe[0] for probe in probes):
+            skipped += 1
+    discriminating = [
+        case
+        for case in cases
+        if 'still_in_global_range' in case['case']
+    ]
+    return {
+        'global_core_range_m': [shallow_all, deep_all],
+        'case_count': len(cases),
+        'discriminating_case_count': len(discriminating),
+        'skipped_pixel_count': skipped,
+        'cases': cases,
+        'passed': bool(discriminating)
+        and all(case['passed'] for case in cases),
+        'note': (
+            '反例深度刻意落在全体像素核区间的极值范围内，'
+            '因此误用统一深度区间的实现会在这些用例上判为核内而被本检查识别。'
+        ),
+    }
+
+
+def _ofes_vertical_velocity_validation_status(
+    output_dir: str | Path | None = None,
+) -> dict:
+    """读取既有的 OFES `w` 数据集验证结果，不触发重新验证。
+
+    三维轨迹要求每个快照携带已通过的 `w` 验证标记。本函数只读取
+    `validate_ofes_vertical_velocity` 已经写出的 manifest，供轨迹入口在放行三维
+    积分之前核对结果；它不会运行验证，也不会补写标记。
+
+    参数:
+        - output_dir (str | Path | None): 输出根目录；None 时使用 OFES 共享输出树。
+
+    返回:
+        - dict: 含 `run_dir`、`manifest_path`、`status`、`validation_passed`、
+          `completed_dates` 与 `total_dates`。
+
+    说明:
+        - manifest 缺失、未完成或未通过时直接报错；调用方**不得**据此静默放行三维积分。
+        - 需先运行 `validate_ofes_vertical_velocity` 生成结果，再调用本函数。
+    """
+    settings = _ofes_vertical_velocity_validation_settings(None)
+    run_dir = _ofes_analysis_output_path(
+        settings['output_subdir'], output_dir
+    )
+    manifest_path = Path(run_dir) / 'manifest.json'
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            'OFES vertical velocity validation manifest is missing at '
+            f'{manifest_path}; run validate_ofes_vertical_velocity first.'
+        )
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    status = manifest.get('status')
+    passed = manifest.get('validation_passed')
+    if status != 'complete':
+        raise RuntimeError(
+            'OFES vertical velocity validation is not complete '
+            f'(status={status!r}); three-dimensional integration refused.'
+        )
+    if passed is not True:
+        raise RuntimeError(
+            'OFES vertical velocity validation did not pass '
+            f'(validation_passed={passed!r}); three-dimensional '
+            'integration refused.'
+        )
+    return {
+        'run_dir': run_dir,
+        'manifest_path': manifest_path,
+        'status': status,
+        'validation_passed': True,
+        'completed_dates': manifest.get('completed_dates'),
+        'total_dates': manifest.get('total_dates'),
+    }
+
+
+def _ofes_dual_endpoint_build_verdict(
+    settings: dict,
+    summary: pd.DataFrame,
+    arrival_verification: pd.DataFrame,
+    arrival_summary: dict,
+    validation: dict,
+    boundary: dict,
+    freeze_record: dict | None = None,
+) -> str:
+    """构造双端点积分的稳定中文裁决，限定在数值连接与实现核对范围内。"""
+    group_lines = []
+    for row in summary.itertuples(index=False):
+        arrival_fraction = row.arrival_fraction_of_active
+        arrival_fraction_text = (
+            'n/a'
+            if pd.isna(arrival_fraction)
+            else f'{float(arrival_fraction):.4f}'
+        )
+        group_lines.append(
+            f'| {row.arm} | {row.group} | {row.seed_count} | '
+            f'{row.final_active_count} | {row.escaped_count} | '
+            f'{row.invalid_count} | {row.arrived_count} | '
+            f'{arrival_fraction_text} |'
+        )
+    arm_lines = []
+    for arm, arm_settings in settings['arms'].items():
+        count = int(
+            arrival_verification.loc[
+                arrival_verification['arm'].eq(arm)
+            ].shape[0]
+        )
+        arm_lines.append(
+            f'- {arm}：{arm_settings["source_object_key"]} -> '
+            f'{arm_settings["target_object_key"]}，积分到达记录 {count} 条。'
+        )
+    timestep = validation['timestep']
+    reversibility = validation['reversibility']
+    boundary_passed = all(
+        bool(value['passed']) for value in boundary.values()
+    )
+    freeze_by_arm = {
+        str(item['arm']): item
+        for item in (freeze_record or {}).get('arms', [])
+        if isinstance(item, Mapping) and 'arm' in item
+    }
+    interpretation_lines = []
+    for arm in settings['arms']:
+        control_status = str(
+            freeze_by_arm.get(arm, {}).get('control_status', 'not_recorded')
+        )
+        if control_status == 'no_qualified_control':
+            interpretation_lines.append(
+                f'- {arm}：C1 为 `no_qualified_control`，不作目标特异性判定。'
+            )
+            continue
+        object_rows = summary.loc[
+            summary['arm'].eq(arm) & summary['group'].eq('object_seed')
+        ]
+        control_rows = summary.loc[
+            summary['arm'].eq(arm)
+            & summary['group'].eq('c1_background_control')
+        ]
+        if len(object_rows) == 1 and len(control_rows) == 1:
+            object_row = object_rows.iloc[0]
+            control_row = control_rows.iloc[0]
+            interpretation_lines.append(
+                f'- {arm}：对象臂 {int(object_row["arrived_count"])} / '
+                f'{int(object_row["seed_count"])}，C1 {int(control_row["arrived_count"])} / '
+                f'{int(control_row["seed_count"])}；仅作描述性差异，不作目标特异性结论。'
+            )
+        else:
+            interpretation_lines.append(
+                f'- {arm}：C1 状态为 `{control_status}`；仅作当前设置下的描述性记录。'
+            )
+    return f"""# {settings['title']}：数值连接审计
+
+本产物由冻结的 C1 对照名单驱动正式积分。对象臂与对照臂只表示当前 OFES
+解析流场和释放设置下的种子计数结果，不构成独立重复、材料同一性或氧通量证据。
+
+## 设置
+
+- 积分窗口：{settings['start_date']:%Y-%m-%d} -> {settings['end_date']:%Y-%m-%d}，
+  {settings['integration_days']} 个积分日、{settings['integration_days'] + 1} 个日历快照。
+- 释放深度：{settings['seed_depth_m']:.5f} m；基础步长：{settings['base_dt_seconds']:g} s。
+- 到达判定：终点时刻同时落入目标真实像素单元和该像素自己的半振幅核，
+  深度容差 {settings['depth_tolerance_m']:g} m。
+- 本试验不选择候选路径分支；目标只由两端对象像素支撑定义；完整氧层重叠仍为未知，未由半振幅核边缘替代。
+
+## 结果
+
+| arm | group | seeds | active | escaped | invalid | arrived | arrived/active |
+|---|---|---:|---:|---:|---:|---:|---:|
+{chr(10).join(group_lines)}
+
+{chr(10).join(arm_lines)}
+
+到达比例分母是终点有效粒子数；结果是种子计数比例，不是输送体积或氧通量。
+
+## 科学解释边界
+
+{chr(10).join(interpretation_lines)}
+
+- C2 固定深度对照同样出现到达时，只能说明到达现象不足以支持潜沉解释；到达数量相近不代表相同粒子或相同路径，不能据此推出“三维连接不依赖垂向速度”。
+- 两臂共享同一解析流场与数值设置，不构成独立证据。
+
+## 验证
+
+- w 数据集验证标记全部通过：
+  {validation['w_validation']['all_snapshots_carry_passed_flag']}。
+- 步长敏感性：{json.dumps(timestep, ensure_ascii=False, default=str)}。
+- 可逆性：{json.dumps(reversibility, ensure_ascii=False, default=str)}。
+- 逐像素边界检查通过：{boundary_passed}。
+- 到达分类在声明的步长集合下稳定：
+  {arrival_summary['arrival_classification_stable_across_dt']}；
+  到达记录 {arrival_summary['arrival_record_count']} 条。
+
+这些检查支持数值稳定性、目标像素归属和实现一致性；不证明材料连续、
+目标特异性、潜沉机制或真实 detector-off。
+"""
+
+
+def build_ofes_dual_endpoint_control_freeze(
+    case_spec: dict,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """冻结双端点 C1 背景对照名单和全部候选审计。
+
+    该 producer 只读取端点对象峰像素、原生半振幅核和释放日 OFES 场，按案例规格中
+    已声明的距离、方位、等密度、流速、流向、对象排除和示踪指纹准则筛选对照。
+    正式积分 producer 只消费本函数写出的冻结名单，不在看到轨迹结果后重新选取对照。
+
+    参数:
+        - case_spec (dict): Notebook 提供的双端点案例规格，包含身份、输入、控制准则、积分窗口与输出目录。
+        - output_dir (str | Path | None): 覆盖案例规格输出目录的临时或正式目录。
+
+    返回:
+        - dict: 含冻结名单、候选审计、每臂汇总、冻结记录和输出路径。
+
+    输出:
+        - output_dir/control_c1_frozen.csv、control_c1_candidate_audit.csv、control_c1_freeze_record.json 与 control_c1_freeze_manifest.json。
+
+    说明:
+        - 本阶段不读取轨迹结果，也不执行粒子积分。
+        - 合格对照不足时保留 no_qualified_control，不得放宽准则补齐数量。
+    """
+    settings = _ofes_dual_endpoint_case_settings(case_spec, output_dir)
+    _ofes_dual_endpoint_validate_output_identity(
+        settings['output_dir'],
+        settings,
+        stage='freeze',
+    )
+    support, _, objects, _ = _ofes_dual_endpoint_load_support(settings)
+    selected = []
+    audits = []
+    summaries = []
+    for arm, arm_settings in settings['arms'].items():
+        target_pixels = support.loc[
+            support['daily_object_key'].astype(str).eq(
+                arm_settings['target_object_key']
+            )
+        ].reset_index(drop=True)
+        chosen, audit, summary = _ofes_dual_endpoint_select_controls(
+            objects[arm],
+            target_pixels,
+            arm_settings['release_date'],
+            arm,
+            settings['seed_depth_m'],
+            settings['control_settings'],
+        )
+        chosen = chosen.copy()
+        chosen['group'] = 'c1_background_control'
+        selected.append(chosen)
+        audits.append(audit)
+        summaries.append(summary)
+    return _ofes_dual_endpoint_write_freeze_outputs(
+        settings,
+        selected,
+        audits,
+        summaries,
+    )
+
+
+def build_ofes_dual_endpoint_connection(
+    case_spec: dict,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """消费冻结 C1 名单并执行双端点对象、对照和固定深度积分审计。
+
+    本 producer 读取案例规格声明的窗口、释放方向、种子深度和验证门槛，消费冻结阶段
+    写出的 C1 名单，运行对象种子、合格 C1 对照和附加 C2 固定深度对照。它登记逐粒子
+    终点、目标像素自身半振幅核、到达分类稳定性、步长敏感性、可逆性与逐像素边界反例。
+
+    参数:
+        - case_spec (dict): Notebook 提供的双端点案例规格，包含冻结输入、积分设置、验证门槛和输出目录。
+        - output_dir (str | Path | None): 覆盖案例规格输出目录的临时或正式目录。
+
+    返回:
+        - dict: 含逐粒子登记、各臂各组汇总、到达核对、验证记录、边界检查、裁决文本和输出路径。
+
+    输出:
+        - output_dir/particle_endpoint_registration.csv、group_summary.csv、arrival_verification.csv、
+          arrival_classification_stability.csv、validation.json、pixel_core_boundary_check.json、
+          verdict_zh.md 与 manifest.json。
+
+    说明:
+        - 若冻结名单不存在或冻结记录的案例身份不匹配，直接拒绝积分。
+        - 正式积分不重新筛选 C1；本试验不选择候选路径分支，未到达、退出、无效状态均保留。
+        - 到达结果是解析平流下的种子计数事实，不升级为材料连续或机制结论。
+    """
+    settings = _ofes_dual_endpoint_case_settings(case_spec, output_dir)
+    _ofes_dual_endpoint_validate_output_identity(
+        settings['output_dir'],
+        settings,
+        stage='connection',
+    )
+    freeze_paths = {
+        'frozen': settings['output_dir'] / 'control_c1_frozen.csv',
+        'record': settings['output_dir'] / 'control_c1_freeze_record.json',
+    }
+    if not freeze_paths['frozen'].exists() or not freeze_paths['record'].exists():
+        raise FileNotFoundError(
+            'Run build_ofes_dual_endpoint_control_freeze before the '
+            f'formal integration: {settings["output_dir"]}'
+        )
+    frozen = pd.read_csv(freeze_paths['frozen'])
+    freeze_record = json.loads(
+        freeze_paths['record'].read_text(encoding='utf-8')
+    )
+    if 'case_id' not in freeze_record:
+        raise ValueError('Frozen control record lacks case_id.')
+    if str(freeze_record['case_id']) != settings['case_id']:
+        raise ValueError('Frozen control record belongs to a different case.')
+    expected_identity = _ofes_dual_endpoint_case_identity(settings)
+    if _ofes_sc_jsonable(freeze_record.get('case_identity')) != _ofes_sc_jsonable(
+        expected_identity
+    ):
+        raise ValueError(
+            'Frozen control record does not match the declared endpoint identities.'
+        )
+    if _ofes_sc_jsonable(freeze_record.get('criteria')) != _ofes_sc_jsonable(
+        settings['control_settings']
+    ):
+        raise ValueError(
+            'Frozen control record does not match the declared control criteria.'
+        )
+    if float(freeze_record.get('seed_depth_m')) != settings['seed_depth_m']:
+        raise ValueError(
+            'Frozen control record does not match the declared seed depth.'
+        )
+    actual_members = _ofes_dual_endpoint_selected_member_records(frozen)
+    frozen_selected = _ofes_dual_endpoint_bool_series(
+        frozen['selected'],
+        'selected',
+    )
+    recorded_members = freeze_record.get('selected_members')
+    if not isinstance(recorded_members, list):
+        raise ValueError('Frozen control record lacks selected_members.')
+    if _ofes_sc_jsonable(recorded_members) != _ofes_sc_jsonable(actual_members):
+        raise ValueError(
+            'Frozen control CSV members do not match the freeze record.'
+        )
+    for member in actual_members:
+        arm_settings = settings['arms'].get(member['arm'])
+        if arm_settings is None:
+            raise ValueError(
+                f'Frozen control member uses an undeclared arm: {member["arm"]!r}.'
+            )
+        if member['release_date'] != arm_settings['release_date'].date().isoformat():
+            raise ValueError(
+                'Frozen control member release_date does not match its arm.'
+            )
+        if not np.isclose(
+            member['depth_m'],
+            settings['seed_depth_m'],
+            rtol=0.0,
+            atol=_OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M,
+        ):
+            raise ValueError(
+                'Frozen control member depth does not match the declared seed depth.'
+            )
+    if not isinstance(freeze_record.get('arms'), list):
+        raise ValueError('Frozen control record lacks arm summaries.')
+    recorded_arms = {
+        str(item.get('arm'))
+        for item in freeze_record['arms']
+        if isinstance(item, Mapping) and 'arm' in item
+    }
+    if recorded_arms != set(settings['arms']):
+        raise ValueError(
+            'Frozen control record arm summaries do not match the declared arms.'
+        )
+    control_status = {
+        str(item['arm']): str(item['control_status'])
+        for item in freeze_record['arms']
+    }
+    required_by_arm = {
+        str(item['arm']): int(item['required_count'])
+        for item in freeze_record['arms']
+    }
+    support, target_info, objects, grid_cell_size_deg = (
+        _ofes_dual_endpoint_load_support(settings)
+    )
+    targets = target_info['targets']
+    snapshots = _ofes_dual_endpoint_load_snapshots(settings, support)
+    groups = []
+    object_payloads = {}
+    for arm, arm_settings in settings['arms'].items():
+        backward = arm_settings['backward']
+        target = targets[arm]
+        object_seeds = _ofes_dual_endpoint_seed_array(
+            objects[arm],
+            settings['seed_depth_m'],
+        )
+        object_payloads[arm] = {
+            'seeds': object_seeds,
+            'backward': backward,
+        }
+        groups.append(
+            (
+                arm,
+                'object_seed',
+                {
+                    'seeds': object_seeds,
+                    'backward': backward,
+                    'target': target,
+                },
+            )
+        )
+        control = frozen.loc[
+            frozen['arm'].astype(str).eq(arm)
+            & frozen_selected
+        ].reset_index(drop=True)
+        if (
+            control_status.get(arm) == 'qualified'
+            and len(control) == required_by_arm[arm]
+        ):
+            groups.append(
+                (
+                    arm,
+                    'c1_background_control',
+                    {
+                        'seeds': _ofes_dual_endpoint_seed_array(
+                            control,
+                            settings['seed_depth_m'],
+                        ),
+                        'backward': backward,
+                        'target': target,
+                    },
+                )
+            )
+        groups.append(
+            (
+                arm,
+                'c2_fixed_depth_control',
+                {
+                    'seeds': object_seeds,
+                    'backward': backward,
+                    'target': target,
+                    'vertical_mode': 'fixed_depth',
+                },
+            )
+        )
+    particle_frames = []
+    for arm, group, payload in groups:
+        result = advect_ofes_particles(
+            snapshots,
+            payload['seeds'],
+            backward=payload['backward'],
+            dt_seconds=settings['base_dt_seconds'],
+            temporal_interpolation='linear',
+            vertical_mode=payload.get('vertical_mode', 'three_dimensional'),
+        )
+        particle_frames.append(
+            _ofes_dual_endpoint_register_arrival(
+                group,
+                arm,
+                payload['seeds'],
+                result,
+                payload['target'],
+                depth_tolerance_m=settings['depth_tolerance_m'],
+            )
+        )
+    particles = pd.concat(particle_frames, ignore_index=True)
+    summary = _ofes_dual_endpoint_summarize_groups(
+        particles,
+        minimum_active_fraction=settings['minimum_active_fraction'],
+    )
+    summary['scope'] = [
+        (
+            'addendum_this_round_beyond_approved_first_batch'
+            if row.group == 'c2_fixed_depth_control'
+            else 'approved_first_batch'
+        )
+        for row in summary.itertuples(index=False)
+    ]
+    boundary = {
+        arm: _ofes_dual_endpoint_check_pixel_core_boundary(
+            targets[arm],
+            depth_tolerance_m=settings['depth_tolerance_m'],
+        )
+        for arm in settings['arms']
+    }
+    validation = _ofes_dual_endpoint_run_validation(
+        snapshots,
+        object_payloads,
+        settings,
+    )
+    arrival_verification = _ofes_dual_endpoint_build_arrival_verification(
+        particles,
+        objects,
+        targets,
+        settings,
+        grid_cell_size_deg,
+    )
+    arrival_stability = _ofes_dual_endpoint_build_arrival_stability(
+        snapshots,
+        objects,
+        targets,
+        settings,
+    )
+    stable = bool(
+        arrival_stability['arrival_classification_stable'].astype(bool).all()
+    )
+    arrival_summary = {
+        'generated_at': pd.Timestamp.now().isoformat(timespec='seconds'),
+        'arrival_record_count': int(len(arrival_verification)),
+        'arrival_records_by_arm': {
+            arm: int(arrival_verification['arm'].eq(arm).sum())
+            for arm in settings['arms']
+        },
+        'all_horizontal_uses_real_pixel_cell': bool(
+            not arrival_verification.empty
+            and
+            arrival_verification[
+                'horizontal_uses_real_pixel_cell'
+            ].astype(bool).all()
+        ),
+        'all_vertical_uses_matched_pixel_own_core': bool(
+            not arrival_verification.empty
+            and
+            arrival_verification[
+                'vertical_uses_matched_pixel_own_core'
+            ].astype(bool).all()
+        ),
+        'grid_cell_size_deg': grid_cell_size_deg,
+        'depth_tolerance_m': settings['depth_tolerance_m'],
+        'arrival_classification_stable_across_dt': stable,
+        'dt_seconds': list(settings['sensitivity_dt_seconds']),
+        'scope_note': (
+            'c2_fixed_depth_control 为本轮附加分析，超出首批批准范围（A、B 与合格 C1）；'
+            '不据此自动展开其他敏感性。'
+        ),
+    }
+    return _ofes_dual_endpoint_write_verification_outputs(
+        settings,
+        particles,
+        summary,
+        arrival_verification,
+        arrival_summary,
+        arrival_stability,
+        boundary,
+        validation,
+        {
+            'control_freeze': {
+                'freeze_record': freeze_record,
+                'frozen_control_path': str(freeze_paths['frozen'].resolve()),
+            },
+        },
+    )
+
+
+def load_ofes_dual_endpoint_connection(
+    output_dir: str | Path,
+) -> dict:
+    """读取已验收的双端点连接输出，不重放粒子或读取原生场。
+
+    该轻量读取器核对正式产物的分析标识、案例端点身份和完成状态，然后读取逐粒子
+    登记、组汇总、到达核对、步长稳定性、像元半振幅核边界检查、验证 JSON、manifest
+    和中文裁决。它只消费连接 producer 已保存的文件，供 Notebook 展示验收结果。
+
+    参数:
+        - output_dir (str | pathlib.Path): 已完成的双端点连接输出目录。
+
+    返回:
+        - dict: 含 `manifest`、`validation`、四张结果表、一项边界 JSON 检查、
+          `case_identity`、`complete` 和 `verdict` 的读取结果。
+
+    输出:
+        - 无文件输出；读取器不会修改 output_dir。
+
+    说明:
+        - 必需文件缺失、分析或案例身份不一致、任何正式验证门失败时直接报错。
+        - 读取范围固定为登记、汇总、验证和裁决文件，不读取 OFES native snapshots，
+          也不消费其他旧 canonical 输出目录。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(
+            f'Dual-endpoint output is not a directory: {root}'
+        )
+    required_paths = {
+        'particle_endpoint_registration': (
+            root / 'particle_endpoint_registration.csv'
+        ),
+        'group_summary': root / 'group_summary.csv',
+        'arrival_verification': root / 'arrival_verification.csv',
+        'arrival_classification_stability': (
+            root / 'arrival_classification_stability.csv'
+        ),
+        'pixel_core_boundary_check': root / 'pixel_core_boundary_check.json',
+        'validation': root / 'validation.json',
+        'manifest': root / 'manifest.json',
+        'verdict': root / 'verdict_zh.md',
+    }
+    missing = [
+        name for name, path in required_paths.items() if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'Dual-endpoint output lacks required files: {missing}'
+        )
+    try:
+        manifest = json.loads(
+            required_paths['manifest'].read_text(encoding='utf-8')
+        )
+        validation = json.loads(
+            required_paths['validation'].read_text(encoding='utf-8')
+        )
+        boundary_check = json.loads(
+            required_paths['pixel_core_boundary_check'].read_text(
+                encoding='utf-8'
+            )
+        )
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            f'Dual-endpoint manifest, validation, or boundary check is unreadable: {root}'
+        ) from exc
+    if not isinstance(manifest, Mapping) or not isinstance(validation, Mapping):
+        raise ValueError('Dual-endpoint manifest and validation must be mappings.')
+    if manifest.get('analysis') != 'dual_endpoint_connection':
+        raise ValueError(
+            'Unexpected dual-endpoint analysis identity: '
+            f'{manifest.get("analysis")!r}'
+        )
+    if validation.get('analysis') != manifest.get('analysis'):
+        raise ValueError('Dual-endpoint validation analysis does not match manifest.')
+    case_id = str(manifest.get('case_id', '')).strip()
+    if not case_id or str(validation.get('case_id', '')).strip() != case_id:
+        raise ValueError('Dual-endpoint manifest and validation case_id do not match.')
+    case_identity_raw = manifest.get('case_identity')
+    if case_identity_raw is None:
+        case_identity_raw = (manifest.get('case_spec') or {}).get('arms')
+    try:
+        case_identity = _ofes_dual_endpoint_normalize_case_identity(
+            case_identity_raw
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            'Dual-endpoint manifest lacks valid case identity.'
+        ) from exc
+    if len(case_identity) < 2:
+        raise ValueError(
+            'Dual-endpoint manifest must contain at least two arm identities.'
+        )
+    case_spec_arms = (manifest.get('case_spec') or {}).get('arms')
+    if case_spec_arms is not None:
+        try:
+            normalized_spec_arms = _ofes_dual_endpoint_normalize_case_identity(
+                case_spec_arms
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('Dual-endpoint manifest case_spec arms are invalid.') from exc
+        if normalized_spec_arms != case_identity:
+            raise ValueError(
+                'Dual-endpoint manifest case_identity differs from case_spec arms.'
+            )
+    if not isinstance(boundary_check, Mapping):
+        raise ValueError('Dual-endpoint pixel core boundary check is invalid.')
+    boundary_passed = [
+        value.get('passed') is True
+        for value in boundary_check.values()
+        if isinstance(value, Mapping)
+    ]
+    if len(boundary_passed) != len(boundary_check):
+        raise ValueError('Dual-endpoint pixel core boundary check is malformed.')
+    if not boundary_passed or not all(boundary_passed):
+        raise ValueError('Dual-endpoint pixel core boundary check did not pass.')
+    arrival_validation = validation.get('arrival_verification')
+    nested_validation = validation.get('validation')
+    derived_checks = [
+        isinstance(validation.get('boundary_check_passed'), Mapping)
+        and all(
+            value is True
+            for value in validation['boundary_check_passed'].values()
+        ),
+        isinstance(arrival_validation, Mapping),
+        isinstance(nested_validation, Mapping),
+    ]
+    if isinstance(arrival_validation, Mapping):
+        derived_checks.extend(
+            arrival_validation.get(name) is True
+            for name in (
+                'all_horizontal_uses_real_pixel_cell',
+                'all_vertical_uses_matched_pixel_own_core',
+                'arrival_classification_stable_across_dt',
+            )
+        )
+    if isinstance(nested_validation, Mapping):
+        reversibility = nested_validation.get('reversibility')
+        timestep = nested_validation.get('timestep')
+        w_validation = nested_validation.get('w_validation')
+        derived_checks.extend([
+            isinstance(reversibility, Mapping)
+            and bool(reversibility)
+            and all(
+                isinstance(day, Mapping) and day.get('passed') is True
+                for arm in reversibility.values()
+                if isinstance(arm, Mapping)
+                for day in arm.values()
+            ),
+            isinstance(timestep, Mapping)
+            and bool(timestep)
+            and all(
+                isinstance(arm, Mapping) and arm.get('passed') is True
+                for arm in timestep.values()
+            ),
+            isinstance(w_validation, Mapping)
+            and w_validation.get('all_snapshots_carry_passed_flag') is True,
+        ])
+    explicit_complete = manifest.get('complete')
+    if explicit_complete is None:
+        explicit_complete = validation.get('complete')
+    complete = (
+        explicit_complete is True
+        if explicit_complete is not None
+        else all(derived_checks)
+    )
+    if not complete:
+        raise ValueError(
+            f'Dual-endpoint output validation is incomplete or failed: {root}'
+        )
+    particle_registration = pd.read_csv(
+        required_paths['particle_endpoint_registration']
+    )
+    group_summary = pd.read_csv(required_paths['group_summary'])
+    arrival_verification = pd.read_csv(
+        required_paths['arrival_verification']
+    )
+    arrival_stability = pd.read_csv(
+        required_paths['arrival_classification_stability']
+    )
+    if isinstance(arrival_validation, Mapping):
+        expected_arrivals = arrival_validation.get('arrival_record_count')
+        if (
+            expected_arrivals is not None
+            and int(expected_arrivals) != len(arrival_verification)
+        ):
+            raise ValueError(
+                'Dual-endpoint arrival record count does not match validation.'
+            )
+    verdict = required_paths['verdict'].read_text(encoding='utf-8')
+    return {
+        'output_dir': root,
+        'analysis': manifest['analysis'],
+        'case_id': case_id,
+        'case_identity': case_identity,
+        'complete': complete,
+        'manifest': dict(manifest),
+        'validation': dict(validation),
+        'particle_endpoint_registration': particle_registration,
+        'group_summary': group_summary,
+        'arrival_verification': arrival_verification,
+        'arrival_classification_stability': arrival_stability,
+        'pixel_core_boundary_check': dict(boundary_check),
+        'verdict': verdict,
+        'verdict_path': required_paths['verdict'],
+    }
+
+
+def _ofes_dual_endpoint_case_settings(
+    case_spec: dict,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """解析双端点案例规格，把身份、积分和验证参数集中为不可变运行设置。"""
+    if not isinstance(case_spec, Mapping):
+        raise TypeError('case_spec must be a mapping.')
+    required = {
+        'case_id',
+        'inputs',
+        'output_dir',
+        'start_date',
+        'end_date',
+        'seed_depth_m',
+        'integration',
+        'validation',
+        'control_settings',
+        'arms',
+        'w_validation_output_dir',
+    }
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise ValueError(f'Dual-endpoint case_spec lacks fields: {missing}')
+    start_date = pd.Timestamp(case_spec['start_date']).normalize()
+    end_date = pd.Timestamp(case_spec['end_date']).normalize()
+    integration = dict(case_spec['integration'])
+    validation = dict(case_spec['validation'])
+    integration_days = int(integration['integration_days'])
+    if (end_date - start_date).days != integration_days:
+        raise ValueError(
+            'integration_days does not match the declared start/end dates.'
+        )
+    if integration_days < 1:
+        raise ValueError('integration_days must be positive.')
+    inputs = dict(case_spec['inputs'])
+    for name in ('endpoint_members', 'native_profile_recovery'):
+        if name not in inputs:
+            raise ValueError(f'Dual-endpoint inputs lack {name!r}.')
+    arms = {}
+    raw_arms = case_spec['arms']
+    if not isinstance(raw_arms, Mapping) or not raw_arms:
+        raise ValueError('case_spec arms must be a non-empty mapping.')
+    for arm, raw in raw_arms.items():
+        if not isinstance(raw, Mapping):
+            raise ValueError(f'Arm {arm!r} must be a mapping.')
+        required_arm = {
+            'source_object_key',
+            'target_object_key',
+            'release_date',
+            'direction',
+        }
+        missing_arm = sorted(required_arm.difference(raw))
+        if missing_arm:
+            raise ValueError(
+                f'Arm {arm!r} lacks fields: {missing_arm}'
+            )
+        direction = str(raw['direction']).lower()
+        if direction not in ('forward', 'backward'):
+            raise ValueError(
+                f'Arm {arm!r} direction must be forward or backward.'
+            )
+        release_date = pd.Timestamp(raw['release_date']).normalize()
+        arms[str(arm)] = {
+            'source_object_key': str(raw['source_object_key']),
+            'target_object_key': str(raw['target_object_key']),
+            'release_date': release_date,
+            'direction': direction,
+            'backward': direction == 'backward',
+        }
+    if len(arms) != 2:
+        raise ValueError(
+            'Dual-endpoint case_spec must declare exactly two arms.'
+        )
+    forward_arms = [
+        arm for arm, values in arms.items()
+        if values['direction'] == 'forward'
+    ]
+    backward_arms = [
+        arm for arm, values in arms.items()
+        if values['direction'] == 'backward'
+    ]
+    if len(forward_arms) != 1 or len(backward_arms) != 1:
+        raise ValueError(
+            'Dual-endpoint case_spec must contain one forward and one backward arm.'
+        )
+    forward = arms[forward_arms[0]]
+    backward = arms[backward_arms[0]]
+    if (
+        forward['source_object_key'] != backward['target_object_key']
+        or forward['target_object_key'] != backward['source_object_key']
+    ):
+        raise ValueError(
+            'Forward and backward arms must be mutually reversed endpoint identities.'
+        )
+    expected_dates = {
+        'forward': (start_date, end_date),
+        'backward': (end_date, start_date),
+    }
+    for arm, values in arms.items():
+        expected_source_date, expected_target_date = expected_dates[
+            values['direction']
+        ]
+        source_date = _ofes_dual_endpoint_object_key_date(
+            values['source_object_key']
+        )
+        target_date = _ofes_dual_endpoint_object_key_date(
+            values['target_object_key']
+        )
+        if source_date != expected_source_date:
+            raise ValueError(
+                f'Arm {arm!r} source date must match its integration release endpoint.'
+            )
+        if target_date != expected_target_date:
+            raise ValueError(
+                f'Arm {arm!r} target date must match its integration endpoint.'
+            )
+        if values['release_date'] != expected_source_date:
+            raise ValueError(
+                f'Arm {arm!r} release_date must match its integration start endpoint.'
+            )
+    settings = {
+        'case_id': str(case_spec['case_id']),
+        'title': str(case_spec.get('title', case_spec['case_id'])),
+        'inputs': {
+            key: Path(value)
+            for key, value in inputs.items()
+        },
+        'output_dir': Path(
+            output_dir if output_dir is not None else case_spec['output_dir']
+        ),
+        'w_validation_output_dir': Path(case_spec['w_validation_output_dir']),
+        'start_date': start_date,
+        'end_date': end_date,
+        'integration_days': integration_days,
+        'seed_depth_m': float(case_spec['seed_depth_m']),
+        'base_dt_seconds': float(integration['base_dt_seconds']),
+        'sensitivity_dt_seconds': tuple(
+            float(value) for value in integration['sensitivity_dt_seconds']
+        ),
+        'reversibility_days': tuple(
+            int(value) for value in integration['reversibility_days']
+        ),
+        'domain_margin_km': float(integration['domain_margin_km']),
+        'depth_tolerance_m': float(integration['depth_tolerance_m']),
+        'minimum_active_fraction': float(
+            integration['minimum_active_fraction']
+        ),
+        'validation': {
+            key: float(value)
+            for key, value in validation.items()
+        },
+        'control_settings': dict(case_spec['control_settings']),
+        'arms': arms,
+    }
+    if not np.isfinite(settings['seed_depth_m']):
+        raise ValueError('seed_depth_m must be finite.')
+    if settings['depth_tolerance_m'] != _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M:
+        raise ValueError(
+            'depth_tolerance_m must equal the shared endpoint registration '
+            'tolerance.'
+        )
+    if any(
+        not np.isfinite(value) or value <= 0
+        for value in (
+            settings['base_dt_seconds'],
+            settings['domain_margin_km'],
+            settings['depth_tolerance_m'],
+        )
+    ):
+        raise ValueError('Positive finite integration settings are required.')
+    if not 0.0 <= settings['minimum_active_fraction'] <= 1.0:
+        raise ValueError('minimum_active_fraction must be within [0, 1].')
+    if len(settings['sensitivity_dt_seconds']) < 1 or any(
+        not np.isfinite(value) or value <= 0
+        for value in settings['sensitivity_dt_seconds']
+    ):
+        raise ValueError('sensitivity_dt_seconds must be positive.')
+    if not any(
+        np.isclose(
+            settings['base_dt_seconds'],
+            value,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        for value in settings['sensitivity_dt_seconds']
+    ):
+        raise ValueError(
+            'base_dt_seconds must belong to sensitivity_dt_seconds.'
+        )
+    if len(settings['reversibility_days']) < 1 or any(
+        value < 1 for value in settings['reversibility_days']
+    ):
+        raise ValueError('reversibility_days must be positive.')
+    if any(
+        value > settings['integration_days']
+        for value in settings['reversibility_days']
+    ):
+        raise ValueError(
+            'reversibility_days cannot exceed integration_days.'
+        )
+    return settings
+
+
+def _ofes_dual_endpoint_object_key_date(object_key: str) -> pd.Timestamp:
+    """从 OFES daily object key 提取日期并校验其格式。"""
+    match = re.fullmatch(r'(\d{8})_DO\d+_\d+', str(object_key))
+    if match is None:
+        raise ValueError(f'Invalid OFES daily object key: {object_key!r}')
+    return pd.to_datetime(match.group(1), format='%Y%m%d').normalize()
+
+
+def _ofes_dual_endpoint_load_support(
+    settings: dict,
+) -> tuple[pd.DataFrame, dict, dict, float]:
+    """读取逐像素目标支撑并按案例臂建立源对象、目标单元和网格间距。"""
+    support = _ofes_dual_endpoint_build_target_support(
+        settings['inputs']['endpoint_members'],
+        settings['inputs']['native_profile_recovery'],
+    )
+    if support.empty:
+        raise ValueError('Dual-endpoint target support is empty.')
+    probe_margin = 0.2
+    probe = load_ofes_snapshot(
+        settings['start_date'],
+        variables=['u'],
+        lon_bounds=(
+            float(support['lon'].min()) - probe_margin,
+            float(support['lon'].max()) + probe_margin,
+        ),
+        lat_bounds=(
+            float(support['lat'].min()) - probe_margin,
+            float(support['lat'].max()) + probe_margin,
+        ),
+    )
+    grid_cell_size_deg = float(
+        np.median(np.diff(np.asarray(probe['lat'], dtype=float)))
+    )
+    if not np.isfinite(grid_cell_size_deg) or grid_cell_size_deg <= 0:
+        raise ValueError('Could not resolve a positive OFES grid cell size.')
+    cells = _ofes_dual_endpoint_attach_cell_bounds(
+        support,
+        grid_cell_size_deg,
+    )
+    objects = {}
+    targets = {}
+    for arm, arm_settings in settings['arms'].items():
+        source = support.loc[
+            support['daily_object_key'].astype(str).eq(
+                arm_settings['source_object_key']
+            )
+        ].reset_index(drop=True)
+        target = cells.loc[
+            cells['daily_object_key'].astype(str).eq(
+                arm_settings['target_object_key']
+            )
+        ].reset_index(drop=True)
+        if source.empty or target.empty:
+            raise ValueError(
+                f'Arm {arm!r} source/target object support is incomplete.'
+            )
+        expected_release = _ofes_dual_endpoint_object_key_date(
+            arm_settings['source_object_key']
+        )
+        if expected_release != arm_settings['release_date']:
+            raise ValueError(
+                f'Arm {arm!r} release_date does not match its source object key.'
+            )
+        objects[arm] = source
+        targets[arm] = target
+    return support, {'cells': cells, 'targets': targets}, objects, grid_cell_size_deg
+
+
+def _ofes_dual_endpoint_load_snapshots(
+    settings: dict,
+    support: pd.DataFrame,
+) -> list[dict]:
+    """读取双端点积分窗口的三维 OFES 快照并附加已通过的 w 验证标记。"""
+    validation = _ofes_vertical_velocity_validation_status(
+        settings['w_validation_output_dir']
+    )
+    scale = approximate_degree_length(
+        0.5 * (float(support['lat'].min()) + float(support['lat'].max()))
+    )
+    lat_margin = (
+        settings['domain_margin_km']
+        * 1000.0
+        / float(scale['meters_per_degree_lat'])
+    )
+    lon_margin = (
+        settings['domain_margin_km']
+        * 1000.0
+        / float(scale['meters_per_degree_lon'])
+    )
+    snapshots = []
+    for date in pd.date_range(
+        settings['start_date'],
+        settings['end_date'],
+        freq='D',
+    ):
+        snapshot = load_ofes_snapshot(
+            date,
+            variables=['u', 'v', 'w'],
+            lon_bounds=(
+                float(support['lon'].min()) - lon_margin,
+                float(support['lon'].max()) + lon_margin,
+            ),
+            lat_bounds=(
+                float(support['lat'].min()) - lat_margin,
+                float(support['lat'].max()) + lat_margin,
+            ),
+        )
+        snapshot['metadata']['w_validation_passed'] = bool(
+            validation['validation_passed']
+        )
+        snapshots.append(snapshot)
+    if len(snapshots) != settings['integration_days'] + 1:
+        raise ValueError('The loaded snapshot count does not match the window.')
+    return snapshots
+
+
+def _ofes_dual_endpoint_seed_array(
+    frame: pd.DataFrame,
+    seed_depth_m: float,
+) -> np.ndarray:
+    """把对象或冻结对照表转换为 [depth, lat, lon] 的粒子种子数组。"""
+    return np.column_stack(
+        [
+            np.full(len(frame), float(seed_depth_m), dtype=float),
+            frame['lat'].to_numpy(dtype=float),
+            frame['lon'].to_numpy(dtype=float),
+        ]
+    )
+
+
+def _ofes_dual_endpoint_write_csv(
+    frame: pd.DataFrame,
+    path: Path,
+) -> None:
+    """写出双端点表格并确认目标目录已存在。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+
+
+def _ofes_dual_endpoint_case_identity(settings: dict) -> dict:
+    """构造双端点案例的可比较端点身份记录。"""
+    return {
+        arm: {
+            'source_object_key': values['source_object_key'],
+            'target_object_key': values['target_object_key'],
+            'release_date': values['release_date'].date().isoformat(),
+            'direction': values['direction'],
+        }
+        for arm, values in settings['arms'].items()
+    }
+
+
+def _ofes_dual_endpoint_normalize_case_identity(identity: object) -> dict:
+    """规范化 manifest 中的双端点身份，以便拒绝案例串写。"""
+    if not isinstance(identity, Mapping):
+        raise ValueError('Dual-endpoint case identity must be a mapping.')
+    normalized = {}
+    for arm, values in identity.items():
+        if not isinstance(values, Mapping):
+            raise ValueError(f'Dual-endpoint identity for {arm!r} is invalid.')
+        required = {
+            'source_object_key',
+            'target_object_key',
+            'release_date',
+            'direction',
+        }
+        if not required.issubset(values):
+            raise ValueError(f'Dual-endpoint identity for {arm!r} is incomplete.')
+        normalized[str(arm)] = {
+            'source_object_key': str(values['source_object_key']),
+            'target_object_key': str(values['target_object_key']),
+            'release_date': pd.Timestamp(values['release_date']).date().isoformat(),
+            'direction': str(values['direction']).lower(),
+        }
+    return normalized
+
+
+def _ofes_dual_endpoint_validate_output_identity(
+    output_root: Path,
+    settings: dict,
+    stage: str,
+) -> None:
+    """在双端点 producer 写入前核对案例身份和阶段生命周期。"""
+    if stage not in {'freeze', 'connection'}:
+        raise ValueError(f'Unsupported dual-endpoint output stage: {stage!r}')
+    if not output_root.exists():
+        return
+    if not output_root.is_dir():
+        raise ValueError(f'Output path is not a directory: {output_root}')
+    formal_manifest_path = output_root / 'manifest.json'
+    freeze_manifest_path = output_root / 'control_c1_freeze_manifest.json'
+    if formal_manifest_path.exists():
+        manifest_path = formal_manifest_path
+    elif freeze_manifest_path.exists():
+        manifest_path = freeze_manifest_path
+    else:
+        if any(output_root.iterdir()):
+            raise ValueError(
+                'Refusing to overwrite a non-empty dual-endpoint output '
+                f'directory without a manifest: {output_root}'
+            )
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        existing_case_id = manifest['case_id']
+        existing_identity = manifest.get('case_identity')
+        if existing_identity is None:
+            existing_identity = (manifest.get('case_spec') or {}).get('arms')
+        normalized_existing = _ofes_dual_endpoint_normalize_case_identity(
+            existing_identity
+        )
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f'Existing dual-endpoint manifest lacks valid case identity: '
+            f'{manifest_path}'
+        ) from exc
+    if str(existing_case_id) != settings['case_id']:
+        raise ValueError(
+            'Dual-endpoint output directory case_id mismatch: '
+            f'existing={existing_case_id!r}, requested={settings["case_id"]!r}.'
+        )
+    if normalized_existing != _ofes_dual_endpoint_case_identity(settings):
+        raise ValueError(
+            'Dual-endpoint output directory endpoint identity differs from '
+            'the requested case.'
+        )
+    if stage == 'freeze' and manifest_path == formal_manifest_path:
+        raise ValueError(
+            'Refusing to re-freeze a directory with a completed formal '
+            'manifest; use a new output directory.'
+        )
+
+
+def _ofes_dual_endpoint_bool_series(
+    values: pd.Series,
+    field_name: str,
+) -> pd.Series:
+    """把冻结 CSV 中的布尔字段解析成严格的布尔序列。"""
+    if pd.api.types.is_bool_dtype(values):
+        return values.astype(bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    if not normalized.isin({'true', 'false'}).all():
+        raise ValueError(
+            f'Dual-endpoint frozen field {field_name!r} contains non-boolean values.'
+        )
+    return normalized.eq('true')
+
+
+def _ofes_dual_endpoint_selected_member_records(
+    frozen: pd.DataFrame,
+) -> list[dict]:
+    """提取冻结 CSV 中每条入选控制的稳定成员身份。"""
+    required = {
+        'arm',
+        'candidate_index',
+        'release_date',
+        'lat',
+        'lon',
+        'depth_m',
+        'selection_rank',
+        'selected',
+    }
+    missing = sorted(required.difference(frozen.columns))
+    if missing:
+        raise ValueError(
+            f'Dual-endpoint frozen controls lack member identity fields: {missing}'
+        )
+    selected = _ofes_dual_endpoint_bool_series(frozen['selected'], 'selected')
+    if not bool(selected.all()):
+        raise ValueError('Frozen control CSV contains a non-selected row.')
+    records = []
+    for row in frozen.itertuples(index=False):
+        release_date = pd.Timestamp(row.release_date).normalize()
+        values = {
+            'arm': str(row.arm),
+            'candidate_index': int(row.candidate_index),
+            'release_date': release_date.date().isoformat(),
+            'lat': float(row.lat),
+            'lon': float(row.lon),
+            'depth_m': float(row.depth_m),
+            'selection_rank': int(row.selection_rank),
+        }
+        if not all(
+            np.isfinite(values[key])
+            for key in ('lat', 'lon', 'depth_m')
+        ):
+            raise ValueError('Frozen control member identity contains non-finite coordinates.')
+        records.append(values)
+    return sorted(
+        records,
+        key=lambda value: (
+            value['arm'],
+            value['selection_rank'],
+            value['candidate_index'],
+        ),
+    )
+
+
+def _ofes_dual_endpoint_write_freeze_outputs(
+    settings: dict,
+    selected: list[pd.DataFrame],
+    audits: list[pd.DataFrame],
+    summaries: list[dict],
+) -> dict:
+    """写出冻结控制名单、全候选审计和冻结记录。"""
+    output_root = settings['output_dir']
+    output_root.mkdir(parents=True, exist_ok=True)
+    frozen = pd.concat(selected, ignore_index=True)
+    audit = pd.concat(audits, ignore_index=True)
+    frozen_path = output_root / 'control_c1_frozen.csv'
+    audit_path = output_root / 'control_c1_candidate_audit.csv'
+    record_path = output_root / 'control_c1_freeze_record.json'
+    manifest_path = output_root / 'control_c1_freeze_manifest.json'
+    _ofes_dual_endpoint_write_csv(frozen, frozen_path)
+    _ofes_dual_endpoint_write_csv(audit, audit_path)
+    persisted_frozen = pd.read_csv(frozen_path)
+    selected_members = _ofes_dual_endpoint_selected_member_records(
+        persisted_frozen
+    )
+    record = {
+        'analysis': 'dual_endpoint_control_freeze',
+        'case_id': settings['case_id'],
+        'frozen_at': pd.Timestamp.now().isoformat(timespec='seconds'),
+        'stage': 'freeze',
+        'criteria': settings['control_settings'],
+        'seed_depth_m': settings['seed_depth_m'],
+        'case_identity': _ofes_dual_endpoint_case_identity(settings),
+        'selected_members': selected_members,
+        'arms': summaries,
+        'outputs': {
+            'control_c1_frozen': str(frozen_path.resolve()),
+            'control_c1_candidate_audit': str(audit_path.resolve()),
+            'control_c1_freeze_record': str(record_path.resolve()),
+            'control_c1_freeze_manifest': str(manifest_path.resolve()),
+        },
+    }
+    _ofes_atomic_write_json(record, record_path)
+    manifest = {
+        'analysis': 'dual_endpoint_control_freeze',
+        'case_id': settings['case_id'],
+        'task_scope': 'dual_endpoint_control_freeze',
+        'case_identity': _ofes_dual_endpoint_case_identity(settings),
+        'case_spec': _ofes_sc_jsonable(settings),
+        'criteria': _ofes_sc_jsonable(settings['control_settings']),
+        'seed_depth_m': settings['seed_depth_m'],
+        'outputs': {
+            'control_c1_frozen': str(frozen_path.resolve()),
+            'control_c1_candidate_audit': str(audit_path.resolve()),
+            'control_c1_freeze_record': str(record_path.resolve()),
+            'control_c1_freeze_manifest': str(manifest_path.resolve()),
+        },
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return {
+        'control_c1_frozen': persisted_frozen,
+        'control_c1_candidate_audit': audit,
+        'freeze_record': record,
+        'paths': {
+            'control_c1_frozen': frozen_path,
+            'control_c1_candidate_audit': audit_path,
+            'control_c1_freeze_record': record_path,
+            'control_c1_freeze_manifest': manifest_path,
+        },
+    }
+
+
+def _ofes_dual_endpoint_write_verification_outputs(
+    settings: dict,
+    particles: pd.DataFrame,
+    summary: pd.DataFrame,
+    arrival_verification: pd.DataFrame,
+    arrival_summary: dict,
+    arrival_stability: pd.DataFrame,
+    boundary: dict,
+    validation: dict,
+    manifest_extra: dict,
+) -> dict:
+    """写出积分登记、到达核对、验证记录、裁决与 manifest。"""
+    output_root = settings['output_dir']
+    output_root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        'particle_endpoint_registration': (
+            output_root / 'particle_endpoint_registration.csv'
+        ),
+        'group_summary': output_root / 'group_summary.csv',
+        'arrival_verification': output_root / 'arrival_verification.csv',
+        'arrival_verification_summary': (
+            output_root / 'arrival_verification_summary.json'
+        ),
+        'arrival_classification_stability': (
+            output_root / 'arrival_classification_stability.csv'
+        ),
+        'pixel_core_boundary_check': (
+            output_root / 'pixel_core_boundary_check.json'
+        ),
+        'validation': output_root / 'validation.json',
+        'verdict': output_root / 'verdict_zh.md',
+        'manifest': output_root / 'manifest.json',
+    }
+    _ofes_dual_endpoint_write_csv(
+        particles, paths['particle_endpoint_registration']
+    )
+    _ofes_dual_endpoint_write_csv(summary, paths['group_summary'])
+    _ofes_dual_endpoint_write_csv(
+        arrival_verification, paths['arrival_verification']
+    )
+    _ofes_atomic_write_json(arrival_summary, paths['arrival_verification_summary'])
+    _ofes_dual_endpoint_write_csv(
+        arrival_stability, paths['arrival_classification_stability']
+    )
+    _ofes_atomic_write_json(boundary, paths['pixel_core_boundary_check'])
+    validation_payload = {
+        'analysis': 'dual_endpoint_connection',
+        'case_id': settings['case_id'],
+        'settings': settings,
+        'validation': validation,
+        'boundary_check_passed': {
+            arm: bool(value['passed'])
+            for arm, value in boundary.items()
+        },
+        'arrival_verification': arrival_summary,
+        **manifest_extra,
+    }
+    _ofes_atomic_write_json(validation_payload, paths['validation'])
+    verdict = _ofes_dual_endpoint_build_verdict(
+        settings,
+        summary,
+        arrival_verification,
+        arrival_summary,
+        validation,
+        boundary,
+        manifest_extra.get('control_freeze', {}).get('freeze_record'),
+    )
+    paths['verdict'].write_text(verdict, encoding='utf-8')
+    manifest = {
+        'analysis': 'dual_endpoint_connection',
+        'case_id': settings['case_id'],
+        'task_scope': 'dual_endpoint_native_particle_connection',
+        'case_identity': _ofes_dual_endpoint_case_identity(settings),
+        'case_spec': _ofes_sc_jsonable(settings),
+        'control_freeze': manifest_extra.get('control_freeze'),
+        'outputs': {
+            key: str(path.resolve())
+            for key, path in paths.items()
+        },
+        'validation': validation_payload,
+    }
+    _ofes_atomic_write_json(manifest, paths['manifest'])
+    return {
+        'particles': particles,
+        'summary': summary,
+        'arrival_verification': arrival_verification,
+        'arrival_verification_summary': arrival_summary,
+        'arrival_classification_stability': arrival_stability,
+        'boundary': boundary,
+        'validation': validation_payload,
+        'verdict': verdict,
+        'paths': paths,
+    }
+
+
+def _ofes_dual_endpoint_run_validation(
+    snapshots: list[dict],
+    arm_payloads: dict,
+    settings: dict,
+) -> dict:
+    """对对象臂执行步长敏感性、可逆性和有效比例验证。"""
+    output = {
+        'w_validation': {
+            'all_snapshots_carry_passed_flag': bool(
+                all(
+                    snapshot.get('metadata', {}).get('w_validation_passed')
+                    is True
+                    for snapshot in snapshots
+                )
+            ),
+            'basis': (
+                'dataset-level validate_ofes_vertical_velocity manifest at '
+                f'{settings["w_validation_output_dir"]}'
+            ),
+            'vertical_mode': 'three_dimensional',
+        },
+        'timestep': {},
+        'reversibility': {},
+    }
+    sensitivity_dts = settings['sensitivity_dt_seconds']
+    for arm, payload in arm_payloads.items():
+        endpoints = {}
+        for dt in sensitivity_dts:
+            result = advect_ofes_particles(
+                snapshots,
+                payload['seeds'],
+                backward=payload['backward'],
+                dt_seconds=float(dt),
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            endpoints[float(dt)] = np.asarray(
+                result['positions'], dtype=float
+            )[-1]
+        common = None
+        for array in endpoints.values():
+            mask = np.all(np.isfinite(array), axis=1)
+            common = mask if common is None else common & mask
+        spread_km = []
+        spread_m = []
+        if common is not None and common.any():
+            stack = np.stack([array[common] for array in endpoints.values()])
+            for column in range(stack.shape[1]):
+                points = stack[:, column, :]
+                centre_lat = float(points[:, 1].mean())
+                centre_lon = float(points[:, 2].mean())
+                spread_km.append(
+                    float(
+                        np.median(
+                            great_circle_distance_m(
+                                points[:, 2],
+                                points[:, 1],
+                                centre_lon,
+                                centre_lat,
+                            )
+                            / 1000.0
+                        )
+                    )
+                )
+                spread_m.append(
+                    float(np.median(np.abs(points[:, 0] - points[:, 0].mean())))
+                )
+        spread_limit_km = float(
+            settings['validation']['timestep_median_spread_max_km']
+        )
+        spread_limit_m = float(
+            settings['validation']['timestep_median_depth_spread_max_m']
+        )
+        output['timestep'][arm] = {
+            'dt_seconds': list(sensitivity_dts),
+            'common_active_particle_count': (
+                int(common.sum()) if common is not None else 0
+            ),
+            'endpoint_spread_median_km': (
+                round(float(np.median(spread_km)), 4)
+                if spread_km else None
+            ),
+            'endpoint_depth_spread_median_m': (
+                round(float(np.median(spread_m)), 4)
+                if spread_m else None
+            ),
+            'passed': bool(
+                spread_km
+                and float(np.median(spread_km)) <= spread_limit_km
+                and float(np.median(spread_m)) <= spread_limit_m
+            ),
+        }
+        reversibility = {}
+        for days in settings['reversibility_days']:
+            segment = (
+                snapshots[-(days + 1):]
+                if payload['backward']
+                else snapshots[: days + 1]
+            )
+            forward = advect_ofes_particles(
+                segment,
+                payload['seeds'],
+                backward=payload['backward'],
+                dt_seconds=settings['base_dt_seconds'],
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            backward = advect_ofes_particles(
+                segment,
+                np.asarray(forward['positions'], dtype=float)[-1],
+                backward=not payload['backward'],
+                dt_seconds=settings['base_dt_seconds'],
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            endpoint = np.asarray(backward['positions'], dtype=float)[-1]
+            mask = np.all(np.isfinite(endpoint), axis=1)
+            error_km = (
+                great_circle_distance_m(
+                    endpoint[mask, 2],
+                    endpoint[mask, 1],
+                    payload['seeds'][mask, 2],
+                    payload['seeds'][mask, 1],
+                )
+                / 1000.0
+            )
+            median_limit = float(
+                settings['validation']['reversibility_median_error_max_km']
+            )
+            q90_limit = float(
+                settings['validation']['reversibility_q90_error_max_km']
+            )
+            reversibility[str(days)] = {
+                'common_active_particle_count': int(mask.sum()),
+                'median_error_km': (
+                    round(float(np.median(error_km)), 4)
+                    if mask.any() else None
+                ),
+                'q90_error_km': (
+                    round(float(np.percentile(error_km, 90)), 4)
+                    if mask.any() else None
+                ),
+                'passed': bool(
+                    mask.any()
+                    and float(np.median(error_km)) <= median_limit
+                    and float(np.percentile(error_km, 90)) <= q90_limit
+                ),
+            }
+        output['reversibility'][arm] = reversibility
+    return output
+
+
+def _ofes_dual_endpoint_build_arrival_verification(
+    particles: pd.DataFrame,
+    objects: dict,
+    targets: dict,
+    settings: dict,
+    grid_cell_size_deg: float,
+) -> pd.DataFrame:
+    """展开每条到达记录，核对命中的是目标像素自身单元与半振幅核。"""
+    arrivals = particles.loc[
+        particles['group'].eq('object_seed')
+        & particles['arrived'].astype(bool)
+    ]
+    rows = []
+    for particle in arrivals.itertuples(index=False):
+        arm = str(particle.arm)
+        source = objects[arm].iloc[int(particle.particle_index)]
+        target = targets[arm].loc[
+            targets[arm]['lat_index'].eq(
+                int(particle.matched_pixel_lat_index)
+            )
+            & targets[arm]['lon_index'].eq(
+                int(particle.matched_pixel_lon_index)
+            )
+        ]
+        if len(target) != 1:
+            raise ValueError(
+                f'Arrival {arm}/{particle.particle_index} does not map to one target pixel.'
+            )
+        target = target.iloc[0]
+        target_key = settings['arms'][arm]['target_object_key']
+        rows.append(
+            {
+                'arm': arm,
+                'direction': settings['arms'][arm]['direction'],
+                'release_date': str(
+                    settings['arms'][arm]['release_date'].date()
+                ),
+                'endpoint_date': str(
+                    _ofes_dual_endpoint_object_key_date(target_key).date()
+                ),
+                'particle_index': int(particle.particle_index),
+                'source_object_key': settings['arms'][arm]['source_object_key'],
+                'source_lat_index': int(source['lat_index']),
+                'source_lon_index': int(source['lon_index']),
+                'source_lat': float(source['lat']),
+                'source_lon': float(source['lon']),
+                'seed_depth_m': float(particle.seed_depth_m),
+                'target_object_key': target_key,
+                'matched_target_lat_index': int(target['lat_index']),
+                'matched_target_lon_index': int(target['lon_index']),
+                'matched_target_lat': float(target['lat']),
+                'matched_target_lon': float(target['lon']),
+                'target_cell_lat_min': float(target['cell_lat_min']),
+                'target_cell_lat_max': float(target['cell_lat_max']),
+                'target_cell_lon_min': float(target['cell_lon_min']),
+                'target_cell_lon_max': float(target['cell_lon_max']),
+                'matched_core_shallow_edge_m': float(
+                    target['core_shallow_edge_m']
+                ),
+                'matched_core_deep_edge_m': float(
+                    target['core_deep_edge_m']
+                ),
+                'matched_core_thickness_m': float(
+                    target['core_thickness_m']
+                ),
+                'final_lat': float(particle.final_lat),
+                'final_lon': float(particle.final_lon),
+                'final_depth_m': float(particle.final_depth_m),
+                'horizontal_uses_real_pixel_cell': bool(
+                    particle.horizontal_inside_any_pixel
+                ),
+                'vertical_uses_matched_pixel_own_core': bool(
+                    particle.vertical_inside_matched_core
+                ),
+                'vertical_depth_tolerance_m': settings['depth_tolerance_m'],
+                'grid_cell_size_deg': grid_cell_size_deg,
+                'distance_to_target_centroid_km': float(
+                    particle.distance_to_target_centroid_km
+                ),
+            }
+        )
+    columns = [
+        'arm',
+        'direction',
+        'release_date',
+        'endpoint_date',
+        'particle_index',
+        'source_object_key',
+        'source_lat_index',
+        'source_lon_index',
+        'source_lat',
+        'source_lon',
+        'seed_depth_m',
+        'target_object_key',
+        'matched_target_lat_index',
+        'matched_target_lon_index',
+        'matched_target_lat',
+        'matched_target_lon',
+        'target_cell_lat_min',
+        'target_cell_lat_max',
+        'target_cell_lon_min',
+        'target_cell_lon_max',
+        'matched_core_shallow_edge_m',
+        'matched_core_deep_edge_m',
+        'matched_core_thickness_m',
+        'final_lat',
+        'final_lon',
+        'final_depth_m',
+        'horizontal_uses_real_pixel_cell',
+        'vertical_uses_matched_pixel_own_core',
+        'vertical_depth_tolerance_m',
+        'grid_cell_size_deg',
+        'distance_to_target_centroid_km',
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _ofes_dual_endpoint_build_arrival_stability(
+    snapshots: list[dict],
+    objects: dict,
+    targets: dict,
+    settings: dict,
+) -> pd.DataFrame:
+    """在案例声明的时间步长敏感性下逐粒子比较到达分类。"""
+    rows = []
+    base_dt = float(settings['base_dt_seconds'])
+    for arm, arm_settings in settings['arms'].items():
+        seeds = _ofes_dual_endpoint_seed_array(
+            objects[arm],
+            settings['seed_depth_m'],
+        )
+        registrations = {}
+        for dt in settings['sensitivity_dt_seconds']:
+            result = advect_ofes_particles(
+                snapshots,
+                seeds,
+                backward=arm_settings['backward'],
+                dt_seconds=float(dt),
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            registrations[float(dt)] = _ofes_dual_endpoint_register_arrival(
+                'object_seed',
+                arm,
+                seeds,
+                result,
+                targets[arm],
+                depth_tolerance_m=settings['depth_tolerance_m'],
+            )
+        if base_dt not in registrations:
+            raise ValueError('base_dt_seconds must be one of sensitivity_dt_seconds.')
+        base = registrations[base_dt]
+        arrived_columns = [
+            registrations[float(dt)]['arrived'].astype(int).to_numpy()
+            for dt in settings['sensitivity_dt_seconds']
+        ]
+        status = base['final_status'].astype(str).to_numpy()
+        stable = np.all(
+            np.stack(arrived_columns, axis=1)
+            == arrived_columns[0][:, None],
+            axis=1,
+        )
+        endpoint_date = str(
+            _ofes_dual_endpoint_object_key_date(
+                arm_settings['target_object_key']
+            ).date()
+        )
+        for index in range(len(base)):
+            rows.append(
+                {
+                    'arm': arm,
+                    'endpoint_date': endpoint_date,
+                    'particle_index': index,
+                    'final_status': status[index],
+                    **{
+                        f'arrived_dt{int(float(dt))}': int(
+                            registrations[float(dt)].iloc[index]['arrived']
+                        )
+                        for dt in settings['sensitivity_dt_seconds']
+                    },
+                    'arrival_classification_stable': bool(stable[index]),
+                    'matched_pixel_index': int(
+                        base.iloc[index]['matched_pixel_index']
+                    ),
+                }
+            )
+        rows.append(
+            {
+                'arm': arm,
+                'endpoint_date': endpoint_date,
+                'particle_index': -1,
+                'final_status': 'GROUP',
+                **{
+                    f'arrived_dt{int(float(dt))}': int(
+                        registrations[float(dt)]['arrived'].sum()
+                    )
+                    for dt in settings['sensitivity_dt_seconds']
+                },
+                'arrival_classification_stable': bool(stable.all()),
+                'matched_pixel_index': -1,
+            }
+        )
+    return pd.DataFrame(rows)
