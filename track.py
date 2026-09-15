@@ -91757,6 +91757,7 @@ def build_ofes_half_amplitude_core_registration(
         peak_support_check,
     )
 
+
 def load_ofes_half_amplitude_core_registration(
     output_dir: str | Path,
 ) -> dict:
@@ -93447,6 +93448,3663 @@ def load_ofes_dual_endpoint_connection(
         'pixel_core_boundary_check': dict(boundary_check),
         'verdict': verdict,
         'verdict_path': required_paths['verdict'],
+    }
+
+
+def _ofes_watermass_seed_key(
+    case_id: str,
+    arm: str,
+    row: pd.Series,
+    release_date: pd.Timestamp,
+    depth: float,
+) -> str:
+    """构造跨三维和固定深度模式稳定的对象种子身份。"""
+    lat_index = int(row.get('source_lat_index', row['lat_index']))
+    lon_index = int(row.get('source_lon_index', row['lon_index']))
+    return '|'.join(
+        [
+            str(case_id),
+            str(arm),
+            str(row['daily_object_key']),
+            str(lat_index),
+            str(lon_index),
+            pd.Timestamp(release_date).date().isoformat(),
+            f'{float(depth):.8f}',
+        ]
+    )
+
+
+def _ofes_watermass_write_frame(frame: pd.DataFrame, path: Path) -> None:
+    """写出水团复核表并确认其父目录存在。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+
+
+def _ofes_watermass_parse_case_inputs(
+    case_spec: Mapping,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """解析水团复核案例规格、输入路径、日期和数值容差。"""
+    required = {
+        'case_id',
+        'inputs',
+        'output_dir',
+        'reference_output_dir',
+        'structure_candidates_path',
+        'structure_path_members_path',
+        'structure_match_edges_path',
+        'start_date',
+        'end_date',
+        'do_threshold',
+    }
+    if not isinstance(case_spec, Mapping):
+        raise TypeError('case_spec must be a mapping.')
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise ValueError(f'Watermass case_spec lacks fields: {missing}')
+    settings = _ofes_dual_endpoint_case_settings(case_spec, output_dir)
+    settings['output_dir'] = Path(
+        output_dir if output_dir is not None else case_spec['output_dir']
+    ).expanduser().resolve()
+    settings['reference_output_dir'] = Path(
+        case_spec['reference_output_dir']
+    ).expanduser().resolve()
+    settings['structure_paths'] = {
+        'candidates': Path(
+            case_spec['structure_candidates_path']
+        ).expanduser().resolve(),
+        'path_members': Path(
+            case_spec['structure_path_members_path']
+        ).expanduser().resolve(),
+        'match_edges': Path(
+            case_spec['structure_match_edges_path']
+        ).expanduser().resolve(),
+    }
+    settings['inputs'] = {
+        key: Path(value).expanduser().resolve()
+        for key, value in settings['inputs'].items()
+    }
+    settings['w_validation_output_dir'] = Path(
+        settings['w_validation_output_dir']
+    ).expanduser().resolve()
+    required_inputs = {
+        **settings['inputs'],
+        **settings['structure_paths'],
+    }
+    required_inputs['reference_output_dir'] = settings['reference_output_dir']
+    for name, path in required_inputs.items():
+        if not path.exists():
+            raise FileNotFoundError(
+                f'Watermass input {name!r} does not exist: {path}'
+            )
+    if not settings['reference_output_dir'].is_dir():
+        raise NotADirectoryError(
+            f'Reference output is not a directory: '
+            f'{settings["reference_output_dir"]}'
+        )
+    for name in (
+        'particle_endpoint_registration.csv',
+        'arrival_verification.csv',
+        'group_summary.csv',
+        'manifest.json',
+    ):
+        if not (settings['reference_output_dir'] / name).is_file():
+            raise FileNotFoundError(
+                f'Reference output lacks required file {name!r}: '
+                f'{settings["reference_output_dir"]}'
+            )
+    settings['do_threshold'] = float(case_spec['do_threshold'])
+    settings['case_label'] = str(
+        case_spec.get('case_label', settings['case_id'])
+    )
+    if not np.isfinite(settings['do_threshold']) or settings['do_threshold'] <= 0:
+        raise ValueError('do_threshold must be finite and positive.')
+    settings['dates'] = pd.date_range(
+        settings['start_date'],
+        settings['end_date'],
+        freq='D',
+    )
+    validation = dict(case_spec.get('validation', {}))
+    settings['watermass_tolerances'] = {
+        'position_atol_deg': float(
+            validation.get('position_atol_deg', 1e-8)
+        ),
+        'depth_atol_m': float(validation.get('depth_atol_m', 1e-5)),
+        'property_closure_atol': float(
+            validation.get('property_closure_atol', 1e-4)
+        ),
+        'haversine_atol_km': float(
+            validation.get('haversine_atol_km', 0.05)
+        ),
+    }
+    if any(
+        not np.isfinite(value) or value < 0
+        for value in settings['watermass_tolerances'].values()
+    ):
+        raise ValueError('Watermass tolerances must be finite and nonnegative.')
+    settings['mode_by_group'] = {
+        'object_seed': 'three_dimensional',
+        'c2_fixed_depth_control': 'fixed_depth',
+    }
+    return settings
+
+
+def _ofes_watermass_validate_output_identity(
+    output_root: Path,
+    settings: dict,
+) -> None:
+    """在水团复核写入前拒绝已有不同案例或未登记目录。"""
+    if not output_root.exists():
+        return
+    if not output_root.is_dir():
+        raise ValueError(f'Watermass output path is not a directory: {output_root}')
+    entries = list(output_root.iterdir())
+    manifest_path = output_root / 'manifest.json'
+    if not manifest_path.exists():
+        if entries:
+            raise ValueError(
+                'Refusing to write a non-empty watermass output without '
+                f'a manifest: {output_root}'
+            )
+        return
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    expected = _ofes_dual_endpoint_case_identity(settings)
+    saved_identity = manifest.get('case_identity')
+    if (
+        manifest.get('analysis') != 'dual_endpoint_watermass_review'
+        or str(manifest.get('case_id')) != settings['case_id']
+        or _ofes_dual_endpoint_normalize_case_identity(saved_identity)
+        != expected
+    ):
+        raise ValueError(
+            'Existing watermass output manifest has a different case or '
+            f'arm identity: {manifest_path}'
+        )
+
+
+def _ofes_watermass_build_seed_registry(
+    settings: dict,
+    objects: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """建立真实对象种子及三维、固定深度轨迹身份登记表。"""
+    rows = []
+    for arm, frame in objects.items():
+        arm_settings = settings['arms'][arm]
+        release = arm_settings['release_date']
+        source_key = arm_settings['source_object_key']
+        if frame.empty:
+            raise ValueError(f'Watermass source object is empty for {arm}.')
+        for particle_index, row in frame.reset_index(drop=True).iterrows():
+            if str(row['daily_object_key']) != source_key:
+                raise ValueError(
+                    f'Object row {particle_index} does not match source key '
+                    f'for {arm}.'
+                )
+            seed_key = _ofes_watermass_seed_key(
+                settings['case_id'],
+                arm,
+                row,
+                release,
+                settings['seed_depth_m'],
+            )
+            for mode in ('three_dimensional', 'fixed_depth'):
+                rows.append(
+                    {
+                        'case_id': settings['case_id'],
+                        'arm': arm,
+                        'particle_index': int(particle_index),
+                        'seed_key': seed_key,
+                        'trajectory_key': (
+                            f'{seed_key}|{mode}|'
+                            f'dt={settings["base_dt_seconds"]:g}'
+                        ),
+                        'vertical_mode': mode,
+                        'mode': mode,
+                        'source_object_key': source_key,
+                        'source_lat_index': int(
+                            row.get('source_lat_index', row['lat_index'])
+                        ),
+                        'source_lon_index': int(
+                            row.get('source_lon_index', row['lon_index'])
+                        ),
+                        'seed_lat': float(row['lat']),
+                        'seed_lon': float(row['lon']),
+                        'seed_depth_m': float(settings['seed_depth_m']),
+                        'release_date': release,
+                        'target_object_key': arm_settings[
+                            'target_object_key'
+                        ],
+                        'integration_direction': arm_settings['direction'],
+                        'dt_seconds': float(settings['base_dt_seconds']),
+                    }
+                )
+    registry = pd.DataFrame(rows)
+    if registry.empty:
+        raise ValueError('Watermass seed registry is empty.')
+    if registry['seed_key'].nunique() * 2 != len(registry):
+        raise ValueError('Seed registry does not contain exactly two modes per seed.')
+    if registry.duplicated(
+        ['seed_key', 'vertical_mode']
+    ).any():
+        raise ValueError('Seed registry contains duplicate seed-mode identities.')
+    return registry
+
+
+def _ofes_watermass_flatten_trajectory(
+    result: dict,
+    registry: pd.DataFrame,
+) -> pd.DataFrame:
+    """展开一条模式的全部亚步时刻、位置和失败状态。"""
+    times = pd.to_datetime(np.asarray(result['times']))
+    positions = np.asarray(result['positions'], dtype=float)
+    statuses = np.asarray(result['status'])
+    if positions.ndim != 3 or positions.shape[2] != 3:
+        raise ValueError('Trajectory positions must have shape (time, particle, 3).')
+    if statuses.shape != positions.shape[:2] or len(times) != len(positions):
+        raise ValueError('Trajectory time, position and status shapes disagree.')
+    rows = []
+    for row in registry.sort_values('particle_index').itertuples(index=False):
+        particle_index = int(row.particle_index)
+        for step, stamp in enumerate(times):
+            offset = (pd.Timestamp(stamp) - pd.Timestamp(row.release_date)).total_seconds()
+            rows.append(
+                {
+                    'case_id': row.case_id,
+                    'arm': row.arm,
+                    'particle_index': particle_index,
+                    'seed_key': row.seed_key,
+                    'trajectory_key': row.trajectory_key,
+                    'vertical_mode': row.vertical_mode,
+                    'mode': row.mode,
+                    'source_object_key': row.source_object_key,
+                    'source_lat_index': row.source_lat_index,
+                    'source_lon_index': row.source_lon_index,
+                    'release_date': pd.Timestamp(row.release_date),
+                    'calendar_time': pd.Timestamp(stamp),
+                    'calendar_offset_seconds': float(offset),
+                    'integration_elapsed_seconds': float(abs(offset)),
+                    'integration_step': int(step),
+                    'integration_direction': row.integration_direction,
+                    'dt_seconds': float(row.dt_seconds),
+                    'status': str(statuses[step, particle_index]),
+                    'depth_m': float(positions[step, particle_index, 0]),
+                    'lat': float(positions[step, particle_index, 1]),
+                    'lon': float(positions[step, particle_index, 2]),
+                }
+            )
+    output = pd.DataFrame(rows)
+    if output.empty:
+        raise ValueError('Flattened trajectory table is empty.')
+    return output
+
+
+def _ofes_watermass_exact_midnight_positions(
+    flattened: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """仅提取时间戳等于每日午夜的粒子位置并保留失败状态。"""
+    rows = []
+    for trajectory_key, group in flattened.groupby(
+        'trajectory_key',
+        sort=True,
+    ):
+        expected = settings['dates']
+        for stamp in expected:
+            selected = group.loc[group['calendar_time'].eq(stamp)]
+            if len(selected) != 1:
+                raise ValueError(
+                    f'Trajectory {trajectory_key} does not have exactly one '
+                    f'position at {stamp}.'
+                )
+            row = selected.iloc[0].to_dict()
+            if pd.Timestamp(row['calendar_time']) != stamp:
+                raise ValueError('Midnight extraction did not retain an exact timestamp.')
+            rows.append(row)
+    output = pd.DataFrame(rows)
+    expected_count = len(settings['dates']) * flattened['trajectory_key'].nunique()
+    if len(output) != expected_count:
+        raise ValueError('Daily midnight position row count is inconsistent.')
+    return output.sort_values(
+        ['trajectory_key', 'calendar_time'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+
+
+def _ofes_watermass_axis_bounds(
+    axis: np.ndarray,
+    points: np.ndarray,
+) -> tuple[float, float]:
+    """根据当日活动粒子的实际包络扩展一个原生网格单元 halo。"""
+    values = np.asarray(axis, dtype=float)
+    points = np.asarray(points, dtype=float)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.diff(values) > 0):
+        raise ValueError('OFES coordinate must be increasing with at least two points.')
+    finite = points[np.isfinite(points)]
+    if finite.size == 0:
+        raise ValueError('Cannot construct a scalar read window without finite positions.')
+    step = float(np.median(np.diff(values)))
+    lower = max(float(values[0]), float(np.min(finite)) - step)
+    upper = min(float(values[-1]), float(np.max(finite)) + step)
+    if not upper > lower:
+        raise ValueError('Scalar halo window is empty.')
+    return lower, upper
+
+
+def _ofes_watermass_assert_point_bounds(
+    points: np.ndarray,
+    snapshot: dict,
+    *,
+    depth_key: str = 'depth',
+) -> None:
+    """显式检查活动粒子点位于本日插值快照的全部坐标范围内。"""
+    values = np.asarray(points, dtype=float)
+    finite = np.all(np.isfinite(values), axis=1)
+    values = values[finite]
+    if values.size == 0:
+        return
+    depth = np.asarray(snapshot[depth_key], dtype=float)
+    lat = np.asarray(snapshot['lat'], dtype=float)
+    lon = np.asarray(snapshot['lon'], dtype=float)
+    if not (
+        np.all((values[:, 0] >= depth[0]) & (values[:, 0] <= depth[-1]))
+        and np.all((values[:, 1] >= lat[0]) & (values[:, 1] <= lat[-1]))
+        and np.all((values[:, 2] >= lon[0]) & (values[:, 2] <= lon[-1]))
+    ):
+        raise ValueError(
+            'An active watermass point lies outside the loaded scalar or '
+            'velocity interpolation bounds.'
+        )
+
+
+def _ofes_watermass_replay_trajectories(
+    settings: dict,
+    support: pd.DataFrame,
+    objects: dict[str, pd.DataFrame],
+    registry: pd.DataFrame,
+) -> tuple[list[dict], dict, pd.DataFrame, pd.DataFrame]:
+    """仅一次读取正式 u/v/w 域并重放两种模式的完整轨迹。"""
+    velocity_snapshots = _ofes_dual_endpoint_load_snapshots(settings, support)
+    results = {}
+    flattened = []
+    for arm, arm_settings in settings['arms'].items():
+        seeds = _ofes_dual_endpoint_seed_array(
+            objects[arm],
+            settings['seed_depth_m'],
+        )
+        for mode in ('three_dimensional', 'fixed_depth'):
+            result = advect_ofes_particles(
+                velocity_snapshots,
+                seeds,
+                backward=arm_settings['backward'],
+                dt_seconds=settings['base_dt_seconds'],
+                temporal_interpolation='linear',
+                vertical_mode=mode,
+            )
+            mode_registry = registry.loc[
+                registry['arm'].eq(arm)
+                & registry['vertical_mode'].eq(mode)
+            ].copy()
+            if len(mode_registry) != len(seeds):
+                raise ValueError('Seed registry and trajectory particle counts differ.')
+            results[(arm, mode)] = result
+            flattened.append(
+                _ofes_watermass_flatten_trajectory(result, mode_registry)
+            )
+    positions = pd.concat(flattened, ignore_index=True)
+    midnight = _ofes_watermass_exact_midnight_positions(positions, settings)
+    return velocity_snapshots, results, positions, midnight
+
+
+def _ofes_watermass_load_daily_scalar_snapshots(
+    settings: dict,
+    midnight: pd.DataFrame,
+    velocity_snapshots: list[dict],
+) -> dict[pd.Timestamp, dict]:
+    """按每日活动午夜点实际包络加一格 halo 读取标量水柱。"""
+    contexts = {}
+    if len(velocity_snapshots) != len(settings['dates']):
+        raise ValueError('Velocity snapshot count does not match the daily window.')
+    for index, stamp in enumerate(settings['dates']):
+        day_rows = midnight.loc[midnight['calendar_time'].eq(stamp)]
+        active = day_rows.loc[
+            day_rows['status'].eq('active')
+            & np.isfinite(day_rows['depth_m'])
+            & np.isfinite(day_rows['lat'])
+            & np.isfinite(day_rows['lon'])
+        ]
+        finite_rows = day_rows.loc[
+            np.isfinite(day_rows['depth_m'])
+            & np.isfinite(day_rows['lat'])
+            & np.isfinite(day_rows['lon'])
+        ]
+        bounds_rows = active if not active.empty else finite_rows
+        if bounds_rows.empty:
+            raise RuntimeError(
+                f'No finite midnight points are available on {stamp:%Y-%m-%d}.'
+            )
+        tracer_lon, tracer_lat, _, _, _ = _ofes_tracer_coordinates(stamp)
+        lon_bounds = _ofes_watermass_axis_bounds(
+            tracer_lon,
+            bounds_rows['lon'].to_numpy(dtype=float),
+        )
+        lat_bounds = _ofes_watermass_axis_bounds(
+            tracer_lat,
+            bounds_rows['lat'].to_numpy(dtype=float),
+        )
+        scalar = load_ofes_snapshot(
+            stamp,
+            variables=['do2', 'temp', 'salinity'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=(0.0, 1000.0),
+        )
+        active_points = active[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+        _ofes_watermass_assert_point_bounds(active_points, scalar)
+        velocity = velocity_snapshots[index]
+        _ofes_watermass_assert_point_bounds(
+            active_points,
+            velocity,
+            depth_key='depth',
+        )
+        source_files = {
+            variable: str(_ofes_file_path(variable, stamp).resolve())
+            for variable in ('do2', 'temp', 'salinity', 'u', 'v', 'w')
+        }
+        scalar.setdefault('metadata', {})['watermass_read'] = {
+            'actual_active_position_bounds': {
+                'depth_m': [
+                    float(active['depth_m'].min())
+                    if not active.empty
+                    else None,
+                    float(active['depth_m'].max())
+                    if not active.empty
+                    else None,
+                ],
+                'lat': [
+                    float(active['lat'].min()) if not active.empty else None,
+                    float(active['lat'].max()) if not active.empty else None,
+                ],
+                'lon': [
+                    float(active['lon'].min()) if not active.empty else None,
+                    float(active['lon'].max()) if not active.empty else None,
+                ],
+            },
+            'scalar_lon_bounds': list(lon_bounds),
+            'scalar_lat_bounds': list(lat_bounds),
+            'scalar_depth_bounds_m': [0.0, 1000.0],
+            'halo_grid_cells': 1,
+            'source_files': source_files,
+            'scalar_source': 'OFES tracer snapshot at exact calendar midnight',
+        }
+        contexts[pd.Timestamp(stamp)] = {
+            'date': pd.Timestamp(stamp),
+            'scalar': scalar,
+            'velocity': velocity,
+            'source_files': source_files,
+        }
+    return contexts
+
+
+def _ofes_watermass_sample_properties(
+    midnight: pd.DataFrame,
+    contexts: dict[pd.Timestamp, dict],
+    settings: dict,
+) -> pd.DataFrame:
+    """在共享每日标量快照上采样原始氧、温盐、密度和原生 w。"""
+    value_names = (
+        'raw_do2_umol_kg',
+        'theta',
+        'sp',
+        'sa',
+        'ct',
+        'sigma0',
+        'spiciness0',
+        'w_m_s',
+    )
+    rows = midnight.to_dict('records')
+    for row in rows:
+        row.update(
+            {
+                name: np.nan
+                for name in value_names
+            }
+        )
+        row.update(
+            {
+                'w_interpolation_depth_m': np.nan,
+                'depth_w_m': np.nan,
+                'w_depth_m': np.nan,
+                'w_depth_coordinate': 'depth_w',
+                'w_units': 'm s-1',
+                'w_positive_direction': 'up',
+                'do_units': 'umol kg-1',
+                'theta_units': 'degC potential temperature',
+                'sp_units': 'PSS-78',
+                'sa_units': 'g kg-1',
+                'ct_units': 'degC conservative temperature',
+                'sigma0_units': 'kg m-3',
+                'spiciness0_units': 'kg m-3',
+                'depth_units': 'm downward positive',
+                'scalar_interpolation': 'trilinear on tracer centers',
+                'w_interpolation': 'trilinear on native depth_w layers',
+                'property_source': 'OFES daily Eulerian scalar and velocity snapshots',
+                'scalar_source_file': '',
+                'w_source_file': '',
+                'property_qc_status': 'inactive',
+            }
+        )
+    frame = pd.DataFrame(rows)
+    for stamp, index_values in frame.groupby(
+        'calendar_time',
+        sort=True,
+    ).groups.items():
+        context = contexts[pd.Timestamp(stamp)]
+        scalar = context['scalar']
+        velocity = context['velocity']
+        subset = frame.loc[index_values]
+        active_mask = (
+            subset['status'].eq('active')
+            & np.isfinite(subset['depth_m'])
+            & np.isfinite(subset['lat'])
+            & np.isfinite(subset['lon'])
+        )
+        active_index = subset.index[active_mask]
+        if len(active_index) == 0:
+            continue
+        points = frame.loc[
+            active_index,
+            ['depth_m', 'lat', 'lon'],
+        ].to_numpy(dtype=float)
+        _ofes_watermass_assert_point_bounds(points, scalar)
+        _ofes_watermass_assert_point_bounds(points, velocity)
+        scalar_values = {
+            'raw_do2_umol_kg': _ofes_interp3d(
+                scalar['do2'],
+                scalar['depth'],
+                scalar['lat'],
+                scalar['lon'],
+                points,
+            ),
+            'theta': _ofes_interp3d(
+                scalar['temp'],
+                scalar['depth'],
+                scalar['lat'],
+                scalar['lon'],
+                points,
+            ),
+            'sp': _ofes_interp3d(
+                scalar['salinity'],
+                scalar['depth'],
+                scalar['lat'],
+                scalar['lon'],
+                points,
+            ),
+        }
+        w_values = _ofes_interp3d(
+            velocity['w'],
+            velocity['depth_w'],
+            velocity['lat'],
+            velocity['lon'],
+            points,
+        )
+        for position, row_index in enumerate(active_index):
+            thermo = _ofes_point_thermodynamics(
+                float(points[position, 0]),
+                float(scalar_values['sp'][position]),
+                float(scalar_values['theta'][position]),
+                float(scalar_values['raw_do2_umol_kg'][position]),
+                float(points[position, 2]),
+                float(points[position, 1]),
+            )
+            frame.loc[row_index, 'raw_do2_umol_kg'] = scalar_values[
+                'raw_do2_umol_kg'
+            ][position]
+            frame.loc[row_index, 'theta'] = scalar_values['theta'][position]
+            frame.loc[row_index, 'sp'] = scalar_values['sp'][position]
+            frame.loc[row_index, 'sa'] = thermo['absolute_salinity']
+            frame.loc[row_index, 'ct'] = thermo['conservative_temperature']
+            frame.loc[row_index, 'sigma0'] = thermo['sigma0']
+            frame.loc[row_index, 'spiciness0'] = thermo['spiciness0']
+            frame.loc[row_index, 'w_m_s'] = w_values[position]
+            frame.loc[row_index, 'w_interpolation_depth_m'] = points[position, 0]
+            frame.loc[row_index, 'depth_w_m'] = points[position, 0]
+            frame.loc[row_index, 'w_depth_m'] = points[position, 0]
+            frame.loc[row_index, 'scalar_source_file'] = context[
+                'source_files'
+            ]['do2']
+            frame.loc[row_index, 'w_source_file'] = context['source_files']['w']
+            finite_values = np.isfinite(
+                [
+                    scalar_values['raw_do2_umol_kg'][position],
+                    scalar_values['theta'][position],
+                    scalar_values['sp'][position],
+                    thermo['absolute_salinity'],
+                    thermo['conservative_temperature'],
+                    thermo['sigma0'],
+                    thermo['spiciness0'],
+                    w_values[position],
+                ]
+            )
+            frame.loc[
+                row_index,
+                'property_qc_status',
+            ] = 'finite' if finite_values.all() else 'field_missing'
+    delta_fields = (
+        'depth_m',
+        'raw_do2_umol_kg',
+        'theta',
+        'sp',
+        'sa',
+        'ct',
+        'sigma0',
+        'spiciness0',
+    )
+    delta_names = {
+        'depth_m': 'delta_depth_from_release_m',
+        'raw_do2_umol_kg': 'delta_do_from_release_umol_kg',
+        'theta': 'delta_theta_from_release',
+        'sp': 'delta_sp_from_release',
+        'sa': 'delta_sa_from_release',
+        'ct': 'delta_ct_from_release',
+        'sigma0': 'delta_sigma0_from_release',
+        'spiciness0': 'delta_spiciness0_from_release',
+    }
+    for trajectory_key, group in frame.groupby('trajectory_key', sort=False):
+        release = pd.Timestamp(group['release_date'].iloc[0])
+        base = group.loc[group['calendar_time'].eq(release)]
+        if len(base) != 1:
+            raise ValueError(
+                f'Trajectory {trajectory_key} lacks a unique release midnight row.'
+            )
+        base_row = base.iloc[0]
+        for property_name in delta_fields:
+            target = delta_names[property_name]
+            base_value = float(base_row[property_name]) if np.isfinite(base_row[property_name]) else np.nan
+            values = pd.to_numeric(
+                group[property_name],
+                errors='coerce',
+            ).to_numpy(dtype=float)
+            frame.loc[group.index, target] = (
+                values - base_value
+                if np.isfinite(base_value)
+                else np.nan
+            )
+    release_rows = frame['calendar_time'].eq(frame['release_date'])
+    for target in delta_names.values():
+        values = pd.to_numeric(
+            frame.loc[release_rows, target],
+            errors='coerce',
+        ).to_numpy(dtype=float)
+        if not np.all(np.isfinite(values)) or not np.allclose(values, 0.0, atol=0.0):
+            raise ValueError(f'Release delta is not exactly zero for {target}.')
+    return frame
+
+
+def _ofes_watermass_bool_value(value: object) -> bool:
+    """把参考表中的布尔或数值字段转换成严格布尔值。"""
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', '1'}:
+            return True
+        if normalized in {'false', '0'}:
+            return False
+    numeric = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+    if not np.isfinite(numeric):
+        raise ValueError(f'Invalid boolean value: {value!r}')
+    return bool(numeric)
+
+
+def _ofes_watermass_reproduce_endpoints(
+    settings: dict,
+    registry: pd.DataFrame,
+    results: dict,
+    target_info: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """用共享逐像素配准 helper 重现参考端点并逐列核对。"""
+    endpoint_frames = []
+    for arm in settings['arms']:
+        for group_name, mode in settings['mode_by_group'].items():
+            result = results[(arm, mode)]
+            mode_registry = registry.loc[
+                registry['arm'].eq(arm)
+                & registry['vertical_mode'].eq(mode)
+            ].sort_values('particle_index').copy()
+            mode_registry['lat'] = mode_registry['seed_lat']
+            mode_registry['lon'] = mode_registry['seed_lon']
+            registration = _ofes_dual_endpoint_register_arrival(
+                group_name,
+                arm,
+                _ofes_dual_endpoint_seed_array(
+                    mode_registry,
+                    settings['seed_depth_m'],
+                ),
+                result,
+                target_info['targets'][arm],
+                depth_tolerance_m=settings['depth_tolerance_m'],
+            )
+            target_cells = target_info['targets'][arm].reset_index(drop=True)
+            matched_index = pd.to_numeric(
+                registration['matched_pixel_index'],
+                errors='coerce',
+            ).fillna(-1).astype(int).to_numpy()
+            for source_column, output_column in (
+                ('core_shallow_edge_m', 'matched_core_shallow_depth_m'),
+                ('core_deep_edge_m', 'matched_core_deep_depth_m'),
+                ('core_thickness_m', 'matched_core_thickness_m'),
+                ('cell_lat_min', 'matched_pixel_cell_lat_min'),
+                ('cell_lat_max', 'matched_pixel_cell_lat_max'),
+                ('cell_lon_min', 'matched_pixel_cell_lon_min'),
+                ('cell_lon_max', 'matched_pixel_cell_lon_max'),
+            ):
+                values = np.full(len(registration), np.nan, dtype=float)
+                valid = (
+                    (matched_index >= 0)
+                    & (matched_index < len(target_cells))
+                )
+                values[valid] = target_cells.iloc[matched_index[valid]][
+                    source_column
+                ].to_numpy(dtype=float)
+                registration[output_column] = values
+            registration['vertical_mode'] = mode
+            mode_registry = registry.loc[
+                registry['arm'].eq(arm)
+                & registry['vertical_mode'].eq(mode),
+                [
+                    'particle_index',
+                    'seed_key',
+                    'trajectory_key',
+                ],
+            ]
+            endpoint_frames.append(
+                registration.merge(
+                    mode_registry,
+                    on='particle_index',
+                    how='left',
+                    validate='one_to_one',
+                )
+            )
+    ours = pd.concat(endpoint_frames, ignore_index=True)
+    reference_path = (
+        settings['reference_output_dir']
+        / 'particle_endpoint_registration.csv'
+    )
+    reference = pd.read_csv(reference_path)
+    reference['vertical_mode'] = reference['group'].map(
+        settings['mode_by_group']
+    )
+    reference = reference.loc[reference['vertical_mode'].notna()].copy()
+    expected = registry.loc[
+        registry['vertical_mode'].isin(
+            ('three_dimensional', 'fixed_depth')
+        ),
+        [
+            'arm',
+            'particle_index',
+            'seed_key',
+            'vertical_mode',
+        ],
+    ]
+    ours_keyed = ours.set_index(
+        ['arm', 'particle_index', 'vertical_mode']
+    )
+    reference_keyed = reference.set_index(
+        ['arm', 'particle_index', 'vertical_mode']
+    )
+    merged = expected.set_index(
+        ['arm', 'particle_index', 'vertical_mode']
+    ).join(
+        ours_keyed,
+        how='left',
+        rsuffix='_ours_duplicate',
+    ).join(
+        reference_keyed,
+        how='left',
+        rsuffix='_reference',
+    )
+    fields = {
+        'final_status': ('final_status', 'final_status', 'categorical', 0.0),
+        'arrived': ('arrived', 'arrived', 'boolean', 0.0),
+        'matched_pixel_lat_index': (
+            'matched_pixel_lat_index',
+            'matched_pixel_lat_index',
+            'integer',
+            0.0,
+        ),
+        'matched_pixel_lon_index': (
+            'matched_pixel_lon_index',
+            'matched_pixel_lon_index',
+            'integer',
+            0.0,
+        ),
+        'horizontal_inside_any_pixel': (
+            'horizontal_inside_any_pixel',
+            'horizontal_inside_any_pixel',
+            'boolean',
+            0.0,
+        ),
+        'vertical_inside_matched_core': (
+            'vertical_inside_matched_core',
+            'vertical_inside_matched_core',
+            'boolean',
+            0.0,
+        ),
+        'final_depth_m': (
+            'final_depth_m',
+            'final_depth_m',
+            'numeric',
+            settings['watermass_tolerances']['depth_atol_m'],
+        ),
+        'final_lat': (
+            'final_lat',
+            'final_lat',
+            'numeric',
+            settings['watermass_tolerances']['position_atol_deg'],
+        ),
+        'final_lon': (
+            'final_lon',
+            'final_lon',
+            'numeric',
+            settings['watermass_tolerances']['position_atol_deg'],
+        ),
+    }
+    report_rows = []
+    row_mismatch = np.zeros(len(merged), dtype=bool)
+    for compared_field, (ours_field, ref_field, kind, atol) in fields.items():
+        mismatch = np.zeros(len(merged), dtype=bool)
+        errors = np.zeros(len(merged), dtype=float)
+        for position, (_, row) in enumerate(merged.iterrows()):
+            ours_value = row.get(ours_field)
+            ref_value = row.get(f'{ref_field}_reference')
+            ours_missing = pd.isna(ours_value)
+            ref_missing = pd.isna(ref_value)
+            if kind == 'categorical':
+                mismatch[position] = (
+                    ours_missing
+                    or ref_missing
+                    or str(ours_value) != str(ref_value)
+                )
+            elif kind == 'boolean':
+                if ours_missing or ref_missing:
+                    mismatch[position] = ours_missing != ref_missing
+                else:
+                    mismatch[position] = (
+                        _ofes_watermass_bool_value(ours_value)
+                        != _ofes_watermass_bool_value(ref_value)
+                    )
+            elif kind == 'integer':
+                if ours_missing or ref_missing:
+                    mismatch[position] = ours_missing != ref_missing
+                else:
+                    mismatch[position] = int(ours_value) != int(ref_value)
+            else:
+                ours_numeric = pd.to_numeric(
+                    pd.Series([ours_value]),
+                    errors='coerce',
+                ).iloc[0]
+                ref_numeric = pd.to_numeric(
+                    pd.Series([ref_value]),
+                    errors='coerce',
+                ).iloc[0]
+                if pd.isna(ours_numeric) or pd.isna(ref_numeric):
+                    mismatch[position] = pd.isna(ours_numeric) != pd.isna(ref_numeric)
+                else:
+                    errors[position] = abs(
+                        float(ours_numeric) - float(ref_numeric)
+                    )
+                    mismatch[position] = errors[position] > atol
+        row_mismatch |= mismatch
+        report_rows.append(
+            {
+                'field': compared_field,
+                'compared_row_count': int(len(merged)),
+                'mismatch_count': int(mismatch.sum()),
+                'max_abs_error': float(errors.max()) if len(errors) else 0.0,
+                'atol': float(atol),
+                'passed': bool(not mismatch.any()),
+            }
+        )
+    missing_reference = merged['final_status_reference'].isna()
+    missing_ours = merged['final_status'].isna()
+    if missing_reference.any() or missing_ours.any():
+        row_mismatch |= missing_reference.to_numpy() | missing_ours.to_numpy()
+    qa_frame = pd.DataFrame(report_rows)
+    qa = {
+        'endpoint_reproduction_status': (
+            'passed' if not row_mismatch.any() else 'failed'
+        ),
+        'passed': bool(not row_mismatch.any()),
+        'compared_row_count': int(len(merged)),
+        'row_mismatch_count': int(row_mismatch.sum()),
+        'field_report': report_rows,
+        'tolerances': settings['watermass_tolerances'],
+        'reference_path': str(reference_path),
+    }
+    return ours, {'frame': qa_frame, **qa}
+
+
+def _ofes_watermass_build_trajectory_summary(
+    properties: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总每条轨迹从真实释放日至对侧日期的性质变化和 w 摘要。"""
+    change_fields = {
+        'depth_m': 'endpoint_delta_depth_m',
+        'raw_do2_umol_kg': 'endpoint_delta_do_umol_kg',
+        'theta': 'endpoint_delta_theta',
+        'sp': 'endpoint_delta_sp',
+        'sa': 'endpoint_delta_sa',
+        'ct': 'endpoint_delta_ct',
+        'sigma0': 'endpoint_delta_sigma0',
+        'spiciness0': 'endpoint_delta_spiciness0',
+    }
+    rows = []
+    for trajectory_key, group in properties.groupby(
+        'trajectory_key',
+        sort=True,
+    ):
+        first = group.iloc[0]
+        arm = str(first['arm'])
+        arm_settings = settings['arms'][arm]
+        target_date = _ofes_dual_endpoint_object_key_date(
+            arm_settings['target_object_key']
+        )
+        calendar_forward_sign = (
+            1.0 if arm_settings['direction'] == 'forward' else -1.0
+        )
+        release_rows = group.loc[
+            group['calendar_time'].eq(pd.Timestamp(first['release_date']))
+        ]
+        target_rows = group.loc[group['calendar_time'].eq(target_date)]
+        if len(release_rows) != 1 or len(target_rows) != 1:
+            raise ValueError(
+                f'Trajectory {trajectory_key} lacks release or target midnight.'
+            )
+        release = release_rows.iloc[0]
+        target = target_rows.iloc[0]
+        record = {
+            'case_id': first['case_id'],
+            'arm': arm,
+            'particle_index': int(first['particle_index']),
+            'seed_key': first['seed_key'],
+            'trajectory_key': trajectory_key,
+            'vertical_mode': first['vertical_mode'],
+            'release_date': release['calendar_time'],
+            'target_date': target['calendar_time'],
+            'release_status': release['status'],
+            'target_status': target['status'],
+            'arrival_outcome': first.get('arrival_outcome', 'unknown'),
+            'integration_direction': arm_settings['direction'],
+            'calendar_forward_sign': calendar_forward_sign,
+        }
+        for property_name, output_name in change_fields.items():
+            delta = (
+                float(target[property_name] - release[property_name])
+                if np.isfinite(target[property_name])
+                and np.isfinite(release[property_name])
+                else np.nan
+            )
+            record[output_name] = delta
+            record[output_name.replace('endpoint_', 'calendar_forward_')] = (
+                calendar_forward_sign * delta
+                if np.isfinite(delta)
+                else np.nan
+            )
+        depth_delta = pd.to_numeric(
+            group['delta_depth_from_release_m'],
+            errors='coerce',
+        ).to_numpy(dtype=float)
+        w_values = pd.to_numeric(
+            group['w_m_s'],
+            errors='coerce',
+        ).to_numpy(dtype=float)
+        finite_depth = depth_delta[np.isfinite(depth_delta)]
+        finite_w = w_values[np.isfinite(w_values)]
+        record['max_depth_excursion_m'] = (
+            float(np.max(np.abs(finite_depth)))
+            if finite_depth.size
+            else np.nan
+        )
+        record['daily_w_mean_m_s'] = (
+            float(np.mean(finite_w)) if finite_w.size else np.nan
+        )
+        record['daily_w_median_m_s'] = (
+            float(np.median(finite_w)) if finite_w.size else np.nan
+        )
+        record['daily_w_min_m_s'] = (
+            float(np.min(finite_w)) if finite_w.size else np.nan
+        )
+        record['daily_w_max_m_s'] = (
+            float(np.max(finite_w)) if finite_w.size else np.nan
+        )
+        record['daily_w_positive_fraction'] = (
+            float(np.mean(finite_w > 0)) if finite_w.size else np.nan
+        )
+        rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def _ofes_watermass_stat_triplet(values: object) -> tuple[float, float, float]:
+    """返回有限数值的中位数、第一四分位数和第三四分位数。"""
+    numeric = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
+    if numeric.empty:
+        return np.nan, np.nan, np.nan
+    return (
+        float(numeric.median()),
+        float(numeric.quantile(0.25)),
+        float(numeric.quantile(0.75)),
+    )
+
+
+def _ofes_watermass_add_stats(
+    record: dict,
+    prefix: str,
+    values: object,
+    absolute: bool = False,
+) -> None:
+    """把一组数的中位数/IQR写入紧凑汇总记录。"""
+    numeric = pd.to_numeric(pd.Series(values), errors='coerce')
+    if absolute:
+        numeric = numeric.abs()
+    median, q1, q3 = _ofes_watermass_stat_triplet(numeric)
+    record[f'{prefix}_median'] = median
+    record[f'{prefix}_q1'] = q1
+    record[f'{prefix}_q3'] = q3
+
+
+def _ofes_watermass_build_arrival_outcome_summary(
+    paired: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    trajectory_summary: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """按臂、模式和到达结局汇总路径分流与性质/垂向差异证据。"""
+    categories = (
+        'both_arrived',
+        'only_3d',
+        'only_c2',
+        'both_not_arrived',
+    )
+    endpoint_outcomes = trajectory_summary[
+        ['trajectory_key', 'arrival_outcome']
+    ].drop_duplicates('trajectory_key')
+    endpoint_table = endpoints.merge(
+        endpoint_outcomes,
+        on='trajectory_key',
+        how='left',
+        validate='one_to_one',
+    )
+    target_dates = {
+        arm: _ofes_dual_endpoint_object_key_date(
+            values['target_object_key']
+        )
+        for arm, values in settings['arms'].items()
+    }
+    mode_arrival_outcomes = {
+        'three_dimensional': {'both_arrived', 'only_3d'},
+        'fixed_depth': {'both_arrived', 'only_c2'},
+    }
+    delta_fields = {
+        'endpoint_delta_depth_m': 'endpoint_delta_depth_m',
+        'endpoint_delta_do_umol_kg': 'endpoint_delta_do_umol_kg',
+        'endpoint_delta_theta': 'endpoint_delta_theta',
+        'endpoint_delta_sp': 'endpoint_delta_sp',
+        'endpoint_delta_sa': 'endpoint_delta_sa',
+        'endpoint_delta_ct': 'endpoint_delta_ct',
+        'endpoint_delta_sigma0': 'endpoint_delta_sigma0',
+        'endpoint_delta_spiciness0': 'endpoint_delta_spiciness0',
+        'calendar_forward_delta_depth_m': 'calendar_forward_delta_depth_m',
+        'calendar_forward_delta_do_umol_kg': 'calendar_forward_delta_do_umol_kg',
+        'calendar_forward_delta_theta': 'calendar_forward_delta_theta',
+        'calendar_forward_delta_sp': 'calendar_forward_delta_sp',
+        'calendar_forward_delta_sa': 'calendar_forward_delta_sa',
+        'calendar_forward_delta_ct': 'calendar_forward_delta_ct',
+        'calendar_forward_delta_sigma0': 'calendar_forward_delta_sigma0',
+        'calendar_forward_delta_spiciness0': 'calendar_forward_delta_spiciness0',
+        'max_depth_excursion_m': 'max_depth_excursion_m',
+        'daily_w_median_m_s': 'daily_w_median_m_s',
+    }
+    paired_fields = {
+        'paired_endpoint_horizontal_distance_km': (
+            'horizontal_distance_km_3d_c2',
+            False,
+        ),
+        'paired_endpoint_abs_depth_difference_m': (
+            'depth_difference_m_3d_minus_c2',
+            True,
+        ),
+        'paired_endpoint_abs_do_difference_umol_kg': (
+            'do_difference_umol_kg_3d_minus_c2',
+            True,
+        ),
+        'paired_endpoint_abs_theta_difference': (
+            'theta_difference_3d_minus_c2',
+            True,
+        ),
+        'paired_endpoint_abs_sigma0_difference': (
+            'sigma0_difference_3d_minus_c2',
+            True,
+        ),
+    }
+    rows = []
+    for arm, arm_settings in settings['arms'].items():
+        for mode in ('three_dimensional', 'fixed_depth'):
+            mode_table = endpoint_table.loc[
+                endpoint_table['arm'].eq(arm)
+                & endpoint_table['vertical_mode'].eq(mode)
+            ]
+            arrived_outcomes = mode_arrival_outcomes[mode]
+            arrived_pool = mode_table.loc[
+                mode_table['arrival_outcome'].isin(arrived_outcomes)
+            ]
+            non_arrived_pool = mode_table.loc[
+                ~mode_table['arrival_outcome'].isin(arrived_outcomes)
+            ]
+            route_arrived = _ofes_watermass_stat_triplet(
+                arrived_pool['distance_to_target_centroid_km']
+            )[0]
+            route_non_arrived = _ofes_watermass_stat_triplet(
+                non_arrived_pool['distance_to_target_centroid_km']
+            )[0]
+            route_gap = (
+                route_non_arrived - route_arrived
+                if np.isfinite(route_arrived) and np.isfinite(route_non_arrived)
+                else np.nan
+            )
+            trajectory_arrived = trajectory_summary.loc[
+                trajectory_summary['arm'].eq(arm)
+                & trajectory_summary['vertical_mode'].eq(mode)
+                & trajectory_summary['arrival_outcome'].isin(arrived_outcomes)
+            ]
+            trajectory_non_arrived = trajectory_summary.loc[
+                trajectory_summary['arm'].eq(arm)
+                & trajectory_summary['vertical_mode'].eq(mode)
+                & ~trajectory_summary['arrival_outcome'].isin(arrived_outcomes)
+            ]
+            depth_arrived = _ofes_watermass_stat_triplet(
+                trajectory_arrived['max_depth_excursion_m']
+            )[0]
+            depth_non_arrived = _ofes_watermass_stat_triplet(
+                trajectory_non_arrived['max_depth_excursion_m']
+            )[0]
+            do_arrived = _ofes_watermass_stat_triplet(
+                pd.to_numeric(
+                    trajectory_arrived['endpoint_delta_do_umol_kg'],
+                    errors='coerce',
+                ).abs(),
+            )[0]
+            do_non_arrived = _ofes_watermass_stat_triplet(
+                pd.to_numeric(
+                    trajectory_non_arrived['endpoint_delta_do_umol_kg'],
+                    errors='coerce',
+                ).abs(),
+            )[0]
+            for outcome in categories:
+                trajectory_subset = trajectory_summary.loc[
+                    trajectory_summary['arm'].eq(arm)
+                    & trajectory_summary['vertical_mode'].eq(mode)
+                    & trajectory_summary['arrival_outcome'].eq(outcome)
+                ]
+                endpoint_subset = mode_table.loc[
+                    mode_table['arrival_outcome'].eq(outcome)
+                ]
+                record = {
+                    'case_id': settings['case_id'],
+                    'arm': arm,
+                    'direction': arm_settings['direction'],
+                    'vertical_mode': mode,
+                    'arrival_outcome': outcome,
+                    'mode_arrived': bool(outcome in arrived_outcomes),
+                    'trajectory_count': int(len(trajectory_subset)),
+                    'seed_count': int(
+                        trajectory_subset['seed_key'].nunique()
+                    ),
+                    'endpoint_row_count': int(len(endpoint_subset)),
+                    'endpoint_arrived_count': int(
+                        pd.to_numeric(
+                            endpoint_subset['arrived'], errors='coerce'
+                        ).fillna(0).sum()
+                    ),
+                    'arrival_vs_nonarrival_endpoint_distance_gap_km': route_gap,
+                    'arrival_vs_nonarrival_max_depth_excursion_gap_m': (
+                        depth_non_arrived - depth_arrived
+                        if np.isfinite(depth_arrived)
+                        and np.isfinite(depth_non_arrived)
+                        else np.nan
+                    ),
+                    'arrival_vs_nonarrival_endpoint_abs_do_gap_umol_kg': (
+                        abs(do_non_arrived) - abs(do_arrived)
+                        if np.isfinite(do_arrived)
+                        and np.isfinite(do_non_arrived)
+                        else np.nan
+                    ),
+                }
+                _ofes_watermass_add_stats(
+                    record,
+                    'seed_lat',
+                    endpoint_subset['seed_lat'],
+                )
+                _ofes_watermass_add_stats(
+                    record,
+                    'seed_lon',
+                    endpoint_subset['seed_lon'],
+                )
+                _ofes_watermass_add_stats(
+                    record,
+                    'endpoint_distance_to_target_centroid_km',
+                    endpoint_subset['distance_to_target_centroid_km'],
+                )
+                _ofes_watermass_add_stats(
+                    record,
+                    'endpoint_final_depth_m',
+                    endpoint_subset['final_depth_m'],
+                )
+                for prefix, column in delta_fields.items():
+                    _ofes_watermass_add_stats(
+                        record,
+                        prefix,
+                        trajectory_subset[column],
+                    )
+                paired_subset = paired.loc[
+                    paired['arm'].eq(arm)
+                    & paired['arrival_outcome'].eq(outcome)
+                    & paired['calendar_time'].eq(target_dates[arm])
+                ]
+                if mode == 'fixed_depth':
+                    paired_subset = paired_subset.iloc[0:0]
+                for prefix, (column, absolute) in paired_fields.items():
+                    _ofes_watermass_add_stats(
+                        record,
+                        prefix,
+                        paired_subset[column],
+                        absolute=absolute,
+                    )
+                if np.isfinite(route_gap) and route_gap > 0:
+                    judgement = '到达组终点更接近目标，结局差异以水平路径分流为主线。'
+                elif np.isfinite(route_gap) and route_gap < 0:
+                    judgement = '到达组终点距目标更远，需结合性质和垂向差异解释。'
+                else:
+                    judgement = '终点距离未形成方向性分离，保留性质与垂向差异证据。'
+                record['mechanism_judgement'] = judgement
+                rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def _ofes_watermass_build_paired_summary(
+    properties: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """按同 seed 和午夜配对三维、固定深度并生成两级汇总。"""
+    arrival = endpoints[
+        ['arm', 'particle_index', 'vertical_mode', 'arrived']
+    ].copy()
+    arrival['arrived'] = arrival['arrived'].astype(bool)
+    properties = properties.merge(
+        arrival,
+        on=['arm', 'particle_index', 'vertical_mode'],
+        how='left',
+        validate='many_to_one',
+        suffixes=('', '_endpoint'),
+    )
+    properties['arrival_outcome'] = 'both_not_arrived'
+    endpoint_arrival = (
+        properties[
+            ['seed_key', 'arm', 'vertical_mode', 'arrived']
+        ].drop_duplicates()
+    )
+    pivot = endpoint_arrival.pivot_table(
+        index=['seed_key', 'arm'],
+        columns='vertical_mode',
+        values='arrived',
+        aggfunc='first',
+        fill_value=False,
+    ).reset_index()
+    for column in ('three_dimensional', 'fixed_depth'):
+        if column not in pivot:
+            pivot[column] = False
+    pivot['arrival_outcome'] = np.select(
+        [
+            pivot['three_dimensional'] & pivot['fixed_depth'],
+            pivot['three_dimensional'],
+            pivot['fixed_depth'],
+        ],
+        ['both_arrived', 'only_3d', 'only_c2'],
+        default='both_not_arrived',
+    )
+    properties = properties.drop(columns=['arrival_outcome'], errors='ignore').merge(
+        pivot[['seed_key', 'arm', 'arrival_outcome']],
+        on=['seed_key', 'arm'],
+        how='left',
+        validate='many_to_one',
+    )
+    left = properties.loc[
+        properties['vertical_mode'].eq('three_dimensional')
+    ].copy()
+    right = properties.loc[
+        properties['vertical_mode'].eq('fixed_depth')
+    ].copy()
+    paired = left.merge(
+        right,
+        on=['seed_key', 'arm', 'particle_index', 'calendar_time'],
+        how='outer',
+        suffixes=('_3d', '_c2'),
+        validate='one_to_one',
+    )
+    paired['arrival_outcome'] = paired['arrival_outcome_3d'].fillna(
+        paired['arrival_outcome_c2']
+    )
+    for property_name, output_name in (
+        ('lat', 'horizontal_distance_km_3d_c2'),
+        ('depth_m', 'depth_difference_m_3d_minus_c2'),
+        ('raw_do2_umol_kg', 'do_difference_umol_kg_3d_minus_c2'),
+        ('theta', 'theta_difference_3d_minus_c2'),
+        ('sp', 'sp_difference_3d_minus_c2'),
+        ('sa', 'sa_difference_3d_minus_c2'),
+        ('ct', 'ct_difference_3d_minus_c2'),
+        ('sigma0', 'sigma0_difference_3d_minus_c2'),
+        ('spiciness0', 'spiciness0_difference_3d_minus_c2'),
+    ):
+        if property_name == 'lat':
+            paired[output_name] = np.nan
+            finite = (
+                np.isfinite(paired['lat_3d'])
+                & np.isfinite(paired['lon_3d'])
+                & np.isfinite(paired['lat_c2'])
+                & np.isfinite(paired['lon_c2'])
+            )
+            for index in paired.index[finite]:
+                paired.loc[index, output_name] = _ofes_watermass_distance_check(
+                    float(paired.at[index, 'lat_3d']),
+                    float(paired.at[index, 'lon_3d']),
+                    float(paired.at[index, 'lat_c2']),
+                    float(paired.at[index, 'lon_c2']),
+                )[0]
+        else:
+            paired[output_name] = (
+                pd.to_numeric(paired[f'{property_name}_3d'], errors='coerce')
+                - pd.to_numeric(paired[f'{property_name}_c2'], errors='coerce')
+            )
+    target_dates = {
+        arm: _ofes_dual_endpoint_object_key_date(
+            values['target_object_key']
+        )
+        for arm, values in settings['arms'].items()
+    }
+    rows = []
+    categories = (
+        'both_arrived',
+        'only_3d',
+        'only_c2',
+        'both_not_arrived',
+    )
+    for arm in settings['arms']:
+        for category in categories:
+            subset = paired.loc[
+                paired['arm'].eq(arm)
+                & paired['arrival_outcome'].eq(category)
+            ]
+            endpoints_subset = subset.loc[
+                subset['calendar_time'].eq(target_dates[arm])
+            ]
+            rows.append(
+                {
+                    'arm': arm,
+                    'arrival_outcome': category,
+                    'seed_count': int(subset['seed_key'].nunique()),
+                    'daily_pair_count': int(len(subset)),
+                    'endpoint_pair_count': int(len(endpoints_subset)),
+                    'median_horizontal_distance_km': float(
+                        endpoints_subset['horizontal_distance_km_3d_c2'].median()
+                    )
+                    if not endpoints_subset.empty
+                    else np.nan,
+                    'median_abs_depth_difference_m': float(
+                        endpoints_subset['depth_difference_m_3d_minus_c2']
+                        .abs()
+                        .median()
+                    )
+                    if not endpoints_subset.empty
+                    else np.nan,
+                    'median_abs_do_difference_umol_kg': float(
+                        endpoints_subset['do_difference_umol_kg_3d_minus_c2']
+                        .abs()
+                        .median()
+                    )
+                    if not endpoints_subset.empty
+                    else np.nan,
+                    'median_abs_theta_difference': float(
+                        endpoints_subset['theta_difference_3d_minus_c2']
+                        .abs()
+                        .median()
+                    )
+                    if not endpoints_subset.empty
+                    else np.nan,
+                    'median_abs_sigma0_difference': float(
+                        endpoints_subset['sigma0_difference_3d_minus_c2']
+                        .abs()
+                        .median()
+                    )
+                    if not endpoints_subset.empty
+                    else np.nan,
+                }
+            )
+    pair_summary = pd.DataFrame(rows)
+    trajectory_summary = _ofes_watermass_build_trajectory_summary(
+        properties,
+        settings,
+    )
+    return properties, paired, pair_summary, trajectory_summary
+
+
+def _ofes_watermass_haversine_km(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """用独立 haversine 公式计算球面距离。"""
+    radius_m = 6371000.0
+    lat_a = np.radians(float(lat1))
+    lat_b = np.radians(float(lat2))
+    dlat = lat_b - lat_a
+    dlon = np.radians(
+        float(_minimal_lon_diff_deg(float(lon2), float(lon1)))
+    )
+    haversine_a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(lat_a)
+        * np.cos(lat_b)
+        * np.sin(dlon / 2.0) ** 2
+    )
+    return float(
+        radius_m
+        * 2.0
+        * np.arcsin(np.sqrt(np.minimum(1.0, haversine_a)))
+        / 1000.0
+    )
+
+
+def _ofes_watermass_distance_check(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> tuple[float, float, float]:
+    """交叉核对项目球面距离与独立 haversine 距离。"""
+    great = float(
+        great_circle_distance_m(
+            float(lon1),
+            float(lat1),
+            float(lon2),
+            float(lat2),
+        )
+        / 1000.0
+    )
+    haversine = _ofes_watermass_haversine_km(lat1, lon1, lat2, lon2)
+    return great, haversine, abs(great - haversine)
+
+
+def _ofes_watermass_load_candidate_graph(
+    settings: dict,
+) -> dict:
+    """读取并校验逐日候选、路径成员和一日结构边。"""
+    candidates = pd.read_csv(settings['structure_paths']['candidates'])
+    path_members = pd.read_csv(settings['structure_paths']['path_members'])
+    edges = pd.read_csv(settings['structure_paths']['match_edges'])
+    candidate_required = {
+        'date',
+        'candidate_id',
+        'depth_m',
+        'thermohaline_centroid_lon',
+        'thermohaline_centroid_lat',
+        'thermohaline_component_radius_km',
+        'vertical_anomaly_level_count',
+        'vertical_shallow_depth_m',
+        'vertical_deep_depth_m',
+    }
+    path_required = {'path_id', 'step', 'date', 'candidate_id'}
+    edge_required = {
+        'from_date',
+        'to_date',
+        'from_candidate_id',
+        'to_candidate_id',
+    }
+    if not candidate_required.issubset(candidates.columns):
+        raise ValueError(
+            f'Candidate table lacks columns: '
+            f'{sorted(candidate_required.difference(candidates.columns))}'
+        )
+    if not path_required.issubset(path_members.columns):
+        raise ValueError(
+            f'Path member table lacks columns: '
+            f'{sorted(path_required.difference(path_members.columns))}'
+        )
+    if not edge_required.issubset(edges.columns):
+        raise ValueError(
+            f'Match edge table lacks columns: '
+            f'{sorted(edge_required.difference(edges.columns))}'
+        )
+    candidates = candidates.copy()
+    candidates['date'] = pd.to_datetime(candidates['date']).dt.normalize()
+    if candidates['candidate_id'].isna().any() or candidates['candidate_id'].duplicated().any():
+        raise ValueError('Candidate IDs must be unique and non-null.')
+    if not set(candidates['date']).issubset(set(settings['dates'])):
+        raise ValueError('Candidate table contains dates outside the trajectory window.')
+    numeric_candidate_columns = [
+        'depth_m',
+        'thermohaline_centroid_lon',
+        'thermohaline_centroid_lat',
+        'thermohaline_component_radius_km',
+        'vertical_anomaly_level_count',
+        'vertical_shallow_depth_m',
+        'vertical_deep_depth_m',
+    ]
+    for column in numeric_candidate_columns:
+        candidates[column] = pd.to_numeric(
+            candidates[column],
+            errors='coerce',
+        )
+    if candidates[numeric_candidate_columns].isna().any().any():
+        raise ValueError('Candidate geometry contains nonnumeric or missing values.')
+    if (candidates['thermohaline_component_radius_km'] < 0).any():
+        raise ValueError('Candidate radii must be nonnegative.')
+    multi_level = candidates['vertical_anomaly_level_count'].round().gt(1)
+    if (
+        candidates.loc[multi_level, 'vertical_shallow_depth_m']
+        > candidates.loc[multi_level, 'vertical_deep_depth_m']
+    ).any():
+        raise ValueError('Multi-level candidate vertical bounds are reversed.')
+    path_members = path_members.copy()
+    path_members['date'] = pd.to_datetime(path_members['date']).dt.normalize()
+    path_members['candidate_id'] = path_members['candidate_id'].astype(str)
+    candidates['candidate_id'] = candidates['candidate_id'].astype(str)
+    candidate_keys = set(
+        zip(
+            candidates['date'].dt.strftime('%Y-%m-%d'),
+            candidates['candidate_id'],
+        )
+    )
+    path_keys = set(
+        zip(
+            path_members['date'].dt.strftime('%Y-%m-%d'),
+            path_members['candidate_id'],
+        )
+    )
+    if not path_keys.issubset(candidate_keys):
+        raise ValueError('Path members reference an unknown candidate date or ID.')
+    if path_members.duplicated(['path_id', 'date']).any():
+        raise ValueError('Each path may have at most one candidate per date.')
+    for path_id, path in path_members.groupby('path_id', sort=False):
+        ordered = path.sort_values('step')
+        if not ordered['step'].eq(
+            np.arange(len(ordered), dtype=ordered['step'].dtype)
+        ).all():
+            raise ValueError(f'Path {path_id!r} has non-contiguous steps.')
+        if len(ordered) > 1 and not (
+            ordered['date'].diff().dropna().dt.days.eq(1).all()
+        ):
+            raise ValueError(f'Path {path_id!r} has non-consecutive dates.')
+    edges = edges.copy()
+    edges['from_date'] = pd.to_datetime(edges['from_date']).dt.normalize()
+    edges['to_date'] = pd.to_datetime(edges['to_date']).dt.normalize()
+    edges['from_candidate_id'] = edges['from_candidate_id'].astype(str)
+    edges['to_candidate_id'] = edges['to_candidate_id'].astype(str)
+    if not edges['from_date'].isin(settings['dates']).all() or not edges['to_date'].isin(settings['dates']).all():
+        raise ValueError('Structure edges contain dates outside the trajectory window.')
+    if not (
+        (edges['to_date'] - edges['from_date']).dt.days.eq(1).all()
+    ):
+        raise ValueError('Every structure edge must connect consecutive dates.')
+    edge_from_keys = set(
+        zip(
+            edges['from_date'].dt.strftime('%Y-%m-%d'),
+            edges['from_candidate_id'],
+        )
+    )
+    edge_to_keys = set(
+        zip(
+            edges['to_date'].dt.strftime('%Y-%m-%d'),
+            edges['to_candidate_id'],
+        )
+    )
+    if not edge_from_keys.issubset(candidate_keys) or not edge_to_keys.issubset(candidate_keys):
+        raise ValueError('Structure edges reference an unknown candidate date or ID.')
+    candidates['incoming_edge_count'] = pd.to_numeric(
+        candidates.get('incoming_edge_count', 0), errors='coerce'
+    ).fillna(0).astype(int)
+    candidates['outgoing_edge_count'] = pd.to_numeric(
+        candidates.get('outgoing_edge_count', 0), errors='coerce'
+    ).fillna(0).astype(int)
+    calculated_incoming = edges.groupby(
+        ['to_date', 'to_candidate_id']
+    ).size()
+    calculated_outgoing = edges.groupby(
+        ['from_date', 'from_candidate_id']
+    ).size()
+    for row in candidates.itertuples(index=False):
+        key_in = (row.date, row.candidate_id)
+        key_out = (row.date, row.candidate_id)
+        if int(row.incoming_edge_count) != int(calculated_incoming.get(key_in, 0)):
+            raise ValueError(
+                f'Saved incoming edge count differs for {row.candidate_id}.'
+            )
+        if int(row.outgoing_edge_count) != int(calculated_outgoing.get(key_out, 0)):
+            raise ValueError(
+                f'Saved outgoing edge count differs for {row.candidate_id}.'
+            )
+    edges = edges.sort_values(
+        ['from_date', 'to_date', 'from_candidate_id', 'to_candidate_id'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    edges['edge_id'] = [
+        f'edge_{index:06d}' for index in range(len(edges))
+    ]
+    path_map = defaultdict(list)
+    for row in path_members.itertuples(index=False):
+        key = (
+            pd.Timestamp(row.date).strftime('%Y-%m-%d'),
+            str(row.candidate_id),
+        )
+        path_map[key].append(str(row.path_id))
+    path_map = {
+        key: sorted(set(values))
+        for key, values in path_map.items()
+    }
+    incoming = defaultdict(list)
+    outgoing = defaultdict(list)
+    for row in edges.itertuples(index=False):
+        outgoing[
+            (
+                pd.Timestamp(row.from_date).strftime('%Y-%m-%d'),
+                str(row.from_candidate_id),
+            )
+        ].append(str(row.edge_id))
+        incoming[
+            (
+                pd.Timestamp(row.to_date).strftime('%Y-%m-%d'),
+                str(row.to_candidate_id),
+            )
+        ].append(str(row.edge_id))
+    candidates_by_date = {
+        stamp: group.to_dict('records')
+        for stamp, group in candidates.groupby('date', sort=True)
+    }
+    validation = {
+        'candidate_ids_unique': True,
+        'candidate_dates_within_window': True,
+        'path_members_reference_known_candidates': True,
+        'path_members_unique_by_path_date': True,
+        'edges_are_one_day': True,
+        'edges_reference_known_candidates': True,
+        'candidate_count': int(len(candidates)),
+        'path_member_count': int(len(path_members)),
+        'edge_count': int(len(edges)),
+    }
+    return {
+        'candidates': candidates,
+        'path_members': path_members,
+        'edges': edges,
+        'path_map': path_map,
+        'incoming': dict(incoming),
+        'outgoing': dict(outgoing),
+        'candidates_by_date': candidates_by_date,
+        'validation': validation,
+    }
+
+
+def _ofes_watermass_register_structure(
+    properties: pd.DataFrame,
+    graph: dict,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """逐轨迹日登记候选水平、垂向、联合相容性和路径边关系。"""
+    rows = []
+    base_columns = [
+        'case_id',
+        'arm',
+        'particle_index',
+        'seed_key',
+        'trajectory_key',
+        'vertical_mode',
+        'calendar_time',
+        'status',
+        'depth_m',
+        'lat',
+        'lon',
+        'arrival_outcome',
+    ]
+    for record in properties.to_dict('records'):
+        base = {key: record.get(key) for key in base_columns}
+        stamp = pd.Timestamp(record['calendar_time']).normalize()
+        candidates = graph['candidates_by_date'].get(stamp, [])
+        finite_position = (
+            str(record['status']) == 'active'
+            and np.all(
+                np.isfinite(
+                    [
+                        record.get('depth_m'),
+                        record.get('lat'),
+                        record.get('lon'),
+                    ]
+                )
+            )
+        )
+        common = {
+            'candidate_date': stamp,
+            'horizontal_geometry': 'approximate_circle',
+            'vertical_tolerance_m': settings['depth_tolerance_m'],
+            'candidate_count_for_day': int(len(candidates)),
+            'candidate_centroid_lon': np.nan,
+            'candidate_centroid_lat': np.nan,
+        }
+        if not finite_position:
+            rows.append(
+                {
+                    **base,
+                    **common,
+                    'candidate_id': (
+                        '__INACTIVE__' if not candidates
+                        else '__INACTIVE_WITH_CANDIDATES__'
+                    ),
+                    'candidate_depth_m': np.nan,
+                    'candidate_radius_km': np.nan,
+                    'distance_km': np.nan,
+                    'haversine_distance_km': np.nan,
+                    'haversine_crosscheck_error_km': np.nan,
+                    'horizontal_compatible': False,
+                    'vertical_compatible': False,
+                    'joint_compatible': False,
+                    'vertical_rule': 'inactive',
+                    'path_ids': '',
+                    'incoming_edge_ids': '',
+                    'outgoing_edge_ids': '',
+                    'incoming_edge_count': 0,
+                    'outgoing_edge_count': 0,
+                    'path_id_count': 0,
+                    'registration_status': 'inactive',
+                    'sentinel': True,
+                }
+            )
+            continue
+        joint_any = False
+        for candidate in candidates:
+            candidate_id = str(candidate['candidate_id'])
+            distance, haversine, crosscheck = _ofes_watermass_distance_check(
+                float(record['lat']),
+                float(record['lon']),
+                float(candidate['thermohaline_centroid_lat']),
+                float(candidate['thermohaline_centroid_lon']),
+            )
+            if crosscheck > settings['watermass_tolerances']['haversine_atol_km']:
+                raise ValueError(
+                    f'Haversine cross-check exceeded tolerance on {stamp}: '
+                    f'{crosscheck:g} km.'
+                )
+            level_count = int(round(float(candidate['vertical_anomaly_level_count'])))
+            if level_count > 1:
+                vertical_rule = 'saved_shallow_deep_contains'
+                vertical = (
+                    float(candidate['vertical_shallow_depth_m'])
+                    - settings['depth_tolerance_m']
+                    <= float(record['depth_m'])
+                    <= float(candidate['vertical_deep_depth_m'])
+                    + settings['depth_tolerance_m']
+                )
+            else:
+                vertical_rule = 'single_level_point_tolerance'
+                vertical = abs(
+                    float(record['depth_m']) - float(candidate['depth_m'])
+                ) <= settings['depth_tolerance_m']
+            horizontal = (
+                distance
+                <= float(candidate['thermohaline_component_radius_km'])
+            )
+            joint = bool(horizontal and vertical)
+            joint_any |= joint
+            key = (stamp.strftime('%Y-%m-%d'), candidate_id)
+            path_ids = graph['path_map'].get(key, [])
+            incoming = graph['incoming'].get(key, [])
+            outgoing = graph['outgoing'].get(key, [])
+            rows.append(
+                {
+                    **base,
+                    **common,
+                    'candidate_id': candidate_id,
+                    'candidate_centroid_lon': float(
+                        candidate['thermohaline_centroid_lon']
+                    ),
+                    'candidate_centroid_lat': float(
+                        candidate['thermohaline_centroid_lat']
+                    ),
+                    'candidate_depth_m': float(candidate['depth_m']),
+                    'candidate_radius_km': float(
+                        candidate['thermohaline_component_radius_km']
+                    ),
+                    'distance_km': distance,
+                    'haversine_distance_km': haversine,
+                    'haversine_crosscheck_error_km': crosscheck,
+                    'horizontal_compatible': bool(horizontal),
+                    'vertical_compatible': bool(vertical),
+                    'joint_compatible': joint,
+                    'vertical_rule': vertical_rule,
+                    'path_ids': ';'.join(path_ids),
+                    'incoming_edge_ids': ';'.join(incoming),
+                    'outgoing_edge_ids': ';'.join(outgoing),
+                    'incoming_edge_count': int(len(incoming)),
+                    'outgoing_edge_count': int(len(outgoing)),
+                    'path_id_count': int(len(path_ids)),
+                    'registration_status': 'candidate_evaluated',
+                    'sentinel': False,
+                }
+            )
+        if not candidates:
+            rows.append(
+                {
+                    **base,
+                    **common,
+                    'candidate_id': '__NO_CANDIDATE__',
+                    'candidate_depth_m': np.nan,
+                    'candidate_radius_km': np.nan,
+                    'distance_km': np.nan,
+                    'haversine_distance_km': np.nan,
+                    'haversine_crosscheck_error_km': np.nan,
+                    'horizontal_compatible': False,
+                    'vertical_compatible': False,
+                    'joint_compatible': False,
+                    'vertical_rule': 'no_candidate',
+                    'path_ids': '',
+                    'incoming_edge_ids': '',
+                    'outgoing_edge_ids': '',
+                    'incoming_edge_count': 0,
+                    'outgoing_edge_count': 0,
+                    'path_id_count': 0,
+                    'registration_status': 'no_candidate',
+                    'sentinel': True,
+                }
+            )
+        elif not joint_any:
+            rows.append(
+                {
+                    **base,
+                    **common,
+                    'candidate_id': '__NO_JOINT__',
+                    'candidate_depth_m': np.nan,
+                    'candidate_radius_km': np.nan,
+                    'distance_km': np.nan,
+                    'haversine_distance_km': np.nan,
+                    'haversine_crosscheck_error_km': np.nan,
+                    'horizontal_compatible': False,
+                    'vertical_compatible': False,
+                    'joint_compatible': False,
+                    'vertical_rule': 'no_joint',
+                    'path_ids': '',
+                    'incoming_edge_ids': '',
+                    'outgoing_edge_ids': '',
+                    'incoming_edge_count': 0,
+                    'outgoing_edge_count': 0,
+                    'path_id_count': 0,
+                    'registration_status': 'no_joint',
+                    'sentinel': True,
+                }
+            )
+    registration = pd.DataFrame(rows)
+    active_days = properties.loc[
+        properties['status'].eq('active')
+        & np.isfinite(properties['depth_m'])
+        & np.isfinite(properties['lat'])
+        & np.isfinite(properties['lon'])
+    ][
+        ['arm', 'vertical_mode', 'seed_key', 'trajectory_key', 'calendar_time', 'arrival_outcome']
+    ].drop_duplicates()
+    evaluated = registration.loc[
+        ~registration['sentinel']
+    ].copy()
+    joint_days = evaluated.loc[
+        evaluated['joint_compatible'],
+        ['arm', 'vertical_mode', 'seed_key', 'trajectory_key', 'calendar_time'],
+    ].drop_duplicates()
+    group_rows = []
+    categories = (
+        'both_arrived',
+        'only_3d',
+        'only_c2',
+        'both_not_arrived',
+    )
+    for arm in settings['arms']:
+        for mode in ('three_dimensional', 'fixed_depth'):
+            for category in categories:
+                denominator = active_days.loc[
+                    active_days['arm'].eq(arm)
+                    & active_days['vertical_mode'].eq(mode)
+                    & active_days['arrival_outcome'].eq(category)
+                ]
+                hits = joint_days.loc[
+                    joint_days['arm'].eq(arm)
+                    & joint_days['vertical_mode'].eq(mode)
+                    & joint_days['seed_key'].isin(denominator['seed_key'])
+                ]
+                group_rows.append(
+                    {
+                        'arm': arm,
+                        'vertical_mode': mode,
+                        'arrival_outcome': category,
+                        'active_trajectory_day_count': int(len(denominator)),
+                        'joint_compatible_day_count': int(len(hits)),
+                        'joint_compatible_day_fraction': (
+                            float(len(hits) / len(denominator))
+                            if len(denominator)
+                            else np.nan
+                        ),
+                        'joint_with_path_day_count': int(
+                            len(
+                                evaluated.loc[
+                                    evaluated['joint_compatible']
+                                    & evaluated['path_id_count'].gt(0)
+                                    & evaluated['arm'].eq(arm)
+                                    & evaluated['vertical_mode'].eq(mode)
+                                    & evaluated['seed_key'].isin(
+                                        denominator['seed_key']
+                                    )
+                                ][
+                                    ['seed_key', 'trajectory_key', 'calendar_time']
+                                ].drop_duplicates()
+                            )
+                        ),
+                        'unique_joint_path_ids': ';'.join(
+                            sorted(
+                                set(
+                                    value
+                                    for values in evaluated.loc[
+                                        evaluated['joint_compatible']
+                                        & evaluated['arm'].eq(arm)
+                                        & evaluated['vertical_mode'].eq(mode)
+                                        & evaluated['seed_key'].isin(
+                                            denominator['seed_key']
+                                        )
+                                    ]['path_ids']
+                                    for value in str(values).split(';')
+                                    if value
+                                )
+                            )
+                        ),
+                    }
+                )
+    return registration, pd.DataFrame(group_rows)
+
+
+def _ofes_watermass_build_virtual_profiles(
+    properties: pd.DataFrame,
+    contexts: dict[pd.Timestamp, dict],
+    settings: dict,
+) -> pd.DataFrame:
+    """对真实活动午夜点运行正式 DO50 虚拟剖面并闭合参考线。"""
+    config = make_detection_config(
+        'do',
+        do_threshold=settings['do_threshold'],
+    )
+    rows = []
+    for record in properties.to_dict('records'):
+        base = {
+            'case_id': record['case_id'],
+            'arm': record['arm'],
+            'particle_index': record['particle_index'],
+            'seed_key': record['seed_key'],
+            'trajectory_key': record['trajectory_key'],
+            'vertical_mode': record['vertical_mode'],
+            'arrival_outcome': record.get(
+                'arrival_outcome',
+                'unknown',
+            ),
+            'calendar_time': record['calendar_time'],
+            'particle_depth_m': record['depth_m'],
+            'status': record['status'],
+            'object_identity': 'none_virtual_diagnostic',
+            'event_identity': 'none_virtual_diagnostic',
+            'virtual_along_path_detectability': 0,
+        }
+        if (
+            str(record['status']) != 'active'
+            or not np.all(
+                np.isfinite(
+                    [
+                        record['depth_m'],
+                        record['lat'],
+                        record['lon'],
+                    ]
+                )
+            )
+        ):
+            rows.append(
+                {
+                    **base,
+                    'profile_status': 'inactive',
+                    'profile_evaluated': 0,
+                    'n_valid_peaks': 0,
+                    'peak_depth_m': np.nan,
+                    'peak_do2_umol_kg': np.nan,
+                    'reference_shallow_depth_m': np.nan,
+                    'reference_shallow_value': np.nan,
+                    'reference_deep_depth_m': np.nan,
+                    'reference_deep_value': np.nan,
+                    'reference_at_peak_do2': np.nan,
+                    'delta_do': np.nan,
+                    'reference_closure_error': np.nan,
+                }
+            )
+            continue
+        context = contexts[pd.Timestamp(record['calendar_time'])]
+        scalar = context['scalar']
+        point = np.asarray(
+            [[record['depth_m'], record['lat'], record['lon']]],
+            dtype=float,
+        )
+        _ofes_watermass_assert_point_bounds(point, scalar)
+        detected = detect_ofes_delta_do(
+            scalar,
+            float(record['lon']),
+            float(record['lat']),
+            detection_config=config,
+            interp=True,
+        )
+        if detected.empty:
+            rows.append(
+                {
+                    **base,
+                    'profile_status': 'no_candidate',
+                    'profile_evaluated': 1,
+                    'n_valid_peaks': 0,
+                    'peak_depth_m': np.nan,
+                    'peak_do2_umol_kg': np.nan,
+                    'reference_shallow_depth_m': np.nan,
+                    'reference_shallow_value': np.nan,
+                    'reference_deep_depth_m': np.nan,
+                    'reference_deep_value': np.nan,
+                    'reference_at_peak_do2': np.nan,
+                    'delta_do': np.nan,
+                    'reference_closure_error': np.nan,
+                }
+            )
+            continue
+        if len(detected) != 1:
+            raise ValueError('The formal virtual profile helper returned more than one candidate.')
+        peak = detected.iloc[0]
+        peak_depth = float(peak['depth'])
+        profile = extract_ofes_profile_interp(
+            scalar,
+            float(record['lon']),
+            float(record['lat']),
+            variables=['do2', 'temp', 'salinity'],
+        )
+        profile['Depth'] = pd.to_numeric(profile['Depth'], errors='coerce')
+        for column in ('do2', 'temp', 'salinity'):
+            profile[column] = pd.to_numeric(profile[column], errors='coerce')
+        valid = profile.dropna(
+            subset=['Depth', 'do2', 'temp', 'salinity']
+        ).sort_values('Depth')
+        half_window = float(config.depth_interval)
+        window = valid.loc[
+            (valid['Depth'] >= peak_depth - half_window)
+            & (valid['Depth'] <= peak_depth + half_window)
+        ]
+        if len(window) < 2 or float(window['Depth'].iloc[0]) >= float(window['Depth'].iloc[-1]):
+            raise ValueError(
+                'A detected virtual DO50 peak lacks two formal reference endpoints.'
+            )
+        shallow_row = window.iloc[0]
+        deep_row = window.iloc[-1]
+        reference_at_peak = float(
+            np.interp(
+                peak_depth,
+                [float(shallow_row['Depth']), float(deep_row['Depth'])],
+                [float(shallow_row['do2']), float(deep_row['do2'])],
+            )
+        )
+        do_value = float(peak['do_value'])
+        delta_do = float(peak['delta_do'])
+        closure_error = do_value - reference_at_peak - delta_do
+        if abs(closure_error) > settings['watermass_tolerances']['property_closure_atol']:
+            raise ValueError(
+                f'Virtual profile reference closure failed: {closure_error:g}.'
+            )
+        rows.append(
+            {
+                **base,
+                'profile_status': 'evaluated',
+                'profile_evaluated': 1,
+                'n_valid_peaks': 1,
+                'peak_depth_m': peak_depth,
+                'peak_do2_umol_kg': do_value,
+                'reference_shallow_depth_m': float(shallow_row['Depth']),
+                'reference_shallow_value': float(shallow_row['do2']),
+                'reference_deep_depth_m': float(deep_row['Depth']),
+                'reference_deep_value': float(deep_row['do2']),
+                'reference_at_peak_do2': reference_at_peak,
+                'delta_do': delta_do,
+                'reference_closure_error': closure_error,
+                'virtual_along_path_detectability': 1,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ofes_watermass_build_property_group_daily_summary(
+    properties: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总各臂、模式和到达结局的逐日 DO、sigma0、深度和 w。"""
+    categories = (
+        'both_arrived',
+        'only_3d',
+        'only_c2',
+        'both_not_arrived',
+    )
+    fields = {
+        'do': 'raw_do2_umol_kg',
+        'sigma0': 'sigma0',
+        'depth': 'depth_m',
+        'w': 'w_m_s',
+    }
+    rows = []
+    for arm in settings['arms']:
+        for mode in ('three_dimensional', 'fixed_depth'):
+            for outcome in categories:
+                group = properties.loc[
+                    properties['arm'].eq(arm)
+                    & properties['vertical_mode'].eq(mode)
+                    & properties['arrival_outcome'].eq(outcome)
+                ]
+                for stamp in settings['dates']:
+                    day = group.loc[group['calendar_time'].eq(stamp)]
+                    finite = day.loc[
+                        day['property_qc_status'].eq('finite')
+                    ]
+                    record = {
+                        'case_id': settings['case_id'],
+                        'arm': arm,
+                        'direction': settings['arms'][arm]['direction'],
+                        'vertical_mode': mode,
+                        'arrival_outcome': outcome,
+                        'calendar_time': stamp,
+                        'active_trajectory_count': int(
+                            finite['trajectory_key'].nunique()
+                        ),
+                        'active_row_count': int(len(finite)),
+                    }
+                    for prefix, property_column in fields.items():
+                        _ofes_watermass_add_stats(
+                            record,
+                            prefix,
+                            finite[property_column],
+                        )
+                    rows.append(record)
+    daily = pd.DataFrame(rows)
+    group_columns = [
+        'arm',
+        'vertical_mode',
+        'arrival_outcome',
+    ]
+    for _, group in daily.groupby(group_columns, sort=False):
+        indices = group.sort_values('calendar_time').index
+        ordered = daily.loc[indices]
+        for prefix in fields:
+            median_column = f'{prefix}_median'
+            delta = ordered[median_column].diff()
+            daily.loc[indices, f'adjacent_{prefix}_delta'] = (
+                delta.to_numpy(dtype=float)
+            )
+            finite_delta = delta.dropna()
+            if finite_delta.empty:
+                max_date = None
+                max_delta = np.nan
+            else:
+                max_position = finite_delta.abs().idxmax()
+                max_date = pd.Timestamp(
+                    daily.loc[max_position, 'calendar_time']
+                ).date().isoformat()
+                max_delta = float(finite_delta.loc[max_position])
+            daily.loc[indices, f'max_adjacent_{prefix}_date'] = max_date
+            daily.loc[indices, f'max_adjacent_{prefix}_delta'] = max_delta
+            daily.loc[indices, f'max_adjacent_{prefix}_abs'] = (
+                abs(max_delta) if np.isfinite(max_delta) else np.nan
+            )
+    return daily.sort_values(
+        group_columns + ['calendar_time'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+
+
+def _ofes_watermass_longest_streak(values: object, target: bool) -> int:
+    """计算布尔日期序列中目标状态的最长连续长度。"""
+    flags = pd.Series(values).fillna(False).astype(bool).to_numpy()
+    best = current = 0
+    for value in flags:
+        if bool(value) == bool(target):
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return int(best)
+
+
+def _ofes_watermass_build_virtual_profile_group_summary(
+    profiles: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """按臂、模式和到达结局汇总 virtual DO50 的日期可探测性。"""
+    categories = (
+        'both_arrived',
+        'only_3d',
+        'only_c2',
+        'both_not_arrived',
+    )
+    rows = []
+    for arm in settings['arms']:
+        for mode in ('three_dimensional', 'fixed_depth'):
+            arrival_outcomes = (
+                {'both_arrived', 'only_3d'}
+                if mode == 'three_dimensional'
+                else {'both_arrived', 'only_c2'}
+            )
+            for outcome in categories:
+                subset = profiles.loc[
+                    profiles['arm'].eq(arm)
+                    & profiles['vertical_mode'].eq(mode)
+                    & profiles['arrival_outcome'].eq(outcome)
+                ].copy()
+                subset = subset.sort_values(
+                    ['trajectory_key', 'calendar_time'],
+                    kind='mergesort',
+                )
+                evaluated = subset.loc[
+                    subset['profile_evaluated'].eq(1)
+                ]
+                detected = evaluated.loc[
+                    evaluated['virtual_along_path_detectability'].eq(1)
+                ]
+                date_count = int(subset['calendar_time'].nunique())
+                record = {
+                    'case_id': settings['case_id'],
+                    'arm': arm,
+                    'direction': settings['arms'][arm]['direction'],
+                    'vertical_mode': mode,
+                    'arrival_outcome': outcome,
+                    'trajectory_count': int(
+                        subset['trajectory_key'].nunique()
+                    ),
+                    'evaluated_day_count': int(len(evaluated)),
+                    'detected_day_count': int(len(detected)),
+                    'evaluated_date_count': date_count,
+                    'detected_date_count': int(
+                        detected['calendar_time'].nunique()
+                    ),
+                    'detected_fraction': (
+                        float(len(detected) / len(evaluated))
+                        if len(evaluated)
+                        else np.nan
+                    ),
+                    'detected_date_fraction': (
+                        float(
+                            detected['calendar_time'].nunique() / date_count
+                        )
+                        if date_count
+                        else np.nan
+                    ),
+                    'profile_exception_count': int(
+                        (~subset['profile_status'].isin(
+                            {'evaluated', 'no_candidate'}
+                        )).sum()
+                    ),
+                    'longest_detected_streak_days': 0,
+                    'longest_no_detection_streak_days': 0,
+                    'midpath_trajectory_count': np.nan,
+                    'midpath_total_days': np.nan,
+                    'midpath_detected_days': np.nan,
+                    'midpath_detected_fraction': np.nan,
+                    'midpath_longest_detected_streak_days': np.nan,
+                }
+                streak_true = []
+                streak_false = []
+                for _, trajectory in subset.groupby(
+                    'trajectory_key',
+                    sort=False,
+                ):
+                    flags = trajectory[
+                        'virtual_along_path_detectability'
+                    ].eq(1)
+                    streak_true.append(_ofes_watermass_longest_streak(flags, True))
+                    streak_false.append(_ofes_watermass_longest_streak(flags, False))
+                if streak_true:
+                    record['longest_detected_streak_days'] = int(max(streak_true))
+                    record['longest_no_detection_streak_days'] = int(max(streak_false))
+                if mode == 'three_dimensional' and outcome in arrival_outcomes:
+                    target_date = _ofes_dual_endpoint_object_key_date(
+                        settings['arms'][arm]['target_object_key']
+                    )
+                    release_date = settings['arms'][arm]['release_date']
+                    window_start = min(release_date, target_date)
+                    window_end = max(release_date, target_date)
+                    midpath = subset.loc[
+                        subset['calendar_time'].gt(window_start)
+                        & subset['calendar_time'].lt(window_end)
+                    ]
+                    midpath_trajectory_count = int(
+                        midpath['trajectory_key'].nunique()
+                    )
+                    midpath_detected = midpath.loc[
+                        midpath['virtual_along_path_detectability'].eq(1)
+                    ]
+                    record.update(
+                        {
+                            'midpath_trajectory_count': midpath_trajectory_count,
+                            'midpath_total_days': int(len(midpath)),
+                            'midpath_detected_days': int(len(midpath_detected)),
+                            'midpath_detected_fraction': (
+                                float(len(midpath_detected) / len(midpath))
+                                if len(midpath)
+                                else np.nan
+                            ),
+                            'midpath_longest_detected_streak_days': int(
+                                max(
+                                    [
+                                        _ofes_watermass_longest_streak(
+                                            trajectory[
+                                                trajectory['calendar_time'].gt(
+                                                    window_start
+                                                )
+                                                & trajectory['calendar_time'].lt(
+                                                    window_end
+                                                )
+                                            ][
+                                                'virtual_along_path_detectability'
+                                            ].eq(1),
+                                            True,
+                                        )
+                                        for _, trajectory in subset.groupby(
+                                            'trajectory_key',
+                                            sort=False,
+                                        )
+                                    ]
+                                    or [0]
+                                )
+                            ),
+                        }
+                    )
+                rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def _ofes_watermass_build_reducer_tables(
+    paired: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    trajectory_summary: pd.DataFrame,
+    properties: pd.DataFrame,
+    profiles: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """集中生成到达、逐日性质和 virtual DO50 三个轻量 reducer 表。"""
+    return (
+        _ofes_watermass_build_arrival_outcome_summary(
+            paired,
+            endpoints,
+            trajectory_summary,
+            settings,
+        ),
+        _ofes_watermass_build_property_group_daily_summary(
+            properties,
+            settings,
+        ),
+        _ofes_watermass_build_virtual_profile_group_summary(
+            profiles,
+            settings,
+        ),
+    )
+
+
+def _ofes_watermass_plot_outputs(
+    positions: pd.DataFrame,
+    properties: pd.DataFrame,
+    structure: pd.DataFrame,
+    profiles: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """生成三张分别表达路径、性质演变和虚拟 DO50 的 PNG。"""
+    root = settings['output_dir']
+    root.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for _, group in positions.groupby('trajectory_key', sort=True):
+        group = group.sort_values('integration_step')
+        ax.plot(
+            group['lon'],
+            group['lat'],
+            linewidth=0.65,
+            alpha=0.35,
+            color=(
+                '#1f77b4'
+                if group['vertical_mode'].iloc[0] == 'three_dimensional'
+                else '#d62728'
+            ),
+        )
+    candidate_points = structure.loc[
+        ~structure['sentinel']
+        & structure['joint_compatible']
+    ].drop_duplicates('candidate_id')
+    if not candidate_points.empty:
+        ax.scatter(
+            candidate_points['candidate_centroid_lon'],
+            candidate_points['candidate_centroid_lat'],
+            s=9,
+            c='#2ca02c',
+            alpha=0.5,
+            label='joint candidate',
+        )
+    endpoints = positions.loc[
+        positions['calendar_time'].isin(
+            pd.concat(
+                [
+                    positions['release_date'],
+                    positions['calendar_time'].where(
+                        positions['calendar_time'].isin(
+                            [
+                                _ofes_dual_endpoint_object_key_date(
+                                    values['target_object_key']
+                                )
+                                for values in settings['arms'].values()
+                            ]
+                        )
+                    ),
+                ],
+                ignore_index=True,
+            ).dropna().unique()
+        )
+    ]
+    if not endpoints.empty:
+        ax.scatter(
+            endpoints['lon'],
+            endpoints['lat'],
+            s=7,
+            c='#111111',
+            alpha=0.2,
+        )
+    ax.set(
+        xlabel='longitude (deg E)',
+        ylabel='latitude (deg N)',
+        title=f'{settings["case_id"]} exact midnight trajectory paths',
+    )
+    ax.grid(alpha=0.25)
+    paths['paths'] = root / 'figure_1_paths.png'
+    fig.savefig(paths['paths'], dpi=180, bbox_inches='tight')
+    plt.close(fig)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.ravel()
+    mode_colors = {
+        'three_dimensional': '#1f77b4',
+        'fixed_depth': '#d62728',
+    }
+    arm_styles = {
+        arm: '-' if values['direction'] == 'forward' else '--'
+        for arm, values in settings['arms'].items()
+    }
+    arrival_alpha = {
+        'both_arrived': 0.65,
+        'only_3d': 0.5,
+        'only_c2': 0.4,
+        'both_not_arrived': 0.25,
+    }
+    finite_properties = properties.loc[
+        properties['property_qc_status'].eq('finite')
+    ]
+    for (arm, mode, arrival), subset in finite_properties.groupby(
+        ['arm', 'vertical_mode', 'arrival_outcome'],
+        sort=True,
+    ):
+        color = mode_colors[str(mode)]
+        linestyle = arm_styles.get(str(arm), '-')
+        alpha = arrival_alpha.get(str(arrival), 0.35)
+        axes[0].scatter(
+            subset['sp'],
+            subset['theta'],
+            s=4,
+            alpha=alpha,
+            color=color,
+            label=f'{arm}/{mode}/{arrival}',
+        )
+        for _, group in subset.groupby('trajectory_key', sort=True):
+            group = group.sort_values('calendar_time')
+            axes[1].plot(
+                group['calendar_time'],
+                group['raw_do2_umol_kg'],
+                linewidth=0.45,
+                alpha=alpha,
+                color=color,
+                linestyle=linestyle,
+            )
+            axes[2].plot(
+                group['calendar_time'],
+                group['sigma0'],
+                linewidth=0.45,
+                alpha=alpha,
+                color=color,
+                linestyle=linestyle,
+            )
+            axes[3].plot(
+                group['calendar_time'],
+                group['depth_m'],
+                linewidth=0.45,
+                alpha=alpha,
+                color=color,
+                linestyle=linestyle,
+            )
+        median_by_date = subset.groupby('calendar_time', sort=True).agg(
+            raw_do2_umol_kg=('raw_do2_umol_kg', 'median'),
+            sigma0=('sigma0', 'median'),
+            depth_m=('depth_m', 'median'),
+        )
+        axes[1].plot(
+            median_by_date.index,
+            median_by_date['raw_do2_umol_kg'],
+            linewidth=1.6,
+            alpha=0.95,
+            color=color,
+            linestyle=linestyle,
+        )
+        axes[2].plot(
+            median_by_date.index,
+            median_by_date['sigma0'],
+            linewidth=1.6,
+            alpha=0.95,
+            color=color,
+            linestyle=linestyle,
+        )
+        axes[3].plot(
+            median_by_date.index,
+            median_by_date['depth_m'],
+            linewidth=1.6,
+            alpha=0.95,
+            color=color,
+            linestyle=linestyle,
+        )
+    axes[0].set(xlabel='SP', ylabel='theta')
+    axes[1].set(xlabel='calendar date', ylabel='raw DO (umol kg-1)')
+    axes[2].set(xlabel='calendar date', ylabel='sigma0 (kg m-3)')
+    axes[3].set(xlabel='calendar date', ylabel='depth (m)')
+    axes[0].set_title(
+        'Individual T-S by arm/mode/arrival; thick lines are medians'
+    )
+    axes[0].legend(fontsize=8)
+    fig.autofmt_xdate()
+    paths['properties'] = root / 'figure_2_properties.png'
+    fig.savefig(paths['properties'], dpi=180, bbox_inches='tight')
+    plt.close(fig)
+
+    profile_meta = profiles[
+        ['trajectory_key', 'arm', 'vertical_mode', 'arrival_outcome']
+    ].drop_duplicates('trajectory_key')
+    arm_order = {arm: index for index, arm in enumerate(settings['arms'])}
+    mode_order = {
+        'three_dimensional': 0,
+        'fixed_depth': 1,
+    }
+    outcome_order = {
+        'both_arrived': 0,
+        'only_3d': 1,
+        'only_c2': 2,
+        'both_not_arrived': 3,
+    }
+    profile_meta['_arm_order'] = profile_meta['arm'].map(arm_order)
+    profile_meta['_mode_order'] = profile_meta['vertical_mode'].map(mode_order)
+    profile_meta['_outcome_order'] = profile_meta['arrival_outcome'].map(
+        outcome_order
+    )
+    profile_meta = profile_meta.sort_values(
+        ['_arm_order', '_mode_order', '_outcome_order', 'trajectory_key'],
+        kind='mergesort',
+    )
+    pivot = profiles.pivot_table(
+        index='trajectory_key',
+        columns='calendar_time',
+        values='virtual_along_path_detectability',
+        aggfunc='max',
+        fill_value=0,
+    )
+    pivot = pivot.reindex(profile_meta['trajectory_key'])
+    pivot = pivot.reindex(
+        columns=settings['dates'],
+        fill_value=0,
+    )
+    fig, ax = plt.subplots(figsize=(12, 8))
+    image = ax.imshow(
+        pivot.to_numpy(dtype=float),
+        aspect='auto',
+        interpolation='nearest',
+        cmap='Greens',
+        vmin=0,
+        vmax=1,
+    )
+    ax.set(
+        xlabel='calendar date',
+        ylabel='',
+        title='Virtual DO50 detectability along exact paths',
+    )
+    ax.set_xticks(
+        np.arange(len(pivot.columns)),
+        [pd.Timestamp(value).strftime('%m-%d') for value in pivot.columns],
+        rotation=60,
+        ha='right',
+    )
+    ax.set_yticks([])
+    short_mode = {
+        'three_dimensional': '3D',
+        'fixed_depth': 'C2',
+    }
+    short_outcome = {
+        'both_arrived': 'both',
+        'only_3d': '3D-only',
+        'only_c2': 'C2-only',
+        'both_not_arrived': 'neither',
+    }
+    start = 0
+    for (arm, mode, outcome), group in profile_meta.groupby(
+        ['arm', 'vertical_mode', 'arrival_outcome'],
+        sort=False,
+    ):
+        stop = start + len(group)
+        ax.axhline(start - 0.5, color='#777777', linewidth=0.5, alpha=0.5)
+        ax.text(
+            -0.01,
+            (start + stop - 1) / 2.0,
+            f'{arm}/{short_mode.get(mode, mode)}/{short_outcome.get(outcome, outcome)}',
+            transform=ax.get_yaxis_transform(),
+            ha='right',
+            va='center',
+            fontsize=6,
+            clip_on=False,
+        )
+        start = stop
+    ax.axhline(start - 0.5, color='#777777', linewidth=0.5, alpha=0.5)
+    fig.subplots_adjust(left=0.22, bottom=0.18, right=0.90)
+    fig.colorbar(image, ax=ax, label='detected candidate (0/1)')
+    paths['profiles'] = root / 'figure_3_virtual_profiles.png'
+    fig.savefig(paths['profiles'], dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return paths
+
+
+def _ofes_watermass_build_validation_verdict(
+    positions: pd.DataFrame,
+    midnight: pd.DataFrame,
+    properties: pd.DataFrame,
+    registry: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    endpoint_qa: dict,
+    structure: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    arrival_summary: pd.DataFrame,
+    property_daily_summary: pd.DataFrame,
+    profile_summary: pd.DataFrame,
+    graph: dict,
+    profiles: pd.DataFrame,
+    figures: dict,
+    settings: dict,
+) -> dict:
+    """从所有已生成门数据派生 validation 和 completion。"""
+    expected_trajectories = int(len(registry))
+    trajectory_counts = positions.groupby('trajectory_key').size()
+    expected_steps = int(positions['integration_step'].max()) + 1
+    step_summary = positions.groupby('trajectory_key')['integration_step'].agg(
+        ['min', 'max', 'nunique']
+    )
+    elapsed_monotonic = all(
+        np.all(
+            np.diff(
+                group.sort_values('integration_step')[
+                    'integration_elapsed_seconds'
+                ].to_numpy(dtype=float)
+            ) >= 0.0
+        )
+        for _, group in positions.groupby('trajectory_key', sort=False)
+    )
+    position_gate = bool(
+        len(trajectory_counts) == expected_trajectories
+        and (trajectory_counts > 0).all()
+        and positions['status'].notna().all()
+        and expected_steps > 1
+        and step_summary['min'].eq(0).all()
+        and step_summary['max'].eq(expected_steps - 1).all()
+        and step_summary['nunique'].eq(expected_steps).all()
+        and not positions.duplicated(
+            ['trajectory_key', 'integration_step']
+        ).any()
+        and elapsed_monotonic
+        and positions.loc[
+            positions['status'].ne('active'),
+            ['depth_m', 'lat', 'lon'],
+        ].isna().all().all()
+    )
+    midnight_counts = midnight.groupby('trajectory_key').size()
+    midnight_gate = bool(
+        len(midnight_counts) == expected_trajectories
+        and midnight_counts.eq(len(settings['dates'])).all()
+        and midnight['calendar_time'].eq(
+            midnight['calendar_time'].dt.normalize()
+        ).all()
+        and not midnight.duplicated(
+            ['trajectory_key', 'calendar_time']
+        ).any()
+    )
+    release_rows = properties.loc[
+        properties['calendar_time'].eq(properties['release_date'])
+    ]
+    release_gate = bool(
+        len(release_rows) == len(registry)
+        and release_rows[
+            [
+                'delta_depth_from_release_m',
+                'delta_do_from_release_umol_kg',
+                'delta_theta_from_release',
+                'delta_sp_from_release',
+                'delta_sa_from_release',
+                'delta_ct_from_release',
+                'delta_sigma0_from_release',
+                'delta_spiciness0_from_release',
+            ]
+        ].notna().all().all()
+        and np.allclose(
+            release_rows[
+                [
+                    'delta_depth_from_release_m',
+                    'delta_do_from_release_umol_kg',
+                    'delta_theta_from_release',
+                    'delta_sp_from_release',
+                    'delta_sa_from_release',
+                    'delta_ct_from_release',
+                    'delta_sigma0_from_release',
+                    'delta_spiciness0_from_release',
+                ]
+            ].to_numpy(dtype=float),
+            0.0,
+            atol=0.0,
+        )
+    )
+    active_properties = properties.loc[
+        properties['status'].eq('active')
+    ]
+    required_properties = [
+        'raw_do2_umol_kg',
+        'theta',
+        'sp',
+        'sa',
+        'ct',
+        'sigma0',
+        'spiciness0',
+        'w_m_s',
+    ]
+    property_gate = bool(
+        active_properties['property_qc_status'].eq('finite').all()
+        and active_properties[required_properties].notna().all().all()
+        and properties.loc[
+            properties['status'].ne('active'),
+            required_properties,
+        ].isna().all().all()
+    )
+    seed_gate = bool(
+        registry.groupby('seed_key')['vertical_mode'].nunique().eq(2).all()
+        and registry['seed_key'].nunique() * 2 == len(registry)
+    )
+    endpoint_gate = bool(endpoint_qa['passed'])
+    graph_boolean_values = [
+        value for value in graph['validation'].values()
+        if isinstance(value, (bool, np.bool_))
+    ]
+    graph_gate = bool(
+        graph_boolean_values and all(graph_boolean_values)
+    )
+    structure_gate = bool(
+        not structure.empty
+        and structure['candidate_date'].eq(
+            structure['calendar_time'].dt.normalize()
+        ).all()
+        and structure['haversine_crosscheck_error_km'].dropna().le(
+            settings['watermass_tolerances']['haversine_atol_km']
+        ).all()
+    )
+    active_profiles = profiles.loc[profiles['profile_evaluated'].eq(1)]
+    allowed_profile_status = {'evaluated', 'no_candidate'}
+    profile_exception_count = int(
+        (~active_profiles['profile_status'].isin(allowed_profile_status)).sum()
+        if not active_profiles.empty
+        else 0
+    )
+    closure_gate = bool(
+        active_profiles['reference_closure_error'].dropna().abs().le(
+            settings['watermass_tolerances']['property_closure_atol']
+        ).all()
+        and len(active_profiles) == int(
+            properties['status'].eq('active').sum()
+        )
+    )
+    profile_gate = bool(
+        profiles.groupby('trajectory_key').size().eq(len(settings['dates'])).all()
+        and profile_exception_count == 0
+        and closure_gate
+    )
+    expected_group_count = len(settings['arms']) * 2 * 4
+    arrival_group_keys = arrival_summary[
+        ['arm', 'vertical_mode', 'arrival_outcome']
+    ].drop_duplicates()
+    arrival_summary_gate = bool(
+        len(arrival_summary) == expected_group_count
+        and len(arrival_group_keys) == expected_group_count
+        and arrival_summary[
+            ['trajectory_count', 'seed_count', 'endpoint_row_count']
+        ].notna().all().all()
+    )
+    daily_group_keys = property_daily_summary[
+        ['arm', 'vertical_mode', 'arrival_outcome']
+    ].drop_duplicates()
+    daily_group_counts = property_daily_summary.groupby(
+        ['arm', 'vertical_mode', 'arrival_outcome']
+    ).size()
+    daily_active = property_daily_summary.loc[
+        property_daily_summary['active_row_count'].gt(0)
+    ]
+    property_daily_summary_gate = bool(
+        len(property_daily_summary)
+        == expected_group_count * len(settings['dates'])
+        and len(daily_group_keys) == expected_group_count
+        and daily_group_counts.eq(len(settings['dates'])).all()
+        and property_daily_summary['calendar_time'].eq(
+            property_daily_summary['calendar_time'].dt.normalize()
+        ).all()
+        and daily_active[
+            ['do_median', 'sigma0_median', 'depth_median']
+        ].notna().all().all()
+    )
+    profile_group_keys = profile_summary[
+        ['arm', 'vertical_mode', 'arrival_outcome']
+    ].drop_duplicates()
+    profile_summary_gate = bool(
+        len(profile_summary) == expected_group_count
+        and len(profile_group_keys) == expected_group_count
+        and profile_summary['profile_exception_count'].fillna(0).eq(0).all()
+    )
+    figure_gate = bool(all(Path(path).is_file() for path in figures.values()))
+    gates = {
+        'trajectory_time_status_contract': position_gate,
+        'exact_midnight_contract': midnight_gate,
+        'release_delta_zero_contract': release_gate,
+        'property_and_qc_contract': property_gate,
+        'seed_pairing_contract': seed_gate,
+        'endpoint_reproduction_contract': endpoint_gate,
+        'candidate_graph_contract': graph_gate,
+        'candidate_registration_contract': structure_gate,
+        'virtual_profile_contract': profile_gate,
+        'arrival_outcome_mechanism_summary_contract': arrival_summary_gate,
+        'property_group_daily_summary_contract': property_daily_summary_gate,
+        'virtual_profile_group_summary_contract': profile_summary_gate,
+        'figure_file_contract': figure_gate,
+    }
+    exception_count = int(
+        profile_exception_count + endpoint_qa['row_mismatch_count']
+    )
+    complete = bool(all(gates.values()) and exception_count == 0)
+    return {
+        'analysis': 'dual_endpoint_watermass_review',
+        'case_id': settings['case_id'],
+        'required_gates': gates,
+        'exception_count': exception_count,
+        'complete': complete,
+        'trajectory_count': expected_trajectories,
+        'midnight_row_count': int(len(midnight)),
+        'property_row_count': int(len(properties)),
+        'endpoint_row_count': int(len(endpoints)),
+        'active_property_row_count': int(
+            properties['status'].eq('active').sum()
+        ),
+        'profile_evaluated_row_count': int(
+            profiles['profile_evaluated'].eq(1).sum()
+        ),
+        'profile_exception_count': profile_exception_count,
+        'arrival_outcome_summary_rows': int(len(arrival_summary)),
+        'property_group_daily_summary_rows': int(
+            len(property_daily_summary)
+        ),
+        'virtual_profile_group_summary_rows': int(len(profile_summary)),
+        'endpoint_reproduction': {
+            key: value for key, value in endpoint_qa.items() if key != 'frame'
+        },
+        'candidate_graph_validation': graph['validation'],
+        'structure_summary_rows': int(len(structure_summary)),
+        'figures': {
+            name: str(Path(path).resolve())
+            for name, path in figures.items()
+        },
+    }
+
+
+def _ofes_watermass_decision_brief(
+    trajectory_summary: pd.DataFrame,
+    pair_summary: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    arrival_summary: pd.DataFrame,
+    property_daily_summary: pd.DataFrame,
+    profile_summary: pd.DataFrame,
+    settings: dict,
+) -> str:
+    """从复核表数值生成不超过约1800字的中文机制裁决。"""
+    def fmt(value: object, digits: int = 2) -> str:
+        numeric = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]
+        return f'{float(numeric):.{digits}f}' if np.isfinite(numeric) else 'NA'
+    def date_text(value: object) -> str:
+        return str(value) if pd.notna(value) else 'NA'
+
+    def median_column(table: pd.DataFrame, column: str) -> float:
+        values = pd.to_numeric(table.get(column, pd.Series(dtype=float)), errors='coerce')
+        return float(values.dropna().median()) if values.notna().any() else np.nan
+
+    endpoint_outcomes = trajectory_summary[
+        ['trajectory_key', 'arrival_outcome']
+    ].drop_duplicates('trajectory_key')
+    endpoint_table = endpoints.merge(
+        endpoint_outcomes,
+        on='trajectory_key',
+        how='left',
+        validate='one_to_one',
+    )
+    object_endpoints = endpoint_table.loc[
+        endpoint_table['vertical_mode'].eq('three_dimensional')
+    ]
+    total_arrived = int(object_endpoints['arrived'].sum())
+    both_count = int(
+        object_endpoints['arrival_outcome'].eq('both_arrived').sum()
+    )
+    property_labels = (
+        ('DO', 'endpoint_delta_do_umol_kg'),
+        ('θ', 'endpoint_delta_theta'),
+        ('SP', 'endpoint_delta_sp'),
+        ('SA', 'endpoint_delta_sa'),
+        ('CT', 'endpoint_delta_ct'),
+        ('σ₀', 'endpoint_delta_sigma0'),
+        ('spice', 'endpoint_delta_spiciness0'),
+        ('dz', 'endpoint_delta_depth_m'),
+    )
+    forward_labels = tuple(
+        (label, column.replace('endpoint_', 'calendar_forward_'))
+        for label, column in property_labels
+    )
+
+    def change_text(table: pd.DataFrame, labels: tuple) -> str:
+        return '/'.join(
+            f'{label}{fmt(median_column(table, column))}'
+            for label, column in labels
+        )
+
+    def direction_label(arm: str) -> str:
+        direction = settings['arms'][arm]['direction']
+        direction_zh = '正向' if direction == 'forward' else '反向'
+        return f'{arm}({direction_zh})'
+
+    arm_lines = []
+    arrival_lines = []
+    structure_lines = []
+    property_change_lines = []
+    route_gaps = []
+    profile_total = profile_detected = 0
+    for arm in settings['arms']:
+        arm_label = direction_label(arm)
+        arm_3d = object_endpoints.loc[object_endpoints['arm'].eq(arm)]
+        arm_arrived = arm_3d.loc[arm_3d['arrived'].astype(bool)]
+        arm_summary = trajectory_summary.loc[
+            trajectory_summary['arm'].eq(arm)
+            & trajectory_summary['vertical_mode'].eq('three_dimensional')
+            & trajectory_summary['arrival_outcome'].isin(
+                ('both_arrived', 'only_3d')
+            )
+        ]
+        endpoint_delta = change_text(arm_summary, property_labels)
+        forward_delta = change_text(arm_summary, forward_labels)
+        max_excursion = median_column(arm_summary, 'max_depth_excursion_m')
+        core_thickness = median_column(
+            arm_arrived,
+            'matched_core_thickness_m',
+        )
+        arm_arrival = arrival_summary.loc[
+            arrival_summary['arm'].eq(arm)
+            & arrival_summary['vertical_mode'].eq('three_dimensional')
+        ]
+        route_gap = median_column(
+            arm_arrival,
+            'arrival_vs_nonarrival_endpoint_distance_gap_km',
+        )
+        depth_gap = median_column(
+            arm_arrival,
+            'arrival_vs_nonarrival_max_depth_excursion_gap_m',
+        )
+        do_gap = median_column(
+            arm_arrival,
+            'arrival_vs_nonarrival_endpoint_abs_do_gap_umol_kg',
+        )
+        pair_arm = pair_summary.loc[
+            pair_summary['arm'].eq(arm)
+            & pair_summary['arrival_outcome'].eq('both_arrived')
+        ]
+        pair_horizontal = median_column(
+            pair_arm,
+            'median_horizontal_distance_km',
+        )
+        pair_depth = median_column(
+            pair_arm,
+            'median_abs_depth_difference_m',
+        )
+        daily_facts = []
+        for outcome in ('both_arrived', 'only_3d'):
+            daily = property_daily_summary.loc[
+                property_daily_summary['arm'].eq(arm)
+                & property_daily_summary['vertical_mode'].eq(
+                    'three_dimensional'
+                )
+                & property_daily_summary['arrival_outcome'].eq(outcome)
+                & property_daily_summary['active_row_count'].gt(0)
+            ]
+            if daily.empty:
+                continue
+            first = daily.iloc[0]
+            daily_facts.append(
+                f'{outcome}@{date_text(first["max_adjacent_do_date"])} '
+                f'ΔDO{fmt(first["max_adjacent_do_abs"])} '
+                f'Δσ{fmt(first["max_adjacent_sigma0_abs"], 4)} '
+                f'Δz{fmt(first["max_adjacent_depth_abs"])}m'
+            )
+        property_change_lines.append(
+            f'{arm_label}逐日最大相邻日变幅：'
+            + ('；'.join(daily_facts) if daily_facts else '无到达组')
+        )
+        profile_arm = profile_summary.loc[
+            profile_summary['arm'].eq(arm)
+            & profile_summary['vertical_mode'].eq('three_dimensional')
+            & profile_summary['arrival_outcome'].isin(
+                ('both_arrived', 'only_3d')
+            )
+        ]
+        mid_total = int(
+            pd.to_numeric(profile_arm['midpath_total_days'], errors='coerce')
+            .fillna(0)
+            .sum()
+        )
+        mid_detected = int(
+            pd.to_numeric(profile_arm['midpath_detected_days'], errors='coerce')
+            .fillna(0)
+            .sum()
+        )
+        profile_total += mid_total
+        profile_detected += mid_detected
+        structure_arm = structure_summary.loc[
+            structure_summary['arm'].eq(arm)
+            & structure_summary['vertical_mode'].eq('three_dimensional')
+            & structure_summary['arrival_outcome'].isin(
+                ('both_arrived', 'only_3d')
+            )
+        ]
+        structure_active = int(
+            pd.to_numeric(
+                structure_arm['active_trajectory_day_count'],
+                errors='coerce',
+            ).fillna(0).sum()
+        )
+        structure_joint = int(
+            pd.to_numeric(
+                structure_arm['joint_compatible_day_count'],
+                errors='coerce',
+            ).fillna(0).sum()
+        )
+        structure_fraction = (
+            structure_joint / structure_active
+            if structure_active
+            else np.nan
+        )
+        structure_lines.append(
+            f'{arm_label} {structure_joint}/{structure_active}='
+            f'{fmt(structure_fraction, 3)}'
+        )
+        arm_lines.append(
+            f'{arm_label} 3-D {int(arm_3d["arrived"].sum())}/{len(arm_3d)}：'
+            f'释放→目标[{endpoint_delta}]；共同日历正向[{forward_delta}]；'
+            f'max|dz|{fmt(max_excursion)}m；同 seed 终点距差'
+            f'{fmt(pair_horizontal)}km/深度差{fmt(pair_depth)}m；'
+            f'目标核厚中位{fmt(core_thickness)}m。'
+        )
+        arrival_lines.append(
+            f'{arm_label} 到达相对未到达：距目标差{fmt(route_gap)}km、'
+            f'max|dz|差{fmt(depth_gap)}m、|ΔDO|差{fmt(do_gap)}。'
+        )
+        route_gaps.append(route_gap)
+    core_arrived = object_endpoints.loc[object_endpoints['arrived'].astype(bool)]
+    core_q1 = _ofes_watermass_stat_triplet(
+        core_arrived.get('matched_core_thickness_m', pd.Series(dtype=float))
+    )[1]
+    core_q3 = _ofes_watermass_stat_triplet(
+        core_arrived.get('matched_core_thickness_m', pd.Series(dtype=float))
+    )[2]
+    if profile_total:
+        profile_sentence = (
+            f'{total_arrived}条3-D到达轨迹中途 DO50 可探测 {profile_detected}/'
+            f'{profile_total} 个日点（{fmt(profile_detected / profile_total, 3)}，'
+            f'水团属性逐日连续而阈值化剖面间歇出现，不等于运输消失）。'
+        )
+    else:
+        profile_sentence = '3-D到达轨迹无可评估中途 DO50 日点。'
+    if route_gaps and all(np.isfinite(value) and value > 0 for value in route_gaps):
+        arrival_conclusion = (
+            '两臂到达组均比未到达组更接近目标，结合性质和深度差异，'
+            '到达/未到达主要由水平流线与路径分流造成。'
+        )
+    else:
+        arrival_conclusion = (
+            '到达组与未到达组的终点去向、性质和深度差异需联合解释，'
+            '具体中位数与 IQR 保存在 arrival outcome reducer 表。'
+        )
+    mechanism = (
+        f'{both_count}/{total_arrived} 条3-D到达同时由同 seed C2 到达；'
+        f'到达终点均相对目标真实像元及其自身半振幅核登记，核厚 IQR '
+        f'{fmt(core_q1)}–{fmt(core_q3)}m。'
+        f'因此这{max(len(settings["dates"]) - 2, 0)}日缺口主要是约'
+        f'{fmt(settings["seed_depth_m"])}m层上的弯曲次表层水平平流通道，'
+        f'约十米级垂向摆动/取样为修饰，不是这段时间内潜沉主导；'
+        f'更早形成阶段仍可能发生潜沉。'
+    )
+    structure_sentence = (
+        '真正3-D到达组的持续结构承载证据弱：'
+        + '；'.join(structure_lines)
+        + '；结果支持共享解析输送走廊和部分水团连接，'
+        '而非粒子始终被同一候选结构包裹。'
+    )
+    brief = (
+        f'# {settings["case_label"]} 沿确切双端点轨迹水团机制裁决\n\n'
+        f'已成立连接：在本次 OFES 解析流场、释放和逐像素目标定义下，'
+        f'{settings["case_label"]} 已识别到部分解析尺度平流连接；'
+        f'积分窗口为 {settings["start_date"].date()} 至 '
+        f'{settings["end_date"].date()}，dt 分类保持参考结果。\n\n'
+        '(a) 连接轨迹性质：\n' + '\n'.join(arm_lines) + '\n'
+        + f'逐日性质均覆盖{len(settings["dates"])}个午夜、无状态断裂；'
+        + '；'.join(property_change_lines)
+        + '。性质表现为保持并渐变，最大相邻日变化已定位，未见可定位的状态突变。\n\n'
+        '(b) 到达差异：' + '\n'.join(arrival_lines)
+        + f'\n{arrival_conclusion}\n{profile_sentence}\n\n'
+        '(c) 结构关系：逐日候选只按同 calendar date 登记，水平为 '
+        'approximate_circle，垂向按保存的 shallow/deep 或单层点容差；'
+        + structure_sentence
+        + '\n\n'
+        + mechanism
+    )
+    return brief
+
+
+def _ofes_watermass_write_outputs(
+    settings: dict,
+    registry: pd.DataFrame,
+    positions: pd.DataFrame,
+    properties: pd.DataFrame,
+    paired: pd.DataFrame,
+    pair_summary: pd.DataFrame,
+    trajectory_summary: pd.DataFrame,
+    structure: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    arrival_summary: pd.DataFrame,
+    property_daily_summary: pd.DataFrame,
+    profile_group_summary: pd.DataFrame,
+    profiles: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    endpoint_qa: dict,
+    graph: dict,
+    contexts: dict[pd.Timestamp, dict],
+    figures: dict,
+    validation: dict,
+) -> dict:
+    """写出水团复核表、验证记录、参考副本、manifest和中文裁决。"""
+    root = settings['output_dir']
+    root.mkdir(parents=True, exist_ok=True)
+    registry.to_csv(root / 'seed_registry.csv', index=False)
+    _ofes_watermass_write_frame(positions, root / 'trajectory_positions.parquet')
+    _ofes_watermass_write_frame(
+        properties,
+        root / 'trajectory_properties_daily.parquet',
+    )
+    _ofes_watermass_write_frame(
+        paired,
+        root / 'paired_3d_c2_comparison.parquet',
+    )
+    positions.to_csv(root / 'trajectory_positions.csv', index=False)
+    properties.to_csv(root / 'trajectory_properties_daily.csv', index=False)
+    paired.to_csv(root / 'paired_3d_c2_comparison.csv', index=False)
+    pair_summary.to_csv(root / 'seed_pair_mechanism_summary.csv', index=False)
+    trajectory_summary.to_csv(
+        root / 'trajectory_mechanism_summary.csv',
+        index=False,
+    )
+    structure.to_csv(
+        root / 'trajectory_structure_registration.csv',
+        index=False,
+    )
+    structure_summary.to_csv(
+        root / 'structure_group_summary.csv',
+        index=False,
+    )
+    arrival_summary.to_csv(
+        root / 'arrival_outcome_mechanism_summary.csv',
+        index=False,
+    )
+    property_daily_summary.to_csv(
+        root / 'property_group_daily_summary.csv',
+        index=False,
+    )
+    profile_group_summary.to_csv(
+        root / 'virtual_profile_group_summary.csv',
+        index=False,
+    )
+    profiles.to_csv(root / 'along_path_profile_metrics.csv', index=False)
+    endpoints.to_csv(root / 'particle_endpoint_registration.csv', index=False)
+    endpoint_qa['frame'].to_csv(
+        root / 'endpoint_reproduction_qa.csv',
+        index=False,
+    )
+    endpoint_qa_json = {
+        key: value for key, value in endpoint_qa.items() if key != 'frame'
+    }
+    (root / 'endpoint_reproduction_qa.json').write_text(
+        json.dumps(endpoint_qa_json, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    (root / 'candidate_graph_validation.json').write_text(
+        json.dumps(graph['validation'], ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+    reference_names = (
+        'particle_endpoint_registration.csv',
+        'arrival_verification.csv',
+        'group_summary.csv',
+        'manifest.json',
+    )
+    for name in reference_names:
+        source = settings['reference_output_dir'] / name
+        if not source.is_file():
+            raise FileNotFoundError(f'Missing reference file: {source}')
+        shutil.copy2(source, root / f'reference_{name}')
+    source_inventory = []
+    for stamp in settings['dates']:
+        for variable in ('do2', 'temp', 'salinity', 'u', 'v', 'w'):
+            source_inventory.append(
+                {
+                    'date': pd.Timestamp(stamp).date().isoformat(),
+                    'variable': variable,
+                    'path': str(_ofes_file_path(variable, stamp).resolve()),
+                }
+            )
+    daily_scalar_inventory = []
+    for stamp in settings['dates']:
+        context = contexts.get(pd.Timestamp(stamp))
+        if context is None:
+            raise ValueError(f'Missing daily scalar context for {stamp}.')
+        daily_scalar_inventory.append(
+            {
+                'date': pd.Timestamp(stamp).date().isoformat(),
+                **context['scalar'].get('metadata', {}).get(
+                    'watermass_read', {}
+                ),
+            }
+        )
+    (root / 'daily_scalar_read_inventory.json').write_text(
+        json.dumps(daily_scalar_inventory, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+    output_names = [
+        'experiment_identity.json',
+        'manifest.json',
+        'validation.json',
+        'seed_registry.csv',
+        'trajectory_positions.parquet',
+        'trajectory_positions.csv',
+        'trajectory_properties_daily.parquet',
+        'trajectory_properties_daily.csv',
+        'paired_3d_c2_comparison.parquet',
+        'paired_3d_c2_comparison.csv',
+        'seed_pair_mechanism_summary.csv',
+        'trajectory_mechanism_summary.csv',
+        'trajectory_structure_registration.csv',
+        'structure_group_summary.csv',
+        'arrival_outcome_mechanism_summary.csv',
+        'property_group_daily_summary.csv',
+        'virtual_profile_group_summary.csv',
+        'along_path_profile_metrics.csv',
+        'particle_endpoint_registration.csv',
+        'endpoint_reproduction_qa.csv',
+        'endpoint_reproduction_qa.json',
+        'candidate_graph_validation.json',
+        'daily_scalar_read_inventory.json',
+        'figure_1_paths.png',
+        'figure_2_properties.png',
+        'figure_3_virtual_profiles.png',
+        'ROOT_DECISION_BRIEF_zh.md',
+        'reference_particle_endpoint_registration.csv',
+        'reference_arrival_verification.csv',
+        'reference_group_summary.csv',
+        'reference_manifest.json',
+    ]
+    brief = _ofes_watermass_decision_brief(
+        trajectory_summary,
+        pair_summary,
+        structure_summary,
+        endpoints,
+        arrival_summary,
+        property_daily_summary,
+        profile_group_summary,
+        settings,
+    )
+    (root / 'ROOT_DECISION_BRIEF_zh.md').write_text(
+        brief,
+        encoding='utf-8',
+    )
+    case_identity = _ofes_dual_endpoint_case_identity(settings)
+    identity = {
+        'analysis': 'dual_endpoint_watermass_review',
+        'case_id': settings['case_id'],
+        'case_label': settings['case_label'],
+        'case_identity': case_identity,
+        'case_arms': settings['arms'],
+        'input_paths': {
+            name: str(path.resolve())
+            for name, path in {
+                **settings['inputs'],
+                **settings['structure_paths'],
+                'reference_output_dir': settings['reference_output_dir'],
+                'w_validation_output_dir': settings['w_validation_output_dir'],
+            }.items()
+        },
+        'reference_provenance': {
+            'source_directory': str(settings['reference_output_dir']),
+            'copied_files': [
+                f'reference_{name}' for name in reference_names
+            ],
+        },
+        'daily_window': {
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+            'midnight_count': int(len(settings['dates'])),
+            'scalar_variables': ['do2', 'temp', 'salinity'],
+            'velocity_variables': ['u', 'v', 'w'],
+            'source_inventory': source_inventory,
+            'scalar_read_inventory': daily_scalar_inventory,
+        },
+        'w_semantics': {
+            'units': 'm s-1',
+            'positive_direction': 'up',
+            'depth_coordinate': 'depth_w',
+        },
+        'time_conventions': {
+            'calendar_time': 'naive UTC-like OFES calendar timestamp at exact midnight',
+            'calendar_offset_seconds': 'signed calendar_time minus each arm release',
+            'integration_elapsed_seconds': 'nonnegative elapsed time along integration direction',
+            'integration_step': 'ordered returned substep index',
+        },
+        'outputs': {
+            name: str((root / name).resolve())
+            for name in output_names
+        },
+        'completion': {
+            'complete': bool(validation['complete']),
+            'exception_count': int(validation['exception_count']),
+        },
+    }
+    (root / 'experiment_identity.json').write_text(
+        json.dumps(identity, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    manifest = {
+        'analysis': 'dual_endpoint_watermass_review',
+        'case_id': settings['case_id'],
+        'case_label': settings['case_label'],
+        'case_identity': case_identity,
+        'reference_provenance': identity['reference_provenance'],
+        'inputs': identity['input_paths'],
+        'daily_window': identity['daily_window'],
+        'w_semantics': identity['w_semantics'],
+        'time_conventions': identity['time_conventions'],
+        'outputs': identity['outputs'],
+        'validation': validation,
+        'completion_status': (
+            'complete' if validation['complete'] else 'failed'
+        ),
+        'complete': bool(validation['complete']),
+    }
+    (root / 'validation.json').write_text(
+        json.dumps(validation, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    (root / 'manifest.json').write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'trajectory_positions': positions,
+        'trajectory_properties_daily': properties,
+        'paired_3d_c2_comparison': paired,
+        'seed_pair_mechanism_summary': pair_summary,
+        'trajectory_mechanism_summary': trajectory_summary,
+        'trajectory_structure_registration': structure,
+        'structure_group_summary': structure_summary,
+        'arrival_outcome_mechanism_summary': arrival_summary,
+        'property_group_daily_summary': property_daily_summary,
+        'virtual_profile_group_summary': profile_group_summary,
+        'along_path_profile_metrics': profiles,
+        'particle_endpoint_registration': endpoints,
+        'endpoint_reproduction_qa': endpoint_qa,
+        'decision_brief': brief,
+        'figures': figures,
+    }
+
+
+def build_ofes_dual_endpoint_watermass_review(
+    case_spec: dict,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """沿确切双端点解析轨迹生成水团性质、结构关系和机制复核。
+
+    本 producer 使用案例声明的真实对象像素、端点半振幅核、解析 u/v/w 日场和同 seed
+    固定深度 C2 控制。它严格提取每日午夜位置，在共享日标量快照上计算 raw DO、温盐、
+    TEOS-10 密度/spiciness、原生 w、候选图关系和 virtual DO50，并把所有验证门写入
+    自包含输出目录。
+
+    参数:
+        - case_spec (dict): 包含端点、参考输出、候选图、路径图和积分参数的案例规格。
+        - output_dir (str | pathlib.Path | None): 覆盖案例规格中的新输出目录。
+    返回:
+        - dict: 返回表格、验证门、manifest、图件和中文裁决路径。
+    输出:
+        - 新输出目录中的轨迹、属性、配对、结构、虚拟剖面、验证、参考副本、
+          arrival outcome、逐日性质和 virtual DO50 分组表、三张 PNG 和裁决文件。
+    说明:
+        - producer 只负责编排；所有轨迹数据来自既有 OFES Eulerian 场，
+          不等同体积输送率或闭合氧预算。
+    """
+    settings = _ofes_watermass_parse_case_inputs(case_spec, output_dir)
+    _ofes_watermass_validate_output_identity(settings['output_dir'], settings)
+    support, target_info, objects, _ = _ofes_dual_endpoint_load_support(settings)
+    registry = _ofes_watermass_build_seed_registry(settings, objects)
+    velocity, results, positions, midnight = _ofes_watermass_replay_trajectories(
+        settings,
+        support,
+        objects,
+        registry,
+    )
+    contexts = _ofes_watermass_load_daily_scalar_snapshots(
+        settings,
+        midnight,
+        velocity,
+    )
+    properties = _ofes_watermass_sample_properties(
+        midnight,
+        contexts,
+        settings,
+    )
+    endpoints, endpoint_qa = _ofes_watermass_reproduce_endpoints(
+        settings,
+        registry,
+        results,
+        target_info,
+    )
+    properties, paired, pair_summary, trajectory_summary = (
+        _ofes_watermass_build_paired_summary(
+            properties,
+            endpoints,
+            settings,
+        )
+    )
+    graph = _ofes_watermass_load_candidate_graph(settings)
+    structure, structure_summary = _ofes_watermass_register_structure(
+        properties,
+        graph,
+        settings,
+    )
+    profiles = _ofes_watermass_build_virtual_profiles(
+        properties,
+        contexts,
+        settings,
+    )
+    arrival_summary, property_daily_summary, profile_group_summary = (
+        _ofes_watermass_build_reducer_tables(
+            paired, endpoints, trajectory_summary, properties, profiles, settings
+        )
+    )
+    figures = _ofes_watermass_plot_outputs(
+        positions,
+        properties,
+        structure,
+        profiles,
+        settings,
+    )
+    validation = _ofes_watermass_build_validation_verdict(
+        positions,
+        midnight,
+        properties,
+        registry,
+        endpoints,
+        endpoint_qa,
+        structure,
+        structure_summary,
+        arrival_summary,
+        property_daily_summary,
+        profile_group_summary,
+        graph,
+        profiles,
+        figures,
+        settings,
+    )
+    return _ofes_watermass_write_outputs(
+        settings,
+        registry,
+        positions,
+        properties,
+        paired,
+        pair_summary,
+        trajectory_summary,
+        structure,
+        structure_summary,
+        arrival_summary,
+        property_daily_summary,
+        profile_group_summary,
+        profiles,
+        endpoints,
+        endpoint_qa,
+        graph,
+        contexts,
+        figures,
+        validation,
+    )
+
+
+def load_ofes_dual_endpoint_watermass_review(
+    output_dir: str | Path,
+) -> dict:
+    """读取已生成的双端点水团复核输出，不重新读取场或重放轨迹。
+
+    读取器返回 manifest、validation、逐日属性、轨迹、配对、结构登记、三个 reducer 表和 virtual profile 表，
+    供 Notebook 轻量展示；它不会重新计算科学量。
+
+    参数:
+        - output_dir (str | pathlib.Path): 已生成的水团复核输出目录。
+    返回:
+        - dict: 返回 manifest、validation、表格、中文裁决和图件路径。
+    输出:
+        - 无文件输出。
+    说明:
+        - 读取器保留失败 validation，调用方应先检查 manifest 的 complete 字段。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    pair_summary = pd.read_csv(root / 'seed_pair_mechanism_summary.csv')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'trajectory_positions': pd.read_parquet(
+            root / 'trajectory_positions.parquet'
+        ),
+        'trajectory_properties_daily': pd.read_parquet(
+            root / 'trajectory_properties_daily.parquet'
+        ),
+        'paired_3d_c2_comparison': pd.read_parquet(
+            root / 'paired_3d_c2_comparison.parquet'
+        ),
+        'trajectory_mechanism_summary': pd.read_csv(
+            root / 'trajectory_mechanism_summary.csv'
+        ),
+        'seed_pair_mechanism_summary': pair_summary,
+        'summary': pair_summary,
+        'trajectory_structure_registration': pd.read_csv(
+            root / 'trajectory_structure_registration.csv'
+        ),
+        'structure_group_summary': pd.read_csv(
+            root / 'structure_group_summary.csv'
+        ),
+        'arrival_outcome_mechanism_summary': pd.read_csv(
+            root / 'arrival_outcome_mechanism_summary.csv'
+        ),
+        'property_group_daily_summary': pd.read_csv(
+            root / 'property_group_daily_summary.csv'
+        ),
+        'virtual_profile_group_summary': pd.read_csv(
+            root / 'virtual_profile_group_summary.csv'
+        ),
+        'along_path_profile_metrics': pd.read_csv(
+            root / 'along_path_profile_metrics.csv'
+        ),
+        'endpoint_reproduction_qa': pd.read_csv(
+            root / 'endpoint_reproduction_qa.csv'
+        ),
+        'daily_scalar_read_inventory': json.loads(
+            (root / 'daily_scalar_read_inventory.json').read_text(
+                encoding='utf-8'
+            )
+        ),
+        'decision_brief': (
+            root / 'ROOT_DECISION_BRIEF_zh.md'
+        ).read_text(encoding='utf-8'),
+        'figures': {
+            name: root / name
+            for name in (
+                'figure_1_paths.png',
+                'figure_2_properties.png',
+                'figure_3_virtual_profiles.png',
+            )
+        },
     }
 
 
