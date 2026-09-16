@@ -97820,10 +97820,11 @@ def _ofes_do50_detectability_verdict(
     detected = int(daily['formal_do50_detected'].astype(bool).sum())
     missed = total - detected
     sub50 = get_count('same_peak_sub50_positive')
+    ge50 = get_count('same_peak_ge50')
+    associated = ge50 + sub50
     outside = get_count('peak_outside_particle_layer')
     absent = get_count('peak_shape_absent')
     invalid = get_count('invalid')
-    threshold_share = sub50 / missed if missed else np.nan
     sub50_delta = pd.to_numeric(
         daily.loc[
             daily['classification'].eq('same_peak_sub50_positive'),
@@ -97843,27 +97844,33 @@ def _ofes_do50_detectability_verdict(
             f'μmol kg⁻¹，median={sub50_delta.median():.3f}，'
             f'IQR={q25:.3f}–{q75:.3f} μmol kg⁻¹。'
         )
-    if np.isfinite(threshold_share) and threshold_share > 0.5:
-        main_sentence = (
-            f'未检出 {missed} 日中有 {sub50} 日（{threshold_share:.1%}）仍保留'
-            f'与粒子层关联的正 ΔDO 峰但低于 {settings["do_threshold"]:g}，因此目录缺口的主要原因是'
-            ' DO50 阈值化可探测性的开关。'
-        )
+    main_sentence = (
+        f'在这 {total} 个实际采样位置的 virtual profile 中，未检出 {missed} 日里有 {sub50} 日'
+        f'（{sub50 / missed:.1%}）仍保留与粒子层关联的正 ΔDO 峰但低于'
+        f' {settings["do_threshold"]:g} μmol kg⁻¹。这个比例只描述这些采样位置上的'
+        '阈值判定，不能单独归因整个原生格点对象或整个目录的缺口。'
+    ) if missed else (
+        '实际采样位置上没有未检出日，因此没有可计算的低于阈值比例；这不外推到整个原生格点对象或目录。'
+    )
+    if associated == total and outside == 0 and absent == 0 and invalid == 0:
         continuity_sentence = (
-            f'在本案例的 {validation["arrived_3d_trajectory_count"]} 条到达轨迹和 {validation["internal_day_count_per_trajectory"]} 个内部日范围内，这支持“原始氧异常'
-            '连续存在而阈值化剖面间歇出现”。因此目录断裂主要反映 DO50 可探测性开关，'
-            '解析平流和水团性质连续性未中断。'
+            f'在本案例 {validation["arrived_3d_trajectory_count"]} 条到达轨迹的'
+            f' {validation["internal_day_count_per_trajectory"]} 个内部日中，'
+            f'粒子层关联正峰覆盖 {associated}/{total} 日（其中 ≥50 为 {ge50} 日、'
+            f'低于阈值但为正峰 {sub50} 日）；峰移层、峰形消失和无效均为 0 日，'
+            '因此这些实际采样位置的每个内部日都伴随粒子层关联正峰。'
         )
     else:
-        main_sentence = (
-            f'未检出 {missed} 日中仅有 {sub50} 日（{threshold_share:.1%}）仍保留'
-            f'与粒子层关联的正 ΔDO 峰但低于 {settings["do_threshold"]:g}；缺口由阈值开关与峰层/峰形变化'
-            '共同造成，不能归为单一原因。'
-        )
         continuity_sentence = (
-            '因此原始氧异常只在同一粒子层关联正峰类别覆盖的日期保持连续，其他日期需按'
-            '峰移层或峰形消失解释。'
+            f'在本案例 {validation["arrived_3d_trajectory_count"]} 条到达轨迹的'
+            f' {validation["internal_day_count_per_trajectory"]} 个内部日中，'
+            f'粒子层关联正峰覆盖 {associated}/{total} 日（其中 ≥50 为 {ge50} 日、'
+            f'低于阈值但为正峰 {sub50} 日）；峰移层 {outside} 日、峰形消失 {absent} 日、'
+            f'无效 {invalid} 日。'
         )
+    continuity_sentence += (
+        '该连续性判定只适用于这些实际采样位置，不能外推为整个原生格点对象或目录的连续性。'
+    )
     arm_lines = []
     for arm in sorted(daily['arm'].astype(str).unique()):
         arm_daily = daily.loc[daily['arm'].eq(arm)]
@@ -100959,6 +100966,3172 @@ def load_ofes_dual_endpoint_mechanism_closure(
         **frames,
         'verdict': (root / 'verdict_zh.md').read_text(encoding='utf-8'),
         'figures': {'mechanism_closure': figure_path},
+    }
+
+
+_OFES_TRANSPORT_ORGANIZATION_CATEGORIES = (
+    'joint_same_candidate',
+    'horizontal_and_vertical_separate_candidates_no_joint',
+    'horizontal_only',
+    'vertical_only',
+    'neither',
+    'no_candidate_support',
+)
+_OFES_TRANSPORT_ORGANIZATION_FIELD_METRICS = (
+    'raw_do_umol_kg',
+    'temp_potential_deg_c',
+    'salinity_psu',
+    'u_m_s',
+    'v_m_s',
+    'speed_m_s',
+    'relative_vorticity_s_1',
+    'normal_strain_s_1',
+    'shear_strain_s_1',
+    'strain_magnitude_s_1',
+)
+_OFES_TRANSPORT_ORGANIZATION_SEED_SUMMARY_COLUMNS = (
+    'trajectory_key',
+    'path_id',
+    'arm',
+    'particle_index',
+    'seed_key',
+    'calendar_day_count',
+    'path_support_day_count',
+    'relative_geometry_day_count',
+    'relative_r_start_km',
+    'relative_r_end_km',
+    'relative_r_min_km',
+    'relative_r_max_km',
+    'relative_bearing_net_deg',
+    'bearing_increment_count',
+    'bearing_increment_median_deg',
+    'bearing_increment_max_abs_deg',
+    'bearing_increment_median_deg_per_day',
+    'bearing_increment_max_abs_deg_per_day',
+    'bearing_calendar_gap_max_days',
+    'bearing_increment_positive_fraction',
+    'near_origin_threshold_km',
+    'near_origin_day_count',
+    'near_origin_angle_unstable',
+    'path_center_jump_max_km',
+    'path_center_source',
+    'first_valid_date',
+    'last_valid_date',
+)
+
+
+def _ofes_transport_organization_text(value: object) -> str:
+    """保留运输组织审查中的分号连接身份，同时把空值变为空字符串。"""
+    if value is None or pd.isna(value):
+        return ''
+    return str(value).strip()
+
+
+def _ofes_transport_organization_signed_xy(
+    lon: float,
+    lat: float,
+    lon0: float,
+    lat0: float,
+) -> tuple[float, float]:
+    """返回以参考点为原点、东向和北向为正的局地米制位移。"""
+    scale = approximate_degree_length(float(lat0))
+    dx = float(
+        _minimal_lon_diff_deg(float(lon), float(lon0))
+        * scale['meters_per_degree_lon']
+    )
+    dy = float((float(lat) - float(lat0)) * scale['meters_per_degree_lat'])
+    return dx, dy
+
+
+def _ofes_transport_organization_field_metrics(
+    snapshot: dict,
+    depth_index: int,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """从同层实际 u/v 计算速度、相对涡度和应变场，不做空间平均。"""
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    target_depth = float(depth[depth_index])
+    kinematic = _ofes_fixed_depth_kinematic_fields(
+        snapshot, target_depth, smoothing_sigma_pixels=0.0
+    )
+    relative_vorticity = np.asarray(kinematic['relative_vorticity'], dtype=float)
+    normal_strain = np.asarray(kinematic['normal_strain'], dtype=float)
+    shear_strain = np.asarray(kinematic['shear_strain'], dtype=float)
+    return (
+        {
+            'u_m_s': np.asarray(kinematic['u'], dtype=float),
+            'v_m_s': np.asarray(kinematic['v'], dtype=float),
+            'speed_m_s': np.hypot(kinematic['u'], kinematic['v']),
+            'relative_vorticity_s_1': relative_vorticity,
+            'normal_strain_s_1': normal_strain,
+            'shear_strain_s_1': shear_strain,
+            'strain_magnitude_s_1': np.asarray(kinematic['total_strain'], dtype=float),
+        },
+        {
+            'gradient_coordinate': 'tracer-center lon/lat grid',
+            'gradient_definition': {
+                'relative_vorticity_s_1': 'dv/dx - du/dy',
+                'normal_strain_s_1': 'du/dx - dv/dy',
+                'shear_strain_s_1': 'dv/dx + du/dy',
+                'strain_magnitude_s_1': 'sqrt(normal_strain^2 + shear_strain^2)',
+            },
+            'no_spatial_average': True,
+        },
+    )
+
+
+def _ofes_transport_organization_sample_metrics(
+    interpolators: Mapping[str, RegularGridInterpolator],
+    lat: float,
+    lon: float,
+) -> dict[str, float]:
+    """在一个经纬度位置双线性采样同层场量，缺测保留 NaN。"""
+    result = {name: np.nan for name in _OFES_TRANSPORT_ORGANIZATION_FIELD_METRICS}
+    if not np.all(np.isfinite([lat, lon])):
+        return result
+    point = np.asarray([[float(lat), float(lon)]], dtype=float)
+    for name, interpolator in interpolators.items():
+        value = np.asarray(interpolator(point), dtype=float).reshape(-1)
+        if value.size and np.isfinite(value[0]):
+            result[name] = float(value[0])
+    return result
+
+
+def _ofes_transport_organization_parse_case_spec(
+    case_spec: Mapping,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """解析运输组织审查规格并锁定已有双端点与候选输入。"""
+    required = {
+        'case_id',
+        'watermass_output_dir',
+        'mechanism_closure_output_dir',
+        'structure_continuity_output_dir',
+        'output_dir',
+        'start_date',
+        'end_date',
+        'reference_depth_m',
+        'reference_depth_half_window_m',
+        'max_read_span_km',
+    }
+    if not isinstance(case_spec, Mapping):
+        raise TypeError('case_spec must be a mapping.')
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise ValueError(f'Transport organization case_spec lacks fields: {missing}')
+    watermass_root = Path(case_spec['watermass_output_dir']).expanduser().resolve()
+    closure_root = Path(case_spec['mechanism_closure_output_dir']).expanduser().resolve()
+    structure_root = Path(case_spec['structure_continuity_output_dir']).expanduser().resolve()
+    root = Path(output_dir if output_dir is not None else case_spec['output_dir']).expanduser().resolve()
+    if root == watermass_root:
+        raise ValueError('Transport organization output must be a child of the watermass review.')
+    try:
+        root.relative_to(watermass_root)
+    except ValueError as exc:
+        raise ValueError('Transport organization output must live under watermass_output_dir.') from exc
+    for protected_label, protected_root in (
+        ('mechanism closure', closure_root),
+        ('structure continuity', structure_root),
+    ):
+        if (
+            root == protected_root
+            or root.is_relative_to(protected_root)
+            or protected_root.is_relative_to(root)
+        ):
+            raise ValueError(
+                'Transport organization output overlaps the protected '
+                f'{protected_label} input: {root}.'
+            )
+    for label, path in (
+        ('watermass', watermass_root),
+        ('mechanism closure', closure_root),
+        ('structure continuity', structure_root),
+    ):
+        if not path.is_dir():
+            raise FileNotFoundError(f'{label.title()} directory is missing: {path}')
+    start_date = pd.Timestamp(case_spec['start_date']).normalize()
+    end_date = pd.Timestamp(case_spec['end_date']).normalize()
+    if end_date < start_date:
+        raise ValueError('The transport organization date window must be increasing.')
+    reference_depth_m = float(case_spec['reference_depth_m'])
+    depth_half_window_m = float(case_spec['reference_depth_half_window_m'])
+    max_read_span_km = float(case_spec['max_read_span_km'])
+    grid_halo_cells = int(case_spec.get('grid_halo_cells', 2))
+    if (
+        not np.isfinite(reference_depth_m)
+        or reference_depth_m <= 0
+        or not np.isfinite(depth_half_window_m)
+        or depth_half_window_m <= 0
+        or not np.isfinite(max_read_span_km)
+        or max_read_span_km <= 0
+        or grid_halo_cells < 1
+    ):
+        raise ValueError('Transport organization depth and grid halo settings are invalid.')
+    dates = pd.date_range(start_date, end_date, freq='D')
+    representative_dates = case_spec.get('representative_dates')
+    if representative_dates is None:
+        representative_dates = [
+            dates[0], dates[len(dates) // 2], dates[-1]
+        ]
+    representative_dates = [pd.Timestamp(value).normalize() for value in representative_dates]
+    if not representative_dates or not set(representative_dates).issubset(set(dates)):
+        raise ValueError('Representative dates must be inside the declared date window.')
+    display_path_ids = case_spec.get('display_path_ids')
+    if display_path_ids is not None:
+        if isinstance(display_path_ids, str):
+            display_path_ids = [display_path_ids]
+        display_path_ids = [str(value).strip() for value in display_path_ids]
+        if any(not value for value in display_path_ids):
+            raise ValueError('Display path IDs must be non-empty strings.')
+    manifest_path = watermass_root / 'manifest.json'
+    validation_path = watermass_root / 'validation.json'
+    if not manifest_path.is_file() or not validation_path.is_file():
+        raise FileNotFoundError('Watermass review manifest and validation are required.')
+    watermass_manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    watermass_validation = json.loads(validation_path.read_text(encoding='utf-8'))
+    if (
+        watermass_manifest.get('analysis') != 'dual_endpoint_watermass_review'
+        or not bool(watermass_manifest.get('complete'))
+        or watermass_validation.get('analysis') != watermass_manifest.get('analysis')
+        or not bool(watermass_validation.get('complete'))
+    ):
+        raise ValueError('The supplied watermass review is incomplete or has a wrong identity.')
+    manifest_window = watermass_manifest.get('daily_window', {})
+    if (
+        pd.Timestamp(manifest_window.get('start_date')).normalize() != start_date
+        or pd.Timestamp(manifest_window.get('end_date')).normalize() != end_date
+    ):
+        raise ValueError('Transport organization dates do not match the watermass review window.')
+    closure_manifest = closure_root / 'manifest.json'
+    closure_validation = closure_root / 'validation.json'
+    if not closure_manifest.is_file() or not closure_validation.is_file():
+        raise FileNotFoundError('Mechanism closure manifest and validation are required.')
+    closure_manifest_data = json.loads(closure_manifest.read_text(encoding='utf-8'))
+    closure_validation_data = json.loads(closure_validation.read_text(encoding='utf-8'))
+    source_case_id = str(watermass_manifest.get('case_id'))
+    if (
+        closure_manifest_data.get('analysis') != 'ofes_dual_endpoint_mechanism_closure'
+        or not bool(closure_manifest_data.get('complete'))
+        or closure_validation_data.get('analysis') != 'ofes_dual_endpoint_mechanism_closure'
+        or not bool(closure_validation_data.get('complete'))
+        or str(closure_manifest_data.get('source_case_id')) != source_case_id
+    ):
+        raise ValueError('The mechanism closure identity is incomplete or mismatched.')
+    return {
+        'case_id': str(case_spec['case_id']),
+        'case_label': str(case_spec.get('case_label', case_spec['case_id'])),
+        'watermass_output_dir': watermass_root,
+        'mechanism_closure_output_dir': closure_root,
+        'structure_continuity_output_dir': structure_root,
+        'output_dir': root,
+        'start_date': start_date,
+        'end_date': end_date,
+        'dates': dates,
+        'representative_dates': representative_dates,
+        'display_path_ids': display_path_ids,
+        'reference_depth_m': reference_depth_m,
+        'reference_depth_half_window_m': depth_half_window_m,
+        'max_read_span_km': max_read_span_km,
+        'grid_halo_cells': grid_halo_cells,
+        'watermass_manifest': watermass_manifest,
+        'watermass_validation': watermass_validation,
+        'watermass_case_id': source_case_id,
+        'watermass_case_identity': dict(watermass_manifest.get('case_identity', {})),
+        'closure_manifest': closure_manifest_data,
+        'closure_validation': closure_validation_data,
+    }
+
+
+def _ofes_transport_organization_load_inputs(settings: dict) -> dict:
+    """读取 arrived 3-D 轨迹、全部候选分支和独立结构路径表。"""
+    watermass_root = settings['watermass_output_dir']
+    closure = load_ofes_dual_endpoint_mechanism_closure(
+        settings['mechanism_closure_output_dir']
+    )
+    paired = closure['paired_path_daily'].copy()
+    paired['calendar_time'] = pd.to_datetime(paired['calendar_time']).dt.normalize()
+    paired['trajectory_key_3d'] = paired['trajectory_key_3d'].astype(str)
+    endpoint = pd.read_csv(watermass_root / 'particle_endpoint_registration.csv')
+    endpoint['arrived_bool'] = endpoint['arrived'].map(_ofes_dual_endpoint_mechanism_closure_bool)
+    arrived = endpoint.loc[
+        endpoint['vertical_mode'].astype(str).eq('three_dimensional')
+        & endpoint['arrived_bool']
+    ].copy()
+    if arrived.empty or arrived['trajectory_key'].duplicated().any():
+        raise ValueError('Arrived 3-D endpoint registrations are missing or duplicated.')
+    arrived_keys = set(arrived['trajectory_key'].astype(str))
+    paired_keys = set(paired['trajectory_key_3d'].astype(str))
+    if arrived_keys != paired_keys:
+        raise ValueError('Mechanism closure and endpoint registration cover different arrived trajectories.')
+    positions = pd.read_parquet(watermass_root / 'trajectory_positions.parquet')
+    positions['calendar_time'] = pd.to_datetime(positions['calendar_time'])
+    positions['calendar_date'] = positions['calendar_time'].dt.normalize()
+    position_columns = {
+        'trajectory_key', 'arm', 'particle_index', 'seed_key', 'vertical_mode',
+        'calendar_time', 'status', 'depth_m', 'lat', 'lon',
+    }
+    missing = sorted(position_columns.difference(positions.columns))
+    if missing:
+        raise ValueError(f'Trajectory positions lack columns: {missing}')
+    positions = positions.loc[positions['vertical_mode'].astype(str).eq('three_dimensional')].copy()
+    background_positions = positions.loc[positions['status'].astype(str).eq('active')].copy()
+    selected_positions = background_positions.loc[
+        background_positions['trajectory_key'].astype(str).isin(arrived_keys)
+        & background_positions['calendar_date'].isin(set(settings['dates']))
+    ].copy()
+    selected_positions = selected_positions.loc[
+        selected_positions['calendar_time'].dt.hour.eq(0)
+    ].copy()
+    selected_positions['calendar_time'] = selected_positions['calendar_date']
+    if selected_positions.duplicated(['trajectory_key', 'calendar_time']).any():
+        raise ValueError('Arrived trajectory positions contain duplicate calendar samples.')
+    expected_position_rows = len(arrived_keys) * len(settings['dates'])
+    if len(selected_positions) != expected_position_rows:
+        raise ValueError(
+            f'Arrived trajectory positions have {len(selected_positions)} rows; expected {expected_position_rows}.'
+        )
+    background_positions = background_positions.loc[
+        background_positions['calendar_date'].isin(set(settings['dates']))
+        & background_positions['calendar_time'].dt.hour.eq(0)
+    ].copy()
+    background_positions['calendar_time'] = background_positions['calendar_date']
+    structure_registration = pd.read_csv(
+        watermass_root / 'trajectory_structure_registration.csv',
+        parse_dates=['calendar_time', 'candidate_date'],
+    )
+    structure_registration['calendar_time'] = pd.to_datetime(
+        structure_registration['calendar_time']
+    ).dt.normalize()
+    structure_registration = structure_registration.loc[
+        structure_registration['vertical_mode'].astype(str).eq('three_dimensional')
+        & structure_registration['trajectory_key'].astype(str).isin(arrived_keys)
+    ].copy()
+    registration_required = {
+        'case_id', 'arm', 'particle_index', 'seed_key', 'trajectory_key',
+        'vertical_mode', 'calendar_time', 'status', 'depth_m', 'lat', 'lon',
+        'candidate_id', 'horizontal_geometry', 'candidate_depth_m',
+        'candidate_radius_km', 'distance_km', 'horizontal_compatible',
+        'vertical_compatible', 'joint_compatible', 'path_ids',
+        'incoming_edge_ids', 'outgoing_edge_ids', 'sentinel', 'registration_status',
+    }
+    missing = sorted(registration_required.difference(structure_registration.columns))
+    if missing:
+        raise ValueError(f'Trajectory structure registration lacks columns: {missing}')
+    if structure_registration.duplicated(
+        ['trajectory_key', 'calendar_time', 'candidate_id']
+    ).any():
+        raise ValueError('Trajectory structure registration has duplicate candidate rows.')
+    observed_registration_days = {
+        (str(row.trajectory_key), pd.Timestamp(row.calendar_time))
+        for row in structure_registration.itertuples(index=False)
+    }
+    expected_registration_days = {
+        (str(key), pd.Timestamp(date))
+        for key in arrived_keys
+        for date in settings['dates']
+    }
+    if observed_registration_days != expected_registration_days:
+        raise ValueError('Trajectory structure registration does not cover all arrived trajectory-days.')
+    structure_registration['sentinel_bool'] = structure_registration['sentinel'].map(
+        _ofes_dual_endpoint_mechanism_closure_bool
+    )
+    for column in ('horizontal_compatible', 'vertical_compatible', 'joint_compatible'):
+        structure_registration[f'{column}_bool'] = structure_registration[column].map(
+            _ofes_dual_endpoint_mechanism_closure_bool
+        )
+    structure_candidates = pd.read_csv(
+        settings['structure_continuity_output_dir'] / 'daily_structure_candidates.csv'
+    )
+    structure_candidates['date'] = pd.to_datetime(structure_candidates['date']).dt.normalize()
+    if structure_candidates.duplicated(['date', 'candidate_id']).any():
+        raise ValueError('Daily structure candidates are not unique by date and candidate ID.')
+    candidate_fields = [
+        'date', 'candidate_id', 'depth_m', 'lon', 'lat',
+        'thermohaline_centroid_lon', 'thermohaline_centroid_lat',
+        'thermohaline_component_radius_km', 'vertical_shallow_depth_m',
+        'vertical_deep_depth_m', 'vertical_thickness_m', 'vertical_status',
+        'correspondence_status', 'candidate_merge_group',
+    ]
+    missing = sorted(set(candidate_fields).difference(structure_candidates.columns))
+    if missing:
+        raise ValueError(f'Daily structure candidates lack columns: {missing}')
+    candidate_geometry = structure_registration.merge(
+        structure_candidates[candidate_fields],
+        left_on=['calendar_time', 'candidate_id'],
+        right_on=['date', 'candidate_id'],
+        how='left',
+        suffixes=('', '_candidate'),
+        validate='many_to_one',
+    )
+    candidate_geometry['candidate_id'] = candidate_geometry['candidate_id'].astype(str)
+    candidate_geometry['candidate_row_status'] = np.where(
+        candidate_geometry['sentinel_bool'], 'sentinel_no_candidate', 'candidate'
+    )
+    non_sentinel = ~candidate_geometry['sentinel_bool']
+    if candidate_geometry.loc[non_sentinel, 'depth_m_candidate'].isna().any():
+        raise ValueError('A non-sentinel registration row lacks its existing candidate geometry.')
+    candidate_geometry['candidate_relation'] = np.select(
+        [
+            candidate_geometry['joint_compatible_bool'],
+            candidate_geometry['horizontal_compatible_bool']
+            & ~candidate_geometry['vertical_compatible_bool'],
+            candidate_geometry['vertical_compatible_bool']
+            & ~candidate_geometry['horizontal_compatible_bool'],
+        ],
+        ['joint_same_candidate', 'horizontal_only', 'vertical_only'],
+        default='neither',
+    )
+    candidate_geometry['candidate_core_center_depth_m'] = pd.to_numeric(
+        candidate_geometry['depth_m_candidate'], errors='coerce'
+    )
+    candidate_geometry['candidate_core_shallow_depth_m'] = pd.to_numeric(
+        candidate_geometry['vertical_shallow_depth_m'], errors='coerce'
+    )
+    candidate_geometry['candidate_core_deep_depth_m'] = pd.to_numeric(
+        candidate_geometry['vertical_deep_depth_m'], errors='coerce'
+    )
+    particle_depth = pd.to_numeric(candidate_geometry['depth_m'], errors='coerce')
+    candidate_geometry['particle_minus_core_center_m'] = (
+        particle_depth - candidate_geometry['candidate_core_center_depth_m']
+    )
+    candidate_geometry['particle_minus_core_shallow_m'] = (
+        particle_depth - candidate_geometry['candidate_core_shallow_depth_m']
+    )
+    candidate_geometry['particle_minus_core_deep_m'] = (
+        particle_depth - candidate_geometry['candidate_core_deep_depth_m']
+    )
+    candidate_geometry['registration_distance_km'] = pd.to_numeric(
+        candidate_geometry['distance_km'], errors='coerce'
+    )
+    candidate_geometry['registration_radius_km'] = pd.to_numeric(
+        candidate_geometry['candidate_radius_km'], errors='coerce'
+    )
+    candidate_geometry['registration_horizontal_compatible_bool'] = (
+        candidate_geometry['horizontal_compatible_bool'].astype(bool)
+    )
+    candidate_geometry['candidate_distance_km'] = pd.to_numeric(
+        candidate_geometry['distance_km'], errors='coerce'
+    )
+    candidate_geometry['candidate_radius_km'] = pd.to_numeric(
+        candidate_geometry['thermohaline_component_radius_km'], errors='coerce'
+    )
+    with np.errstate(divide='ignore', invalid='ignore'):
+        candidate_geometry['candidate_distance_over_radius'] = (
+            candidate_geometry['candidate_distance_km']
+            / candidate_geometry['candidate_radius_km']
+        )
+    candidate_geometry['candidate_geometry_support'] = np.where(
+        candidate_geometry['sentinel_bool'],
+        'no_candidate_sentinel',
+        'approximate_circle_no_saved_mask',
+    )
+    candidate_geometry['candidate_mask_available'] = False
+    candidate_geometry['path_ids'] = candidate_geometry['path_ids'].map(
+        _ofes_transport_organization_text
+    )
+    candidate_geometry['incoming_edge_ids'] = candidate_geometry['incoming_edge_ids'].map(
+        _ofes_transport_organization_text
+    )
+    candidate_geometry['outgoing_edge_ids'] = candidate_geometry['outgoing_edge_ids'].map(
+        _ofes_transport_organization_text
+    )
+    path_members = pd.read_csv(
+        settings['structure_continuity_output_dir'] / 'structure_path_members.csv'
+    )
+    path_members['date'] = pd.to_datetime(path_members['date']).dt.normalize()
+    path_fields = [
+        'path_id', 'step', 'date', 'candidate_id', 'path_start_date',
+        'path_end_date', 'path_day_count', 'path_candidate_count',
+    ]
+    missing = sorted(set(path_fields).difference(path_members.columns))
+    if missing:
+        raise ValueError(f'Structure path members lack columns: {missing}')
+    path_members = path_members.loc[path_members['date'].isin(set(settings['dates']))].copy()
+    path_members = path_members.merge(
+        structure_candidates[candidate_fields],
+        on=['date', 'candidate_id'],
+        how='left',
+        validate='many_to_one',
+        suffixes=('', '_candidate'),
+    )
+    if path_members['depth_m'].isna().any() or path_members['lon'].isna().any():
+        raise ValueError('Independent structure path lacks candidate geometry.')
+    path_members['path_id'] = path_members['path_id'].map(
+        _ofes_transport_organization_text
+    )
+    if path_members['path_id'].eq('').any():
+        raise ValueError('Existing structure path members contain a blank path ID.')
+    if path_members.duplicated(['path_id', 'date']).any():
+        raise ValueError('Existing structure path has duplicate path/date members.')
+    path_ids = sorted(path_members['path_id'].unique())
+    requested_display_path_ids = settings.get('display_path_ids')
+    if requested_display_path_ids is None:
+        display_path_ids = list(path_ids)
+    elif not path_ids:
+        display_path_ids = []
+    else:
+        unknown_display_path_ids = sorted(
+            set(requested_display_path_ids).difference(path_ids)
+        )
+        if unknown_display_path_ids:
+            raise ValueError(
+                'Requested display paths are absent from structure_path_members.csv: '
+                f'{unknown_display_path_ids}.'
+            )
+        display_path_ids = list(requested_display_path_ids)
+    effective_path_ids = path_ids or ['__NO_PATH__']
+    settings['path_ids_resolved'] = list(path_ids)
+    settings['display_path_ids_resolved'] = list(display_path_ids)
+    p0_summary = pd.read_csv(watermass_root / 'do50_detectability_diagnostic' / 'classification_summary.csv')
+    p0_overall = p0_summary.loc[p0_summary['scope'].astype(str).eq('overall')].copy()
+    p0_counts = {
+        str(row.classification): int(row.count)
+        for row in p0_overall.itertuples(index=False)
+    }
+    return {
+        'closure': closure,
+        'endpoint': endpoint,
+        'arrived': arrived,
+        'paired': paired,
+        'positions': selected_positions,
+        'background_positions': background_positions,
+        'structure_registration': structure_registration,
+        'candidate_geometry': candidate_geometry,
+        'structure_candidates': structure_candidates,
+        'path_members': path_members,
+        'path_ids': path_ids,
+        'effective_path_ids': effective_path_ids,
+        'display_path_ids': display_path_ids,
+        'p0_counts': p0_counts,
+        'p0_total_days': int(p0_overall['count'].sum()),
+    }
+
+
+def _ofes_transport_organization_build_domain(
+    settings: dict,
+    inputs: dict,
+) -> dict:
+    """依据全部既有候选分支、独立路径和轨迹位置构造受限读取域。"""
+    candidates = inputs['candidate_geometry']
+    finite_candidates = candidates.loc[
+        ~candidates['sentinel_bool']
+        & np.isfinite(pd.to_numeric(candidates['lon_candidate'], errors='coerce'))
+        & np.isfinite(pd.to_numeric(candidates['lat_candidate'], errors='coerce'))
+    ].copy()
+    candidate_points = finite_candidates[['lon_candidate', 'lat_candidate']].rename(
+        columns={'lon_candidate': 'lon', 'lat_candidate': 'lat'}
+    )
+    path = inputs['path_members'].loc[:, ['lon', 'lat']].copy()
+    particles = inputs['positions'].loc[:, ['lon', 'lat']].copy()
+    background = inputs['background_positions'].loc[:, ['lon', 'lat']].copy()
+    points = pd.concat([candidate_points, path, particles, background], ignore_index=True)
+    points = points.apply(pd.to_numeric, errors='coerce').dropna()
+    if points.empty:
+        raise ValueError('No finite points are available to define the OFES read domain.')
+    full_lon, full_lat, _, _, reference_path = _ofes_tracer_coordinates(settings['start_date'])
+    lon_scale = approximate_degree_length(float(points['lat'].median()))['meters_per_degree_lon']
+    lat_scale = approximate_degree_length(float(points['lat'].median()))['meters_per_degree_lat']
+    grid_dx_m = float(np.nanmedian(np.diff(full_lon)) * lon_scale)
+    grid_dy_m = float(np.nanmedian(np.diff(full_lat)) * lat_scale)
+    candidate_radii = pd.to_numeric(
+        finite_candidates['candidate_radius_km'], errors='coerce'
+    ).to_numpy(dtype=float)
+    max_radius = float(np.nanmax(candidate_radii)) if np.isfinite(candidate_radii).any() else 0.0
+    buffer_km = max_radius + settings['grid_halo_cells'] * max(grid_dx_m, grid_dy_m) / 1000.0
+    lon_bounds = (
+        max(float(full_lon[0]), float(points['lon'].min() - buffer_km * 1000.0 / lon_scale)),
+        min(float(full_lon[-1]), float(points['lon'].max() + buffer_km * 1000.0 / lon_scale)),
+    )
+    lat_bounds = (
+        max(float(full_lat[0]), float(points['lat'].min() - buffer_km * 1000.0 / lat_scale)),
+        min(float(full_lat[-1]), float(points['lat'].max() + buffer_km * 1000.0 / lat_scale)),
+    )
+    mean_lat = float(np.mean(lat_bounds))
+    span_lon_km = (lon_bounds[1] - lon_bounds[0]) * approximate_degree_length(mean_lat)['meters_per_degree_lon'] / 1000.0
+    span_lat_km = (lat_bounds[1] - lat_bounds[0]) * approximate_degree_length(mean_lat)['meters_per_degree_lat'] / 1000.0
+    if max(span_lon_km, span_lat_km) > settings['max_read_span_km']:
+        raise ValueError(
+            'Transport organization read domain exceeds the configured span limit '
+            f'({settings["max_read_span_km"]:.1f} km): '
+            f'lon={span_lon_km:.1f} km, lat={span_lat_km:.1f} km.'
+        )
+    return {
+        'lon_bounds': lon_bounds,
+        'lat_bounds': lat_bounds,
+        'depth_bounds_m': (
+            max(0.0, settings['reference_depth_m'] - settings['reference_depth_half_window_m']),
+            settings['reference_depth_m'] + settings['reference_depth_half_window_m'],
+        ),
+        'reference_coordinate_path': str(reference_path.resolve()),
+        'grid_spacing_m': {'lon': grid_dx_m, 'lat': grid_dy_m},
+        'candidate_buffer_km': buffer_km,
+        'max_candidate_radius_km': max_radius,
+        'span_km': {'lon': span_lon_km, 'lat': span_lat_km},
+        'point_count_used': int(len(points)),
+        'point_extent': {
+            'lon_min': float(points['lon'].min()),
+            'lon_max': float(points['lon'].max()),
+            'lat_min': float(points['lat'].min()),
+            'lat_max': float(points['lat'].max()),
+        },
+    }
+
+
+def _ofes_transport_organization_read_fields(
+    settings: dict,
+    inputs: dict,
+    domain: dict,
+) -> dict:
+    """逐日一次读取参考层局部 DO/T/S/u/v，并返回逐点采样表和图缓存。"""
+    candidates = inputs['candidate_geometry'].copy()
+    candidate_unique = candidates.loc[
+        ~candidates['sentinel_bool'],
+        ['calendar_time', 'candidate_id', 'lon_candidate', 'lat_candidate'],
+    ].drop_duplicates(['calendar_time', 'candidate_id']).copy()
+    path = inputs['path_members'].sort_values(['date', 'path_id'], kind='mergesort').copy()
+    path_ids = list(inputs['effective_path_ids'])
+    path_lookup = {
+        (str(row.path_id), pd.Timestamp(row.date).normalize()): row._asdict()
+        for row in path.itertuples(index=False)
+    }
+    particles = inputs['positions'].copy()
+    field_rows = []
+    path_rows = []
+    candidate_field_rows = []
+    representative_snapshots = {}
+    inventory = []
+    for stamp in settings['dates']:
+        stamp = pd.Timestamp(stamp).normalize()
+        snapshot = load_ofes_snapshot(
+            stamp,
+            variables=['do2', 'temp', 'salinity', 'u', 'v'],
+            lon_bounds=domain['lon_bounds'],
+            lat_bounds=domain['lat_bounds'],
+            depth_bounds=domain['depth_bounds_m'],
+        )
+        depth = np.asarray(snapshot['depth'], dtype=float)
+        depth_index = int(np.argmin(np.abs(depth - settings['reference_depth_m'])))
+        actual_depth = float(depth[depth_index])
+        if abs(actual_depth - settings['reference_depth_m']) > settings['reference_depth_half_window_m']:
+            raise ValueError(f'No delivered layer near {settings["reference_depth_m"]} m on {stamp:%Y-%m-%d}.')
+        field_arrays, gradient_metadata = _ofes_transport_organization_field_metrics(
+            snapshot, depth_index
+        )
+        field_arrays['raw_do_umol_kg'] = np.asarray(snapshot['do2'][depth_index], dtype=float)
+        field_arrays['temp_potential_deg_c'] = np.asarray(snapshot['temp'][depth_index], dtype=float)
+        field_arrays['salinity_psu'] = np.asarray(snapshot['salinity'][depth_index], dtype=float)
+        interpolators = {
+            name: RegularGridInterpolator(
+                (np.asarray(snapshot['lat'], dtype=float), np.asarray(snapshot['lon'], dtype=float)),
+                np.asarray(array, dtype=float),
+                bounds_error=False,
+                fill_value=np.nan,
+            )
+            for name, array in field_arrays.items()
+        }
+        candidate_day = candidate_unique.loc[candidate_unique['calendar_time'].eq(stamp)].copy()
+        for row in candidate_day.itertuples(index=False):
+            metrics = _ofes_transport_organization_sample_metrics(
+                interpolators, float(row.lat_candidate), float(row.lon_candidate)
+            )
+            candidate_field_rows.append(
+                {
+                    'calendar_time': stamp,
+                    'candidate_id': str(row.candidate_id),
+                    'field_layer_depth_m': actual_depth,
+                    'field_sample_status': 'finite' if np.isfinite(metrics['raw_do_umol_kg']) else 'raw_do_missing',
+                    **{f'candidate_field_{key}': value for key, value in metrics.items()},
+                }
+            )
+        for path_id in path_ids:
+            path_record = path_lookup.get((str(path_id), stamp))
+            path_row = {
+                'case_id': settings['case_id'],
+                'source_case_id': settings['watermass_case_id'],
+                'path_id': str(path_id),
+                'step': np.nan,
+                'calendar_time': stamp,
+                'candidate_id': '',
+                'path_center_lon': np.nan,
+                'path_center_lat': np.nan,
+                'thermohaline_centroid_lon': np.nan,
+                'thermohaline_centroid_lat': np.nan,
+                'path_center_depth_m': np.nan,
+                'path_center_shallow_depth_m': np.nan,
+                'path_center_deep_depth_m': np.nan,
+                'path_radius_km': np.nan,
+                'path_geometry_support': 'no_existing_path' if path_record is None else 'approximate_circle_no_saved_mask',
+                'path_mask_available': False,
+                'path_support_status': 'no_existing_path' if path_record is None else 'path_member',
+                'field_layer_depth_m': actual_depth,
+                'field_sample_status': 'path_missing_for_date' if path_record is None else 'raw_do_missing',
+                'path_gradient_coordinate': gradient_metadata['gradient_coordinate'],
+                **{f'path_field_{key}': np.nan for key in _OFES_TRANSPORT_ORGANIZATION_FIELD_METRICS},
+            }
+            if path_record is not None:
+                path_metrics = _ofes_transport_organization_sample_metrics(
+                    interpolators,
+                    float(path_record['lat']),
+                    float(path_record['lon']),
+                )
+                path_row.update(
+                    {
+                        'step': int(path_record['step']),
+                        'candidate_id': str(path_record['candidate_id']),
+                        'path_center_lon': float(path_record['lon']),
+                        'path_center_lat': float(path_record['lat']),
+                        'thermohaline_centroid_lon': float(path_record['thermohaline_centroid_lon']),
+                        'thermohaline_centroid_lat': float(path_record['thermohaline_centroid_lat']),
+                        'path_center_depth_m': float(path_record['depth_m']),
+                        'path_center_shallow_depth_m': float(path_record['vertical_shallow_depth_m']),
+                        'path_center_deep_depth_m': float(path_record['vertical_deep_depth_m']),
+                        'path_radius_km': float(path_record['thermohaline_component_radius_km']),
+                        'field_sample_status': 'finite' if np.isfinite(path_metrics['raw_do_umol_kg']) else 'raw_do_missing',
+                        **{f'path_field_{key}': value for key, value in path_metrics.items()},
+                    }
+                )
+            path_rows.append(path_row)
+        particle_day = particles.loc[particles['calendar_time'].eq(stamp)].copy()
+        for row in particle_day.sort_values(['arm', 'particle_index', 'trajectory_key']).itertuples(index=False):
+            metrics = _ofes_transport_organization_sample_metrics(
+                interpolators, float(row.lat), float(row.lon)
+            )
+            field_rows.append(
+                {
+                    'case_id': settings['case_id'],
+                    'source_case_id': settings['watermass_case_id'],
+                    'entity_type': 'particle',
+                    'arm': str(row.arm),
+                    'particle_index': int(row.particle_index),
+                    'seed_key': str(row.seed_key),
+                    'trajectory_key': str(row.trajectory_key),
+                    'calendar_time': stamp,
+                    'entity_lon': float(row.lon),
+                    'entity_lat': float(row.lat),
+                    'entity_depth_m': float(row.depth_m),
+                    'field_layer_depth_m': actual_depth,
+                    'field_sample_status': 'finite' if np.isfinite(metrics['raw_do_umol_kg']) else 'raw_do_missing',
+                    **metrics,
+                }
+            )
+        if stamp in set(settings['representative_dates']):
+            representative_snapshots[stamp] = {
+                'lon': np.asarray(snapshot['lon'], dtype=float),
+                'lat': np.asarray(snapshot['lat'], dtype=float),
+                'raw_do_umol_kg': np.asarray(snapshot['do2'][depth_index], dtype=float),
+                'temp_potential_deg_c': np.asarray(snapshot['temp'][depth_index], dtype=float),
+                'salinity_psu': np.asarray(snapshot['salinity'][depth_index], dtype=float),
+                'u_m_s': np.asarray(snapshot['u'][depth_index], dtype=float),
+                'v_m_s': np.asarray(snapshot['v'][depth_index], dtype=float),
+                'field_layer_depth_m': actual_depth,
+            }
+        source_files = {
+            variable: str(_ofes_file_path(variable, stamp).resolve())
+            for variable in ('do2', 'temp', 'salinity', 'u', 'v')
+        }
+        loaded_shapes = {
+            variable: [int(value) for value in np.asarray(snapshot[variable]).shape]
+            for variable in ('do2', 'temp', 'salinity', 'u', 'v')
+        }
+        loaded_values = {
+            variable: int(np.asarray(snapshot[variable]).size)
+            for variable in ('do2', 'temp', 'salinity', 'u', 'v')
+        }
+        inventory.append(
+            {
+                'date': stamp.date().isoformat(),
+                'variables': ['do2', 'temp', 'salinity', 'u', 'v'],
+                'reference_depth_requested_m': settings['reference_depth_m'],
+                'reference_depth_actual_m': actual_depth,
+                'reference_depth_index_in_loaded_slice': depth_index,
+                'loaded_depth_levels_m': depth.tolist(),
+                'lon_bounds_requested': list(domain['lon_bounds']),
+                'lat_bounds_requested': list(domain['lat_bounds']),
+                'lon_bounds_actual': [float(snapshot['lon'][0]), float(snapshot['lon'][-1])],
+                'lat_bounds_actual': [float(snapshot['lat'][0]), float(snapshot['lat'][-1])],
+                'loaded_shapes': loaded_shapes,
+                'loaded_values': loaded_values,
+                'loaded_float32_bytes': int(sum(4 * value for value in loaded_values.values())),
+                'source_files': source_files,
+                'horizontal_sampling': 'bilinear on tracer-center grid',
+                'gradient_metadata': gradient_metadata,
+            }
+        )
+    field_daily = pd.DataFrame(field_rows).sort_values(
+        ['arm', 'particle_index', 'calendar_time', 'trajectory_key'], kind='mergesort'
+    ).reset_index(drop=True)
+    path_daily = pd.DataFrame(path_rows).sort_values(
+        ['path_id', 'calendar_time'], kind='mergesort'
+    ).reset_index(drop=True)
+    path_origin_comparison = _ofes_transport_organization_path_origin_comparison(
+        path_daily
+    )
+    path_daily = path_daily.merge(
+        path_origin_comparison.loc[:, [
+            'path_id', 'calendar_time',
+            'path_center_minus_thermohaline_dx_m',
+            'path_center_minus_thermohaline_dy_m',
+            'path_center_minus_thermohaline_distance_km',
+            'path_center_source', 'thermohaline_centroid_source',
+            'dynamical_centre_claim',
+        ]],
+        on=['path_id', 'calendar_time'],
+        how='left',
+        validate='one_to_one',
+    )
+    candidate_field_columns = [
+        'calendar_time', 'candidate_id', 'field_layer_depth_m',
+        'field_sample_status',
+    ] + [
+        f'candidate_field_{key}'
+        for key in _OFES_TRANSPORT_ORGANIZATION_FIELD_METRICS
+    ]
+    candidate_field = pd.DataFrame(
+        candidate_field_rows, columns=candidate_field_columns
+    )
+    candidates = candidates.merge(
+        candidate_field,
+        left_on=['calendar_time', 'candidate_id'],
+        right_on=['calendar_time', 'candidate_id'],
+        how='left',
+        validate='many_to_one',
+    )
+    return {
+        'field_daily': field_daily,
+        'path_daily': path_daily,
+        'candidate_geometry': candidates,
+        'representative_snapshots': representative_snapshots,
+        'inventory': inventory,
+        'read_domain': domain,
+    }
+
+
+def _ofes_transport_organization_add_path_motion(
+    path_daily: pd.DataFrame,
+) -> pd.DataFrame:
+    """从独立候选路径的逐日位置计算平移位移与局地流速方向关系。"""
+    path = path_daily.sort_values(['path_id', 'calendar_time'], kind='mergesort').copy()
+    path['path_dx_m_from_previous_day'] = np.nan
+    path['path_dy_m_from_previous_day'] = np.nan
+    path['path_translation_speed_m_s'] = np.nan
+    path['path_velocity_alignment_cosine'] = np.nan
+    for path_id, group_index in path.groupby('path_id', sort=False).groups.items():
+        indices = list(group_index)
+        for previous_index, current_index in zip(indices[:-1], indices[1:]):
+            previous = path.loc[previous_index]
+            current = path.loc[current_index]
+            dt_seconds = float(
+                (pd.Timestamp(current['calendar_time']) - pd.Timestamp(previous['calendar_time'])).total_seconds()
+            )
+            if dt_seconds <= 0 or not np.all(
+                np.isfinite(
+                    [
+                        previous['path_center_lon'],
+                        previous['path_center_lat'],
+                        current['path_center_lon'],
+                        current['path_center_lat'],
+                        current['path_field_u_m_s'],
+                        current['path_field_v_m_s'],
+                    ]
+                )
+            ):
+                continue
+            dx, dy = _ofes_transport_organization_signed_xy(
+                float(current['path_center_lon']),
+                float(current['path_center_lat']),
+                float(previous['path_center_lon']),
+                float(previous['path_center_lat']),
+            )
+            displacement_speed = float(np.hypot(dx, dy) / dt_seconds)
+            u = float(current['path_field_u_m_s'])
+            v = float(current['path_field_v_m_s'])
+            flow_speed = float(np.hypot(u, v))
+            alignment = (
+                (dx * u + dy * v) / (np.hypot(dx, dy) * flow_speed)
+                if np.hypot(dx, dy) > 0 and flow_speed > 0
+                else np.nan
+            )
+            path.loc[current_index, 'path_dx_m_from_previous_day'] = dx
+            path.loc[current_index, 'path_dy_m_from_previous_day'] = dy
+            path.loc[current_index, 'path_translation_speed_m_s'] = displacement_speed
+            path.loc[current_index, 'path_velocity_alignment_cosine'] = alignment
+    return path
+
+
+def _ofes_transport_organization_seed_motion_summary(
+    daily: pd.DataFrame,
+    *,
+    near_origin_threshold_km: float = 1.0,
+) -> pd.DataFrame:
+    """按 trajectory/path 身份汇总相对半径、逐日方位增量和近原点不稳性。"""
+    required = {
+        'trajectory_key', 'calendar_time', 'path_id', 'arm', 'particle_index',
+        'seed_key', 'particle_relative_r_km', 'particle_relative_bearing_deg',
+    }
+    missing = sorted(required.difference(daily.columns))
+    if missing:
+        raise ValueError(f'Transport daily table lacks seed-motion columns: {missing}')
+    if near_origin_threshold_km <= 0:
+        raise ValueError('near_origin_threshold_km must be positive.')
+    frame = daily.copy()
+    frame['calendar_time'] = pd.to_datetime(frame['calendar_time']).dt.normalize()
+    if 'path_support_status' not in frame.columns:
+        frame['path_support_status'] = np.where(
+            frame[['path_center_lon', 'path_center_lat']].notna().all(axis=1),
+            'path_member',
+            'path_missing_for_date',
+        )
+    rows = []
+    group_columns = ['trajectory_key', 'path_id']
+    for (trajectory_key, path_id), group in frame.groupby(
+        group_columns, sort=False, dropna=False
+    ):
+        group = group.sort_values('calendar_time', kind='mergesort')
+        first = group.iloc[0]
+        radius = pd.to_numeric(group['particle_relative_r_km'], errors='coerce').to_numpy(dtype=float)
+        bearing = pd.to_numeric(group['particle_relative_bearing_deg'], errors='coerce').to_numpy(dtype=float)
+        valid_radius = np.isfinite(radius)
+        valid_bearing = np.isfinite(bearing)
+        unwrapped = np.full(bearing.shape, np.nan, dtype=float)
+        if valid_bearing.any():
+            unwrapped[valid_bearing] = np.degrees(
+                np.unwrap(np.deg2rad(bearing[valid_bearing]))
+            )
+        valid_unwrapped = unwrapped[np.isfinite(unwrapped)]
+        increments = np.diff(valid_unwrapped) if valid_unwrapped.size >= 2 else np.asarray([])
+        bearing_dates = group.loc[valid_bearing, 'calendar_time'].to_numpy(dtype='datetime64[s]')
+        date_steps = (
+            np.diff(bearing_dates).astype('timedelta64[s]').astype(float) / 86400.0
+            if bearing_dates.size >= 2 else np.asarray([])
+        )
+        increments_per_day = (
+            increments / date_steps
+            if increments.size and np.all(date_steps > 0) else np.asarray([])
+        )
+        path_rows = group.loc[:, [
+            'calendar_time', 'path_center_lon', 'path_center_lat',
+            'path_support_status',
+        ]].drop_duplicates('calendar_time').sort_values('calendar_time')
+        path_lons = pd.to_numeric(path_rows['path_center_lon'], errors='coerce').to_numpy(dtype=float)
+        path_lats = pd.to_numeric(path_rows['path_center_lat'], errors='coerce').to_numpy(dtype=float)
+        path_jumps = []
+        for previous, current in zip(range(len(path_rows) - 1), range(1, len(path_rows))):
+            if np.all(np.isfinite([
+                path_lons[previous], path_lats[previous],
+                path_lons[current], path_lats[current],
+            ])):
+                dx, dy = _ofes_transport_organization_signed_xy(
+                    path_lons[current], path_lats[current],
+                    path_lons[previous], path_lats[previous],
+                )
+                path_jumps.append(np.hypot(dx, dy) / 1000.0)
+        finite_dates = group.loc[valid_radius, 'calendar_time']
+        support = group['path_support_status'].astype(str).eq('path_member')
+        net_bearing = (
+            float(valid_unwrapped[-1] - valid_unwrapped[0])
+            if valid_unwrapped.size >= 2 else np.nan
+        )
+        rows.append({
+            'trajectory_key': str(trajectory_key),
+            'path_id': str(path_id),
+            'arm': str(first['arm']),
+            'particle_index': int(first['particle_index']),
+            'seed_key': str(first['seed_key']),
+            'calendar_day_count': int(len(group)),
+            'path_support_day_count': int(support.sum()),
+            'relative_geometry_day_count': int(valid_radius.sum()),
+            'relative_r_start_km': float(radius[valid_radius][0]) if valid_radius.any() else np.nan,
+            'relative_r_end_km': float(radius[valid_radius][-1]) if valid_radius.any() else np.nan,
+            'relative_r_min_km': float(np.nanmin(radius)) if valid_radius.any() else np.nan,
+            'relative_r_max_km': float(np.nanmax(radius)) if valid_radius.any() else np.nan,
+            'relative_bearing_net_deg': net_bearing,
+            'bearing_increment_count': int(increments.size),
+            'bearing_increment_median_deg': float(np.nanmedian(increments)) if increments.size else np.nan,
+            'bearing_increment_max_abs_deg': float(np.nanmax(np.abs(increments))) if increments.size else np.nan,
+            'bearing_increment_median_deg_per_day': (
+                float(np.nanmedian(increments_per_day))
+                if increments_per_day.size else np.nan
+            ),
+            'bearing_increment_max_abs_deg_per_day': (
+                float(np.nanmax(np.abs(increments_per_day)))
+                if increments_per_day.size else np.nan
+            ),
+            'bearing_calendar_gap_max_days': (
+                float(np.nanmax(date_steps)) if date_steps.size else np.nan
+            ),
+            'bearing_increment_positive_fraction': (
+                float(np.count_nonzero(increments > 0) / increments.size)
+                if increments.size else np.nan
+            ),
+            'near_origin_threshold_km': float(near_origin_threshold_km),
+            'near_origin_day_count': int(np.count_nonzero(radius < near_origin_threshold_km)),
+            'near_origin_angle_unstable': bool(
+                valid_radius.any() and np.nanmin(radius) < near_origin_threshold_km
+            ),
+            'path_center_jump_max_km': float(np.nanmax(path_jumps)) if path_jumps else np.nan,
+            'path_center_source': 'existing daily structure candidate lon/lat (peak-pixel location); not a dynamical centre',
+            'first_valid_date': (
+                pd.Timestamp(finite_dates.iloc[0]).date().isoformat()
+                if len(finite_dates) else None
+            ),
+            'last_valid_date': (
+                pd.Timestamp(finite_dates.iloc[-1]).date().isoformat()
+                if len(finite_dates) else None
+            ),
+        })
+    return pd.DataFrame(
+        rows,
+        columns=_OFES_TRANSPORT_ORGANIZATION_SEED_SUMMARY_COLUMNS,
+    ).sort_values(
+        ['arm', 'particle_index', 'path_id', 'trajectory_key'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_transport_organization_path_origin_comparison(
+    path_daily: pd.DataFrame,
+) -> pd.DataFrame:
+    """记录既有候选峰像素位置与热盐质心的位置差，避免混称为动力中心。"""
+    required = {
+        'path_id', 'calendar_time', 'candidate_id', 'path_center_lon',
+        'path_center_lat', 'thermohaline_centroid_lon',
+        'thermohaline_centroid_lat', 'path_support_status',
+    }
+    missing = sorted(required.difference(path_daily.columns))
+    if missing:
+        raise ValueError(f'Path table lacks origin comparison columns: {missing}')
+    rows = []
+    for record in path_daily.sort_values(
+        ['path_id', 'calendar_time'], kind='mergesort'
+    ).itertuples(index=False):
+        values = [
+            record.path_center_lon, record.path_center_lat,
+            record.thermohaline_centroid_lon, record.thermohaline_centroid_lat,
+        ]
+        if np.all(np.isfinite(values)):
+            dx, dy = _ofes_transport_organization_signed_xy(
+                float(record.path_center_lon), float(record.path_center_lat),
+                float(record.thermohaline_centroid_lon),
+                float(record.thermohaline_centroid_lat),
+            )
+            distance = float(np.hypot(dx, dy) / 1000.0)
+        else:
+            dx = dy = distance = np.nan
+        rows.append({
+            'path_id': str(record.path_id),
+            'calendar_time': pd.Timestamp(record.calendar_time),
+            'candidate_id': str(record.candidate_id),
+            'path_support_status': str(record.path_support_status),
+            'path_center_lon': float(record.path_center_lon) if np.isfinite(record.path_center_lon) else np.nan,
+            'path_center_lat': float(record.path_center_lat) if np.isfinite(record.path_center_lat) else np.nan,
+            'thermohaline_centroid_lon': float(record.thermohaline_centroid_lon) if np.isfinite(record.thermohaline_centroid_lon) else np.nan,
+            'thermohaline_centroid_lat': float(record.thermohaline_centroid_lat) if np.isfinite(record.thermohaline_centroid_lat) else np.nan,
+            'path_center_minus_thermohaline_dx_m': dx,
+            'path_center_minus_thermohaline_dy_m': dy,
+            'path_center_minus_thermohaline_distance_km': distance,
+            'path_center_source': 'existing daily structure candidate lon/lat (peak-pixel location)',
+            'thermohaline_centroid_source': 'existing candidate thermohaline centroid lon/lat',
+            'dynamical_centre_claim': False,
+        })
+    return pd.DataFrame(rows)
+
+
+def _ofes_transport_organization_candidate_summary(
+    candidate_geometry: pd.DataFrame,
+    structure_daily: pd.DataFrame,
+) -> pd.DataFrame:
+    """按 trajectory-day 汇总全部水平与垂向候选的几何分布，不选最佳分支。"""
+    rows = []
+    candidate_geometry = candidate_geometry.copy()
+    candidate_geometry['calendar_time'] = pd.to_datetime(
+        candidate_geometry['calendar_time']
+    ).dt.normalize()
+    for (trajectory_key, calendar_time), group in candidate_geometry.groupby(
+        ['trajectory_key', 'calendar_time'], sort=False
+    ):
+        row = {
+            'trajectory_key': str(trajectory_key),
+            'calendar_time': pd.Timestamp(calendar_time),
+        }
+        for flag, prefix in (
+            ('horizontal_compatible_bool', 'horizontal'),
+            ('vertical_compatible_bool', 'vertical'),
+            ('joint_compatible_bool', 'joint'),
+        ):
+            subset = group.loc[group[flag] & ~group['sentinel_bool']]
+            row[f'{prefix}_candidate_row_count'] = int(len(subset))
+            row[f'{prefix}_candidate_id_count'] = int(subset['candidate_id'].nunique())
+        horizontal = group.loc[
+            group['horizontal_compatible_bool'] & ~group['sentinel_bool']
+        ]
+        vertical = group.loc[
+            group['vertical_compatible_bool'] & ~group['sentinel_bool']
+        ]
+        for prefix, subset in (('horizontal', horizontal), ('vertical', vertical)):
+            for source, target in (
+                ('candidate_core_center_depth_m', 'core_center_depth_m'),
+                ('particle_minus_core_center_m', 'particle_minus_core_center_m'),
+                ('particle_minus_core_shallow_m', 'particle_minus_core_shallow_m'),
+                ('particle_minus_core_deep_m', 'particle_minus_core_deep_m'),
+                ('candidate_distance_km', 'distance_km'),
+                ('candidate_radius_km', 'radius_km'),
+                ('candidate_distance_over_radius', 'distance_over_radius'),
+            ):
+                for statistic in ('median', 'min', 'max'):
+                    row[f'{prefix}_{target}_{statistic}'] = _nan_stat(
+                        pd.to_numeric(subset[source], errors='coerce').to_numpy(dtype=float),
+                        statistic,
+                    )
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    summary = summary.merge(
+        structure_daily.loc[:, [
+            'case_id', 'source_case_id',
+            'trajectory_key_3d', 'calendar_time', 'arm', 'particle_index',
+            'seed_key', 'arrival_outcome', 'classification', 'candidate_ids',
+            'horizontal_candidate_ids', 'vertical_candidate_ids', 'joint_candidate_ids',
+            'path_ids', 'candidate_row_count', 'sentinel_row_count',
+            'horizontal_candidate_count', 'vertical_candidate_count', 'joint_candidate_count',
+        ]].rename(columns={'trajectory_key_3d': 'trajectory_key'}),
+        on=['trajectory_key', 'calendar_time'],
+        how='left',
+        validate='one_to_one',
+    )
+    return summary.sort_values(
+        ['arm', 'particle_index', 'calendar_time', 'trajectory_key'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _ofes_transport_organization_build_daily(
+    inputs: dict,
+    fields: dict,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """合并真实流场采样、独立结构路径和全部候选几何统计。"""
+    structure_daily = inputs['closure']['structure_compatibility_daily'].copy()
+    structure_daily['calendar_time'] = pd.to_datetime(
+        structure_daily['calendar_time']
+    ).dt.normalize()
+    daily = _ofes_transport_organization_candidate_summary(
+        fields['candidate_geometry'], structure_daily
+    )
+    particle_field = fields['field_daily'].copy()
+    particle_field['calendar_time'] = pd.to_datetime(
+        particle_field['calendar_time']
+    ).dt.normalize()
+    particle_columns = [
+        'trajectory_key', 'calendar_time', 'entity_lon', 'entity_lat',
+        'entity_depth_m', 'field_layer_depth_m', 'field_sample_status',
+    ] + list(_OFES_TRANSPORT_ORGANIZATION_FIELD_METRICS)
+    daily = daily.merge(
+        particle_field[particle_columns].rename(columns={
+            'entity_lon': 'particle_lon',
+            'entity_lat': 'particle_lat',
+            'entity_depth_m': 'particle_depth_m',
+        }),
+        on=['trajectory_key', 'calendar_time'],
+        how='left',
+        validate='one_to_one',
+    )
+    path = _ofes_transport_organization_add_path_motion(fields['path_daily'])
+    daily = daily.merge(
+        path.drop(
+            columns=[
+                'case_id',
+                'source_case_id',
+                'field_layer_depth_m',
+                'field_sample_status',
+            ],
+            errors='ignore',
+        ).rename(
+            columns={'calendar_time': 'path_calendar_time'}
+        ),
+        left_on='calendar_time',
+        right_on='path_calendar_time',
+        how='left',
+        validate='many_to_many',
+    ).drop(columns=['path_calendar_time'])
+    registration = fields['candidate_geometry'].loc[:, [
+        'trajectory_key', 'calendar_time', 'candidate_id',
+        'registration_distance_km', 'registration_radius_km',
+        'registration_horizontal_compatible_bool',
+    ]].drop_duplicates([
+        'trajectory_key', 'calendar_time', 'candidate_id'
+    ]).rename(columns={
+        'registration_distance_km': 'particle_registration_distance_km',
+        'registration_radius_km': 'particle_registration_radius_km',
+        'registration_horizontal_compatible_bool': (
+            'particle_registration_horizontal_compatible'
+        ),
+    })
+    daily = daily.merge(
+        registration,
+        on=['trajectory_key', 'calendar_time', 'candidate_id'],
+        how='left',
+        validate='many_to_one',
+    )
+    daily['particle_minus_reference_layer_m'] = (
+        pd.to_numeric(daily['particle_depth_m'], errors='coerce')
+        - pd.to_numeric(daily['field_layer_depth_m'], errors='coerce')
+    )
+    dx_values = []
+    dy_values = []
+    radius_values = []
+    for row in daily.itertuples(index=False):
+        try:
+            dx, dy = _ofes_transport_organization_signed_xy(
+                float(row.particle_lon),
+                float(row.particle_lat),
+                float(row.path_center_lon),
+                float(row.path_center_lat),
+            )
+        except (TypeError, ValueError):
+            dx, dy = np.nan, np.nan
+        dx_values.append(dx)
+        dy_values.append(dy)
+        radius_values.append(float(row.path_radius_km) if np.isfinite(row.path_radius_km) else np.nan)
+    daily['particle_relative_x_m'] = dx_values
+    daily['particle_relative_y_m'] = dy_values
+    daily['particle_relative_r_km'] = np.hypot(daily['particle_relative_x_m'], daily['particle_relative_y_m']) / 1000.0
+    daily['particle_relative_bearing_deg'] = (
+        np.degrees(np.arctan2(daily['particle_relative_x_m'], daily['particle_relative_y_m']))
+        % 360.0
+    )
+    daily['path_radius_km'] = radius_values
+    with np.errstate(divide='ignore', invalid='ignore'):
+        daily['particle_relative_r_over_path_radius'] = (
+            daily['particle_relative_r_km'] / daily['path_radius_km']
+        )
+        daily['particle_registration_distance_over_radius'] = (
+            pd.to_numeric(daily['particle_registration_distance_km'], errors='coerce')
+            / pd.to_numeric(daily['particle_registration_radius_km'], errors='coerce')
+        )
+    peak_distance = great_circle_distance_m(
+        pd.to_numeric(daily['particle_lon'], errors='coerce').to_numpy(dtype=float),
+        pd.to_numeric(daily['particle_lat'], errors='coerce').to_numpy(dtype=float),
+        pd.to_numeric(daily['path_center_lon'], errors='coerce').to_numpy(dtype=float),
+        pd.to_numeric(daily['path_center_lat'], errors='coerce').to_numpy(dtype=float),
+    ) / 1000.0
+    daily['particle_peak_origin_distance_km'] = peak_distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        daily['particle_peak_origin_distance_over_registration_radius'] = (
+            peak_distance
+            / pd.to_numeric(daily['particle_registration_radius_km'], errors='coerce')
+        )
+    daily['particle_peak_origin_circle_inside'] = (
+        peak_distance
+        <= pd.to_numeric(daily['particle_registration_radius_km'], errors='coerce')
+    )
+    daily['particle_registration_circle_inside_from_distance'] = (
+        pd.to_numeric(daily['particle_registration_distance_over_radius'], errors='coerce')
+        <= 1.0
+    )
+    daily['relative_bearing_deg_unwrapped'] = np.nan
+    daily['relative_bearing_delta_deg_from_first'] = np.nan
+    for _, group_index in daily.groupby(
+        ['trajectory_key', 'path_id'], sort=False, dropna=False
+    ).groups.items():
+        indices = list(group_index)
+        indices.sort(key=lambda index: pd.Timestamp(daily.loc[index, 'calendar_time']))
+        bearings = daily.loc[indices, 'particle_relative_bearing_deg'].to_numpy(dtype=float)
+        valid = np.isfinite(bearings)
+        if valid.any():
+            unwrapped = np.full(bearings.shape, np.nan, dtype=float)
+            unwrapped[valid] = np.degrees(
+                np.unwrap(np.deg2rad(bearings[valid]))
+            )
+            daily.loc[indices, 'relative_bearing_deg_unwrapped'] = unwrapped
+            delta = np.full(unwrapped.shape, np.nan, dtype=float)
+            delta[valid] = unwrapped[valid] - unwrapped[valid][0]
+            daily.loc[indices, 'relative_bearing_delta_deg_from_first'] = delta
+    daily['field_sampling_depth_semantics'] = 'raw DO/T/S and u/v at delivered reference layer; raw DO is not profile delta DO'
+    return daily.sort_values(
+        ['arm', 'particle_index', 'calendar_time', 'path_id', 'trajectory_key'], kind='mergesort'
+    ).reset_index(drop=True), path
+
+
+def _ofes_transport_organization_flow_figure(
+    daily: pd.DataFrame,
+    candidate_geometry: pd.DataFrame,
+    path_daily: pd.DataFrame,
+    background_positions: pd.DataFrame,
+    snapshots: dict,
+    settings: dict,
+    figure_path: Path,
+) -> dict:
+    """绘制实际参考层 raw DO/u/v、材料路径和独立候选包络。"""
+    if not snapshots:
+        raise ValueError('No representative snapshots are available for the flow figure.')
+    path_daily = path_daily.copy()
+    if 'path_support_status' not in path_daily.columns:
+        path_daily['path_support_status'] = np.where(
+            path_daily[['path_center_lon', 'path_center_lat']].notna().all(axis=1),
+            'path_member',
+            'path_missing_for_date',
+        )
+    trajectory_table = daily.loc[:, ['trajectory_key', 'arm', 'particle_index']].drop_duplicates()
+    trajectory_table = trajectory_table.sort_values(
+        ['arm', 'particle_index', 'trajectory_key'], kind='mergesort'
+    )
+    colours = plt.get_cmap('tab10')(
+        np.linspace(0.05, 0.95, max(len(trajectory_table), 1))
+    )
+    colour_by_key = {
+        str(row.trajectory_key): colours[index]
+        for index, row in enumerate(trajectory_table.itertuples(index=False))
+    }
+    all_background = background_positions.copy()
+    all_background['calendar_time'] = pd.to_datetime(all_background['calendar_time']).dt.normalize()
+    display_path_ids = set(
+        settings.get(
+            'display_path_ids_resolved',
+            settings.get('display_path_ids') or [],
+        )
+    )
+    path_for_plot = path_daily.loc[
+        path_daily['path_id'].astype(str).isin(display_path_ids)
+        & path_daily['path_support_status'].astype(str).eq('path_member')
+    ].copy()
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_values = np.concatenate([
+        np.asarray(record['raw_do_umol_kg'], dtype=float).ravel()
+        for record in snapshots.values()
+    ])
+    raw_values = raw_values[np.isfinite(raw_values)]
+    if raw_values.size == 0:
+        raise ValueError('Representative raw DO layers contain no finite values.')
+    sampled_values = np.concatenate(
+        [
+            pd.to_numeric(daily['raw_do_umol_kg'], errors='coerce').to_numpy(dtype=float),
+            pd.to_numeric(path_daily['path_field_raw_do_umol_kg'], errors='coerce').to_numpy(dtype=float),
+        ]
+    )
+    sampled_values = sampled_values[np.isfinite(sampled_values)]
+    lower = float(np.nanquantile(raw_values, 0.02))
+    upper = float(np.nanquantile(raw_values, 0.98))
+    if sampled_values.size:
+        sample_pad = max(0.5, 0.02 * float(np.nanmax(sampled_values) - np.nanmin(sampled_values)))
+        lower = min(lower, float(np.nanmin(sampled_values)) - sample_pad)
+        upper = max(upper, float(np.nanmax(sampled_values)) + sample_pad)
+    norm = Normalize(
+        vmin=lower,
+        vmax=upper,
+    )
+    if norm.vmax <= norm.vmin:
+        norm = Normalize(vmin=float(np.nanmin(raw_values)), vmax=float(np.nanmax(raw_values) + 1.0))
+    fig, axes_grid = plt.subplots(
+        1,
+        len(settings['representative_dates']),
+        figsize=(16.0, 5.7),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+        constrained_layout=False,
+    )
+    axes = axes_grid[0]
+    meshes = []
+    contour_metadata = []
+    for axis_index, stamp in enumerate(settings['representative_dates']):
+        axis = axes[axis_index]
+        record = snapshots[pd.Timestamp(stamp).normalize()]
+        lon = record['lon']
+        lat = record['lat']
+        raw_do = record['raw_do_umol_kg']
+        mesh = axis.pcolormesh(
+            lon,
+            lat,
+            raw_do,
+            shading='auto',
+            cmap='viridis',
+            norm=norm,
+            rasterized=True,
+        )
+        meshes.append(mesh)
+        for field_name, color, linestyle, label in (
+            ('temp_potential_deg_c', '#f5f5f5', '-', 'potential temperature'),
+            ('salinity_psu', '#ff9f43', '--', 'salinity'),
+        ):
+            contour_values = record.get(field_name)
+            finite_contour_values = (
+                np.asarray(contour_values, dtype=float)
+                if contour_values is not None else np.asarray([])
+            )
+            finite_contour_values = finite_contour_values[np.isfinite(finite_contour_values)]
+            levels = np.unique(
+                np.nanpercentile(finite_contour_values, [20.0, 50.0, 80.0])
+            ) if finite_contour_values.size else np.asarray([])
+            if levels.size >= 2:
+                axis.contour(
+                    lon,
+                    lat,
+                    np.asarray(contour_values, dtype=float),
+                    levels=levels,
+                    colors=color,
+                    linestyles=linestyle,
+                    linewidths=0.55,
+                    alpha=0.72,
+                    zorder=2,
+                )
+                contour_metadata.append(
+                    {
+                        'date': pd.Timestamp(stamp).date().isoformat(),
+                        'field': label,
+                        'levels': [float(level) for level in levels],
+                    }
+                )
+        u = record['u_m_s']
+        v = record['v_m_s']
+        arrow_step = max(1, int(np.ceil(np.sqrt(u.size / 625.0))))
+        lat_scale = approximate_degree_length(lat)['meters_per_degree_lat']
+        lon_scale = approximate_degree_length(lat)['meters_per_degree_lon']
+        u_deg_day = u * 86400.0 / lon_scale[:, None]
+        v_deg_day = v * 86400.0 / lat_scale[:, None]
+        axis.quiver(
+            lon[::arrow_step],
+            lat[::arrow_step],
+            u_deg_day[::arrow_step, ::arrow_step],
+            v_deg_day[::arrow_step, ::arrow_step],
+            color='white',
+            alpha=0.78,
+            angles='xy',
+            scale_units='xy',
+            scale=1.0,
+            width=0.0012,
+            zorder=3,
+        )
+        for _, group in all_background.groupby('trajectory_key', sort=False):
+            axis.plot(
+                group['lon'], group['lat'], color='0.25', alpha=0.16, linewidth=0.55, zorder=4
+            )
+        for row in trajectory_table.itertuples(index=False):
+            group = daily.loc[
+                daily['trajectory_key'].astype(str).eq(str(row.trajectory_key))
+            ].sort_values('calendar_time').drop_duplicates('calendar_time')
+            axis.plot(
+                group['particle_lon'], group['particle_lat'],
+                color=colour_by_key[str(row.trajectory_key)], linewidth=1.35,
+                alpha=0.92, zorder=6,
+            )
+            current = group.loc[group['calendar_time'].eq(pd.Timestamp(stamp).normalize())]
+            if len(current) == 1:
+                axis.scatter(
+                    current['particle_lon'], current['particle_lat'],
+                    s=25, color=colour_by_key[str(row.trajectory_key)],
+                    edgecolor='black', linewidth=0.4, zorder=8,
+                )
+        for path_id, path_group in path_for_plot.groupby('path_id', sort=False):
+            finite_path = path_group.loc[
+                path_group[['path_center_lon', 'path_center_lat']].notna().all(axis=1)
+            ].sort_values('calendar_time')
+            if len(finite_path):
+                axis.plot(
+                    finite_path['path_center_lon'], finite_path['path_center_lat'],
+                    color='black', linestyle=(0, (4, 2)), linewidth=1.1, alpha=0.9, zorder=7,
+                )
+        path_current = path_for_plot.loc[
+            path_for_plot['calendar_time'].eq(pd.Timestamp(stamp).normalize())
+            & path_for_plot[['path_center_lon', 'path_center_lat']].notna().all(axis=1)
+        ].copy()
+        for path_record in path_current.itertuples(index=False):
+            if not np.all(np.isfinite([
+                path_record.thermohaline_centroid_lon,
+                path_record.thermohaline_centroid_lat,
+                path_record.path_radius_km,
+            ])):
+                continue
+            path_lat_scale = approximate_degree_length(
+                float(path_record.thermohaline_centroid_lat)
+            )
+            axis.add_patch(
+                Ellipse(
+                    (
+                        float(path_record.thermohaline_centroid_lon),
+                        float(path_record.thermohaline_centroid_lat),
+                    ),
+                    width=2.0 * float(path_record.path_radius_km) * 1000.0 / path_lat_scale['meters_per_degree_lon'],
+                    height=2.0 * float(path_record.path_radius_km) * 1000.0 / path_lat_scale['meters_per_degree_lat'],
+                    fill=False, edgecolor='black', linewidth=1.4, linestyle='-', zorder=9,
+                )
+            )
+        candidate_day = candidate_geometry.loc[
+            candidate_geometry['calendar_time'].eq(pd.Timestamp(stamp).normalize())
+            & ~candidate_geometry['sentinel_bool']
+        ].drop_duplicates('candidate_id')
+        horizontal = candidate_day.loc[candidate_day['horizontal_compatible_bool']]
+        vertical = candidate_day.loc[candidate_day['vertical_compatible_bool']]
+        axis.scatter(
+            horizontal['lon_candidate'], horizontal['lat_candidate'],
+            marker='o', facecolors='none', edgecolors='#f28e2b', s=30,
+            linewidth=0.9, zorder=10,
+        )
+        axis.scatter(
+            vertical['lon_candidate'], vertical['lat_candidate'],
+            marker='x', color='#6a3d9a', s=28, linewidth=0.9, zorder=10,
+        )
+        if len(path_current):
+            axis.scatter(
+                path_current['path_center_lon'], path_current['path_center_lat'],
+                marker='*', color='white', edgecolor='black', s=75, linewidth=0.7, zorder=11,
+            )
+            finite_thermal = path_current.loc[
+                path_current[[
+                    'thermohaline_centroid_lon', 'thermohaline_centroid_lat'
+                ]].notna().all(axis=1)
+            ]
+            if len(finite_thermal):
+                axis.scatter(
+                    finite_thermal['thermohaline_centroid_lon'],
+                    finite_thermal['thermohaline_centroid_lat'],
+                    marker='P', color='#ffd166', edgecolor='black', s=34,
+                    linewidth=0.45, zorder=11,
+                )
+        path_text = []
+        for path_record in path_current.itertuples(index=False):
+            path_text.append(
+                f'{path_record.path_id} u/v={path_record.path_field_u_m_s:.2f}/{path_record.path_field_v_m_s:.2f} m s⁻¹\n'
+                f'|V|={path_record.path_field_speed_m_s:.2f} m s⁻¹, ζ={path_record.path_field_relative_vorticity_s_1:.2e} s⁻¹'
+            )
+        path_text = '\n'.join(path_text) or 'No displayed path member on this date'
+        axis.text(
+            0.02, 0.97,
+            f'{pd.Timestamp(stamp):%Y-%m-%d}\n{path_text}',
+            transform=axis.transAxes, va='top', ha='left', fontsize=7.2,
+            color='white', bbox={'facecolor': 'black', 'alpha': 0.47, 'pad': 3, 'edgecolor': 'none'},
+            zorder=12,
+        )
+        if len(path_current):
+            finite_current = path_current.loc[
+                path_current[['path_center_lon', 'path_center_lat']].notna().all(axis=1)
+            ]
+            if len(finite_current):
+                zoom_lon = float(finite_current['path_center_lon'].mean())
+                zoom_lat = float(finite_current['path_center_lat'].mean())
+                zoom_radius = float(
+                    pd.to_numeric(finite_current['path_radius_km'], errors='coerce').max()
+                )
+                zoom_scale = approximate_degree_length(zoom_lat)
+                zoom_lon_half = max(
+                    0.45,
+                    1.8 * zoom_radius * 1000.0 / zoom_scale['meters_per_degree_lon'],
+                )
+                zoom_lat_half = max(
+                    0.40,
+                    1.8 * zoom_radius * 1000.0 / zoom_scale['meters_per_degree_lat'],
+                )
+                inset = axis.inset_axes([0.67, 0.04, 0.30, 0.34], zorder=20)
+                inset.pcolormesh(
+                    lon, lat, raw_do, shading='auto', cmap='viridis', norm=norm,
+                    rasterized=True,
+                )
+                for field_name, color, linestyle in (
+                    ('temp_potential_deg_c', '#f5f5f5', '-'),
+                    ('salinity_psu', '#ff9f43', '--'),
+                ):
+                    contour_values = record.get(field_name)
+                    if contour_values is None:
+                        continue
+                    finite_contour_values = np.asarray(contour_values, dtype=float)
+                    finite_contour_values = finite_contour_values[np.isfinite(finite_contour_values)]
+                    levels = np.unique(
+                        np.nanpercentile(finite_contour_values, [20.0, 50.0, 80.0])
+                    ) if finite_contour_values.size else np.asarray([])
+                    if levels.size >= 2:
+                        inset.contour(
+                            lon, lat, np.asarray(contour_values, dtype=float),
+                            levels=levels, colors=color, linestyles=linestyle,
+                            linewidths=0.45, alpha=0.75,
+                        )
+                ilat = np.flatnonzero(
+                    (lat >= zoom_lat - zoom_lat_half) & (lat <= zoom_lat + zoom_lat_half)
+                )
+                ilon = np.flatnonzero(
+                    (lon >= zoom_lon - zoom_lon_half) & (lon <= zoom_lon + zoom_lon_half)
+                )
+                if ilat.size and ilon.size:
+                    zoom_step = max(1, int(np.ceil(np.sqrt(ilat.size * ilon.size / 100.0))))
+                    inset_lat_scale = approximate_degree_length(lat[ilat])['meters_per_degree_lat']
+                    inset_lon_scale = approximate_degree_length(lat[ilat])['meters_per_degree_lon']
+                    inset.quiver(
+                        lon[ilon][::zoom_step], lat[ilat][::zoom_step],
+                        u[np.ix_(ilat, ilon)][::zoom_step, ::zoom_step]
+                        * 86400.0 / inset_lon_scale[:, None][::zoom_step, :],
+                        v[np.ix_(ilat, ilon)][::zoom_step, ::zoom_step]
+                        * 86400.0 / inset_lat_scale[:, None][::zoom_step, :],
+                        color='white', angles='xy', scale_units='xy', scale=1.0,
+                        width=0.002, alpha=0.85, zorder=3,
+                    )
+                for path_id, path_group in path_for_plot.groupby('path_id', sort=False):
+                    finite_path = path_group.loc[
+                        path_group[['path_center_lon', 'path_center_lat']].notna().all(axis=1)
+                    ].sort_values('calendar_time')
+                    if len(finite_path):
+                        inset.plot(
+                            finite_path['path_center_lon'], finite_path['path_center_lat'],
+                            color='black', linestyle=(0, (3, 1)), linewidth=0.8,
+                        )
+                inset.scatter(
+                    finite_current['path_center_lon'], finite_current['path_center_lat'],
+                    marker='*', color='white', edgecolor='black', s=35, linewidth=0.4,
+                )
+                finite_thermal = finite_current.loc[
+                    finite_current[[
+                        'thermohaline_centroid_lon', 'thermohaline_centroid_lat'
+                    ]].notna().all(axis=1)
+                ]
+                if len(finite_thermal):
+                    inset.scatter(
+                        finite_thermal['thermohaline_centroid_lon'],
+                        finite_thermal['thermohaline_centroid_lat'],
+                        marker='P', color='#ffd166', edgecolor='black', s=20,
+                        linewidth=0.3,
+                    )
+                inset.set_xlim(zoom_lon - zoom_lon_half, zoom_lon + zoom_lon_half)
+                inset.set_ylim(zoom_lat - zoom_lat_half, zoom_lat + zoom_lat_half)
+                inset.set_xticks([])
+                inset.set_yticks([])
+                inset.set_title('local flow', fontsize=6, pad=1.5)
+                for spine in inset.spines.values():
+                    spine.set_linewidth(0.8)
+                    spine.set_color('white')
+        axis.set_xlim(float(record['lon'][0]), float(record['lon'][-1]))
+        axis.set_ylim(float(record['lat'][0]), float(record['lat'][-1]))
+        axis.set_xlabel('Longitude (°E)')
+        axis.grid(color='white', alpha=0.22, linewidth=0.55)
+        axis.tick_params(labelsize=8)
+    axes[0].set_ylabel('Latitude (°N)')
+    handles = [
+        Line2D([0], [0], color='black', linestyle=(0, (4, 2)), linewidth=1.1, label='Existing path member centre (peak pixel; not dynamical centre)'),
+        Line2D([0], [0], color='black', linewidth=1.4, label='Original thermohaline-centred candidate envelope (approx. circle; no mask saved)'),
+        Line2D([0], [0], marker='P', color='#ffd166', markeredgecolor='black', linestyle='None', label='Thermohaline centroid used for envelope'),
+        Line2D([0], [0], marker='o', color='#f28e2b', markerfacecolor='none', linestyle='None', label='Horizontal-compatible candidate'),
+        Line2D([0], [0], marker='x', color='#6a3d9a', linestyle='None', label='Vertical-compatible candidate'),
+        Line2D([0], [0], color='0.25', alpha=0.35, linewidth=0.8, label=f'Existing 3-D trajectories ({int(all_background["trajectory_key"].nunique())} total)'),
+        Line2D([0], [0], color='#f5f5f5', linewidth=0.8, label='Potential temperature contours'),
+        Line2D([0], [0], color='#ff9f43', linestyle='--', linewidth=0.8, label='Salinity contours'),
+    ]
+    fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.45, 0.005), ncol=3, frameon=False, fontsize=7.2)
+    colorbar_axis = fig.add_axes([0.935, 0.24, 0.014, 0.55])
+    fig.colorbar(
+        meshes[0],
+        cax=colorbar_axis,
+        extend='both',
+        label='Raw DO at delivered reference layer (μmol kg⁻¹)',
+    )
+    fig.suptitle(
+        f'{settings["case_id"]}: material paths in the actual {float(np.nanmean([record["field_layer_depth_m"] for record in snapshots.values()])):.1f} m u/v and raw DO field',
+        fontsize=12, y=0.995,
+    )
+    fig.text(
+        0.5, 0.958,
+        f'{len(trajectory_table)} arrived paths are highlighted; all candidate branches remain visible. Arrows are daily u/v on the tracer-center grid; raw DO is not profile ΔDO. Contours show same-layer potential temperature and salinity.',
+        ha='center', va='center', fontsize=8, color='0.25',
+    )
+    fig.subplots_adjust(left=0.06, right=0.91, top=0.85, bottom=0.18, wspace=0.10)
+    fig.savefig(figure_path, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    image = plt.imread(figure_path)
+    if image.ndim not in (2, 3) or not np.isfinite(image).all() or image.shape[0] < 1000 or image.shape[1] < 2600:
+        raise ValueError('Transport flow figure PNG is unreadable or too small.')
+    return {
+        'path': str(figure_path.resolve()),
+        'format': 'PNG',
+        'png_readable': True,
+        'pixel_width': int(image.shape[1]),
+        'pixel_height': int(image.shape[0]),
+        'representative_date_count': int(len(settings['representative_dates'])),
+        'representative_dates': [pd.Timestamp(value).date().isoformat() for value in settings['representative_dates']],
+        'highlighted_trajectory_count': int(trajectory_table['trajectory_key'].nunique()),
+        'background_trajectory_count': int(all_background['trajectory_key'].nunique()),
+        'raw_do_field_semantics': 'raw DO at delivered reference layer, not profile delta DO',
+        'velocity_field_semantics': 'actual daily u/v at delivered reference layer, B-grid corrected to tracer centers',
+        'contour_field_semantics': 'same-layer potential temperature and salinity contours; no new depth read',
+        'contour_levels': contour_metadata,
+        'raw_do_norm': {
+            'base_quantiles': [0.02, 0.98],
+            'sample_values_included': bool(sampled_values.size),
+            'extend': 'both',
+            'vmin': float(norm.vmin),
+            'vmax': float(norm.vmax),
+        },
+        'display_path_ids': sorted(display_path_ids),
+        'display_path_member_count': int(len(path_for_plot)),
+        'local_zoom': 'inset around displayed path members with same-layer contours and u/v',
+        'non_color_encoding': ['line_style_for_existing_path', 'marker_for_candidate_relation', 'black_candidate_envelope'],
+    }
+
+
+def _ofes_transport_organization_relative_figure(
+    daily: pd.DataFrame,
+    candidate_geometry: pd.DataFrame,
+    settings: dict,
+    figure_path: Path,
+) -> dict:
+    """绘制结构相对运动、展开方位和全部错层/错位候选分布。"""
+    trajectory_table = daily.loc[:, ['trajectory_key', 'arm', 'particle_index']].drop_duplicates().sort_values(
+        ['arm', 'particle_index', 'trajectory_key'], kind='mergesort'
+    )
+    colours = plt.get_cmap('tab10')(
+        np.linspace(0.05, 0.95, max(len(trajectory_table), 1))
+    )
+    colour_by_key = {
+        str(row.trajectory_key): colours[index]
+        for index, row in enumerate(trajectory_table.itertuples(index=False))
+    }
+    display_path_ids = set(
+        settings.get(
+            'display_path_ids_resolved',
+            settings.get('display_path_ids') or [],
+        )
+    )
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13.6, 9.5), dpi=300, constrained_layout=False)
+    axis_r, axis_bearing, axis_h, axis_v = axes.ravel()
+    for row in trajectory_table.itertuples(index=False):
+        group = daily.loc[
+            daily['trajectory_key'].astype(str).eq(str(row.trajectory_key))
+            & daily['path_id'].astype(str).isin(display_path_ids)
+        ].sort_values('calendar_time')
+        label = f'{row.arm}/p{int(row.particle_index)}'
+        for path_id, path_group in group.groupby('path_id', sort=False):
+            path_group = path_group.sort_values('calendar_time')
+            line_label = (
+                label
+                if len(display_path_ids) == 1
+                else f'{label}/{path_id}'
+            )
+            color = colour_by_key[str(row.trajectory_key)]
+            axis_r.plot(
+                path_group['calendar_time'],
+                path_group['particle_peak_origin_distance_km'],
+                color=color, linewidth=0.95, alpha=0.75,
+            )
+            axis_r.plot(
+                path_group['calendar_time'],
+                path_group['particle_registration_distance_km'],
+                color=color, linestyle='--', linewidth=0.95, alpha=0.75,
+            )
+            axis_bearing.plot(
+                path_group['calendar_time'],
+                path_group['relative_bearing_deg_unwrapped'],
+                color=color, linewidth=1.1, label=line_label,
+            )
+    path_daily = daily.loc[
+        daily['path_id'].astype(str).isin(display_path_ids),
+        ['calendar_time', 'path_id', 'path_radius_km'],
+    ].drop_duplicates().sort_values(['path_id', 'calendar_time'])
+    for path_id, path_group in path_daily.groupby('path_id', sort=False):
+        axis_r.plot(
+            path_group['calendar_time'], path_group['path_radius_km'],
+            color='black', linestyle=(0, (4, 2)), linewidth=1.35,
+        )
+    axis_r.axhline(0.0, color='0.35', linewidth=0.7)
+    axis_r.set_ylabel('Distance from origin / envelope (km)')
+    axis_r.set_title('A. Peak-origin motion and original candidate envelope')
+    axis_r.legend(
+        handles=[
+            Line2D([0], [0], color='0.35', linewidth=1.0, label='Particle–peak-pixel distance'),
+            Line2D([0], [0], color='0.35', linestyle='--', linewidth=1.0, label='Particle–thermohaline-centroid registration distance'),
+            Line2D([0], [0], color='black', linestyle=(0, (4, 2)), linewidth=1.2, label='Original registration radius'),
+        ],
+        frameon=False, fontsize=6.5, loc='upper left',
+    )
+    axis_bearing.set_ylabel('Unwrapped bearing from peak-pixel origin (°)')
+    axis_bearing.set_title('B. Relative bearing in calendar time (one line per path)')
+    axis_bearing.axhline(0.0, color='0.35', linewidth=0.7)
+    axis_bearing.legend(frameon=False, fontsize=7, ncol=2, loc='upper left')
+    for axis in (axis_r, axis_bearing):
+        axis.grid(axis='y', color='0.88', linewidth=0.65)
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=9))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        axis.tick_params(axis='x', labelrotation=35, labelsize=8)
+        axis.tick_params(axis='y', labelsize=8)
+    horizontal = candidate_geometry.loc[
+        candidate_geometry['horizontal_compatible_bool'] & ~candidate_geometry['sentinel_bool']
+    ].copy()
+    vertical = candidate_geometry.loc[
+        candidate_geometry['vertical_compatible_bool'] & ~candidate_geometry['sentinel_bool']
+    ].copy()
+    horizontal['calendar_time'] = pd.to_datetime(horizontal['calendar_time']).dt.normalize()
+    vertical['calendar_time'] = pd.to_datetime(vertical['calendar_time']).dt.normalize()
+    axis_h.scatter(horizontal['calendar_time'], horizontal['particle_minus_core_shallow_m'], s=10, alpha=0.24, color='#f28e2b', marker='o', label='particle − shallow core edge')
+    axis_h.scatter(horizontal['calendar_time'], horizontal['particle_minus_core_deep_m'], s=10, alpha=0.24, color='#4e79a7', marker='x', label='particle − deep core edge')
+    axis_h.scatter(horizontal['calendar_time'], horizontal['particle_minus_core_center_m'], s=8, alpha=0.18, color='0.25', marker='.', label='particle − core centre')
+    axis_h.axhline(0.0, color='0.25', linewidth=0.8)
+    axis_h.set_ylabel('Signed depth difference (m)\nparticle depth − candidate depth')
+    axis_h.set_title('C. All horizontal-compatible candidate core edges')
+    axis_h.legend(frameon=False, fontsize=7, loc='best')
+    axis_v.scatter(vertical['calendar_time'], vertical['candidate_distance_over_radius'], s=10, alpha=0.22, color='#6a3d9a', marker='x', label='all vertical-compatible rows')
+    daily_vertical = vertical.groupby('calendar_time', sort=True)['candidate_distance_over_radius'].median()
+    axis_v.plot(daily_vertical.index, daily_vertical.to_numpy(dtype=float), color='#6a3d9a', linewidth=1.4, label='median across all vertical candidates')
+    axis_v.axhline(1.0, color='0.25', linestyle=(0, (4, 2)), linewidth=0.9, label='one candidate radius')
+    axis_v.set_ylabel('Candidate-centre distance / candidate radius')
+    axis_v.set_title('D. All vertical-compatible candidate horizontal offsets')
+    axis_v.legend(frameon=False, fontsize=7, loc='upper left')
+    for axis in (axis_h, axis_v):
+        axis.grid(axis='y', color='0.88', linewidth=0.65)
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=9))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        axis.tick_params(axis='x', labelrotation=35, labelsize=8)
+        axis.tick_params(axis='y', labelsize=8)
+    fig.suptitle(
+        f'{settings["case_id"]}: relative motion and candidate geometry (all branches retained)',
+        fontsize=12, y=0.985,
+    )
+    fig.text(
+        0.5, 0.955,
+        'Negative particle−core depth means the material layer is shallower; the original registration distance/radius uses the thermohaline centroid, while peak-pixel distance/bearing remains a separate origin diagnostic.',
+        ha='center', va='center', fontsize=8, color='0.25',
+    )
+    fig.subplots_adjust(left=0.09, right=0.98, top=0.89, bottom=0.12, hspace=0.38, wspace=0.25)
+    fig.savefig(figure_path, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    image = plt.imread(figure_path)
+    if image.ndim not in (2, 3) or not np.isfinite(image).all() or image.shape[0] < 2400 or image.shape[1] < 3200:
+        raise ValueError('Transport relative figure PNG is unreadable or too small.')
+    return {
+        'path': str(figure_path.resolve()),
+        'format': 'PNG',
+        'png_readable': True,
+        'pixel_width': int(image.shape[1]),
+        'pixel_height': int(image.shape[0]),
+        'trajectory_count': int(trajectory_table['trajectory_key'].nunique()),
+        'horizontal_candidate_rows': int(len(horizontal)),
+        'vertical_candidate_rows': int(len(vertical)),
+        'panels': ['relative_radius', 'relative_unwrapped_bearing', 'horizontal_core_edges', 'vertical_candidate_distance_over_radius'],
+        'all_candidate_branches_plotted': True,
+    }
+
+
+def _ofes_transport_organization_decision_brief(
+    daily: pd.DataFrame,
+    candidate_geometry: pd.DataFrame,
+    path_daily: pd.DataFrame,
+    validation: dict,
+    settings: dict,
+) -> str:
+    """根据新表的实际计数和空间分布生成不超过 1800 字的中文裁决。"""
+    base_daily = daily.drop_duplicates(['trajectory_key', 'calendar_time'])
+    total_days = int(len(base_daily))
+    relative_values = pd.to_numeric(
+        daily['particle_registration_distance_over_radius'], errors='coerce'
+    ).to_numpy(dtype=float)
+    relative_values = relative_values[np.isfinite(relative_values)]
+    if relative_values.size:
+        relative_inside_count = int(np.count_nonzero(relative_values <= 1.0))
+        relative_inside = relative_inside_count / relative_values.size
+        relative_text = (
+            f'{relative_inside_count}/{relative_values.size} 个有 path 支撑的 '
+            'trajectory-path-day 落在原 registration 热盐质心圆内'
+        )
+    else:
+        relative_inside = np.nan
+        relative_text = '没有可用的原 registration 粒子—path 圆配对'
+    supported_daily = daily.loc[
+        daily['path_support_status'].astype(str).eq('path_member')
+    ].copy()
+    seed_motion_summary = _ofes_transport_organization_seed_motion_summary(
+        supported_daily
+        if len(supported_daily)
+        else daily.iloc[0:0].copy()
+    )
+    h = candidate_geometry.loc[
+        candidate_geometry['horizontal_compatible_bool'] & ~candidate_geometry['sentinel_bool']
+    ]
+    v = candidate_geometry.loc[
+        candidate_geometry['vertical_compatible_bool'] & ~candidate_geometry['sentinel_bool']
+    ]
+    path_member = path_daily.loc[
+        path_daily['path_support_status'].astype(str).eq('path_member')
+    ]
+    path_vorticity = pd.to_numeric(
+        path_member['path_field_relative_vorticity_s_1'], errors='coerce'
+    ).dropna()
+    path_strain = pd.to_numeric(
+        path_member['path_field_strain_magnitude_s_1'], errors='coerce'
+    ).dropna()
+    path_alignment = pd.to_numeric(
+        path_member['path_velocity_alignment_cosine'], errors='coerce'
+    ).dropna()
+    path_order = path_daily.sort_values('calendar_time', kind='mergesort').reset_index(drop=True)
+    trajectory_count = int(validation['arrived_3d_trajectory_count'])
+    calendar_day_count = int(len(settings['dates']))
+    path_ids = sorted(
+        path_id for path_id in path_daily['path_id'].astype(str).unique()
+        if path_id != '__NO_PATH__'
+    )
+    path_label = ', '.join(f'`{path_id}`' for path_id in path_ids) or '既有 path'
+    finite_radius = path_order.loc[
+        pd.to_numeric(path_order['path_radius_km'], errors='coerce').notna()
+    ]
+    if len(finite_radius) and path_ids:
+        if len(path_ids) == 1:
+            start_radius = float(finite_radius['path_radius_km'].iloc[0])
+            end_radius = float(finite_radius['path_radius_km'].iloc[-1])
+            start_date = pd.Timestamp(finite_radius['calendar_time'].iloc[0]).date().isoformat()
+            end_date = pd.Timestamp(finite_radius['calendar_time'].iloc[-1]).date().isoformat()
+            registration_distance_max = pd.to_numeric(
+                daily['particle_registration_distance_km'], errors='coerce'
+            ).max()
+            peak_origin_distance_max = pd.to_numeric(
+                daily['particle_peak_origin_distance_km'], errors='coerce'
+            ).max()
+            radius_text = (
+                f'既有 {path_label} 的热盐质心圆半径从 {start_radius:.1f} km（{start_date}）'
+                f'变为 {end_radius:.1f} km（{end_date}）；材料到热盐质心的 registration 距离最大 '
+                f'{registration_distance_max:.1f} km，峰像素原点距离最大 {peak_origin_distance_max:.1f} km。'
+            )
+        else:
+            radius_text = (
+                f'{len(path_ids)} 条既有 path 均有部分热盐质心圆半径记录；'
+                '材料与各路径的相对关系按 path 身份分别保留，不能合并为单一结构包络。'
+            )
+    else:
+        radius_text = '没有可用的既有 path 热盐质心圆半径记录，候选和实际流场证据仍单独保留。'
+    counts = validation['candidate_classification_counts']
+    p0_text = '；'.join(
+        f'{key}={value}' for key, value in sorted(validation.get('p0_classification_counts', {}).items())
+    )
+    if len(path_vorticity):
+        vorticity_median = float(np.nanmedian(path_vorticity))
+        if (path_vorticity < 0).all():
+            vorticity_sign = '负涡度'
+        elif (path_vorticity > 0).all():
+            vorticity_sign = '正涡度'
+        else:
+            vorticity_sign = '正负混合涡度'
+        vort_text = f'路径中心同层局地相对涡度中位 {vorticity_median:.2e} s⁻¹（{vorticity_sign}）'
+        if len(path_strain):
+            vort_text += f'、应变幅中位 {np.nanmedian(path_strain):.2e} s⁻¹'
+    else:
+        vorticity_sign = '无可用涡度'
+        vort_text = '路径中心同层动力量存在缺测'
+    alignment_text = (
+        f'路径中心逐日平移与同层实际流速方向的 cosine 中位 {np.nanmedian(path_alignment):.2f}（仅作描述性一致性）'
+        if len(path_alignment) else '路径中心平移与同层流速方向无法比较'
+    )
+    center_jump = pd.to_numeric(
+        seed_motion_summary['path_center_jump_max_km'], errors='coerce'
+    ).dropna()
+    center_jump_text = (
+        f'既有 path 相邻有效日期的中心最大跳动 {np.nanmax(center_jump):.1f} km'
+        if len(center_jump) else '既有 path 中心跳动无法比较'
+    )
+    finite_net = pd.to_numeric(
+        seed_motion_summary['relative_bearing_net_deg'], errors='coerce'
+    ).dropna()
+    if len(finite_net) and (finite_net > 0).all():
+        bearing_direction = 'clockwise'
+    elif len(finite_net) and (finite_net < 0).all():
+        bearing_direction = 'counterclockwise'
+    elif len(finite_net):
+        bearing_direction = 'mixed'
+    else:
+        bearing_direction = 'unavailable'
+    seed_labels = []
+    for seed_row in seed_motion_summary.itertuples(index=False):
+        if not np.isfinite(seed_row.relative_bearing_net_deg):
+            continue
+        label = (
+            f'{seed_row.arm}/p{int(seed_row.particle_index)}='
+            f'{seed_row.relative_bearing_net_deg:.0f}°'
+        )
+        if bool(seed_row.near_origin_angle_unstable):
+            label += '*'
+        seed_labels.append(label)
+    if seed_labels:
+        rotation_text = (
+            '逐 seed 净方位展开角为 ' + '、'.join(seed_labels)
+            + '；* 表示 r<1 km 的近原点角度不稳'
+        )
+        if bearing_direction == 'clockwise':
+            rotation_text += '；整体为顺时针展开'
+        elif bearing_direction == 'counterclockwise':
+            rotation_text += '；整体为逆时针展开'
+        else:
+            rotation_text += '；净展开方向不一致'
+    else:
+        rotation_text = '逐 seed 相对方位没有足够有限值展开。'
+    if not len(path_member):
+        organization_kind = 'no_path'
+        organization_sentence = (
+            '没有既有 path 的有效支撑日，因而不能由本表判断材料是否随移动结构传播。'
+        )
+    elif vorticity_sign == '负涡度' and bearing_direction == 'clockwise':
+        organization_kind = 'anticyclonic'
+        organization_sentence = (
+            '有 path 支撑的日期中，同层实际 u/v 呈负涡度且材料相对方位总体顺时针展开；'
+            '这支持移动反气旋式次表层组织延伸到材料层的解释。'
+        )
+    elif vorticity_sign == '正涡度' and bearing_direction == 'counterclockwise':
+        organization_kind = 'cyclonic'
+        organization_sentence = (
+            '有 path 支撑的日期中，同层实际 u/v 呈正涡度且材料相对方位总体逆时针展开；'
+            '这支持气旋式局地组织的解释。'
+        )
+    elif vorticity_sign == '负涡度':
+        organization_kind = 'negative_vorticity_only'
+        organization_sentence = (
+            '有 path 支撑的日期中，同层实际 u/v 呈负涡度局地组织，但相对方位没有统一方向；'
+            '这只支持负涡度流路线索。'
+        )
+    elif vorticity_sign == '正涡度':
+        organization_kind = 'positive_vorticity_only'
+        organization_sentence = (
+            '有 path 支撑的日期中，同层实际 u/v 呈正涡度局地组织，但相对方位没有与其共同闭合的统一方向；'
+            '这只支持正涡度流路线索。'
+        )
+    else:
+        organization_kind = 'indeterminate'
+        organization_sentence = (
+            '有 path 支撑的日期中存在局地流场资料，但涡度符号或相对方位不一致，'
+            '不能从本表指定气旋方向。'
+        )
+    origin_comparison = _ofes_transport_organization_path_origin_comparison(path_daily)
+    origin_values = pd.to_numeric(
+        origin_comparison['path_center_minus_thermohaline_distance_km'],
+        errors='coerce',
+    ).dropna()
+    origin_text = (
+        f'路径用既有 daily candidate 的峰像素 lon/lat；它与同一 candidate 的热盐质心位置差中位 {np.nanmedian(origin_values):.2f} km，'
+        '两者分列记录，均不被称为独立动力中心。'
+        if len(origin_values) else
+        '路径峰像素位置与热盐质心没有可用逐日差值；两者仍分列记录，均不称为独立动力中心。'
+    )
+    horizontal_center_gap = _nan_stat(
+        pd.to_numeric(h['particle_minus_core_center_m'], errors='coerce').to_numpy(dtype=float),
+        'median',
+    )
+    horizontal_shallow_gap = _nan_stat(
+        pd.to_numeric(h['particle_minus_core_shallow_m'], errors='coerce').to_numpy(dtype=float),
+        'median',
+    )
+    horizontal_deep_gap = _nan_stat(
+        pd.to_numeric(h['particle_minus_core_deep_m'], errors='coerce').to_numpy(dtype=float),
+        'median',
+    )
+    if np.isfinite(horizontal_shallow_gap) and horizontal_shallow_gap < 0:
+        edge_text = (
+            f'水平兼容行的粒子层中位比候选浅边浅 {abs(horizontal_shallow_gap):.1f} m，'
+            f'比候选中心浅 {abs(horizontal_center_gap):.1f} m，属于候选核上缘之外的材料层位。'
+        )
+        layer_relation_text = '候选核上缘之外的材料层'
+    elif np.isfinite(horizontal_deep_gap) and horizontal_deep_gap > 0:
+        edge_text = (
+            f'水平兼容行的粒子层中位比候选深边还深 {horizontal_deep_gap:.1f} m，'
+            f'比候选中心深 {horizontal_center_gap:.1f} m，位于候选核下缘之外。'
+        )
+        layer_relation_text = '候选核下缘之外的材料层'
+    elif np.isfinite(horizontal_shallow_gap) and horizontal_shallow_gap > 0:
+        edge_text = (
+            f'水平兼容行的粒子层中位比候选浅边深 {horizontal_shallow_gap:.1f} m、'
+            f'粒子减候选中心的中位深差为 {horizontal_center_gap:+.1f} m，且仍在候选深边之上。'
+        )
+        layer_relation_text = '候选核垂向范围内的材料层'
+    else:
+        edge_text = '水平兼容行没有可用的浅边深差。'
+        layer_relation_text = '候选核边界关系未定的材料层'
+    if np.isfinite(relative_inside):
+        relative_clause = (
+            f'{relative_text}' if relative_inside_count != relative_values.size
+            else f'全部 {relative_text}'
+        )
+    else:
+        relative_clause = relative_text
+    candidate_relation_text = (
+        f'水平兼容候选 {len(h)} 行；'
+        f'垂向兼容候选 {len(v)} 行的中心距离中位 '
+        f'{_nan_stat(pd.to_numeric(v["candidate_distance_km"], errors="coerce").to_numpy(dtype=float), "median"):.1f} km，'
+        f'距离/半径中位 {_nan_stat(pd.to_numeric(v["candidate_distance_over_radius"], errors="coerce").to_numpy(dtype=float), "median"):.2f}。'
+    )
+    if organization_kind == 'anticyclonic':
+        scv_text = (
+            f'对 SCV 的具体关系是：负涡度旋转组织延伸到{layer_relation_text}，'
+            '支持随移动反气旋式次表层组织输送的 SCV-like carrier 解释；'
+            '它不证明严格同一 SCV、物质身份或不可替代的 SCV 作用。'
+        )
+    elif organization_kind == 'cyclonic':
+        scv_text = (
+            f'对 SCV 的具体关系是：当前空间/时间资料支持气旋式组织延伸到{layer_relation_text}，'
+            '不支持把本例直接命名为反气旋 SCV-like carrier，也不证明严格同一 SCV 或物质身份。'
+        )
+    elif organization_kind == 'no_path':
+        scv_text = (
+            '对 SCV 的具体关系是：没有既有 path 的有效支撑，不能由本表支持 SCV-like carrier 或气旋方向。'
+        )
+    else:
+        scv_text = (
+            f'对 SCV 的具体关系是：局地流路资料延伸到{layer_relation_text}，但涡度/方位没有闭合，'
+            '不能指定反气旋或气旋 SCV-like carrier，也不证明严格同一 SCV 或物质身份。'
+        )
+    return (
+        f'# {settings["case_label"]}复核裁决\n\n'
+        f'本轮沿 {settings["start_date"]:%Y-%m-%d} 至 {settings["end_date"]:%Y-%m-%d} 的 {calendar_day_count} 个日历位置，锁定端点试验中 {trajectory_count} 条真实 arrived 3-D 轨迹，'
+        f'共 {total_days} 个 trajectory-day；原有 P0 分类保持 {p0_text}。\n\n'
+        f'{organization_sentence}参考位置沿既有候选路径登记。{relative_clause}；相对 {path_label} 峰像素原点，{rotation_text}；'
+        f'{vort_text}；{alignment_text}；{center_jump_text}。{origin_text}{radius_text}同层实际 u/v 与粒子路径的关系按这些字段描述，不能仅由圆包含把材料命名为核内或侧翼。\n\n'
+        f'候选错配不是“没有候选”：{counts.get("horizontal_and_vertical_separate_candidates_no_joint", 0)}/{total_days} 日为水平和垂向分别有候选但无同一 candidate，'
+        f'{counts.get("joint_same_candidate", 0)} 日 joint，{counts.get("vertical_only", 0)} 日仅垂向。{candidate_relation_text}'
+        f'{edge_text}垂向兼容候选的距离/半径只是保存候选的几何诊断，不能代表整个结构范围；H 与 V 不能拼成一涡。\n\n'
+        f'{scv_text}必要限制是路径中心来自独立候选登记，圆半径沿用 registration 的热盐质心且没有保存 mask；流场为逐日 Eulerian 薄层 u/v，没有完整动力中心和 tracer tendency/混合闭合，因此背景流路接管与阶段混合仍未被唯一排除。\n'
+    )
+
+
+def _ofes_transport_organization_validation(
+    settings: dict,
+    inputs: dict,
+    daily: pd.DataFrame,
+    candidate_geometry: pd.DataFrame,
+    path_daily: pd.DataFrame,
+    field_daily: pd.DataFrame,
+    inventory: list[dict],
+    figure_metadata: dict,
+    seed_motion_summary: pd.DataFrame | None = None,
+    path_origin_comparison: pd.DataFrame | None = None,
+) -> dict:
+    """验证运输组织输出的身份、时钟、分母、坐标和实际读取范围。"""
+    structure_validation = inputs['closure']['validation']
+    base_daily = daily.drop_duplicates(['trajectory_key', 'calendar_time'])
+    effective_path_count = max(len(inputs['path_ids']), 1)
+    if seed_motion_summary is None:
+        seed_motion_summary = _ofes_transport_organization_seed_motion_summary(daily)
+    if path_origin_comparison is None:
+        path_origin_comparison = _ofes_transport_organization_path_origin_comparison(
+            path_daily
+        )
+    categories = {
+        category: int(base_daily['classification'].astype(str).eq(category).sum())
+        for category in _OFES_TRANSPORT_ORGANIZATION_CATEGORIES
+    }
+    expected_categories = {
+        str(key): int(value)
+        for key, value in structure_validation.get('structure_classification_counts', {}).items()
+    }
+    case_identity = {
+        'transport_case_id': str(settings['case_id']),
+        'closure_case_id': str(settings['closure_manifest'].get('case_id')),
+        'watermass_case_id': str(settings['watermass_manifest'].get('case_id')),
+        'closure_source_case_id': str(settings['closure_manifest'].get('source_case_id')),
+        'daily_case_ids': sorted(set(daily['case_id'].dropna().astype(str))),
+        'candidate_case_ids': sorted(set(candidate_geometry['case_id'].dropna().astype(str))),
+        'field_case_ids': sorted(set(field_daily['case_id'].dropna().astype(str))),
+        'path_case_ids': sorted(set(path_daily['case_id'].dropna().astype(str))),
+        'daily_source_case_ids': sorted(set(daily['source_case_id'].dropna().astype(str))),
+        'field_source_case_ids': sorted(set(field_daily['source_case_id'].dropna().astype(str))),
+        'path_source_case_ids': sorted(set(path_daily['source_case_id'].dropna().astype(str))),
+        'candidate_source_case_ids': [str(settings['watermass_case_id'])],
+    }
+    dates = set(pd.Timestamp(value).normalize() for value in settings['dates'])
+    particle_finite = field_daily.loc[field_daily['entity_type'].astype(str).eq('particle')]
+    relative_finite = daily[[
+        'particle_relative_x_m', 'particle_relative_y_m', 'particle_relative_r_km',
+        'particle_relative_bearing_deg', 'particle_peak_origin_distance_km',
+        'particle_registration_distance_km',
+        'particle_registration_radius_km',
+        'particle_registration_distance_over_radius',
+    ]].apply(pd.to_numeric, errors='coerce').notna().all(axis=1)
+    path_member_mask = daily['path_support_status'].astype(str).eq('path_member')
+    relative_ratio = pd.to_numeric(
+        daily['particle_registration_distance_over_radius'], errors='coerce'
+    )
+    registration_geometry_mask = path_member_mask & relative_ratio.notna()
+    relative_geometry_complete = bool(
+        relative_finite.loc[registration_geometry_mask].all()
+    )
+    relative_inside_mask = registration_geometry_mask
+    relative_inside_count = int(
+        (relative_ratio.loc[relative_inside_mask] <= 1.0).sum()
+    )
+    registration_flag = daily['particle_registration_horizontal_compatible'].astype('boolean')
+    registration_distance_inside = daily[
+        'particle_registration_circle_inside_from_distance'
+    ].astype('boolean')
+    registration_flag_mask = (
+        registration_geometry_mask
+        & registration_flag.notna()
+        & registration_distance_inside.notna()
+    )
+    registration_circle_consistent = bool(
+        (registration_flag.loc[registration_flag_mask]
+         == registration_distance_inside.loc[registration_flag_mask]).all()
+    )
+    peak_inside = daily['particle_peak_origin_circle_inside'].astype('boolean')
+    peak_inside_mask = path_member_mask & peak_inside.notna()
+    peak_inside_count = int(peak_inside.loc[peak_inside_mask].sum())
+    daily_path_ids = sorted(daily['path_id'].dropna().astype(str).unique())
+    path_table_ids = sorted(path_daily['path_id'].dropna().astype(str).unique())
+    expected_path_table_ids = sorted(inputs['effective_path_ids'])
+    finite_candidate_geometry = candidate_geometry.loc[
+        ~candidate_geometry['sentinel_bool'],
+        ['candidate_core_center_depth_m', 'candidate_distance_km', 'candidate_radius_km'],
+    ].apply(pd.to_numeric, errors='coerce').notna().all(axis=1)
+    source_files = sorted({
+        path
+        for row in inventory
+        for path in row.get('source_files', {}).values()
+    })
+    return {
+        'analysis': 'ofes_transport_organization_review',
+        'complete': bool(
+            case_identity['watermass_case_id'] == case_identity['closure_source_case_id']
+            and case_identity['transport_case_id'] == str(settings['case_id'])
+            and case_identity['daily_case_ids'] == [case_identity['closure_case_id']]
+            and case_identity['candidate_case_ids'] == [case_identity['watermass_case_id']]
+            and case_identity['field_case_ids'] == [case_identity['transport_case_id']]
+            and case_identity['path_case_ids'] == [case_identity['transport_case_id']]
+            and case_identity['daily_source_case_ids'] == [case_identity['watermass_case_id']]
+            and case_identity['field_source_case_ids'] == [case_identity['watermass_case_id']]
+            and case_identity['path_source_case_ids'] == [case_identity['watermass_case_id']]
+            and int(len(base_daily)) == int(len(inputs['arrived']) * len(settings['dates']))
+            and int(len(daily)) == int(
+                len(inputs['arrived']) * len(settings['dates']) * effective_path_count
+            )
+            and int(len(candidate_geometry)) == int(len(inputs['structure_registration']))
+            and int(len(path_daily)) == int(len(settings['dates']) * effective_path_count)
+            and int(len(seed_motion_summary)) == int(
+                len(inputs['arrived']) * effective_path_count
+            )
+            and int(len(path_origin_comparison)) == int(len(path_daily))
+            and set(pd.Timestamp(value).normalize() for value in daily['calendar_time']) == dates
+            and categories == expected_categories
+            and int(len(particle_finite)) == len(base_daily)
+            and relative_geometry_complete
+            and registration_circle_consistent
+            and bool(finite_candidate_geometry.all())
+            and len(inventory) == len(settings['dates'])
+            and daily_path_ids == expected_path_table_ids
+            and path_table_ids == expected_path_table_ids
+            and all(bool(meta.get('png_readable')) for meta in figure_metadata.values())
+        ),
+        'case_identity': case_identity,
+        'arrived_3d_trajectory_count': int(len(inputs['arrived'])),
+        'arrived_3d_trajectory_keys': sorted(set(inputs['arrived']['trajectory_key'].astype(str))),
+        'arrived_count_by_arm': {
+            str(key): int(value)
+            for key, value in inputs['arrived'].groupby('arm').size().to_dict().items()
+        },
+        'calendar_day_count': int(len(settings['dates'])),
+        'expected_trajectory_day_rows': int(len(inputs['arrived']) * len(settings['dates'])),
+        'actual_trajectory_day_rows': int(len(base_daily)),
+        'effective_path_count': int(effective_path_count),
+        'expected_transport_organization_daily_rows': int(
+            len(inputs['arrived']) * len(settings['dates']) * effective_path_count
+        ),
+        'actual_transport_organization_daily_rows': int(len(daily)),
+        'candidate_registration_rows_including_sentinel': int(len(candidate_geometry)),
+        'candidate_non_sentinel_rows': int((~candidate_geometry['sentinel_bool']).sum()),
+        'candidate_sentinel_rows': int(candidate_geometry['sentinel_bool'].sum()),
+        'horizontal_compatible_candidate_rows': int(candidate_geometry['horizontal_compatible_bool'].sum()),
+        'vertical_compatible_candidate_rows': int(candidate_geometry['vertical_compatible_bool'].sum()),
+        'joint_compatible_candidate_rows': int(candidate_geometry['joint_compatible_bool'].sum()),
+        'candidate_classification_counts': categories,
+        'candidate_classification_counts_match_mechanism_closure': bool(categories == expected_categories),
+        'p0_classification_counts': inputs['p0_counts'],
+        'p0_total_days_from_saved_summary': int(inputs['p0_total_days']),
+        'p1_paired_path_daily_rows': int(len(inputs['closure']['paired_path_daily'])),
+        'p1_candidate_classification_counts': expected_categories,
+        'path_id_count': int(len(inputs['path_ids'])),
+        'path_ids': list(inputs['path_ids']),
+        'effective_path_ids': list(inputs['effective_path_ids']),
+        'display_path_ids': list(inputs['display_path_ids']),
+        'path_daily_rows': int(len(path_daily)),
+        'path_table_ids': path_table_ids,
+        'path_missing_rows': int(
+            path_daily['path_support_status'].astype(str).ne('path_member').sum()
+        ),
+        'relative_geometry_rows': int(path_member_mask.sum()),
+        'registration_geometry_rows': int(registration_geometry_mask.sum()),
+        'relative_geometry_complete': relative_geometry_complete,
+        'relative_geometry_definition': (
+            'original registration distance/radius and horizontal_compatible flag use the '
+            'thermohaline centroid; peak-pixel distance/bearing remain separate origin diagnostics'
+        ),
+        'relative_geometry_inside_count': relative_inside_count,
+        'relative_geometry_inside_denominator': int(relative_inside_mask.sum()),
+        'relative_geometry_inside_fraction': (
+            float(relative_inside_count / relative_inside_mask.sum())
+            if relative_inside_mask.any() else np.nan
+        ),
+        'registration_circle_consistent': registration_circle_consistent,
+        'registration_circle_flag_inside_count': int(
+            registration_flag.loc[registration_flag_mask].sum()
+        ),
+        'registration_circle_flag_denominator': int(registration_flag_mask.sum()),
+        'peak_origin_circle_inside_count': peak_inside_count,
+        'peak_origin_circle_inside_denominator': int(peak_inside_mask.sum()),
+        'seed_motion_summary_rows': int(len(seed_motion_summary)),
+        'near_origin_seed_count': int(
+            seed_motion_summary['near_origin_angle_unstable'].astype(bool).sum()
+        ),
+        'positive_net_bearing_seed_count': int(
+            (pd.to_numeric(seed_motion_summary['relative_bearing_net_deg'], errors='coerce') > 0).sum()
+        ),
+        'near_origin_threshold_km': 1.0,
+        'path_origin_comparison_rows': int(len(path_origin_comparison)),
+        'path_origin_comparison_finite_rows': int(
+            pd.to_numeric(
+                path_origin_comparison['path_center_minus_thermohaline_distance_km'],
+                errors='coerce',
+            ).notna().sum()
+        ),
+        'field_daily_rows': int(len(field_daily)),
+        'field_particle_rows': int(len(particle_finite)),
+        'field_read_day_count': int(len(inventory)),
+        'field_read_source_file_count': int(len(source_files)),
+        'field_read_source_files': source_files,
+        'field_variables': ['do2', 'temp', 'salinity', 'u', 'v'],
+        'field_read_depth_semantics': (
+            f'one delivered layer nearest {settings["reference_depth_m"]:g} m; '
+            'no w read; no trajectory reintegration'
+        ),
+        'field_sampling': 'bilinear on tracer-center grid',
+        'raw_do_semantics': 'raw DO at the delivered reference layer, not profile delta DO',
+        'candidate_geometry_support': 'approximate_circle_no_saved_mask',
+        'candidate_mask_available': False,
+        'all_candidate_branches_retained': True,
+        'no_reintegration': True,
+        'no_new_candidate_search': True,
+        'read_domain': inputs.get('read_domain'),
+        'figure_metadata': figure_metadata,
+        'source_artifacts_read_only': True,
+        'input_paths': {
+            'watermass_review': str(settings['watermass_output_dir'].resolve()),
+            'mechanism_closure': str(settings['mechanism_closure_output_dir'].resolve()),
+            'structure_candidates': str((settings['structure_continuity_output_dir'] / 'daily_structure_candidates.csv').resolve()),
+            'structure_path_members': str((settings['structure_continuity_output_dir'] / 'structure_path_members.csv').resolve()),
+            'structure_match_edges': str((settings['structure_continuity_output_dir'] / 'structure_match_edges.csv').resolve()),
+        },
+    }
+
+
+def _ofes_transport_organization_write_snapshot_cache(
+    snapshots: Mapping[pd.Timestamp, Mapping[str, np.ndarray]],
+    settings: dict,
+    root: Path,
+) -> dict:
+    """保存代表日同层数组，供图件重绘和点值核对复用。"""
+    cache_root = root / 'field_snapshot_cache'
+    cache_root.mkdir(parents=True, exist_ok=True)
+    dates = []
+    for stamp in settings['representative_dates']:
+        stamp = pd.Timestamp(stamp).normalize()
+        if stamp not in snapshots:
+            continue
+        record = snapshots[stamp]
+        cache_path = cache_root / f'{stamp.date().isoformat()}.npz'
+        np.savez_compressed(
+            cache_path,
+            lon=np.asarray(record['lon'], dtype=np.float64),
+            lat=np.asarray(record['lat'], dtype=np.float64),
+            raw_do_umol_kg=np.asarray(record['raw_do_umol_kg'], dtype=np.float32),
+            temp_potential_deg_c=np.asarray(record['temp_potential_deg_c'], dtype=np.float32),
+            salinity_psu=np.asarray(record['salinity_psu'], dtype=np.float32),
+            u_m_s=np.asarray(record['u_m_s'], dtype=np.float32),
+            v_m_s=np.asarray(record['v_m_s'], dtype=np.float32),
+            field_layer_depth_m=np.asarray([float(record['field_layer_depth_m'])], dtype=np.float64),
+        )
+        dates.append(stamp.date().isoformat())
+    metadata = {
+        'analysis': 'ofes_transport_organization_representative_field_cache',
+        'cache_format': 'compressed_npz',
+        'dates': dates,
+        'variables': ['do2', 'temp', 'salinity', 'u', 'v'],
+        'requested_depth_m': float(settings['reference_depth_m']),
+        'source_file_count': int(len(dates) * 5),
+        'source_read_note': 'Representative arrays persist the already read local layers for figure refresh and point-value crosscheck; they do not replace the full daily field table.',
+        'files': {
+            date: str((cache_root / f'{date}.npz').resolve()) for date in dates
+        },
+    }
+    _ofes_atomic_write_json(metadata, cache_root / 'manifest.json')
+    return metadata
+
+
+def _ofes_transport_organization_point_value_crosscheck(
+    snapshots: Mapping[pd.Timestamp, Mapping[str, np.ndarray]],
+    daily: pd.DataFrame,
+    path_daily: pd.DataFrame,
+    representative_dates: Sequence[pd.Timestamp],
+    cache_root: Path,
+) -> pd.DataFrame:
+    """核对代表日粒子/path 中心的最近格点、双线性值和已保存采样值。"""
+    rows = []
+    particle = daily.loc[:, [
+        'trajectory_key', 'calendar_time', 'particle_lon', 'particle_lat',
+        'raw_do_umol_kg', 'path_id',
+    ]].drop_duplicates(['trajectory_key', 'calendar_time'])
+    particle = particle.rename(columns={
+        'particle_lon': 'entity_lon', 'particle_lat': 'entity_lat',
+        'raw_do_umol_kg': 'saved_field_raw_do_umol_kg',
+    })
+    for stamp in representative_dates:
+        stamp = pd.Timestamp(stamp).normalize()
+        record = snapshots.get(stamp)
+        if record is None:
+            continue
+        lon = np.asarray(record['lon'], dtype=float)
+        lat = np.asarray(record['lat'], dtype=float)
+        raw_do = np.asarray(record['raw_do_umol_kg'], dtype=float)
+        interpolator = RegularGridInterpolator(
+            (lat, lon), raw_do, bounds_error=False, fill_value=np.nan
+        )
+        points = []
+        particle_day = particle.loc[particle['calendar_time'].eq(stamp)]
+        for item in particle_day.itertuples(index=False):
+            points.append({
+                'date': stamp.date().isoformat(),
+                'entity_type': 'particle',
+                'trajectory_key': str(item.trajectory_key),
+                'path_id': str(item.path_id),
+                'candidate_id': '',
+                'entity_lon': float(item.entity_lon),
+                'entity_lat': float(item.entity_lat),
+                'saved_field_raw_do_umol_kg': float(item.saved_field_raw_do_umol_kg),
+            })
+        path_day = path_daily.loc[
+            path_daily['calendar_time'].eq(stamp)
+        ].drop_duplicates('path_id')
+        for item in path_day.itertuples(index=False):
+            if not np.all(np.isfinite([item.path_center_lon, item.path_center_lat])):
+                continue
+            points.append({
+                'date': stamp.date().isoformat(),
+                'entity_type': 'path_center_peak_pixel',
+                'trajectory_key': '',
+                'path_id': str(item.path_id),
+                'candidate_id': str(item.candidate_id),
+                'entity_lon': float(item.path_center_lon),
+                'entity_lat': float(item.path_center_lat),
+                'saved_field_raw_do_umol_kg': float(item.path_field_raw_do_umol_kg),
+            })
+        for item in points:
+            lat_index = int(np.argmin(np.abs(lat - item['entity_lat'])))
+            lon_index = int(np.argmin(np.abs(lon - item['entity_lon'])))
+            point = np.asarray([[item['entity_lat'], item['entity_lon']]], dtype=float)
+            bilinear = float(np.asarray(interpolator(point)).reshape(-1)[0])
+            nearest = float(raw_do[lat_index, lon_index])
+            saved = item['saved_field_raw_do_umol_kg']
+            rows.append({
+                **item,
+                'nearest_grid_lon': float(lon[lon_index]),
+                'nearest_grid_lat': float(lat[lat_index]),
+                'nearest_grid_raw_do_umol_kg': nearest,
+                'bilinear_raw_do_umol_kg': bilinear,
+                'nearest_minus_bilinear_umol_kg': nearest - bilinear,
+                'bilinear_minus_saved_umol_kg': bilinear - saved,
+                'cache_file': str((cache_root / f'{stamp.date().isoformat()}.npz').resolve()),
+            })
+    return pd.DataFrame(rows)
+
+
+def _ofes_transport_organization_output_paths(root: Path) -> dict[str, Path]:
+    """集中定义运输组织审查的持久化文件路径，供写入器和 loader 共用。"""
+    return {
+        'transport_organization_daily': root / 'transport_organization_daily.csv',
+        'candidate_geometry_daily': root / 'transport_candidate_geometry_daily.csv',
+        'field_daily': root / 'transport_field_daily.csv',
+        'path_daily': root / 'transport_structure_path_daily.csv',
+        'seed_motion_summary': root / 'transport_seed_motion_summary.csv',
+        'path_origin_comparison': root / 'transport_path_origin_comparison.csv',
+        'point_value_crosscheck': root / 'field_point_value_crosscheck.csv',
+        'representative_cache': root / 'field_snapshot_cache',
+        'field_read_inventory': root / 'field_read_inventory.json',
+        'flow_figure': root / 'figure_transport_organization_flow.png',
+        'relative_figure': root / 'figure_transport_organization_relative.png',
+        'validation': root / 'validation.json',
+        'manifest': root / 'manifest.json',
+        'verdict': root / 'verdict_zh.md',
+        'decision_brief': root / 'ROOT_DECISION_BRIEF_zh.md',
+    }
+
+
+def _ofes_transport_organization_write_outputs(
+    settings: dict,
+    inputs: dict,
+    daily: pd.DataFrame,
+    candidate_geometry: pd.DataFrame,
+    field_daily: pd.DataFrame,
+    path_daily: pd.DataFrame,
+    inventory: list[dict],
+    read_domain: dict,
+    snapshots: dict,
+) -> dict:
+    """写出运输组织审查的正式小表、PNG、manifest、validation 和中文简报。"""
+    root = settings['output_dir']
+    root.mkdir(parents=True, exist_ok=True)
+    paths = _ofes_transport_organization_output_paths(root)
+    flow_metadata = _ofes_transport_organization_flow_figure(
+        daily,
+        candidate_geometry,
+        path_daily,
+        inputs['background_positions'],
+        snapshots,
+        settings,
+        paths['flow_figure'],
+    )
+    relative_metadata = _ofes_transport_organization_relative_figure(
+        daily,
+        candidate_geometry,
+        settings,
+        paths['relative_figure'],
+    )
+    figure_metadata = {'flow': flow_metadata, 'relative': relative_metadata}
+    seed_motion_summary = _ofes_transport_organization_seed_motion_summary(daily)
+    path_origin_comparison = _ofes_transport_organization_path_origin_comparison(path_daily)
+    cache_metadata = _ofes_transport_organization_write_snapshot_cache(
+        snapshots, settings, root
+    )
+    point_value_crosscheck = _ofes_transport_organization_point_value_crosscheck(
+        snapshots,
+        daily,
+        path_daily,
+        settings['representative_dates'],
+        root / 'field_snapshot_cache',
+    )
+    validation = _ofes_transport_organization_validation(
+        settings,
+        inputs,
+        daily,
+        candidate_geometry,
+        path_daily,
+        field_daily,
+        inventory,
+        figure_metadata,
+        seed_motion_summary,
+        path_origin_comparison,
+    )
+    validation['read_domain'] = read_domain
+    validation['representative_cache'] = cache_metadata
+    validation['point_value_crosscheck_rows'] = int(len(point_value_crosscheck))
+    validation['point_value_crosscheck_max_abs_bilinear_minus_saved_umol_kg'] = (
+        float(
+            pd.to_numeric(
+                point_value_crosscheck['bilinear_minus_saved_umol_kg'],
+                errors='coerce',
+            ).abs().max()
+        )
+        if len(point_value_crosscheck) else np.nan
+    )
+    decision_brief = _ofes_transport_organization_decision_brief(
+        daily, candidate_geometry, path_daily, validation, settings
+    )
+    daily.to_csv(paths['transport_organization_daily'], index=False)
+    candidate_geometry.to_csv(paths['candidate_geometry_daily'], index=False)
+    field_daily.to_csv(paths['field_daily'], index=False)
+    path_daily.to_csv(paths['path_daily'], index=False)
+    seed_motion_summary.to_csv(paths['seed_motion_summary'], index=False)
+    path_origin_comparison.to_csv(paths['path_origin_comparison'], index=False)
+    point_value_crosscheck.to_csv(paths['point_value_crosscheck'], index=False)
+    _ofes_atomic_write_json(
+        {
+            'analysis': 'ofes_transport_organization_field_read',
+            'complete': bool(validation['complete']),
+            'read_domain': read_domain,
+            'daily_inventory': inventory,
+            'no_reintegration': True,
+            'no_new_candidate_search': True,
+            'representative_cache': cache_metadata,
+            'point_value_crosscheck': {
+                'path': str(paths['point_value_crosscheck'].resolve()),
+                'rows': int(len(point_value_crosscheck)),
+                'max_abs_bilinear_minus_saved_umol_kg': validation[
+                    'point_value_crosscheck_max_abs_bilinear_minus_saved_umol_kg'
+                ],
+            },
+        },
+        paths['field_read_inventory'],
+    )
+    paths['verdict'].write_text(decision_brief, encoding='utf-8')
+    paths['decision_brief'].write_text(decision_brief, encoding='utf-8')
+    manifest = {
+        'analysis': 'ofes_transport_organization_review',
+        'case_id': settings['case_id'],
+        'case_label': settings['case_label'],
+        'source_case_id': settings['watermass_case_id'],
+        'case_identity': {
+            'case_id': settings['case_id'],
+            'source_case_id': settings['watermass_case_id'],
+            'closure_case_id': str(settings['closure_manifest'].get('case_id')),
+            'source_case_identity': settings['watermass_case_identity'],
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+        },
+        'diagnostic_window': {
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+            'calendar_dates': [pd.Timestamp(value).date().isoformat() for value in settings['dates']],
+            'representative_dates': [
+                pd.Timestamp(value).date().isoformat()
+                for value in settings['representative_dates']
+            ],
+            'calendar_day_count': int(len(settings['dates'])),
+        },
+        'reference_layer': {
+            'requested_depth_m': settings['reference_depth_m'],
+            'read_half_window_m': settings['reference_depth_half_window_m'],
+            'depth_semantics': 'delivered OFES z-level depth below sea surface',
+            'variables': ['do2', 'temp', 'salinity', 'u', 'v'],
+            'raw_do_label': 'raw DO at reference layer; not profile delta DO',
+        },
+        'candidate_geometry_contract': {
+            'horizontal_metrics': 'particle depth minus candidate core centre, shallow edge, and deep edge; sign positive means particle is deeper',
+            'vertical_metrics': 'candidate-centre great-circle distance and distance divided by saved thermohaline component radius',
+            'registration_circle_metrics': 'particle registration distance/radius/flag use the original thermohaline-centred candidate circle; peak-pixel distance is retained separately for relative-origin diagnostics',
+            'mask_status': 'no per-candidate mask saved; registration distance/radius is the original approximate-circle diagnostic',
+            'candidate_temperature_salinity_centroid': 'retained as provenance only; never called a dynamical centre',
+            'all_same_day_branches_retained': True,
+        },
+        'motion_contract': {
+            'relative_origin': 'existing daily structure candidate lon/lat at the path member (peak-pixel candidate location), paired by trajectory/date/path ID; this is not an independent dynamical centre',
+            'thermohaline_centroid': 'existing candidate thermohaline centroid is retained separately for source/difference comparison',
+            'relative_x_m': 'eastward particle minus path-centre displacement',
+            'relative_y_m': 'northward particle minus path-centre displacement',
+            'peak_origin_circle': 'peak-pixel origin distance compared with the original registration thermohaline radius; not the original horizontal compatibility flag',
+            'registration_circle': 'original registration distance/radius/flag centred on the candidate thermohaline centroid',
+            'bearing': 'clockwise from north, unwrapped separately per trajectory and path; finite path dates remain visible across gaps',
+            'path_translation': 'calendar-forward displacement of the existing path centre; descriptive only',
+            'vorticity_and_strain': 'local finite differences of actual same-layer u/v on tracer-centre grid',
+            'near_origin_angle_flag': 'r < 1 km is a diagnostic flag for unstable bearing interpretation, not a physical threshold',
+        },
+        'path_contract': {
+            'path_ids': list(inputs['path_ids']),
+            'effective_path_ids': list(inputs['effective_path_ids']),
+            'display_path_ids': list(inputs['display_path_ids']),
+            'missing_date_rows_retained': True,
+            'no_path_marker': '__NO_PATH__',
+        },
+        'read_scope': {
+            'max_span_km': settings['max_read_span_km'],
+            'daily_read_count': int(len(inventory)),
+            'source_file_count': int(validation['field_read_source_file_count']),
+            'source_files': validation['field_read_source_files'],
+            'domain': read_domain,
+            'no_w_read': True,
+            'no_particle_integration': True,
+            'no_new_candidate_search': True,
+            'representative_cache': cache_metadata,
+            'point_value_crosscheck': {
+                'path': str(paths['point_value_crosscheck'].resolve()),
+                'rows': int(len(point_value_crosscheck)),
+                'max_abs_bilinear_minus_saved_umol_kg': validation[
+                    'point_value_crosscheck_max_abs_bilinear_minus_saved_umol_kg'
+                ],
+            },
+        },
+        'inputs': validation['input_paths'],
+        'outputs': {key: str(path.resolve()) for key, path in paths.items()},
+        'figures': {
+            'flow': str(paths['flow_figure'].resolve()),
+            'relative': str(paths['relative_figure'].resolve()),
+        },
+        'validation': validation,
+        'complete': bool(validation['complete']),
+    }
+    _ofes_atomic_write_json(validation, paths['validation'])
+    _ofes_atomic_write_json(manifest, paths['manifest'])
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'transport_organization_daily': daily,
+        'candidate_geometry_daily': candidate_geometry,
+        'field_daily': field_daily,
+        'path_daily': path_daily,
+        'seed_motion_summary': seed_motion_summary,
+        'path_origin_comparison': path_origin_comparison,
+        'point_value_crosscheck': point_value_crosscheck,
+        'representative_cache': cache_metadata,
+        'field_read_inventory': inventory,
+        'decision_brief': decision_brief,
+        'verdict': decision_brief,
+        'figures': {
+            'flow': paths['flow_figure'],
+            'relative': paths['relative_figure'],
+        },
+        'paths': paths,
+    }
+
+
+def _ofes_transport_organization_saved_identity_mismatches(
+    manifest: Mapping,
+    settings: dict,
+) -> list[str]:
+    """列出已保存输送组织结果与当前规格不一致的身份字段。"""
+    mismatches = []
+    identity = manifest.get('case_identity', {})
+    diagnostic_window = manifest.get('diagnostic_window', {})
+    reference_layer = manifest.get('reference_layer', {})
+    read_scope = manifest.get('read_scope', {})
+    if str(manifest.get('case_id')) != str(settings['case_id']):
+        mismatches.append('case_id')
+    if str(manifest.get('source_case_id')) != str(settings['watermass_case_id']):
+        mismatches.append('source_case_id')
+    if str(identity.get('closure_case_id')) != str(settings['closure_manifest'].get('case_id')):
+        mismatches.append('case_identity.closure_case_id')
+    if str(identity.get('source_case_id')) != str(settings['watermass_case_id']):
+        mismatches.append('case_identity.source_case_id')
+    if identity.get('source_case_identity') != settings['watermass_case_identity']:
+        mismatches.append('case_identity.source_case_identity')
+    expected_start = settings['start_date'].date().isoformat()
+    expected_end = settings['end_date'].date().isoformat()
+    if (
+        identity.get('start_date') != expected_start
+        or identity.get('end_date') != expected_end
+        or diagnostic_window.get('start_date') != expected_start
+        or diagnostic_window.get('end_date') != expected_end
+    ):
+        mismatches.append('date_window')
+    expected_dates = [pd.Timestamp(value).date().isoformat() for value in settings['dates']]
+    if diagnostic_window.get('calendar_dates') != expected_dates:
+        mismatches.append('calendar_dates')
+    cache = read_scope.get('representative_cache', {})
+    expected_representative_dates = [
+        pd.Timestamp(value).date().isoformat()
+        for value in settings['representative_dates']
+    ]
+    if sorted(str(value) for value in cache.get('dates', [])) != sorted(
+        expected_representative_dates
+    ):
+        mismatches.append('representative_cache_dates')
+    if not np.isclose(
+        float(cache.get('requested_depth_m', np.nan)),
+        settings['reference_depth_m'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        mismatches.append('representative_cache_requested_depth_m')
+    if list(cache.get('variables', [])) != ['do2', 'temp', 'salinity', 'u', 'v']:
+        mismatches.append('representative_cache_variables')
+    if not np.isclose(
+        float(reference_layer.get('requested_depth_m', np.nan)),
+        settings['reference_depth_m'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        mismatches.append('reference_depth_m')
+    if not np.isclose(
+        float(reference_layer.get('read_half_window_m', np.nan)),
+        settings['reference_depth_half_window_m'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        mismatches.append('reference_depth_half_window_m')
+    if not np.isclose(
+        float(read_scope.get('max_span_km', np.nan)),
+        settings['max_read_span_km'],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        mismatches.append('max_read_span_km')
+    saved_display_paths = manifest.get('path_contract', {}).get('display_path_ids')
+    expected_display_paths = settings.get('display_path_ids')
+    if expected_display_paths is not None and saved_display_paths != list(expected_display_paths):
+        mismatches.append('display_path_ids')
+    return mismatches
+
+
+def build_ofes_transport_organization_review(
+    case_spec: Mapping,
+    *,
+    output_dir: str | Path | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """把已有双端点材料放回实际同层流场，复核指定案例的输送动力组织。
+
+    本入口沿原 arrived 3-D 身份键和 case_spec 日期窗口读取既有轨迹、全部候选分支与独立候选路径，先量化水平兼容候选的核心边—粒子层有符号深差，再量化垂向兼容候选的水平距离/半径。随后按日期一次读取 reference_depth_m 附近的 raw DO、位温、盐度和 B-grid 校正到 tracer center 的 u/v，计算局地相对涡度与应变，并将材料路径、独立候选路径和实际流场共同制图。
+
+    参数:
+        - case_spec (Mapping): Notebook 提供的案例身份、日期、上游水团/机制闭合/结构连续性目录和输出目录。
+        - output_dir (str | pathlib.Path | None): 覆盖 case_spec 中的输出目录；默认使用 case_spec 的 `output_dir`。
+        - overwrite (bool): 是否覆盖同一身份的已保存输出；默认 False，已有完整结果会直接由 loader 读取。
+
+    返回:
+        - dict: 含 `transport_organization_daily`、`candidate_geometry_daily`、`field_daily`、`path_daily`、`seed_motion_summary`、`path_origin_comparison`、validation、manifest、PNG 路径和中文裁决。
+
+    输出:
+        - `output_dir/transport_organization_daily.csv`、`transport_candidate_geometry_daily.csv`、`transport_field_daily.csv`、`transport_structure_path_daily.csv`、`transport_seed_motion_summary.csv`、`transport_path_origin_comparison.csv`、`field_point_value_crosscheck.csv`、`field_snapshot_cache/*.npz`、`field_read_inventory.json`、两张 PNG、`validation.json`、`manifest.json`、`ROOT_DECISION_BRIEF_zh.md` 和 `verdict_zh.md`。
+
+    说明:
+        - 计算只消费原有 3-D/C2、candidate registration、daily structure candidates、structure path members 和既有背景 3-D 轨迹；不重积分、不重新搜索候选、不读取 w。
+        - 候选表保留同一天的所有既有行和 sentinel；没有 saved mask 时距离/半径明确是近似圆诊断。候选温盐质心只作为来源字段，不称为动力中心；相对方位和路径中心速度一致性是描述性组织证据，不是因果证明。
+    """
+    settings = _ofes_transport_organization_parse_case_spec(case_spec, output_dir)
+    root = settings['output_dir']
+    existing_manifest = root / 'manifest.json'
+    if existing_manifest.is_file():
+        saved = json.loads(existing_manifest.read_text(encoding='utf-8'))
+        if saved.get('analysis') != 'ofes_transport_organization_review':
+            raise ValueError('Transport organization output directory has a different analysis identity.')
+        mismatches = _ofes_transport_organization_saved_identity_mismatches(saved, settings)
+        if mismatches:
+            raise ValueError(
+                'Transport organization output identity does not match the requested case: '
+                f'{mismatches}.'
+            )
+        if bool(saved.get('complete')) and not overwrite:
+            return load_ofes_transport_organization_review(root)
+    elif root.exists() and any(root.iterdir()):
+        raise ValueError(
+            'Refusing to overwrite a non-empty transport organization output '
+            'without a matching manifest identity.'
+        )
+    inputs = _ofes_transport_organization_load_inputs(settings)
+    domain = _ofes_transport_organization_build_domain(settings, inputs)
+    fields = _ofes_transport_organization_read_fields(settings, inputs, domain)
+    daily, path_daily = _ofes_transport_organization_build_daily(inputs, fields, settings)
+    result = _ofes_transport_organization_write_outputs(
+        settings,
+        inputs,
+        daily,
+        fields['candidate_geometry'],
+        fields['field_daily'],
+        path_daily,
+        fields['inventory'],
+        domain,
+        fields['representative_snapshots'],
+    )
+    return result
+
+
+def load_ofes_transport_organization_review(
+    output_dir: str | Path,
+) -> dict:
+    """读取已保存的运输组织审查表、图件和裁决，并核对输出身份。
+
+    读取器只消费运输组织目录中的 CSV、JSON、PNG 和中文裁决，不重读 OFES 原生场、不调用积分器，也不改变任何冻结上游产物。
+
+    参数:
+        - output_dir (str | pathlib.Path): 已完成的运输组织审查输出目录。
+
+    返回:
+        - dict: 含 manifest、validation、逐日组织表、全部候选几何表、同层场采样表、独立路径表、逐 seed 运动表、中心来源差值表、图件路径和中文裁决。
+
+    输出:
+        - 无文件输出；读取器不会修改结果目录。
+
+    说明:
+        - loader 核对保存的 trajectory-day 分母、候选 sentinel/兼容性计数、P0/P1 上游分母以及两张 PNG 的保存元数据。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    required = {
+        'transport_organization_daily.csv',
+        'transport_candidate_geometry_daily.csv',
+        'transport_field_daily.csv',
+        'transport_structure_path_daily.csv',
+        'transport_seed_motion_summary.csv',
+        'transport_path_origin_comparison.csv',
+        'field_point_value_crosscheck.csv',
+        'field_snapshot_cache/manifest.json',
+        'field_read_inventory.json',
+        'figure_transport_organization_flow.png',
+        'figure_transport_organization_relative.png',
+        'validation.json',
+        'manifest.json',
+        'ROOT_DECISION_BRIEF_zh.md',
+        'verdict_zh.md',
+    }
+    missing = sorted(name for name in required if not (root / name).is_file())
+    if missing:
+        raise FileNotFoundError(f'Transport organization output lacks files: {missing}')
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    if (
+        manifest.get('analysis') != 'ofes_transport_organization_review'
+        or validation.get('analysis') != 'ofes_transport_organization_review'
+        or not bool(manifest.get('complete'))
+        or not bool(validation.get('complete'))
+    ):
+        raise ValueError('The transport organization output is incomplete or has a wrong analysis.')
+    daily = pd.read_csv(root / 'transport_organization_daily.csv', parse_dates=['calendar_time'])
+    candidate = pd.read_csv(root / 'transport_candidate_geometry_daily.csv', parse_dates=['calendar_time', 'candidate_date', 'date'])
+    field = pd.read_csv(root / 'transport_field_daily.csv', parse_dates=['calendar_time'])
+    path = pd.read_csv(root / 'transport_structure_path_daily.csv', parse_dates=['calendar_time'])
+    seed_motion_summary = pd.read_csv(root / 'transport_seed_motion_summary.csv')
+    path_origin_comparison = pd.read_csv(
+        root / 'transport_path_origin_comparison.csv',
+        parse_dates=['calendar_time'],
+    )
+    point_value_crosscheck = pd.read_csv(
+        root / 'field_point_value_crosscheck.csv'
+    )
+    cache_metadata = json.loads(
+        (root / 'field_snapshot_cache' / 'manifest.json').read_text(encoding='utf-8')
+    )
+    inventory = json.loads((root / 'field_read_inventory.json').read_text(encoding='utf-8'))
+    identity = validation.get('case_identity', {})
+    if (
+        manifest.get('case_id') != identity.get('transport_case_id')
+        or manifest.get('source_case_id') != identity.get('watermass_case_id')
+        or manifest.get('case_identity', {}).get('closure_case_id') != identity.get('closure_case_id')
+        or manifest.get('case_identity', {}).get('source_case_id') != identity.get('watermass_case_id')
+    ):
+        raise ValueError('Transport organization manifest and validation identities disagree.')
+    diagnostic_window = manifest.get('diagnostic_window', {})
+    expected_dates = [
+        pd.Timestamp(value).normalize()
+        for value in diagnostic_window.get('calendar_dates', [])
+    ]
+    if not expected_dates:
+        raise ValueError('Transport organization manifest lacks calendar dates.')
+    expected_date_set = set(expected_dates)
+    path_contract = manifest.get('path_contract', {})
+    expected_path_ids = sorted(
+        str(value) for value in path_contract.get('effective_path_ids', [])
+    )
+    if not expected_path_ids:
+        expected_path_ids = sorted(
+            str(value) for value in validation.get('effective_path_ids', [])
+        )
+    if not expected_path_ids:
+        expected_path_ids = ['__NO_PATH__']
+    expected_trajectory_keys = set(
+        str(value) for value in validation.get('arrived_3d_trajectory_keys', [])
+    )
+    table_specs = {
+        'daily': daily,
+        'candidate': candidate,
+        'field': field,
+        'path': path,
+    }
+    required_identity_columns = {
+        'daily': {'case_id', 'source_case_id', 'trajectory_key', 'calendar_time', 'path_id'},
+        'candidate': {'case_id', 'trajectory_key', 'calendar_time'},
+        'field': {'case_id', 'source_case_id', 'trajectory_key', 'calendar_time'},
+        'path': {'case_id', 'source_case_id', 'path_id', 'calendar_time'},
+    }
+    required_geometry_columns = {
+        'particle_peak_origin_distance_km',
+        'particle_registration_distance_km',
+        'particle_registration_radius_km',
+        'particle_registration_distance_over_radius',
+        'particle_registration_horizontal_compatible',
+        'particle_registration_circle_inside_from_distance',
+        'particle_peak_origin_circle_inside',
+    }
+    missing_geometry = sorted(required_geometry_columns.difference(daily.columns))
+    if missing_geometry:
+        raise ValueError(
+            f'Transport organization daily table lacks registration geometry columns: {missing_geometry}'
+        )
+    for label, table in table_specs.items():
+        missing_identity = sorted(required_identity_columns[label].difference(table.columns))
+        if missing_identity:
+            raise ValueError(f'Transport organization {label} table lacks identity columns: {missing_identity}')
+        if set(pd.to_datetime(table['calendar_time']).dt.normalize()) != expected_date_set:
+            raise ValueError(f'Transport organization {label} table dates disagree with the manifest.')
+    if sorted(daily['case_id'].dropna().astype(str).unique()) != [str(identity.get('closure_case_id'))]:
+        raise ValueError('Transport organization daily closure case identity disagrees with validation.')
+    if sorted(daily['source_case_id'].dropna().astype(str).unique()) != [str(identity.get('watermass_case_id'))]:
+        raise ValueError('Transport organization daily source identity disagrees with validation.')
+    if sorted(candidate['case_id'].dropna().astype(str).unique()) != [str(identity.get('watermass_case_id'))]:
+        raise ValueError('Transport organization candidate source identity disagrees with validation.')
+    for label, table in (('field', field), ('path', path)):
+        if sorted(table['case_id'].dropna().astype(str).unique()) != [str(identity.get('transport_case_id'))]:
+            raise ValueError(f'Transport organization {label} case identity disagrees with validation.')
+        if sorted(table['source_case_id'].dropna().astype(str).unique()) != [str(identity.get('watermass_case_id'))]:
+            raise ValueError(f'Transport organization {label} source identity disagrees with validation.')
+    if set(daily['trajectory_key'].astype(str)) != expected_trajectory_keys:
+        raise ValueError('Transport organization daily trajectory identities disagree with validation.')
+    if set(candidate['trajectory_key'].astype(str)) != expected_trajectory_keys:
+        raise ValueError('Transport organization candidate trajectory identities disagree with validation.')
+    if set(field['trajectory_key'].astype(str)) != expected_trajectory_keys:
+        raise ValueError('Transport organization field trajectory identities disagree with validation.')
+    daily_path_ids = sorted(daily['path_id'].dropna().astype(str).unique())
+    path_table_ids = sorted(path['path_id'].dropna().astype(str).unique())
+    if daily_path_ids != expected_path_ids or path_table_ids != expected_path_ids:
+        raise ValueError('Transport organization daily/path identities disagree with the manifest.')
+    seed_required = {
+        'trajectory_key', 'path_id', 'arm', 'particle_index', 'seed_key',
+        'relative_bearing_net_deg', 'relative_r_min_km', 'relative_r_max_km',
+        'near_origin_angle_unstable',
+    }
+    missing_seed = sorted(seed_required.difference(seed_motion_summary.columns))
+    if missing_seed:
+        raise ValueError(f'Transport seed summary lacks identity/geometry columns: {missing_seed}')
+    if set(seed_motion_summary['trajectory_key'].astype(str)) != expected_trajectory_keys:
+        raise ValueError('Transport seed summary trajectory identities disagree with validation.')
+    if sorted(seed_motion_summary['path_id'].astype(str).unique()) != expected_path_ids:
+        raise ValueError('Transport seed summary path identities disagree with the manifest.')
+    if set(path_origin_comparison['path_id'].astype(str)) != set(expected_path_ids):
+        raise ValueError('Transport path-origin comparison identities disagree with the manifest.')
+    if set(pd.to_datetime(path_origin_comparison['calendar_time']).dt.normalize()) != expected_date_set:
+        raise ValueError('Transport path-origin comparison dates disagree with the manifest.')
+    cache_dates = [str(value) for value in cache_metadata.get('dates', [])]
+    expected_cache_dates = [
+        str(value) for value in manifest.get('read_scope', {}).get(
+            'representative_cache', {}
+        ).get('dates', [])
+    ]
+    if sorted(cache_dates) != sorted(expected_cache_dates):
+        raise ValueError('Transport representative cache dates disagree with manifest.')
+    expected_representative_dates = [
+        str(value) for value in manifest.get('diagnostic_window', {}).get(
+            'representative_dates', []
+        )
+    ]
+    if sorted(cache_dates) != sorted(expected_representative_dates):
+        raise ValueError('Transport representative cache dates disagree with diagnostic window.')
+    if list(cache_metadata.get('variables', [])) != [
+        'do2', 'temp', 'salinity', 'u', 'v'
+    ]:
+        raise ValueError('Transport representative cache variables disagree with the field contract.')
+    for date, cache_file in cache_metadata.get('files', {}).items():
+        try:
+            cache_path = Path(cache_file).expanduser().resolve()
+            cache_path.relative_to(root)
+        except (TypeError, ValueError):
+            raise ValueError('Transport representative cache file is outside its output directory.')
+        if not cache_path.is_file():
+            raise FileNotFoundError(f'Transport representative cache file is missing: {cache_path}')
+    inventory_dates = sorted(
+        str(row.get('date')) for row in inventory.get('daily_inventory', [])
+    ) if isinstance(inventory, Mapping) else []
+    if inventory_dates != sorted(
+        pd.Timestamp(value).date().isoformat() for value in expected_dates
+    ):
+        raise ValueError('Transport field-read inventory dates disagree with the manifest.')
+    inventory_variables = {
+        tuple(str(value) for value in row.get('variables', []))
+        for row in inventory.get('daily_inventory', [])
+    } if isinstance(inventory, Mapping) else set()
+    if inventory_variables != {('do2', 'temp', 'salinity', 'u', 'v')}:
+        raise ValueError('Transport field-read inventory variables disagree with the field contract.')
+    if set(point_value_crosscheck.get('date', pd.Series(dtype=str)).astype(str)) != set(cache_dates):
+        raise ValueError('Transport point-value crosscheck dates disagree with representative cache.')
+    point_trajectory_keys = set(
+        point_value_crosscheck.loc[
+            point_value_crosscheck.get('entity_type', pd.Series(dtype=str)).astype(str).eq('particle'),
+            'trajectory_key',
+        ].astype(str)
+    )
+    if not point_trajectory_keys.issubset(expected_trajectory_keys):
+        raise ValueError('Transport point-value crosscheck trajectory identities disagree with validation.')
+    point_path_ids = set(point_value_crosscheck.get('path_id', pd.Series(dtype=str)).astype(str))
+    if not point_path_ids.issubset(set(expected_path_ids)):
+        raise ValueError('Transport point-value crosscheck path identities disagree with manifest.')
+    reference_layer = manifest.get('reference_layer', {})
+    requested_depth = float(reference_layer.get('requested_depth_m', np.nan))
+    depth_half_window = float(reference_layer.get('read_half_window_m', np.nan))
+    if not np.isclose(
+        float(cache_metadata.get('requested_depth_m', np.nan)),
+        requested_depth,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError('Transport representative cache depth disagrees with the manifest reference layer.')
+    field_depths = pd.to_numeric(field['field_layer_depth_m'], errors='coerce').dropna()
+    if (
+        not np.isfinite(requested_depth)
+        or not np.isfinite(depth_half_window)
+        or field_depths.empty
+        or bool((field_depths.sub(requested_depth).abs() > depth_half_window).any())
+    ):
+        raise ValueError('Transport organization field depths disagree with the manifest reference layer.')
+    outputs = manifest.get('outputs', {})
+    for output_name, output_path in outputs.items():
+        try:
+            Path(output_path).expanduser().resolve().relative_to(root)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f'Transport organization manifest output {output_name} is outside its isolated directory.'
+            )
+    expected_daily = int(validation.get('expected_transport_organization_daily_rows', -1))
+    if len(daily) != expected_daily or len(candidate) != int(validation.get('candidate_registration_rows_including_sentinel', -1)):
+        raise ValueError('Transport organization table row counts disagree with validation.')
+    if len(path) != int(validation.get('path_daily_rows', -1)) or len(field) != int(validation.get('field_daily_rows', -1)):
+        raise ValueError('Transport organization field table row counts disagree with validation.')
+    if len(seed_motion_summary) != int(validation.get('seed_motion_summary_rows', -1)):
+        raise ValueError('Transport seed summary row count disagrees with validation.')
+    if len(path_origin_comparison) != int(validation.get('path_origin_comparison_rows', -1)):
+        raise ValueError('Transport path-origin comparison row count disagrees with validation.')
+    if len(point_value_crosscheck) != int(validation.get('point_value_crosscheck_rows', -1)):
+        raise ValueError('Transport point-value crosscheck row count disagrees with validation.')
+    point_error = pd.to_numeric(
+        point_value_crosscheck.get('bilinear_minus_saved_umol_kg'), errors='coerce'
+    ).abs()
+    saved_point_error = float(
+        validation.get('point_value_crosscheck_max_abs_bilinear_minus_saved_umol_kg', np.nan)
+    )
+    if len(point_value_crosscheck) and (
+        point_error.empty
+        or not np.isfinite(saved_point_error)
+        or not np.isclose(float(point_error.max()), saved_point_error, rtol=0.0, atol=1e-8)
+    ):
+        raise ValueError('Transport point-value crosscheck metadata disagrees with the saved table.')
+    saved_registration_ratio = pd.to_numeric(
+        daily['particle_registration_distance_over_radius'], errors='coerce'
+    )
+    saved_registration_inside = int(
+        saved_registration_ratio.le(1.0).sum()
+    )
+    if saved_registration_inside != int(
+        validation.get('relative_geometry_inside_count', -1)
+    ):
+        raise ValueError('Transport registration-circle inclusion disagrees with validation.')
+    registration_flag = daily[
+        'particle_registration_horizontal_compatible'
+    ].astype('boolean')
+    registration_distance_inside = daily[
+        'particle_registration_circle_inside_from_distance'
+    ].astype('boolean')
+    registration_mask = (
+        daily['path_support_status'].astype(str).eq('path_member')
+        & registration_flag.notna()
+        & registration_distance_inside.notna()
+    )
+    if bool(
+        (registration_flag.loc[registration_mask]
+         == registration_distance_inside.loc[registration_mask]).all()
+    ) != bool(validation.get('registration_circle_consistent')):
+        raise ValueError('Transport registration-circle flag consistency disagrees with validation.')
+    saved_peak_inside = pd.Series(
+        daily['particle_peak_origin_circle_inside'], index=daily.index
+    ).astype('boolean')
+    if int(saved_peak_inside.sum()) != int(
+        validation.get('peak_origin_circle_inside_count', -1)
+    ):
+        raise ValueError('Transport peak-origin circle inclusion disagrees with validation.')
+    base_daily = daily.drop_duplicates(['trajectory_key', 'calendar_time'])
+    saved_counts = {
+        category: int(base_daily['classification'].astype(str).eq(category).sum())
+        for category in _OFES_TRANSPORT_ORGANIZATION_CATEGORIES
+    }
+    if saved_counts != {
+        str(key): int(value)
+        for key, value in validation.get('candidate_classification_counts', {}).items()
+    }:
+        raise ValueError('Transport organization classification counts disagree with validation.')
+    figure_metadata = validation.get('figure_metadata', {})
+    output_paths = _ofes_transport_organization_output_paths(root)
+    figure_paths = {
+        'flow': output_paths['flow_figure'],
+        'relative': output_paths['relative_figure'],
+    }
+    for key, figure_path in figure_paths.items():
+        metadata = figure_metadata.get(key, {})
+        image = plt.imread(figure_path)
+        if (
+            not bool(metadata.get('png_readable'))
+            or image.ndim not in (2, 3)
+            or image.shape[0] != int(metadata.get('pixel_height', -1))
+            or image.shape[1] != int(metadata.get('pixel_width', -1))
+            or not np.isfinite(image).all()
+        ):
+            raise ValueError(f'Transport organization figure {key} is unreadable or inconsistent.')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'transport_organization_daily': daily,
+        'candidate_geometry_daily': candidate,
+        'field_daily': field,
+        'path_daily': path,
+        'seed_motion_summary': seed_motion_summary,
+        'path_origin_comparison': path_origin_comparison,
+        'point_value_crosscheck': point_value_crosscheck,
+        'representative_cache': cache_metadata,
+        'field_read_inventory': inventory,
+        'decision_brief': (root / 'ROOT_DECISION_BRIEF_zh.md').read_text(encoding='utf-8'),
+        'verdict': (root / 'verdict_zh.md').read_text(encoding='utf-8'),
+        'figures': figure_paths,
+        'paths': output_paths,
     }
 
 
