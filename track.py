@@ -98865,6 +98865,2103 @@ def load_ofes_do50_detectability_diagnostic(
     }
 
 
+_OFES_MECHANISM_CLOSURE_CATEGORIES = (
+    'joint_same_candidate',
+    'horizontal_and_vertical_separate_candidates_no_joint',
+    'horizontal_only',
+    'vertical_only',
+    'neither',
+    'no_candidate_support',
+)
+
+_OFES_MECHANISM_CLOSURE_VARIABLES = (
+    ('raw_do', 'raw_do2_umol_kg_3d', 'umol kg-1'),
+    ('theta', 'theta_3d', 'degC potential temperature'),
+    ('sp', 'sp_3d', 'PSS-78'),
+    ('sa', 'sa_3d', 'g kg-1'),
+    ('ct', 'ct_3d', 'degC conservative temperature'),
+    ('sigma0', 'sigma0_3d', 'kg m-3'),
+    ('spiciness0', 'spiciness0_3d', 'kg m-3'),
+)
+
+
+def _ofes_dual_endpoint_mechanism_closure_case_date(
+    object_key: str,
+) -> pd.Timestamp:
+    """从上游对象键解析日期，不改变对象身份。"""
+    token = str(object_key).split('_', 1)[0]
+    return pd.to_datetime(token, format='%Y%m%d').normalize()
+
+
+def _ofes_dual_endpoint_mechanism_closure_split_ids(value: object) -> list[str]:
+    """展开以分号连接的 candidate/path ID，并保留空值语义。"""
+    if value is None or pd.isna(value):
+        return []
+    values = []
+    for token in str(value).split(';'):
+        token = token.strip()
+        if token and token not in values:
+            values.append(token)
+    return values
+
+
+def _ofes_dual_endpoint_mechanism_closure_bool(value: object) -> bool:
+    """将已有表中的布尔/整数标记规范化。"""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return str(value).strip().lower() in {'1', 'true', 'yes'}
+
+
+def _ofes_dual_endpoint_mechanism_closure_source_ids(
+    frame: pd.DataFrame,
+    *,
+    direct_columns: Sequence[str],
+    label: str,
+) -> set[str]:
+    """从直接 case_id 或 trajectory_key 提取并返回唯一上游身份。"""
+    source_series = None
+    for column in direct_columns:
+        if column in frame.columns:
+            source_series = frame[column].astype('string')
+            break
+    if source_series is None:
+        if 'trajectory_key' not in frame.columns:
+            raise ValueError(f'{label} lacks an upstream case identity column.')
+        keys = frame['trajectory_key'].astype('string')
+        if not keys.str.contains('|', regex=False).all():
+            raise ValueError(f'{label} trajectory keys lack an upstream prefix.')
+        source_series = keys.str.split('|', n=1).str[0]
+    source_series = source_series.dropna().astype(str)
+    if len(source_series) != len(frame) or any(
+        not value.strip() for value in source_series
+    ):
+        raise ValueError(f'{label} contains missing upstream case identities.')
+    return set(source_series)
+
+
+def _ofes_dual_endpoint_mechanism_closure_parse_case_spec(
+    case_spec: Mapping,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """解析双端点机制闭合规格并锁定正式水团复核身份。"""
+    required = {
+        'case_id',
+        'watermass_output_dir',
+        'output_dir',
+        'start_date',
+        'end_date',
+    }
+    if not isinstance(case_spec, Mapping):
+        raise TypeError('case_spec must be a mapping.')
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise ValueError(
+            f'Mechanism closure case_spec lacks fields: {missing}'
+        )
+    watermass_root = Path(case_spec['watermass_output_dir']).expanduser().resolve()
+    root = Path(
+        output_dir if output_dir is not None else case_spec['output_dir']
+    ).expanduser().resolve()
+    if root == watermass_root:
+        raise ValueError(
+            'Mechanism closure output must be a child of the watermass review.'
+        )
+    try:
+        root.relative_to(watermass_root)
+    except ValueError as exc:
+        raise ValueError(
+            'Mechanism closure output must live under watermass_output_dir.'
+        ) from exc
+    start_date = pd.Timestamp(case_spec['start_date']).normalize()
+    end_date = pd.Timestamp(case_spec['end_date']).normalize()
+    if end_date < start_date:
+        raise ValueError('The mechanism closure date window must be increasing.')
+    manifest_path = watermass_root / 'manifest.json'
+    validation_path = watermass_root / 'validation.json'
+    required_inputs = (
+        manifest_path,
+        validation_path,
+        watermass_root / 'paired_3d_c2_comparison.parquet',
+        watermass_root / 'particle_endpoint_registration.csv',
+        watermass_root / 'trajectory_structure_registration.csv',
+    )
+    missing_inputs = [str(path) for path in required_inputs if not path.is_file()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            f'Watermass review lacks mechanism closure inputs: {missing_inputs}'
+        )
+    watermass_manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    watermass_validation = json.loads(
+        validation_path.read_text(encoding='utf-8')
+    )
+    upstream_case_id = watermass_manifest.get('case_id')
+    upstream_case_identity = watermass_manifest.get('case_identity')
+    required_gates = watermass_validation.get('required_gates')
+    if (
+        watermass_manifest.get('analysis') != 'dual_endpoint_watermass_review'
+        or not bool(watermass_manifest.get('complete'))
+        or not upstream_case_id
+        or not isinstance(upstream_case_identity, Mapping)
+        or watermass_validation.get('analysis')
+        != watermass_manifest.get('analysis')
+        or str(watermass_validation.get('case_id'))
+        != str(upstream_case_id)
+        or not bool(watermass_validation.get('complete'))
+        or int(watermass_validation.get('exception_count', 0)) != 0
+        or not isinstance(required_gates, Mapping)
+        or not required_gates
+        or not all(bool(value) for value in required_gates.values())
+    ):
+        raise ValueError(
+            'The watermass review is incomplete or has a mismatched identity.'
+        )
+    manifest_window = watermass_manifest.get('daily_window', {})
+    if (
+        pd.Timestamp(manifest_window.get('start_date')).normalize() != start_date
+        or pd.Timestamp(manifest_window.get('end_date')).normalize() != end_date
+    ):
+        raise ValueError(
+            'Mechanism closure dates do not match the formal review window.'
+        )
+    arms = {}
+    for arm, identity in upstream_case_identity.items():
+        if not isinstance(identity, Mapping):
+            raise ValueError(f'Watermass arm {arm!r} lacks case identity.')
+        release_date = pd.Timestamp(identity['release_date']).normalize()
+        target_date = _ofes_dual_endpoint_mechanism_closure_case_date(
+            identity['target_object_key']
+        )
+        if release_date < start_date or release_date > end_date:
+            raise ValueError(f'Watermass arm {arm!r} release date is outside the window.')
+        if target_date < start_date or target_date > end_date:
+            raise ValueError(f'Watermass arm {arm!r} target date is outside the window.')
+        arms[str(arm)] = {
+            'release_date': release_date,
+            'target_date': target_date,
+            'integration_direction': str(identity['direction']),
+            'source_object_key': str(identity['source_object_key']),
+            'target_object_key': str(identity['target_object_key']),
+        }
+    existing_manifest = root / 'manifest.json'
+    if root.exists() and existing_manifest.exists():
+        existing_validation = root / 'validation.json'
+        if not existing_validation.is_file():
+            raise ValueError(
+                'Existing mechanism closure output lacks validation.json.'
+            )
+        saved = json.loads(existing_manifest.read_text(encoding='utf-8'))
+        saved_validation = json.loads(
+            existing_validation.read_text(encoding='utf-8')
+        )
+        saved_source_identity = saved.get('source_case_identity')
+        saved_manifest_identity = saved.get('source_manifest_identity', {})
+        if (
+            saved.get('analysis') != 'ofes_dual_endpoint_mechanism_closure'
+            or str(saved.get('case_id')) != str(case_spec['case_id'])
+            or str(saved.get('source_case_id')) != str(upstream_case_id)
+            or saved_source_identity != upstream_case_identity
+            or str(saved_manifest_identity.get('case_id'))
+            != str(upstream_case_id)
+            or saved_manifest_identity.get('case_identity')
+            != upstream_case_identity
+            or not bool(saved_manifest_identity.get('complete'))
+            or saved_validation.get('analysis')
+            != 'ofes_dual_endpoint_mechanism_closure'
+            or str(saved_validation.get('diagnostic_case_id'))
+            != str(case_spec['case_id'])
+            or str(saved_validation.get('source_case_id'))
+            != str(upstream_case_id)
+            or saved_validation.get('source_case_identity')
+            != upstream_case_identity
+            or saved_validation.get('source_manifest_identity')
+            != saved_manifest_identity
+            or not bool(saved_validation.get('complete'))
+        ):
+            raise ValueError(
+                'Existing mechanism closure output has a different identity.'
+            )
+    elif root.exists() and any(root.iterdir()):
+        raise ValueError(
+            'Refusing to write a non-empty mechanism closure directory without a manifest.'
+        )
+    return {
+        'case_id': str(case_spec['case_id']),
+        'case_label': str(case_spec.get('case_label', case_spec['case_id'])),
+        'watermass_output_dir': watermass_root,
+        'output_dir': root,
+        'start_date': start_date,
+        'end_date': end_date,
+        'dates': pd.date_range(start_date, end_date, freq='D'),
+        'watermass_manifest': watermass_manifest,
+        'watermass_validation': watermass_validation,
+        'watermass_case_id': str(upstream_case_id),
+        'watermass_case_identity': dict(upstream_case_identity),
+        'arms': arms,
+        'property_variables': _OFES_MECHANISM_CLOSURE_VARIABLES,
+        'categories': _OFES_MECHANISM_CLOSURE_CATEGORIES,
+        'r_eq_normalization': {
+            'available': False,
+            'reason': 'No formal R_eq field is present in the supplied review tables or manifest.',
+        },
+    }
+
+
+def _ofes_dual_endpoint_mechanism_closure_load_pairs(
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """读取正式 arrived 3-D 与同 seed C2 的逐日配对表。"""
+    root = settings['watermass_output_dir']
+    endpoints = pd.read_csv(root / 'particle_endpoint_registration.csv')
+    endpoint_required = {
+        'arm',
+        'particle_index',
+        'seed_key',
+        'trajectory_key',
+        'vertical_mode',
+        'arrived',
+        'final_status',
+    }
+    missing = sorted(endpoint_required.difference(endpoints.columns))
+    if missing:
+        raise ValueError(f'Endpoint registration lacks columns: {missing}')
+    endpoint_case_ids = _ofes_dual_endpoint_mechanism_closure_source_ids(
+        endpoints.loc[:],
+        direct_columns=('case_id',),
+        label='Endpoint registration',
+    )
+    if endpoint_case_ids != {settings['watermass_case_id']}:
+        raise ValueError(
+            f'Endpoint registration identity mismatch: {sorted(endpoint_case_ids)}'
+        )
+    arrived = endpoints.loc[
+        endpoints['vertical_mode'].astype(str).eq('three_dimensional')
+        & endpoints['arrived'].map(
+            _ofes_dual_endpoint_mechanism_closure_bool
+        )
+    ].copy()
+    if arrived.empty:
+        raise ValueError('The watermass review has no arrived 3-D endpoint seed.')
+    if arrived['seed_key'].duplicated().any():
+        raise ValueError('Arrived 3-D endpoint seeds are duplicated.')
+    if arrived['trajectory_key'].duplicated().any():
+        raise ValueError('Arrived 3-D endpoint trajectories are duplicated.')
+    arrived_seed_keys = set(arrived['seed_key'].astype(str))
+    c2_endpoints = endpoints.loc[
+        endpoints['seed_key'].astype(str).isin(arrived_seed_keys)
+        & endpoints['vertical_mode'].astype(str).eq('fixed_depth')
+    ].copy()
+    if set(c2_endpoints['seed_key'].astype(str)) != arrived_seed_keys:
+        raise ValueError('Every arrived 3-D seed must have a same-seed C2 endpoint.')
+    if c2_endpoints['seed_key'].duplicated().any():
+        raise ValueError('Same-seed C2 endpoint registrations are duplicated.')
+    pair_path = root / 'paired_3d_c2_comparison.parquet'
+    pair_required = {
+        'case_id_3d',
+        'case_id_c2',
+        'arm',
+        'particle_index',
+        'seed_key',
+        'trajectory_key_3d',
+        'source_object_key_3d',
+        'vertical_mode_3d',
+        'release_date_3d',
+        'calendar_time',
+        'integration_elapsed_seconds_3d',
+        'integration_step_3d',
+        'integration_direction_3d',
+        'dt_seconds_3d',
+        'status_3d',
+        'depth_m_3d',
+        'lat_3d',
+        'lon_3d',
+        'raw_do2_umol_kg_3d',
+        'theta_3d',
+        'sp_3d',
+        'sa_3d',
+        'ct_3d',
+        'sigma0_3d',
+        'spiciness0_3d',
+        'arrived_3d',
+        'arrival_outcome_3d',
+        'trajectory_key_c2',
+        'vertical_mode_c2',
+        'integration_elapsed_seconds_c2',
+        'integration_step_c2',
+        'integration_direction_c2',
+        'dt_seconds_c2',
+        'status_c2',
+        'depth_m_c2',
+        'lat_c2',
+        'lon_c2',
+        'raw_do2_umol_kg_c2',
+        'theta_c2',
+        'sp_c2',
+        'sa_c2',
+        'ct_c2',
+        'sigma0_c2',
+        'spiciness0_c2',
+        'arrived_c2',
+        'arrival_outcome_c2',
+        'arrival_outcome',
+        'horizontal_distance_km_3d_c2',
+        'depth_difference_m_3d_minus_c2',
+        'do_difference_umol_kg_3d_minus_c2',
+        'theta_difference_3d_minus_c2',
+        'sp_difference_3d_minus_c2',
+        'sa_difference_3d_minus_c2',
+        'ct_difference_3d_minus_c2',
+        'sigma0_difference_3d_minus_c2',
+        'spiciness0_difference_3d_minus_c2',
+    }
+    pairs = pd.read_parquet(pair_path, columns=sorted(pair_required))
+    missing = sorted(pair_required.difference(pairs.columns))
+    if missing:
+        raise ValueError(f'Paired comparison lacks columns: {missing}')
+    pairs['calendar_time'] = pd.to_datetime(pairs['calendar_time']).dt.normalize()
+    pair_case_ids = set(pairs['case_id_3d'].dropna().astype(str))
+    pair_case_ids.update(pairs['case_id_c2'].dropna().astype(str))
+    if pair_case_ids != {settings['watermass_case_id']}:
+        raise ValueError(
+            f'Paired comparison identity mismatch: {sorted(pair_case_ids)}'
+        )
+    selected = pairs.loc[
+        pairs['trajectory_key_3d'].astype(str).isin(
+            set(arrived['trajectory_key'].astype(str))
+        )
+    ].copy()
+    expected_dates = set(pd.Timestamp(value) for value in settings['dates'])
+    selected_keys = set(selected['trajectory_key_3d'].astype(str))
+    if selected_keys != set(arrived['trajectory_key'].astype(str)):
+        raise ValueError('Paired comparison does not cover every arrived 3-D trajectory.')
+    for key, group in selected.groupby('trajectory_key_3d', sort=False):
+        dates = set(pd.Timestamp(value) for value in group['calendar_time'])
+        if dates != expected_dates:
+            raise ValueError(
+                f'Paired comparison dates are incomplete for trajectory {key}.'
+            )
+        if group['calendar_time'].duplicated().any():
+            raise ValueError(f'Paired comparison has duplicate dates for trajectory {key}.')
+        if group['trajectory_key_c2'].astype(str).nunique() != 1:
+            raise ValueError(f'Trajectory {key} maps to multiple C2 trajectories.')
+        if not group['vertical_mode_c2'].astype(str).eq('fixed_depth').all():
+            raise ValueError(f'Trajectory {key} does not map to fixed-depth C2.')
+        if group['arrival_outcome'].astype(str).nunique() != 1:
+            raise ValueError(f'Trajectory {key} has multiple arrival outcomes.')
+    endpoint_c2_by_seed = {
+        str(row.seed_key): str(row.trajectory_key)
+        for row in c2_endpoints.itertuples(index=False)
+    }
+    endpoint_arm_by_seed = {
+        str(row.seed_key): str(row.arm)
+        for row in arrived.itertuples(index=False)
+    }
+    endpoint_particle_by_seed = {
+        str(row.seed_key): int(row.particle_index)
+        for row in arrived.itertuples(index=False)
+    }
+    endpoint_3d_by_seed = {
+        str(row.seed_key): str(row.trajectory_key)
+        for row in arrived.itertuples(index=False)
+    }
+    for seed_key, group in selected.groupby('seed_key', sort=False):
+        seed_key = str(seed_key)
+        if str(group['arm'].iloc[0]) != endpoint_arm_by_seed[seed_key]:
+            raise ValueError('Paired trajectory arm does not match endpoint registration.')
+        if int(group['particle_index'].iloc[0]) != endpoint_particle_by_seed[seed_key]:
+            raise ValueError('Paired particle index does not match endpoint registration.')
+        if str(group['trajectory_key_3d'].iloc[0]) != endpoint_3d_by_seed[seed_key]:
+            raise ValueError('Paired 3-D trajectory does not match endpoint registration.')
+        if str(group['trajectory_key_c2'].iloc[0]) != endpoint_c2_by_seed[seed_key]:
+            raise ValueError('Paired C2 trajectory does not match same-seed registration.')
+    pair_rows = []
+    for record in selected.sort_values(
+        ['arm', 'particle_index', 'seed_key', 'calendar_time'],
+        kind='mergesort',
+    ).to_dict('records'):
+        arm = str(record['arm'])
+        arm_settings = settings['arms'][arm]
+        pair_rows.append(
+            {
+                'case_id': settings['case_id'],
+                'source_case_id': str(record['case_id_3d']),
+                'arm': arm,
+                'particle_index': int(record['particle_index']),
+                'seed_key': str(record['seed_key']),
+                'trajectory_key_3d': str(record['trajectory_key_3d']),
+                'trajectory_key_c2': str(record['trajectory_key_c2']),
+                'vertical_mode_3d': str(record['vertical_mode_3d']),
+                'vertical_mode_c2': str(record['vertical_mode_c2']),
+                'source_object_key_3d': str(record['source_object_key_3d']),
+                'release_date_3d': pd.Timestamp(record['release_date_3d']).date().isoformat(),
+                'integration_release_date': arm_settings['release_date'].date().isoformat(),
+                'integration_target_date': arm_settings['target_date'].date().isoformat(),
+                'integration_direction': arm_settings['integration_direction'],
+                'calendar_start_date': settings['start_date'].date().isoformat(),
+                'calendar_end_date': settings['end_date'].date().isoformat(),
+                'calendar_direction': 'ascending_calendar_date',
+                'calendar_time': pd.Timestamp(record['calendar_time']),
+                'calendar_date': pd.Timestamp(record['calendar_time']).date().isoformat(),
+                'integration_elapsed_seconds_3d': float(record['integration_elapsed_seconds_3d']),
+                'integration_step_3d': int(record['integration_step_3d']),
+                'integration_direction_3d': str(record['integration_direction_3d']),
+                'dt_seconds_3d': float(record['dt_seconds_3d']),
+                'status_3d': str(record['status_3d']),
+                'status_c2': str(record['status_c2']),
+                'arrival_outcome': str(record['arrival_outcome']),
+                'arrival_outcome_3d': str(record['arrival_outcome_3d']),
+                'arrival_outcome_c2': str(record['arrival_outcome_c2']),
+                'arrived_3d': _ofes_dual_endpoint_mechanism_closure_bool(record['arrived_3d']),
+                'arrived_c2': _ofes_dual_endpoint_mechanism_closure_bool(record['arrived_c2']),
+                'depth_m_3d': float(record['depth_m_3d']),
+                'depth_m_c2': float(record['depth_m_c2']),
+                'lat_3d': float(record['lat_3d']),
+                'lon_3d': float(record['lon_3d']),
+                'lat_c2': float(record['lat_c2']),
+                'lon_c2': float(record['lon_c2']),
+                'raw_do2_umol_kg_3d': float(record['raw_do2_umol_kg_3d']),
+                'raw_do2_umol_kg_c2': float(record['raw_do2_umol_kg_c2']),
+                'theta_3d': float(record['theta_3d']),
+                'theta_c2': float(record['theta_c2']),
+                'sp_3d': float(record['sp_3d']),
+                'sp_c2': float(record['sp_c2']),
+                'sa_3d': float(record['sa_3d']),
+                'sa_c2': float(record['sa_c2']),
+                'ct_3d': float(record['ct_3d']),
+                'ct_c2': float(record['ct_c2']),
+                'sigma0_3d': float(record['sigma0_3d']),
+                'sigma0_c2': float(record['sigma0_c2']),
+                'spiciness0_3d': float(record['spiciness0_3d']),
+                'spiciness0_c2': float(record['spiciness0_c2']),
+                'horizontal_distance_km_3d_c2': float(record['horizontal_distance_km_3d_c2']),
+                'depth_difference_m_3d_minus_c2': float(record['depth_difference_m_3d_minus_c2']),
+                'do_difference_umol_kg_3d_minus_c2': float(record['do_difference_umol_kg_3d_minus_c2']),
+                'theta_difference_3d_minus_c2': float(record['theta_difference_3d_minus_c2']),
+                'sp_difference_3d_minus_c2': float(record['sp_difference_3d_minus_c2']),
+                'sa_difference_3d_minus_c2': float(record['sa_difference_3d_minus_c2']),
+                'ct_difference_3d_minus_c2': float(record['ct_difference_3d_minus_c2']),
+                'sigma0_difference_3d_minus_c2': float(record['sigma0_difference_3d_minus_c2']),
+                'spiciness0_difference_3d_minus_c2': float(record['spiciness0_difference_3d_minus_c2']),
+            }
+        )
+    paired_daily = pd.DataFrame(pair_rows)
+    return paired_daily, arrived
+
+
+def _ofes_dual_endpoint_mechanism_closure_seed_summary(
+    paired_daily: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """汇总每个 arrived 3-D seed 的配对分离和深度口径。"""
+    rows = []
+    for seed_key, group in paired_daily.groupby('seed_key', sort=False):
+        group = group.sort_values('calendar_time', kind='mergesort').reset_index(drop=True)
+        arm = str(group['arm'].iloc[0])
+        arm_settings = settings['arms'][arm]
+        release_date = arm_settings['release_date']
+        target_date = arm_settings['target_date']
+        release = group.loc[group['calendar_time'].eq(release_date)]
+        target = group.loc[group['calendar_time'].eq(target_date)]
+        if len(release) != 1 or len(target) != 1:
+            raise ValueError(f'Cannot resolve release/target rows for seed {seed_key}.')
+        depth = pd.to_numeric(group['depth_m_3d'], errors='coerce')
+        depth_difference = pd.to_numeric(
+            group['depth_difference_m_3d_minus_c2'],
+            errors='coerce',
+        )
+        horizontal = pd.to_numeric(
+            group['horizontal_distance_km_3d_c2'],
+            errors='coerce',
+        )
+        if (
+            depth.isna().any()
+            or depth_difference.isna().any()
+            or horizontal.isna().any()
+        ):
+            raise ValueError(f'Non-finite paired geometry for seed {seed_key}.')
+        release_depth = float(release['depth_m_3d'].iloc[0])
+        max_abs_release = (depth - release_depth).abs()
+        max_horizontal_index = horizontal.idxmax()
+        max_release_index = max_abs_release.idxmax()
+        depth_abs = depth_difference.abs()
+        rows.append(
+            {
+                'case_id': settings['case_id'],
+                'source_case_id': settings['watermass_case_id'],
+                'arm': arm,
+                'particle_index': int(group['particle_index'].iloc[0]),
+                'seed_key': str(seed_key),
+                'trajectory_key_3d': str(group['trajectory_key_3d'].iloc[0]),
+                'trajectory_key_c2': str(group['trajectory_key_c2'].iloc[0]),
+                'arrival_outcome': str(group['arrival_outcome'].iloc[0]),
+                'integration_direction': arm_settings['integration_direction'],
+                'integration_release_date': release_date.date().isoformat(),
+                'integration_target_date': target_date.date().isoformat(),
+                'calendar_start_date': settings['start_date'].date().isoformat(),
+                'calendar_end_date': settings['end_date'].date().isoformat(),
+                'release_depth_m_3d': release_depth,
+                'target_depth_m_3d': float(target['depth_m_3d'].iloc[0]),
+                'integration_release_to_target_net_depth_change_m': float(
+                    target['depth_m_3d'].iloc[0] - release_depth
+                ),
+                'calendar_forward_net_depth_change_m': float(
+                    group['depth_m_3d'].iloc[-1] - group['depth_m_3d'].iloc[0]
+                ),
+                'max_abs_deviation_from_integration_release_m': float(
+                    max_abs_release.iloc[max_release_index]
+                ),
+                'max_abs_deviation_from_integration_release_date': pd.Timestamp(
+                    group.loc[max_release_index, 'calendar_time']
+                ).date().isoformat(),
+                'full_depth_min_m': float(depth.min()),
+                'full_depth_max_m': float(depth.max()),
+                'full_depth_range_m': float(depth.max() - depth.min()),
+                'horizontal_distance_median_km': float(horizontal.median()),
+                'horizontal_distance_q1_km': float(horizontal.quantile(0.25)),
+                'horizontal_distance_q3_km': float(horizontal.quantile(0.75)),
+                'horizontal_distance_max_km': float(horizontal.max()),
+                'horizontal_distance_max_date': pd.Timestamp(
+                    group.loc[max_horizontal_index, 'calendar_time']
+                ).date().isoformat(),
+                'endpoint_horizontal_distance_km': float(
+                    target['horizontal_distance_km_3d_c2'].iloc[0]
+                ),
+                'endpoint_depth_difference_m_3d_minus_c2': float(
+                    target['depth_difference_m_3d_minus_c2'].iloc[0]
+                ),
+                'daily_depth_difference_median_m_3d_minus_c2': float(
+                    depth_difference.median()
+                ),
+                'daily_depth_difference_q1_m_3d_minus_c2': float(
+                    depth_difference.quantile(0.25)
+                ),
+                'daily_depth_difference_q3_m_3d_minus_c2': float(
+                    depth_difference.quantile(0.75)
+                ),
+                'daily_depth_difference_max_m_3d_minus_c2': float(
+                    depth_difference.max()
+                ),
+                'daily_abs_depth_difference_median_m': float(depth_abs.median()),
+                'daily_abs_depth_difference_max_m': float(depth_abs.max()),
+                'daily_pair_day_count': int(len(group)),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        ['arm', 'particle_index', 'seed_key'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+
+
+def _ofes_dual_endpoint_mechanism_closure_member_properties(
+    paired_daily: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按 arrived 3-D 成员汇总原始性质的双时钟变化和全程振幅。"""
+    rows = []
+    for seed_key, group in paired_daily.groupby('seed_key', sort=False):
+        group = group.sort_values('calendar_time', kind='mergesort').reset_index(drop=True)
+        arm = str(group['arm'].iloc[0])
+        arm_settings = settings['arms'][arm]
+        release = group.loc[group['calendar_time'].eq(arm_settings['release_date'])]
+        target = group.loc[group['calendar_time'].eq(arm_settings['target_date'])]
+        if len(release) != 1 or len(target) != 1:
+            raise ValueError(f'Cannot resolve property release/target rows for {seed_key}.')
+        for variable, column, units in settings['property_variables']:
+            values = pd.to_numeric(group[column], errors='coerce')
+            if values.isna().any():
+                raise ValueError(
+                    f'Non-finite {variable} values for trajectory {seed_key}.'
+                )
+            release_value = float(release[column].iloc[0])
+            target_value = float(target[column].iloc[0])
+            release_offset = (values - release_value).abs()
+            adjacent_change = values.diff().abs()
+            adjacent_change.iloc[0] = np.nan
+            max_release_index = release_offset.idxmax()
+            max_adjacent_index = adjacent_change.idxmax()
+            rows.append(
+                {
+                    'case_id': settings['case_id'],
+                    'source_case_id': settings['watermass_case_id'],
+                    'arm': arm,
+                    'particle_index': int(group['particle_index'].iloc[0]),
+                    'seed_key': str(seed_key),
+                    'trajectory_key_3d': str(group['trajectory_key_3d'].iloc[0]),
+                    'arrival_outcome': str(group['arrival_outcome'].iloc[0]),
+                    'integration_direction': arm_settings['integration_direction'],
+                    'variable': variable,
+                    'source_column': column,
+                    'units': units,
+                    'integration_release_date': arm_settings['release_date'].date().isoformat(),
+                    'integration_target_date': arm_settings['target_date'].date().isoformat(),
+                    'calendar_start_date': settings['start_date'].date().isoformat(),
+                    'calendar_end_date': settings['end_date'].date().isoformat(),
+                    'integration_release_value': release_value,
+                    'integration_target_value': target_value,
+                    'integration_release_to_target_net_change': target_value - release_value,
+                    'calendar_forward_start_value': float(values.iloc[0]),
+                    'calendar_forward_end_value': float(values.iloc[-1]),
+                    'calendar_forward_net_change': float(values.iloc[-1] - values.iloc[0]),
+                    'full_min': float(values.min()),
+                    'full_max': float(values.max()),
+                    'full_range': float(values.max() - values.min()),
+                    'max_abs_deviation_from_integration_release': float(
+                        release_offset.iloc[max_release_index]
+                    ),
+                    'max_abs_deviation_date': pd.Timestamp(
+                        group.loc[max_release_index, 'calendar_time']
+                    ).date().isoformat(),
+                    'max_adjacent_day_abs_change': float(
+                        adjacent_change.iloc[max_adjacent_index]
+                    ),
+                    'max_adjacent_day_abs_change_date': pd.Timestamp(
+                        group.loc[max_adjacent_index, 'calendar_time']
+                    ).date().isoformat(),
+                    'finite_day_count': int(values.notna().sum()),
+                }
+            )
+    member = pd.DataFrame(rows).sort_values(
+        ['arm', 'particle_index', 'variable', 'seed_key'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    arm_summary = (
+        member.groupby(['arm', 'variable', 'units'], as_index=False)
+        .agg(
+            member_count=('seed_key', 'nunique'),
+            integration_net_median=('integration_release_to_target_net_change', 'median'),
+            calendar_net_median=('calendar_forward_net_change', 'median'),
+            full_range_median=('full_range', 'median'),
+            max_abs_release_deviation_median=(
+                'max_abs_deviation_from_integration_release', 'median'
+            ),
+            max_adjacent_change_median=(
+                'max_adjacent_day_abs_change', 'median'
+            ),
+            max_abs_release_deviation_max=(
+                'max_abs_deviation_from_integration_release', 'max'
+            ),
+            max_adjacent_change_max=('max_adjacent_day_abs_change', 'max'),
+        )
+        .sort_values(['arm', 'variable'], kind='mergesort')
+        .reset_index(drop=True)
+    )
+    arm_summary.insert(0, 'case_id', settings['case_id'])
+    arm_summary.insert(1, 'source_case_id', settings['watermass_case_id'])
+    return member, arm_summary
+
+
+def _ofes_dual_endpoint_mechanism_closure_structure_tables(
+    paired_daily: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """聚合 selected trajectory-day 的多候选结构兼容性。"""
+    root = settings['watermass_output_dir']
+    path = root / 'trajectory_structure_registration.csv'
+    structure = pd.read_csv(path, parse_dates=['calendar_time', 'candidate_date'])
+    required = {
+        'case_id',
+        'arm',
+        'particle_index',
+        'seed_key',
+        'trajectory_key',
+        'vertical_mode',
+        'calendar_time',
+        'arrival_outcome',
+        'candidate_id',
+        'candidate_count_for_day',
+        'horizontal_compatible',
+        'vertical_compatible',
+        'joint_compatible',
+        'path_ids',
+        'sentinel',
+        'registration_status',
+    }
+    missing = sorted(required.difference(structure.columns))
+    if missing:
+        raise ValueError(f'Structure registration lacks columns: {missing}')
+    source_ids = _ofes_dual_endpoint_mechanism_closure_source_ids(
+        structure,
+        direct_columns=('case_id',),
+        label='Structure registration',
+    )
+    if source_ids != {settings['watermass_case_id']}:
+        raise ValueError(
+            f'Structure registration identity mismatch: {sorted(source_ids)}'
+        )
+    structure['calendar_time'] = pd.to_datetime(
+        structure['calendar_time']
+    ).dt.normalize()
+    trajectory_keys = set(paired_daily['trajectory_key_3d'].astype(str))
+    structure = structure.loc[
+        structure['trajectory_key'].astype(str).isin(trajectory_keys)
+    ].copy()
+    pair_key = ['trajectory_key_3d', 'calendar_time']
+    pair_identity = paired_daily.loc[
+        :, pair_key + ['arm', 'particle_index', 'seed_key', 'arrival_outcome']
+    ].copy()
+    pair_identity['trajectory_key_3d'] = pair_identity[
+        'trajectory_key_3d'
+    ].astype(str)
+    pair_identity['calendar_time'] = pd.to_datetime(
+        pair_identity['calendar_time']
+    ).dt.normalize()
+    pair_lookup = {
+        (str(row.trajectory_key_3d), pd.Timestamp(row.calendar_time)): row._asdict()
+        for row in pair_identity.itertuples(index=False)
+    }
+    expected_pairs = set(pair_lookup)
+    observed_pairs = {
+        (str(row.trajectory_key), pd.Timestamp(row.calendar_time))
+        for row in structure.itertuples(index=False)
+    }
+    if not expected_pairs.issubset(observed_pairs):
+        missing_pairs = sorted(expected_pairs.difference(observed_pairs))
+        raise ValueError(
+            f'Structure registration lacks selected trajectory-days: {missing_pairs[:3]}'
+        )
+    structure_daily_rows = []
+    expanded_rows = []
+    for (trajectory_key, calendar_time), group in structure.groupby(
+        ['trajectory_key', 'calendar_time'],
+        sort=False,
+    ):
+        key = (str(trajectory_key), pd.Timestamp(calendar_time))
+        if key not in pair_lookup:
+            continue
+        pair = pair_lookup[key]
+        for column, expected_value in (
+            ('arm', pair['arm']),
+            ('particle_index', pair['particle_index']),
+            ('seed_key', pair['seed_key']),
+            ('arrival_outcome', pair['arrival_outcome']),
+        ):
+            values = group[column].dropna().astype(str)
+            if len(values) != len(group) or values.nunique() != 1:
+                raise ValueError(
+                    f'Structure registration has inconsistent {column} for {key}.'
+                )
+            if str(values.iloc[0]) != str(expected_value):
+                raise ValueError(
+                    f'Structure registration {column} does not match paired identity for {key}.'
+                )
+        sentinel = group['sentinel'].map(
+            _ofes_dual_endpoint_mechanism_closure_bool
+        )
+        candidate_id = group['candidate_id'].astype('string')
+        candidate_rows = group.loc[
+            ~sentinel
+            & candidate_id.notna()
+            & ~candidate_id.astype(str).eq('__NO_JOINT__')
+        ].copy()
+        candidate_rows['horizontal_compatible'] = candidate_rows[
+            'horizontal_compatible'
+        ].map(_ofes_dual_endpoint_mechanism_closure_bool)
+        candidate_rows['vertical_compatible'] = candidate_rows[
+            'vertical_compatible'
+        ].map(_ofes_dual_endpoint_mechanism_closure_bool)
+        candidate_rows['joint_compatible'] = candidate_rows[
+            'joint_compatible'
+        ].map(_ofes_dual_endpoint_mechanism_closure_bool)
+        horizontal_ids = sorted(
+            set(candidate_rows.loc[
+                candidate_rows['horizontal_compatible'], 'candidate_id'
+            ].astype(str))
+        )
+        vertical_ids = sorted(
+            set(candidate_rows.loc[
+                candidate_rows['vertical_compatible'], 'candidate_id'
+            ].astype(str))
+        )
+        joint_ids = sorted(
+            set(candidate_rows.loc[
+                candidate_rows['joint_compatible'], 'candidate_id'
+            ].astype(str))
+        )
+        horizontal = bool(horizontal_ids)
+        vertical = bool(vertical_ids)
+        joint = bool(joint_ids)
+        if not len(candidate_rows):
+            classification = 'no_candidate_support'
+        elif joint:
+            classification = 'joint_same_candidate'
+        elif horizontal and vertical:
+            classification = (
+                'horizontal_and_vertical_separate_candidates_no_joint'
+            )
+        elif horizontal:
+            classification = 'horizontal_only'
+        elif vertical:
+            classification = 'vertical_only'
+        else:
+            classification = 'neither'
+        path_ids = sorted(
+            {
+                path_id
+                for value in candidate_rows['path_ids']
+                for path_id in _ofes_dual_endpoint_mechanism_closure_split_ids(value)
+            }
+        )
+        candidate_ids = sorted(set(candidate_rows['candidate_id'].astype(str)))
+        structure_daily_rows.append(
+            {
+                'case_id': settings['case_id'],
+                'source_case_id': settings['watermass_case_id'],
+                'arm': str(pair['arm']),
+                'particle_index': int(pair['particle_index']),
+                'seed_key': str(pair['seed_key']),
+                'trajectory_key_3d': str(trajectory_key),
+                'calendar_date': pd.Timestamp(calendar_time).date().isoformat(),
+                'calendar_time': pd.Timestamp(calendar_time),
+                'arrival_outcome': str(pair['arrival_outcome']),
+                'candidate_count_for_day': int(
+                    pd.to_numeric(
+                        group['candidate_count_for_day'], errors='coerce'
+                    ).dropna().iloc[0]
+                ) if pd.to_numeric(
+                    group['candidate_count_for_day'], errors='coerce'
+                ).notna().any() else 0,
+                'candidate_row_count': int(len(candidate_rows)),
+                'sentinel_row_count': int(sentinel.sum()),
+                'candidate_id_count': int(len(candidate_ids)),
+                'candidate_ids': ';'.join(candidate_ids),
+                'horizontal_candidate_ids': ';'.join(horizontal_ids),
+                'vertical_candidate_ids': ';'.join(vertical_ids),
+                'joint_candidate_ids': ';'.join(joint_ids),
+                'path_ids': ';'.join(path_ids),
+                'path_id_count': int(len(path_ids)),
+                'horizontal_candidate_count': int(len(horizontal_ids)),
+                'vertical_candidate_count': int(len(vertical_ids)),
+                'joint_candidate_count': int(len(joint_ids)),
+                'horizontal_compatible': horizontal,
+                'vertical_compatible': vertical,
+                'joint_compatible': joint,
+                'classification': classification,
+                'registration_statuses': ';'.join(
+                    sorted(set(group['registration_status'].astype(str)))
+                ),
+            }
+        )
+        for record in candidate_rows.to_dict('records'):
+            candidate = str(record['candidate_id'])
+            path_values = _ofes_dual_endpoint_mechanism_closure_split_ids(
+                record['path_ids']
+            ) or ['__NO_PATH__']
+            for path_id in path_values:
+                expanded_rows.append(
+                    {
+                        'case_id': settings['case_id'],
+                        'source_case_id': settings['watermass_case_id'],
+                        'arm': str(pair['arm']),
+                        'particle_index': int(pair['particle_index']),
+                        'seed_key': str(pair['seed_key']),
+                        'trajectory_key_3d': str(trajectory_key),
+                        'calendar_time': pd.Timestamp(calendar_time),
+                        'candidate_id': candidate,
+                        'path_id': str(path_id),
+                        'horizontal_compatible': bool(
+                            record['horizontal_compatible']
+                        ),
+                        'vertical_compatible': bool(
+                            record['vertical_compatible']
+                        ),
+                        'joint_compatible': bool(record['joint_compatible']),
+                    }
+                )
+    structure_daily = pd.DataFrame(structure_daily_rows).sort_values(
+        ['arm', 'particle_index', 'calendar_time', 'trajectory_key_3d'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    if len(structure_daily) != len(paired_daily):
+        raise ValueError('Structure compatibility daily rows do not cover all paired days.')
+    expanded_columns = [
+        'case_id',
+        'source_case_id',
+        'arm',
+        'particle_index',
+        'seed_key',
+        'trajectory_key_3d',
+        'calendar_time',
+        'candidate_id',
+        'path_id',
+        'horizontal_compatible',
+        'vertical_compatible',
+        'joint_compatible',
+    ]
+    expanded = pd.DataFrame(expanded_rows, columns=expanded_columns)
+    candidate_rows = []
+    for (candidate_id, path_id), group in expanded.groupby(
+        ['candidate_id', 'path_id'],
+        sort=False,
+    ):
+        dates = sorted(pd.Timestamp(value).normalize() for value in group['calendar_time'].unique())
+        any_h = bool(group['horizontal_compatible'].any())
+        any_v = bool(group['vertical_compatible'].any())
+        any_j = bool(group['joint_compatible'].any())
+        if any_j:
+            relation = 'joint_same_candidate'
+        elif any_h and any_v:
+            relation = 'horizontal_and_vertical_separate_candidates_no_joint'
+        elif any_h:
+            relation = 'horizontal_only'
+        elif any_v:
+            relation = 'vertical_only'
+        else:
+            relation = 'neither'
+        candidate_rows.append(
+            {
+                'case_id': settings['case_id'],
+                'source_case_id': settings['watermass_case_id'],
+                'candidate_id': str(candidate_id),
+                'path_id': str(path_id),
+                'relation': relation,
+                'any_horizontal_compatible': any_h,
+                'any_vertical_compatible': any_v,
+                'any_joint_compatible': any_j,
+                'first_date': dates[0].date().isoformat(),
+                'last_date': dates[-1].date().isoformat(),
+                'calendar_day_count': int(len(dates)),
+                'trajectory_day_count': int(
+                    group[['trajectory_key_3d', 'calendar_time']].drop_duplicates().shape[0]
+                ),
+                'trajectory_count': int(group['trajectory_key_3d'].nunique()),
+            }
+        )
+    candidate_registry_columns = [
+        'case_id',
+        'source_case_id',
+        'candidate_id',
+        'path_id',
+        'relation',
+        'any_horizontal_compatible',
+        'any_vertical_compatible',
+        'any_joint_compatible',
+        'first_date',
+        'last_date',
+        'calendar_day_count',
+        'trajectory_day_count',
+        'trajectory_count',
+    ]
+    candidate_registry = pd.DataFrame(
+        candidate_rows,
+        columns=candidate_registry_columns,
+    ).sort_values(
+        ['path_id', 'candidate_id'],
+        kind='mergesort',
+    ).reset_index(drop=True)
+    path_period_rows = []
+    path_expanded = expanded.loc[expanded['path_id'].ne('__NO_PATH__')]
+    for path_id, group in path_expanded.groupby('path_id', sort=False):
+        dates = sorted(pd.Timestamp(value).normalize() for value in group['calendar_time'].unique())
+        if not dates:
+            continue
+        periods = []
+        period_start = dates[0]
+        previous = dates[0]
+        for date in dates[1:]:
+            if date - previous != pd.Timedelta(days=1):
+                periods.append((period_start, previous))
+                period_start = date
+            previous = date
+        periods.append((period_start, previous))
+        if bool(group['joint_compatible'].any()):
+            relation = 'joint_same_candidate'
+        elif bool(group['horizontal_compatible'].any()) and bool(
+            group['vertical_compatible'].any()
+        ):
+            relation = 'horizontal_and_vertical_separate_candidates_no_joint'
+        elif bool(group['horizontal_compatible'].any()):
+            relation = 'horizontal_only'
+        elif bool(group['vertical_compatible'].any()):
+            relation = 'vertical_only'
+        else:
+            relation = 'neither'
+        for period_start, period_end in periods:
+            path_period_rows.append(
+                {
+                    'case_id': settings['case_id'],
+                    'source_case_id': settings['watermass_case_id'],
+                    'path_id': str(path_id),
+                    'relation': relation,
+                    'period_start': period_start.date().isoformat(),
+                    'period_end': period_end.date().isoformat(),
+                    'period_day_count': int((period_end - period_start).days + 1),
+                    'observed_day_count': int(len(dates)),
+                    'candidate_count': int(group['candidate_id'].nunique()),
+                    'trajectory_day_count': int(
+                        group[['trajectory_key_3d', 'calendar_time']].drop_duplicates().shape[0]
+                    ),
+                    'any_horizontal_compatible': bool(group['horizontal_compatible'].any()),
+                    'any_vertical_compatible': bool(group['vertical_compatible'].any()),
+                    'any_joint_compatible': bool(group['joint_compatible'].any()),
+                }
+            )
+    path_period_columns = [
+        'case_id',
+        'source_case_id',
+        'path_id',
+        'relation',
+        'period_start',
+        'period_end',
+        'period_day_count',
+        'observed_day_count',
+        'candidate_count',
+        'trajectory_day_count',
+        'any_horizontal_compatible',
+        'any_vertical_compatible',
+        'any_joint_compatible',
+    ]
+    path_periods = pd.DataFrame(path_period_rows, columns=path_period_columns)
+    return structure_daily, candidate_registry, path_periods, expanded
+
+
+def _ofes_dual_endpoint_mechanism_closure_summary(
+    structure_daily: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """按总体、臂和到达结果汇总逐 trajectory-day 结构类别。"""
+    rows = []
+    groups = [('overall', 'overall', structure_daily, None, None)]
+    for arm in sorted(structure_daily['arm'].astype(str).unique()):
+        groups.append(
+            (
+                'arm',
+                arm,
+                structure_daily.loc[structure_daily['arm'].astype(str).eq(arm)],
+                arm,
+                None,
+            )
+        )
+    for outcome in sorted(
+        structure_daily['arrival_outcome'].astype(str).unique()
+    ):
+        groups.append(
+            (
+                'arrival_outcome',
+                outcome,
+                structure_daily.loc[
+                    structure_daily['arrival_outcome'].astype(str).eq(outcome)
+                ],
+                None,
+                outcome,
+            )
+        )
+    for scope, group_key, group, arm, outcome in groups:
+        total_days = int(len(group))
+        for category in settings['categories']:
+            count = int(group['classification'].eq(category).sum())
+            rows.append(
+                {
+                    'case_id': settings['case_id'],
+                    'source_case_id': settings['watermass_case_id'],
+                    'scope': scope,
+                    'group_key': group_key,
+                    'arm': arm,
+                    'arrival_outcome': outcome,
+                    'classification': category,
+                    'count': count,
+                    'total_trajectory_days': total_days,
+                    'fraction': count / total_days if total_days else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _ofes_dual_endpoint_mechanism_closure_validation(
+    paired_daily: pd.DataFrame,
+    seed_summary: pd.DataFrame,
+    member: pd.DataFrame,
+    member_arm_summary: pd.DataFrame,
+    structure_daily: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    candidate_registry: pd.DataFrame,
+    path_periods: pd.DataFrame,
+    settings: dict,
+) -> dict:
+    """验证机制闭合产物的身份、行数、时钟和互斥类别。"""
+    diagnostic_case_id = str(settings['case_id'])
+    source_case_id = str(settings['watermass_case_id'])
+    identity_frames = {
+        'paired_path_daily': paired_daily,
+        'paired_path_seed_summary': seed_summary,
+        'member_property_excursion': member,
+        'member_property_arm_summary': member_arm_summary,
+        'structure_compatibility_daily': structure_daily,
+        'structure_compatibility_summary': structure_summary,
+        'structure_compatibility_candidate_registry': candidate_registry,
+        'structure_compatibility_path_periods': path_periods,
+    }
+    case_id_consistent = {}
+    source_case_id_consistent = {}
+    for name, frame in identity_frames.items():
+        case_values = (
+            set(frame['case_id'].dropna().astype(str))
+            if 'case_id' in frame.columns else set()
+        )
+        source_values = (
+            set(frame['source_case_id'].dropna().astype(str))
+            if 'source_case_id' in frame.columns else set()
+        )
+        case_id_consistent[name] = case_values == {diagnostic_case_id}
+        source_case_id_consistent[name] = source_values == {source_case_id}
+    trajectory_count = int(seed_summary['seed_key'].nunique())
+    date_count = int(len(settings['dates']))
+    expected_pair_rows = trajectory_count * date_count
+    expected_member_rows = trajectory_count * len(settings['property_variables'])
+    arrival_outcome_counts = {
+        str(key): int(value)
+        for key, value in seed_summary['arrival_outcome'].astype(str).value_counts().items()
+    }
+    expected_structure_summary_rows = len(settings['categories']) * (
+        1
+        + int(structure_daily['arm'].astype(str).nunique())
+        + int(structure_daily['arrival_outcome'].astype(str).nunique())
+    )
+    pair_keys = paired_daily[['trajectory_key_3d', 'calendar_time']].copy()
+    pair_keys['trajectory_key_3d'] = pair_keys['trajectory_key_3d'].astype(str)
+    pair_keys['calendar_time'] = pd.to_datetime(pair_keys['calendar_time']).dt.normalize()
+    pair_duplicate_count = int(pair_keys.duplicated().sum())
+    pair_dates_complete = True
+    expected_dates = set(pd.Timestamp(value) for value in settings['dates'])
+    for _, group in pair_keys.groupby('trajectory_key_3d', sort=False):
+        pair_dates_complete = pair_dates_complete and (
+            set(group['calendar_time']) == expected_dates
+            and len(group) == date_count
+        )
+    seed_duplicate_count = int(seed_summary.duplicated(['seed_key']).sum())
+    member_duplicate_count = int(
+        member.duplicated(['seed_key', 'variable']).sum()
+    )
+    structure_duplicate_count = int(
+        structure_daily.duplicated(['trajectory_key_3d', 'calendar_time']).sum()
+    )
+    classifications = set(structure_daily['classification'].astype(str))
+    classification_counts = {
+        category: int(structure_daily['classification'].eq(category).sum())
+        for category in settings['categories']
+    }
+    category_sum = int(sum(classification_counts.values()))
+    category_complete = classifications.issubset(set(settings['categories']))
+    category_disjoint = bool(category_sum == len(structure_daily))
+    summary_total = structure_summary.loc[
+        structure_summary['scope'].eq('overall')
+    ]
+    summary_counts = {
+        str(row.classification): int(row.count)
+        for row in summary_total.itertuples(index=False)
+    }
+    summary_denominator = (
+        int(summary_total['total_trajectory_days'].iloc[0])
+        if len(summary_total) else -1
+    )
+    geometry_columns = [
+        'horizontal_distance_km_3d_c2',
+        'depth_difference_m_3d_minus_c2',
+        'do_difference_umol_kg_3d_minus_c2',
+        'theta_difference_3d_minus_c2',
+        'sp_difference_3d_minus_c2',
+        'sa_difference_3d_minus_c2',
+        'ct_difference_3d_minus_c2',
+        'sigma0_difference_3d_minus_c2',
+        'spiciness0_difference_3d_minus_c2',
+    ]
+    finite_geometry = all(
+        column in paired_daily.columns
+        and np.isfinite(pd.to_numeric(paired_daily[column], errors='coerce')).all()
+        for column in geometry_columns
+    )
+    finite_properties = all(
+        column in paired_daily.columns
+        and np.isfinite(pd.to_numeric(paired_daily[column], errors='coerce')).all()
+        for _, column, _ in settings['property_variables']
+    )
+    directions = set(paired_daily['calendar_direction'].astype(str))
+    calendar_direction_valid = directions == {'ascending_calendar_date'}
+    arm_clock_valid = True
+    for arm, arm_settings in settings['arms'].items():
+        rows = seed_summary.loc[seed_summary['arm'].astype(str).eq(arm)]
+        if rows.empty:
+            arm_clock_valid = False
+            continue
+        release = arm_settings['release_date']
+        target = arm_settings['target_date']
+        if arm_settings['integration_direction'] == 'backward':
+            arm_clock_valid = arm_clock_valid and target < release
+        elif arm_settings['integration_direction'] == 'forward':
+            arm_clock_valid = arm_clock_valid and release < target
+        else:
+            arm_clock_valid = False
+    expected_summary_scope_groups = {
+        'overall': 1,
+        'arm': int(structure_daily['arm'].astype(str).nunique()),
+        'arrival_outcome': int(
+            structure_daily['arrival_outcome'].astype(str).nunique()
+        ),
+    }
+    summary_group_counts = (
+        structure_summary.groupby('scope', dropna=False).size().to_dict()
+        if not structure_summary.empty else {}
+    )
+    summary_complete = bool(
+        len(structure_summary) == expected_structure_summary_rows
+        and len(summary_total) == len(settings['categories'])
+        and summary_denominator == len(structure_daily)
+        and summary_counts == classification_counts
+        and all(
+            int(summary_group_counts.get(scope, 0))
+            == len(settings['categories']) * group_count
+            for scope, group_count in expected_summary_scope_groups.items()
+        )
+        and len(summary_group_counts) == len(expected_summary_scope_groups)
+    )
+    required_inputs = {
+        'paired_3d_c2_comparison': 'paired_3d_c2_comparison.parquet',
+        'particle_endpoint_registration': 'particle_endpoint_registration.csv',
+        'trajectory_structure_registration': 'trajectory_structure_registration.csv',
+        'watermass_manifest': 'manifest.json',
+        'watermass_validation': 'validation.json',
+    }
+    complete = bool(
+        all(case_id_consistent.values())
+        and all(source_case_id_consistent.values())
+        and trajectory_count > 0
+        and date_count > 0
+        and len(paired_daily) == expected_pair_rows
+        and pair_duplicate_count == 0
+        and pair_dates_complete
+        and len(seed_summary) == trajectory_count
+        and seed_duplicate_count == 0
+        and len(member) == expected_member_rows
+        and member_duplicate_count == 0
+        and len(structure_daily) == expected_pair_rows
+        and structure_duplicate_count == 0
+        and category_complete
+        and category_disjoint
+        and summary_complete
+        and finite_geometry
+        and finite_properties
+        and calendar_direction_valid
+        and arm_clock_valid
+        and bool(settings['watermass_manifest'].get('complete'))
+        and bool(settings['watermass_validation'].get('complete'))
+    )
+    return {
+        'analysis': 'ofes_dual_endpoint_mechanism_closure',
+        'diagnostic_case_id': diagnostic_case_id,
+        'source_case_id': source_case_id,
+        'source_case_identity': settings['watermass_case_identity'],
+        'source_manifest_identity': {
+            'analysis': settings['watermass_manifest'].get('analysis'),
+            'case_id': settings['watermass_manifest'].get('case_id'),
+            'case_identity': settings['watermass_manifest'].get('case_identity'),
+            'complete': bool(settings['watermass_manifest'].get('complete')),
+        },
+        'complete': complete,
+        'arrived_3d_trajectory_count': trajectory_count,
+        'calendar_day_count': date_count,
+        'expected_paired_path_daily_rows': expected_pair_rows,
+        'actual_paired_path_daily_rows': int(len(paired_daily)),
+        'paired_path_daily_row_count': bool(len(paired_daily) == expected_pair_rows),
+        'paired_path_daily_duplicate_key_count': pair_duplicate_count,
+        'paired_path_daily_dates_complete': bool(pair_dates_complete),
+        'paired_path_seed_summary_rows': int(len(seed_summary)),
+        'seed_arrival_outcome_counts': arrival_outcome_counts,
+        'member_property_variables': [
+            variable for variable, _, _ in settings['property_variables']
+        ],
+        'expected_member_property_rows': expected_member_rows,
+        'actual_member_property_rows': int(len(member)),
+        'member_property_row_count': bool(len(member) == expected_member_rows),
+        'member_property_duplicate_key_count': member_duplicate_count,
+        'expected_structure_compatibility_daily_rows': expected_pair_rows,
+        'actual_structure_compatibility_daily_rows': int(len(structure_daily)),
+        'structure_compatibility_daily_row_count': bool(
+            len(structure_daily) == expected_pair_rows
+        ),
+        'structure_compatibility_daily_duplicate_key_count': structure_duplicate_count,
+        'structure_categories': list(settings['categories']),
+        'structure_classification_counts': classification_counts,
+        'structure_classification_sum': category_sum,
+        'structure_classification_exhaustive': bool(category_complete),
+        'structure_classification_mutually_exclusive': category_disjoint,
+        'structure_summary_expected_rows': expected_structure_summary_rows,
+        'structure_summary_actual_rows': int(len(structure_summary)),
+        'structure_summary_complete': summary_complete,
+        'structure_summary_denominator_trajectory_days': summary_denominator,
+        'structure_summary_group_counts': {
+            str(key): int(value) for key, value in summary_group_counts.items()
+        },
+        'case_id_consistent_by_output': case_id_consistent,
+        'source_case_id_consistent_by_output': source_case_id_consistent,
+        'all_case_ids_consistent': bool(all(case_id_consistent.values())),
+        'all_source_case_ids_consistent': bool(
+            all(source_case_id_consistent.values())
+        ),
+        'finite_pair_geometry': finite_geometry,
+        'finite_member_properties': finite_properties,
+        'calendar_direction': 'ascending_calendar_date',
+        'calendar_direction_valid': calendar_direction_valid,
+        'integration_clock_valid': arm_clock_valid,
+        'integration_release_to_target_definition': (
+            '3-D target-date depth minus 3-D release-date depth, using each arm direction.'
+        ),
+        'calendar_forward_definition': (
+            '3-D depth at the last calendar date minus 3-D depth at the first calendar date.'
+        ),
+        'max_abs_release_deviation_definition': (
+            'Maximum absolute 3-D depth deviation from the integration release depth over the full calendar window.'
+        ),
+        'daily_pair_depth_difference_definition': (
+            'Signed 3-D depth minus same-seed fixed-depth C2 depth at each calendar date.'
+        ),
+        'r_eq_normalization': settings['r_eq_normalization'],
+        'inputs': required_inputs,
+        'input_read_scope': (
+            'Only the saved parquet/csv/json review artifacts were read; no flow/native field or integrator call.'
+        ),
+    }
+
+
+def _ofes_dual_endpoint_mechanism_closure_verdict(
+    paired_daily: pd.DataFrame,
+    seed_summary: pd.DataFrame,
+    member: pd.DataFrame,
+    structure_daily: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    validation: dict,
+    settings: dict,
+) -> str:
+    """由配对、性质和候选拆解结果生成机制闭合裁决。"""
+    trajectory_count = int(seed_summary['seed_key'].nunique())
+    day_count = int(len(settings['dates']))
+    paired_days = int(len(paired_daily))
+    both_arrived = int(seed_summary['arrival_outcome'].eq('both_arrived').sum())
+    only_3d = int(seed_summary['arrival_outcome'].eq('only_3d').sum())
+    overall = structure_summary.loc[structure_summary['scope'].eq('overall')]
+    category_counts = {
+        category: int(
+            overall.loc[overall['classification'].eq(category), 'count'].iloc[0]
+        )
+        for category in settings['categories']
+    }
+    total_days = int(len(structure_daily))
+    separate = category_counts[
+        'horizontal_and_vertical_separate_candidates_no_joint'
+    ]
+    joint = category_counts['joint_same_candidate']
+    h_only = category_counts['horizontal_only']
+    v_only = category_counts['vertical_only']
+    neither = category_counts['neither']
+    no_support = category_counts['no_candidate_support']
+    max_horizontal = float(seed_summary['horizontal_distance_max_km'].max())
+    median_horizontal = float(paired_daily['horizontal_distance_km_3d_c2'].median())
+    max_horizontal_by_seed = seed_summary.loc[
+        :, ['arm', 'particle_index', 'horizontal_distance_max_km']
+    ].copy()
+    max_horizontal_by_seed['label'] = max_horizontal_by_seed.apply(
+        lambda row: f"{row['arm']}/p{int(row['particle_index'])}", axis=1
+    )
+    horizontal_detail = '; '.join(
+        f"{row.label}={row.horizontal_distance_max_km:.3f} km"
+        for row in max_horizontal_by_seed.itertuples(index=False)
+    )
+    depth_deviation = pd.to_numeric(
+        seed_summary['max_abs_deviation_from_integration_release_m'],
+        errors='coerce',
+    )
+    depth_arm_lines = []
+    for arm in sorted(seed_summary['arm'].astype(str).unique()):
+        values = depth_deviation.loc[seed_summary['arm'].astype(str).eq(arm)]
+        depth_arm_lines.append(
+            f"{arm}: median={values.median():.3f} m, range={values.min():.3f}–{values.max():.3f} m"
+        )
+    property_lines = []
+    for variable in [name for name, _, _ in settings['property_variables']]:
+        rows = member.loc[member['variable'].eq(variable)]
+        max_value = float(
+            rows['max_abs_deviation_from_integration_release'].max()
+        )
+        max_row = rows.loc[
+            rows['max_abs_deviation_from_integration_release'].idxmax()
+        ]
+        property_lines.append(
+            f"- `{variable}`: maximum individual release-relative deviation "
+            f"{max_value:.4f} ({max_row['arm']}/p{int(max_row['particle_index'])}; {max_row['units']})."
+        )
+    summary_lines = []
+    for category in settings['categories']:
+        count = category_counts[category]
+        summary_lines.append(
+            f"| `{category}` | {count} | {count / total_days:.1%} |"
+        )
+    if separate >= max(joint, h_only, v_only, neither, no_support):
+        structure_sentence = (
+            f"低 joint 相容主要来自同一 trajectory-day 上水平和垂向分别有兼容候选、"
+            f"但没有同一候选同时满足两者（{separate}/{total_days}，{separate / total_days:.1%}）。"
+        )
+    else:
+        structure_sentence = (
+            "低 joint 相容由多个类别共同构成，需按上表的比例解释，不能归因于单一失配来源。"
+        )
+    return (
+        f"# {settings['case_label']} 机制闭合诊断裁决\n\n"
+        f"本诊断锁定 {trajectory_count} 条正式 arrived 3-D 轨迹，并与每条同 seed 的固定深度 C2 "
+        f"轨迹按 {day_count} 个日历日逐日配对，共 {paired_days} 个 trajectory-day。"
+        f"其中 {both_arrived} 条为 `both_arrived`，{only_3d} 条为 `only_3d`；每条均保留个体记录。\n\n"
+        "## A. 3-D/C2 配对路径\n\n"
+        f"逐日水平分离的总体 median 为 {median_horizontal:.3f} km，跨成员日最大值为 {max_horizontal:.3f} km。"
+        f"各 seed 的全程最大水平分离为：{horizontal_detail}。"
+        "这些数值描述配对轨迹的几何分离，是否‘全程贴近’由上述全程分布直接判断；"
+        "输入 manifest 和表中没有正式 `R_eq`，因此没有生成 distance/R_eq 或越界日数。\n\n"
+        "深度口径彼此分开：`integration release→target` 是按各臂积分方向取目标日减释放日；"
+        "`calendar-forward` 是按升序日历的末日减首日；`max_abs_deviation_from_integration_release_m` "
+        "是全窗口相对积分释放深度的最大绝对偏离。此前约 10–13 m 的概括对应最后这个定义的臂内 median，"
+        + "；".join(depth_arm_lines)
+        + "。它不是端点 3-D/C2 深度差，也不是只看端点的量。Arm B 的积分释放日在窗口末端，"
+        "所以其 integration-oriented 与 calendar-forward net change 符号相反，表中已显式保留。\n\n"
+        "## B. 逐成员性质连续性\n\n"
+        "以下最大偏离均从每个成员的积分释放值计算，性质没有被组中位数替代，也未进行独立重复显著性检验。\n\n"
+        + "\n".join(property_lines)
+        + "\n\n"
+        "## C. candidate 失配拆解\n\n"
+        "分类以逐 trajectory-day 的全部候选行为单位；sentinel/缺候选不被当作不兼容。"
+        "`joint_same_candidate` 表示至少一个相同 candidate 同时满足水平和垂向条件；"
+        "其余类别按水平、垂向兼容候选集合的存在与交集互斥划分。\n\n"
+        "| 分类 | trajectory-day 数 | 占比 |\n|---|---:|---:|\n"
+        + "\n".join(summary_lines)
+        + "\n\n"
+        + structure_sentence
+        + f" joint 仅 {joint}/{total_days}（{joint / total_days:.1%}）；"
+        f"horizontal-only={h_only}，vertical-only={v_only}，neither={neither}，"
+        f"no-candidate-support={no_support}。"
+        "因此低 joint 主要是 H/V 分候选错配，不能写成没有候选支撑。"
+        "candidate registry 展开了分号连接的 path ID，并保留连续日段；没有事后挑选最佳路径。"
+        "代表剖面的垂向范围也不等同于完整动力结构。\n\n"
+        "## 裁决和边界\n\n"
+        "该闭合结果支持在既有已到达轨迹上同时检查几何配对、逐成员性质连续性和 candidate 失配来源；"
+        "它不把 virtual/profile 证据升级为整个对象、严格同一 SCV 或物质身份。"
+        f"验证状态为 `{bool(validation['complete'])}`；本 P1 已覆盖上述问题，因此不需要为回答这些问题另启 P2。"
+        "若后续需要完整动力结构或独立路径动力学检验，应作为另一个明确限定的任务。\n"
+    )
+
+
+def _ofes_dual_endpoint_mechanism_closure_plot(
+    paired_daily: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    settings: dict,
+    figure_path: Path,
+) -> dict:
+    """绘制配对分离、深度差和 candidate 类别组成的组合证据图。"""
+    required_pair = {
+        'arm',
+        'particle_index',
+        'trajectory_key_3d',
+        'calendar_time',
+        'horizontal_distance_km_3d_c2',
+        'depth_difference_m_3d_minus_c2',
+    }
+    missing = sorted(required_pair.difference(paired_daily.columns))
+    if missing:
+        raise ValueError(f'Mechanism closure figure lacks paired columns: {missing}')
+    work = paired_daily.copy()
+    work['calendar_time'] = pd.to_datetime(work['calendar_time']).dt.normalize()
+    if not np.isfinite(
+        pd.to_numeric(work['horizontal_distance_km_3d_c2'], errors='coerce')
+    ).all() or not np.isfinite(
+        pd.to_numeric(work['depth_difference_m_3d_minus_c2'], errors='coerce')
+    ).all():
+        raise ValueError('Mechanism closure figure contains non-finite geometry.')
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(8.4, 9.0),
+        dpi=300,
+        sharex=False,
+        gridspec_kw={'height_ratios': [1.0, 1.0, 1.15]},
+    )
+    arm_styles = {
+        arm: (('-' if index % 2 == 0 else '--'), ('o' if index % 2 == 0 else '^'))
+        for index, arm in enumerate(sorted(work['arm'].astype(str).unique()))
+    }
+    trajectories = list(
+        work[['trajectory_key_3d', 'arm', 'particle_index']]
+        .drop_duplicates()
+        .sort_values(['arm', 'particle_index', 'trajectory_key_3d'])
+        .itertuples(index=False)
+    )
+    palette = plt.get_cmap('tab10')
+    for index, record in enumerate(trajectories):
+        subset = work.loc[
+            work['trajectory_key_3d'].astype(str).eq(str(record.trajectory_key_3d))
+        ].sort_values('calendar_time', kind='mergesort')
+        linestyle, marker = arm_styles[str(record.arm)]
+        color = palette(index % 10)
+        label = f"{record.arm} / p{int(record.particle_index)}"
+        axes[0].plot(
+            subset['calendar_time'],
+            subset['horizontal_distance_km_3d_c2'],
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            markersize=3.0,
+            linewidth=1.0,
+            label=label,
+        )
+        axes[1].plot(
+            subset['calendar_time'],
+            subset['depth_difference_m_3d_minus_c2'],
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            markersize=3.0,
+            linewidth=1.0,
+        )
+    axes[0].set_ylabel('3-D/C2 horizontal distance (km)')
+    axes[0].set_title('A. Same-seed paired-path separation')
+    axes[1].set_ylabel('3-D − C2 depth (m)')
+    axes[1].set_title('B. Same-seed paired-path depth difference')
+    axes[1].axhline(0.0, color='0.25', linewidth=0.8, linestyle=':')
+    axes[0].legend(
+        ncol=4,
+        fontsize=7,
+        frameon=False,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.34),
+    )
+    for axis in axes[:2]:
+        axis.grid(axis='y', color='0.88', linewidth=0.6)
+        axis.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=9))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    groups = [('overall', 'overall', 'Overall')]
+    for arm in sorted(structure_summary.loc[
+        structure_summary['scope'].eq('arm'), 'group_key'
+    ].astype(str).unique()):
+        groups.append(('arm', arm, arm))
+    for outcome in sorted(structure_summary.loc[
+        structure_summary['scope'].eq('arrival_outcome'), 'group_key'
+    ].astype(str).unique()):
+        groups.append(('arrival_outcome', outcome, outcome))
+    labels = [label for _, _, label in groups]
+    x = np.arange(len(groups))
+    bottom = np.zeros(len(groups), dtype=float)
+    hatches = ['', '//', '..', 'xx', '\\\\', '--']
+    category_colors = plt.get_cmap('tab20').colors[:len(settings['categories'])]
+    for category_index, category in enumerate(settings['categories']):
+        values = []
+        for scope, group_key, _ in groups:
+            rows = structure_summary.loc[
+                structure_summary['scope'].eq(scope)
+                & structure_summary['group_key'].astype(str).eq(group_key)
+                & structure_summary['classification'].eq(category)
+            ]
+            values.append(float(rows['count'].iloc[0]) if len(rows) == 1 else 0.0)
+        values = np.asarray(values, dtype=float)
+        bars = axes[2].bar(
+            x,
+            values,
+            bottom=bottom,
+            color=category_colors[category_index],
+            edgecolor='0.2',
+            linewidth=0.4,
+            hatch=hatches[category_index],
+            label=category,
+        )
+        for bar, value, base in zip(bars, values, bottom):
+            if value >= 1:
+                axes[2].text(
+                    bar.get_x() + bar.get_width() / 2,
+                    base + value / 2,
+                    f'{int(value)}',
+                    ha='center',
+                    va='center',
+                    fontsize=6,
+                )
+        bottom += values
+    axes[2].set_xticks(x, labels, rotation=25, ha='right')
+    axes[2].set_ylabel('Trajectory-days (count)')
+    axes[2].set_title('C. Candidate compatibility composition')
+    axes[2].set_ylim(0.0, max(float(bottom.max()) * 1.12, 1.0))
+    axes[2].legend(
+        fontsize=6.5,
+        frameon=False,
+        ncol=1,
+        loc='upper left',
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+    )
+    axes[2].grid(axis='y', color='0.88', linewidth=0.6)
+    fig.suptitle(
+        'Mechanism closure: same-seed path separation and candidate support',
+        fontsize=12,
+    )
+    fig.text(
+        0.01,
+        0.005,
+        'Each line/marker = one repeated trajectory; each marker = one trajectory-day. '
+        'Arm is encoded by line style and marker as well as color.',
+        fontsize=7,
+    )
+    fig.subplots_adjust(top=0.86, bottom=0.10, hspace=0.55, left=0.12, right=0.78)
+    fig.savefig(figure_path, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    image = plt.imread(figure_path)
+    if image.ndim not in (2, 3) or not np.isfinite(image).all():
+        raise ValueError('Mechanism closure figure PNG is unreadable.')
+    return {
+        'path': str(figure_path.resolve()),
+        'point_count': int(len(work)),
+        'trajectory_count': int(work['trajectory_key_3d'].nunique()),
+        'trajectory_day_unit': True,
+        'png_readable': True,
+        'pixel_width': int(image.shape[1]),
+        'pixel_height': int(image.shape[0]),
+        'dpi': 300,
+        'panels': ['paired_horizontal_distance', 'paired_depth_difference', 'candidate_composition'],
+        'non_color_encoding': ['arm_line_style', 'arm_marker', 'candidate_hatch'],
+        'all_plotted_points_finite': True,
+    }
+
+
+def _ofes_dual_endpoint_mechanism_closure_write_outputs(
+    paired_daily: pd.DataFrame,
+    seed_summary: pd.DataFrame,
+    member: pd.DataFrame,
+    member_arm_summary: pd.DataFrame,
+    structure_daily: pd.DataFrame,
+    structure_summary: pd.DataFrame,
+    candidate_registry: pd.DataFrame,
+    path_periods: pd.DataFrame,
+    validation: dict,
+    settings: dict,
+) -> dict:
+    """写出机制闭合诊断的表格、图件、验证和裁决。"""
+    root = settings['output_dir']
+    root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        'paired_path_daily': root / 'paired_path_daily.csv',
+        'paired_path_seed_summary': root / 'paired_path_seed_summary.csv',
+        'member_property_excursion': root / 'member_property_excursion.csv',
+        'member_property_arm_summary': root / 'member_property_arm_summary.csv',
+        'structure_compatibility_daily': root / 'structure_compatibility_daily.csv',
+        'structure_compatibility_summary': root / 'structure_compatibility_summary.csv',
+        'structure_compatibility_candidate_registry': root / 'structure_compatibility_candidate_registry.csv',
+        'structure_compatibility_path_periods': root / 'structure_compatibility_path_periods.csv',
+        'validation': root / 'validation.json',
+        'manifest': root / 'manifest.json',
+        'verdict': root / 'verdict_zh.md',
+        'mechanism_closure_figure': root / 'figure_mechanism_closure.png',
+    }
+    figure = _ofes_dual_endpoint_mechanism_closure_plot(
+        paired_daily,
+        structure_summary,
+        settings,
+        paths['mechanism_closure_figure'],
+    )
+    figure_complete = bool(
+        figure['png_readable']
+        and figure['all_plotted_points_finite']
+        and figure['point_count'] == len(paired_daily)
+        and figure['trajectory_count'] == seed_summary['seed_key'].nunique()
+    )
+    final_validation = {
+        **validation,
+        'figure': figure,
+        'figure_contract': {
+            'point_count_matches_paired_daily': bool(
+                figure['point_count'] == len(paired_daily)
+            ),
+            'trajectory_count_matches_seed_summary': bool(
+                figure['trajectory_count'] == seed_summary['seed_key'].nunique()
+            ),
+            'threshold_or_probability_encoding': 'not used; no area or probability encoding',
+        },
+        'complete': bool(validation['complete'] and figure_complete),
+        'output_paths': {
+            key: str(path.resolve()) for key, path in paths.items()
+        },
+    }
+    paired_daily.to_csv(paths['paired_path_daily'], index=False)
+    seed_summary.to_csv(paths['paired_path_seed_summary'], index=False)
+    member.to_csv(paths['member_property_excursion'], index=False)
+    member_arm_summary.to_csv(paths['member_property_arm_summary'], index=False)
+    structure_daily.to_csv(paths['structure_compatibility_daily'], index=False)
+    structure_summary.to_csv(paths['structure_compatibility_summary'], index=False)
+    candidate_registry.to_csv(
+        paths['structure_compatibility_candidate_registry'], index=False
+    )
+    path_periods.to_csv(paths['structure_compatibility_path_periods'], index=False)
+    verdict = _ofes_dual_endpoint_mechanism_closure_verdict(
+        paired_daily,
+        seed_summary,
+        member,
+        structure_daily,
+        structure_summary,
+        final_validation,
+        settings,
+    )
+    _ofes_atomic_write_json(final_validation, paths['validation'])
+    paths['verdict'].write_text(verdict, encoding='utf-8')
+    source_manifest_identity = {
+        'analysis': settings['watermass_manifest'].get('analysis'),
+        'case_id': settings['watermass_manifest'].get('case_id'),
+        'case_identity': settings['watermass_manifest'].get('case_identity'),
+        'complete': bool(settings['watermass_manifest'].get('complete')),
+    }
+    manifest = {
+        'analysis': 'ofes_dual_endpoint_mechanism_closure',
+        'case_id': settings['case_id'],
+        'case_label': settings['case_label'],
+        'case_identity': {
+            'case_id': settings['case_id'],
+            'source_case_id': settings['watermass_case_id'],
+            'source_case_identity': settings['watermass_case_identity'],
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+        },
+        'source_case_id': settings['watermass_case_id'],
+        'source_case_identity': settings['watermass_case_identity'],
+        'source_manifest_identity': source_manifest_identity,
+        'diagnostic_window': {
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+            'calendar_dates': [
+                pd.Timestamp(value).date().isoformat() for value in settings['dates']
+            ],
+            'calendar_day_count': int(len(settings['dates'])),
+        },
+        'clocks_and_depth_definitions': {
+            'integration_release_to_target': validation[
+                'integration_release_to_target_definition'
+            ],
+            'calendar_forward': validation['calendar_forward_definition'],
+            'max_abs_release_deviation': validation[
+                'max_abs_release_deviation_definition'
+            ],
+            'daily_pair_depth_difference': validation[
+                'daily_pair_depth_difference_definition'
+            ],
+            'arm_b_clock_note': (
+                'Arm B releases at the last calendar date, so integration-oriented and calendar-forward changes have opposite orientation.'
+            ),
+        },
+        'r_eq_normalization': settings['r_eq_normalization'],
+        'candidate_classification_rule': {
+            'categories': list(settings['categories']),
+            'sentinel_policy': 'Sentinel/no-joint rows are excluded from incompatibility categories.',
+            'aggregation_unit': 'one selected trajectory-day after aggregating all candidate rows',
+            'joint_definition': 'At least one candidate row has both horizontal_compatible and vertical_compatible.',
+        },
+        'inputs': {
+            'watermass_review_dir': str(settings['watermass_output_dir'].resolve()),
+            'paired_3d_c2_comparison': str(
+                (settings['watermass_output_dir'] / 'paired_3d_c2_comparison.parquet').resolve()
+            ),
+            'particle_endpoint_registration': str(
+                (settings['watermass_output_dir'] / 'particle_endpoint_registration.csv').resolve()
+            ),
+            'trajectory_structure_registration': str(
+                (settings['watermass_output_dir'] / 'trajectory_structure_registration.csv').resolve()
+            ),
+            'watermass_manifest': str(
+                (settings['watermass_output_dir'] / 'manifest.json').resolve()
+            ),
+            'watermass_validation': str(
+                (settings['watermass_output_dir'] / 'validation.json').resolve()
+            ),
+            'read_scope': 'saved parquet/csv/json only; no u/v/w or native field access; no particle integration',
+        },
+        'outputs': {key: str(path.resolve()) for key, path in paths.items()},
+        'figures': {'mechanism_closure': str(paths['mechanism_closure_figure'].resolve())},
+        'validation': final_validation,
+        'complete': bool(final_validation['complete']),
+    }
+    _ofes_atomic_write_json(manifest, paths['manifest'])
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': final_validation,
+        'paired_path_daily': paired_daily,
+        'paired_path_seed_summary': seed_summary,
+        'member_property_excursion': member,
+        'member_property_arm_summary': member_arm_summary,
+        'structure_compatibility_daily': structure_daily,
+        'structure_compatibility_summary': structure_summary,
+        'structure_compatibility_candidate_registry': candidate_registry,
+        'structure_compatibility_path_periods': path_periods,
+        'verdict': verdict,
+        'figures': {'mechanism_closure': paths['mechanism_closure_figure']},
+        'paths': paths,
+    }
+
+
+def build_ofes_dual_endpoint_mechanism_closure(
+    case_spec: Mapping,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """闭合双端点试验的配对路径、性质连续性和 candidate 失配证据。
+
+    本 producer 从已完成的水团复核目录读取 endpoint registration、3-D/C2 配对表和
+    trajectory structure registration，逐 seed、逐 calendar day 汇总结果。它不读取速度场
+    或原生场，也不重新积分粒子；Notebook 只负责提供案例身份与输出目录。
+
+    参数:
+        - case_spec (Mapping): Notebook 提供的诊断案例身份、上游目录和完整日期窗口。
+        - output_dir (str | Path | None): 覆盖 case_spec 中的机制闭合输出目录。
+
+    返回:
+        - dict: 逐日配对表、seed 汇总、逐成员性质表、candidate 汇总、manifest、validation、图件和裁决。
+
+    输出:
+        - `output_dir/paired_path_daily.csv`、`paired_path_seed_summary.csv`、`member_property_excursion.csv`、
+          `structure_compatibility_daily.csv`、`structure_compatibility_summary.csv`、`validation.json`、
+          `manifest.json`、`verdict_zh.md` 和 `figure_mechanism_closure.png` 等闭合产物。
+
+    说明:
+        - 所有计数和日期从上游身份及表格推导；不硬编码案例、seed 数或 trajectory-day 数。
+        - `same-seed` 只表示正式配对键，candidate 类别按当日全部候选聚合；结果不等同完整动力结构、整个对象或严格同一 SCV。
+    """
+    settings = _ofes_dual_endpoint_mechanism_closure_parse_case_spec(
+        case_spec,
+        output_dir,
+    )
+    paired_daily, _ = _ofes_dual_endpoint_mechanism_closure_load_pairs(settings)
+    seed_summary = _ofes_dual_endpoint_mechanism_closure_seed_summary(
+        paired_daily,
+        settings,
+    )
+    member, member_arm_summary = _ofes_dual_endpoint_mechanism_closure_member_properties(
+        paired_daily,
+        settings,
+    )
+    (
+        structure_daily,
+        candidate_registry,
+        path_periods,
+        _,
+    ) = _ofes_dual_endpoint_mechanism_closure_structure_tables(
+        paired_daily,
+        settings,
+    )
+    structure_summary = _ofes_dual_endpoint_mechanism_closure_summary(
+        structure_daily,
+        settings,
+    )
+    validation = _ofes_dual_endpoint_mechanism_closure_validation(
+        paired_daily,
+        seed_summary,
+        member,
+        member_arm_summary,
+        structure_daily,
+        structure_summary,
+        candidate_registry,
+        path_periods,
+        settings,
+    )
+    return _ofes_dual_endpoint_mechanism_closure_write_outputs(
+        paired_daily,
+        seed_summary,
+        member,
+        member_arm_summary,
+        structure_daily,
+        structure_summary,
+        candidate_registry,
+        path_periods,
+        validation,
+        settings,
+    )
+
+
+def load_ofes_dual_endpoint_mechanism_closure(
+    output_dir: str | Path,
+) -> dict:
+    """读取已保存的双端点机制闭合结果并拒绝坏身份或坏行数。
+
+    读取器只消费机制闭合目录中的 CSV、JSON、PNG 和裁决文本，不重读 OFES 场、不调用
+    积分器，也不改变上游水团复核产物。
+
+    参数:
+        - output_dir (str | Path): 已完成的机制闭合输出目录。
+
+    返回:
+        - dict: manifest、validation、各结果表、图件路径和中文裁决。
+
+    输出:
+        - 无文件输出；读取器不会修改结果目录。
+
+    说明:
+        - loader 会核对诊断 case_id、上游 source_case_id/case_identity、逐日行数、分类计数和 PNG 元数据。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    required = {
+        'paired_path_daily.csv',
+        'paired_path_seed_summary.csv',
+        'member_property_excursion.csv',
+        'member_property_arm_summary.csv',
+        'structure_compatibility_daily.csv',
+        'structure_compatibility_summary.csv',
+        'structure_compatibility_candidate_registry.csv',
+        'structure_compatibility_path_periods.csv',
+        'validation.json',
+        'manifest.json',
+        'verdict_zh.md',
+        'figure_mechanism_closure.png',
+    }
+    missing = sorted(name for name in required if not (root / name).is_file())
+    if missing:
+        raise FileNotFoundError(
+            f'Mechanism closure output lacks files: {missing}'
+        )
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    if (
+        manifest.get('analysis') != 'ofes_dual_endpoint_mechanism_closure'
+        or validation.get('analysis') != 'ofes_dual_endpoint_mechanism_closure'
+        or not bool(manifest.get('complete'))
+        or not bool(validation.get('complete'))
+    ):
+        raise ValueError('The mechanism closure output is incomplete or has a wrong analysis.')
+    diagnostic_case_id = str(manifest.get('case_id'))
+    source_case_id = str(manifest.get('source_case_id'))
+    source_identity = manifest.get('source_case_identity')
+    source_manifest_identity = manifest.get('source_manifest_identity')
+    manifest_case_identity = manifest.get('case_identity')
+    manifest_validation = manifest.get('validation')
+    if not isinstance(source_identity, Mapping) or not isinstance(
+        source_manifest_identity, Mapping
+    ):
+        raise ValueError('Mechanism closure manifest lacks upstream identity.')
+    if (
+        str(validation.get('diagnostic_case_id')) != diagnostic_case_id
+        or str(validation.get('source_case_id')) != source_case_id
+        or validation.get('source_case_identity') != source_identity
+        or validation.get('source_manifest_identity') != source_manifest_identity
+        or not bool(source_manifest_identity.get('complete'))
+        or str(source_manifest_identity.get('case_id')) != source_case_id
+        or source_manifest_identity.get('case_identity') != source_identity
+        or not isinstance(manifest_case_identity, Mapping)
+        or str(manifest_case_identity.get('case_id')) != diagnostic_case_id
+        or str(manifest_case_identity.get('source_case_id')) != source_case_id
+        or manifest_case_identity.get('source_case_identity') != source_identity
+        or not isinstance(manifest_validation, Mapping)
+        or not bool(manifest_validation.get('complete'))
+        or str(manifest_validation.get('diagnostic_case_id'))
+        != diagnostic_case_id
+        or str(manifest_validation.get('source_case_id')) != source_case_id
+        or manifest_validation.get('source_case_identity') != source_identity
+        or manifest_validation.get('source_manifest_identity')
+        != source_manifest_identity
+    ):
+        raise ValueError('Mechanism closure manifest and validation identities disagree.')
+    read_specs = {
+        'paired_path_daily': ('paired_path_daily.csv', {'calendar_time': 'datetime'}),
+        'paired_path_seed_summary': ('paired_path_seed_summary.csv', {}),
+        'member_property_excursion': ('member_property_excursion.csv', {}),
+        'member_property_arm_summary': ('member_property_arm_summary.csv', {}),
+        'structure_compatibility_daily': (
+            'structure_compatibility_daily.csv',
+            {'calendar_time': 'datetime'},
+        ),
+        'structure_compatibility_summary': ('structure_compatibility_summary.csv', {}),
+        'structure_compatibility_candidate_registry': (
+            'structure_compatibility_candidate_registry.csv',
+            {},
+        ),
+        'structure_compatibility_path_periods': (
+            'structure_compatibility_path_periods.csv',
+            {},
+        ),
+    }
+    frames = {}
+    for key, (filename, parse) in read_specs.items():
+        frames[key] = pd.read_csv(
+            root / filename,
+            parse_dates=list(parse),
+        )
+    for key, frame in frames.items():
+        if (
+            'case_id' not in frame.columns
+            or set(frame['case_id'].dropna().astype(str)) != {diagnostic_case_id}
+            or 'source_case_id' not in frame.columns
+            or set(frame['source_case_id'].dropna().astype(str)) != {source_case_id}
+        ):
+            raise ValueError(f'{key} contains mismatched case identity.')
+    expected = {
+        'paired_path_daily': int(validation.get('expected_paired_path_daily_rows', -1)),
+        'paired_path_seed_summary': int(validation.get('arrived_3d_trajectory_count', -1)),
+        'member_property_excursion': int(validation.get('expected_member_property_rows', -1)),
+        'structure_compatibility_daily': int(
+            validation.get('expected_structure_compatibility_daily_rows', -1)
+        ),
+        'structure_compatibility_summary': int(
+            validation.get('structure_summary_expected_rows', -1)
+        ),
+    }
+    for key, expected_rows in expected.items():
+        if len(frames[key]) != expected_rows:
+            raise ValueError(
+                f'{key} row count {len(frames[key])} does not match validation {expected_rows}.'
+            )
+    daily = frames['paired_path_daily']
+    if daily.duplicated(['trajectory_key_3d', 'calendar_time']).any():
+        raise ValueError('The paired daily table contains duplicate trajectory-days.')
+    structure_daily = frames['structure_compatibility_daily']
+    categories = set(structure_daily['classification'].astype(str))
+    expected_categories = set(validation.get('structure_categories', []))
+    if not categories.issubset(expected_categories):
+        raise ValueError('The structure daily table contains an unknown category.')
+    saved_counts = {
+        category: int(
+            structure_daily['classification'].eq(category).sum()
+        )
+        for category in expected_categories
+    }
+    validated_counts = {
+        str(key): int(value)
+        for key, value in validation.get('structure_classification_counts', {}).items()
+    }
+    if saved_counts != validated_counts:
+        raise ValueError('The structure classification counts do not match validation.')
+    summary_overall = frames['structure_compatibility_summary'].loc[
+        frames['structure_compatibility_summary']['scope'].eq('overall')
+    ]
+    summary_counts = {
+        str(row.classification): int(row.count)
+        for row in summary_overall.itertuples(index=False)
+    }
+    if summary_counts != validated_counts:
+        raise ValueError('The structure summary counts do not match daily data.')
+    figure_path = root / 'figure_mechanism_closure.png'
+    figure = validation.get('figure')
+    manifest_figures = manifest.get('figures')
+    if (
+        not isinstance(figure, Mapping)
+        or not isinstance(manifest_figures, Mapping)
+        or Path(str(manifest_figures.get('mechanism_closure'))).name
+        != figure_path.name
+        or int(figure.get('point_count', -1)) != len(daily)
+        or int(figure.get('trajectory_count', -1))
+        != daily['trajectory_key_3d'].nunique()
+        or not bool(figure.get('png_readable'))
+    ):
+        raise ValueError('The mechanism closure figure metadata does not match tables.')
+    image = plt.imread(figure_path)
+    if (
+        image.ndim not in (2, 3)
+        or image.shape[0] != int(figure.get('pixel_height', -1))
+        or image.shape[1] != int(figure.get('pixel_width', -1))
+        or not np.isfinite(image).all()
+    ):
+        raise ValueError('The mechanism closure figure PNG is unreadable or inconsistent.')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        **frames,
+        'verdict': (root / 'verdict_zh.md').read_text(encoding='utf-8'),
+        'figures': {'mechanism_closure': figure_path},
+    }
+
+
 def _ofes_dual_endpoint_case_settings(
     case_spec: dict,
     output_dir: str | Path | None = None,
