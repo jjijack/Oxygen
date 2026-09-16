@@ -97108,6 +97108,1763 @@ def load_ofes_dual_endpoint_watermass_review(
     }
 
 
+_OFES_DO50_DETECTABILITY_RULE_VERSION = (
+    'daily_positive_peak_half_amplitude_core_v1'
+)
+
+
+def _ofes_do50_detectability_parse_case_spec(
+    case_spec: Mapping,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """解析 DO50 可探测性诊断规格并锁定输入身份。"""
+    required = {
+        'case_id',
+        'watermass_output_dir',
+        'output_dir',
+        'start_date',
+        'end_date',
+        'do_threshold',
+        'association_rule',
+    }
+    if not isinstance(case_spec, Mapping):
+        raise TypeError('case_spec must be a mapping.')
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise ValueError(
+            f'DO50 detectability case_spec lacks fields: {missing}'
+        )
+    watermass_root = Path(case_spec['watermass_output_dir']).expanduser().resolve()
+    root = Path(
+        output_dir if output_dir is not None else case_spec['output_dir']
+    ).expanduser().resolve()
+    if root == watermass_root:
+        raise ValueError(
+            'DO50 detectability output must be a child of the watermass review.'
+        )
+    try:
+        root.relative_to(watermass_root)
+    except ValueError as exc:
+        raise ValueError(
+            'DO50 detectability output must live under watermass_output_dir.'
+        ) from exc
+    start_date = pd.Timestamp(case_spec['start_date']).normalize()
+    end_date = pd.Timestamp(case_spec['end_date']).normalize()
+    if end_date <= start_date:
+        raise ValueError('The diagnostic date window must be increasing.')
+    threshold = float(case_spec['do_threshold'])
+    formal_config = make_detection_config('do')
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError('do_threshold must be finite and positive.')
+    if not np.isclose(
+        threshold,
+        float(formal_config.do_threshold),
+        rtol=0.0,
+        atol=0.0,
+    ):
+        raise ValueError(
+            'The diagnostic must use the current formal DO threshold without '
+            'changing the detector configuration.'
+        )
+    rule = dict(case_spec['association_rule'])
+    if str(rule.get('version')) != _OFES_DO50_DETECTABILITY_RULE_VERSION:
+        raise ValueError(
+            'The particle-layer association rule version is not recognized.'
+        )
+    half_window_m = float(rule.get('half_window_m', np.nan))
+    half_fraction = float(rule.get('half_amplitude_fraction', np.nan))
+    depth_tolerance_m = float(rule.get('depth_tolerance_m', np.nan))
+    if not np.isclose(
+        half_window_m,
+        float(formal_config.depth_interval),
+        rtol=0.0,
+        atol=0.0,
+    ):
+        raise ValueError(
+            'The association half-window must equal the formal detector '
+            'depth interval.'
+        )
+    if not (
+        np.isfinite(half_fraction)
+        and 0.0 < half_fraction <= 1.0
+        and np.isfinite(depth_tolerance_m)
+        and depth_tolerance_m >= 0.0
+    ):
+        raise ValueError('The association rule contains invalid numeric values.')
+    normalized_rule = {
+        'version': _OFES_DO50_DETECTABILITY_RULE_VERSION,
+        'half_window_m': half_window_m,
+        'half_amplitude_fraction': half_fraction,
+        'depth_tolerance_m': depth_tolerance_m,
+        'selection_order': 'maximum_positive_delta_then_nearest_particle_depth_then_shallowest_depth',
+    }
+    manifest_path = watermass_root / 'manifest.json'
+    validation_path = watermass_root / 'validation.json'
+    required_inputs = (
+        manifest_path,
+        validation_path,
+        watermass_root / 'trajectory_properties_daily.parquet',
+        watermass_root / 'particle_endpoint_registration.csv',
+        watermass_root / 'along_path_profile_metrics.csv',
+    )
+    missing_inputs = [str(path) for path in required_inputs if not path.is_file()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            f'Watermass review lacks diagnostic inputs: {missing_inputs}'
+        )
+    watermass_manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    watermass_validation = json.loads(
+        validation_path.read_text(encoding='utf-8')
+    )
+    if watermass_manifest.get('analysis') != 'dual_endpoint_watermass_review':
+        raise ValueError('The supplied watermass output is not the formal review.')
+    if not bool(watermass_manifest.get('complete')):
+        raise ValueError('The supplied watermass review is not complete.')
+    upstream_case_id = watermass_manifest.get('case_id')
+    upstream_case_identity = watermass_manifest.get('case_identity')
+    required_gates = watermass_validation.get('required_gates')
+    if not upstream_case_id or not isinstance(upstream_case_identity, Mapping):
+        raise ValueError(
+            'The watermass manifest lacks a complete upstream case identity.'
+        )
+    if (
+        watermass_validation.get('analysis')
+        != watermass_manifest.get('analysis')
+        or str(watermass_validation.get('case_id'))
+        != str(upstream_case_id)
+        or not bool(watermass_validation.get('complete'))
+        or int(watermass_validation.get('exception_count', 0)) != 0
+        or not isinstance(required_gates, Mapping)
+        or not required_gates
+        or not all(bool(value) for value in required_gates.values())
+    ):
+        raise ValueError(
+            'The watermass validation is incomplete or has a mismatched identity.'
+        )
+    manifest_window = watermass_manifest.get('daily_window', {})
+    if (
+        pd.Timestamp(manifest_window.get('start_date')).normalize() != start_date
+        or pd.Timestamp(manifest_window.get('end_date')).normalize() != end_date
+    ):
+        raise ValueError(
+            'Diagnostic dates do not match the formal watermass review window.'
+        )
+    existing_manifest = root / 'manifest.json'
+    if root.exists() and existing_manifest.exists():
+        saved = json.loads(existing_manifest.read_text(encoding='utf-8'))
+        saved_watermass_identity = saved.get(
+            'watermass_review_manifest_identity', {}
+        )
+        saved_watermass_case_id = saved.get(
+            'watermass_review_case_id',
+            saved_watermass_identity.get('case_id'),
+        )
+        saved_watermass_case_identity = saved.get(
+            'watermass_review_case_identity',
+            saved_watermass_identity.get('case_identity'),
+        )
+        if (
+            saved.get('analysis') != 'ofes_do50_detectability_diagnostic'
+            or str(saved.get('case_id')) != str(case_spec['case_id'])
+            or saved.get('association_rule') != normalized_rule
+            or saved.get('formal_detector', {}).get('do_threshold')
+            != float(formal_config.do_threshold)
+            or str(saved_watermass_case_id)
+            != str(upstream_case_id)
+            or saved_watermass_case_identity
+            != upstream_case_identity
+            or not bool(saved_watermass_identity.get('complete'))
+        ):
+            raise ValueError(
+                'Existing DO50 detectability output has a different identity.'
+            )
+    elif root.exists() and any(root.iterdir()):
+        raise ValueError(
+            'Refusing to write a non-empty diagnostic directory without a manifest.'
+        )
+    return {
+        'case_id': str(case_spec['case_id']),
+        'case_label': str(case_spec.get('case_label', case_spec['case_id'])),
+        'watermass_output_dir': watermass_root,
+        'output_dir': root,
+        'start_date': start_date,
+        'end_date': end_date,
+        'dates': pd.date_range(start_date, end_date, freq='D'),
+        'do_threshold': threshold,
+        'formal_config': formal_config,
+        'association_rule': normalized_rule,
+        'watermass_manifest': watermass_manifest,
+        'watermass_validation': watermass_validation,
+        'watermass_case_id': str(upstream_case_id),
+        'watermass_case_identity': dict(upstream_case_identity),
+    }
+
+
+def _ofes_do50_detectability_profile_sampling(
+    snapshot: dict,
+    lon: float,
+    lat: float,
+) -> str:
+    """返回当前剖面的水平插值支撑标签。"""
+    lat_arr = np.asarray(snapshot['lat'], dtype=float)
+    lon_arr = np.asarray(snapshot['lon'], dtype=float)
+    if lat_arr.size < 2 or lon_arr.size < 2:
+        return 'nearest_neighbor_insufficient_bracket'
+    j = int(np.clip(np.searchsorted(lat_arr, lat) - 1, 0, lat_arr.size - 2))
+    i = int(np.clip(np.searchsorted(lon_arr, lon) - 1, 0, lon_arr.size - 2))
+    for variable in ('do2', 'temp', 'salinity'):
+        arr = np.asarray(snapshot[variable], dtype=float)
+        col = (
+            (1.0 - (lat - lat_arr[j]) / (lat_arr[j + 1] - lat_arr[j]))
+            * (1.0 - (lon - lon_arr[i]) / (lon_arr[i + 1] - lon_arr[i]))
+            * arr[:, j, i]
+            + (1.0 - (lat - lat_arr[j]) / (lat_arr[j + 1] - lat_arr[j]))
+            * ((lon - lon_arr[i]) / (lon_arr[i + 1] - lon_arr[i]))
+            * arr[:, j, i + 1]
+            + ((lat - lat_arr[j]) / (lat_arr[j + 1] - lat_arr[j]))
+            * (1.0 - (lon - lon_arr[i]) / (lon_arr[i + 1] - lon_arr[i]))
+            * arr[:, j + 1, i]
+            + ((lat - lat_arr[j]) / (lat_arr[j + 1] - lat_arr[j]))
+            * ((lon - lon_arr[i]) / (lon_arr[i + 1] - lon_arr[i]))
+            * arr[:, j + 1, i + 1]
+        )
+        if np.all(np.isnan(col)):
+            return 'nearest_neighbor_fallback_all_nan_column'
+    return 'bilinear_adjacent_tracer_centers'
+
+
+def _ofes_do50_detectability_peak_rows(
+    profile: pd.DataFrame,
+    formal_config: DetectionConfig,
+    *,
+    half_window_m: float,
+    half_amplitude_fraction: float,
+) -> dict:
+    """按正式 DO 峰和参考线返回未设阈值的正峰及离散半振幅核。"""
+    required = {'Depth', 'do2', 'temp', 'salinity'}
+    if not required.issubset(profile.columns):
+        return {
+            'status': 'invalid_missing_profile_columns',
+            'profile': pd.DataFrame(),
+            'peak_rows': [],
+            'peak_count': 0,
+            'positive_peak_count': 0,
+            'valid_level_count': 0,
+            'near_zero_count': 0,
+        }
+    work = profile.loc[:, ['Depth', 'do2', 'temp', 'salinity']].copy()
+    for column in work.columns:
+        work[column] = pd.to_numeric(work[column], errors='coerce')
+    near_zero = (
+        work['do2'].notna()
+        & work['do2'].le(float(formal_config.do_near_zero_threshold))
+    )
+    near_zero_count = int(near_zero.sum())
+    if (
+        formal_config.do_near_zero_max_count is not None
+        and near_zero_count > int(formal_config.do_near_zero_max_count)
+    ):
+        return {
+            'status': 'invalid_near_zero_profile_rejected',
+            'profile': pd.DataFrame(),
+            'peak_rows': [],
+            'peak_count': 0,
+            'positive_peak_count': 0,
+            'valid_level_count': 0,
+            'near_zero_count': near_zero_count,
+        }
+    work.loc[near_zero, 'do2'] = np.nan
+    work = work.dropna(subset=['Depth', 'do2', 'temp', 'salinity'])
+    work = work.sort_values('Depth', kind='mergesort')
+    work = work.drop_duplicates('Depth', keep='first').reset_index(drop=True)
+    if len(work) < 5:
+        return {
+            'status': 'invalid_insufficient_profile_levels',
+            'profile': work,
+            'peak_rows': [],
+            'peak_count': 0,
+            'positive_peak_count': 0,
+            'valid_level_count': int(len(work)),
+            'near_zero_count': near_zero_count,
+        }
+    depth = work['Depth'].to_numpy(dtype=float)
+    do_values = work['do2'].to_numpy(dtype=float)
+    if not np.all(np.diff(depth) > 0):
+        return {
+            'status': 'invalid_nonmonotonic_profile_depth',
+            'profile': work,
+            'peak_rows': [],
+            'peak_count': 0,
+            'positive_peak_count': 0,
+            'valid_level_count': int(len(work)),
+            'near_zero_count': near_zero_count,
+        }
+    slopes = np.gradient(do_values, depth)
+    peak_rows = []
+    peak_count = 0
+    for level_index in range(1, len(depth) - 1):
+        if not (slopes[level_index - 1] > 0 and slopes[level_index + 1] < 0):
+            continue
+        target_depth = float(depth[level_index])
+        if (
+            formal_config.anomaly_max_depth is not None
+            and formal_config.anomaly_max_depth > 0
+            and target_depth > float(formal_config.anomaly_max_depth)
+        ):
+            continue
+        lower = int(np.searchsorted(
+            depth,
+            max(0.0, target_depth - float(half_window_m)),
+            side='left',
+        ))
+        upper = int(np.searchsorted(
+            depth,
+            target_depth + float(half_window_m),
+            side='right',
+        ) - 1)
+        if lower >= upper:
+            continue
+        reference = float(np.interp(
+            target_depth,
+            [depth[lower], depth[upper]],
+            [do_values[lower], do_values[upper]],
+        ))
+        peak_delta = float(do_values[level_index] - reference)
+        peak_count += 1
+        if not np.isfinite(peak_delta) or peak_delta <= 0:
+            continue
+        segment_depth = depth[lower:upper + 1]
+        segment_values = do_values[lower:upper + 1]
+        segment_reference = np.interp(
+            segment_depth,
+            [depth[lower], depth[upper]],
+            [do_values[lower], do_values[upper]],
+        )
+        above_half = (
+            segment_values - segment_reference
+            >= float(half_amplitude_fraction) * peak_delta
+        )
+        peak_local = level_index - lower
+        if not above_half[peak_local]:
+            continue
+        left = peak_local
+        right = peak_local
+        while left > 0 and above_half[left - 1]:
+            left -= 1
+        while right + 1 < len(above_half) and above_half[right + 1]:
+            right += 1
+        upper_edge = (
+            segment_depth[left]
+            if left == 0
+            else 0.5 * (segment_depth[left - 1] + segment_depth[left])
+        )
+        lower_edge = (
+            segment_depth[right]
+            if right + 1 == len(segment_depth)
+            else 0.5 * (segment_depth[right] + segment_depth[right + 1])
+        )
+        peak_rows.append(
+            {
+                'peak_level_index': int(level_index),
+                'peak_depth_m': target_depth,
+                'peak_do_umol_kg': float(do_values[level_index]),
+                'reference_line_do_umol_kg': reference,
+                'delta_do_umol_kg': peak_delta,
+                'half_amplitude_upper_depth_m': float(upper_edge),
+                'half_amplitude_lower_depth_m': float(lower_edge),
+                'half_amplitude_thickness_m': float(
+                    max(0.0, lower_edge - upper_edge)
+                ),
+            }
+        )
+    return {
+        'status': 'evaluated',
+        'profile': work,
+        'peak_rows': peak_rows,
+        'peak_count': peak_count,
+        'positive_peak_count': int(len(peak_rows)),
+        'valid_level_count': int(len(work)),
+        'near_zero_count': near_zero_count,
+    }
+
+
+def _ofes_do50_detectability_load_snapshots(
+    properties: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+) -> tuple[dict[pd.Timestamp, dict], list[dict]]:
+    """按诊断轨迹位置读取每日标量剖面输入，不读取速度或重放轨迹。"""
+    contexts: dict[pd.Timestamp, dict] = {}
+    inventory = []
+    for stamp in dates:
+        day = properties.loc[properties['calendar_time'].eq(stamp)]
+        active = day.loc[
+            day['status'].eq('active')
+            & np.isfinite(day['depth_m'])
+            & np.isfinite(day['lat'])
+            & np.isfinite(day['lon'])
+        ]
+        if active.empty:
+            raise ValueError(
+                f'No finite active diagnostic positions on {stamp:%Y-%m-%d}.'
+            )
+        tracer_lon, tracer_lat, _, _, _ = _ofes_tracer_coordinates(stamp)
+        lon_bounds = _ofes_watermass_axis_bounds(
+            tracer_lon,
+            active['lon'].to_numpy(dtype=float),
+        )
+        lat_bounds = _ofes_watermass_axis_bounds(
+            tracer_lat,
+            active['lat'].to_numpy(dtype=float),
+        )
+        snapshot = load_ofes_snapshot(
+            stamp,
+            variables=['do2', 'temp', 'salinity'],
+            lon_bounds=lon_bounds,
+            lat_bounds=lat_bounds,
+            depth_bounds=(0.0, 1000.0),
+        )
+        _ofes_watermass_assert_point_bounds(
+            active[['depth_m', 'lat', 'lon']].to_numpy(dtype=float),
+            snapshot,
+        )
+        source_files = {
+            variable: str(_ofes_file_path(variable, stamp).resolve())
+            for variable in ('do2', 'temp', 'salinity')
+        }
+        snapshot.setdefault('metadata', {})['do50_detectability_read'] = {
+            'scalar_lon_bounds': list(lon_bounds),
+            'scalar_lat_bounds': list(lat_bounds),
+            'scalar_depth_bounds_m': [0.0, 1000.0],
+            'halo_grid_cells': 1,
+            'source_files': source_files,
+            'scalar_source': 'OFES tracer snapshot at exact calendar midnight',
+            'position_count': int(len(active)),
+        }
+        contexts[pd.Timestamp(stamp)] = snapshot
+        inventory.append(
+            {
+                'date': pd.Timestamp(stamp).date().isoformat(),
+                **snapshot['metadata']['do50_detectability_read'],
+            }
+        )
+    return contexts, inventory
+
+
+def _ofes_do50_detectability_summary(
+    daily: pd.DataFrame,
+    settings: dict,
+) -> pd.DataFrame:
+    """生成总体及分臂的互斥分类汇总。"""
+    categories = (
+        'same_peak_ge50',
+        'same_peak_sub50_positive',
+        'peak_outside_particle_layer',
+        'peak_shape_absent',
+        'invalid',
+    )
+    rows = []
+    scopes = [('overall', None)] + [
+        ('arm', arm) for arm in sorted(daily['arm'].astype(str).unique())
+    ]
+    for scope, arm in scopes:
+        subset = daily if arm is None else daily.loc[daily['arm'].eq(arm)]
+        total = int(len(subset))
+        for category in categories:
+            count = int(subset['classification'].eq(category).sum())
+            rows.append(
+                {
+                    'case_id': settings['case_id'],
+                    'scope': scope,
+                    'arm': arm,
+                    'classification': category,
+                    'count': count,
+                    'total_days': total,
+                    'fraction': float(count / total) if total else np.nan,
+                    'formal_detected_count': int(
+                        subset.loc[
+                            subset['classification'].eq(category),
+                            'formal_do50_detected',
+                        ].astype(bool).sum()
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _ofes_do50_detectability_validation(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    settings: dict,
+    inventory: list[dict],
+) -> dict:
+    """检查诊断行数、分类、阈值对齐和数值身份。"""
+    categories = {
+        'same_peak_ge50',
+        'same_peak_sub50_positive',
+        'peak_outside_particle_layer',
+        'peak_shape_absent',
+        'invalid',
+    }
+    category_counts = daily['classification'].value_counts(dropna=False)
+    classification_exhaustive = bool(
+        daily['classification'].notna().all()
+        and set(category_counts.index).issubset(categories)
+        and int(category_counts.sum()) == len(daily)
+    )
+    finite_associated = daily['associated_peak_delta_do_umol_kg'].notna()
+    associated_identity_error = (
+        daily.loc[finite_associated, 'associated_peak_do_umol_kg']
+        - daily.loc[finite_associated, 'associated_reference_line_do_umol_kg']
+        - daily.loc[finite_associated, 'associated_peak_delta_do_umol_kg']
+    ).abs()
+    finite_candidate = daily['candidate_peak_delta_do_umol_kg'].notna()
+    candidate_identity_error = (
+        daily.loc[finite_candidate, 'candidate_peak_do_umol_kg']
+        - daily.loc[finite_candidate, 'candidate_reference_line_do_umol_kg']
+        - daily.loc[finite_candidate, 'candidate_peak_delta_do_umol_kg']
+    ).abs()
+    finite_difference = daily['candidate_peak_depth_abs_difference_m'].notna()
+    candidate_difference_error = (
+        daily.loc[finite_difference, 'candidate_peak_depth_abs_difference_m']
+        - daily.loc[finite_difference, 'candidate_peak_depth_offset_m'].abs()
+    ).abs()
+    finite_thickness = daily['candidate_peak_half_amplitude_thickness_m'].notna()
+    candidate_thickness_error = (
+        daily.loc[finite_thickness, 'candidate_peak_half_amplitude_thickness_m']
+        - (
+            daily.loc[finite_thickness, 'candidate_peak_lower_depth_m']
+            - daily.loc[finite_thickness, 'candidate_peak_upper_depth_m']
+        )
+    ).abs()
+    finite_formal = daily['formal_do50_detected'].astype(bool)
+    formal_identity_error = (
+        daily.loc[finite_formal, 'formal_peak_do_umol_kg']
+        - daily.loc[finite_formal, 'formal_reference_line_do_umol_kg']
+        - daily.loc[finite_formal, 'formal_delta_do_umol_kg']
+    ).abs()
+    formal_associated_alignment = (
+        daily['formal_do50_detected'].astype(bool)
+        == daily['classification'].eq('same_peak_ge50')
+    )
+    existing_alignment = daily['formal_do50_detected'].astype(bool).eq(
+        daily['existing_virtual_do50_detected'].astype(bool)
+    )
+    global_alignment = (
+        daily['formal_do50_detected'].astype(bool)
+        == daily['global_positive_peak_delta_do_umol_kg'].ge(
+            float(settings['do_threshold'])
+        )
+    )
+    raw_profile_error = pd.to_numeric(
+        daily['raw_do_property_minus_profile_at_particle_umol_kg'],
+        errors='coerce',
+    ).abs()
+    row_count_expected = int(
+        daily['trajectory_key'].nunique()
+        * max(len(settings['dates']) - 2, 0)
+    )
+    summary_overall = summary.loc[summary['scope'].eq('overall')]
+    daily_case_ids = set(daily['case_id'].dropna().astype(str))
+    source_case_ids = set(daily['source_case_id'].dropna().astype(str))
+    summary_case_ids = set(summary['case_id'].dropna().astype(str))
+    daily_case_identity_matches = daily_case_ids == {settings['case_id']}
+    source_case_identity_matches = (
+        source_case_ids == {settings['watermass_case_id']}
+    )
+    summary_case_identity_matches = summary_case_ids == {settings['case_id']}
+    summary_expected_rows = int(
+        5 * (1 + daily['arm'].astype(str).nunique())
+    )
+    watermass_validation_identity_matches = bool(
+        settings['watermass_validation'].get('analysis')
+        == settings['watermass_manifest'].get('analysis')
+        and str(settings['watermass_validation'].get('case_id'))
+        == str(settings['watermass_case_id'])
+        and bool(settings['watermass_validation'].get('complete'))
+    )
+    return {
+        'analysis': 'ofes_do50_detectability_diagnostic',
+        'complete': bool(
+            classification_exhaustive
+            and len(daily) == row_count_expected
+            and daily_case_identity_matches
+            and source_case_identity_matches
+            and summary_case_identity_matches
+            and len(summary) == summary_expected_rows
+            and watermass_validation_identity_matches
+            and not daily.duplicated(['trajectory_key', 'calendar_date']).any()
+            and bool(formal_associated_alignment.all())
+            and bool(existing_alignment.all())
+            and bool(global_alignment.all())
+            and (
+                associated_identity_error.empty
+                or associated_identity_error.max() <= 1e-5
+            )
+            and (
+                candidate_identity_error.empty
+                or candidate_identity_error.max() <= 1e-5
+            )
+            and (
+                candidate_difference_error.empty
+                or candidate_difference_error.max() <= 1e-8
+            )
+            and (
+                candidate_thickness_error.empty
+                or candidate_thickness_error.max() <= 1e-8
+            )
+            and (
+                formal_identity_error.empty
+                or formal_identity_error.max() <= 1e-5
+            )
+            and (
+                raw_profile_error.dropna().empty
+                or raw_profile_error.dropna().max() <= 1e-4
+            )
+        ),
+        'input_identity_locked': True,
+        'diagnostic_case_id': settings['case_id'],
+        'source_case_id': settings['watermass_case_id'],
+        'source_case_identity': settings['watermass_case_identity'],
+        'daily_case_id_unique': len(daily_case_ids) == 1,
+        'daily_case_id_consistent': daily_case_identity_matches,
+        'source_case_id_unique': len(source_case_ids) == 1,
+        'source_case_id_consistent': source_case_identity_matches,
+        'source_case_id_matches_watermass_manifest': source_case_identity_matches,
+        'summary_case_id_unique': len(summary_case_ids) == 1,
+        'summary_case_id_consistent': summary_case_identity_matches,
+        'watermass_validation_identity_matches': watermass_validation_identity_matches,
+        'watermass_review_complete': bool(
+            settings['watermass_manifest'].get('complete')
+        ),
+        'arrived_3d_trajectory_count': int(daily['trajectory_key'].nunique()),
+        'internal_day_count_per_trajectory': int(max(len(settings['dates']) - 2, 0)),
+        'expected_row_count': row_count_expected,
+        'actual_row_count': int(len(daily)),
+        'row_count_gate': bool(len(daily) == row_count_expected),
+        'duplicate_trajectory_date_count': int(
+            daily.duplicated(['trajectory_key', 'calendar_date']).sum()
+        ),
+        'classification_categories': sorted(categories),
+        'classification_exhaustive': classification_exhaustive,
+        'classification_mutually_exclusive': bool(
+            daily['classification'].notna().all()
+            and len(daily) == int(category_counts.sum())
+        ),
+        'classification_counts': {
+            str(key): int(value) for key, value in category_counts.items()
+        },
+        'formal_detected_count': int(daily['formal_do50_detected'].astype(bool).sum()),
+        'associated_ge50_count': int(
+            daily['classification'].eq('same_peak_ge50').sum()
+        ),
+        'formal_detected_equals_associated_ge50': bool(
+            formal_associated_alignment.all()
+        ),
+        'formal_helper_matches_saved_virtual_flag': bool(existing_alignment.all()),
+        'formal_detected_equals_global_unthresholded_ge50': bool(
+            global_alignment.all()
+        ),
+        'associated_delta_reference_identity_max_abs_error': (
+            float(associated_identity_error.max())
+            if not associated_identity_error.empty
+            else 0.0
+        ),
+        'candidate_delta_reference_identity_max_abs_error': (
+            float(candidate_identity_error.max())
+            if not candidate_identity_error.empty
+            else 0.0
+        ),
+        'candidate_depth_difference_identity_max_abs_error': (
+            float(candidate_difference_error.max())
+            if not candidate_difference_error.empty
+            else 0.0
+        ),
+        'candidate_half_amplitude_thickness_identity_max_abs_error': (
+            float(candidate_thickness_error.max())
+            if not candidate_thickness_error.empty
+            else 0.0
+        ),
+        'formal_delta_reference_identity_max_abs_error': (
+            float(formal_identity_error.max())
+            if not formal_identity_error.empty
+            else 0.0
+        ),
+        'raw_do_property_profile_max_abs_error': (
+            float(raw_profile_error.dropna().max())
+            if not raw_profile_error.dropna().empty
+            else 0.0
+        ),
+        'unthresholded_peak_fixed_before_threshold': True,
+        'threshold_application': 'post_hoc_classification_only',
+        'formal_detector_configuration_unchanged': True,
+        'association_rule': settings['association_rule'],
+        'scalar_read_day_count': int(len(inventory)),
+        'summary_overall_rows': int(len(summary_overall)),
+        'summary_expected_rows': summary_expected_rows,
+        'summary_row_count': int(len(summary)),
+    }
+
+
+def _ofes_do50_detectability_verdict(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    validation: dict,
+    settings: dict,
+) -> str:
+    """从分类计数生成直接回答阈值开关问题的中文裁决。"""
+    overall = summary.loc[summary['scope'].eq('overall')].set_index(
+        'classification'
+    )
+    get_count = lambda name: int(overall.loc[name, 'count'])
+    total = int(len(daily))
+    detected = int(daily['formal_do50_detected'].astype(bool).sum())
+    missed = total - detected
+    sub50 = get_count('same_peak_sub50_positive')
+    outside = get_count('peak_outside_particle_layer')
+    absent = get_count('peak_shape_absent')
+    invalid = get_count('invalid')
+    threshold_share = sub50 / missed if missed else np.nan
+    sub50_delta = pd.to_numeric(
+        daily.loc[
+            daily['classification'].eq('same_peak_sub50_positive'),
+            'associated_peak_delta_do_umol_kg',
+        ],
+        errors='coerce',
+    ).dropna()
+    if sub50_delta.empty:
+        sub50_distribution = (
+            '未检出且仍有当日粒子层关联正峰的 ΔDO 没有有限值。'
+        )
+    else:
+        q25, q75 = np.nanpercentile(sub50_delta, [25.0, 75.0])
+        sub50_distribution = (
+            f'未检出且仍有当日粒子层关联正峰的 {len(sub50_delta)} 日，'
+            f'ΔDO 范围为 {sub50_delta.min():.3f}–{sub50_delta.max():.3f} '
+            f'μmol kg⁻¹，median={sub50_delta.median():.3f}，'
+            f'IQR={q25:.3f}–{q75:.3f} μmol kg⁻¹。'
+        )
+    if np.isfinite(threshold_share) and threshold_share > 0.5:
+        main_sentence = (
+            f'未检出 {missed} 日中有 {sub50} 日（{threshold_share:.1%}）仍保留'
+            f'与粒子层关联的正 ΔDO 峰但低于 {settings["do_threshold"]:g}，因此目录缺口的主要原因是'
+            ' DO50 阈值化可探测性的开关。'
+        )
+        continuity_sentence = (
+            f'在本案例的 {validation["arrived_3d_trajectory_count"]} 条到达轨迹和 {validation["internal_day_count_per_trajectory"]} 个内部日范围内，这支持“原始氧异常'
+            '连续存在而阈值化剖面间歇出现”。因此目录断裂主要反映 DO50 可探测性开关，'
+            '解析平流和水团性质连续性未中断。'
+        )
+    else:
+        main_sentence = (
+            f'未检出 {missed} 日中仅有 {sub50} 日（{threshold_share:.1%}）仍保留'
+            f'与粒子层关联的正 ΔDO 峰但低于 {settings["do_threshold"]:g}；缺口由阈值开关与峰层/峰形变化'
+            '共同造成，不能归为单一原因。'
+        )
+        continuity_sentence = (
+            '因此原始氧异常只在同一粒子层关联正峰类别覆盖的日期保持连续，其他日期需按'
+            '峰移层或峰形消失解释。'
+        )
+    arm_lines = []
+    for arm in sorted(daily['arm'].astype(str).unique()):
+        arm_daily = daily.loc[daily['arm'].eq(arm)]
+        arm_lines.append(
+            f'- {arm}：{len(arm_daily)} 日；'
+            + '，'.join(
+                f'{name}={int(arm_daily["classification"].eq(name).sum())}'
+                for name in (
+                    'same_peak_ge50',
+                    'same_peak_sub50_positive',
+                    'peak_outside_particle_layer',
+                    'peak_shape_absent',
+                    'invalid',
+                )
+            )
+        )
+    return (
+        f'# {settings["case_label"]} DO50 可探测性小诊断裁决\n\n'
+        f'诊断对象为正式双端点试验中 {validation["arrived_3d_trajectory_count"]} 条已到达 '
+        f'3-D 轨迹的 {validation["internal_day_count_per_trajectory"]} 个内部日，'
+        f'共 {total} 个粒子日；正式 virtual DO50 检出 {detected}/{total}。\n\n'
+        '## 分类规则\n\n'
+        '先在每个同位置 OFES 原生 DO 剖面上按正式正峰斜率和 ±100 m 端点连线计算'
+        '所有正 ΔDO 峰，再用该峰相对参考线达到 50% 的连续离散半振幅核定义粒子层。'
+        '粒子深度落入该核才算当日与粒子层关联的正峰；`same_peak_*` 仅是这一操作性分类，'
+        '没有另建跨日峰 ID，不表示跨日追踪的是同一个峰；阈值只在未设阈值的峰值保存后后验应用。\n\n'
+        '## 结果\n\n'
+        '| 分类 | 日数 | 占全部 |\n|---|---:|---:|\n'
+        + '\n'.join(
+            f'| `{name}` | {get_count(name)} | {get_count(name) / total:.1%} |'
+            for name in (
+                'same_peak_ge50',
+                'same_peak_sub50_positive',
+                'peak_outside_particle_layer',
+                'peak_shape_absent',
+                'invalid',
+            )
+        )
+        + '\n\n'
+        + '\n'.join(arm_lines)
+        + '\n\n'
+        + main_sentence
+        + '\n'
+        + continuity_sentence
+        + '\n'
+        + sub50_distribution
+        + '\n\n'
+        + f'峰移层 {outside} 日、峰形消失 {absent} 日、无效 {invalid} 日；'
+        + '这些类别没有被并入阈值不足类别。\n\n'
+        + '## 证据边界\n\n'
+        + '该结果针对 virtual profile 的粒子层可探测性，不能升级为整个 DO 对象、'
+        '严格同一 SCV 或物质身份的证明。正式双端点轨迹、种子、目标、半振幅核、'
+        '到达定义和 DO50 detector 配置均未改动，也没有重新积分粒子。\n\n'
+        + f'验证完成：{bool(validation["complete"])}；正式 detected 与关联峰 ≥50 对齐：'
+        f'{bool(validation["formal_detected_equals_associated_ge50"])}。\n'
+    )
+
+
+def _ofes_do50_detectability_plot(
+    daily: pd.DataFrame,
+    settings: dict,
+    figure_path: Path,
+) -> dict:
+    """绘制逐轨迹粒子层关联 ΔDO 与正式阈值开关图。"""
+    required = {
+        'arm',
+        'particle_index',
+        'trajectory_key',
+        'calendar_time',
+        'associated_peak_delta_do_umol_kg',
+        'formal_do50_detected',
+    }
+    missing = sorted(required.difference(daily.columns))
+    if missing:
+        raise ValueError(f'DO50 figure input lacks columns: {missing}')
+    work = daily.loc[
+        :,
+        [
+            'arm',
+            'particle_index',
+            'trajectory_key',
+            'calendar_time',
+            'associated_peak_delta_do_umol_kg',
+            'formal_do50_detected',
+        ],
+    ].copy()
+    work['calendar_time'] = pd.to_datetime(work['calendar_time'])
+    work['associated_peak_delta_do_umol_kg'] = pd.to_numeric(
+        work['associated_peak_delta_do_umol_kg'],
+        errors='coerce',
+    )
+    if work.empty or work['calendar_time'].isna().any():
+        raise ValueError('DO50 figure input has no complete calendar dates.')
+    if work['associated_peak_delta_do_umol_kg'].isna().any():
+        raise ValueError('DO50 figure input has missing associated ΔDO values.')
+    detected = work['formal_do50_detected'].map(
+        lambda value: (
+            value
+            if isinstance(value, (bool, np.bool_))
+            else str(value).strip().lower() in {'1', 'true', 'yes'}
+        )
+    ).astype(bool)
+    threshold = float(settings['do_threshold'])
+    threshold_alignment = bool(
+        np.array_equal(
+            detected.to_numpy(dtype=bool),
+            work['associated_peak_delta_do_umol_kg'].ge(threshold).to_numpy(
+                dtype=bool
+            ),
+        )
+    )
+    if not threshold_alignment:
+        raise ValueError('DO50 figure detected flags do not match the threshold.')
+    work['formal_do50_detected'] = detected.to_numpy(dtype=bool)
+    track_table = work.loc[
+        :, ['trajectory_key', 'arm', 'particle_index']
+    ].drop_duplicates()
+    if len(track_table) != work['trajectory_key'].nunique():
+        raise ValueError('DO50 figure input has inconsistent trajectory identities.')
+    track_table = track_table.sort_values(
+        ['arm', 'particle_index', 'trajectory_key'],
+        kind='mergesort',
+    )
+    arms = track_table['arm'].astype(str).drop_duplicates().tolist()
+    if not arms:
+        raise ValueError('DO50 figure input has no trajectory arm.')
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes_grid = plt.subplots(
+        1,
+        len(arms),
+        figsize=(7.4, 4.8),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    axes = axes_grid[0]
+    colors = plt.get_cmap('tab10')(
+        np.linspace(0.05, 0.95, max(len(track_table), 1))
+    )
+    line_styles = ['-', '--', '-.', ':']
+    track_handles = []
+    for track_number, track_row in enumerate(track_table.itertuples(index=False)):
+        panel_index = arms.index(str(track_row.arm))
+        axis = axes[panel_index]
+        track = work.loc[
+            work['trajectory_key'].eq(track_row.trajectory_key)
+        ].sort_values('calendar_time', kind='mergesort')
+        line, = axis.plot(
+            track['calendar_time'],
+            track['associated_peak_delta_do_umol_kg'],
+            color=colors[track_number],
+            linestyle=line_styles[panel_index % len(line_styles)],
+            linewidth=1.25,
+            alpha=0.9,
+            zorder=2,
+        )
+        track_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=colors[track_number],
+                linestyle=line_styles[panel_index % len(line_styles)],
+                linewidth=1.6,
+                label=f'{track_row.arm} / particle {int(track_row.particle_index)}',
+            )
+        )
+        detected_track = track['formal_do50_detected'].astype(bool)
+        axis.scatter(
+            track.loc[detected_track, 'calendar_time'],
+            track.loc[detected_track, 'associated_peak_delta_do_umol_kg'],
+            marker='o',
+            s=28,
+            facecolor=colors[track_number],
+            edgecolor='black',
+            linewidth=0.45,
+            zorder=3,
+        )
+        axis.scatter(
+            track.loc[~detected_track, 'calendar_time'],
+            track.loc[~detected_track, 'associated_peak_delta_do_umol_kg'],
+            marker='s',
+            s=29,
+            facecolor='white',
+            edgecolor=colors[track_number],
+            linewidth=0.9,
+            zorder=3,
+        )
+
+    y_values = work['associated_peak_delta_do_umol_kg'].to_numpy(dtype=float)
+    y_min = min(float(np.nanmin(y_values)), threshold)
+    y_max = max(float(np.nanmax(y_values)), threshold)
+    y_margin = max(2.0, 0.12 * (y_max - y_min))
+    date_min = work['calendar_time'].min()
+    date_max = work['calendar_time'].max()
+    date_margin = pd.Timedelta(hours=12)
+    for panel_index, axis in enumerate(axes):
+        panel_arm = arms[panel_index]
+        panel = work.loc[work['arm'].astype(str).eq(panel_arm)]
+        axis.axhline(
+            threshold,
+            color='0.25',
+            linestyle=(0, (4, 2)),
+            linewidth=1.15,
+            zorder=1,
+        )
+        axis.set_title(
+            f'{panel_arm} ({panel["trajectory_key"].nunique()} trajectories)',
+            fontsize=9,
+            pad=8,
+        )
+        axis.set_xlim(date_min - date_margin, date_max + date_margin)
+        axis.set_ylim(y_min - y_margin, y_max + y_margin)
+        axis.grid(axis='y', color='0.88', linewidth=0.7)
+        axis.grid(axis='x', visible=False)
+        axis.xaxis.set_major_locator(
+            mdates.DayLocator(interval=max(1, int(np.ceil(len(work['calendar_time'].dt.normalize().unique()) / 8))))
+        )
+        axis.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+        axis.tick_params(axis='x', labelrotation=35, labelsize=8)
+        axis.tick_params(axis='y', labelsize=8)
+        axis.set_xlabel('Calendar date', fontsize=9)
+        axis.text(
+            0.02,
+            0.04,
+            f'n={len(panel)} member-days',
+            transform=axis.transAxes,
+            fontsize=7.5,
+            color='0.30',
+        )
+    axes[0].set_ylabel('Particle-layer-associated ΔDO (μmol kg⁻¹)', fontsize=9)
+    status_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='black',
+            markerfacecolor='0.25',
+            markeredgecolor='black',
+            linestyle='None',
+            markersize=5.5,
+            label=f'Formal detected (≥{threshold:g} μmol kg⁻¹)',
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker='s',
+            color='black',
+            markerfacecolor='white',
+            markeredgecolor='black',
+            linestyle='None',
+            markersize=5.5,
+            label=f'Formal not detected (<{threshold:g} μmol kg⁻¹)',
+        ),
+        Line2D(
+            [0],
+            [0],
+            color='0.25',
+            linestyle=(0, (4, 2)),
+            linewidth=1.15,
+            label=f'DO{threshold:g} threshold (μmol kg⁻¹)',
+        ),
+    ]
+    fig.suptitle(
+        'Particle-layer-associated ΔDO along arrived 3-D trajectories',
+        fontsize=11,
+        y=0.985,
+    )
+    fig.text(
+        0.5,
+        0.935,
+        'Each line is one repeated trajectory; each marker is one member-day',
+        ha='center',
+        va='center',
+        fontsize=8,
+        color='0.28',
+    )
+    fig.legend(
+        status_handles,
+        [handle.get_label() for handle in status_handles],
+        loc='upper center',
+        bbox_to_anchor=(0.5, 0.905),
+        ncol=3,
+        frameon=False,
+        fontsize=7.5,
+    )
+    fig.legend(
+        track_handles,
+        [handle.get_label() for handle in track_handles],
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=min(4, len(track_handles)),
+        frameon=False,
+        fontsize=7.5,
+        title='Trajectory identity',
+        title_fontsize=8,
+    )
+    fig.subplots_adjust(left=0.09, right=0.98, top=0.78, bottom=0.25, wspace=0.12)
+    fig.savefig(
+        figure_path,
+        format='png',
+        dpi=300,
+        bbox_inches='tight',
+        pad_inches=0.08,
+    )
+    plt.close(fig)
+    image = plt.imread(figure_path)
+    if image.ndim not in (2, 3) or image.shape[0] < 700 or image.shape[1] < 1200:
+        raise ValueError('DO50 figure PNG has insufficient readable dimensions.')
+    if not np.isfinite(image).all() or float(np.nanmax(image) - np.nanmin(image)) <= 0:
+        raise ValueError('DO50 figure PNG is not a readable non-empty image.')
+    return {
+        'path': str(figure_path.resolve()),
+        'format': 'PNG',
+        'point_count': int(len(work)),
+        'trajectory_count': int(work['trajectory_key'].nunique()),
+        'arm_count': int(len(arms)),
+        'formal_detected_point_count': int(detected.sum()),
+        'formal_not_detected_point_count': int((~detected).sum()),
+        'threshold': threshold,
+        'threshold_alignment': threshold_alignment,
+        'png_readable': True,
+        'pixel_width': int(image.shape[1]),
+        'pixel_height': int(image.shape[0]),
+        'all_plotted_points_finite': True,
+    }
+
+
+def _ofes_do50_detectability_write_outputs(
+    daily: pd.DataFrame,
+    summary: pd.DataFrame,
+    validation: dict,
+    verdict: str,
+    settings: dict,
+    inventory: list[dict],
+) -> dict:
+    """写出 DO50 可探测性诊断的表格、验证和裁决。"""
+    root = settings['output_dir']
+    root.mkdir(parents=True, exist_ok=True)
+    daily_path = root / 'daily_detectability.csv'
+    summary_path = root / 'classification_summary.csv'
+    validation_path = root / 'validation.json'
+    verdict_path = root / 'verdict_zh.md'
+    manifest_path = root / 'manifest.json'
+    figure_path = root / 'figure_do50_threshold_crossing.png'
+    figure = _ofes_do50_detectability_plot(
+        daily,
+        settings,
+        figure_path,
+    )
+    figure_complete = bool(
+        figure['png_readable']
+        and figure['all_plotted_points_finite']
+        and figure['threshold_alignment']
+        and figure['point_count'] == len(daily)
+        and figure['trajectory_count'] == daily['trajectory_key'].nunique()
+        and figure['formal_detected_point_count']
+        == int(daily['formal_do50_detected'].astype(bool).sum())
+    )
+    daily.to_csv(daily_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    validation = {
+        **validation,
+        'complete': bool(validation['complete'] and figure_complete),
+        'figure': figure,
+        'source_inventory': inventory,
+        'output_paths': {
+            'daily_detectability': str(daily_path.resolve()),
+            'classification_summary': str(summary_path.resolve()),
+            'validation': str(validation_path.resolve()),
+            'verdict': str(verdict_path.resolve()),
+            'figure_do50_threshold_crossing': str(figure_path.resolve()),
+        },
+    }
+    validation_path.write_text(
+        json.dumps(validation, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    verdict_path.write_text(verdict, encoding='utf-8')
+    manifest = {
+        'analysis': 'ofes_do50_detectability_diagnostic',
+        'case_id': settings['case_id'],
+        'case_label': settings['case_label'],
+        'case_identity': settings['watermass_manifest'].get('case_identity'),
+        'watermass_review_case_id': settings['watermass_case_id'],
+        'watermass_review_case_identity': settings['watermass_case_identity'],
+        'watermass_review_output_dir': str(
+            settings['watermass_output_dir'].resolve()
+        ),
+        'watermass_review_manifest_identity': {
+            'analysis': settings['watermass_manifest'].get('analysis'),
+            'case_id': settings['watermass_manifest'].get('case_id'),
+            'case_identity': settings['watermass_manifest'].get('case_identity'),
+            'complete': settings['watermass_manifest'].get('complete'),
+        },
+        'diagnostic_window': {
+            'start_date': settings['start_date'].date().isoformat(),
+            'end_date': settings['end_date'].date().isoformat(),
+            'calendar_dates': [
+                pd.Timestamp(value).date().isoformat()
+                for value in settings['dates']
+            ],
+            'internal_dates_only': True,
+        },
+        'formal_detector': {
+            'method': settings['formal_config'].method,
+            'do_threshold': float(settings['formal_config'].do_threshold),
+            'depth_interval_m': float(settings['formal_config'].depth_interval),
+            'anomaly_min_depth_m': float(settings['formal_config'].anomaly_min_depth),
+            'anomaly_max_depth_m': float(settings['formal_config'].anomaly_max_depth),
+            'helper': 'detect_ofes_delta_do',
+        },
+        'association_rule': settings['association_rule'],
+        'inputs': {
+            'trajectory_properties_daily': str(
+                (settings['watermass_output_dir'] / 'trajectory_properties_daily.parquet').resolve()
+            ),
+            'particle_endpoint_registration': str(
+                (settings['watermass_output_dir'] / 'particle_endpoint_registration.csv').resolve()
+            ),
+            'along_path_profile_metrics': str(
+                (settings['watermass_output_dir'] / 'along_path_profile_metrics.csv').resolve()
+            ),
+        },
+        'outputs': {
+            'daily_detectability': str(daily_path.resolve()),
+            'classification_summary': str(summary_path.resolve()),
+            'validation': str(validation_path.resolve()),
+            'verdict': str(verdict_path.resolve()),
+            'figure_do50_threshold_crossing': str(figure_path.resolve()),
+        },
+        'figures': {
+            'threshold_crossing': str(figure_path.resolve()),
+        },
+        'validation': validation,
+        'complete': bool(validation['complete']),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8',
+    )
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'daily_detectability': daily,
+        'classification_summary': summary,
+        'verdict': verdict,
+        'figures': {
+            'threshold_crossing': figure_path,
+        },
+    }
+
+
+def build_ofes_do50_detectability_diagnostic(
+    case_spec: Mapping,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """沿已到达 3-D 轨迹诊断正式 virtual DO50 的粒子层可探测性。
+
+    本 producer 只读取已完成的双端点水团复核、同日期同位置的 OFES 标量剖面和正式
+    `detect_ofes_delta_do` helper。它保存未设阈值的正峰、正式参考线、逐峰半振幅核和
+    互斥分类，供判断目录缺口来自阈值化剖面还是峰层/峰形变化。
+
+    参数:
+        - case_spec (Mapping): Notebook 提供的案例身份、输入水团复核目录、日期窗口、正式阈值和关联规则。
+        - output_dir (str | Path | None): 覆盖案例规格中的诊断输出目录。
+
+    返回:
+        - dict: 含逐日表、分类汇总、验证记录、manifest 和中文裁决。
+
+    输出:
+        - `output_dir/daily_detectability.csv`、`classification_summary.csv`、`validation.json`、`manifest.json`、`verdict_zh.md` 和 `figure_do50_threshold_crossing.png`。
+
+    说明:
+        - 粒子轨迹、种子、端点、半振幅核、到达定义和正式 DO50 配置均来自既有产物，不重积分。
+        - `same_peak_*` 只表示当日正峰与同一粒子层的操作性关联；本诊断没有另建跨日峰 ID，不能把逐日关联写成跨日追踪的同一个峰。
+        - 关联峰定义为粒子深度落入该正峰的离散半振幅核；同一日的水柱最强峰不会自动代表粒子携带峰。
+    """
+    settings = _ofes_do50_detectability_parse_case_spec(
+        case_spec,
+        output_dir,
+    )
+    watermass_root = settings['watermass_output_dir']
+    properties = pd.read_parquet(
+        watermass_root / 'trajectory_properties_daily.parquet'
+    )
+    properties['calendar_time'] = pd.to_datetime(
+        properties['calendar_time']
+    ).dt.normalize()
+    endpoints = pd.read_csv(
+        watermass_root / 'particle_endpoint_registration.csv'
+    )
+
+    def _assert_source_case_id(frame: pd.DataFrame, label: str) -> set[str]:
+        if 'case_id' in frame.columns:
+            source_ids = frame['case_id'].astype('string')
+        elif 'trajectory_key' in frame.columns:
+            trajectory_keys = frame['trajectory_key'].astype('string')
+            if not trajectory_keys.str.contains('|', regex=False).all():
+                raise ValueError(
+                    f'{label} trajectory keys lack the upstream case prefix.'
+                )
+            source_ids = trajectory_keys.str.split('|', n=1).str[0]
+        else:
+            raise ValueError(f'{label} lacks an upstream case identity column.')
+        source_ids = source_ids.dropna().astype(str)
+        if len(source_ids) != len(frame) or any(
+            not value.strip() for value in source_ids
+        ):
+            raise ValueError(f'{label} contains missing upstream case identities.')
+        identities = set(source_ids)
+        if identities != {settings['watermass_case_id']}:
+            raise ValueError(
+                f'{label} upstream case identity does not match the watermass '
+                f'manifest: {sorted(identities)}.'
+            )
+        return identities
+
+    endpoint_mask = (
+        endpoints['vertical_mode'].astype(str).eq('three_dimensional')
+        & endpoints['arrived'].astype(bool)
+    )
+    arrived = endpoints.loc[endpoint_mask].copy()
+    if arrived.empty:
+        raise ValueError('The formal watermass review has no arrived 3-D trajectory.')
+    _assert_source_case_id(arrived, 'Arrived endpoint registration')
+    arrived_keys = set(arrived['trajectory_key'].astype(str))
+    selected = properties.loc[
+        properties['trajectory_key'].astype(str).isin(arrived_keys)
+        & properties['vertical_mode'].astype(str).eq('three_dimensional')
+    ].copy()
+    lower = settings['start_date']
+    upper = settings['end_date']
+    selected = selected.loc[
+        selected['calendar_time'].gt(lower)
+        & selected['calendar_time'].lt(upper)
+    ].copy()
+    expected_rows = len(arrived_keys) * max(len(settings['dates']) - 2, 0)
+    if len(selected) != expected_rows:
+        raise ValueError(
+            'Arrived 3-D internal-day row count does not match the declared window: '
+            f'{len(selected)} != {expected_rows}.'
+        )
+    if selected.duplicated(['trajectory_key', 'calendar_time']).any():
+        raise ValueError('Arrived 3-D internal-day properties contain duplicates.')
+    _assert_source_case_id(selected, 'Selected trajectory properties')
+    profile_metrics = pd.read_csv(
+        watermass_root / 'along_path_profile_metrics.csv',
+        parse_dates=['calendar_time'],
+    )
+    profile_metrics['calendar_time'] = profile_metrics['calendar_time'].dt.normalize()
+    existing = profile_metrics.loc[
+        profile_metrics['trajectory_key'].astype(str).isin(arrived_keys)
+        & profile_metrics['vertical_mode'].astype(str).eq('three_dimensional')
+        & profile_metrics['calendar_time'].gt(lower)
+        & profile_metrics['calendar_time'].lt(upper)
+    ].copy()
+    if len(existing) != len(selected):
+        raise ValueError('Saved along-path profile metrics do not cover the selected rows.')
+    _assert_source_case_id(existing, 'Selected along-path profile metrics')
+    existing = existing.drop_duplicates(['trajectory_key', 'calendar_time'])
+    existing_by_key = {
+        (str(row.trajectory_key), pd.Timestamp(row.calendar_time)): row._asdict()
+        for row in existing.itertuples(index=False)
+    }
+    contexts, inventory = _ofes_do50_detectability_load_snapshots(
+        selected,
+        pd.date_range(lower + pd.Timedelta(days=1), upper - pd.Timedelta(days=1), freq='D'),
+    )
+    rows = []
+    rule = settings['association_rule']
+    for record in selected.sort_values(
+        ['arm', 'trajectory_key', 'calendar_time'],
+        kind='mergesort',
+    ).to_dict('records'):
+        stamp = pd.Timestamp(record['calendar_time'])
+        snapshot = contexts[stamp]
+        profile = extract_ofes_profile_interp(
+            snapshot,
+            float(record['lon']),
+            float(record['lat']),
+            variables=['do2', 'temp', 'salinity'],
+        )
+        sampling = _ofes_do50_detectability_profile_sampling(
+            snapshot,
+            float(record['lon']),
+            float(record['lat']),
+        )
+        peak_info = _ofes_do50_detectability_peak_rows(
+            profile,
+            settings['formal_config'],
+            half_window_m=float(rule['half_window_m']),
+            half_amplitude_fraction=float(rule['half_amplitude_fraction']),
+        )
+        formal = detect_ofes_delta_do(
+            snapshot,
+            float(record['lon']),
+            float(record['lat']),
+            detection_config=settings['formal_config'],
+            interp=True,
+        )
+        formal_detected = bool(not formal.empty)
+        formal_row = formal.iloc[0] if formal_detected else None
+        formal_delta = (
+            float(formal_row['delta_do']) if formal_row is not None else np.nan
+        )
+        formal_peak_depth = (
+            float(formal_row['depth']) if formal_row is not None else np.nan
+        )
+        formal_peak_do = (
+            float(formal_row['do_value']) if formal_row is not None else np.nan
+        )
+        formal_reference = (
+            formal_peak_do - formal_delta
+            if np.isfinite(formal_peak_do) and np.isfinite(formal_delta)
+            else np.nan
+        )
+        peak_rows = peak_info['peak_rows']
+        global_peak = (
+            sorted(
+                peak_rows,
+                key=lambda item: (
+                    -float(item['delta_do_umol_kg']),
+                    abs(float(item['peak_depth_m']) - float(record['depth_m'])),
+                    float(item['peak_depth_m']),
+                ),
+            )[0]
+            if peak_rows
+            else None
+        )
+        associated_rows = [
+            item for item in peak_rows
+            if (
+                float(item['half_amplitude_upper_depth_m'])
+                - float(rule['depth_tolerance_m'])
+                <= float(record['depth_m'])
+                <= float(item['half_amplitude_lower_depth_m'])
+                + float(rule['depth_tolerance_m'])
+            )
+        ]
+        associated = (
+            sorted(
+                associated_rows,
+                key=lambda item: (
+                    -float(item['delta_do_umol_kg']),
+                    abs(float(item['peak_depth_m']) - float(record['depth_m'])),
+                    float(item['peak_depth_m']),
+                ),
+            )[0]
+            if associated_rows
+            else None
+        )
+        profile_status = str(peak_info['status'])
+        if profile_status != 'evaluated':
+            classification = 'invalid'
+        elif not peak_rows:
+            classification = 'peak_shape_absent'
+        elif associated is None:
+            classification = 'peak_outside_particle_layer'
+        elif float(associated['delta_do_umol_kg']) >= float(settings['do_threshold']):
+            classification = 'same_peak_ge50'
+        else:
+            classification = 'same_peak_sub50_positive'
+        existing_row = existing_by_key[(str(record['trajectory_key']), stamp)]
+        raw_profile_at_particle = np.nan
+        if profile_status == 'evaluated':
+            clean_profile = peak_info['profile']
+            raw_profile_at_particle = float(np.interp(
+                float(record['depth_m']),
+                clean_profile['Depth'].to_numpy(dtype=float),
+                clean_profile['do2'].to_numpy(dtype=float),
+            ))
+        row = {
+            'case_id': settings['case_id'],
+            'source_case_id': str(record['case_id']),
+            'arm': record['arm'],
+            'particle_index': int(record['particle_index']),
+            'seed_key': record['seed_key'],
+            'trajectory_key': record['trajectory_key'],
+            'vertical_mode': record['vertical_mode'],
+            'source_object_key': record['source_object_key'],
+            'source_lat_index': int(record['source_lat_index']),
+            'source_lon_index': int(record['source_lon_index']),
+            'release_date': pd.Timestamp(record['release_date']).date().isoformat(),
+            'calendar_date': stamp.date().isoformat(),
+            'calendar_time': stamp,
+            'calendar_offset_seconds': float(record['calendar_offset_seconds']),
+            'integration_step': int(record['integration_step']),
+            'integration_direction': record['integration_direction'],
+            'dt_seconds': float(record['dt_seconds']),
+            'status': record['status'],
+            'particle_depth_m': float(record['depth_m']),
+            'particle_lat': float(record['lat']),
+            'particle_lon': float(record['lon']),
+            'raw_do_at_particle_umol_kg': float(record['raw_do2_umol_kg']),
+            'raw_do_profile_at_particle_umol_kg': raw_profile_at_particle,
+            'raw_do_property_minus_profile_at_particle_umol_kg': (
+                float(record['raw_do2_umol_kg']) - raw_profile_at_particle
+                if np.isfinite(raw_profile_at_particle)
+                else np.nan
+            ),
+            'formal_do50_detected': formal_detected,
+            'formal_peak_depth_m': formal_peak_depth,
+            'formal_peak_do_umol_kg': formal_peak_do,
+            'formal_delta_do_umol_kg': formal_delta,
+            'formal_reference_line_do_umol_kg': formal_reference,
+            'formal_reference_closure_error_umol_kg': (
+                formal_peak_do - formal_reference - formal_delta
+                if np.isfinite(formal_peak_do)
+                and np.isfinite(formal_reference)
+                and np.isfinite(formal_delta)
+                else np.nan
+            ),
+            'existing_virtual_do50_detected': bool(
+                int(existing_row['virtual_along_path_detectability'])
+            ),
+            'existing_virtual_profile_status': existing_row['profile_status'],
+            'existing_virtual_delta_do_umol_kg': pd.to_numeric(
+                pd.Series([existing_row['delta_do']]), errors='coerce'
+            ).iloc[0],
+            'existing_virtual_peak_depth_m': pd.to_numeric(
+                pd.Series([existing_row['peak_depth_m']]), errors='coerce'
+            ).iloc[0],
+            'profile_status': profile_status,
+            'profile_sampling': sampling,
+            'property_qc_status': record['property_qc_status'],
+            'property_scalar_interpolation': record['scalar_interpolation'],
+            'property_source': record['property_source'],
+            'profile_valid_level_count': int(peak_info['valid_level_count']),
+            'profile_peak_count': int(peak_info['peak_count']),
+            'profile_positive_peak_count': int(peak_info['positive_peak_count']),
+            'profile_near_zero_count': int(peak_info['near_zero_count']),
+            'global_positive_peak_depth_m': (
+                float(global_peak['peak_depth_m']) if global_peak else np.nan
+            ),
+            'global_positive_peak_delta_do_umol_kg': (
+                float(global_peak['delta_do_umol_kg']) if global_peak else np.nan
+            ),
+            'global_positive_peak_reference_line_do_umol_kg': (
+                float(global_peak['reference_line_do_umol_kg'])
+                if global_peak else np.nan
+            ),
+            'global_positive_peak_upper_depth_m': (
+                float(global_peak['half_amplitude_upper_depth_m'])
+                if global_peak else np.nan
+            ),
+            'global_positive_peak_lower_depth_m': (
+                float(global_peak['half_amplitude_lower_depth_m'])
+                if global_peak else np.nan
+            ),
+            'associated_peak_depth_m': (
+                float(associated['peak_depth_m']) if associated else np.nan
+            ),
+            'associated_peak_do_umol_kg': (
+                float(associated['peak_do_umol_kg']) if associated else np.nan
+            ),
+            'associated_peak_delta_do_umol_kg': (
+                float(associated['delta_do_umol_kg']) if associated else np.nan
+            ),
+            'associated_reference_line_do_umol_kg': (
+                float(associated['reference_line_do_umol_kg'])
+                if associated else np.nan
+            ),
+            'associated_peak_upper_depth_m': (
+                float(associated['half_amplitude_upper_depth_m'])
+                if associated else np.nan
+            ),
+            'associated_peak_lower_depth_m': (
+                float(associated['half_amplitude_lower_depth_m'])
+                if associated else np.nan
+            ),
+            'associated_peak_half_amplitude_thickness_m': (
+                float(associated['half_amplitude_thickness_m'])
+                if associated else np.nan
+            ),
+            'associated_peak_depth_offset_m': (
+                float(associated['peak_depth_m']) - float(record['depth_m'])
+                if associated else np.nan
+            ),
+            'associated_peak_depth_abs_difference_m': (
+                abs(float(associated['peak_depth_m']) - float(record['depth_m']))
+                if associated else np.nan
+            ),
+            'candidate_peak_depth_m': (
+                float(associated['peak_depth_m'])
+                if associated else (float(global_peak['peak_depth_m']) if global_peak else np.nan)
+            ),
+            'candidate_peak_do_umol_kg': (
+                float(associated['peak_do_umol_kg'])
+                if associated else (float(global_peak['peak_do_umol_kg']) if global_peak else np.nan)
+            ),
+            'candidate_peak_delta_do_umol_kg': (
+                float(associated['delta_do_umol_kg'])
+                if associated else (float(global_peak['delta_do_umol_kg']) if global_peak else np.nan)
+            ),
+            'candidate_reference_line_do_umol_kg': (
+                float(associated['reference_line_do_umol_kg'])
+                if associated else (float(global_peak['reference_line_do_umol_kg']) if global_peak else np.nan)
+            ),
+            'candidate_peak_upper_depth_m': (
+                float(associated['half_amplitude_upper_depth_m'])
+                if associated else (float(global_peak['half_amplitude_upper_depth_m']) if global_peak else np.nan)
+            ),
+            'candidate_peak_lower_depth_m': (
+                float(associated['half_amplitude_lower_depth_m'])
+                if associated else (float(global_peak['half_amplitude_lower_depth_m']) if global_peak else np.nan)
+            ),
+            'candidate_peak_half_amplitude_thickness_m': (
+                float(associated['half_amplitude_thickness_m'])
+                if associated else (float(global_peak['half_amplitude_thickness_m']) if global_peak else np.nan)
+            ),
+            'candidate_peak_depth_offset_m': (
+                float(associated['peak_depth_m']) - float(record['depth_m'])
+                if associated else (
+                    float(global_peak['peak_depth_m']) - float(record['depth_m'])
+                    if global_peak else np.nan
+                )
+            ),
+            'candidate_peak_depth_abs_difference_m': (
+                abs(float(associated['peak_depth_m']) - float(record['depth_m']))
+                if associated else (
+                    abs(float(global_peak['peak_depth_m']) - float(record['depth_m']))
+                    if global_peak else np.nan
+                )
+            ),
+            'candidate_peak_relation': (
+                'same_particle_layer'
+                if associated is not None
+                else ('outside_particle_layer' if global_peak else 'none')
+            ),
+            'classification': classification,
+            'association_rule_version': rule['version'],
+        }
+        rows.append(row)
+    daily = pd.DataFrame(rows)
+    summary = _ofes_do50_detectability_summary(daily, settings)
+    validation = _ofes_do50_detectability_validation(
+        daily,
+        summary,
+        settings,
+        inventory,
+    )
+    verdict = _ofes_do50_detectability_verdict(
+        daily,
+        summary,
+        validation,
+        settings,
+    )
+    return _ofes_do50_detectability_write_outputs(
+        daily,
+        summary,
+        validation,
+        verdict,
+        settings,
+        inventory,
+    )
+
+
+def load_ofes_do50_detectability_diagnostic(
+    output_dir: str | Path,
+) -> dict:
+    """读取已保存的 DO50 可探测性诊断，不重读场或重放轨迹。
+
+    读取器只消费诊断 producer 已保存的逐日表、分类汇总、验证、manifest 和裁决，供
+    `OFES.ipynb` 展示结果。
+
+    参数:
+        - output_dir (str | Path): 已完成的 DO50 可探测性诊断目录。
+
+    返回:
+        - dict: 含逐日表、分类汇总、验证、manifest、图件路径和中文裁决。
+
+    输出:
+        - 无文件输出；读取器不会修改诊断目录。
+
+    说明:
+        - 读取器不读取 OFES native snapshot，也不改变已保存的无阈值峰值和分类；它会拒绝不完整、身份不一致或行数不符的产物。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    required = {
+        'manifest.json',
+        'validation.json',
+        'daily_detectability.csv',
+        'classification_summary.csv',
+        'verdict_zh.md',
+        'figure_do50_threshold_crossing.png',
+    }
+    missing = sorted(name for name in required if not (root / name).is_file())
+    if missing:
+        raise FileNotFoundError(
+            f'DO50 detectability diagnostic lacks files: {missing}'
+        )
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_do50_detectability_diagnostic':
+        raise ValueError('The supplied directory is not a DO50 detectability diagnostic.')
+    if not bool(manifest.get('complete')) or not bool(validation.get('complete')):
+        raise ValueError('The supplied DO50 detectability diagnostic is incomplete.')
+    manifest_validation = manifest.get('validation')
+    if (
+        not isinstance(manifest_validation, Mapping)
+        or not bool(manifest_validation.get('complete'))
+    ):
+        raise ValueError('The diagnostic manifest contains incomplete validation.')
+    diagnostic_case_id = str(manifest.get('case_id'))
+    source_case_id = str(manifest.get('watermass_review_case_id'))
+    source_case_identity = manifest.get('watermass_review_case_identity')
+    saved_watermass_identity = manifest.get(
+        'watermass_review_manifest_identity',
+    )
+    if not isinstance(source_case_identity, Mapping):
+        raise ValueError('The diagnostic manifest lacks upstream case identity.')
+    if not isinstance(saved_watermass_identity, Mapping):
+        raise ValueError('The diagnostic manifest lacks upstream manifest identity.')
+    if (
+        saved_watermass_identity.get('analysis')
+        != 'dual_endpoint_watermass_review'
+        or str(saved_watermass_identity.get('case_id')) != source_case_id
+        or saved_watermass_identity.get('case_identity')
+        != source_case_identity
+        or not bool(saved_watermass_identity.get('complete'))
+        or manifest.get('case_identity') != source_case_identity
+        or str(validation.get('diagnostic_case_id')) != diagnostic_case_id
+        or str(validation.get('source_case_id')) != source_case_id
+        or validation.get('source_case_identity') != source_case_identity
+        or str(manifest_validation.get('diagnostic_case_id')) != diagnostic_case_id
+        or str(manifest_validation.get('source_case_id')) != source_case_id
+        or manifest_validation.get('source_case_identity')
+        != source_case_identity
+    ):
+        raise ValueError('The diagnostic manifest and validation have mismatched identities.')
+    daily = pd.read_csv(
+        root / 'daily_detectability.csv',
+        parse_dates=['calendar_time'],
+    )
+    summary = pd.read_csv(root / 'classification_summary.csv')
+    if (
+        set(daily['case_id'].dropna().astype(str)) != {diagnostic_case_id}
+        or set(daily['source_case_id'].dropna().astype(str)) != {source_case_id}
+        or set(summary['case_id'].dropna().astype(str)) != {diagnostic_case_id}
+    ):
+        raise ValueError('The diagnostic tables contain mismatched case identities.')
+    if (
+        len(daily) != int(validation.get('actual_row_count', -1))
+        or len(daily) != int(validation.get('expected_row_count', -1))
+        or len(summary) != int(validation.get('summary_row_count', -1))
+        or len(summary.loc[summary['scope'].eq('overall')])
+        != int(validation.get('summary_overall_rows', -1))
+    ):
+        raise ValueError('The diagnostic tables do not match validation row counts.')
+    if daily.duplicated(['trajectory_key', 'calendar_date']).any():
+        raise ValueError('The diagnostic daily table contains duplicate trajectory dates.')
+    saved_counts = {
+        str(key): int(value)
+        for key, value in daily['classification'].value_counts().items()
+    }
+    validated_counts = {
+        str(key): int(value)
+        for key, value in validation.get('classification_counts', {}).items()
+    }
+    if saved_counts != validated_counts:
+        raise ValueError('The diagnostic classification counts do not match validation.')
+    figure_path = root / 'figure_do50_threshold_crossing.png'
+    figure = validation.get('figure')
+    manifest_figures = manifest.get('figures')
+    if (
+        not isinstance(figure, Mapping)
+        or not isinstance(manifest_figures, Mapping)
+        or Path(str(manifest_figures.get('threshold_crossing'))).name
+        != figure_path.name
+        or int(figure.get('point_count', -1)) != len(daily)
+        or int(figure.get('trajectory_count', -1))
+        != daily['trajectory_key'].nunique()
+        or int(figure.get('formal_detected_point_count', -1))
+        != int(daily['formal_do50_detected'].astype(bool).sum())
+        or not bool(figure.get('threshold_alignment'))
+        or not bool(figure.get('png_readable'))
+    ):
+        raise ValueError('The diagnostic figure metadata does not match the tables.')
+    image = plt.imread(figure_path)
+    if (
+        image.ndim not in (2, 3)
+        or image.shape[0] != int(figure.get('pixel_height', -1))
+        or image.shape[1] != int(figure.get('pixel_width', -1))
+        or not np.isfinite(image).all()
+    ):
+        raise ValueError('The diagnostic figure PNG is unreadable or inconsistent.')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'validation': validation,
+        'daily_detectability': daily,
+        'classification_summary': summary,
+        'verdict': (root / 'verdict_zh.md').read_text(encoding='utf-8'),
+        'figures': {
+            'threshold_crossing': figure_path,
+        },
+    }
+
+
 def _ofes_dual_endpoint_case_settings(
     case_spec: dict,
     output_dir: str | Path | None = None,
