@@ -18684,11 +18684,11 @@ def plot_mccoy_datagap_atlas(
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """McCoy SCV 数据缺陷总览：GLORYS/META 漏检世界图 + GLORYS×META 列联热图。
+    """绘制 McCoy 目录记录的 GLORYS/META 诊断地图与列联热图。
 
-    读纯 GLORYS 全目录 parquet（含 `glorys_misses` + `meta_miss`），画两联：（左）4084 个 McCoy SCV
-    世界地图，按数据缺陷分类着色（红＝两产品都漏、橙＝仅 GLORYS 漏、蓝＝仅 META 漏、灰＝都看到）；
-    （右）GLORYS×META 2×2 列联热图（四类计数与占比），量化两产品的互补失效。仅读缓存 parquet 渲染。
+    读取含 `glorys_misses` 与 `meta_miss` 的已有 parquet，可传入预先筛选的子集。
+    左侧地图按两产品诊断状态着色，右侧显示共同可评估记录的 2×2 计数与占比。
+    仅读缓存渲染，不把缺失诊断计为未满足条件。
 
     参数:
         - resolution_path (str | Path | None): 纯 GLORYS 全目录 parquet；None 时优先按当前 method 的
@@ -18700,6 +18700,9 @@ def plot_mccoy_datagap_atlas(
 
     返回:
         - dict: 含 `n_scv` / `glorys_miss` / `meta_miss` / `both_miss` 与 `figure_path`（save_fig 时）等摘要。
+
+    说明:
+        - 历史返回键 `n_scv` 保留兼容性，表示输入中两个诊断均非缺失的记录数。
     """
     cfg = _resolve_detection_config(detection_config)
     region_slug = _current_region_key()
@@ -18718,16 +18721,16 @@ def plot_mccoy_datagap_atlas(
     mm = d['meta_miss'].astype(bool)
 
     fig = plt.figure(figsize=(17, 6.5))
-    grid_spec = fig.add_gridspec(1, 2, width_ratios=(1.35, 1.0), wspace=0.14)
+    grid_spec = fig.add_gridspec(1, 2, width_ratios=(1.35, 1.0), wspace=0.30)
     ax = fig.add_subplot(grid_spec[0, 0], projection=ccrs.PlateCarree(central_longitude=180))
     ax.add_feature(cfeature.LAND, facecolor=_BASEMAP_COLORS['land'])
     ax.coastlines(color=_BASEMAP_COLORS['coastline'], lw=0.4)
     ax.set_global()
     cats = [
-        (~gm & ~mm, _REPRESENTATION_STATUS_COLORS['both_criteria_met'], 'seen by both', 3, 10),
-        (~gm & mm, _REPRESENTATION_STATUS_COLORS['meta_criterion_not_met'], 'META misses only', 4, 12),
-        (gm & ~mm, _REPRESENTATION_STATUS_COLORS['glorys_criterion_not_met'], 'GLORYS misses only', 5, 12),
-        (gm & mm, _REPRESENTATION_STATUS_COLORS['neither_criterion_met'], 'both miss', 6, 14),
+        (~gm & ~mm, _REPRESENTATION_STATUS_COLORS['both_criteria_met'], 'GLORYS met; META matched', 3, 10),
+        (~gm & mm, _REPRESENTATION_STATUS_COLORS['meta_criterion_not_met'], 'GLORYS met; META not matched', 4, 12),
+        (gm & ~mm, _REPRESENTATION_STATUS_COLORS['glorys_criterion_not_met'], 'GLORYS not met; META matched', 5, 12),
+        (gm & mm, _REPRESENTATION_STATUS_COLORS['neither_criterion_met'], 'GLORYS not met; META not matched', 6, 14),
     ]
     for sel, col, lab, z, s in cats:
         ax.scatter(d.loc[sel, 'lon'], d.loc[sel, 'lat'], s=s, c=col, edgecolor='k',
@@ -18737,17 +18740,17 @@ def plot_mccoy_datagap_atlas(
         loc='upper left',
         bbox_to_anchor=(0.0, -0.13),
         fontsize=_PLOT_TYPOGRAPHY['tick_legend'],
-        ncol=2,
+        ncol=1,
         borderaxespad=0,
     )
-    ax.set_title(f'McCoy SCVs by data gap (n={len(d)})', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
+    ax.set_title(f'Catalogue-associated records (n={len(d)})', fontsize=_PLOT_TYPOGRAPHY['panel_title'])
 
     ax2 = fig.add_subplot(grid_spec[0, 1])
     mat = np.array([[int((gm & mm).sum()), int((gm & ~mm).sum())],
                     [int((~gm & mm).sum()), int((~gm & ~mm).sum())]])
-    im = ax2.imshow(mat, cmap='Reds')
-    ax2.set_xticks([0, 1]); ax2.set_xticklabels(['META misses', 'META catches'])
-    ax2.set_yticks([0, 1]); ax2.set_yticklabels(['GLORYS\nmisses', 'GLORYS\ncatches'])
+    im = ax2.imshow(mat, cmap='Reds', vmin=0)
+    ax2.set_xticks([0, 1]); ax2.set_xticklabels(['META not matched', 'META matched'])
+    ax2.set_yticks([0, 1]); ax2.set_yticklabels(['GLORYS criterion\nnot met', 'GLORYS criterion\nmet'])
     tot = mat.sum()
     for i in range(2):
         for j in range(2):
@@ -18758,9 +18761,8 @@ def plot_mccoy_datagap_atlas(
     cbar.set_label('count', fontsize=_PLOT_TYPOGRAPHY['axis_label'])
     cbar.ax.tick_params(labelsize=_PLOT_TYPOGRAPHY['tick_legend'])
 
-    fig.suptitle(f"GLORYS/META miss {len(d)} McCoy SCVs  |  GLORYS {100*gm.mean():.0f}%  "
-                 f"META {100*mm.mean():.0f}%  both {100*(gm & mm).mean():.0f}%  "
-                 f"≥1 {100*(gm | mm).mean():.0f}%", fontsize=_PLOT_TYPOGRAPHY['figure_title'], y=0.99)
+    fig.suptitle(f"GLORYS/META diagnostics: {len(d)} jointly evaluated records",
+                 fontsize=_PLOT_TYPOGRAPHY['figure_title'], y=0.99)
     _apply_plot_typography(fig)
     fig.tight_layout(rect=(0, 0.13, 1, 0.95), w_pad=0.8)
 
@@ -18771,7 +18773,7 @@ def plot_mccoy_datagap_atlas(
                 else cfg.output_dir("plot_mccoy_datagap_atlas", region_slug))
         base.mkdir(parents=True, exist_ok=True)
         fpath = base / f"mccoy_datagap_atlas_{cfg.file_stem()}.png"
-        fig.savefig(fpath, dpi=150, bbox_inches='tight')
+        fig.savefig(fpath, dpi=300, bbox_inches='tight')
         out['figure_path'] = str(fpath)
         print(f"[*] McCoy data-gap atlas saved: {fpath}")
     if show_fig:
