@@ -17707,36 +17707,203 @@ def glorys_reproduces_mccoy_scv(
 def _match_mccoy_scvs_to_profiles(
     scv: pd.DataFrame, argo_data_dir: str | Path, match_days: int,
 ) -> pd.DataFrame:
-    """把 McCoy SCV 行按 Platform 编号 + 周期日期（±match_days 天）映射到我们年度 Argo 的 Profile_number。
+    """按目录行、平台和日历日期建立可追溯的 Argo profile 关联。
 
-    逐年读年度 parquet 的 (Platform_number, Profile_number, 年月日) 索引，对每个 Platform 用日期二分
-    找最近剖面；匹配不上（无该年 parquet / 无该 Platform / 超容差）的 SCV 丢弃。返回带 year/
-    profile_number 列的匹配子集。"""
-    tol = np.timedelta64(int(match_days), 'D')
-    out = []
-    for yr, sub in scv.groupby(scv['date'].dt.year):
-        fp = Path(argo_data_dir) / f'Argo{int(yr)}.parquet'
-        if not fp.exists():
+    McCoy 周期时间含小时，而年度 Argo 索引只有年月日；匹配先在日历日精度上进行，再用独立
+    Argo 坐标与目录坐标在目录源精度上比较。存在多个无法由这些元数据区分的 profile 时保留
+    未决记录，不按排序位置或最近时间任取一个。
+
+    参数:
+        scv: 含目录行、Platform、Cycle 时间、经纬度和核字段的 McCoy 表。
+        argo_data_dir: 年度 Argo parquet 所在目录。
+        match_days: 日历日期窗口的半宽（天）。
+
+    返回:
+        `pandas.DataFrame`: 每条目录行一行，含原 matcher 字段以及 `catalog_row_id`、候选 profile
+        列表、`match_status`、目录 Platform/Cycle/核字段和未决原因。
+
+    说明:
+        该函数只使用平台、日历日期和独立位置元数据；不读取氧结果或 GLORYS，也不使用运动或
+        任意距离阈值。历史 screen 输出不会由此函数自动刷新。
+    """
+    tol_days = int(match_days)
+    if tol_days < 0:
+        raise ValueError('match_days must be non-negative')
+
+    def _decimal_places(value: Any) -> int:
+        text = str(value).strip()
+        if not text or text.lower() in {'nan', 'none'}:
+            return 0
+        if 'e' in text.lower():
+            return 8
+        return len(text.split('.', 1)[1].rstrip('0')) if '.' in text else 0
+
+    def _coordinate_match(
+        candidate_lon: Any,
+        candidate_lat: Any,
+        catalog_lon: Any,
+        catalog_lat: Any,
+        lon_decimals: int,
+        lat_decimals: int,
+    ) -> tuple[bool, float, float]:
+        values = [candidate_lon, candidate_lat, catalog_lon, catalog_lat]
+        if not all(pd.notna(value) for value in values):
+            return False, np.nan, np.nan
+        candidate_lon_round = round(float(candidate_lon), int(lon_decimals))
+        catalog_lon_round = round(float(catalog_lon), int(lon_decimals))
+        candidate_lat_round = round(float(candidate_lat), int(lat_decimals))
+        catalog_lat_round = round(float(catalog_lat), int(lat_decimals))
+        lon_delta = float(np.asarray(
+            _minimal_lon_diff_deg(candidate_lon_round, catalog_lon_round)
+        ))
+        lat_delta = candidate_lat_round - catalog_lat_round
+        return bool(lon_delta == 0.0 and lat_delta == 0.0), lon_delta, lat_delta
+
+    catalog_columns = [
+        'Profile_number', 'Platform_number', 'Year', 'Month', 'Day',
+        'Longitude', 'Latitude',
+    ]
+    min_day = pd.to_datetime(scv['date'], errors='coerce').dt.normalize().min()
+    max_day = pd.to_datetime(scv['date'], errors='coerce').dt.normalize().max()
+    if pd.isna(min_day) or pd.isna(max_day):
+        return pd.DataFrame(columns=[
+            'year', 'profile_number', 'core_pressure_db', 'scv_type', 'basin',
+            'catalog_row_id', 'catalog_platform', 'catalog_cycle', 'catalog_date',
+            'catalog_lon', 'catalog_lat', 'catalog_shallow_pressure_db',
+            'catalog_deep_pressure_db', 'candidate_profile_numbers',
+            'candidate_profile_dates', 'match_status', 'match_reason',
+            'profile_date', 'profile_lon', 'profile_lat', 'calendar_day_delta',
+            'coordinate_match', 'minimal_lon_diff_deg', 'lat_diff_deg',
+            'n_profile_candidates',
+        ])
+
+    years = range(int((min_day - pd.Timedelta(days=tol_days)).year),
+                  int((max_day + pd.Timedelta(days=tol_days)).year) + 1)
+    frames = []
+    for year in years:
+        path = Path(argo_data_dir) / f'Argo{int(year)}.parquet'
+        if not path.exists():
             continue
-        idx = pq.read_table(fp, columns=['Profile_number', 'Platform_number',
-                                         'Year', 'Month', 'Day']).to_pandas()
-        idx = idx.groupby('Profile_number').first().reset_index()
-        idx['date'] = pd.to_datetime(dict(year=idx['Year'], month=idx['Month'], day=idx['Day']))
-        by_plat = {int(p): g.sort_values('date') for p, g in idx.groupby('Platform_number')}
-        for row in sub.itertuples(index=False):
-            g = by_plat.get(int(row.Platform))
-            if g is None:
-                continue
-            dates = g['date'].values.astype('datetime64[ns]')
-            j = int(np.searchsorted(dates, np.datetime64(row.date)))
-            best = min((k for k in (j - 1, j) if 0 <= k < dates.size),
-                       key=lambda k: abs(dates[k] - np.datetime64(row.date)), default=None)
-            if best is None or abs(dates[best] - np.datetime64(row.date)) > tol:
-                continue
-            out.append({'year': int(yr),
-                        'profile_number': int(g['Profile_number'].values[best]),
-                        'core_pressure_db': float(row.Core_Pressure),
-                        'scv_type': row.SCV_Type, 'basin': row.basin})
+        schema = set(pq.read_schema(path).names)
+        columns = [column for column in catalog_columns if column in schema]
+        if not {'Profile_number', 'Platform_number', 'Year', 'Month', 'Day'}.issubset(columns):
+            continue
+        frame = pq.read_table(path, columns=columns).to_pandas()
+        for column in ['Longitude', 'Latitude']:
+            if column not in frame.columns:
+                frame[column] = np.nan
+        frames.append(frame[catalog_columns])
+    if frames:
+        index = pd.concat(frames, ignore_index=True)
+        index = index.dropna(subset=['Profile_number', 'Platform_number']).copy()
+        index['Profile_number'] = pd.to_numeric(index['Profile_number'], errors='coerce').astype('Int64')
+        index['Platform_number'] = pd.to_numeric(index['Platform_number'], errors='coerce').astype('Int64')
+        index['profile_date'] = pd.to_datetime(
+            {
+                'year': pd.to_numeric(index['Year'], errors='coerce'),
+                'month': pd.to_numeric(index['Month'], errors='coerce'),
+                'day': pd.to_numeric(index['Day'], errors='coerce'),
+            },
+            errors='coerce',
+        ).dt.normalize()
+        index = index.dropna(subset=['profile_date']).drop_duplicates(
+            ['Profile_number'], keep='first'
+        )
+    else:
+        index = pd.DataFrame(columns=catalog_columns + ['profile_date'])
+    by_platform = {
+        int(platform): group.sort_values(['profile_date', 'Profile_number'])
+        for platform, group in index.groupby('Platform_number', dropna=True, sort=False)
+    }
+
+    out = []
+    for fallback_row_id, row in enumerate(scv.itertuples(index=False), start=0):
+        row_dict = row._asdict()
+        catalog_row_id = row_dict.get('catalog_row_id', fallback_row_id)
+        catalog_date = pd.Timestamp(row_dict.get('date')).normalize()
+        platform = pd.to_numeric(pd.Series([row_dict.get('Platform')]), errors='coerce').iloc[0]
+        catalog_lon = pd.to_numeric(pd.Series([row_dict.get('Longitude')]), errors='coerce').iloc[0]
+        catalog_lat = pd.to_numeric(pd.Series([row_dict.get('Latitude')]), errors='coerce').iloc[0]
+        lon_decimals = int(row_dict.get('catalog_lon_decimals', _decimal_places(catalog_lon)))
+        lat_decimals = int(row_dict.get('catalog_lat_decimals', _decimal_places(catalog_lat)))
+        candidates = by_platform.get(int(platform), pd.DataFrame()).copy() if pd.notna(platform) else pd.DataFrame()
+        if not candidates.empty:
+            day_delta = (candidates['profile_date'] - catalog_date).dt.days.abs()
+            candidates = candidates.loc[day_delta.le(tol_days)].copy()
+            candidates['calendar_day_delta'] = (
+                candidates['profile_date'] - catalog_date
+            ).dt.days.astype(int)
+            candidates['coordinate_match'], candidates['minimal_lon_diff_deg'], candidates['lat_diff_deg'] = zip(*[
+                _coordinate_match(
+                    candidate.Longitude, candidate.Latitude,
+                    catalog_lon, catalog_lat, lon_decimals, lat_decimals,
+                )
+                for candidate in candidates.itertuples(index=False)
+            ]) if not candidates.empty else ([], [], [])
+        same_day = candidates.loc[candidates['calendar_day_delta'].eq(0)] if not candidates.empty else candidates
+        coordinate_candidates = candidates.loc[candidates['coordinate_match']] if not candidates.empty else candidates
+        same_day_coordinate = same_day.loc[same_day['coordinate_match']] if not same_day.empty else same_day
+        if len(same_day) == 1:
+            selected = same_day.iloc[0]
+            match_status = 'unique_same_calendar_day'
+            match_reason = 'one same-platform profile on the catalog calendar day'
+        elif len(same_day_coordinate) == 1:
+            selected = same_day_coordinate.iloc[0]
+            match_status = 'same_day_coordinate_supported'
+            match_reason = 'one same-day profile matches independent catalog coordinates at source precision'
+        elif len(same_day) > 1:
+            selected = None
+            match_status = 'unresolved_same_day_multiple_profiles'
+            match_reason = 'multiple same-platform profiles on the catalog calendar day without one coordinate-supported candidate'
+        elif len(coordinate_candidates) == 1:
+            selected = coordinate_candidates.iloc[0]
+            match_status = 'window_coordinate_supported'
+            match_reason = 'one calendar-window profile matches independent catalog coordinates at source precision'
+        elif len(candidates) == 1:
+            selected = candidates.iloc[0]
+            match_status = 'unique_calendar_window_candidate'
+            match_reason = 'one same-platform profile in the calendar-date window'
+        elif len(candidates) == 0:
+            selected = None
+            match_status = 'unresolved_no_calendar_window_candidate'
+            match_reason = 'no same-platform profile in the calendar-date window'
+        else:
+            selected = None
+            match_status = 'unresolved_multiple_calendar_window_profiles'
+            match_reason = 'multiple same-platform profiles in the calendar-date window without one coordinate-supported candidate'
+        candidate_numbers = [int(value) for value in candidates['Profile_number'].dropna().astype(int).tolist()]
+        candidate_dates = [pd.Timestamp(value).strftime('%Y-%m-%d') for value in candidates['profile_date'].dropna()]
+        selected_profile = int(selected['Profile_number']) if selected is not None else pd.NA
+        selected_year = int(selected['profile_date'].year) if selected is not None else int(catalog_date.year)
+        selected_date = selected['profile_date'] if selected is not None else pd.NaT
+        out.append({
+            'year': selected_year,
+            'profile_number': selected_profile,
+            'core_pressure_db': float(row_dict.get('Core_Pressure')),
+            'scv_type': row_dict.get('SCV_Type'),
+            'basin': row_dict.get('basin'),
+            'catalog_row_id': int(catalog_row_id),
+            'catalog_id': row_dict.get('ID'),
+            'catalog_platform': int(platform) if pd.notna(platform) else pd.NA,
+            'catalog_cycle': row_dict.get('Cycle'),
+            'catalog_date': pd.Timestamp(row_dict.get('date')),
+            'catalog_lon': catalog_lon,
+            'catalog_lat': catalog_lat,
+            'catalog_shallow_pressure_db': row_dict.get('Shallow_Pressure'),
+            'catalog_deep_pressure_db': row_dict.get('Deep_Pressure'),
+            'profile_date': selected_date,
+            'profile_lon': selected['Longitude'] if selected is not None else np.nan,
+            'profile_lat': selected['Latitude'] if selected is not None else np.nan,
+            'calendar_day_delta': int(selected['calendar_day_delta']) if selected is not None else pd.NA,
+            'coordinate_match': bool(selected['coordinate_match']) if selected is not None else False,
+            'minimal_lon_diff_deg': float(selected['minimal_lon_diff_deg']) if selected is not None else np.nan,
+            'lat_diff_deg': float(selected['lat_diff_deg']) if selected is not None else np.nan,
+            'candidate_profile_numbers': candidate_numbers,
+            'candidate_profile_dates': candidate_dates,
+            'n_profile_candidates': int(len(candidate_numbers)),
+            'match_status': match_status,
+            'match_reason': match_reason,
+        })
     return pd.DataFrame(out)
 
 
@@ -17760,37 +17927,47 @@ def screen_mccoy_scvs_against_glorys(
 ) -> dict:
     """在 McCoy(2020) 全球 SCV 目录上跑 GLORYS 漏检检验，按海盆汇总 GLORYS 抹平率。
 
-    读 McCoy SCV 目录（``mccoy_csv``），按 Platform 编号 + 周期日期（±``match_days`` 天）匹配到我们含
-    DO 的 BGC Argo 剖面（逐年 parquet），逐条调 glorys_reproduces_mccoy_scv 在 McCoy 核压处做 GLORYS
-    复现，输出明细 parquet 与按 _residual_basin_of 海盆分组的 GLORYS 抹平计数。仅覆盖同时被 McCoy 检测
-    且落在我们 BGC Argo 上的 SCV（约全目录 6%），是"GLORYS 漏检次表层涡"的正样本证据。**串行实现，
-    逐条重建局地背景池 + 读 GLORYS，大批量较慢**。
+    读 McCoy SCV 目录（``mccoy_csv``），按 Platform 编号、日历日期窗口和独立位置元数据匹配到我们含
+    DO 的 BGC Argo 剖面（逐年 parquet）。只有元数据匹配状态明确的目录行才调用
+    glorys_reproduces_mccoy_scv；无法在元数据层区分的目录行保留为未决记录。函数输出明细 parquet 与
+    按 _residual_basin_of 海盆分组的 GLORYS 抹平计数。仅覆盖同时被 McCoy 检测且落在我们 BGC Argo
+    上的 SCV（约全目录 6%），是"GLORYS 漏检次表层涡"的正样本证据。**串行实现，逐条重建局地背景池
+    + 读 GLORYS，大批量较慢**。
 
     参数:
-        mccoy_csv: McCoy SCV 目录 CSV 路径；None 使用 paths.yml 中的 mccoy_scv_csv。
-        basins: 只保留这些海盆（_residual_basin_of 标签，如 ['Pacific','SO']）；None 全部。
-        max_scvs: 处理的匹配 SCV 数上限（截断），None 不限。
-        match_days: McCoy 周期日期 ↔ 我们剖面的 Platform+日期匹配容差（天）。
-        bg_box_deg: 局地背景 Argo 池的经纬度半宽（°）。
-        bg_window_days: 局地背景池的时间半窗（天，同年）。
-        spice_sigma_bandwidth: δπ 的 σ₀ 高斯核带宽（kg/m³）。
-        glorys_sameloc_radius_km: GLORYS 同位列读取窗口半宽（km）。
-        glorys_repro_dpi_frac: GLORYS 核处 |δπ| 保留低于该比例×Argo 即判抹平。
-        argo_min_dpi: Argo 核处 |δπ| 下限，低于此值判 argo_no_signal。
-        argo_data_dir: Argo 年数据目录；None 使用配置默认路径。
-        output_dir: 输出根目录；None 使用当前 method/region 下默认目录。
-        rows_path: 明细 parquet 路径；None 时落在 output_dir 下默认文件名。
-        verbose: 是否打印每条跳过明细。
-        return_details: 是否在返回中附带明细 DataFrame，默认 False。
+        - mccoy_csv (str | Path | None): McCoy SCV 目录 CSV；默认 None，使用 paths.yml 中的 mccoy_scv_csv。
+        - basins (list[str] | None): 只保留这些海盆；默认 None，保留全部。
+        - max_scvs (int | None): 处理的匹配 SCV 数上限；默认 None，不限数量。
+        - match_days (int): Platform 加日历日期匹配窗口的半宽；默认 `_subsurf_lens_mccoy_match_days`。
+        - bg_box_deg (float): 局地背景 Argo 池的经纬度半宽（°）；默认 `_subsurf_lens_bg_box_deg`。
+        - bg_window_days (int): 局地背景池的时间半窗（天）；默认 `_subsurf_lens_bg_window_days`。
+        - spice_sigma_bandwidth (float): δπ 的 σ₀ 高斯核带宽（kg/m³）；默认 `_subsurf_lens_spice_bandwidth`。
+        - glorys_sameloc_radius_km (float): GLORYS 同位列读取窗口半径（km）；默认 `_subsurf_lens_glorys_sameloc_radius_km`。
+        - glorys_repro_dpi_frac (float): GLORYS 核处 |δπ| 相对 Argo 的抹平比例阈值；默认 `_subsurf_lens_glorys_repro_dpi_frac`。
+        - argo_min_dpi (float): Argo 核处 |δπ| 下限，低于此值判为 argo_no_signal；默认 `_subsurf_lens_mccoy_argo_min_dpi`。
+        - argo_data_dir (str | Path | None): Argo 年数据目录；默认 None，使用配置默认路径。
+        - output_dir (str | Path | None): 输出根目录；默认 None，使用当前 method/region 下的默认目录。
+        - rows_path (str | Path | None): 明细 parquet 路径；默认 None，使用 output_dir 下的默认文件名。
+        - verbose (bool): 是否打印每条跳过明细；默认 False。
+        - return_details (bool): 是否在返回中附带明细 DataFrame；默认 False。
 
     返回:
-        dict: 含 n_catalog/n_matched/n_evaluated/argo_no_signal/glorys_miss_count/miss_rate/
-              by_basin/rows_path/output_dir 等摘要；return_details=True 时附 'rows'。
+        - dict: 含目录数、元数据匹配/未决数、评估数、GLORYS 结果、海盆汇总和输出路径；return_details=True 时附 `rows`。
     """
     if argo_data_dir is None:
         argo_data_dir = argo_path
     csv_path = Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv
+    raw_scv = pd.read_csv(csv_path, dtype=str)
     scv = pd.read_csv(csv_path)
+    scv.insert(0, 'catalog_row_id', np.arange(len(scv), dtype=int))
+    scv['catalog_lon_decimals'] = raw_scv['Longitude'].map(
+        lambda value: len(str(value).split('.', 1)[1].rstrip('0'))
+        if '.' in str(value) and str(value).strip().lower() not in {'nan', 'none'} else 0
+    )
+    scv['catalog_lat_decimals'] = raw_scv['Latitude'].map(
+        lambda value: len(str(value).split('.', 1)[1].rstrip('0'))
+        if '.' in str(value) and str(value).strip().lower() not in {'nan', 'none'} else 0
+    )
     scv['date'] = pd.to_datetime(scv['Cycle_ISO_DateTime_UTC']).dt.tz_localize(None)
     scv['basin'] = [_residual_basin_of(la, lo)
                     for la, lo in zip(scv['Latitude'], scv['Longitude'])]
@@ -17810,20 +17987,68 @@ def screen_mccoy_scvs_against_glorys(
                      else base / "mccoy_glorys_miss.parquet")
 
     rows = []
+    resolved_match_statuses = {
+        'unique_same_calendar_day',
+        'same_day_coordinate_supported',
+        'window_coordinate_supported',
+        'unique_calendar_window_candidate',
+    }
     for row in tqdm(matched.itertuples(index=False), total=len(matched),
                     desc="mccoy→glorys", unit="scv"):
-        rep = glorys_reproduces_mccoy_scv(
-            row.year, row.profile_number, row.core_pressure_db,
-            bg_box_deg=bg_box_deg, bg_window_days=bg_window_days,
-            spice_sigma_bandwidth=spice_sigma_bandwidth,
-            glorys_sameloc_radius_km=glorys_sameloc_radius_km,
-            glorys_repro_dpi_frac=glorys_repro_dpi_frac,
-            argo_min_dpi=argo_min_dpi, argo_data_dir=argo_data_dir)
-        rep['basin'] = row.basin
-        rep['scv_type'] = row.scv_type
+        if row.match_status in resolved_match_statuses and pd.notna(row.profile_number):
+            rep = glorys_reproduces_mccoy_scv(
+                row.year, int(row.profile_number), row.core_pressure_db,
+                bg_box_deg=bg_box_deg, bg_window_days=bg_window_days,
+                spice_sigma_bandwidth=spice_sigma_bandwidth,
+                glorys_sameloc_radius_km=glorys_sameloc_radius_km,
+                glorys_repro_dpi_frac=glorys_repro_dpi_frac,
+                argo_min_dpi=argo_min_dpi, argo_data_dir=argo_data_dir)
+        else:
+            rep = {
+                'lon': round(float(row.catalog_lon), 3) if pd.notna(row.catalog_lon) else np.nan,
+                'lat': round(float(row.catalog_lat), 3) if pd.notna(row.catalog_lat) else np.nan,
+                'date': pd.Timestamp(row.catalog_date).strftime('%Y-%m-%d')
+                if pd.notna(row.catalog_date) else None,
+                'core_depth_m': np.nan,
+                'argo_dpi_core': np.nan,
+                'argo_lens_sign': None,
+                'glorys_dpi_core': np.nan,
+                'glorys_dpi_ratio': np.nan,
+                'glorys_n2_core': np.nan,
+                'glorys_misses': None,
+                'status': 'unresolved_profile_match',
+                'skip_reason': row.match_reason,
+            }
+        rep.update({
+            'basin': row.basin,
+            'scv_type': row.scv_type,
+            'catalog_row_id': int(row.catalog_row_id),
+            'catalog_id': row.catalog_id,
+            'catalog_platform': row.catalog_platform,
+            'catalog_cycle': row.catalog_cycle,
+            'catalog_date': row.catalog_date,
+            'catalog_lon': row.catalog_lon,
+            'catalog_lat': row.catalog_lat,
+            'catalog_core_pressure_db': row.core_pressure_db,
+            'catalog_shallow_pressure_db': row.catalog_shallow_pressure_db,
+            'catalog_deep_pressure_db': row.catalog_deep_pressure_db,
+            'profile_number': row.profile_number,
+            'profile_date': row.profile_date,
+            'profile_lon': row.profile_lon,
+            'profile_lat': row.profile_lat,
+            'calendar_day_delta': row.calendar_day_delta,
+            'coordinate_match': row.coordinate_match,
+            'minimal_lon_diff_deg': row.minimal_lon_diff_deg,
+            'lat_diff_deg': row.lat_diff_deg,
+            'candidate_profile_numbers': row.candidate_profile_numbers,
+            'candidate_profile_dates': row.candidate_profile_dates,
+            'n_profile_candidates': row.n_profile_candidates,
+            'match_status': row.match_status,
+            'match_reason': row.match_reason,
+        })
         rows.append(rep)
         if verbose and rep['status'] not in ('ok', 'argo_no_signal'):
-            print(f"[skip] {row.year}/{row.profile_number}: {rep['skip_reason']}")
+            print(f"[skip] catalog row {row.catalog_row_id}: {rep['skip_reason']}")
 
     cand = pd.DataFrame(rows)
     cand.to_parquet(resolved_rows, index=False)
@@ -17838,7 +18063,10 @@ def screen_mccoy_scvs_against_glorys(
                             'miss_pct': round(100.0 * m.mean(), 1)}
     summary = {
         'n_catalog': int(len(scv)),
-        'n_matched': int(len(matched)),
+        'n_matched': int(matched['match_status'].isin(resolved_match_statuses).sum()),
+        'n_unresolved_profile_match': int(
+            (~matched['match_status'].isin(resolved_match_statuses)).sum()
+        ),
         'n_evaluated': int(len(ev)),
         'argo_no_signal': int((cand['status'] == 'argo_no_signal').sum()) if len(cand) else 0,
         'glorys_miss_count': int(miss.sum()),
@@ -17848,7 +18076,7 @@ def screen_mccoy_scvs_against_glorys(
         'output_dir': str(base),
     }
     print(f"[*] GLORYS misses {int(miss.sum())}/{len(ev)} evaluable McCoy SCVs "
-          f"({len(matched)} matched of {len(scv)}) → {resolved_rows}")
+          f"({summary['n_matched']} metadata-matched, {summary['n_unresolved_profile_match']} unresolved of {len(scv)}) → {resolved_rows}")
     if return_details:
         summary['rows'] = cand
     return summary
@@ -24523,6 +24751,137 @@ def run_euler_grid_analysis(
         'eke': eke_bundle,
     }
 
+
+def _prepare_do_profile_for_detection(
+    profile_data: pd.DataFrame,
+    detection_config: DetectionConfig,
+    *,
+    depth_col: str = 'Depth',
+    do_col: str = 'DO',
+    salinity_col: str = 'Salinity',
+    temperature_col: str = 'Temperature',
+    remove_outliers: bool = True,
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    """按 DO detector 的正式规则清洗一个剖面并返回资格诊断。"""
+    work = profile_data.copy()
+    diagnostics: dict[str, Any] = {
+        'raw_rows': int(len(work)),
+        'near_zero_count': 0,
+        'near_zero_triggered': False,
+        'clean_rows_before_depth_dedup': 0,
+        'clean_rows_after_depth_dedup': 0,
+        'duplicate_depth_groups': 0,
+        'duplicate_depth_rows_removed': 0,
+        'detector_preprocessed': False,
+        'preprocess_reason': 'profile_not_returned',
+    }
+    for column in [depth_col, do_col, salinity_col, temperature_col]:
+        if column in work.columns:
+            work[column] = pd.to_numeric(work[column], errors='coerce')
+
+    if remove_outliers:
+        good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+        for variable in [do_col, salinity_col, temperature_col]:
+            qc_column = f'{variable}_Flag'
+            if qc_column in work.columns:
+                bad_qc = ~work[qc_column].isin(good_qc_flags)
+                work.loc[bad_qc, variable] = np.nan
+        if do_col in work.columns:
+            do_numeric = pd.to_numeric(work[do_col], errors='coerce')
+            bad_do = do_numeric <= float(detection_config.do_near_zero_threshold)
+            diagnostics['near_zero_count'] = int(np.count_nonzero(bad_do.to_numpy()))
+            max_count = detection_config.do_near_zero_max_count
+            if max_count is not None and int(max_count) >= 0:
+                diagnostics['near_zero_triggered'] = bool(
+                    diagnostics['near_zero_count'] > int(max_count)
+                )
+            work.loc[bad_do, do_col] = np.nan
+
+    drop_subset = [depth_col, do_col, salinity_col, temperature_col]
+    cleaned = work.dropna(subset=drop_subset).copy()
+    diagnostics['clean_rows_before_depth_dedup'] = int(len(cleaned))
+    if diagnostics['near_zero_triggered']:
+        diagnostics['preprocess_reason'] = 'near_zero_count_exceeds_max'
+        return None, diagnostics
+    if len(cleaned) < 5:
+        diagnostics['preprocess_reason'] = 'clean_rows_before_depth_dedup_below_five'
+        return None, diagnostics
+
+    strategy = str(detection_config.duplicate_depth_strategy or 'best_qc').lower()
+    if strategy not in {'best_qc', 'first', 'mean', 'max', 'min'}:
+        strategy = 'best_qc'
+    if cleaned[depth_col].duplicated().any():
+        picked_rows: list[pd.Series] = []
+        for _, group in cleaned.groupby(depth_col, sort=False):
+            if len(group) == 1:
+                picked_rows.append(group.iloc[0])
+                continue
+            diagnostics['duplicate_depth_groups'] += 1
+            diagnostics['duplicate_depth_rows_removed'] += len(group) - 1
+            if strategy == 'best_qc':
+                qc_column = f'{do_col}_Flag'
+                priority = {1: 0, 2: 1, 5: 2, 8: 3}
+
+                def rank(value: Any) -> int:
+                    try:
+                        return priority.get(int(value), 999)
+                    except Exception:
+                        return 999
+
+                if qc_column in group.columns:
+                    ranks = group[qc_column].map(rank)
+                    candidates = group.loc[ranks.eq(ranks.min())]
+                    if do_col in candidates.columns:
+                        with_do = candidates[candidates[do_col].notna()]
+                        if not with_do.empty:
+                            candidates = with_do
+                    picked_rows.append(candidates.iloc[0])
+                else:
+                    picked_rows.append(group.iloc[0])
+            elif strategy == 'first':
+                picked_rows.append(group.iloc[0])
+            elif strategy == 'mean':
+                first = group.iloc[0].copy()
+                for column in [do_col, salinity_col, temperature_col]:
+                    if column in group.columns:
+                        first[column] = pd.to_numeric(
+                            group[column], errors='coerce'
+                        ).mean()
+                picked_rows.append(first)
+            elif strategy == 'max':
+                picked_rows.append(
+                    group.loc[pd.to_numeric(group[do_col], errors='coerce').idxmax()]
+                )
+            else:
+                picked_rows.append(
+                    group.loc[pd.to_numeric(group[do_col], errors='coerce').idxmin()]
+                )
+        cleaned = pd.DataFrame(picked_rows)
+
+    cleaned = cleaned.sort_values(depth_col).reset_index(drop=True)
+    diagnostics['clean_rows_after_depth_dedup'] = int(len(cleaned))
+    if len(cleaned) < 5:
+        diagnostics['preprocess_reason'] = 'clean_rows_after_depth_dedup_below_five'
+        return None, diagnostics
+    depths = pd.to_numeric(cleaned[depth_col], errors='coerce').to_numpy(dtype=float)
+    if np.any(np.diff(depths) <= 0):
+        keep_idx = [0]
+        last_depth = depths[0]
+        for row_index in range(1, len(depths)):
+            depth_value = depths[row_index]
+            if np.isfinite(depth_value) and depth_value > last_depth:
+                keep_idx.append(row_index)
+                last_depth = depth_value
+        cleaned = cleaned.iloc[keep_idx].reset_index(drop=True)
+        depths = pd.to_numeric(cleaned[depth_col], errors='coerce').to_numpy(dtype=float)
+    if len(cleaned) < 5 or np.any(np.diff(depths) <= 0):
+        diagnostics['preprocess_reason'] = 'depth_not_strictly_increasing'
+        return None, diagnostics
+    diagnostics['detector_preprocessed'] = True
+    diagnostics['preprocess_reason'] = 'preprocessing_passed'
+    return cleaned, diagnostics
+
+
 def calculate_delta_do(
     data: pd.DataFrame,
     detection_config: DetectionConfig | None = None,
@@ -24631,78 +24990,6 @@ def calculate_delta_do(
         except Exception:
             return out
         return out
-
-    def _best_qc_pick(group: pd.DataFrame) -> pd.Series:
-        qccol = f"{do_col}_Flag"
-        priority = {1: 0, 2: 1, 5: 2, 8: 3}
-
-        def rank(v):
-            try:
-                iv = int(v)
-            except Exception:
-                return 999
-            return priority.get(iv, 999)
-
-        if qccol in group.columns:
-            ranks = group[qccol].apply(rank)
-            min_rank = ranks.min()
-            picked = group.loc[ranks[ranks == min_rank].index]
-            if do_col in picked.columns:
-                picked = picked[pd.notna(picked[do_col])]
-                if picked.empty:
-                    picked = group.loc[ranks[ranks == min_rank].index]
-            return picked.iloc[0]
-        return group.iloc[0]
-
-    def _mean_pick(group: pd.DataFrame) -> pd.Series:
-        first = group.iloc[0].copy()
-        for c in [do_col, salinity_col, temperature_col]:
-            if c in group.columns:
-                first[c] = pd.to_numeric(group[c], errors='coerce').mean()
-        return first
-
-    def _dedupe_profile_depth(profile_df: pd.DataFrame) -> pd.DataFrame:
-        df = profile_df.copy()
-
-        if df[depth_col].duplicated().any():
-            strategy = (duplicate_depth_strategy or 'best_qc').lower()
-            if strategy not in {'best_qc', 'first', 'mean', 'max', 'min'}:
-                strategy = 'best_qc'
-
-            grouped = list(df.groupby(depth_col, sort=False))
-            picked_rows = []
-            for _, grp in grouped:
-                if len(grp) == 1:
-                    picked_rows.append(grp.iloc[0])
-                    continue
-                if strategy == 'best_qc':
-                    picked_rows.append(_best_qc_pick(grp))
-                elif strategy == 'first':
-                    picked_rows.append(grp.iloc[0])
-                elif strategy == 'mean':
-                    picked_rows.append(_mean_pick(grp))
-                elif strategy == 'max':
-                    picked_rows.append(grp.loc[pd.to_numeric(grp[do_col], errors='coerce').idxmax()])
-                elif strategy == 'min':
-                    picked_rows.append(grp.loc[pd.to_numeric(grp[do_col], errors='coerce').idxmin()])
-
-            df = pd.DataFrame(picked_rows)
-
-        df = df.sort_values(by=depth_col).reset_index(drop=True)
-        depth_arr = pd.to_numeric(df[depth_col], errors='coerce').to_numpy(dtype=float)
-        if len(depth_arr) == 0:
-            return df
-
-        if np.any(np.diff(depth_arr) <= 0):
-            keep_idx = [0]
-            last_depth = depth_arr[0]
-            for ridx in range(1, len(depth_arr)):
-                dval = depth_arr[ridx]
-                if np.isfinite(dval) and dval > last_depth:
-                    keep_idx.append(ridx)
-                    last_depth = dval
-            df = df.iloc[keep_idx].reset_index(drop=True)
-        return df
 
     def _find_peaks_by_slope(values: np.ndarray, depth_values: np.ndarray) -> list[tuple[int, str, float]]:
         if len(values) < 3:
@@ -24958,13 +25245,8 @@ def calculate_delta_do(
     salinity_threshold = cfg.salinity_threshold
     temperature_threshold = cfg.temperature_threshold
     depth_merge_tolerance = cfg.depth_merge_tolerance
-    duplicate_depth_strategy = cfg.duplicate_depth_strategy
     anomaly_min_depth = cfg.anomaly_min_depth
     anomaly_max_depth = cfg.anomaly_max_depth
-    do_near_zero_threshold = cfg.do_near_zero_threshold
-    do_near_zero_max_count = cfg.do_near_zero_max_count
-    if do_near_zero_max_count is not None:
-        do_near_zero_max_count = int(do_near_zero_max_count)
 
     method_norm = cfg.method
     aou_threshold = cfg.aou_threshold
@@ -24978,41 +25260,16 @@ def calculate_delta_do(
     trim_depth_max = cfg.trim_depth_max
 
     for profile_num, profile_data in profile_groups:
-        profile_data = profile_data.copy()
-
-        # 先统一为数值，避免字符串导致比较失败。
-        for c in [depth_col, do_col, salinity_col, temperature_col]:
-            if c in profile_data.columns:
-                profile_data[c] = pd.to_numeric(profile_data[c], errors='coerce')
-
-        # 质量控制：移除异常值和质量标记不良的数据
-        if remove_outliers:
-            # 应用Argo QC标准：仅保留等级为{1,2,5,8}的观测
-            for var in [do_col, salinity_col, temperature_col]:
-                qc_column_name = f"{var}_Flag"
-                if qc_column_name in profile_data.columns:
-                    good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
-                    bad_qc_mask = ~profile_data[qc_column_name].isin(good_qc_flags)
-                    profile_data.loc[bad_qc_mask, var] = np.nan
-
-            # 规则法：移除已知的错误值
-            if do_col in profile_data.columns:
-                do_numeric = pd.to_numeric(profile_data[do_col], errors='coerce')
-                bad_do_mask = do_numeric <= do_near_zero_threshold
-                if do_near_zero_max_count is not None and do_near_zero_max_count >= 0:
-                    bad_do_count = int(np.count_nonzero(bad_do_mask.to_numpy()))
-                    if bad_do_count > do_near_zero_max_count:
-                        continue
-                profile_data.loc[bad_do_mask, do_col] = np.nan
-
-        # 移除包含NaN值的行
-        drop_subset = [depth_col, do_col, salinity_col, temperature_col]
-        profile_data_clean = profile_data.dropna(subset=drop_subset)
-        if len(profile_data_clean) < 5:
-            continue
-
-        profile_data_clean = _dedupe_profile_depth(profile_data_clean)
-        if len(profile_data_clean) < 5:
+        profile_data_clean, _ = _prepare_do_profile_for_detection(
+            profile_data,
+            cfg,
+            depth_col=depth_col,
+            do_col=do_col,
+            salinity_col=salinity_col,
+            temperature_col=temperature_col,
+            remove_outliers=remove_outliers,
+        )
+        if profile_data_clean is None:
             continue
 
         depth_values = pd.to_numeric(profile_data_clean[depth_col], errors='coerce').to_numpy(dtype=float)
