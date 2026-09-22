@@ -37304,6 +37304,3107 @@ def advect_ofes_particles(
     }
 
 
+def sample_ofes_trajectory_properties(
+    trajectories: pd.DataFrame,
+    field_snapshot: dict,
+    tracer_snapshot: dict,
+) -> pd.DataFrame:
+    """在单日 OFES 快照上采样粒子热盐、剖面异常和局地动力属性。
+
+    函数把轨迹位置与同日期的 OFES 示踪物和速度快照放在同一网格上，返回逐粒子
+    raw DO、位温、实用盐度、SA/CT、sigma0、spice、项目垂向剖面 ΔDO、三分量速度、
+    相对涡度/应变和固定深度局地背景对比。它保留输入中的 inactive、escaped、invalid
+    和缺测位置；这些行的属性保持 NaN 并带有明确的采样状态。
+
+    参数:
+        - trajectories (pd.DataFrame): 单个日期的粒子位置表，需含 `date`、`depth_m`、`lat`、`lon` 和 `status`。
+        - field_snapshot (dict): `load_ofes_snapshot` 返回的 `u`、`v`、`w` 快照，三维模式需携带 `depth_w`。
+        - tracer_snapshot (dict): 含 `do2`、`temp`、`salinity` 的同日期快照。
+
+    返回:
+        - pd.DataFrame: 保留全部输入行并附加 raw、SA/CT、项目剖面 ΔDO、动力和固定深度局地背景列。
+
+    输出:
+        - 无文件输出；调用方负责按案例 manifest 保存返回表。
+
+    说明:
+        - 局地背景半径读取 `config/processing.yml` 的 OFES process-review 设置，名称明确为 fixed-depth local contrast。
+        - `project_profile_delta_do_umol_kg` 来自同位置原生垂向 DO 剖面的正式正峰参考线；它不等同于 raw DO 或局地背景 contrast。
+        - 背景值沿交付 z 层插值到粒子深度，属于 fixed-depth local comparison，不是等密度面量。
+    """
+    required = {'date', 'depth_m', 'lat', 'lon', 'status'}
+    missing = sorted(required.difference(trajectories.columns))
+    if missing:
+        raise KeyError(f'OFES trajectory table is missing columns: {missing}.')
+    if trajectories.empty:
+        return trajectories.copy()
+    field_date = pd.Timestamp(field_snapshot['date']).normalize()
+    tracer_date = pd.Timestamp(tracer_snapshot['date']).normalize()
+    if field_date != tracer_date:
+        raise ValueError('OFES field and tracer snapshots must share the date.')
+    dates = pd.to_datetime(trajectories['date']).dt.normalize()
+    if not dates.eq(field_date).all():
+        raise ValueError('sample_ofes_trajectory_properties accepts one snapshot date.')
+
+    process_settings = _ofes_process_review_settings()
+    inner_km = float(process_settings['background_inner_km'])
+    outer_km = float(process_settings['background_outer_km'])
+    background_status = (
+        f'fixed_depth_local_annulus_{inner_km:g}_{outer_km:g}_km'
+    )
+    all_rows = trajectories.reset_index(drop=True).copy()
+    all_rows['_input_row_order'] = np.arange(len(all_rows), dtype=int)
+    finite_position = (
+        np.isfinite(all_rows['depth_m'])
+        & np.isfinite(all_rows['lat'])
+        & np.isfinite(all_rows['lon'])
+    )
+    active_mask = all_rows['status'].astype(str).eq('active') & finite_position
+    active = all_rows.loc[active_mask].copy()
+
+    scalar_columns = [
+        'do2', 'theta', 'salinity', 'sa_g_kg', 'ct_deg_c', 'sigma0',
+        'spiciness0', 'project_profile_delta_do_umol_kg',
+        'project_profile_peak_depth_m', 'u_m_s', 'v_m_s', 'w_m_s',
+        'relative_vorticity_s_1', 'normal_strain_s_1', 'shear_strain_s_1',
+        'background_do2_fixed_depth_local',
+        'background_theta_fixed_depth_local',
+        'background_salinity_fixed_depth_local',
+        'background_sigma0_fixed_depth_local',
+        'background_spiciness0_fixed_depth_local',
+        'fixed_depth_local_do_contrast',
+        'fixed_depth_local_theta_contrast',
+        'fixed_depth_local_salinity_contrast',
+        'fixed_depth_local_sigma0_contrast',
+        'fixed_depth_local_spiciness0_contrast',
+    ]
+    result_values = {
+        column: np.full(len(all_rows), np.nan, dtype=float)
+        for column in scalar_columns
+    }
+    result_values.update({
+        'project_profile_status': np.full(len(all_rows), 'not_sampled', dtype=object),
+        'background_status': np.full(len(all_rows), background_status, dtype=object),
+        'background_inner_km': np.full(len(all_rows), inner_km, dtype=float),
+        'background_outer_km': np.full(len(all_rows), outer_km, dtype=float),
+        'background_annulus_valid_columns': np.zeros(len(all_rows), dtype=int),
+        'background_annulus_columns': np.zeros(len(all_rows), dtype=int),
+        'property_sample_status': all_rows['status'].astype(str).map(
+            lambda value: f'not_sampled_{value}'
+        ).to_numpy(dtype=object),
+    })
+    if active.empty:
+        for column, values in result_values.items():
+            all_rows[column] = values
+        all_rows['date'] = field_date
+        return all_rows.sort_values('_input_row_order').drop(columns='_input_row_order')
+
+    center_lon = float(active['lon'].median())
+    center_lat = float(active['lat'].median())
+    lon_grid, lat_grid = np.meshgrid(
+        np.asarray(tracer_snapshot['lon'], dtype=float),
+        np.asarray(tracer_snapshot['lat'], dtype=float),
+    )
+    distance_km = np.asarray(
+        local_xy_distance_m(lon_grid, lat_grid, center_lon, center_lat),
+        dtype=float,
+    ) / 1000.0
+    annulus = (distance_km >= inner_km) & (distance_km <= outer_km)
+    tracer_values = {
+        key: np.asarray(tracer_snapshot[key])
+        for key in ('do2', 'temp', 'salinity')
+    }
+    valid_columns = annulus.copy()
+    for value in tracer_values.values():
+        valid_columns &= np.isfinite(value).any(axis=0)
+    background = {
+        key: np.nanmedian(
+            np.where(valid_columns[None, :, :], value, np.nan), axis=(1, 2)
+        )
+        for key, value in tracer_values.items()
+    }
+    depth = np.asarray(tracer_snapshot['depth'], dtype=float)
+    pressure_background = gsw.p_from_z(
+        -depth, np.full(depth.shape, center_lat, dtype=float)
+    )
+    sa_background = gsw.SA_from_SP(
+        background['salinity'], pressure_background, center_lon, center_lat
+    )
+    ct_background = gsw.CT_from_pt(sa_background, background['temp'])
+    background.update({
+        'sigma0': gsw.sigma0(sa_background, ct_background),
+        'spiciness0': gsw.spiciness0(sa_background, ct_background),
+    })
+    points = active[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+    do2 = _ofes_interp3d(
+        tracer_values['do2'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], points
+    )
+    theta = _ofes_interp3d(
+        tracer_values['temp'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], points
+    )
+    salinity = _ofes_interp3d(
+        tracer_values['salinity'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], points
+    )
+    pressure = gsw.p_from_z(-points[:, 0], points[:, 1])
+    sa = gsw.SA_from_SP(salinity, pressure, points[:, 2], points[:, 1])
+    ct = gsw.CT_from_pt(sa, theta)
+    sigma0 = gsw.sigma0(sa, ct)
+    spiciness0 = gsw.spiciness0(sa, ct)
+
+    profile_delta = np.full(len(active), np.nan, dtype=float)
+    profile_peak_depth = np.full(len(active), np.nan, dtype=float)
+    profile_status = np.full(len(active), 'profile_not_evaluated', dtype=object)
+    formal_config = make_detection_config('do')
+    for index, point in enumerate(points):
+        profile = pd.DataFrame({
+            'Depth': depth,
+            'do2': _ofes_interp3d(
+                tracer_values['do2'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'],
+                np.column_stack((depth, np.full(depth.size, point[1]), np.full(depth.size, point[2]))),
+            ),
+            'temp': _ofes_interp3d(
+                tracer_values['temp'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'],
+                np.column_stack((depth, np.full(depth.size, point[1]), np.full(depth.size, point[2]))),
+            ),
+            'salinity': _ofes_interp3d(
+                tracer_values['salinity'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'],
+                np.column_stack((depth, np.full(depth.size, point[1]), np.full(depth.size, point[2]))),
+            ),
+        })
+        peak_info = _ofes_do50_detectability_peak_rows(
+            profile,
+            formal_config,
+            half_window_m=float(formal_config.depth_interval),
+            half_amplitude_fraction=0.5,
+        )
+        profile_status[index] = str(peak_info['status'])
+        if peak_info['peak_rows']:
+            peak = max(peak_info['peak_rows'], key=lambda row: row['delta_do_umol_kg'])
+            profile_delta[index] = float(peak['delta_do_umol_kg'])
+            profile_peak_depth[index] = float(peak['peak_depth_m'])
+
+    field_depth = np.asarray(field_snapshot['depth'], dtype=float)
+    field_lat = np.asarray(field_snapshot['lat'], dtype=float)
+    field_lon = np.asarray(field_snapshot['lon'], dtype=float)
+    u = _ofes_interp3d(field_snapshot['u'], field_depth, field_lat, field_lon, points)
+    v = _ofes_interp3d(field_snapshot['v'], field_depth, field_lat, field_lon, points)
+    w = _ofes_interp3d(
+        field_snapshot['w'], field_snapshot['depth_w'], field_lat, field_lon, points
+    )
+    _, du_dy, du_dx = np.gradient(
+        np.asarray(field_snapshot['u']), field_depth, field_lat, field_lon, edge_order=1
+    )
+    _, dv_dy, dv_dx = np.gradient(
+        np.asarray(field_snapshot['v']), field_depth, field_lat, field_lon, edge_order=1
+    )
+    grid_lengths = approximate_degree_length(field_lat)
+    lon_lengths = np.asarray(grid_lengths['meters_per_degree_lon'], dtype=float)[None, :, None]
+    lat_lengths = np.asarray(grid_lengths['meters_per_degree_lat'], dtype=float)[None, :, None]
+    du_dx = du_dx / lon_lengths
+    dv_dx = dv_dx / lon_lengths
+    du_dy = du_dy / lat_lengths
+    dv_dy = dv_dy / lat_lengths
+    relative_vorticity = _ofes_interp3d(
+        dv_dx - du_dy, field_depth, field_lat, field_lon, points
+    )
+    normal_strain = _ofes_interp3d(
+        du_dx - dv_dy, field_depth, field_lat, field_lon, points
+    )
+    shear_strain = _ofes_interp3d(
+        du_dy + dv_dx, field_depth, field_lat, field_lon, points
+    )
+    active_indices = active['_input_row_order'].to_numpy(dtype=int)
+    active_values = {
+        'do2': do2,
+        'theta': theta,
+        'salinity': salinity,
+        'sa_g_kg': sa,
+        'ct_deg_c': ct,
+        'sigma0': sigma0,
+        'spiciness0': spiciness0,
+        'project_profile_delta_do_umol_kg': profile_delta,
+        'project_profile_peak_depth_m': profile_peak_depth,
+        'u_m_s': u,
+        'v_m_s': v,
+        'w_m_s': w,
+        'relative_vorticity_s_1': relative_vorticity,
+        'normal_strain_s_1': normal_strain,
+        'shear_strain_s_1': shear_strain,
+        'background_do2_fixed_depth_local': np.interp(points[:, 0], depth, background['do2'], left=np.nan, right=np.nan),
+        'background_theta_fixed_depth_local': np.interp(points[:, 0], depth, background['temp'], left=np.nan, right=np.nan),
+        'background_salinity_fixed_depth_local': np.interp(points[:, 0], depth, background['salinity'], left=np.nan, right=np.nan),
+        'background_sigma0_fixed_depth_local': np.interp(points[:, 0], depth, background['sigma0'], left=np.nan, right=np.nan),
+        'background_spiciness0_fixed_depth_local': np.interp(points[:, 0], depth, background['spiciness0'], left=np.nan, right=np.nan),
+        'fixed_depth_local_do_contrast': do2 - np.interp(points[:, 0], depth, background['do2'], left=np.nan, right=np.nan),
+        'fixed_depth_local_theta_contrast': theta - np.interp(points[:, 0], depth, background['temp'], left=np.nan, right=np.nan),
+        'fixed_depth_local_salinity_contrast': salinity - np.interp(points[:, 0], depth, background['salinity'], left=np.nan, right=np.nan),
+        'fixed_depth_local_sigma0_contrast': sigma0 - np.interp(points[:, 0], depth, background['sigma0'], left=np.nan, right=np.nan),
+        'fixed_depth_local_spiciness0_contrast': spiciness0 - np.interp(points[:, 0], depth, background['spiciness0'], left=np.nan, right=np.nan),
+    }
+    for column, values in active_values.items():
+        result_values[column][active_indices] = np.asarray(values, dtype=float)
+    result_values['project_profile_status'][active_indices] = profile_status
+    result_values['property_sample_status'][active_indices] = 'sampled'
+    result_values['background_annulus_valid_columns'][active_indices] = int(np.count_nonzero(valid_columns))
+    result_values['background_annulus_columns'][active_indices] = int(np.count_nonzero(annulus))
+    for column, values in result_values.items():
+        all_rows[column] = values
+    all_rows['date'] = field_date
+    return all_rows.sort_values('_input_row_order').drop(columns='_input_row_order')
+
+
+def evaluate_ofes_endpoint_hits(
+    trajectories: pd.DataFrame,
+    endpoint_members: pd.DataFrame,
+    native_profiles: pd.DataFrame,
+    endpoint_definitions: Mapping[str, Mapping[str, Any]],
+    arms: Sequence[Mapping[str, Any]],
+    grid_cell_size_deg: float | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按正式原生网格单元和逐像元半振幅核评估端点命中。
+
+    函数复用双端点 producer 的真实单元边界、共享深度容差和逐像元到达 helper。
+    native profile 与峰成员只按 `case_label`、`daily_object_key` 和全局 source
+    经纬索引做唯一连接；不按排序位置或 particle_id 代配。所有积分状态均保留，
+    并把像元外、像元内但自身核心外、全局深度带内却没有目标像元支撑的负例分开登记。
+
+    参数:
+        - trajectories (pd.DataFrame): 含 arm、日期、位置、状态、integration_label 和 seed_id 的逐日轨迹表。
+        - endpoint_members (pd.DataFrame): 正式端点峰成员表，需含 `case_label`、对象 key、全局索引和位置。
+        - native_profiles (pd.DataFrame): 与成员唯一键对应的原生半振幅核心边界表。
+        - endpoint_definitions (Mapping[str, Mapping[str, Any]]): 端点标签到日期的正式定义。
+        - arms (Sequence[Mapping[str, Any]]): 独立释放臂及其 arm_id、source/target label 和 release_date。
+        - grid_cell_size_deg (float | None): 从实际 OFES 坐标快照解析出的原生单元步长；缺失时拒绝判定，不从目标成员间距或默认常数推断。
+
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame]: 逐粒子 exact-pixel QA 表及按 arm、端点和模式汇总的表。
+
+    输出:
+        - 无文件输出；调用方负责保存逐粒子和汇总结果。
+
+    说明:
+        - 水平命中只由目标像元自身 `cell_lat/lon_min/max` 判定，中心距离只作为负例诊断量。
+        - `pixel_core_hit` 是目标像元自己的原生核心命中；`global_core_depth_range_hit` 仅是全体目标核心深度带对照，不能替代逐像元命中。
+    """
+    required_member = {
+        'case_label', 'daily_object_key', 'source_lat_index', 'source_lon_index',
+        'lat_index', 'lon_index', 'lat', 'lon', 'delta_do', 'peak_depth',
+    }
+    missing_member = sorted(required_member.difference(endpoint_members.columns))
+    if missing_member:
+        raise KeyError(f'Endpoint members lack required fields: {missing_member}.')
+    required_native = {
+        'case_label', 'daily_object_key', 'source_lat_index', 'source_lon_index',
+        'recovered_core_shallow_edge_m', 'recovered_core_deep_edge_m',
+        'recovered_core_thickness_m',
+    }
+    missing_native = sorted(required_native.difference(native_profiles.columns))
+    if missing_native:
+        raise KeyError(f'Native profiles lack required fields: {missing_native}.')
+
+    key = ['case_label', 'daily_object_key', 'source_lat_index', 'source_lon_index']
+    members = endpoint_members.copy()
+    native = native_profiles.copy()
+    if members.duplicated(key).any() or native.duplicated(key).any():
+        raise ValueError('Endpoint member/native profile key is not unique.')
+    native_core = native.loc[:, key + [
+        'recovered_core_shallow_edge_m', 'recovered_core_deep_edge_m',
+        'recovered_core_thickness_m',
+    ]]
+    support = members.merge(native_core, on=key, how='left', validate='one_to_one')
+    if support[['recovered_core_shallow_edge_m', 'recovered_core_deep_edge_m']].isna().any().any():
+        raise ValueError('Endpoint support lacks a native core for at least one exact pixel key.')
+    # The shared registration helper consumes producer-neutral core names.
+    # Preserve the recovered columns in the input contract, then rename them
+    # explicitly so no positional or sorted-row pairing can enter the join.
+    support = support.rename(columns={
+        'recovered_core_shallow_edge_m': 'core_shallow_edge_m',
+        'recovered_core_deep_edge_m': 'core_deep_edge_m',
+    })
+
+    if grid_cell_size_deg is None or not np.isfinite(float(grid_cell_size_deg)):
+        raise ValueError(
+            'Exact endpoint cell bounds require grid_cell_size_deg resolved from '
+            'an actual OFES coordinate snapshot; member spacing/default fallback is forbidden.'
+        )
+    grid_step = float(grid_cell_size_deg)
+    if grid_step <= 0:
+        raise ValueError('Resolved OFES grid cell size must be positive.')
+
+    target_cells = {}
+    global_ranges = {}
+    grid_steps = {}
+    for label in endpoint_definitions:
+        target = support.loc[support['case_label'].astype(str).eq(str(label))].copy()
+        if target.empty:
+            raise ValueError(f'Endpoint definition {label!r} has no support pixels.')
+        target_cells[label] = _ofes_dual_endpoint_attach_cell_bounds(target, grid_step)
+        global_ranges[label] = (
+            float(target['core_shallow_edge_m'].min()),
+            float(target['core_deep_edge_m'].max()),
+        )
+        grid_steps[label] = grid_step
+
+    tolerance = float(_OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M)
+    rows = []
+    for arm in arms:
+        arm_id = str(arm['arm_id'])
+        for target_label, definition in endpoint_definitions.items():
+            target = target_cells[target_label]
+            target_date = pd.Timestamp(definition['date']).normalize()
+            subset = trajectories.loc[
+                trajectories['arm_id'].astype(str).eq(arm_id)
+                & pd.to_datetime(trajectories['date']).dt.normalize().eq(target_date)
+            ].copy().reset_index(drop=True)
+            if subset.empty:
+                continue
+            seed_fields = ['source_seed_depth_m', 'source_seed_lat', 'source_seed_lon']
+            missing_seed = sorted(set(seed_fields).difference(subset.columns))
+            if missing_seed:
+                raise KeyError(f'Trajectory rows lack release seed fields: {missing_seed}.')
+            seeds = subset[seed_fields].to_numpy(dtype=float)
+            final_positions = subset[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+            result = {
+                'positions': final_positions[None, :, :],
+                'final_status': subset['status'].astype(str).to_numpy(),
+            }
+            registered = _ofes_dual_endpoint_register_arrival(
+                'endpoint_seed',
+                arm_id,
+                seeds,
+                result,
+                target,
+                depth_tolerance_m=tolerance,
+            )
+            target_lats = target['lat'].to_numpy(dtype=float)
+            target_lons = target['lon'].to_numpy(dtype=float)
+            shallow_global, deep_global = global_ranges[target_label]
+            target_halfdiag_km = float(
+                np.sqrt(
+                    (grid_steps[target_label] * approximate_degree_length(float(target['lat'].mean()))['meters_per_degree_lat'] / 2.0 / 1000.0) ** 2
+                    + (grid_steps[target_label] * approximate_degree_length(float(target['lat'].mean()))['meters_per_degree_lon'] / 2.0 / 1000.0) ** 2
+                )
+            )
+            for index, record in registered.iterrows():
+                original = subset.iloc[index]
+                depth = float(record['final_depth_m']) if np.isfinite(record['final_depth_m']) else np.nan
+                lat = float(record['final_lat']) if np.isfinite(record['final_lat']) else np.nan
+                lon = float(record['final_lon']) if np.isfinite(record['final_lon']) else np.nan
+                if np.isfinite(lat) and np.isfinite(lon):
+                    nearest_distance = float(np.min(local_xy_distance_m(target_lons, target_lats, lon, lat)) / 1000.0)
+                else:
+                    nearest_distance = np.nan
+                status = str(record['final_status'])
+                horizontal_hit = bool(record['horizontal_inside_any_pixel'])
+                pixel_core_hit = bool(record['supported_pixel_count'] > 0)
+                global_core_hit = bool(
+                    np.isfinite(depth)
+                    and shallow_global - tolerance <= depth <= deep_global + tolerance
+                )
+                matched_index = int(record['matched_pixel_index'])
+                if 0 <= matched_index < len(target):
+                    matched_pixel = target.iloc[matched_index]
+                    matched_core_shallow = float(matched_pixel['core_shallow_edge_m'])
+                    matched_core_deep = float(matched_pixel['core_deep_edge_m'])
+                    matched_pixel_lat_index = int(matched_pixel['lat_index'])
+                    matched_pixel_lon_index = int(matched_pixel['lon_index'])
+                    matched_pixel_lat = float(matched_pixel['lat'])
+                    matched_pixel_lon = float(matched_pixel['lon'])
+                else:
+                    matched_core_shallow = np.nan
+                    matched_core_deep = np.nan
+                    matched_pixel_lat_index = -1
+                    matched_pixel_lon_index = -1
+                    matched_pixel_lat = np.nan
+                    matched_pixel_lon = np.nan
+                if status != 'active':
+                    negative_class = f'status_{status}'
+                elif pixel_core_hit:
+                    negative_class = 'exact_target_pixel_own_core_hit'
+                elif horizontal_hit:
+                    negative_class = 'inside_target_pixel_outside_own_core'
+                elif global_core_hit and np.isfinite(nearest_distance) and nearest_distance <= target_halfdiag_km:
+                    negative_class = 'near_target_grid_pixel_outside_target_cell'
+                elif global_core_hit:
+                    negative_class = 'global_core_depth_range_only'
+                else:
+                    negative_class = 'outside_target_pixel_support'
+                rows.append({
+                    **record.to_dict(),
+                    'arm_id': arm_id,
+                    'target_label': str(target_label),
+                    'target_date': target_date.date().isoformat(),
+                    'target_object_key': str(definition.get('object_key', target_label)),
+                    'release_date': str(pd.Timestamp(arm['release_date']).date()),
+                    'direction': str(arm['direction']),
+                    'seed_id': str(original['seed_id']),
+                    'source_event_id': str(original['source_event_id']),
+                    'integration_label': str(original['integration_label']),
+                    'vertical_mode': str(original['vertical_mode']),
+                    'target_hit': bool(record['arrived']),
+                    'horizontal_pixel_hit': horizontal_hit,
+                    'pixel_core_hit': pixel_core_hit,
+                    'global_core_depth_range_hit': global_core_hit,
+                    'nearest_target_pixel_distance_km': nearest_distance,
+                    'target_global_core_shallow_m': shallow_global,
+                    'target_global_core_deep_m': deep_global,
+                    'target_cell_halfdiag_km': target_halfdiag_km,
+                    'matched_target_pixel_lat_index': matched_pixel_lat_index,
+                    'matched_target_pixel_lon_index': matched_pixel_lon_index,
+                    'matched_target_pixel_lat': matched_pixel_lat,
+                    'matched_target_pixel_lon': matched_pixel_lon,
+                    'matched_pixel_core_shallow_m': matched_core_shallow,
+                    'matched_pixel_core_deep_m': matched_core_deep,
+                    'negative_class': negative_class,
+                    'particle_status': status,
+                })
+    qa = pd.DataFrame(rows)
+    if qa.empty:
+        return qa, qa.copy()
+    summary = (
+        qa.groupby(['arm_id', 'target_label', 'integration_label', 'vertical_mode'], dropna=False)
+        .agg(
+            seed_count=('seed_id', 'size'),
+            final_active_count=('particle_status', lambda values: int((values == 'active').sum())),
+            escaped_count=('particle_status', lambda values: int((values == 'escaped').sum())),
+            invalid_count=('particle_status', lambda values: int((values == 'invalid').sum())),
+            nonfinite_endpoint_count=('particle_status', lambda values: int((values == 'nonfinite_endpoint').sum())),
+            horizontal_pixel_hit_count=('horizontal_pixel_hit', 'sum'),
+            pixel_core_hit_count=('pixel_core_hit', 'sum'),
+            global_core_depth_range_hit_count=('global_core_depth_range_hit', 'sum'),
+            target_hit_count=('target_hit', 'sum'),
+            median_nearest_target_pixel_distance_km=('nearest_target_pixel_distance_km', 'median'),
+        )
+        .reset_index()
+    )
+    summary['arrival_denominator'] = summary['final_active_count']
+    summary['target_hit_fraction_of_active'] = np.divide(
+        summary['target_hit_count'], summary['arrival_denominator'],
+        out=np.full(len(summary), np.nan, dtype=float),
+        where=summary['arrival_denominator'].to_numpy(dtype=float) > 0,
+    )
+    summary['exact_pixel_rule'] = 'native_grid_cell_and_own_half_amplitude_core_with_shared_depth_tolerance'
+    return qa, summary
+
+
+def summarize_ofes_same_release_route(
+    route_qc: pd.DataFrame,
+    endpoint_labels: Sequence[str],
+    event_groups: Sequence[Mapping[str, Any]] | None = None,
+    source_event_id: str | None = None,
+    output_dir: str | Path | None = None,
+) -> dict[str, pd.DataFrame]:
+    """归纳同一 release 在多个声明端点日期上的逐 seed 路由结果。
+
+    本函数把已完成的逐粒子端点 QA 变成逐 seed 的日期交集和事件级经过表。它只使用
+    同一 `arm_id`、`release_date` 和 `seed_id` 的记录，因而可以同时报告“所有声明
+    日期全命中”和“每个后续事件至少命中过一次”两个不同 estimand；不会把不同
+    release 的粒子编号拼成一条材料路径。
+
+    参数:
+        - route_qc (pd.DataFrame): `evaluate_ofes_endpoint_hits` 返回的同一 release 端点 QA 表，需含 `arm_id`、`release_date`、`seed_id`、`target_label` 和 `target_hit`。
+        - endpoint_labels (Sequence[str]): 按日期顺序排列的严格端点标签；每个标签必须在 QA 表中出现。
+        - event_groups (Sequence[Mapping[str, Any]] | None): 可选的事件级标签组；每项含 `event_id` 和 `labels`，组内任一标签命中即视为该事件获得一次真实支撑。
+        - source_event_id (str | None): 可选的 release 源事件 ID；提供时写入事件经过表，明确源事件不由后续日期标签代替。
+        - output_dir (str | Path | None): 可选输出目录；提供时写入机读路由表和严格交集表。
+
+    返回:
+        - dict[str, pd.DataFrame]: `route_qc`、`intersection`、`cumulative` 以及可选的 `event_passage` 表。
+
+    输出:
+        - 提供 `output_dir` 时写入 `same_release_seed_by_date.csv`、`same_release_three_segment_intersection.csv`、`same_release_route_cumulative_summary.csv` 和 `same_release_three_event_passage.csv`（若声明了事件组）。
+
+    说明:
+        - `through_all_declared_dates` 是逐日期严格交集；它不能否定同一 release 在每个后续事件至少一次命中的较宽问题。
+        - 事件组只汇总已有真实端点 QA，不扩展水平 mask、深度核、阈值或 release 集合。
+    """
+    labels = [str(label) for label in endpoint_labels]
+    if not labels or len(set(labels)) != len(labels):
+        raise ValueError('endpoint_labels must be a non-empty unique ordered sequence.')
+    required = {'arm_id', 'release_date', 'seed_id', 'target_label', 'target_hit'}
+    missing = sorted(required.difference(route_qc.columns))
+    if missing:
+        raise KeyError(f'Same-release route QA lacks columns: {missing}.')
+    route = route_qc.copy()
+    route['target_label'] = route['target_label'].astype(str)
+    unknown = sorted(set(route['target_label']).difference(labels))
+    if unknown:
+        raise ValueError(f'Route QA contains labels outside endpoint_labels: {unknown}.')
+    route['same_release_seed_key'] = (
+        route['arm_id'].astype(str) + '|' + route['release_date'].astype(str) + '|' + route['seed_id'].astype(str)
+    )
+    duplicate_key = ['same_release_seed_key', 'target_label']
+    if route.duplicated(duplicate_key).any():
+        raise ValueError('Same-release route QA is not unique per seed and target label.')
+    route['stage_order'] = route['target_label'].map({label: i for i, label in enumerate(labels)})
+    route = route.sort_values(['same_release_seed_key', 'stage_order'], kind='mergesort').reset_index(drop=True)
+    intersection = route.pivot_table(
+        index=['same_release_seed_key', 'arm_id', 'release_date', 'seed_id'],
+        columns='target_label', values='target_hit', aggfunc='first', fill_value=False,
+    ).reset_index()
+    for label in labels:
+        if label not in intersection:
+            intersection[label] = False
+    intersection['exact_endpoint_count'] = intersection[labels].astype(bool).sum(axis=1)
+    intersection['through_all_declared_dates'] = intersection[labels].astype(bool).all(axis=1)
+    intersection['route_endpoint_order'] = ' > '.join(labels)
+    cumulative_rows = []
+    for index, label in enumerate(labels, 1):
+        prior = labels[:index]
+        cumulative_rows.append({
+            'target_label': label,
+            'endpoint_order': index,
+            'exact_hit_count': int(intersection[label].astype(bool).sum()),
+            'cumulative_exact_intersection_count': int(intersection[prior].astype(bool).all(axis=1).sum()),
+            'seed_denominator': int(len(intersection)),
+        })
+    cumulative = pd.DataFrame(cumulative_rows)
+    event_passage = pd.DataFrame()
+    if event_groups:
+        event_passage = intersection.loc[:, [
+            'same_release_seed_key', 'arm_id', 'release_date', 'seed_id',
+        ]].copy()
+        event_names = []
+        for group in event_groups:
+            event_id = str(group['event_id'])
+            group_labels = [str(label) for label in group.get('labels', [])]
+            if not group_labels or not set(group_labels).issubset(labels):
+                raise ValueError(f'Event group {event_id!r} has undeclared endpoint labels.')
+            column = f'event_pass_{event_id}'
+            event_passage[column] = intersection[group_labels].astype(bool).any(axis=1)
+            event_names.append(column)
+        event_passage['passed_declared_events_at_least_once'] = event_passage[event_names].all(axis=1)
+        event_passage['strict_all_declared_dates'] = intersection['through_all_declared_dates'].astype(bool).to_numpy()
+        if source_event_id is not None:
+            event_passage['source_event_id'] = str(source_event_id)
+        event_passage['event_group_order'] = ';'.join(
+            str(group['event_id']) for group in event_groups
+        )
+    if output_dir is not None:
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        route.to_csv(output / 'same_release_seed_by_date.csv', index=False)
+        intersection.to_csv(output / 'same_release_three_segment_intersection.csv', index=False)
+        cumulative.to_csv(output / 'same_release_route_cumulative_summary.csv', index=False)
+        if not event_passage.empty:
+            event_passage.to_csv(output / 'same_release_three_event_passage.csv', index=False)
+    return {
+        'route_qc': route,
+        'intersection': intersection,
+        'cumulative': cumulative,
+        'event_passage': event_passage,
+    }
+
+
+def build_ofes_multicase_transport_products(
+    trajectories: pd.DataFrame,
+    properties: pd.DataFrame,
+    endpoint_members: pd.DataFrame,
+    endpoint_native: pd.DataFrame,
+    endpoint_definitions: Mapping[str, Mapping[str, Any]],
+    arms: Sequence[Mapping[str, Any]],
+    grid_cell_size_deg: float,
+    output_dir: str | Path,
+    route_spec: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """从已有合法轨迹、属性和端点产品生成 multicase QA、路由表和图件。
+
+    该入口集中承载家族端点命中、同一 release 路由归纳和过程图输出。输入必须是
+    已完成的轨迹/场采样产品；函数不调用粒子积分器、不重跑 detector，也不按案例
+    名称写死日期。可选 `route_spec` 只声明同一 release 的目标事件和原生像元支持，
+    从而把严格逐日期交集与事件级至少一次经过统计放在同一正式消费者中。
+
+    参数:
+        - trajectories (pd.DataFrame): 已有逐日 3-D/C2 轨迹表，含 arm、位置、状态和 seed 身份字段。
+        - properties (pd.DataFrame): 已有逐日粒子属性表，含 `arm_id`、`vertical_mode`、`date`、`do2`、`sigma0` 和 `depth_m`。
+        - endpoint_members (pd.DataFrame): 正式端点峰像元成员表。
+        - endpoint_native (pd.DataFrame): 与端点成员唯一键对应的原生半振幅核心表。
+        - endpoint_definitions (Mapping[str, Mapping[str, Any]]): 端点标签到日期、对象键和事件身份的定义。
+        - arms (Sequence[Mapping[str, Any]]): 已有积分臂的 release、方向和标签登记。
+        - grid_cell_size_deg (float): 从实际 OFES 坐标快照解析的原生单元步长。
+        - output_dir (str | Path): multicase 输出目录。
+        - route_spec (Mapping[str, Any] | None): 可选同一 release 路由规格，含 `trajectory`、`members`、`native`、`endpoint_definitions`、`arm`、`endpoint_labels`、`event_groups` 和可选 `source_event_id`。
+
+    返回:
+        - dict[str, Any]: 含 `target_qc`、`target_summary`、可选 `route_qc`、`route_summary`、`route_tables` 和图件路径的结果登记。
+
+    输出:
+        - `output_dir/target_hit_qc.parquet`、`output_dir/target_hit_summary.csv`；提供路由规格时还写入路由 QA、交集、事件经过表和两张 PNG。
+
+    说明:
+        - 端点命中继续使用正式原生网格单元和逐像元原生半振幅核心；输出只描述过程支撑，不推出 carrier identity、材料连续性或氧通量。
+        - 若提供路由规格，`same_release_three_event_passage.csv` 的事件级列与 `same_release_three_segment_intersection.csv` 的逐日期严格列必须分别报告。
+        - 构建前会按 arm、模式、日期和粒子复合键核对属性继承字段，并核对端点声明与 members/native 的真实事件、日期和对象键。
+    """
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    properties = _validate_ofes_family_properties(trajectories, properties)
+    endpoint_members, endpoint_native = _validate_ofes_family_endpoint_identity(
+        endpoint_members, endpoint_native, endpoint_definitions, arms
+    )
+    target_qc, target_summary = evaluate_ofes_endpoint_hits(
+        trajectories,
+        endpoint_members,
+        endpoint_native,
+        endpoint_definitions,
+        arms,
+        grid_cell_size_deg=grid_cell_size_deg,
+    )
+    target_qc.to_parquet(output / 'target_hit_qc.parquet', index=False)
+    target_summary.to_csv(output / 'target_hit_summary.csv', index=False)
+    result: dict[str, Any] = {
+        'target_qc': target_qc,
+        'target_summary': target_summary,
+        'route_qc': pd.DataFrame(),
+        'route_summary': pd.DataFrame(),
+        'route_tables': {},
+        'figures': {},
+    }
+    if route_spec is not None:
+        route_trajectory = route_spec['trajectory']
+        route_arm = route_spec['arm']
+        route_qc, route_summary = evaluate_ofes_endpoint_hits(
+            route_trajectory,
+            route_spec['members'],
+            route_spec['native'],
+            route_spec['endpoint_definitions'],
+            [route_arm],
+            grid_cell_size_deg=grid_cell_size_deg,
+        )
+        route_qc.to_parquet(output / 'same_release_route_qc.parquet', index=False)
+        route_summary.to_csv(output / 'same_release_route_summary.csv', index=False)
+        route_tables = summarize_ofes_same_release_route(
+            route_qc,
+            route_spec['endpoint_labels'],
+            event_groups=route_spec.get('event_groups'),
+            source_event_id=route_spec.get('source_event_id'),
+            output_dir=output,
+        )
+        result.update({
+            'route_qc': route_qc,
+            'route_summary': route_summary,
+            'route_tables': route_tables,
+        })
+    result['figures'] = plot_ofes_family_connection_figures(
+        trajectories,
+        properties,
+        endpoint_members,
+        output,
+    )
+    return result
+
+
+def produce_ofes_multicase_family_trajectories(
+    arms: Sequence[Mapping[str, Any]],
+    endpoint_members: pd.DataFrame,
+    snapshot_loader: Any,
+    existing_trajectory_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    reuse_existing: bool = True,
+    dt_seconds: float = 3600.0,
+    allow_rebuild: bool = False,
+) -> pd.DataFrame:
+    """按声明 release 臂生成或复用 multicase 3-D/C2 逐日轨迹。
+
+    这是家族 trajectory producer 的通用入口。它先验证并复用已有合法位置产品；只有
+    在明确允许且没有可复用轨迹时，才按 `arms` 的原设定调用已验证的 OFES advection
+    helper。3-D 与 fixed-depth C2 使用同一 seed 身份、release 日期和时间步长，输出
+    保留每个粒子的 active、escaped 和 invalid 状态，供后续端点 QA 与属性消费者使用。
+
+    参数:
+        - arms (Sequence[Mapping[str, Any]]): release/target 日期、方向、source label、arm ID、3-D label 和 C2 label 的声明序列。
+        - endpoint_members (pd.DataFrame): 正式端点峰像元成员表，需含 `case_label`、`event_id`、`source_lat_index`、`source_lon_index`、`peak_depth`、`peak_level_index`、`lat` 和 `lon`。
+        - snapshot_loader (Any): 接收一个日期并返回已验证 OFES `u/v/w` 快照的可调用对象；只在显式允许重建时调用。
+        - existing_trajectory_path (str | Path | None): 可复用的已有轨迹 parquet 路径。
+        - output_path (str | Path | None): 可选的轨迹 parquet 输出路径。
+        - reuse_existing (bool): 是否优先复用并校验 `existing_trajectory_path`，默认 True。
+        - dt_seconds (float): advection 时间步长（秒），默认 3600.0。
+        - allow_rebuild (bool): 是否显式允许在没有复用产品时按原规格重新积分，默认 False。
+
+    返回:
+        - pd.DataFrame: 按 arm、模式、日期和粒子顺序整理的逐日轨迹表。
+
+    输出:
+        - 提供 `output_path` 时写入逐日轨迹 parquet。
+
+    说明:
+        - 复用模式会核对 arm、release/target 日历、完整 seed 身份、初值、模式标签、复合键和时间步长；缺失或不匹配直接拒绝。
+          `reuse_existing` 只表示复用授权，不能默认为新积分授权；重建必须显式设置 `allow_rebuild=True`。
+        - 本入口不按案例名称写死日期；路径、核和阈值语义由调用方的正式 specs 与上游产品决定。
+        - 该设计只提供过程轨迹和端点到达输入，不能单独证明材料水团连续性或氧通量。
+    """
+    required_member = {
+        'case_label', 'event_id', 'source_lat_index', 'source_lon_index',
+        'peak_depth', 'peak_level_index', 'lat', 'lon',
+    }
+    missing_member = sorted(required_member.difference(endpoint_members.columns))
+    if missing_member:
+        raise KeyError(f'Family trajectory members lack columns: {missing_member}.')
+    if not arms:
+        raise ValueError('At least one multicase release arm is required.')
+    if float(dt_seconds) <= 0:
+        raise ValueError('dt_seconds must be positive.')
+    required_output = {
+        'arm_id', 'source_label', 'target_label', 'release_date', 'direction',
+        'integration_label', 'vertical_mode', 'dt_seconds', 'seed_id',
+        'particle_index', 'source_event_id', 'source_seed_lon', 'source_seed_lat',
+        'source_seed_depth_m', 'source_peak_level_index', 'date', 'depth_m',
+        'lat', 'lon', 'status', 'is_release', 'is_target',
+    }
+    existing = Path(existing_trajectory_path) if existing_trajectory_path is not None else None
+    members = endpoint_members.copy()
+    members['case_label'] = members['case_label'].astype(str)
+    if 'member_order_by_delta_do' not in members.columns:
+        members['member_order_by_delta_do'] = (
+            members.groupby('case_label', sort=False)['peak_depth']
+            .rank(method='first', ascending=True).astype(int)
+        )
+    members = members.sort_values(
+        ['case_label', 'member_order_by_delta_do'], kind='mergesort'
+    )
+
+    arm_required = {
+        'arm_id', 'source_label', 'target_label', 'release_date', 'target_date',
+        'direction', 'integration_label', 'c2_label',
+    }
+    missing_arm_fields = sorted(
+        field for arm in arms for field in arm_required.difference(arm)
+    )
+    if missing_arm_fields:
+        raise KeyError(
+            f'Family trajectory arm specs lack required fields: {sorted(set(missing_arm_fields))}.'
+        )
+    arm_ids = [str(arm['arm_id']) for arm in arms]
+    if len(set(arm_ids)) != len(arm_ids):
+        raise ValueError('Family trajectory arm_id values must be unique.')
+
+    def _expected_reuse_semantics() -> pd.DataFrame:
+        expected_rows = []
+        for arm in arms:
+            source_label = str(arm['source_label'])
+            source = members.loc[members['case_label'].eq(source_label)].copy()
+            if source.empty:
+                raise ValueError(
+                    f'No endpoint members found for source label {source_label!r}.'
+                )
+            source = source.sort_values(
+                'member_order_by_delta_do', kind='mergesort'
+            ).reset_index(drop=True)
+            source_date = pd.Timestamp(arm['release_date']).normalize()
+            target_date = pd.Timestamp(arm['target_date']).normalize()
+            direction = str(arm['direction'])
+            if direction not in {'forward', 'backward'}:
+                raise ValueError(
+                    f"Unsupported family trajectory direction {direction!r}."
+                )
+            dates = list(pd.date_range(
+                min(source_date, target_date), max(source_date, target_date),
+            ))
+            sequence = dates if direction == 'forward' else list(reversed(dates))
+            seed_ids = [
+                f"{source_label}_m{int(order):03d}_lat{int(lat):03d}_lon{int(lon):03d}"
+                for order, lat, lon in zip(
+                    source['member_order_by_delta_do'],
+                    source['source_lat_index'],
+                    source['source_lon_index'],
+                )
+            ]
+            for mode, label in (
+                ('three_dimensional', str(arm['integration_label'])),
+                ('fixed_depth', str(arm['c2_label'])),
+            ):
+                for date in sequence:
+                    for particle_index, (seed_id, (_, member)) in enumerate(
+                        zip(seed_ids, source.iterrows())
+                    ):
+                        expected_rows.append({
+                            'arm_id': str(arm['arm_id']),
+                            'vertical_mode': mode,
+                            'date': date,
+                            'particle_index': int(particle_index),
+                            'source_label': source_label,
+                            'target_label': str(arm['target_label']),
+                            'release_date': source_date.date().isoformat(),
+                            'direction': direction,
+                            'integration_label': label,
+                            'dt_seconds': float(dt_seconds),
+                            'seed_id': seed_id,
+                            'source_event_id': str(member['event_id']),
+                            'source_seed_lon': float(member['lon']),
+                            'source_seed_lat': float(member['lat']),
+                            'source_seed_depth_m': float(member['peak_depth']),
+                            'source_peak_level_index': int(member['peak_level_index']),
+                            'is_release': bool(date == source_date),
+                            'is_target': bool(date == target_date),
+                            'release_depth_m': float(member['peak_depth']),
+                            'release_lat': float(member['lat']),
+                            'release_lon': float(member['lon']),
+                        })
+        return pd.DataFrame(expected_rows)
+
+    def _validate_reused_result(result: pd.DataFrame) -> pd.DataFrame:
+        missing = sorted(required_output.difference(result.columns))
+        if missing:
+            raise ValueError(f'Reused family trajectories lack columns: {missing}.')
+        result = result.copy()
+        result['arm_id'] = result['arm_id'].astype(str)
+        result['vertical_mode'] = result['vertical_mode'].astype(str)
+        result['particle_index'] = pd.to_numeric(
+            result['particle_index'], errors='raise'
+        ).astype(int)
+        try:
+            result['date'] = pd.to_datetime(result['date'], errors='raise').dt.normalize()
+        except Exception as exc:
+            raise ValueError('Reused family trajectories contain invalid dates.') from exc
+        key = ['arm_id', 'vertical_mode', 'date', 'particle_index']
+        if result.duplicated(key).any():
+            raise ValueError('Reused family trajectories contain duplicate composite keys.')
+        expected = _expected_reuse_semantics()
+        actual_keys = set(map(tuple, result[key].astype(str).to_numpy()))
+        expected_keys = set(map(tuple, expected[key].astype(str).to_numpy()))
+        if actual_keys != expected_keys:
+            missing_keys = len(expected_keys - actual_keys)
+            extra_keys = len(actual_keys - expected_keys)
+            raise ValueError(
+                'Reused family trajectories have wrong arm/date/seed coverage: '
+                f'{missing_keys} expected keys missing, {extra_keys} unexpected keys.'
+            )
+        result = result.merge(
+            expected,
+            on=key,
+            how='left',
+            validate='one_to_one',
+            suffixes=('', '_expected'),
+        )
+        string_fields = [
+            'source_label', 'target_label', 'release_date', 'direction',
+            'integration_label', 'seed_id', 'source_event_id',
+        ]
+        for column_name in string_fields:
+            actual = result[column_name].astype(str)
+            expected_values = result[f'{column_name}_expected'].astype(str)
+            if not actual.eq(expected_values).all():
+                raise ValueError(
+                    f'Reused family trajectories mismatch {column_name}.'
+                )
+        for arm in arms:
+            declared_dt = arm.get('dt_seconds')
+            if declared_dt is not None and not np.isclose(
+                float(declared_dt), float(dt_seconds), rtol=0.0, atol=1e-9
+            ):
+                raise ValueError(
+                    f"Arm {arm['arm_id']!r} declares dt_seconds={declared_dt}, "
+                    f'but the producer requested {dt_seconds}.'
+                )
+        if not pd.to_numeric(result['dt_seconds'], errors='coerce').eq(
+            float(dt_seconds)
+        ).all():
+            raise ValueError('Reused family trajectories mismatch dt_seconds.')
+        for column_name in ('source_peak_level_index',):
+            actual = pd.to_numeric(result[column_name], errors='coerce').to_numpy()
+            expected_values = pd.to_numeric(
+                result[f'{column_name}_expected'], errors='coerce'
+            ).to_numpy()
+            if not np.array_equal(actual, expected_values, equal_nan=True):
+                raise ValueError(
+                    f'Reused family trajectories mismatch {column_name}.'
+                )
+        for column_name in (
+            'source_seed_lon', 'source_seed_lat', 'source_seed_depth_m',
+        ):
+            actual = pd.to_numeric(
+                result[column_name], errors='coerce'
+            ).to_numpy(dtype=float)
+            expected_values = pd.to_numeric(
+                result[f'{column_name}_expected'], errors='coerce'
+            ).to_numpy(dtype=float)
+            if not np.allclose(actual, expected_values, rtol=0.0, atol=1e-7, equal_nan=False):
+                raise ValueError(
+                    f'Reused family trajectories mismatch {column_name}.'
+                )
+        for column_name in ('is_release', 'is_target'):
+            actual = result[column_name].astype(bool).to_numpy()
+            expected_values = result[f'{column_name}_expected'].astype(bool).to_numpy()
+            if not np.array_equal(actual, expected_values):
+                raise ValueError(
+                    f'Reused family trajectories mismatch {column_name} calendar flags.'
+                )
+        release_rows = result.loc[result['is_release']].copy()
+        for column_name, expected_field in (
+            ('depth_m', 'release_depth_m'),
+            ('lat', 'release_lat'),
+            ('lon', 'release_lon'),
+        ):
+            actual = pd.to_numeric(
+                release_rows[column_name], errors='coerce'
+            ).to_numpy(dtype=float)
+            expected_values = pd.to_numeric(
+                release_rows[expected_field], errors='coerce'
+            ).to_numpy(dtype=float)
+            if not np.allclose(actual, expected_values, rtol=0.0, atol=1e-6, equal_nan=False):
+                raise ValueError(
+                    f'Reused family trajectories mismatch release {column_name} initial values.'
+                )
+        drop_expected = [
+            column for column in result.columns
+            if column.endswith('_expected') or column in {
+                'release_depth_m', 'release_lat', 'release_lon',
+            }
+        ]
+        result = result.drop(columns=drop_expected)
+        return result.sort_values(
+            ['arm_id', 'vertical_mode', 'date', 'particle_index'], kind='mergesort'
+        ).reset_index(drop=True)
+
+    if (
+        reuse_existing
+        and (existing is None or not existing.exists())
+        and not allow_rebuild
+    ):
+        raise FileNotFoundError(
+            f'No reusable family trajectory product at {existing!s}; '
+            'set allow_rebuild=True to authorize integration.'
+        )
+    if reuse_existing and existing is not None and existing.exists():
+        result = pd.read_parquet(existing)
+        result = _validate_reused_result(result)
+        if output_path is not None and Path(output_path).resolve() != existing.resolve():
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            result.to_parquet(output_path, index=False)
+        return result
+
+    if not allow_rebuild:
+        raise ValueError(
+            'Family trajectory cache was not reused. Set allow_rebuild=True '
+            'explicitly before calling the advection producer.'
+        )
+    members = members.sort_values(
+        ['case_label', 'member_order_by_delta_do']
+        if 'member_order_by_delta_do' in members.columns
+        else ['case_label', 'source_lat_index', 'source_lon_index'],
+        kind='mergesort',
+    )
+    rows = []
+    for arm in arms:
+        source_label = str(arm['source_label'])
+        source = members.loc[members['case_label'].eq(source_label)].copy()
+        if source.empty:
+            raise ValueError(f'No endpoint members found for source label {source_label!r}.')
+        if 'member_order_by_delta_do' not in source:
+            source['member_order_by_delta_do'] = source['peak_depth'].rank(method='first').astype(int)
+        source = source.sort_values('member_order_by_delta_do', kind='mergesort').reset_index(drop=True)
+        source_date = pd.Timestamp(arm['release_date']).normalize()
+        target_date = pd.Timestamp(arm['target_date']).normalize()
+        forward = str(arm['direction']) == 'forward'
+        dates = list(pd.date_range(min(source_date, target_date), max(source_date, target_date)))
+        sequence = dates if forward else list(reversed(dates))
+        positions = source[['peak_depth', 'lat', 'lon']].to_numpy(dtype=float)
+        statuses = np.full(len(source), 'active', dtype=object)
+        seed_ids = [
+            f"{source_label}_m{int(order):03d}_lat{int(lat):03d}_lon{int(lon):03d}"
+            for order, lat, lon in zip(
+                source['member_order_by_delta_do'],
+                source['source_lat_index'],
+                source['source_lon_index'],
+            )
+        ]
+        for index, date in enumerate(sequence):
+            for seed_index, member in source.iterrows():
+                rows.append({
+                    'arm_id': str(arm['arm_id']),
+                    'source_label': source_label,
+                    'target_label': str(arm['target_label']),
+                    'release_date': source_date.date().isoformat(),
+                    'direction': str(arm['direction']),
+                    'integration_label': str(
+                        arm.get('integration_label', arm.get('three_d_label', 'three_dimensional'))
+                    ),
+                    'vertical_mode': 'three_dimensional',
+                    'dt_seconds': float(dt_seconds),
+                    'seed_id': seed_ids[seed_index],
+                    'particle_index': int(seed_index),
+                    'source_event_id': str(member['event_id']),
+                    'source_seed_lon': float(member['lon']),
+                    'source_seed_lat': float(member['lat']),
+                    'source_seed_depth_m': float(member['peak_depth']),
+                    'source_peak_level_index': int(member['peak_level_index']),
+                    'date': date,
+                    'depth_m': float(positions[seed_index, 0]) if np.isfinite(positions[seed_index, 0]) else np.nan,
+                    'lat': float(positions[seed_index, 1]) if np.isfinite(positions[seed_index, 1]) else np.nan,
+                    'lon': float(positions[seed_index, 2]) if np.isfinite(positions[seed_index, 2]) else np.nan,
+                    'status': str(statuses[seed_index]),
+                    'is_release': bool(index == 0),
+                    'is_target': bool(date == target_date),
+                })
+            if index == len(sequence) - 1:
+                continue
+            left, right = sequence[index], sequence[index + 1]
+            snapshots = (
+                [snapshot_loader(left), snapshot_loader(right)]
+                if forward else [snapshot_loader(right), snapshot_loader(left)]
+            )
+            advected = advect_ofes_particles(
+                snapshots,
+                positions,
+                backward=not forward,
+                dt_seconds=float(dt_seconds),
+                temporal_interpolation='linear',
+                vertical_mode='three_dimensional',
+            )
+            positions = advected['positions'][-1]
+            statuses = advected['final_status'].astype(object)
+        for mode, label_key in (
+            ('fixed_depth', 'c2_label'),
+        ):
+            positions = source[['peak_depth', 'lat', 'lon']].to_numpy(dtype=float)
+            statuses = np.full(len(source), 'active', dtype=object)
+            label = str(arm[label_key])
+            for index, date in enumerate(sequence):
+                for seed_index, member in source.iterrows():
+                    rows.append({
+                        'arm_id': str(arm['arm_id']), 'source_label': source_label,
+                        'target_label': str(arm['target_label']),
+                        'release_date': source_date.date().isoformat(),
+                        'direction': str(arm['direction']), 'integration_label': label,
+                        'vertical_mode': mode, 'dt_seconds': float(dt_seconds),
+                        'seed_id': seed_ids[seed_index], 'particle_index': int(seed_index),
+                        'source_event_id': str(member['event_id']),
+                        'source_seed_lon': float(member['lon']), 'source_seed_lat': float(member['lat']),
+                        'source_seed_depth_m': float(member['peak_depth']),
+                        'source_peak_level_index': int(member['peak_level_index']), 'date': date,
+                        'depth_m': float(positions[seed_index, 0]), 'lat': float(positions[seed_index, 1]),
+                        'lon': float(positions[seed_index, 2]), 'status': str(statuses[seed_index]),
+                        'is_release': bool(index == 0), 'is_target': bool(date == target_date),
+                    })
+                if index == len(sequence) - 1:
+                    continue
+                left, right = sequence[index], sequence[index + 1]
+                snapshots = (
+                    [snapshot_loader(left), snapshot_loader(right)]
+                    if forward else [snapshot_loader(right), snapshot_loader(left)]
+                )
+                advected = advect_ofes_particles(
+                    snapshots,
+                    positions,
+                    backward=not forward,
+                    dt_seconds=float(dt_seconds),
+                    temporal_interpolation='linear',
+                    vertical_mode=mode,
+                )
+                positions = advected['positions'][-1]
+                statuses = advected['final_status'].astype(object)
+    result = pd.DataFrame(rows).sort_values(
+        ['arm_id', 'vertical_mode', 'date', 'particle_index'], kind='mergesort'
+    ).reset_index(drop=True)
+    if output_path is not None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_parquet(path, index=False)
+    return result
+
+
+def _ofes_native_core_config_provenance(config: Any) -> dict[str, Any]:
+    """Return the detection fields that can change native-core recovery semantics."""
+    def optional_float(value: Any) -> float | None:
+        return None if value is None else float(value)
+
+    max_count = getattr(config, 'do_near_zero_max_count', None)
+    return {
+        'detection_config_method': str(config.method),
+        'detection_config_do_threshold': float(config.do_threshold),
+        'detection_config_depth_interval': float(config.depth_interval),
+        'detection_config_anomaly_min_depth': optional_float(
+            getattr(config, 'anomaly_min_depth', None)
+        ),
+        'detection_config_anomaly_max_depth': optional_float(
+            getattr(config, 'anomaly_max_depth', None)
+        ),
+        'detection_config_do_near_zero_threshold': optional_float(
+            getattr(config, 'do_near_zero_threshold', None)
+        ),
+        'detection_config_do_near_zero_max_count': (
+            None if max_count is None else int(max_count)
+        ),
+    }
+
+
+def _ofes_native_core_config_matches(
+    frame: pd.DataFrame,
+    expected: Mapping[str, Any],
+) -> tuple[bool, str | None]:
+    """Compare narrow native-core recovery provenance, including nullable fields."""
+    for column, expected_value in expected.items():
+        if column not in frame:
+            return False, column
+        actual = frame[column]
+        if expected_value is None:
+            as_text = actual.astype('string').str.strip().str.lower()
+            equal = actual.isna() | as_text.isin({'', 'none', 'nan', '<na>'})
+            if not bool(equal.all()):
+                return False, column
+        elif column == 'detection_config_method':
+            if not actual.astype(str).eq(str(expected_value)).all():
+                return False, column
+        elif column.endswith('max_count'):
+            values = pd.to_numeric(actual, errors='coerce')
+            if not values.eq(int(expected_value)).all():
+                return False, column
+        else:
+            values = pd.to_numeric(actual, errors='coerce').to_numpy(dtype=float)
+            if not np.allclose(
+                values, float(expected_value), rtol=0.0, atol=1e-12, equal_nan=False
+            ):
+                return False, column
+    return True, None
+
+
+def recover_ofes_native_object_cores(
+    object_specs: Sequence[Mapping[str, Any]],
+    daily_objects: pd.DataFrame,
+    peak_pixel_root: str | Path,
+    output_profile_path: str | Path,
+    output_summary_path: str | Path,
+    profile_parts_dir: str | Path | None = None,
+    chunk_size: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """恢复声明对象各原生峰像元的 producer-defined 半振幅核心。
+
+    函数按事件、日期和正式对象键读取峰像元，优先复用经过语义身份和检测配置核对的
+    分块缓存；缓存缺少必要 provenance 或成员键不一致时，只重建该窄对象剖面。对象
+    选择存在歧义时直接拒绝，避免用排序位置掩盖多个候选对象。
+
+    参数:
+        - object_specs (Sequence[Mapping[str, Any]]): 声明的事件、日期和可选对象键序列，每项需含 `event_id` 与 `date`，可含 `daily_object_key` 或 `daily_object_id` 做身份核对。
+        - daily_objects (pd.DataFrame): 正式 event catalog 每日对象表，需含 event_id、threshold、date、daily_object_id 和对象摘要字段。
+        - peak_pixel_root (str | Path): 正式 `peak_pixels_YYYYMMDD.parquet` 文件所在目录。
+        - output_profile_path (str | Path): 逐像元核心恢复表的 parquet 输出路径。
+        - output_summary_path (str | Path): 按声明对象汇总的 CSV 输出路径。
+        - profile_parts_dir (str | Path | None): 可选分块 parquet 缓存目录，便于中断后复用。
+        - chunk_size (int): 每次恢复的像元数，必须为正整数。
+
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame]: 逐像元恢复表和逐对象核心范围汇总表。
+
+    输出:
+        - 写入 `output_profile_path` 和 `output_summary_path`；提供 `profile_parts_dir` 时同时写入分块缓存。
+
+    说明:
+        - 每个对象只读取声明日期和对应 object_id 的原生 peak-pixel 行，并调用正式检测配置
+          恢复离散半振幅边界；汇总范围是逐像元核心范围的 union，不能解释成水平材料归属。
+    """
+    required_objects = {
+        'event_id', 'threshold', 'date', 'daily_object_id', 'daily_object_key',
+        'delta_do_max', 'centroid_lon', 'centroid_lat', 'depth_mean',
+        'depth_min', 'depth_max', 'peak_depth_at_max', 'thickness_median_m',
+    }
+    missing_objects = sorted(required_objects - set(daily_objects.columns))
+    if missing_objects:
+        raise KeyError(f'Formal daily object table lacks columns: {missing_objects}.')
+    if not object_specs:
+        raise ValueError('At least one native-core object specification is required.')
+    if int(chunk_size) <= 0:
+        raise ValueError('Native-core chunk_size must be a positive integer.')
+    object_table = daily_objects.copy()
+    object_table['event_id'] = object_table['event_id'].astype(str)
+    object_table['date'] = pd.to_datetime(object_table['date']).dt.normalize()
+    peak_root = Path(peak_pixel_root)
+    profile_path = Path(output_profile_path)
+    summary_path = Path(output_summary_path)
+    parts_path = Path(profile_parts_dir) if profile_parts_dir is not None else None
+    formal_config = make_detection_config('do')
+    config_provenance = _ofes_native_core_config_provenance(formal_config)
+    identity_columns = [
+        'case_label', 'event_id', 'date', 'daily_object_key',
+        'source_lat_index', 'source_lon_index',
+    ]
+    saved_columns = [
+        'saved_delta_do_umol_kg', 'saved_peak_level_index',
+        'saved_peak_depth_m', 'saved_half_amplitude_thickness_m',
+    ]
+    cache_provenance_columns = list(config_provenance)
+
+    def _validated_cached_part(
+        cached: pd.DataFrame,
+        expected: pd.DataFrame,
+    ) -> tuple[bool, str]:
+        required = set(identity_columns + saved_columns + cache_provenance_columns)
+        missing = sorted(required.difference(cached.columns))
+        if missing:
+            return False, f'missing_semantic_fields:{",".join(missing)}'
+        left = cached.copy()
+        right = expected.copy()
+        for frame in (left, right):
+            frame['date'] = pd.to_datetime(frame['date']).dt.normalize().dt.date.astype(str)
+        if len(left) != len(right):
+            return False, f'row_count:{len(left)}!={len(right)}'
+        if left.duplicated(identity_columns).any():
+            return False, 'duplicate_identity_key'
+        left_keys = set(map(tuple, left[identity_columns].astype(str).to_numpy()))
+        right_keys = set(map(tuple, right[identity_columns].astype(str).to_numpy()))
+        if left_keys != right_keys:
+            return False, 'identity_key_mismatch'
+        left = left.sort_values(identity_columns, kind='mergesort').reset_index(drop=True)
+        right = right.sort_values(identity_columns, kind='mergesort').reset_index(drop=True)
+        for column in saved_columns:
+            expected_values = pd.to_numeric(right[column], errors='coerce').to_numpy(dtype=float)
+            actual_values = pd.to_numeric(left[column], errors='coerce').to_numpy(dtype=float)
+            if column.endswith('level_index'):
+                equal = np.array_equal(actual_values, expected_values, equal_nan=True)
+            else:
+                equal = np.allclose(actual_values, expected_values, rtol=2e-6, atol=2e-5, equal_nan=True)
+            if not equal:
+                return False, f'saved_value_mismatch:{column}'
+        config_valid, config_column = _ofes_native_core_config_matches(
+            left, config_provenance
+        )
+        if not config_valid:
+            return False, f'config_mismatch:{config_column}'
+        return True, 'validated_identity_and_config'
+
+    if parts_path is not None:
+        parts_path.mkdir(parents=True, exist_ok=True)
+    profile_frames = []
+    summary_rows = []
+    for spec in object_specs:
+        event_id = str(spec['event_id'])
+        date = pd.Timestamp(spec['date']).normalize()
+        candidates = object_table.loc[
+            object_table['event_id'].eq(event_id)
+            & object_table['threshold'].eq(50)
+            & object_table['date'].eq(date)
+        ].copy()
+        if candidates.empty:
+            raise ValueError(f'No formal DO50 object for {event_id} on {date:%Y-%m-%d}.')
+        if len(candidates) != 1:
+            raise ValueError(
+                f'Formal DO50 object selection is ambiguous for {event_id} on '
+                f'{date:%Y-%m-%d}: {len(candidates)} rows match.'
+            )
+        object_row = candidates.iloc[0]
+        declared_object_key = spec.get('daily_object_key')
+        if declared_object_key is not None and str(object_row['daily_object_key']) != str(declared_object_key):
+            raise ValueError(
+                f'Declared object key {declared_object_key!r} does not match '
+                f'formal object {object_row["daily_object_key"]!r} for {event_id} on {date:%Y-%m-%d}.'
+            )
+        declared_object_id = spec.get('daily_object_id')
+        if declared_object_id is not None and int(object_row['daily_object_id']) != int(declared_object_id):
+            raise ValueError(
+                f'Declared object id {declared_object_id!r} does not match formal '
+                f'object {object_row["daily_object_id"]!r} for {event_id} on {date:%Y-%m-%d}.'
+            )
+        peak_path = peak_root / f'peak_pixels_{date:%Y%m%d}.parquet'
+        if not peak_path.exists():
+            raise FileNotFoundError(peak_path)
+        pixels = pd.read_parquet(peak_path)
+        pixels = pixels.loc[
+            pixels['object_id_do50'].eq(int(object_row['daily_object_id']))
+        ].copy()
+        if 'event_id' in pixels.columns:
+            pixels = pixels.loc[pixels['event_id'].astype(str).eq(event_id)].copy()
+        if 'date' in pixels.columns:
+            pixel_dates = pd.to_datetime(pixels['date']).dt.normalize()
+            pixels = pixels.loc[pixel_dates.eq(date)].copy()
+        if pixels.empty:
+            raise ValueError(f'No formal peak pixels for {event_id} on {date:%Y-%m-%d}.')
+        label = str(spec.get('case_label', f'{event_id}_{date:%Y%m%d}_object'))
+        pixels['case_label'] = label
+        pixels['actual_event_id'] = event_id
+        pixels['event_id'] = event_id
+        pixels['role'] = str(spec.get('role', 'single_event_object_core'))
+        pixels['date'] = pd.to_datetime(pixels['date']).dt.normalize()
+        pixels['daily_object_key'] = str(object_row['daily_object_key'])
+        pixels['member_order_by_delta_do'] = (
+            pixels['delta_do'].rank(method='first', ascending=False).astype(int)
+        )
+        chunk_ranges = list(range(0, len(pixels), int(chunk_size)))
+        chunk_profiles = []
+        cache_statuses = []
+        cache_rebuild_count = 0
+        for start in chunk_ranges:
+            part_file = (
+                parts_path / f'{label}_part_{start:05d}.parquet'
+                if parts_path is not None else None
+            )
+            chunk = pixels.iloc[start:start + int(chunk_size)].copy()
+            expected_cache = chunk.copy()
+            expected_cache['saved_delta_do_umol_kg'] = expected_cache['delta_do']
+            expected_cache['saved_peak_level_index'] = expected_cache['peak_level_index']
+            expected_cache['saved_peak_depth_m'] = expected_cache['peak_depth']
+            expected_cache['saved_half_amplitude_thickness_m'] = (
+                expected_cache['half_amplitude_thickness_m']
+            )
+            profiles = None
+            if part_file is not None and part_file.exists():
+                cached = pd.read_parquet(part_file)
+                valid, reason = _validated_cached_part(cached, expected_cache)
+                if valid:
+                    profiles = cached
+                    cache_statuses.append('reused_validated')
+                else:
+                    cache_statuses.append(f'rebuilt_{reason}')
+            if profiles is None:
+                if part_file is None or not part_file.exists():
+                    cache_statuses.append('created_new')
+                profiles = _ofes_ha_recover_native_profiles(chunk, formal_config)
+                for column, value in config_provenance.items():
+                    profiles[column] = value
+                if part_file is not None:
+                    profiles.to_parquet(part_file, index=False)
+                cache_rebuild_count += 1
+            chunk_profiles.append(profiles)
+        profiles = pd.concat(chunk_profiles, ignore_index=True)
+        profile_frames.append(profiles)
+        shallow = pd.to_numeric(profiles['core_shallow_edge_m'], errors='coerce')
+        deep = pd.to_numeric(profiles['core_deep_edge_m'], errors='coerce')
+        summary_rows.append({
+            'event_id': event_id,
+            'date': date.date().isoformat(),
+            'daily_object_key': str(object_row['daily_object_key']),
+            'object_pixel_count': int(len(pixels)),
+            'object_delta_do_max': float(object_row['delta_do_max']),
+            'object_centroid_lon': float(object_row['centroid_lon']),
+            'object_centroid_lat': float(object_row['centroid_lat']),
+            'object_depth_mean_m': float(object_row['depth_mean']),
+            'object_depth_min_m': float(object_row['depth_min']),
+            'object_depth_max_m': float(object_row['depth_max']),
+            'object_peak_depth_at_max_m': float(object_row['peak_depth_at_max']),
+            'object_thickness_median_m': float(object_row['thickness_median_m']),
+            'native_core_pixel_count': int(len(profiles)),
+            'native_core_shallow_edge_m': float(shallow.min()),
+            'native_core_deep_edge_m': float(deep.max()),
+            'native_core_shallow_edge_median': float(shallow.median()),
+            'native_core_deep_edge_median': float(deep.median()),
+            'native_core_recovery_status': (
+                'all_recovered'
+                if profiles['recovery_status'].eq(
+                    'recovered_producer_discrete_half_amplitude_core'
+                ).all() else 'partial_or_failed'
+            ),
+            'native_core_reproduction_status': (
+                'all_reproduced'
+                if profiles['reproduction_status'].eq(
+                    'saved_peak_and_thickness_reproduced_within_float32_storage_tolerance'
+                ).all() else 'partial_or_failed'
+            ),
+            'core_semantics': 'union_of_per_pixel_native_half_amplitude_core_depth_ranges',
+            'cache_reuse_status': (
+                'all_parts_reused_validated'
+                if cache_statuses and all(status == 'reused_validated' for status in cache_statuses)
+                else 'parts_rebuilt_or_created'
+            ),
+            'cache_validation_statuses': ';'.join(cache_statuses),
+            'cache_rebuild_count': int(cache_rebuild_count),
+            'cache_config_provenance_status': 'present_and_compared',
+            **config_provenance,
+        })
+    profiles = pd.concat(profile_frames, ignore_index=True)
+    summary = pd.DataFrame(summary_rows)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    profiles.to_parquet(profile_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    return profiles, summary
+
+
+def sample_ofes_scalar_properties(
+    trajectories: pd.DataFrame,
+    tracer_snapshot: dict,
+    source: str = 'trajectory_position',
+) -> pd.DataFrame:
+    """在既有轨迹位置补采样 OFES 原生标量和 TEOS-10 属性。
+
+    函数只在已存在的轨迹位置和对应日期快照上插值温度、盐度与 DO，并计算 TEOS-10
+    属性，供固定深度 C2 对照使用；它不改变轨迹、不创建 release，也不重新检测事件。
+
+    参数:
+        - trajectories (pd.DataFrame): 需含 event_id、integration_label、date、particle_id、particle_index、depth_m、lat、lon 和 status。
+        - tracer_snapshot (dict): 同日期 `load_ofes_snapshot` 示踪物快照。
+        - source (str): 写入输出表的标量来源说明。
+
+    返回:
+        - pd.DataFrame: 每个输入位置的 raw DO、位温、盐度、SA、CT、sigma0 和 spice 样本。
+
+    输出:
+        - 无文件输出；调用方负责保存返回表。
+
+    说明:
+        - 该函数只在原日期和原轨迹位置读取标量，不改变轨迹，也不创建新的释放或积分。
+    """
+    required = {
+        'event_id', 'integration_label', 'date', 'particle_id', 'particle_index',
+        'depth_m', 'lat', 'lon', 'status',
+    }
+    missing = sorted(required.difference(trajectories.columns))
+    if missing:
+        raise KeyError(f'OFES scalar trajectory table is missing columns: {missing}.')
+    if trajectories.empty:
+        return pd.DataFrame()
+    snapshot_date = pd.Timestamp(tracer_snapshot['date']).normalize()
+    dates = pd.to_datetime(trajectories['date']).dt.normalize()
+    if not dates.eq(snapshot_date).all():
+        raise ValueError('sample_ofes_scalar_properties accepts one snapshot date.')
+    points = trajectories[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+    valid = np.all(np.isfinite(points), axis=1)
+    values = {
+        key: np.full(len(trajectories), np.nan, dtype=float)
+        for key in ('do2', 'theta', 'salinity', 'sa_g_kg', 'ct_deg_c', 'sigma0', 'spiciness0')
+    }
+    if valid.any():
+        valid_points = points[valid]
+        depth = np.asarray(tracer_snapshot['depth'], dtype=float)
+        temp = _ofes_interp3d(
+            tracer_snapshot['temp'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], valid_points
+        )
+        salinity = _ofes_interp3d(
+            tracer_snapshot['salinity'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], valid_points
+        )
+        do2 = _ofes_interp3d(
+            tracer_snapshot['do2'], depth, tracer_snapshot['lat'], tracer_snapshot['lon'], valid_points
+        )
+        pressure = gsw.p_from_z(-valid_points[:, 0], valid_points[:, 1])
+        sa = gsw.SA_from_SP(salinity, pressure, valid_points[:, 2], valid_points[:, 1])
+        ct = gsw.CT_from_pt(sa, temp)
+        values['do2'][valid] = do2
+        values['theta'][valid] = temp
+        values['salinity'][valid] = salinity
+        values['sa_g_kg'][valid] = sa
+        values['ct_deg_c'][valid] = ct
+        values['sigma0'][valid] = gsw.sigma0(sa, ct)
+        values['spiciness0'][valid] = gsw.spiciness0(sa, ct)
+    output = trajectories.loc[:, [
+        'event_id', 'integration_label', 'date', 'particle_id', 'particle_index',
+        'depth_m', 'lat', 'lon', 'status',
+    ]].copy()
+    output['date'] = snapshot_date.date().isoformat()
+    for key, value in values.items():
+        output[key] = value
+    output['source'] = source
+    return output.reset_index(drop=True)
+
+
+def sample_ofes_single_event_dynamics(
+    paired: pd.DataFrame,
+    event_spec: Mapping[str, Any],
+    snapshot_loader: Any,
+) -> pd.DataFrame:
+    """在声明的代表日期采样单事件 3-D/C2 两臂的动力属性。
+
+    函数把 `summarize_ofes_single_event_controls` 产生的同 release 配对位置转换为
+    轨迹属性采样表，并通过调用方提供的日期快照 loader 复用已有 OFES 场。采样只在
+    已声明代表日期和已有位置上进行，不新建 release、不积分轨迹，也不把局地动力量
+    提升为材料连续性证明。
+
+    参数:
+        - paired (pd.DataFrame): 单事件逐 seed 日期配对表，需含 `date`、`particle_index`、`depth_3d_m`、`lat_3d`、`lon_3d`、`status_3d`、`depth_c2_m`、`lat_c2`、`lon_c2` 和 `status_c2`。
+        - event_spec (Mapping[str, Any]): 含 `event_id`、`three_d_label`、`c2_label` 和 `representative_dates` 的案例规格。
+        - snapshot_loader (Any): 接收 `(date, points)` 并返回同时含速度和示踪物字段的 OFES 快照的可调用对象。
+
+    返回:
+        - pd.DataFrame: 代表日期逐粒子 3-D/C2 动力、热盐和剖面采样表；没有有效日期时为空表。
+
+    说明:
+        - 快照 loader 负责缓存和范围读取；本函数只负责科学采样字段和臂身份登记。
+        - 输出中的 3-D 与 C2 行保留 `side`，不能跨 release 或按独立 particle ID 配对。
+    """
+    required = {
+        'date', 'particle_index', 'depth_3d_m', 'lat_3d', 'lon_3d', 'status_3d',
+        'depth_c2_m', 'lat_c2', 'lon_c2', 'status_c2',
+    }
+    missing = sorted(required.difference(paired.columns))
+    if missing:
+        raise KeyError(f'Single-event dynamics pairing lacks columns: {missing}.')
+    event_id = str(event_spec['event_id'])
+    representative = sorted({
+        pd.Timestamp(value).normalize()
+        for value in event_spec.get('representative_dates', [])
+    })
+    rows = []
+    for date in representative:
+        day = paired.loc[pd.to_datetime(paired['date']).dt.normalize().eq(date)].copy()
+        if day.empty:
+            continue
+        points_by_side = []
+        for side in ('3d', 'c2'):
+            points = pd.DataFrame({
+                'event_id': event_id,
+                'integration_label': (
+                    str(event_spec['three_d_label']) if side == '3d'
+                    else str(event_spec['c2_label'])
+                ),
+                'date': date,
+                'particle_index': day['particle_index'].to_numpy(),
+                'particle_id': day.get(
+                    f'particle_id_{side}', day['particle_index'].astype(str)
+                ).astype(str).to_numpy(),
+                'depth_m': day[f'depth_{side}_m'].to_numpy(dtype=float),
+                'lat': day[f'lat_{side}'].to_numpy(dtype=float),
+                'lon': day[f'lon_{side}'].to_numpy(dtype=float),
+                'status': day[f'status_{side}'].astype(str).to_numpy(),
+                'side': side,
+            })
+            points_by_side.append(points)
+        points = pd.concat(points_by_side, ignore_index=True)
+        snapshot = snapshot_loader(date, points)
+        rows.append(sample_ofes_trajectory_properties(points, snapshot, snapshot))
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def sample_ofes_retention_dynamics(
+    retention_positions: pd.DataFrame,
+    event_spec: Mapping[str, Any],
+    snapshot_loader: Any,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """在既有 peak-forward retention 位置补采样代表日动力属性。
+
+    函数只读取已完成的 peak-forward retention 位置，并在案例规格中声明且晚于峰日
+    的代表日期采样 OFES 三维属性。返回逐粒子样本及按日期的中位数摘要，便于与
+    start-to-peak 同 release 对照分开阅读。
+
+    参数:
+        - retention_positions (pd.DataFrame): 已有 retention 位置表，需含 `date`、`particle_index`、`particle_id`、`depth_m`、`lat`、`lon` 和 `status`。
+        - event_spec (Mapping[str, Any]): 含 `event_id`、`peak_date` 和 `representative_dates` 的案例规格。
+        - snapshot_loader (Any): 接收 `(date, points)` 并返回同时含速度和示踪物字段的 OFES 快照的可调用对象。
+
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame]: 逐粒子代表日样本和按日期的动力/热盐中位数摘要。
+
+    说明:
+        - 采样不增加粒子释放或积分；retention 是既有 peak-forward 产品，不能与 start-to-peak 的 C2 配对表混合。
+    """
+    required = {'date', 'particle_index', 'particle_id', 'depth_m', 'lat', 'lon', 'status'}
+    missing = sorted(required.difference(retention_positions.columns))
+    if missing:
+        raise KeyError(f'Retention positions lack columns: {missing}.')
+    event_id = str(event_spec['event_id'])
+    peak = pd.Timestamp(event_spec['peak_date']).normalize()
+    representative = {
+        pd.Timestamp(value).normalize()
+        for value in event_spec.get('representative_dates', [])
+        if pd.Timestamp(value).normalize() > peak
+    }
+    positions = retention_positions.copy()
+    positions['date'] = pd.to_datetime(positions['date']).dt.normalize()
+    positions = positions.loc[positions['date'].isin(representative)].copy()
+    if positions.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    positions['event_id'] = event_id
+    positions['integration_label'] = 'forward_peak_to_future'
+    sampled_rows = []
+    for date, day in positions.groupby('date', sort=True):
+        points = day.loc[:, [
+            'event_id', 'integration_label', 'date', 'particle_index',
+            'particle_id', 'depth_m', 'lat', 'lon', 'status',
+        ]].copy()
+        snapshot = snapshot_loader(date, points)
+        sampled = sample_ofes_trajectory_properties(points, snapshot, snapshot)
+        sampled['phase'] = 'peak_forward_retention_representative'
+        sampled_rows.append(sampled)
+    sampled = pd.concat(sampled_rows, ignore_index=True)
+    summary_rows = []
+    for date, group in sampled.groupby('date', sort=True):
+        summary_rows.append({
+            'event_id': event_id,
+            'date': date,
+            'phase': 'peak_forward_retention_representative',
+            'particle_count': int(len(group)),
+            'active_count': int(group['status'].astype(str).eq('active').sum()),
+            'depth_median_m': float(group['depth_m'].median()),
+            'do2_median': float(group['do2'].median()),
+            'theta_median': float(group['theta'].median()),
+            'salinity_median': float(group['salinity'].median()),
+            'sigma0_median': float(group['sigma0'].median()),
+            'spiciness0_median': float(group['spiciness0'].median()),
+            'w_median_m_s': float(group['w_m_s'].median()),
+            'relative_vorticity_median_s_1': float(group['relative_vorticity_s_1'].median()),
+            'normal_strain_median_s_1': float(group['normal_strain_s_1'].median()),
+            'shear_strain_median_s_1': float(group['shear_strain_s_1'].median()),
+        })
+    return sampled, pd.DataFrame(summary_rows)
+
+
+def summarize_ofes_single_event_controls(
+    trajectories: pd.DataFrame,
+    tracer_samples: pd.DataFrame,
+    c2_scalar_samples: pd.DataFrame,
+    event_spec: Mapping[str, Any],
+    object_summary: pd.DataFrame | None = None,
+    representative_dates: Sequence[str | pd.Timestamp] | None = None,
+    dynamics_samples: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按同一释放键汇总单事件 3-D 与固定深度 C2 的过程差异。
+
+    函数从已有的 start-to-peak 3-D 与固定深度历史构造逐 seed、逐日期配对，并把对象
+    的原生核心范围、项目剖面信号、局地固定深度 contrast 和可选动力样本分别登记。
+    结果只支持过程对照，不把设计粒子提升为体积、氧通量或材料连续性估计。
+
+    参数:
+        - trajectories (pd.DataFrame): 单事件已有 3-D 与 C2 轨迹历史，至少含 `integration_label`、`time`、`particle_index`、`depth_m`、`lat`、`lon`、`status`。
+        - tracer_samples (pd.DataFrame): 已有 3-D 正向 tracer 样本，含 raw DO、位温、盐度、sigma0 和 spice。
+        - c2_scalar_samples (pd.DataFrame): 同日期同 seed 的固定深度 C2 标量补采样。
+        - event_spec (Mapping[str, Any]): 含 event_id、start_date、peak_date 及可选标签键。
+        - object_summary (pd.DataFrame | None): 正式 Eulerian 对象逐日摘要；若包含 `core_shallow_edge_m` / `core_deep_edge_m`，优先使用实际原生核心范围。
+        - representative_dates (Sequence[str | pd.Timestamp] | None): 要在结果中标记的固定代表日期。
+        - dynamics_samples (pd.DataFrame | None): 代表日期在实际 3-D/C2 位置的局部 u/v/w、涡度和应变样本；需含 `event_id`、`date`、`particle_index` 和 `side`。
+
+    返回:
+        - tuple[pd.DataFrame, pd.DataFrame]: 逐 seed 每日配对表和按日期的分布摘要。
+
+    输出:
+        - 无文件输出；调用方负责保存 parquet/CSV 与图件。
+
+    说明:
+        - 配对键始终是 `event_id + release_date + particle_index + date`，并显式保留
+          两个 integration label；不会跨 release 按 particle_id 拼接。
+        - `depth_m` 与 C2 的差异是实际 3-D 垂向位移参照。对象深度范围、项目垂向
+          `delta DO` 和固定深度局地 contrast 各自保留语义，不能互换。
+    """
+    required_trajectory = {
+        'integration_label', 'time', 'particle_index', 'depth_m', 'lat', 'lon',
+        'status',
+    }
+    missing = sorted(required_trajectory.difference(trajectories.columns))
+    if missing:
+        raise KeyError(f'Single-event trajectory history lacks columns: {missing}.')
+    event_id = str(event_spec['event_id'])
+    start_date = pd.Timestamp(event_spec['start_date']).normalize()
+    peak_date = pd.Timestamp(event_spec['peak_date']).normalize()
+    if peak_date < start_date:
+        raise ValueError('Single-event control window has peak before start.')
+    release_date = str(start_date.date())
+    three_label = str(
+        event_spec.get('three_d_label', 'forward_observed_start_to_peak')
+    )
+    c2_label = str(
+        event_spec.get('c2_label', 'forward_same_seed_fixed_depth_control')
+    )
+
+    history = trajectories.copy()
+    history['date'] = pd.to_datetime(history['time']).dt.normalize()
+    if 'time' in history:
+        time_values = pd.to_datetime(history['time'])
+        history = history.loc[time_values.dt.hour.eq(0)].copy()
+    history = history.loc[
+        history['date'].between(start_date, peak_date)
+        & history['integration_label'].isin([three_label, c2_label])
+    ].copy()
+    if history.empty:
+        raise ValueError(f'No daily trajectories found for {event_id}.')
+    history['event_id'] = event_id
+    history['release_date'] = release_date
+    keys = ['event_id', 'release_date', 'particle_index', 'date']
+    three = history.loc[history['integration_label'].eq(three_label)].copy()
+    c2 = history.loc[history['integration_label'].eq(c2_label)].copy()
+    if three.duplicated(keys).any() or c2.duplicated(keys).any():
+        raise ValueError('Single-event daily control histories are not unique on their release keys.')
+    three = three.rename(columns={
+        'integration_label': 'integration_label_3d',
+        'depth_m': 'depth_3d_m',
+        'lat': 'lat_3d',
+        'lon': 'lon_3d',
+        'status': 'status_3d',
+        'particle_id': 'particle_id_3d',
+    })
+    c2 = c2.rename(columns={
+        'integration_label': 'integration_label_c2',
+        'depth_m': 'depth_c2_m',
+        'lat': 'lat_c2',
+        'lon': 'lon_c2',
+        'status': 'status_c2',
+        'particle_id': 'particle_id_c2',
+    })
+    keep_three = keys + [
+        'integration_label_3d', 'depth_3d_m', 'lat_3d', 'lon_3d', 'status_3d',
+        'particle_id_3d',
+    ]
+    keep_c2 = keys + [
+        'integration_label_c2', 'depth_c2_m', 'lat_c2', 'lon_c2', 'status_c2',
+        'particle_id_c2',
+    ]
+    keep_three = [column for column in keep_three if column in three.columns]
+    keep_c2 = [column for column in keep_c2 if column in c2.columns]
+    paired = three[keep_three].merge(
+        c2[keep_c2], on=keys, how='outer', validate='one_to_one', indicator=True,
+    )
+    paired['pairing_status'] = np.where(
+        paired['_merge'].eq('both'), 'same_release_seed_date_pair',
+        paired['_merge'].map({'left_only': 'missing_c2_same_date', 'right_only': 'missing_3d_same_date'}).fillna('unknown'),
+    )
+    paired = paired.drop(columns='_merge')
+    if paired.empty:
+        raise ValueError(f'No same-release 3-D/C2 pairs found for {event_id}.')
+
+    tracer = tracer_samples.copy()
+    if 'date' not in tracer.columns:
+        raise KeyError('Single-event tracer samples require a date column.')
+    tracer['date'] = pd.to_datetime(tracer['date']).dt.normalize()
+    tracer = tracer.loc[
+        tracer.get('event_id', event_id).astype(str).eq(event_id)
+        & tracer['integration_label'].eq(three_label)
+        & tracer['date'].between(start_date, peak_date)
+    ].copy()
+    tracer['event_id'] = event_id
+    tracer['release_date'] = release_date
+    tracer = tracer.rename(columns={
+        column: f'{column}_3d'
+        for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0')
+        if column in tracer.columns
+    })
+    tracer_columns = keys + [
+        f'{column}_3d' for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0')
+        if f'{column}_3d' in tracer.columns
+    ]
+    if tracer.duplicated(keys).any():
+        raise ValueError('Single-event 3-D tracer samples are not unique on release keys.')
+    paired = paired.merge(
+        tracer[tracer_columns], on=keys, how='left', validate='one_to_one',
+    )
+    c2_scalar = c2_scalar_samples.copy()
+    if 'date' not in c2_scalar.columns:
+        raise KeyError('Single-event C2 scalar samples require a date column.')
+    c2_scalar['date'] = pd.to_datetime(c2_scalar['date']).dt.normalize()
+    c2_scalar = c2_scalar.loc[
+        c2_scalar.get('event_id', event_id).astype(str).eq(event_id)
+        & c2_scalar['integration_label'].eq(c2_label)
+        & c2_scalar['date'].between(start_date, peak_date)
+    ].copy()
+    c2_scalar['event_id'] = event_id
+    c2_scalar['release_date'] = release_date
+    c2_scalar = c2_scalar.rename(columns={
+        column: f'{column}_c2'
+        for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0')
+        if column in c2_scalar.columns
+    })
+    c2_columns = keys + [
+        f'{column}_c2' for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0')
+        if f'{column}_c2' in c2_scalar.columns
+    ]
+    if c2_scalar.duplicated(keys).any():
+        raise ValueError('Single-event C2 scalar samples are not unique on release keys.')
+    paired = paired.merge(
+        c2_scalar[c2_columns], on=keys, how='left', validate='one_to_one',
+    )
+    if dynamics_samples is not None and not dynamics_samples.empty:
+        dynamics = dynamics_samples.copy()
+        required_dynamics = {'event_id', 'date', 'particle_index', 'side'}
+        missing_dynamics = sorted(required_dynamics.difference(dynamics.columns))
+        if missing_dynamics:
+            raise KeyError(f'Single-event dynamics samples lack columns: {missing_dynamics}.')
+        dynamics['event_id'] = dynamics['event_id'].astype(str)
+        dynamics['date'] = pd.to_datetime(dynamics['date']).dt.normalize()
+        dynamics['release_date'] = release_date
+        dynamics = dynamics.loc[
+            dynamics['event_id'].eq(event_id)
+            & dynamics['date'].between(start_date, peak_date)
+            & dynamics['side'].isin(['3d', 'c2'])
+        ].copy()
+        dynamics_metrics = [
+            'u_m_s', 'v_m_s', 'w_m_s', 'relative_vorticity_s_1',
+            'normal_strain_s_1', 'shear_strain_s_1',
+        ]
+        for side in ('3d', 'c2'):
+            side_frame = dynamics.loc[dynamics['side'].eq(side)].copy()
+            if side_frame.duplicated(keys).any():
+                raise ValueError(f'Single-event {side} dynamics are not unique on release keys.')
+            rename = {
+                metric: f'{metric}_{side}' for metric in dynamics_metrics
+                if metric in side_frame.columns
+            }
+            side_frame = side_frame.rename(columns=rename)
+            keep = keys + list(rename.values())
+            paired = paired.merge(
+                side_frame[keep], on=keys, how='left', validate='one_to_one',
+            )
+        for metric in dynamics_metrics:
+            left = f'{metric}_3d'
+            right = f'{metric}_c2'
+            if left in paired and right in paired:
+                paired[f'{metric}_difference_3d_minus_c2'] = paired[left] - paired[right]
+        if {'u_m_s_3d', 'v_m_s_3d'}.issubset(paired.columns):
+            paired['speed_m_s_3d'] = np.hypot(paired['u_m_s_3d'], paired['v_m_s_3d'])
+        if {'u_m_s_c2', 'v_m_s_c2'}.issubset(paired.columns):
+            paired['speed_m_s_c2'] = np.hypot(paired['u_m_s_c2'], paired['v_m_s_c2'])
+    if {'lon_3d', 'lat_3d', 'lon_c2', 'lat_c2'}.issubset(paired.columns):
+        finite_horizontal = paired[['lon_3d', 'lat_3d', 'lon_c2', 'lat_c2']].notna().all(axis=1)
+        paired['horizontal_separation_km'] = np.nan
+        paired.loc[finite_horizontal, 'horizontal_separation_km'] = (
+            great_circle_distance_m(
+                paired.loc[finite_horizontal, 'lon_3d'].to_numpy(dtype=float),
+                paired.loc[finite_horizontal, 'lat_3d'].to_numpy(dtype=float),
+                paired.loc[finite_horizontal, 'lon_c2'].to_numpy(dtype=float),
+                paired.loc[finite_horizontal, 'lat_c2'].to_numpy(dtype=float),
+            ) / 1000.0
+        )
+    else:
+        paired['horizontal_separation_km'] = np.nan
+    paired['depth_difference_3d_minus_c2_m'] = paired['depth_3d_m'] - paired['depth_c2_m']
+    paired['depth_displacement_3d_from_release_m'] = np.nan
+    paired['depth_displacement_c2_from_release_m'] = np.nan
+    for column, output in (
+        ('depth_3d_m', 'depth_displacement_3d_from_release_m'),
+        ('depth_c2_m', 'depth_displacement_c2_from_release_m'),
+    ):
+        initial = paired.loc[paired['date'].eq(start_date), ['particle_index', column]].rename(
+            columns={column: '_initial_depth'}
+        )
+        paired = paired.merge(initial, on='particle_index', how='left', validate='many_to_one')
+        paired[output] = paired[column] - paired['_initial_depth']
+        paired = paired.drop(columns='_initial_depth')
+    for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0'):
+        left = f'{column}_3d'
+        right = f'{column}_c2'
+        if left in paired and right in paired:
+            paired[f'{column}_difference_3d_minus_c2'] = paired[left] - paired[right]
+    initial_identity = paired.loc[
+        paired['date'].eq(start_date),
+        [column for column in ('particle_index', 'depth_3d_m', 'depth_c2_m', 'lat_3d', 'lat_c2', 'lon_3d', 'lon_c2') if column in paired.columns],
+    ].copy()
+    initial_identity['initial_seed_identity_match'] = (
+        np.isfinite(initial_identity.get('depth_3d_m', np.nan))
+        & np.isfinite(initial_identity.get('depth_c2_m', np.nan))
+        & (np.abs(initial_identity['depth_3d_m'] - initial_identity['depth_c2_m']) <= 1e-6)
+        & (np.abs(initial_identity['lat_3d'] - initial_identity['lat_c2']) <= 1e-6)
+        & (np.abs(initial_identity['lon_3d'] - initial_identity['lon_c2']) <= 1e-6)
+    )
+    paired = paired.merge(
+        initial_identity[['particle_index', 'initial_seed_identity_match']],
+        on='particle_index', how='left', validate='many_to_one',
+    )
+    paired['same_release_seed_key'] = (
+        event_id + '|' + release_date + '|' + paired['particle_index'].astype(str)
+    )
+    representative = {
+        pd.Timestamp(value).normalize() for value in (representative_dates or [])
+    }
+    paired['representative_date'] = paired['date'].isin(representative)
+
+    if object_summary is not None and not object_summary.empty:
+        objects = object_summary.copy()
+        objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+        if 'event_id' in objects:
+            objects = objects.loc[objects['event_id'].astype(str).eq(event_id)]
+        objects = objects.loc[objects['date'].between(start_date, peak_date)].copy()
+        if not objects.empty:
+            objects = objects.sort_values('date').drop_duplicates('date', keep='first')
+            object_columns = [
+                column for column in (
+                    'daily_object_key', 'pixel_count', 'centroid_lon', 'centroid_lat',
+                    'delta_do_max', 'depth_mean', 'depth_min', 'depth_max',
+                    'peak_depth_at_max', 'thickness_median_m',
+                    'core_shallow_edge_m', 'core_deep_edge_m', 'core_semantics',
+                ) if column in objects.columns
+            ]
+            paired = paired.merge(
+                objects[['date'] + object_columns], on='date', how='left', validate='many_to_one',
+            )
+    for column in ('core_shallow_edge_m', 'core_deep_edge_m'):
+        if column not in paired:
+            paired[column] = np.nan
+    paired['object_core_semantics'] = np.where(
+        paired[['core_shallow_edge_m', 'core_deep_edge_m']].notna().all(axis=1),
+        'native_eulerian_object_core_range',
+        'formal_object_peak_pixel_depth_envelope_only',
+    )
+    if 'core_semantics' in paired.columns:
+        supplied_semantics = paired['core_semantics'].astype('string')
+        paired['object_core_semantics'] = supplied_semantics.fillna(
+            paired['object_core_semantics']
+        ).astype(str)
+    paired['material_inside_object_core'] = (
+        paired['depth_3d_m'].ge(paired['core_shallow_edge_m'])
+        & paired['depth_3d_m'].le(paired['core_deep_edge_m'])
+    )
+
+    def quantile_or_nan(values: pd.Series, quantile: float) -> float:
+        values = pd.to_numeric(values, errors='coerce').dropna()
+        return float(values.quantile(quantile)) if not values.empty else np.nan
+
+    summaries = []
+    for date, group in paired.groupby('date', sort=True):
+        row = {
+            'event_id': event_id,
+            'release_date': release_date,
+            'date': date,
+            'representative_date': bool(date in representative),
+            'pair_count': int(len(group)),
+            'same_release_pair_count': int(group['pairing_status'].eq('same_release_seed_date_pair').sum()),
+            'initial_seed_identity_match_count': int(group['initial_seed_identity_match'].fillna(False).sum()),
+            'horizontal_separation_median_km': quantile_or_nan(group['horizontal_separation_km'], .5),
+            'horizontal_separation_p10_km': quantile_or_nan(group['horizontal_separation_km'], .1),
+            'horizontal_separation_p90_km': quantile_or_nan(group['horizontal_separation_km'], .9),
+            'depth_3d_median_m': quantile_or_nan(group['depth_3d_m'], .5),
+            'depth_c2_median_m': quantile_or_nan(group['depth_c2_m'], .5),
+            'depth_difference_median_3d_minus_c2_m': quantile_or_nan(group['depth_difference_3d_minus_c2_m'], .5),
+            'depth_difference_p10_3d_minus_c2_m': quantile_or_nan(group['depth_difference_3d_minus_c2_m'], .1),
+            'depth_difference_p90_3d_minus_c2_m': quantile_or_nan(group['depth_difference_3d_minus_c2_m'], .9),
+            'depth_displacement_3d_median_m': quantile_or_nan(group['depth_displacement_3d_from_release_m'], .5),
+            'depth_displacement_c2_median_m': quantile_or_nan(group['depth_displacement_c2_from_release_m'], .5),
+            'material_inside_object_core_count': int(group['material_inside_object_core'].fillna(False).sum()),
+            'material_inside_object_core_fraction': float(group['material_inside_object_core'].fillna(False).mean()),
+            'object_core_semantics': ';'.join(sorted(group['object_core_semantics'].dropna().astype(str).unique())),
+        }
+        for column in ('do2', 'theta', 'salinity', 'sigma0', 'spiciness0'):
+            for side in ('3d', 'c2'):
+                key_name = f'{column}_{side}'
+                row[f'{key_name}_median'] = quantile_or_nan(group.get(key_name, pd.Series(dtype=float)), .5)
+            difference = f'{column}_difference_3d_minus_c2'
+            row[f'{difference}_median'] = quantile_or_nan(group.get(difference, pd.Series(dtype=float)), .5)
+        for column in (
+            'u_m_s', 'v_m_s', 'w_m_s', 'relative_vorticity_s_1',
+            'normal_strain_s_1', 'shear_strain_s_1', 'speed_m_s',
+        ):
+            for side in ('3d', 'c2'):
+                key_name = f'{column}_{side}'
+                row[f'{key_name}_median'] = quantile_or_nan(group.get(key_name, pd.Series(dtype=float)), .5)
+            difference = f'{column}_difference_3d_minus_c2'
+            row[f'{difference}_median'] = quantile_or_nan(group.get(difference, pd.Series(dtype=float)), .5)
+        for column in ('depth_mean', 'depth_min', 'depth_max', 'peak_depth_at_max', 'delta_do_max'):
+            row[f'object_{column}'] = quantile_or_nan(group.get(column, pd.Series(dtype=float)), .5)
+        row['object_core_shallow_edge_m'] = quantile_or_nan(
+            group.get('core_shallow_edge_m', pd.Series(dtype=float)), .5
+        )
+        row['object_core_deep_edge_m'] = quantile_or_nan(
+            group.get('core_deep_edge_m', pd.Series(dtype=float)), .5
+        )
+        summaries.append(row)
+    summary = pd.DataFrame(summaries)
+    if not summary.empty:
+        summary['window_semantics'] = 'observed_start_to_peak_daily_same_release_pair'
+    return paired.sort_values(['date', 'particle_index'], kind='mergesort').reset_index(drop=True), summary
+
+
+def plot_ofes_single_event_control_figure(
+    paired: pd.DataFrame,
+    summary: pd.DataFrame,
+    event_spec: Mapping[str, Any],
+    output_path: str | Path | None = None,
+) -> plt.Figure:
+    """绘制单事件 3-D/C2 深度、水平分离和 raw DO 对照图。
+
+    函数将同一 release 的逐日 paired summary 画成三联图，保留垂向位移、水平分离
+    和 raw DO 差异三个互补量；图件用于过程审计，不把曲线重合解释为材料身份。
+
+    参数:
+        - paired (pd.DataFrame): `summarize_ofes_single_event_controls` 的逐 seed 表。
+        - summary (pd.DataFrame): 同一函数返回的逐日分布摘要。
+        - event_spec (Mapping[str, Any]): 含 event_id、formal_type、start_date 和 peak_date。
+        - output_path (str | Path | None): 可选 PNG 输出路径。
+
+    返回:
+        - plt.Figure: 组合图对象。
+
+    输出:
+        - 指定 `output_path` 时写入一张组合 PNG；不写其他文件。
+
+    说明:
+        - 图中固定深度 C2 是同一释放键的水平参照；阴影对象范围是正式 Eulerian
+          对象的聚合原生核心/深度支撑，不能解读为粒子体积或氧通量。
+    """
+    if summary.empty:
+        raise ValueError('Cannot plot an empty single-event control summary.')
+    plot_summary = summary.copy()
+    plot_summary['date'] = pd.to_datetime(plot_summary['date'])
+    fig, axes = plt.subplots(
+        3, 1, figsize=(9.2, 8.4), sharex=True, constrained_layout=True,
+    )
+    dates = plot_summary['date']
+    axes[0].plot(dates, plot_summary['depth_3d_median_m'], '-o', ms=3, label='3-D material')
+    axes[0].plot(dates, plot_summary['depth_c2_median_m'], '--o', ms=3, label='fixed-depth C2')
+    object_shallow = plot_summary.get('object_core_shallow_edge_m')
+    object_deep = plot_summary.get('object_core_deep_edge_m')
+    if object_shallow is not None and object_deep is not None:
+        finite = object_shallow.notna() & object_deep.notna()
+        if finite.any():
+            axes[0].fill_between(
+                dates, object_shallow, object_deep, where=finite,
+                color='#7f7f7f', alpha=0.18, label='Eulerian object core range',
+            )
+    axes[0].invert_yaxis()
+    axes[0].set_ylabel('Depth (m)')
+    axes[0].legend(frameon=False, fontsize=8, ncol=3)
+    axes[1].plot(dates, plot_summary['horizontal_separation_median_km'], '-o', ms=3, color='#1f77b4')
+    axes[1].fill_between(
+        dates, plot_summary['horizontal_separation_p10_km'],
+        plot_summary['horizontal_separation_p90_km'], color='#1f77b4', alpha=0.15,
+    )
+    axes[1].set_ylabel('3-D/C2 separation (km)')
+    do_difference = 'do2_difference_3d_minus_c2_median'
+    if do_difference in plot_summary:
+        axes[2].plot(dates, plot_summary[do_difference], '-o', ms=3, color='#d62728')
+        axes[2].axhline(0.0, color='0.35', lw=0.7)
+        axes[2].set_ylabel('raw DO 3-D − C2')
+    else:
+        axes[2].plot(dates, plot_summary['depth_difference_median_3d_minus_c2_m'], '-o', ms=3)
+        axes[2].axhline(0.0, color='0.35', lw=0.7)
+        axes[2].set_ylabel('depth difference (m)')
+    axes[2].set_xlabel('Date')
+    for axis in axes:
+        axis.grid(alpha=0.22)
+    fig.suptitle(
+        f"{event_spec.get('event_id', '')} ({event_spec.get('formal_type', 'unknown')}): "
+        'same-release material versus fixed-depth C2',
+        fontsize=12,
+    )
+    if output_path is not None:
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=180)
+    return fig
+
+
+def plot_ofes_family_connection_figures(
+    trajectories: pd.DataFrame,
+    properties: pd.DataFrame,
+    endpoint_members: pd.DataFrame,
+    output_dir: str | Path,
+) -> dict[str, str]:
+    """绘制家族端点轨迹及粒子性质的两张过程对照图。
+
+    函数按 release arm 和 vertical mode 叠加已有轨迹，并将端点正式像元作为位置参照，
+    同时绘制逐日 DO、深度和 sigma0 中位数；它不新增粒子、不改变端点 QA 口径。
+
+    参数:
+        - trajectories (pd.DataFrame): 含 `arm_id`、`vertical_mode`、`seed_id`、`date`、`lon` 和 `lat` 的逐日位置表。
+        - properties (pd.DataFrame): 含 `arm_id`、`vertical_mode`、`date`、`do2`、`sigma0` 和 `depth_m` 的逐日性质表。
+        - endpoint_members (pd.DataFrame): 含 `case_label`、`lon` 和 `lat` 的正式端点成员表。
+        - output_dir (str | Path): 两张 PNG 的输出目录。
+
+    返回:
+        - dict[str, str]: `paths` 和 `properties` 两个图件路径。
+
+    输出:
+        - `<output_dir>/family_connection_paths.png`。
+        - `<output_dir>/family_connection_properties.png`。
+
+    说明:
+        - 3-D 实线与固定深度 C2 虚线只表示同一释放臂的过程对照；端点成员是正式
+          像元位置，不把轨迹线或成员数解释成材料体积、发生率或氧通量。
+    """
+    required_trajectory = {
+        'arm_id', 'vertical_mode', 'seed_id', 'date', 'lon', 'lat',
+    }
+    required_property = {'arm_id', 'vertical_mode', 'date', 'do2', 'sigma0', 'depth_m'}
+    required_member = {'case_label', 'lon', 'lat'}
+    missing = {
+        'trajectories': sorted(required_trajectory - set(trajectories.columns)),
+        'properties': sorted(required_property - set(properties.columns)),
+        'endpoint_members': sorted(required_member - set(endpoint_members.columns)),
+    }
+    missing = {key: value for key, value in missing.items() if value}
+    if missing:
+        raise KeyError(f'Family figure inputs lack columns: {missing}.')
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    path_figure = output / 'family_connection_paths.png'
+    property_figure = output / 'family_connection_properties.png'
+    trajectory_frame = trajectories.copy()
+    trajectory_frame['date'] = pd.to_datetime(trajectory_frame['date'])
+    arm_ids = sorted(trajectory_frame['arm_id'].astype(str).unique())
+    colors = {
+        arm: plt.get_cmap('tab10')(index % 10)
+        for index, arm in enumerate(arm_ids)
+    }
+    figure, axis = plt.subplots(figsize=(9, 6), constrained_layout=True)
+    for (arm_id, mode), group in trajectory_frame.groupby(
+        ['arm_id', 'vertical_mode'], sort=True
+    ):
+        for _, seed in group.groupby('seed_id', sort=False):
+            seed = seed.sort_values('date')
+            axis.plot(
+                seed['lon'], seed['lat'],
+                color=colors.get(str(arm_id), '#444444'),
+                alpha=0.18 if mode == 'three_dimensional' else 0.08,
+                linewidth=0.7,
+                linestyle='-' if mode == 'three_dimensional' else '--',
+            )
+    for label, group in endpoint_members.groupby('case_label', sort=True):
+        axis.scatter(
+            group['lon'], group['lat'], s=18, label=str(label),
+            edgecolor='black', linewidth=0.3,
+        )
+    axis.set(
+        xlabel='Longitude', ylabel='Latitude',
+        title='Family endpoint transport: 3-D / fixed-depth C2',
+    )
+    axis.grid(alpha=0.2)
+    axis.legend(frameon=False, ncol=2, fontsize=8)
+    figure.savefig(path_figure, dpi=180)
+    plt.close(figure)
+    if properties.empty:
+        return {'paths': str(path_figure), 'properties': ''}
+    property_frame = properties.copy()
+    property_frame['date'] = pd.to_datetime(property_frame['date'])
+    figure, axes = plt.subplots(
+        3, 1, figsize=(10, 8), sharex=True, constrained_layout=True,
+    )
+    for (arm_id, mode), group in property_frame.groupby(
+        ['arm_id', 'vertical_mode'], sort=True
+    ):
+        daily = group.groupby('date', as_index=False).agg(
+            do2=('do2', 'median'),
+            sigma0=('sigma0', 'median'),
+            depth=('depth_m', 'median'),
+        )
+        label = f'{arm_id} / {mode}'
+        axes[0].plot(daily['date'], daily['do2'], marker='.', linewidth=1, label=label)
+        axes[1].plot(daily['date'], daily['depth'], marker='.', linewidth=1, label=label)
+        axes[2].plot(daily['date'], daily['sigma0'], marker='.', linewidth=1, label=label)
+    axes[0].set_ylabel('DO (umol kg-1)')
+    axes[1].set_ylabel('Depth (m)')
+    axes[2].set_ylabel('sigma0')
+    axes[2].set_xlabel('Date')
+    axes[0].legend(frameon=False, fontsize=6, ncol=2)
+    for axis in axes:
+        axis.grid(alpha=0.2)
+    figure.savefig(property_figure, dpi=180)
+    plt.close(figure)
+    return {'paths': str(path_figure), 'properties': str(property_figure)}
+
+
+def _ofes_review_path(root: Path, value: str | Path) -> Path:
+    """Resolve a review input path relative to the declared multicase root."""
+    path = Path(value)
+    if path.is_absolute():
+        raise ValueError(
+            f'Multicase review specs must use paths relative to the output root: {value!s}.'
+        )
+    return root / path
+
+
+def _ofes_write_review_manifest(
+    root: Path,
+    section: str,
+    payload: Mapping[str, Any],
+) -> None:
+    """Update the small machine-readable manifest consumed by the Notebook."""
+    manifest_path = root / 'multicase_review_manifest.json'
+    manifest = {}
+    if manifest_path.exists():
+        with manifest_path.open('r', encoding='utf-8') as handle:
+            manifest = json.load(handle)
+    manifest[section] = dict(payload)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open('w', encoding='utf-8') as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
+
+def _validate_ofes_family_properties(
+    trajectories: pd.DataFrame,
+    properties: pd.DataFrame,
+) -> pd.DataFrame:
+    """Validate inherited family property identity against trajectory rows."""
+    required = {
+        'arm_id', 'vertical_mode', 'date', 'particle_index', 'seed_id',
+        'source_label', 'target_label', 'release_date', 'direction',
+        'integration_label', 'dt_seconds', 'source_event_id',
+        'source_seed_lon', 'source_seed_lat', 'source_seed_depth_m',
+        'source_peak_level_index', 'depth_m', 'lat', 'lon', 'status',
+        'is_release', 'is_target',
+    }
+    missing = sorted(required.difference(properties.columns))
+    if missing:
+        raise KeyError(f'Family properties lack inherited identity fields: {missing}.')
+    key = ['arm_id', 'vertical_mode', 'date', 'particle_index']
+
+    def prepare(frame: pd.DataFrame, name: str) -> pd.DataFrame:
+        result = frame.copy()
+        result['arm_id'] = result['arm_id'].astype(str)
+        result['vertical_mode'] = result['vertical_mode'].astype(str)
+        try:
+            result['date'] = pd.to_datetime(result['date'], errors='raise').dt.normalize()
+            result['particle_index'] = pd.to_numeric(
+                result['particle_index'], errors='raise'
+            ).astype(int)
+            result['release_date'] = pd.to_datetime(
+                result['release_date'], errors='raise'
+            ).dt.date.astype(str)
+        except Exception as exc:
+            raise ValueError(f'Family {name} identity dates or particle keys are invalid.') from exc
+        if result.duplicated(key).any():
+            raise ValueError(f'Family {name} has duplicate composite identity keys.')
+        return result
+
+    trajectory = prepare(trajectories, 'trajectory')
+    property_frame = prepare(properties, 'properties')
+    actual_keys = set(map(tuple, property_frame[key].astype(str).to_numpy()))
+    expected_keys = set(map(tuple, trajectory[key].astype(str).to_numpy()))
+    if actual_keys != expected_keys:
+        raise ValueError(
+            'Family properties do not have the same arm/mode/date/particle key set '
+            f'({len(expected_keys - actual_keys)} missing, {len(actual_keys - expected_keys)} extra).'
+        )
+    compare_columns = [
+        'source_label', 'target_label', 'release_date', 'direction',
+        'integration_label', 'seed_id', 'source_event_id', 'status',
+    ]
+    numeric_columns = [
+        'dt_seconds', 'source_seed_lon', 'source_seed_lat',
+        'source_seed_depth_m', 'source_peak_level_index', 'depth_m', 'lat', 'lon',
+    ]
+    boolean_columns = ['is_release', 'is_target']
+    trajectory_columns = key + compare_columns + numeric_columns + boolean_columns
+    merged = property_frame[key + compare_columns + numeric_columns + boolean_columns].merge(
+        trajectory[trajectory_columns],
+        on=key,
+        how='left',
+        validate='one_to_one',
+        suffixes=('_properties', '_trajectory'),
+    )
+    for column in compare_columns:
+        if not merged[f'{column}_properties'].astype(str).eq(
+            merged[f'{column}_trajectory'].astype(str)
+        ).all():
+            raise ValueError(f'Family properties mismatch inherited {column}.')
+    for column in numeric_columns:
+        left = pd.to_numeric(merged[f'{column}_properties'], errors='coerce').to_numpy(dtype=float)
+        right = pd.to_numeric(merged[f'{column}_trajectory'], errors='coerce').to_numpy(dtype=float)
+        if not np.allclose(left, right, rtol=0.0, atol=1e-7, equal_nan=True):
+            raise ValueError(f'Family properties mismatch inherited {column}.')
+    for column in boolean_columns:
+        if not merged[f'{column}_properties'].astype(bool).eq(
+            merged[f'{column}_trajectory'].astype(bool)
+        ).all():
+            raise ValueError(f'Family properties mismatch inherited {column}.')
+    return property_frame.sort_values(
+        ['arm_id', 'vertical_mode', 'date', 'particle_index'], kind='mergesort'
+    ).reset_index(drop=True)
+
+
+def _normalize_ofes_family_native_identity(native: pd.DataFrame) -> pd.DataFrame:
+    """Map explicit native profile identity aliases to the endpoint contract."""
+    result = native.copy()
+    aliases = {
+        'event_id': ('actual_event_id', 'saved_event_id'),
+        'daily_object_key': ('object_key', 'saved_daily_object_key'),
+        'source_lat_index': ('saved_source_lat_index',),
+        'source_lon_index': ('saved_source_lon_index',),
+        'recovered_core_shallow_edge_m': ('core_shallow_edge_m',),
+        'recovered_core_deep_edge_m': ('core_deep_edge_m',),
+        'recovered_core_thickness_m': ('core_thickness_m',),
+    }
+    for canonical, candidates in aliases.items():
+        if canonical not in result:
+            source = next((name for name in candidates if name in result), None)
+            if source is not None:
+                result[canonical] = result[source]
+    return result
+
+
+def _validate_ofes_family_endpoint_identity(
+    members: pd.DataFrame,
+    native: pd.DataFrame,
+    endpoint_definitions: Mapping[str, Mapping[str, Any]],
+    arms: Sequence[Mapping[str, Any]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Validate endpoint declarations and member/native identity joins."""
+    required_members = {
+        'case_label', 'event_id', 'date', 'daily_object_key',
+        'source_lat_index', 'source_lon_index', 'lat', 'lon',
+        'peak_depth', 'peak_level_index',
+    }
+    missing_members = sorted(required_members.difference(members.columns))
+    if missing_members:
+        raise KeyError(f'Family endpoint members lack identity fields: {missing_members}.')
+    normalized_native = _normalize_ofes_family_native_identity(native)
+    required_native = {
+        'case_label', 'event_id', 'date', 'daily_object_key',
+        'source_lat_index', 'source_lon_index',
+        'recovered_core_shallow_edge_m', 'recovered_core_deep_edge_m',
+        'recovered_core_thickness_m',
+    }
+    missing_native = sorted(required_native.difference(normalized_native.columns))
+    if missing_native:
+        raise KeyError(f'Family native profiles lack identity fields: {missing_native}.')
+    member_frame = members.copy()
+    native_frame = normalized_native.copy()
+    for frame in (member_frame, native_frame):
+        frame['case_label'] = frame['case_label'].astype(str)
+        frame['event_id'] = frame['event_id'].astype(str)
+        frame['date'] = pd.to_datetime(frame['date'], errors='raise').dt.normalize()
+        frame['daily_object_key'] = frame['daily_object_key'].astype(str)
+        for column in ('source_lat_index', 'source_lon_index'):
+            frame[column] = pd.to_numeric(frame[column], errors='raise').astype(int)
+    identity_key = [
+        'case_label', 'daily_object_key', 'source_lat_index', 'source_lon_index',
+    ]
+    if member_frame.duplicated(identity_key).any():
+        raise ValueError('Family endpoint members have duplicate identity keys.')
+    if native_frame.duplicated(identity_key).any():
+        raise ValueError('Family native profiles have duplicate identity keys.')
+    member_keys = set(map(tuple, member_frame[identity_key].to_numpy()))
+    native_keys = set(map(tuple, native_frame[identity_key].to_numpy()))
+    if member_keys != native_keys:
+        raise ValueError(
+            'Family endpoint member/native identity keys differ '
+            f'({len(member_keys - native_keys)} native rows missing, '
+            f'{len(native_keys - member_keys)} native rows extra).'
+        )
+    identity = member_frame[identity_key + ['event_id', 'date']].merge(
+        native_frame[identity_key + ['event_id', 'date']],
+        on=identity_key,
+        how='left',
+        validate='one_to_one',
+        suffixes=('_member', '_native'),
+    )
+    if not identity['event_id_member'].eq(identity['event_id_native']).all():
+        raise ValueError('Family native profiles have mismatched event_id identity.')
+    if not identity['date_member'].eq(identity['date_native']).all():
+        raise ValueError('Family native profiles have mismatched date identity.')
+    for label, definition in endpoint_definitions.items():
+        required_definition = {'event_id', 'date', 'object_key'}
+        missing = sorted(required_definition.difference(definition))
+        if missing:
+            raise KeyError(f'Endpoint definition {label!r} lacks fields: {missing}.')
+        expected_event = str(definition['event_id'])
+        expected_date = pd.Timestamp(definition['date']).normalize()
+        expected_object = str(definition['object_key'])
+        selected_members = member_frame.loc[
+            member_frame['case_label'].eq(str(label))
+        ]
+        selected_native = native_frame.loc[
+            native_frame['case_label'].eq(str(label))
+        ]
+        if selected_members.empty or selected_native.empty:
+            raise ValueError(f'Endpoint {label!r} lacks member or native support rows.')
+        if not selected_members['event_id'].eq(expected_event).all():
+            raise ValueError(f'Endpoint {label!r} member event_id disagrees with its declaration.')
+        if not selected_members['date'].eq(expected_date).all():
+            raise ValueError(f'Endpoint {label!r} member date disagrees with its declaration.')
+        if not selected_members['daily_object_key'].eq(expected_object).all():
+            raise ValueError(f'Endpoint {label!r} member object_key disagrees with its declaration.')
+        if not selected_native['event_id'].eq(expected_event).all():
+            raise ValueError(f'Endpoint {label!r} native event_id disagrees with its declaration.')
+        if not selected_native['date'].eq(expected_date).all():
+            raise ValueError(f'Endpoint {label!r} native date disagrees with its declaration.')
+        if not selected_native['daily_object_key'].eq(expected_object).all():
+            raise ValueError(f'Endpoint {label!r} native object_key disagrees with its declaration.')
+    for arm in arms:
+        source_label = str(arm['source_label'])
+        if source_label not in endpoint_definitions:
+            raise ValueError(f'Family arm source label lacks endpoint definition: {source_label}.')
+        source_members = member_frame.loc[member_frame['case_label'].eq(source_label)]
+        release_date = pd.Timestamp(arm['release_date']).normalize()
+        if not source_members['date'].eq(release_date).all():
+            raise ValueError(
+                f"Family arm {arm['arm_id']!r} release_date disagrees with source members."
+            )
+        if release_date != pd.Timestamp(endpoint_definitions[source_label]['date']).normalize():
+            raise ValueError(
+                f"Family arm {arm['arm_id']!r} release_date disagrees with source endpoint."
+            )
+        target_label = str(arm['target_label'])
+        if target_label in endpoint_definitions and pd.Timestamp(
+            arm['target_date']
+        ).normalize() != pd.Timestamp(
+            endpoint_definitions[target_label]['date']
+        ).normalize():
+            raise ValueError(
+                f"Family arm {arm['arm_id']!r} target_date disagrees with target endpoint."
+            )
+    return member_frame, native_frame
+
+
+def _validate_ofes_single_event_inputs(
+    trajectories: pd.DataFrame,
+    tracer: pd.DataFrame,
+    c2_scalar: pd.DataFrame,
+    retention: pd.DataFrame,
+    object_summary: pd.DataFrame,
+    dynamics: pd.DataFrame,
+    event_spec: Mapping[str, Any],
+) -> None:
+    """Validate single-event source identity and start-to-peak calendar coverage."""
+    event_id = str(event_spec['event_id'])
+    start = pd.Timestamp(event_spec['start_date']).normalize()
+    peak = pd.Timestamp(event_spec['peak_date']).normalize()
+    dates = set(pd.date_range(start, peak))
+    three_label = str(event_spec['three_d_label'])
+    c2_label = str(event_spec['c2_label'])
+    if 'event_id' not in trajectories:
+        raise KeyError(f'Single-event trajectories lack event_id: {event_id}.')
+    if not trajectories['event_id'].astype(str).eq(event_id).all():
+        raise ValueError(f'Single-event trajectories have wrong event identity: {event_id}.')
+    history = trajectories.copy()
+    history['_date'] = pd.to_datetime(history['time'], errors='raise').dt.normalize()
+    expected_particle_sets = {}
+    for label in (three_label, c2_label):
+        selected = history.loc[history['integration_label'].astype(str).eq(label)].copy()
+        observed_dates = set(selected['_date'].dropna())
+        if not dates.issubset(observed_dates):
+            missing = sorted(dates - observed_dates)
+            raise ValueError(
+                f'Single-event {label} trajectory calendar lacks dates: '
+                f'{[value.strftime("%Y-%m-%d") for value in missing]}.'
+            )
+        selected = selected.loc[selected['_date'].isin(dates)]
+        if selected.duplicated(['particle_index', '_date']).any():
+            raise ValueError(f'Single-event {label} trajectories have duplicate daily keys.')
+        expected_particle_sets[label] = {
+            date: set(group['particle_index'].astype(int))
+            for date, group in selected.groupby('_date')
+        }
+
+    def check_sample_table(
+        frame: pd.DataFrame,
+        label: str,
+        name: str,
+        required_columns: set[str],
+    ) -> pd.DataFrame:
+        missing = sorted(required_columns.difference(frame.columns))
+        if missing:
+            raise KeyError(f'Single-event {name} lacks fields: {missing}.')
+        local = frame.copy()
+        local['event_id'] = local['event_id'].astype(str)
+        local['date'] = pd.to_datetime(local['date'], errors='raise').dt.normalize()
+        local = local.loc[
+            local['event_id'].eq(event_id) & local['integration_label'].astype(str).eq(label)
+        ].copy()
+        if local.empty:
+            raise ValueError(f'Single-event {name} has no {event_id}/{label} rows.')
+        if local.duplicated(['particle_index', 'date']).any():
+            raise ValueError(f'Single-event {name} has duplicate particle/date keys.')
+        observed_dates = set(local['date'])
+        if not dates.issubset(observed_dates):
+            missing_dates = sorted(dates - observed_dates)
+            raise ValueError(
+                f'Single-event {name} calendar lacks dates: '
+                f'{[value.strftime("%Y-%m-%d") for value in missing_dates]}.'
+            )
+        for date, group in local.loc[local['date'].isin(dates)].groupby('date'):
+            expected = expected_particle_sets[label].get(date, set())
+            actual = set(pd.to_numeric(group['particle_index'], errors='raise').astype(int))
+            if actual != expected:
+                raise ValueError(f'Single-event {name} particle coverage disagrees on {date:%Y-%m-%d}.')
+        return local
+
+    check_sample_table(
+        tracer,
+        three_label,
+        '3-D tracer samples',
+        {'event_id', 'integration_label', 'date', 'particle_index'},
+    )
+    check_sample_table(
+        c2_scalar,
+        c2_label,
+        'C2 scalar samples',
+        {'event_id', 'integration_label', 'date', 'particle_index'},
+    )
+    for frame, name, required in (
+        (retention, 'retention samples', {'event_id', 'date'}),
+        (object_summary, 'object summary', {'event_id', 'date'}),
+        (dynamics, 'representative dynamics', {'event_id', 'date'}),
+    ):
+        missing = sorted(required.difference(frame.columns))
+        if missing:
+            raise KeyError(f'Single-event {name} lacks fields: {missing}.')
+        local = frame.loc[frame['event_id'].astype(str).eq(event_id)].copy()
+        if local.empty:
+            raise ValueError(f'Single-event {name} has no rows for {event_id}.')
+        local['date'] = pd.to_datetime(local['date'], errors='raise').dt.normalize()
+        if name == 'retention samples' and peak not in set(local['date']):
+            raise ValueError(f'Single-event retention samples lack peak date {peak:%Y-%m-%d}.')
+        if name == 'object summary' and not {start, peak}.issubset(set(local['date'])):
+            raise ValueError(f'Single-event object summary lacks start/peak coverage for {event_id}.')
+
+def run_ofes_multicase_family_review(
+    case_spec: Mapping[str, Any],
+    output_root: str | Path,
+    reuse_existing: bool = True,
+) -> dict[str, Any]:
+    """从显式规格加载合法家族产品并完成端点、路由和图表归纳。
+
+    该高层入口把已有 trajectory、属性、端点成员、原生核心和实际 OFES 网格步长
+    组装到通用消费者中。复用模式只校验并读取已有位置产品，不启动粒子积分；端点
+    命中、同一 release 路由和事件级摘要都由 `track.py` 的公共逻辑生成。
+
+    参数:
+        - case_spec (Mapping[str, Any]): 紧凑家族规格，需含 `family_id`、`output_subdir`、输入路径、`endpoint_definitions`、`target_endpoint_labels`、`arms` 和 `route`。
+        - output_root (str | Path): 所有输入相对路径和 review 输出的根目录。
+        - reuse_existing (bool): 是否只复用并严格校验已有轨迹，默认 True。
+
+    返回:
+        - dict[str, Any]: 含 family summary、route tables、图件路径、结论和 review 目录的登记。
+
+    输出:
+        - 在家族 review 目录写入 exact-pixel QA、路由机读表、summary CSV、简报和两张 PNG。
+
+    说明:
+        - `case_spec` 只登记计算所需身份和路径；不接受从产物复制的解释性 provenance 或绝对机器路径。
+        - 复用失败、属性继承键不一致或 endpoint 声明与真实成员/native 身份不一致都会直接报错；本入口不会默默用新规格套用旧轨迹，也不会为本轮验证重新积分。
+    """
+    required = {
+        'family_id', 'output_subdir', 'trajectory_path', 'properties_path',
+        'endpoint_members_path', 'endpoint_native_path', 'field_grid_path',
+        'endpoint_definitions', 'target_endpoint_labels', 'arms', 'route',
+    }
+    missing = sorted(required.difference(case_spec))
+    if missing:
+        raise KeyError(f'Family review spec lacks fields: {missing}.')
+    root = Path(output_root)
+    family_root = _ofes_review_path(root, case_spec['output_subdir'])
+    review_dir = family_root / str(case_spec.get('review_subdir', 'review'))
+    review_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_path = _ofes_review_path(root, case_spec['trajectory_path'])
+    properties_path = _ofes_review_path(root, case_spec['properties_path'])
+    members_path = _ofes_review_path(root, case_spec['endpoint_members_path'])
+    native_path = _ofes_review_path(root, case_spec['endpoint_native_path'])
+    grid_path = _ofes_review_path(root, case_spec['field_grid_path'])
+    for path in (trajectory_path, properties_path, members_path, native_path, grid_path):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    members = pd.read_csv(members_path)
+    native = pd.read_csv(native_path)
+    support_members_path = case_spec.get('route', {}).get('support_members_path')
+    support_native_path = case_spec.get('route', {}).get('support_native_path')
+    if support_members_path is not None or support_native_path is not None:
+        if support_members_path is None or support_native_path is None:
+            raise KeyError('Family route support requires both member and native paths.')
+        support_members = pd.read_csv(_ofes_review_path(root, support_members_path))
+        support_native = pd.read_csv(_ofes_review_path(root, support_native_path))
+        members = pd.concat([members, support_members], ignore_index=True)
+        native = pd.concat([native, support_native], ignore_index=True)
+    properties = pd.read_parquet(properties_path)
+    arms = list(case_spec['arms'])
+    endpoint_definitions = {
+        str(item['label']): dict(item)
+        for item in case_spec['endpoint_definitions']
+    }
+    if len(endpoint_definitions) != len(case_spec['endpoint_definitions']):
+        raise ValueError('Family endpoint labels must be unique.')
+    members, native = _validate_ofes_family_endpoint_identity(
+        members, native, endpoint_definitions, arms
+    )
+
+    def _forbidden_snapshot_loader(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(
+            'snapshot_loader must not run in family review reuse mode.'
+        )
+
+    family_trajectories = produce_ofes_multicase_family_trajectories(
+        arms,
+        members,
+        snapshot_loader=_forbidden_snapshot_loader,
+        existing_trajectory_path=trajectory_path,
+        reuse_existing=bool(reuse_existing),
+        dt_seconds=float(case_spec.get('dt_seconds', 3600.0)),
+    )
+    properties = _validate_ofes_family_properties(
+        family_trajectories, properties
+    )
+    grid = np.load(grid_path)
+    if 'lat' not in grid:
+        raise KeyError(f'Family field cache lacks lat coordinates: {grid_path}.')
+    lat = np.asarray(grid['lat'], dtype=float)
+    if lat.size < 2:
+        raise ValueError('Family field cache needs at least two latitude coordinates.')
+    grid_cell_size_deg = float(np.median(np.abs(np.diff(lat))))
+    target_labels = [str(label) for label in case_spec['target_endpoint_labels']]
+    if len(target_labels) != len(set(target_labels)):
+        raise ValueError('Family target endpoint labels must be unique.')
+    target_endpoint_definitions = {
+        label: endpoint_definitions[label] for label in target_labels
+    }
+    route = dict(case_spec['route'])
+    source_arm_id = str(route['source_arm_id'])
+    route_arm = next(
+        (arm for arm in arms if str(arm['arm_id']) == source_arm_id), None
+    )
+    if route_arm is None:
+        raise ValueError(f'Family route source arm is absent: {source_arm_id}.')
+    route_trajectory = family_trajectories.loc[
+        family_trajectories['arm_id'].astype(str).eq(source_arm_id)
+        & family_trajectories['vertical_mode'].astype(str).eq('three_dimensional')
+    ].copy()
+    if route_trajectory.empty:
+        raise ValueError(f'Family route source arm has no 3-D trajectory: {source_arm_id}.')
+    backward = route.get('backward_check', {})
+    route_spec = {
+        'trajectory': route_trajectory,
+        'arm': route_arm,
+        'members': members,
+        'native': native,
+        'endpoint_definitions': {
+            str(label): endpoint_definitions[str(label)]
+            for label in route['endpoint_labels']
+        },
+        'endpoint_labels': route['endpoint_labels'],
+        'event_groups': route.get('event_groups', []),
+        'source_event_id': route.get('source_event_id'),
+    }
+    product = build_ofes_multicase_transport_products(
+        family_trajectories,
+        properties,
+        members,
+        native,
+        target_endpoint_definitions,
+        arms,
+        grid_cell_size_deg=grid_cell_size_deg,
+        output_dir=review_dir,
+        route_spec=route_spec,
+    )
+    event_passage = product['route_tables'].get('event_passage', pd.DataFrame())
+    intersection = product['route_tables'].get('intersection', pd.DataFrame())
+    passage_count = int(
+        event_passage['passed_declared_events_at_least_once'].astype(bool).sum()
+    ) if not event_passage.empty else 0
+    passage_denominator = int(len(event_passage))
+    supporting_seed_ids = (
+        event_passage.loc[
+            event_passage['passed_declared_events_at_least_once'].astype(bool),
+            'seed_id',
+        ].astype(str).tolist()
+        if not event_passage.empty else []
+    )
+    strict_count = int(
+        intersection['through_all_declared_dates'].astype(bool).sum()
+    ) if not intersection.empty else 0
+    strict_denominator = int(len(intersection))
+    backward_qc = product['target_qc'].loc[
+        product['target_qc']['arm_id'].astype(str).eq(str(backward['arm_id']))
+        & product['target_qc']['vertical_mode'].astype(str).eq(
+            str(backward.get('vertical_mode', 'three_dimensional'))
+        )
+    ].copy() if backward else pd.DataFrame()
+    backward_count = 0
+    backward_denominator = 0
+    if not backward_qc.empty:
+        backward_pivot = backward_qc.pivot_table(
+            index='seed_id', columns='target_label', values='target_hit',
+            aggfunc='first', fill_value=False,
+        )
+        required_backward = [str(value) for value in backward['required_labels']]
+        any_backward = [str(value) for value in backward['any_labels']]
+        missing_backward = sorted(
+            set(required_backward + any_backward).difference(backward_pivot.columns)
+        )
+        if missing_backward:
+            raise ValueError(f'Backward family check lacks target labels: {missing_backward}.')
+        backward_count = int((
+            backward_pivot[required_backward].all(axis=1)
+            & backward_pivot[any_backward].any(axis=1)
+        ).sum())
+        backward_denominator = int(len(backward_pivot))
+    summary = pd.DataFrame([
+        {
+            'record': 'three_event_passage',
+            'event_or_case': str(case_spec['family_id']),
+            'count': passage_count,
+            'denominator': passage_denominator,
+            'metric': 'at least one support per declared later event',
+        },
+        {
+            'record': 'strict_all_dates',
+            'event_or_case': str(case_spec['family_id']),
+            'count': strict_count,
+            'denominator': strict_denominator,
+            'metric': 'all declared endpoint dates',
+        },
+        {
+            'record': 'backward_coverage',
+            'event_or_case': str(backward.get('label', backward.get('arm_id', 'backward'))),
+            'count': backward_count,
+            'denominator': backward_denominator,
+            'metric': 'required backward endpoint and any declared intermediate endpoint',
+        },
+    ])
+    summary_path = review_dir / 'family_transport_summary.csv'
+    summary.to_csv(summary_path, index=False)
+    conclusion = (
+        f"{case_spec['family_id']} supports passage through all declared later events "
+        f"for {passage_count}/{passage_denominator} seeds at least once; the strict "
+        f"all-date intersection is {strict_count}/{strict_denominator}. "
+        f"Supporting seeds are {', '.join(supporting_seed_ids)}; the declared "
+        f"backward check is {backward_count}/{backward_denominator}."
+    )
+    brief_path = review_dir / 'family_transport_brief.md'
+    brief_path.write_text(conclusion + '\n', encoding='utf-8')
+    figures = product.get('figures', {})
+    payload = {
+        'summary_path': str(summary_path.relative_to(root)),
+        'brief_path': str(brief_path.relative_to(root)),
+        'figures': {
+            key: str(Path(value).relative_to(root)) if value else ''
+            for key, value in figures.items()
+        },
+    }
+    _ofes_write_review_manifest(root, 'family', payload)
+    return {
+        'summary_table': summary,
+        'conclusion': conclusion,
+        'figures': figures,
+        'route_tables': product['route_tables'],
+        'target_qc': product['target_qc'],
+        'supporting_seed_ids': supporting_seed_ids,
+        'output_dir': review_dir,
+    }
+
+
+def run_ofes_multicase_single_event_review(
+    case_specs: Sequence[Mapping[str, Any]],
+    output_root: str | Path,
+    reuse_existing: bool = True,
+) -> dict[str, Any]:
+    """加载既有单事件产品并生成统一的 3-D/C2 过程摘要和图件。
+
+    该入口按每个显式事件规格读取已完成的 daily trajectory、tracer、C2 标量、原生
+    对象核心和代表日动力样本，再调用通用 paired reducer。它只重算归纳和图件，不
+    重新积分粒子、不重新检测事件，也不改变原始产品。
+
+    参数:
+        - case_specs (Sequence[Mapping[str, Any]]): 紧凑事件规格序列，需含事件身份、日期、标签和相对输入路径。
+        - output_root (str | Path): 所有输入相对路径和 review 输出的根目录。
+        - reuse_existing (bool): 是否要求所有输入产品已存在，默认 True；当前入口不支持新积分。
+
+    返回:
+        - dict[str, Any]: 含单事件 summary、各事件 paired 表、图件路径和 review 目录的登记。
+
+    输出:
+        - 在 `output_root/<output_subdir>/review` 写入每事件 paired parquet、summary CSV、PNG 和汇总 CSV。
+
+    说明:
+        - 事件之间按 event_id 分开配对；代表日和原生对象范围来自规格与已有正式产品。
+        - 输出只表达 material-versus-fixed-depth 过程差异，不估计氧通量或材料连续性。
+    """
+    if not case_specs:
+        raise ValueError('At least one single-event review spec is required.')
+    if not reuse_existing:
+        raise ValueError(
+            'Single-event review only consumes existing products; no integration path is exposed.'
+        )
+    root = Path(output_root)
+    summary_rows = []
+    event_results = {}
+    figures = {}
+    for spec in case_specs:
+        event_id = str(spec['event_id'])
+        required = {
+            'event_id', 'output_subdir', 'trajectory_path', 'tracer_path',
+            'retention_path', 'representative_dynamics_path', 'c2_scalar_path',
+            'object_summary_path', 'start_date', 'peak_date', 'representative_dates',
+            'three_d_label', 'c2_label',
+        }
+        missing = sorted(required.difference(spec))
+        if missing:
+            raise KeyError(f'Single-event spec {event_id} lacks fields: {missing}.')
+        event_dir = _ofes_review_path(root, spec['output_subdir'])
+        review_dir = event_dir / str(spec.get('review_subdir', 'review'))
+        review_dir.mkdir(parents=True, exist_ok=True)
+        trajectory_path = _ofes_review_path(root, spec['trajectory_path'])
+        tracer_path = _ofes_review_path(root, spec['tracer_path'])
+        retention_path = _ofes_review_path(root, spec['retention_path'])
+        dynamics_path = _ofes_review_path(root, spec['representative_dynamics_path'])
+        for path in (trajectory_path, tracer_path, retention_path, dynamics_path):
+            if not path.exists():
+                raise FileNotFoundError(path)
+        trajectories = pd.read_parquet(trajectory_path)
+        tracer = pd.read_parquet(tracer_path)
+        retention = pd.read_parquet(retention_path)
+        dynamics = pd.read_parquet(dynamics_path)
+        c2_scalar = pd.read_parquet(
+            _ofes_review_path(root, spec['c2_scalar_path'])
+        )
+        object_summary = pd.read_csv(
+            _ofes_review_path(root, spec['object_summary_path'])
+        ).rename(columns={
+            'object_pixel_count': 'pixel_count',
+            'object_centroid_lon': 'centroid_lon',
+            'object_centroid_lat': 'centroid_lat',
+            'object_delta_do_max': 'delta_do_max',
+            'object_depth_mean_m': 'depth_mean',
+            'object_depth_min_m': 'depth_min',
+            'object_depth_max_m': 'depth_max',
+            'object_peak_depth_at_max_m': 'peak_depth_at_max',
+            'native_core_shallow_edge_m': 'core_shallow_edge_m',
+            'native_core_deep_edge_m': 'core_deep_edge_m',
+        })
+        _validate_ofes_single_event_inputs(
+            trajectories,
+            tracer,
+            c2_scalar,
+            retention,
+            object_summary,
+            dynamics,
+            spec,
+        )
+        event_spec = dict(spec)
+        event_objects = object_summary.loc[
+            object_summary['event_id'].astype(str).eq(event_id)
+        ].copy()
+        paired, daily_summary = summarize_ofes_single_event_controls(
+            trajectories,
+            tracer,
+            c2_scalar,
+            event_spec,
+            object_summary=event_objects,
+            representative_dates=spec['representative_dates'],
+            dynamics_samples=dynamics,
+        )
+        if not paired['pairing_status'].eq('same_release_seed_date_pair').all():
+            raise ValueError(
+                f'Single-event paired controls are incomplete for {event_id}.'
+            )
+        if not paired['initial_seed_identity_match'].fillna(False).all():
+            raise ValueError(
+                f'Single-event paired controls have mismatched initial seed identity: {event_id}.'
+            )
+        event_review_dir = review_dir / 'events' / event_id
+        event_review_dir.mkdir(parents=True, exist_ok=True)
+        figure_path = event_review_dir / 'single_event_control.png'
+        plot_ofes_single_event_control_figure(
+            paired, daily_summary, event_spec, output_path=figure_path
+        )
+        paired_path = event_review_dir / 'material_vs_c2_daily.parquet'
+        daily_path = event_review_dir / 'material_vs_c2_daily_summary.csv'
+        paired.to_parquet(paired_path, index=False)
+        daily_summary.to_csv(daily_path, index=False)
+        start = daily_summary.loc[
+            pd.to_datetime(daily_summary['date']).dt.normalize().eq(
+                pd.Timestamp(spec['start_date']).normalize()
+            )
+        ]
+        peak = daily_summary.loc[
+            pd.to_datetime(daily_summary['date']).dt.normalize().eq(
+                pd.Timestamp(spec['peak_date']).normalize()
+            )
+        ]
+        if start.empty or peak.empty:
+            raise ValueError(f'Single-event summary lacks start or peak date: {event_id}.')
+        start_row, peak_row = start.iloc[0], peak.iloc[0]
+        summary_rows.append({
+            'record': 'single_event_control',
+            'event_or_case': str(spec.get('short_event_id', event_id)),
+            'event_id': event_id,
+            'start_pair_count': int(start_row['pair_count']),
+            'peak_pair_count': int(peak_row['pair_count']),
+            'retention_rows': int(len(retention)),
+            'peak_horizontal_separation_median_km': float(
+                peak_row['horizontal_separation_median_km']
+            ),
+            'peak_depth_difference_median_3d_minus_c2_m': float(
+                peak_row['depth_difference_median_3d_minus_c2_m']
+            ),
+            'metric': 'same-release 3-D versus fixed-depth C2 control',
+        })
+        figures[event_id] = str(figure_path)
+        event_results[event_id] = {
+            'paired': paired,
+            'summary': daily_summary,
+            'figure': str(figure_path),
+        }
+    summary = pd.DataFrame(summary_rows)
+    review_roots = {
+        _ofes_review_path(root, spec['output_subdir']) / str(
+            spec.get('review_subdir', 'review')
+        )
+        for spec in case_specs
+    }
+    if len(review_roots) != 1:
+        raise ValueError('Single-event specs must share one review output directory.')
+    summary_dir = next(iter(review_roots))
+    summary_path = summary_dir / 'single_event_transport_summary.csv'
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(summary_path, index=False)
+    _ofes_write_review_manifest(root, 'single_events', {
+        'summary_path': str(summary_path.relative_to(root)),
+        'figures': {
+            event_id: str(Path(path).relative_to(root))
+            for event_id, path in figures.items()
+        },
+    })
+    return {
+        'summary_table': summary,
+        'event_results': event_results,
+        'figures': figures,
+        'output_dir': summary_path.parent,
+    }
+
+
+def load_ofes_multicase_review_summary(
+    output_root: str | Path,
+) -> dict[str, Any]:
+    """读取 multicase review 的机读表、简报和 PNG 路径供 Notebook 展示。
+
+    该轻量 loader 只读取高层 producer 已写出的 review manifest 和汇总文件，不重新
+    计算 route、backward coverage、single-event paired 表或任何轨迹位置。
+
+    参数:
+        - output_root (str | Path): `multicase_review_manifest.json` 所在的实验根目录。
+
+    返回:
+        - dict[str, Any]: 含合并 `summary_table`、`conclusion` 和 `figures` 路径的展示登记。
+
+    输出:
+        - 无文件输出；只返回已有文件的轻量读取结果。
+
+    说明:
+        - 所有数字来自 producer 的机读 summary；Notebook 不应重新 pivot、拼接或手填案例身份。
+    """
+    root = Path(output_root)
+    manifest_path = root / 'multicase_review_manifest.json'
+    if not manifest_path.exists():
+        raise FileNotFoundError(manifest_path)
+    with manifest_path.open('r', encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    tables = []
+    conclusions = []
+    figures = {}
+    family = manifest.get('family', {})
+    if family.get('summary_path'):
+        family_summary = pd.read_csv(root / family['summary_path'])
+        tables.append(family_summary)
+    if family.get('brief_path'):
+        conclusions.append((root / family['brief_path']).read_text(encoding='utf-8').strip())
+    for key, value in family.get('figures', {}).items():
+        figures[f'family_{key}'] = str(root / value) if value else ''
+    single = manifest.get('single_events', {})
+    if single.get('summary_path'):
+        tables.append(pd.read_csv(root / single['summary_path']))
+    for event_id, path in single.get('figures', {}).items():
+        figures[f'single_{event_id}'] = str(root / path)
+    summary = pd.concat(tables, ignore_index=True, sort=False) if tables else pd.DataFrame()
+    return {
+        'summary_table': summary,
+        'conclusion': '\n\n'.join(conclusions),
+        'figures': figures,
+        'manifest': manifest,
+    }
+
+
+def summarize_ofes_family_structure_context(
+    family_objects: pd.DataFrame,
+    local_field_context: pd.DataFrame,
+    water_column_samples: pd.DataFrame | None,
+    endpoint_plan: Sequence[Mapping[str, Any]],
+) -> pd.DataFrame:
+    """合并家族端点几何、既有局地场和峰释放水柱上下文。
+
+    `object_centroid` 是正式 DO50 Eulerian 对象质心，`peak_origin` 是峰像元位置；
+    local-field 与 viewer 水柱样本只作既有峰释放上下文，不承担端点材料身份。
+
+    参数:
+        - family_objects (pd.DataFrame): 正式家族逐日 DO50 对象及其动力摘要。
+        - local_field_context (pd.DataFrame): 已有局地场缓存的对象中心、同层性质和动力字段。
+        - water_column_samples (pd.DataFrame | None): 已有 viewer 峰释放水柱样本，可为空。
+        - endpoint_plan (Sequence[Mapping[str, Any]]): 要登记的事件、日期及上下文路径角色。
+
+    返回:
+        - pd.DataFrame: 每个声明端点一行的 formal 对象、局地场和水柱上下文登记表。
+
+    输出:
+        - 无文件输出；调用方负责保存 CSV 和 manifest。
+
+    说明:
+        - 不提供独立 thermal centroid 时保留明确缺口；局地场和 viewer 样本不用于
+          推断跨日期结构连续性或材料身份。
+    """
+    required = {
+        'event_id', 'date', 'daily_object_key', 'centroid_lon', 'centroid_lat',
+        'peak_lon', 'peak_lat', 'peak_depth_at_max', 'depth_mean', 'depth_min',
+        'depth_max', 'delta_do_max', 'pixel_count', 'rotation_dominated',
+        'kinematic_regime', 'rossby_number', 'relative_vorticity_s_1',
+    }
+    missing = sorted(required.difference(family_objects.columns))
+    if missing:
+        raise KeyError(f'Family object context lacks columns: {missing}.')
+    objects = family_objects.copy()
+    objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+    if 'threshold' in objects:
+        objects = objects.loc[objects['threshold'].eq(50)].copy()
+    fields = local_field_context.copy()
+    fields['date'] = pd.to_datetime(fields['date']).dt.normalize()
+    water = water_column_samples.copy() if water_column_samples is not None else pd.DataFrame()
+    if not water.empty:
+        water['date'] = pd.to_datetime(water['date']).dt.normalize()
+    rows = []
+    for plan in endpoint_plan:
+        event_id = str(plan['event_id'])
+        date = pd.Timestamp(plan['date']).normalize()
+        object_rows = objects.loc[
+            objects['event_id'].astype(str).eq(event_id) & objects['date'].eq(date)
+        ]
+        if object_rows.empty:
+            raise ValueError(f'No family DO50 object for {event_id} on {date:%Y-%m-%d}.')
+        object_row = object_rows.iloc[0]
+        role = str(plan.get('context_path_role', ''))
+        field_rows = fields.loc[
+            fields['event_id'].astype(str).eq(event_id)
+            & fields['date'].eq(date)
+            & (fields['path_role'].astype(str).eq(role) if role else True)
+        ]
+        field_row = field_rows.iloc[0] if not field_rows.empty else None
+        water_rows = water.loc[
+            water['date'].eq(date)
+            & water['particle_id'].astype(str).eq(str(plan.get('water_particle_id', 'z+1_r0_a000')))
+        ] if not water.empty else pd.DataFrame()
+        row = {
+            'event_id': event_id,
+            'date': date.date().isoformat(),
+            'daily_object_key': str(object_row['daily_object_key']),
+            'object_pixel_count': int(object_row['pixel_count']),
+            'object_delta_do_max_umol_kg': float(object_row['delta_do_max']),
+            'object_centroid_lon': float(object_row['centroid_lon']),
+            'object_centroid_lat': float(object_row['centroid_lat']),
+            'peak_origin_lon': float(object_row['peak_lon']),
+            'peak_origin_lat': float(object_row['peak_lat']),
+            'object_peak_depth_at_max_m': float(object_row['peak_depth_at_max']),
+            'object_depth_mean_m': float(object_row['depth_mean']),
+            'object_depth_min_m': float(object_row['depth_min']),
+            'object_depth_max_m': float(object_row['depth_max']),
+            'object_rotation_dominated': bool(object_row['rotation_dominated']),
+            'object_kinematic_regime': str(object_row['kinematic_regime']),
+            'object_rossby_number': float(object_row['rossby_number']),
+            'object_relative_vorticity_s_1': float(object_row['relative_vorticity_s_1']),
+            'thermal_centroid_status': 'not_supplied_as_independent_formal_quantity',
+            'object_centroid_semantics': 'formal_Eulerian_DO50_object_centroid',
+            'peak_origin_semantics': 'formal_DO50_peak_pixel_origin',
+            'context_path_role': role or 'not_available',
+            'context_material_semantics': 'existing_peak_seeded_local_field_context_only_not_endpoint_material',
+            'context_status': 'not_available',
+            'object_to_context_centroid_km': np.nan,
+            'water_column_sample_status': 'not_available',
+            'water_column_particle_id': str(plan.get('water_particle_id', 'z+1_r0_a000')),
+        }
+        if field_row is not None:
+            for source, target in (
+                ('centre_lon', 'context_centre_lon'),
+                ('centre_lat', 'context_centre_lat'),
+                ('centre_depth_m', 'context_centre_depth_m'),
+                ('core_do_fixed_umol_kg', 'context_core_do_fixed_umol_kg'),
+                ('core_theta_fixed_deg_c', 'context_core_theta_fixed_deg_c'),
+                ('core_salinity_fixed_psu', 'context_core_salinity_fixed_psu'),
+                ('core_sigma0_kg_m3', 'context_core_sigma0_kg_m3'),
+                ('core_u_m_s', 'context_core_u_m_s'),
+                ('core_v_m_s', 'context_core_v_m_s'),
+                ('core_rossby_number', 'context_core_rossby_number'),
+                ('core_relative_vorticity_s_1', 'context_core_relative_vorticity_s_1'),
+                ('core_normalized_strain', 'context_core_normalized_strain'),
+            ):
+                row[target] = float(field_row[source]) if source in field_row and pd.notna(field_row[source]) else np.nan
+            row['context_status'] = str(field_row.get('local_field_status', field_row.get('structure_status', 'available')))
+            if np.all(np.isfinite([
+                row.get('context_centre_lon', np.nan), row.get('context_centre_lat', np.nan),
+                row['object_centroid_lon'], row['object_centroid_lat'],
+            ])):
+                row['object_to_context_centroid_km'] = float(
+                    great_circle_distance_m(
+                        row['object_centroid_lon'], row['object_centroid_lat'],
+                        row['context_centre_lon'], row['context_centre_lat'],
+                    ) / 1000.0
+                )
+        if not water_rows.empty:
+            row['water_column_sample_status'] = 'existing_viewer_central_seed_profile'
+            row['water_column_layer_count'] = int(len(water_rows))
+            row['water_column_particle_depth_m'] = float(water_rows['particle_depth_m'].iloc[0])
+            row['water_column_native_depth_min_m'] = float(water_rows['native_depth_m'].min())
+            row['water_column_native_depth_max_m'] = float(water_rows['native_depth_m'].max())
+            row['water_column_do2_median_umol_kg'] = float(water_rows['do2_umol_kg'].median())
+            row['water_column_theta_median_deg_c'] = float(water_rows['temp_potential_c'].median())
+            row['water_column_salinity_median_psu'] = float(water_rows['salinity_psu'].median())
+            row['water_column_sigma0_median_kg_m3'] = float(water_rows['sigma0_kg_m3'].median())
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def plot_ofes_snapshot_quick(
     snapshot: dict,
     variable: str = 'do2',
