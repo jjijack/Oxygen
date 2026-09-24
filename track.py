@@ -38850,6 +38850,567 @@ def sample_ofes_single_event_dynamics(
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
+def _ofes_unique_density_depth(depth, sigma0, target):
+    """只接受唯一密度交点，保留缺测层间断并拒绝平台与多交点。"""
+    z, s = np.asarray(depth, float), np.asarray(sigma0, float)
+    good = np.isfinite(z) & np.isfinite(s)
+    exact = good & (s == target)
+    adjacent = good[:-1] & good[1:]
+    if np.any(adjacent & exact[:-1] & exact[1:]):
+        return np.nan, -1
+    crossing = adjacent & ((s[:-1] - target) * (s[1:] - target) < 0)
+    indices = np.flatnonzero(crossing)
+    roots = np.concatenate((z[exact], z[indices] + (target - s[indices]) *
+                            (z[indices + 1] - z[indices]) / (s[indices + 1] - s[indices])))
+    roots = np.unique(roots)
+    return (float(roots[0]) if len(roots) == 1 else np.nan), int(len(roots))
+
+
+def _ofes_depth_profile_samples(snapshot, positions, reference_sigma):
+    """对各真实位置采样原生水柱，并定位各成员固定初始密度面。"""
+    depth = np.asarray(snapshot['depth'], float)
+    positions = positions.reset_index(drop=True)
+    points = np.column_stack((
+        np.tile(depth, len(positions)),
+        np.repeat(positions['lat'].to_numpy(), len(depth)),
+        np.repeat(positions['lon'].to_numpy(), len(depth)),
+    ))
+    fields = {
+        key: _ofes_interp3d(snapshot[key], depth, snapshot['lat'], snapshot['lon'], points)
+        .reshape(len(positions), len(depth))
+        for key in ('temp', 'salinity', 'do2')
+    }
+    rows, profiles = [], []
+    for i, row in positions.iterrows():
+        sigma = _ofes_sigma0_profile(depth, fields['salinity'][i], fields['temp'][i], row.lon, row.lat)
+        target = float(reference_sigma.loc[row.particle_index])
+        iso, count = _ofes_unique_density_depth(depth, sigma, target)
+        rows.append({'particle_index': row.particle_index, 'reference_sigma0': target,
+                     'isopycnal_depth_m': iso, 'crossing_count': count,
+                     'valid_profile_levels': int(np.isfinite(sigma).sum())})
+        profiles.append(pd.DataFrame({
+            'particle_index': row.particle_index, 'depth_m': depth,
+            'theta': fields['temp'][i], 'salinity': fields['salinity'][i],
+            'do2': fields['do2'][i], 'sigma0': sigma,
+        }))
+    return pd.DataFrame(rows), pd.concat(profiles, ignore_index=True)
+
+
+def _ofes_depth_scene(snapshot, target_sigma, reference_depth):
+    """构造共同参考密度面的空间图，仅保留唯一交点。"""
+    depth = np.asarray(snapshot['depth'], float)
+    lon, lat = np.meshgrid(snapshot['lon'], snapshot['lat'])
+    pressure = gsw.p_from_z(-depth[:, None, None], lat[None])
+    sa = gsw.SA_from_SP(snapshot['salinity'], pressure, lon[None], lat[None])
+    ct = gsw.CT_from_pt(sa, snapshot['temp'])
+    sigma = gsw.sigma0(sa, ct)
+    mapped = _ofes_fields_on_sigma0(
+        depth, sigma, target_sigma, reference_depth,
+        {key: snapshot[key] for key in ('u', 'v', 'do2')},
+    )
+    unique = mapped['crossing_count'] == 1
+    scene = {'lon': snapshot['lon'], 'lat': snapshot['lat']}
+    for key in ('depth', 'u', 'v', 'do2'):
+        scene[key] = np.where(unique, mapped[key], np.nan)
+    du_dx, du_dy = _ofes_mechanism_gradients(scene['u'], scene['lon'], scene['lat'])
+    dv_dx, dv_dy = _ofes_mechanism_gradients(scene['v'], scene['lon'], scene['lat'])
+    scene['vorticity_on_surface_s_1'] = dv_dx - du_dy
+    scene['strain_on_surface_s_1'] = np.hypot(du_dx - dv_dy, du_dy + dv_dx)
+    return scene
+
+
+def diagnose_ofes_particle_depth_changes(
+    paired: pd.DataFrame,
+    snapshot_loader: Any,
+) -> dict[str, pd.DataFrame]:
+    """分解既有粒子下移与固定初始密度面的空间、时间变化。
+
+    对同一事件同一释放的逐日 3-D/C2 配对位置采样原生水柱。每个成员以自身起始
+    sigma0 为固定参考，逐日计算粒子与该密度面的相对深度。相邻日期在两处位置
+    各采样两个日期的场，以对称有限差分拆分密度面的水平位置项与局地时间项。
+
+    参数:
+        - paired (pd.DataFrame): `summarize_ofes_single_event_controls` 返回的单事件同释放每日配对表。
+        - snapshot_loader (Any): 接收日期并返回该日 temp/salinity/do2/u/v/w、depth/depth_w 和水平坐标的可调用对象。
+
+    返回:
+        - dict[str, pd.DataFrame]: daily 为逐成员逐日两臂属性，steps 为 3-D 每日位移分解，profiles 为沿途原生水柱。
+
+    说明:
+        - 深度向下为正，原生 w 向上为正；跨日期交叉采样只用于几何分解，不构成动力预算。
+        - 多交点、密度平台与无交点均不选择一个有利分支；对应分解保留缺测及交点数。
+        - 参考面偏移包含模式属性变化和插值效应，不能直接解释为混合或跨密度面输送率。
+    """
+    required = {'event_id', 'release_date', 'particle_index', 'date', 'sigma0_3d',
+                'initial_seed_identity_match', 'horizontal_separation_km'}
+    for side in ('3d', 'c2'):
+        required.update(f'{key}_{side}' for key in ('lat', 'lon', 'status'))
+        required.update((f'depth_{side}_m', f'integration_label_{side}', f'particle_id_{side}'))
+        required.update(f'{key}_{side}' for key in ('sigma0', 'theta', 'salinity', 'do2'))
+    missing = required.difference(paired.columns)
+    if missing:
+        raise ValueError(f'Depth diagnostic lacks columns: {sorted(missing)}')
+    data = paired.copy()
+    data['date'] = pd.to_datetime(data['date']).dt.normalize()
+    if data.empty or data['event_id'].nunique() != 1 or data['release_date'].nunique() != 1:
+        raise ValueError('Depth diagnostic requires one nonempty event and release.')
+    if not data['initial_seed_identity_match'].eq(True).all():
+        raise ValueError('Depth diagnostic requires matched initial 3-D/C2 seeds.')
+    if data.duplicated(['particle_index', 'date']).any():
+        raise ValueError('Depth diagnostic has duplicate seed dates.')
+    dates = sorted(data['date'].unique())
+    if len(dates) < 2 or list(pd.date_range(dates[0], dates[-1])) != list(pd.to_datetime(dates)):
+        raise ValueError('Depth diagnostic requires at least two consecutive daily samples.')
+    first = data[data['date'].eq(dates[0])].set_index('particle_index').sort_index()
+    if pd.Timestamp(first['release_date'].iloc[0]) != pd.Timestamp(dates[0]):
+        raise ValueError('The first calendar date must be the declared release date.')
+    reference = first['sigma0_3d']
+    if not np.isfinite(reference).all():
+        raise ValueError('Initial reference densities must be finite.')
+    by_date = {}
+    for date, group in data.groupby('date', sort=True):
+        group = group.set_index('particle_index').sort_index()
+        if not group.index.equals(first.index):
+            raise ValueError('Daily member sets differ; do not silently drop members.')
+        by_date[date] = group.reset_index()
+    daily, profiles, cross = [], [], {}
+    for date in by_date:
+        print(f'[depth diagnostic] {date.date()}', flush=True)
+        snapshot = snapshot_loader(date)
+        if pd.Timestamp(snapshot['date']).normalize() != date:
+            raise ValueError('Snapshot date differs from requested trajectory date.')
+        du_dx, du_dy, dv_dx, dv_dy = [], [], [], []
+        for u_layer, v_layer in zip(snapshot['u'], snapshot['v']):
+            ux, uy = _ofes_mechanism_gradients(u_layer, snapshot['lon'], snapshot['lat'])
+            vx, vy = _ofes_mechanism_gradients(v_layer, snapshot['lon'], snapshot['lat'])
+            du_dx.append(ux)
+            du_dy.append(uy)
+            dv_dx.append(vx)
+            dv_dy.append(vy)
+        local_fields = {
+            'relative_vorticity_s_1': np.asarray(dv_dx) - np.asarray(du_dy),
+            'strain_s_1': np.hypot(np.asarray(du_dx) - np.asarray(dv_dy),
+                                    np.asarray(du_dy) + np.asarray(dv_dx)),
+        }
+        for side in ('3d', 'c2'):
+            group = by_date[date]
+            positions = group[['event_id', 'release_date', 'date', 'particle_index']].copy()
+            for key in ('lat', 'lon', 'status', 'particle_id', 'integration_label'):
+                positions[key] = group[f'{key}_{side}'].to_numpy()
+            positions['depth_m'] = group[f'depth_{side}_m'].to_numpy()
+            active = positions['status'].eq('active')
+            positions.loc[~active, ['lat', 'lon', 'depth_m']] = np.nan
+            iso, column_profiles = _ofes_depth_profile_samples(snapshot, positions, reference)
+            sampled = sample_ofes_scalar_properties(positions, snapshot)
+            sampled['release_date'] = positions['release_date'].to_numpy()
+            sampled['side'] = side
+            sampled = sampled.merge(iso, on='particle_index', validate='one_to_one')
+            points = positions[['depth_m', 'lat', 'lon']].to_numpy()
+            for key in ('u', 'v', 'w'):
+                z = snapshot['depth_w'] if key == 'w' else snapshot['depth']
+                sampled[f'{key}_m_s'] = _ofes_interp3d(snapshot[key], z, snapshot['lat'], snapshot['lon'], points)
+            for key, field in local_fields.items():
+                sampled[key] = _ofes_interp3d(field, snapshot['depth'], snapshot['lat'], snapshot['lon'], points)
+            fixed_points = points.copy()
+            fixed_points[:, 0] = first.loc[group['particle_index'], 'depth_3d_m'].to_numpy()
+            for key in ('u', 'v'):
+                sampled[f'{key}_at_initial_depth_m_s'] = _ofes_interp3d(
+                    snapshot[key], snapshot['depth'], snapshot['lat'], snapshot['lon'], fixed_points,
+                )
+            sampled['horizontal_velocity_depth_effect_m_s'] = np.hypot(
+                sampled['u_m_s'] - sampled['u_at_initial_depth_m_s'],
+                sampled['v_m_s'] - sampled['v_at_initial_depth_m_s'],
+            )
+            sampled['relative_to_reference_m'] = sampled['depth_m'] - sampled['isopycnal_depth_m']
+            for quantity in ('sigma0', 'theta', 'salinity', 'do2'):
+                sampled[f'{quantity}_existing_minus_resampled'] = (
+                    group[f'{quantity}_{side}'].to_numpy() - sampled[quantity].to_numpy()
+                )
+            sampled['horizontal_separation_km'] = group['horizontal_separation_km'].to_numpy()
+            daily.append(sampled)
+            column_profiles['date'], column_profiles['side'] = date, side
+            column_profiles['event_id'] = first['event_id'].iloc[0]
+            profiles.append(column_profiles)
+            if side == '3d':
+                cross[(date, date)] = iso.set_index('particle_index')
+        for other in by_date:
+            if abs((other - date).days) != 1:
+                continue
+            group = by_date[other]
+            positions = group[['particle_index']].copy()
+            positions['lat'], positions['lon'] = group['lat_3d'].to_numpy(), group['lon_3d'].to_numpy()
+            positions.loc[~group['status_3d'].eq('active'), ['lat', 'lon']] = np.nan
+            iso, _ = _ofes_depth_profile_samples(snapshot, positions, reference)
+            cross[(date, other)] = iso.set_index('particle_index')
+    result = pd.concat(daily, ignore_index=True)
+    result['date'] = pd.to_datetime(result['date'])
+    steps = []
+    dates = list(by_date)
+    for earlier, later in zip(dates[:-1], dates[1:]):
+        a, b = by_date[earlier].set_index('particle_index'), by_date[later].set_index('particle_index')
+        s00, s01 = cross[(earlier, earlier)], cross[(earlier, later)]
+        s10, s11 = cross[(later, earlier)], cross[(later, later)]
+        z00, z01, z10, z11 = (s['isopycnal_depth_m'] for s in (s00, s01, s10, s11))
+        horizontal = 0.5 * ((z01 - z00) + (z11 - z10))
+        temporal = 0.5 * ((z10 - z00) + (z11 - z01))
+        dz = b['depth_3d_m'] - a['depth_3d_m']
+        frame = pd.DataFrame({
+            'event_id': a['event_id'], 'release_date': a['release_date'],
+            'start_date': earlier, 'end_date': later,
+            'particle_depth_change_m': dz, 'surface_horizontal_change_m': horizontal,
+            'surface_temporal_change_m': temporal, 'surface_total_change_m': z11 - z00,
+            'relative_depth_change_m': dz - (z11 - z00),
+            'position_time_interaction_m': z11 - z10 - z01 + z00,
+        })
+        for label, table in zip(('00', '01', '10', '11'), (s00, s01, s10, s11)):
+            frame[f'crossing_count_{label}'] = table['crossing_count']
+            frame[f'surface_depth_{label}_m'] = table['isopycnal_depth_m']
+        frame['closure_error_m'] = (frame['particle_depth_change_m'] -
+            frame['surface_horizontal_change_m'] - frame['surface_temporal_change_m'] -
+            frame['relative_depth_change_m'])
+        steps.append(frame.reset_index())
+    return {'daily': result, 'steps': pd.concat(steps, ignore_index=True),
+            'profiles': pd.concat(profiles, ignore_index=True)}
+
+
+def _ofes_subdaily_surface_changes(history, paired, snapshot_loader):
+    """沿既有亚日位置细化分解；密度面深度仅在相邻日场之间线性插值。"""
+    label = paired['integration_label_3d'].unique()
+    if len(label) != 1:
+        raise ValueError('One 3-D release label is required for subdaily replay.')
+    start, end = pd.to_datetime(paired['date']).min(), pd.to_datetime(paired['date']).max()
+    table = history[history['integration_label'].eq(label[0])].copy()
+    table['time'] = pd.to_datetime(table['time'])
+    table = table[table['time'].between(start, end)].sort_values(['time', 'particle_index'])
+    if set(table['event_id']) != set(paired['event_id']):
+        raise ValueError('Subdaily history belongs to another event.')
+    if table.duplicated(['time', 'particle_index']).any():
+        raise ValueError('Duplicate subdaily seed/time keys.')
+    first = paired[pd.to_datetime(paired['date']).eq(start)].set_index('particle_index').sort_index()
+    for date, group in paired.groupby('date'):
+        saved = table[table.time.eq(pd.Timestamp(date))].set_index('particle_index').sort_index()
+        expected = group.set_index('particle_index').sort_index()
+        if not saved.index.equals(expected.index):
+            raise ValueError('Subdaily/daily member sets differ.')
+        for actual, target in (('lon', 'lon_3d'), ('lat', 'lat_3d'), ('depth_m', 'depth_3d_m')):
+            if not np.allclose(saved[actual], expected[target], atol=1e-8, rtol=0, equal_nan=True):
+                raise ValueError('Subdaily history does not reproduce daily positions.')
+    surfaces = {}
+    for date in pd.date_range(start, end):
+        local = table[table.time.between(date - pd.Timedelta(days=1), date + pd.Timedelta(days=1))].copy()
+        local.loc[~local.status.eq('active'), ['lat', 'lon', 'depth_m']] = np.nan
+        values, _ = _ofes_depth_profile_samples(snapshot_loader(date), local, first['sigma0_3d'])
+        values['time'] = local['time'].to_numpy()
+        surfaces[date] = values.set_index(['time', 'particle_index'])
+    rows = []
+    times = sorted(table.time.unique())
+    for t0, t1 in zip(times[:-1], times[1:]):
+        t0, t1 = pd.Timestamp(t0), pd.Timestamp(t1)
+        if (t1 - t0).total_seconds() > 3600:
+            raise ValueError('Subdaily depth replay requires hourly or finer saved positions.')
+        day = t0.normalize()
+        next_day = day + pd.Timedelta(days=1)
+        def surface_at(field_time, position_time):
+            alpha = (field_time - day).total_seconds() / 86400.
+            a = surfaces[day].xs(position_time, level='time')['isopycnal_depth_m'].sort_index()
+            b = surfaces[next_day].xs(position_time, level='time')['isopycnal_depth_m'].sort_index()
+            if not a.index.equals(first.index) or not b.index.equals(first.index):
+                raise ValueError('Subdaily member coverage is incomplete.')
+            return (1 - alpha) * a + alpha * b
+        z00, z01 = surface_at(t0, t0), surface_at(t0, t1)
+        z10, z11 = surface_at(t1, t0), surface_at(t1, t1)
+        a = table[table.time.eq(t0)].set_index('particle_index').sort_index()
+        b = table[table.time.eq(t1)].set_index('particle_index').sort_index()
+        dz = b['depth_m'] - a['depth_m']
+        row = pd.DataFrame({
+            'event_id': a['event_id'], 'release_date': str(start.date()),
+            'start_time': t0, 'end_time': t1,
+            'particle_depth_change_m': dz,
+            'surface_horizontal_change_m': .5 * (z01 - z00 + z11 - z10),
+            'surface_temporal_change_m': .5 * (z10 - z00 + z11 - z01),
+            'relative_depth_change_m': dz - (z11 - z00),
+            'horizontal_first_m': z01 - z00, 'horizontal_last_m': z11 - z10,
+            'temporal_first_m': z10 - z00, 'temporal_last_m': z11 - z01,
+            'surface_depth_00_m': z00, 'surface_depth_01_m': z01,
+            'surface_depth_10_m': z10, 'surface_depth_11_m': z11,
+        })
+        row['closure_error_m'] = dz - row['surface_horizontal_change_m'] - row['surface_temporal_change_m'] - row['relative_depth_change_m']
+        rows.append(row.reset_index())
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_ofes_depth_change_review(case_spec: Mapping[str, Any], output_dir: str | Path) -> dict:
+    """从既有同释放轨迹生成材料下移和密度面变化诊断包。
+
+    入口复用声明的端点原场缓存，仅为缺少缓存的日期读取显式局地区域；不重新积分。
+    保存每个成员的属性、水柱、逐日位移分解及共同参考密度面的空间场。
+
+    参数:
+        - case_spec (Mapping[str, Any]): 含 event_id、paired_path、start_date、end_date、lon_bounds、lat_bounds、depth_bounds 和可选 snapshot_paths、tracer_path、trajectory_path 的案例规格。
+        - output_dir (str | Path): 本次诊断的独立输出目录，不能覆盖原输入目录。
+
+    返回:
+        - dict: output_dir、daily_path、steps_path、profiles_path、summary_path、manifest_path 和 scenes 中的输出路径。
+
+    说明:
+        - snapshot_paths 为日期到已有 NPZ 快照的显式映射，必须来自 load_ofes_snapshot 同单位输出；映射日期由调用方确认。
+        - 分解采用两个交换次序的平均，交互项各分一半；结果是几何诊断，不是完整动力或氧预算。
+    """
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    spec = json.loads(json.dumps(dict(case_spec), default=str))
+    paired_path = Path(spec['paired_path'])
+    if output.resolve() == paired_path.parent.resolve():
+        raise ValueError('Use a separate output directory for the depth review.')
+    paired = pd.read_parquet(paired_path)
+    if set(paired['event_id'].astype(str)) != {str(spec['event_id'])}:
+        raise ValueError('Depth review event does not match paired inputs.')
+    paired_dates = pd.to_datetime(paired['date']).dt.normalize()
+    if paired_dates.min() != pd.Timestamp(spec['start_date']) or paired_dates.max() != pd.Timestamp(spec['end_date']):
+        raise ValueError('Declared dates do not match the complete paired input window.')
+    manifest_path = output / 'manifest.json'
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text())
+        if previous['case_spec'] != spec:
+            raise ValueError('Output directory contains a different depth-review specification.')
+    reference = paired.loc[paired_dates.eq(paired_dates.min()), 'sigma0_3d'].median()
+    reference_depth = paired.loc[paired_dates.eq(paired_dates.min()), 'depth_3d_m'].median()
+    scenes, provenance, snapshots = {}, [], {}
+
+    def snapshot_loader(date):
+        if date in snapshots:
+            return snapshots[date]
+        date_key = date.date().isoformat()
+        path = spec.get('snapshot_paths', {}).get(date_key)
+        if path:
+            with np.load(path, allow_pickle=False) as saved:
+                snapshot = {key: saved[key] for key in saved.files}
+            snapshot['date'] = date
+            provenance.append({'date': date_key, 'source': str(path), 'mode': 'existing_declared_snapshot'})
+        else:
+            snapshot = load_ofes_snapshot(
+                date, variables=['temp', 'salinity', 'do2', 'u', 'v', 'w'],
+                lon_bounds=tuple(spec['lon_bounds']), lat_bounds=tuple(spec['lat_bounds']),
+                depth_bounds=tuple(spec['depth_bounds']),
+            )
+            provenance.append({'date': date_key, 'mode': 'native_subset', 'metadata': snapshot['metadata']})
+        zi = np.flatnonzero((snapshot['depth'] >= spec['depth_bounds'][0]) & (snapshot['depth'] <= spec['depth_bounds'][1]))
+        yi = np.flatnonzero((snapshot['lat'] >= spec['lat_bounds'][0]) & (snapshot['lat'] <= spec['lat_bounds'][1]))
+        xi = np.flatnonzero(_region_lon_mask(snapshot['lon'], *spec['lon_bounds']))
+        wi = np.flatnonzero((snapshot['depth_w'] >= spec['depth_bounds'][0]) & (snapshot['depth_w'] <= spec['depth_bounds'][1]))
+        if min(len(zi), len(yi), len(xi), len(wi)) < 2:
+            raise ValueError('Snapshot subset has insufficient interpolation support.')
+        trimmed = {key: snapshot[key][index] for key, index in (('depth', zi), ('lat', yi), ('lon', xi), ('depth_w', wi))}
+        for key in ('temp', 'salinity', 'do2', 'u', 'v'):
+            trimmed[key] = snapshot[key][np.ix_(zi, yi, xi)]
+        trimmed['w'] = snapshot['w'][np.ix_(wi, yi, xi)]
+        trimmed['date'] = date
+        scene = _ofes_depth_scene(trimmed, float(reference), float(reference_depth))
+        scene_path = output / f'surface_{date:%Y%m%d}.npz'
+        np.savez_compressed(scene_path, **scene)
+        scenes[date_key] = str(scene_path)
+        snapshots[date] = trimmed
+        return trimmed
+
+    tables = diagnose_ofes_particle_depth_changes(paired, snapshot_loader)
+    if spec.get('trajectory_path'):
+        tables['subdaily_steps'] = _ofes_subdaily_surface_changes(
+            pd.read_parquet(spec['trajectory_path']), paired, snapshot_loader,
+        )
+    daily = tables['daily']
+    if spec.get('tracer_path'):
+        tracer = pd.read_parquet(spec['tracer_path'])
+        tracer = tracer[tracer['event_id'].eq(spec['event_id']) &
+                        tracer['integration_label'].isin(paired['integration_label_3d'].unique())].copy()
+        tracer['date'] = pd.to_datetime(tracer['date']).dt.normalize()
+        cols = ['event_id', 'integration_label', 'date', 'particle_index']
+        contrasts = ['same_sigma_do_contrast', 'fixed_depth_do_contrast']
+        daily = daily.merge(tracer[cols + contrasts], on=cols, how='left', validate='one_to_one')
+        tables['daily'] = daily
+    steps = tables['steps']
+    summary = []
+    for side, group in daily.groupby('side'):
+        first = group[group['date'].eq(group['date'].min())].set_index('particle_index')
+        last = group[group['date'].eq(group['date'].max())].set_index('particle_index')
+        for quantity in ('depth_m', 'isopycnal_depth_m', 'relative_to_reference_m', 'sigma0', 'do2', 'theta', 'salinity'):
+            values = last[quantity] - first[quantity]
+            summary.append({'side': side, 'metric': f'endpoint_change_{quantity}', 'n': int(values.notna().sum()),
+                            'median': values.median(), 'q25': values.quantile(.25), 'q75': values.quantile(.75),
+                            'min': values.min(), 'max': values.max()})
+    for quantity in ('surface_horizontal_change_m', 'surface_temporal_change_m', 'relative_depth_change_m'):
+        values = steps.groupby('particle_index')[quantity].agg(lambda s: s.sum() if s.notna().all() else np.nan)
+        summary.append({'side': '3d', 'metric': f'cumulative_{quantity}', 'n': int(values.notna().sum()),
+                        'median': values.median(), 'q25': values.quantile(.25), 'q75': values.quantile(.75),
+                        'min': values.min(), 'max': values.max()})
+    if 'subdaily_steps' in tables:
+        for quantity in ('surface_horizontal_change_m', 'surface_temporal_change_m', 'relative_depth_change_m'):
+            values = tables['subdaily_steps'].groupby('particle_index')[quantity].agg(lambda s: s.sum() if s.notna().all() else np.nan)
+            summary.append({'side': '3d', 'metric': f'hourly_cumulative_{quantity}', 'n': int(values.notna().sum()),
+                            'median': values.median(), 'q25': values.quantile(.25), 'q75': values.quantile(.75),
+                            'min': values.min(), 'max': values.max()})
+    result = {'output_dir': str(output), 'scenes': scenes}
+    for name, table in tables.items():
+        path = output / f'{name}.parquet'
+        table.to_parquet(path, index=False)
+        result[f'{name}_path'] = str(path)
+    summary_path = output / 'summary.csv'
+    pd.DataFrame(summary).to_csv(summary_path, index=False)
+    result['summary_path'] = str(summary_path)
+    result['manifest_path'] = str(manifest_path)
+    manifest = {
+        'case_spec': spec, 'outputs': result, 'snapshot_provenance': provenance,
+        'surface_map_sigma0': float(reference), 'density_reference': 'each seed initial sigma0_3d',
+        'decomposition': 'symmetric two-order finite difference; interaction split equally',
+        'subdaily_field_semantics': 'linear interpolation of daily isopycnal depth; actual saved hourly positions, not additional model snapshots',
+        'w_semantics': 'm/s, upward positive, native lower interface',
+        'qa': {'daily_rows': len(daily), 'step_rows': len(steps),
+               'unique_crossing_rows': int(daily['crossing_count'].eq(1).sum()),
+               'complete_steps': int(steps['closure_error_m'].notna().sum()),
+               'max_closure_error_m': float(steps['closure_error_m'].abs().max()),
+               'max_sigma0_resampling_error': float(daily['sigma0_existing_minus_resampled'].abs().max()),
+               'max_do2_resampling_error': float(daily['do2_existing_minus_resampled'].abs().max())},
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str) + '\n')
+    return result
+
+
+def load_ofes_depth_change_review(output_dir: str | Path) -> dict:
+    """读取材料下移诊断的简表与已有图件。
+
+    轻量入口只读取保存的诊断表和 manifest，不采样原场或重画图。
+
+    参数:
+        - output_dir (str | Path): `build_ofes_depth_change_review` 的输出目录。
+
+    返回:
+        - dict: summary 为两臂端点变化中位数简表，full_summary 为完整分布表，figures 为两张 PNG 路径，manifest 为来源记录。
+    """
+    output = Path(output_dir)
+    manifest = json.loads((output / 'manifest.json').read_text())
+    table = pd.read_csv(output / 'summary.csv')
+    labels = {
+        'endpoint_change_depth_m': 'Depth change (m)',
+        'endpoint_change_sigma0': 'Sigma0 change (kg/m3)',
+        'endpoint_change_do2': 'Raw DO change (umol/kg)',
+        'endpoint_change_theta': 'Potential temperature change (deg C)',
+        'endpoint_change_salinity': 'Practical salinity change',
+    }
+    summary = table[table.metric.isin(labels)].pivot(index='metric', columns='side', values='median')
+    summary = summary.reindex(list(labels)).rename(index=labels, columns={'3d': '3-D', 'c2': 'Fixed depth'})
+    summary.index.name = 'Median individual change'
+    summary.columns.name = None
+    return {'summary': summary, 'full_summary': table, 'manifest': manifest,
+            'figures': [str(output / name) for name in ('depth_change_decomposition.png', 'isopycnal_transport_context.png')]}
+
+
+def plot_ofes_depth_change_review(output_dir: str | Path, show_fig: bool = True) -> dict:
+    """绘制材料深度分解、属性演变与参考密度面输送环境。
+
+    图中细线保留全部成员，粗线为每日中位数；空间图使用全体初始密度的中位值，
+    而逐成员分解使用各自初始密度，两者用途分开。
+
+    参数:
+        - output_dir (str | Path): `build_ofes_depth_change_review` 的输出目录。
+        - show_fig (bool): 是否显示图形，默认 True。
+
+    返回:
+        - dict: summary 为摘要表，figures 为保存的 PNG 路径列表；同名 SVG 同时保存。
+    """
+    import matplotlib.dates as mdates
+
+    output = Path(output_dir)
+    manifest = json.loads((output / 'manifest.json').read_text())
+    daily = pd.read_parquet(output / 'daily.parquet').sort_values(['side', 'particle_index', 'date'])
+    step_path = output / ('subdaily_steps.parquet' if 'subdaily_steps_path' in manifest['outputs'] else 'steps.parquet')
+    steps = pd.read_parquet(step_path)
+    summary = pd.read_csv(output / 'summary.csv')
+    colors = {'3d': '#0072B2', 'c2': '#D55E00'}
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), constrained_layout=True)
+    for side, group in daily.groupby('side'):
+        for _, member in group.groupby('particle_index'):
+            member = member.sort_values('date')
+            axes[0, 0].plot(member.date, member.depth_m, color=colors[side], lw=.5, alpha=.18)
+            for ax, quantity in ((axes[1, 0], 'sigma0'), (axes[1, 1], 'do2')):
+                ax.plot(member.date, member[quantity] - member[quantity].iloc[0], color=colors[side], lw=.5, alpha=.18)
+        med = group.groupby('date').median(numeric_only=True)
+        axes[0, 0].plot(med.index, med.depth_m, color=colors[side], lw=2, label=side.upper())
+        for ax, quantity in ((axes[1, 0], 'sigma0'), (axes[1, 1], 'do2')):
+            changes = group.copy()
+            changes['change'] = changes[quantity] - changes.groupby('particle_index')[quantity].transform('first')
+            med_change = changes.groupby('date')['change'].median()
+            ax.plot(med_change.index, med_change, color=colors[side], lw=2, label=side.upper())
+    three = daily[daily.side.eq('3d')]
+    iso = three.groupby('date')['isopycnal_depth_m'].median()
+    axes[0, 0].plot(iso.index, iso, 'k--', lw=1.8, label='Initial-density surface')
+    axes[0, 0].invert_yaxis()
+    axes[0, 0].set_ylabel('Depth (m)')
+    axes[0, 0].legend(fontsize=8)
+    quantities = ['particle_depth_change_m', 'surface_horizontal_change_m', 'surface_temporal_change_m', 'relative_depth_change_m']
+    for i, quantity in enumerate(quantities):
+        values = steps.groupby('particle_index')[quantity].agg(lambda s: s.sum() if s.notna().all() else np.nan).dropna()
+        axes[0, 1].scatter(np.full(len(values), i), values, s=9, alpha=.4, color='#555555')
+        axes[0, 1].plot([i-.2, i+.2], [values.median()]*2, color='black', lw=3)
+    axes[0, 1].set_xticks(range(4), ['Material', 'Horizontal\nsurface term', 'Temporal\nsurface term', 'Relative\nto surface'])
+    axes[0, 1].set_ylabel('Cumulative depth change (m)')
+    axes[0, 1].text(.02, .98, 'Hourly saved positions; interpolated daily surfaces' if 'subdaily_steps_path' in manifest['outputs'] else 'Daily positions and surfaces', transform=axes[0, 1].transAxes, va='top', fontsize=8)
+    axes[0, 1].axhline(0, color='0.6', lw=.7)
+    axes[1, 0].set_ylabel(r'$\Delta\sigma_0$ (kg m$^{-3}$)')
+    axes[1, 1].set_ylabel(r'$\Delta$ raw DO ($\mu$mol kg$^{-1}$)')
+    for ax in (axes[0, 0], axes[1, 0], axes[1, 1]):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+    for label, ax in zip('abcd', axes.flat):
+        ax.set_title(label, loc='left', fontweight='bold')
+        ax.spines[['top', 'right']].set_visible(False)
+    paths = []
+    stem = output / 'depth_change_decomposition'
+    fig.savefig(stem.with_suffix('.png'), dpi=300)
+    fig.savefig(stem.with_suffix('.svg'))
+    paths.append(str(stem.with_suffix('.png')))
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    dates = sorted(manifest['outputs']['scenes'])
+    fig, axes = plt.subplots(1, len(dates), figsize=(4 * len(dates), 4.3), constrained_layout=True, squeeze=False)
+    all_depths = []
+    for date in dates:
+        with np.load(manifest['outputs']['scenes'][date]) as scene:
+            all_depths.append(scene['depth'].ravel())
+    levels = np.linspace(np.nanpercentile(np.concatenate(all_depths), 2), np.nanpercentile(np.concatenate(all_depths), 98), 15)
+    for ax, date in zip(axes.flat, dates):
+        with np.load(manifest['outputs']['scenes'][date]) as scene:
+            lon, lat, z = scene['lon'], scene['lat'], scene['depth']
+            filled = ax.contourf(lon, lat, z, levels=levels, cmap='viridis_r', extend='both')
+            ax.contour(lon, lat, z, levels=levels[::3], colors='0.25', linewidths=.4)
+            stride = max(1, min(len(lon), len(lat)) // 12)
+            q = ax.quiver(lon[::stride], lat[::stride], scene['u'][::stride, ::stride], scene['v'][::stride, ::stride], scale=12, width=.003)
+            ax.quiverkey(q, .8, 1.08, 1, '1 m/s', coordinates='axes')
+            for side, group in daily.groupby('side'):
+                points = group[pd.to_datetime(group.date).eq(pd.Timestamp(date))]
+                ax.scatter(points.lon, points.lat, s=12, marker='o' if side=='3d' else 'x', color=colors[side], edgecolors='white' if side=='3d' else None, linewidths=.4, label=side.upper(), zorder=4)
+            for _, member in three.groupby('particle_index'):
+                ax.plot(member.lon, member.lat, color='0.3', lw=.4, alpha=.25)
+            ax.set_aspect(1 / np.cos(np.deg2rad(float(np.mean(lat)))))
+            ax.set_xlabel('Longitude (°E)')
+            ax.set_title(date)
+    axes[0, 0].set_ylabel('Latitude (°N)')
+    axes[0, -1].legend(loc='lower right', fontsize=8)
+    bounds = manifest['case_spec']['depth_bounds']
+    fig.suptitle(
+        f"Density-surface flow; symbols show horizontal particle positions. White: no unique crossing within {bounds[0]:g}–{bounds[1]:g} m.",
+        fontsize=10,
+    )
+    fig.colorbar(filled, ax=list(axes.flat), label=f"Depth of sigma0 = {manifest['surface_map_sigma0']:.3f} (m)", shrink=.8)
+    stem = output / 'isopycnal_transport_context'
+    fig.savefig(stem.with_suffix('.png'), dpi=300)
+    fig.savefig(stem.with_suffix('.svg'))
+    paths.append(str(stem.with_suffix('.png')))
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return {'summary': summary, 'figures': paths}
+
+
 def sample_ofes_retention_dynamics(
     retention_positions: pd.DataFrame,
     event_spec: Mapping[str, Any],
