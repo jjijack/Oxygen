@@ -38919,6 +38919,14 @@ def _ofes_depth_scene(snapshot, target_sigma, reference_depth):
     return scene
 
 
+def _ofes_depth_symmetric_terms(z00, z01, z10, z11, particle_change):
+    """按 E239 双次序平均，把密度面变化拆为水平、时间和相对位移。"""
+    horizontal = 0.5 * ((z01 - z00) + (z11 - z10))
+    temporal = 0.5 * ((z10 - z00) + (z11 - z01))
+    relative = particle_change - (z11 - z00)
+    return horizontal, temporal, relative
+
+
 def diagnose_ofes_particle_depth_changes(
     paired: pd.DataFrame,
     snapshot_loader: Any,
@@ -39051,15 +39059,16 @@ def diagnose_ofes_particle_depth_changes(
         s00, s01 = cross[(earlier, earlier)], cross[(earlier, later)]
         s10, s11 = cross[(later, earlier)], cross[(later, later)]
         z00, z01, z10, z11 = (s['isopycnal_depth_m'] for s in (s00, s01, s10, s11))
-        horizontal = 0.5 * ((z01 - z00) + (z11 - z10))
-        temporal = 0.5 * ((z10 - z00) + (z11 - z01))
         dz = b['depth_3d_m'] - a['depth_3d_m']
+        horizontal, temporal, relative = _ofes_depth_symmetric_terms(
+            z00, z01, z10, z11, dz,
+        )
         frame = pd.DataFrame({
             'event_id': a['event_id'], 'release_date': a['release_date'],
             'start_date': earlier, 'end_date': later,
             'particle_depth_change_m': dz, 'surface_horizontal_change_m': horizontal,
             'surface_temporal_change_m': temporal, 'surface_total_change_m': z11 - z00,
-            'relative_depth_change_m': dz - (z11 - z00),
+            'relative_depth_change_m': relative,
             'position_time_interaction_m': z11 - z10 - z01 + z00,
         })
         for label, table in zip(('00', '01', '10', '11'), (s00, s01, s10, s11)):
@@ -109613,9 +109622,9 @@ def _ofes_cached_transport_associate_day(
         global_peak, associated, containing_count = _ofes_select_particle_layer_peaks(
             peak_info['peak_rows'], float(record.depth_m), tolerance,
         )
-        if global_peak is not None and not np.isclose(
-            float(global_peak['delta_do_umol_kg']),
-            float(record.project_profile_delta_do_umol_kg),
+        saved_global_peak = float(record.project_profile_delta_do_umol_kg)
+        if global_peak is not None and np.isfinite(saved_global_peak) and not np.isclose(
+            float(global_peak['delta_do_umol_kg']), saved_global_peak,
             atol=1e-3, rtol=0,
         ):
             raise ValueError('Reconstructed global profile peak differs from the saved family property.')
@@ -110262,3 +110271,734 @@ def load_ofes_cached_transport_structure_review(output_dir: str | Path) -> dict[
         'centers': centers, 'members': members, 'association': association,
         'relative': relative, 'figures': figures,
     }
+
+
+def _ofes_single_event_review_prepare(root: Path, identity: dict) -> None:
+    """只允许完整同身份复跑，并在覆盖任何表图前撤销 complete 状态。"""
+    path = root / 'manifest.json'
+    if path.is_file():
+        old = json.loads(path.read_text(encoding='utf-8'))
+        if old.get('analysis') != 'ofes_single_event_material_review' or old.get('resolved_case_spec') != identity:
+            raise ValueError('Existing single-event review has a different or incomplete identity.')
+    elif root.exists() and any((root / name).exists() for name in ('member_daily.parquet', 'association.parquet', 'figure_fields.png')):
+        raise ValueError('Single-event outputs exist without a matching manifest.')
+    root.mkdir(parents=True, exist_ok=True)
+    _ofes_cached_transport_write_json(path, {
+        'analysis': 'ofes_single_event_material_review', 'complete': False,
+        'status': 'in_progress', 'resolved_case_spec': identity,
+    })
+    _ofes_cached_transport_write_json(root / 'validation.json', {
+        'analysis': 'ofes_single_event_material_review', 'complete': False,
+        'status': 'in_progress', 'case_id': identity['case_id'],
+    })
+
+
+def _ofes_single_event_review_verify_cache(
+    saved: Any, cache: Path, date: pd.Timestamp, event_id: str,
+    members: pd.DataFrame,
+) -> float:
+    """用正式文件名/可选日期键和同日已存粒子 DO 验证无日期键的代表日缓存。"""
+    if cache.name != f'{event_id}_{date:%Y%m%d}.npz':
+        raise ValueError('Representative cache filename has a wrong event or date.')
+    if 'date' in saved.files and pd.Timestamp(str(saved['date'].item())).normalize() != date:
+        raise ValueError('Representative cache embedded date differs from request.')
+    for name in ('lon', 'lat', 'depth', 'do2', 'temp', 'salinity', 'u', 'v'):
+        if name not in saved.files:
+            raise ValueError(f'Representative cache lacks {name}.')
+    snapshot = {name: np.asarray(saved[name], dtype=float) for name in ('lon','lat','depth','do2','temp','salinity')}
+    snapshot['metadata'] = {'variable_dims': {name: ('depth','lat','lon') for name in ('do2','temp','salinity')}}
+    if len(members) == 0 or members['date'].nunique() != 1 or pd.Timestamp(members['date'].iloc[0]).normalize() != date:
+        raise ValueError('Same-day saved member reference is incomplete.')
+    errors = []
+    for member in members.itertuples(index=False):
+        profile = extract_ofes_profile_interp(snapshot, float(member.lon_3d), float(member.lat_3d), variables=['do2'])
+        sampled = float(np.interp(float(member.depth_3d_m), profile['Depth'].to_numpy(float), profile['do2'].to_numpy(float)))
+        errors.append(abs(sampled - float(member.do2_3d)))
+    maximum = float(np.max(errors))
+    if not np.isfinite(maximum) or maximum > 1e-3:
+        raise ValueError('Date-less representative cache disagrees with formal same-day particle DO.')
+    return maximum
+
+
+def _ofes_single_event_review_tracers(
+    date: pd.Timestamp, required: pd.DataFrame, source: Path,
+    event_id: str, halo_degrees: float, members: pd.DataFrame,
+) -> tuple[dict, dict]:
+    """按日共享读取覆盖相邻材料位置的小域原生示踪物水柱。"""
+    lon_bounds = (float(required['lon'].min() - halo_degrees), float(required['lon'].max() + halo_degrees))
+    lat_bounds = (float(required['lat'].min() - halo_degrees), float(required['lat'].max() + halo_degrees))
+    cache = source / 'field_cache' / f'{event_id}_{date:%Y%m%d}.npz'
+    mode = 'native_daily_material_subset'
+    snapshot = None
+    if cache.is_file():
+        with np.load(cache, allow_pickle=False) as saved:
+            lon = np.asarray(saved['lon'], dtype=float)
+            lat = np.asarray(saved['lat'], dtype=float)
+            if lon[0] <= lon_bounds[0] and lon[-1] >= lon_bounds[1] and lat[0] <= lat_bounds[0] and lat[-1] >= lat_bounds[1]:
+                cache_do_max_error = _ofes_single_event_review_verify_cache(
+                    saved, cache, date, event_id, members,
+                )
+                x = (lon >= lon_bounds[0]) & (lon <= lon_bounds[1])
+                y = (lat >= lat_bounds[0]) & (lat <= lat_bounds[1])
+                snapshot = {'lon': lon[x], 'lat': lat[y], 'depth': np.asarray(saved['depth'], dtype=float)}
+                for variable in ('do2', 'temp', 'salinity'):
+                    snapshot[variable] = np.asarray(saved[variable][:, y][:, :, x], dtype=float)
+                mode = 'existing_representative_cache_subset'
+    if snapshot is None:
+        snapshot = load_ofes_snapshot(
+            date, variables=['do2', 'temp', 'salinity'],
+            lon_bounds=lon_bounds, lat_bounds=lat_bounds,
+            depth_bounds=(0.0, 1000.0),
+        )
+    snapshot.setdefault('metadata', {})['variable_dims'] = {
+        variable: ('depth', 'lat', 'lon') for variable in ('do2', 'temp', 'salinity')
+    }
+    if (
+        snapshot['lon'][0] > required['lon'].min()
+        or snapshot['lon'][-1] < required['lon'].max()
+        or snapshot['lat'][0] > required['lat'].min()
+        or snapshot['lat'][-1] < required['lat'].max()
+    ):
+        raise ValueError(f'Tracer read does not bracket required material positions on {date:%Y-%m-%d}.')
+    provenance = {
+        'date': date.date().isoformat(), 'mode': mode,
+        'cache_path': str(cache) if mode.startswith('existing') else None,
+        'lon_bounds_requested': lon_bounds, 'lat_bounds_requested': lat_bounds,
+        'actual_shape': list(np.asarray(snapshot['do2']).shape),
+        'cache_same_day_particle_do_max_abs_error': cache_do_max_error if mode.startswith('existing') else None,
+    }
+    return snapshot, provenance
+
+
+def _ofes_single_event_review_rep_field(
+    cache: Path, date: pd.Timestamp, object_row: pd.Series,
+    members: pd.DataFrame, settings: Mapping[str, Any],
+) -> tuple[dict, dict]:
+    """从既有代表日同层场分别截取材料层与正式对象峰层。"""
+    with np.load(cache, allow_pickle=False) as saved:
+        lon = np.asarray(saved['lon'], dtype=float)
+        lat = np.asarray(saved['lat'], dtype=float)
+        depth = np.asarray(saved['depth'], dtype=float)
+        cache_do_max_error = _ofes_single_event_review_verify_cache(
+            saved, cache, date, str(members['event_id'].iloc[0]), members,
+        )
+        points_lon = np.r_[members['lon_3d'].to_numpy(float), members['lon_c2'].to_numpy(float),
+                            float(object_row['centroid_lon']), float(object_row['peak_lon'])]
+        points_lat = np.r_[members['lat_3d'].to_numpy(float), members['lat_c2'].to_numpy(float),
+                            float(object_row['centroid_lat']), float(object_row['peak_lat'])]
+        if (points_lon.min() < lon[0] or points_lon.max() > lon[-1]
+                or points_lat.min() < lat[0] or points_lat.max() > lat[-1]):
+            raise ValueError('Representative cache does not cover both material cohorts and formal object points.')
+        halo = float(settings['map_halo_degrees'])
+        x = (lon >= points_lon.min() - halo) & (lon <= points_lon.max() + halo)
+        y = (lat >= points_lat.min() - halo) & (lat <= points_lat.max() + halo)
+        if min(x.sum(), y.sum()) < 10:
+            raise ValueError('Representative cached field lacks local map support.')
+        result = {'lon': lon[x], 'lat': lat[y], 'support': {
+            'date': date.date().isoformat(), 'cache_path': str(cache),
+            'cache_same_day_particle_do_max_abs_error': cache_do_max_error,
+            'all_3d_c2_object_centroid_and_peak_points_in_cache': True,
+            'cache_lon_min': float(lon[0]), 'cache_lon_max': float(lon[-1]),
+            'cache_lat_min': float(lat[0]), 'cache_lat_max': float(lat[-1]),
+            'requested_halo_lon_min': float(points_lon.min() - halo),
+            'requested_halo_lon_max': float(points_lon.max() + halo),
+            'requested_halo_lat_min': float(points_lat.min() - halo),
+            'requested_halo_lat_max': float(points_lat.max() + halo),
+            'requested_halo_fully_in_cache': bool(
+                points_lon.min() - halo >= lon[0] and points_lon.max() + halo <= lon[-1]
+                and points_lat.min() - halo >= lat[0] and points_lat.max() + halo <= lat[-1]
+            ),
+        }}
+        for role, target in (
+            ('material', float(members['depth_3d_m'].median())),
+            ('object', float(object_row['peak_depth_at_max'])),
+        ):
+            level = int(np.argmin(np.abs(depth - target)))
+            result[role] = {'depth': depth[level:level + 1], 'lon': lon[x], 'lat': lat[y]}
+            for variable in ('do2', 'temp', 'salinity', 'u', 'v'):
+                result[role][variable] = np.asarray(saved[variable][level][np.ix_(y, x)], dtype=float)[None]
+    declared = pd.DataFrame({
+        'date': [date], 'object_centroid_lon': [float(object_row['centroid_lon'])],
+        'object_centroid_lat': [float(object_row['centroid_lat'])],
+    })
+    centre = _ofes_cached_transport_structure_day(
+        result['object'], date, float(object_row['centroid_lon']),
+        float(object_row['centroid_lat']), float(members['lon_3d'].median()),
+        float(members['lat_3d'].median()), declared, settings['structure_settings'],
+    )
+    return result, centre
+
+
+def _ofes_single_event_review_density(
+    paired: pd.DataFrame, cross: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """沿用 E239 唯一密度交点与对称分解，针对同一 3-D release 汇总。"""
+    rows = []
+    steps = []
+    for date, group in paired.groupby('date', sort=True):
+        lookup = cross[(date, date)].set_index('particle_index')
+        day = group.set_index('particle_index').sort_index()
+        aligned = lookup.reindex(day.index)
+        for index, value in day.iterrows():
+            rows.append({
+                'date': date, 'particle_index': int(index),
+                'depth_3d_m': float(value.depth_3d_m),
+                'sigma0_3d': float(value.sigma0_3d),
+                'initial_sigma0_surface_depth_m': float(aligned.loc[index, 'isopycnal_depth_m']),
+                'relative_to_initial_surface_m': float(value.depth_3d_m - aligned.loc[index, 'isopycnal_depth_m']),
+                'crossing_count': int(aligned.loc[index, 'crossing_count']),
+            })
+    dates = sorted(paired['date'].unique())
+    for earlier, later in zip(dates[:-1], dates[1:]):
+        a = paired.loc[paired['date'].eq(earlier)].set_index('particle_index').sort_index()
+        b = paired.loc[paired['date'].eq(later)].set_index('particle_index').sort_index()
+        z00 = cross[(earlier, earlier)].set_index('particle_index').reindex(a.index)['isopycnal_depth_m']
+        z01 = cross[(earlier, later)].set_index('particle_index').reindex(a.index)['isopycnal_depth_m']
+        z10 = cross[(later, earlier)].set_index('particle_index').reindex(a.index)['isopycnal_depth_m']
+        z11 = cross[(later, later)].set_index('particle_index').reindex(a.index)['isopycnal_depth_m']
+        dz = b['depth_3d_m'] - a['depth_3d_m']
+        horizontal, temporal, relative = _ofes_depth_symmetric_terms(z00, z01, z10, z11, dz)
+        for index in a.index:
+            steps.append({
+                'start_date': earlier, 'end_date': later,
+                'particle_index': int(index), 'particle_depth_change_m': float(dz.loc[index]),
+                'surface_horizontal_change_m': float(horizontal.loc[index]),
+                'surface_temporal_change_m': float(temporal.loc[index]),
+                'relative_depth_change_m': float(relative.loc[index]),
+                'closure_error_m': float(dz.loc[index] - horizontal.loc[index] - temporal.loc[index] - relative.loc[index]),
+            })
+    return pd.DataFrame(rows), pd.DataFrame(steps)
+
+
+def _ofes_single_event_review_field_figure(
+    root: Path, paired: pd.DataFrame, objects: pd.DataFrame,
+    fields: dict, centers: pd.DataFrame, mode: str,
+) -> list[str]:
+    """在原对象层和原材料层显示少量代表日真实 DO/u/v 场。"""
+    dates = sorted(fields)
+    if mode == 'control':
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
+        map_axes = axes[0]
+        layers = ['object'] * len(dates)
+    else:
+        fig, axes = plt.subplots(len(dates), 2, figsize=(13, 4 * len(dates)), constrained_layout=True)
+        map_axes = axes.ravel()
+        layers = [role for _ in dates for role in ('object', 'material')]
+    image = None
+    for index, (date, role) in enumerate(zip(dates if mode == 'control' else [d for d in dates for _ in (0, 1)], layers)):
+        ax = map_axes[index]
+        field = fields[date][role]
+        lon, lat = fields[date]['lon'], fields[date]['lat']
+        object_row = objects.loc[objects['date'].eq(date)].iloc[0]
+        day = paired.loc[paired['date'].eq(date)]
+        image = ax.pcolormesh(lon, lat, field['do2'][0], cmap='viridis',
+                              shading='auto', vmin=100, vmax=245, rasterized=True)
+        stride = max(3, int(max(len(lon), len(lat)) / 28))
+        ax.quiver(lon[::stride], lat[::stride], field['u'][0, ::stride, ::stride],
+                  field['v'][0, ::stride, ::stride], color='white', alpha=.6,
+                  width=.002, scale=7)
+        ax.scatter(day['lon_3d'], day['lat_3d'], s=10, c='#ed4968',
+                   edgecolors='black', linewidths=.2, zorder=5)
+        if mode != 'control':
+            ax.scatter(day['lon_c2'], day['lat_c2'], s=7, c='#f1c15d',
+                       edgecolors='black', linewidths=.2, zorder=4)
+        ax.scatter([object_row['centroid_lon']], [object_row['centroid_lat']],
+                   marker='*', s=105, c='white', edgecolors='black', linewidths=.7, zorder=7)
+        center = centers.loc[centers['date'].eq(date)].iloc[0]
+        ax.scatter([center['velocity_center_lon']], [center['velocity_center_lat']],
+                   marker='x', s=65, c='#f335c1', linewidths=2, zorder=8)
+        context_note = '' if fields[date]['support']['requested_halo_fully_in_cache'] else ' [cache edge]'
+        ax.set(title=f'{date:%Y-%m-%d}  {role} layer {float(field["depth"][0]):.0f} m{context_note}',
+               xlabel='Longitude (°E)', ylabel='Latitude (°N)')
+        ax.set_aspect(1 / np.cos(np.radians(float(object_row['centroid_lat']))))
+    if mode == 'control':
+        for ax in axes[1]:
+            ax.grid(alpha=.2)
+        for _, group in paired.groupby('particle_index'):
+            group = group.sort_values('date')
+            axes[1, 0].plot(group['date'], group['depth_3d_m'], color='#c83e67', alpha=.3, linewidth=.7)
+            axes[1, 0].plot(group['date'], group['depth_c2_m'], color='#777777', alpha=.25, linewidth=.7)
+            axes[1, 1].plot(group['date'], group['associated_peak_delta_do_umol_kg'],
+                            color='#c83e67', alpha=.35, linewidth=.8)
+        axes[1, 0].plot(objects['date'], objects['peak_depth_at_max'], color='black', linewidth=2)
+        axes[1, 0].set(ylabel='Depth (m, down positive)', xlabel='Date', title='Same-seed 3-D / fixed-depth / detected peak')
+        axes[1, 1].set(ylabel='Particle-layer ΔDO (µmol kg⁻¹)', xlabel='Date', title='Associated positive peak, all source seeds')
+        fig.colorbar(image, ax=list(map_axes), label='Raw DO (µmol kg⁻¹)', shrink=.7)
+    else:
+        fig.colorbar(image, ax=list(map_axes), label='Raw DO (µmol kg⁻¹)', shrink=.7)
+    name = 'figure_fields.png'
+    fig.savefig(root / name, dpi=210)
+    plt.close(fig)
+    return [name]
+
+
+def _ofes_single_event_review_divergence_figures(
+    root: Path, paired: pd.DataFrame, objects: pd.DataFrame,
+    native_cores: pd.DataFrame, density_daily: pd.DataFrame,
+    density_steps: pd.DataFrame,
+) -> list[str]:
+    """绘制 E002 型对象—材料分离时间过程和等密度面几何分解。"""
+    fig, axes = plt.subplots(3, 2, figsize=(14, 11), sharex=True, constrained_layout=True)
+    for _, group in paired.groupby('particle_index'):
+        group = group.sort_values('date')
+        axes[0, 0].plot(group['date'], group['depth_3d_m'], color='#cb3f64', alpha=.22, linewidth=.7)
+        axes[0, 0].plot(group['date'], group['depth_c2_m'], color='#888888', alpha=.16, linewidth=.7)
+        axes[1, 0].plot(group['date'], group['do2_3d'], color='#cb3f64', alpha=.28, linewidth=.7)
+        axes[1, 1].plot(group['date'], group['associated_peak_delta_do_umol_kg'],
+                        color='#cb3f64', alpha=.28, linewidth=.7)
+        axes[2, 0].plot(group['date'], group['sigma0_3d'], color='#cb3f64', alpha=.28, linewidth=.7)
+        axes[2, 1].plot(group['date'], group['horizontal_separation_km'], color='#cb3f64', alpha=.22, linewidth=.7)
+    object_calendar = objects.set_index('date').reindex(pd.DatetimeIndex(sorted(paired['date'].unique())))
+    axes[0, 0].plot(object_calendar.index, object_calendar['peak_depth_at_max'], color='black', linewidth=2,
+                    label='Catalog peak depth')
+    axes[0, 0].fill_between(object_calendar.index, object_calendar['depth_min'].to_numpy(float),
+                            object_calendar['depth_max'].to_numpy(float),
+                            color='black', alpha=.12, label='Detected pixel peak-depth range')
+    for row in native_cores.itertuples(index=False):
+        stamp = pd.Timestamp(row.date)
+        axes[0, 0].plot([stamp, stamp], [row.native_core_shallow_edge_m, row.native_core_deep_edge_m],
+                        color='#6a36a0', linewidth=5, solid_capstyle='butt')
+    axes[0, 0].legend(fontsize=7, loc='upper left')
+    daily = paired.groupby('date').agg(distance=('distance_to_object_centroid_km', 'median'),
+                                       p10=('distance_to_object_centroid_km', lambda x: x.quantile(.1)),
+                                       p90=('distance_to_object_centroid_km', lambda x: x.quantile(.9)))
+    axes[0, 1].plot(daily.index, daily['distance'], color='#cb3f64', linewidth=2)
+    axes[0, 1].fill_between(daily.index, daily['p10'], daily['p90'], color='#cb3f64', alpha=.16)
+    axes[0, 1].plot(object_calendar.index, object_calendar['equivalent_radius_km'],
+                    color='black', linestyle='--')
+    associated_count = paired.groupby('date')['particle_within_positive_core'].sum()
+    axes[1, 1].text(.02, .95, f'Associated source seeds: {int(associated_count.iloc[0])} → {int(associated_count.iloc[-1])}',
+                    transform=axes[1, 1].transAxes, va='top', fontsize=8)
+    for ax, label in zip(axes.ravel(), (
+        'Depth (m, down positive)', 'Distance to catalog object (km)',
+        'Raw DO (µmol kg⁻¹)', 'Particle-layer ΔDO (µmol kg⁻¹)',
+        'σ₀ (kg m⁻³)', '3-D / fixed-depth separation (km)',
+    )):
+        ax.set_ylabel(label)
+        ax.grid(alpha=.18)
+    for ax in axes[-1]:
+        ax.tick_params(axis='x', rotation=28)
+    fig.savefig(root / 'figure_material_vs_object.png', dpi=210)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+    for _, group in density_daily.groupby('particle_index'):
+        group = group.sort_values('date')
+        axes[0].plot(group['date'], group['depth_3d_m'], color='#cb3f64', alpha=.15, linewidth=.7)
+        axes[0].plot(group['date'], group['initial_sigma0_surface_depth_m'], color='#3b6b9a', alpha=.15, linewidth=.7)
+    median = density_daily.groupby('date')[['depth_3d_m','initial_sigma0_surface_depth_m']].median()
+    axes[0].plot(median.index, median['depth_3d_m'], color='#cb3f64', linewidth=2, label='3-D material')
+    axes[0].plot(median.index, median['initial_sigma0_surface_depth_m'], color='#3b6b9a', linewidth=2, label='Initial-σ₀ surface')
+    axes[0].legend(fontsize=8)
+    complete_columns = (
+        'surface_horizontal_change_m', 'surface_temporal_change_m',
+        'relative_depth_change_m',
+    )
+    full_seeds = density_steps.groupby('particle_index').filter(
+        lambda group: group[list(complete_columns)].notna().all().all()
+    )['particle_index'].unique()
+    cumulative = density_steps.loc[
+        density_steps['particle_index'].isin(full_seeds)
+    ].sort_values('end_date').copy()
+    axes[1].set_title(f'Symmetric terms: {len(full_seeds)} complete source seeds')
+    for name, color in [('surface_horizontal_change_m','#3b6b9a'),
+                        ('surface_temporal_change_m','#68a087'),
+                        ('relative_depth_change_m','#cb3f64')]:
+        cumulative[f'cum_{name}'] = cumulative.groupby('particle_index')[name].cumsum()
+        group = cumulative.groupby('end_date')[f'cum_{name}'].median()
+        axes[1].plot(group.index, group, color=color, linewidth=2, label=name.replace('_change_m','').replace('_',' '))
+    axes[1].legend(fontsize=8)
+    axes[0].set_ylabel('Depth (m, down positive)')
+    axes[1].set_ylabel('Cumulative symmetric contribution (m)')
+    for ax in axes:
+        ax.grid(alpha=.2)
+        ax.tick_params(axis='x', rotation=28)
+    fig.savefig(root / 'figure_density_following.png', dpi=210)
+    plt.close(fig)
+    return ['figure_material_vs_object.png', 'figure_density_following.png']
+
+
+def build_ofes_single_event_material_review(case_spec: Mapping[str, Any]) -> dict[str, Any]:
+    """复用同释放 3-D/C2、正式对象和局地原生场，审查单事件材料机制。
+
+    E171 式近定深对照仅生成一张图；E002 式显著材料/对象分离另作
+    初始密度面几何分解。所有剖面正峰均按 E225 的粒子层核关联。
+
+    参数:
+        - case_spec (Mapping[str, Any]): 显式 event_id、日期、source_dir、output_dir、review_mode、代表日及局地读取/结构参数。
+    返回:
+        - dict[str, Any]: 含 output_dir、manifest、validation、members、association 和 figures 路径。
+    说明:
+        - 只允许完整同身份重跑；开跑即把 manifest 置为 incomplete，全部结果完成后才置 complete。
+        - 物理逻辑在本入口及共享 helper；不重积分、不改变目录事件或检测阈值。
+    """
+    import hashlib
+    from dataclasses import asdict
+
+    source = Path(case_spec['source_dir']).expanduser().resolve()
+    root = Path(case_spec['output_dir']).expanduser().resolve()
+    if root == source or root.is_relative_to(source) or source.is_relative_to(root):
+        raise ValueError('Single-event output must not overlap existing source.')
+    event_id = str(case_spec['event_id'])
+    mode = str(case_spec['review_mode'])
+    if mode not in ('control', 'divergence'):
+        raise ValueError('review_mode must be control or divergence.')
+    specs = json.loads((source / 'case_specs.json').read_text(encoding='utf-8'))
+    matches = [item for item in specs['case_ids'] if str(item['event_id']) == event_id]
+    if len(matches) != 1:
+        raise ValueError('Formal event identity is missing or duplicated.')
+    formal_case = matches[0]
+    start = pd.Timestamp(case_spec['start_date']).normalize()
+    end = pd.Timestamp(case_spec['end_date']).normalize()
+    if start != pd.Timestamp(formal_case['start_date']) or end != pd.Timestamp(formal_case['peak_date']):
+        raise ValueError('This review must use the complete formal start-release to peak window.')
+    dates = pd.date_range(start, end, freq='D')
+    representative_dates = [pd.Timestamp(value).normalize() for value in case_spec['representative_dates']]
+    if not representative_dates or len(representative_dates) != len(set(representative_dates)) or not set(representative_dates).issubset(set(dates)):
+        raise ValueError('Representative dates must be unique and within the formal window.')
+    if mode == 'control' and len(representative_dates) != 2:
+        raise ValueError('Control review requires two representative cached dates.')
+    if mode == 'divergence' and len(representative_dates) != 3:
+        raise ValueError('Divergence review requires three representative cached dates.')
+    event_source = source / 'events' / event_id
+    paired_path = event_source / 'material_vs_c2_daily.parquet'
+    peak_release_path = event_source / 'existing_peak_retention_positions_14d.parquet'
+    paired = pd.read_parquet(paired_path)
+    paired['date'] = pd.to_datetime(paired['date']).dt.normalize()
+    if (
+        set(paired['event_id'].astype(str)) != {event_id}
+        or set(paired['release_date'].astype(str)) != {start.date().isoformat()}
+        or set(paired['integration_label_3d'].astype(str)) != {formal_case['three_d_label']}
+        or set(paired['integration_label_c2'].astype(str)) != {formal_case['c2_label']}
+        or paired.duplicated(['date','particle_index']).any()
+        or paired['status_3d'].ne('active').any()
+        or paired['status_c2'].ne('active').any()
+        or not paired['initial_seed_identity_match'].astype(bool).all()
+        or not paired['pairing_status'].eq('same_release_seed_date_pair').all()
+    ):
+        raise ValueError('Saved same-release paired material identity is invalid.')
+    seeds = sorted(paired['particle_index'].unique())
+    if len(paired) != len(seeds) * len(dates) or set(paired['date']) != set(dates):
+        raise ValueError('Saved paired members do not cover the full declared seed/date grid.')
+    object_path = Path(case_spec['object_catalog_path']).expanduser().resolve()
+    objects = pd.read_parquet(object_path)
+    objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+    objects = objects.loc[
+        objects['event_id'].astype(str).eq(event_id)
+        & objects['date'].isin(dates)
+        & objects['threshold'].eq(50)
+    ].sort_values('date').copy()
+    if objects.empty or objects['date'].duplicated().any() or start not in set(objects['date']) or end not in set(objects['date']):
+        raise ValueError('Formal event object history has invalid endpoint identity.')
+    core_summary = pd.read_csv(source / 'object_core_summary.csv')
+    core_summary['date'] = pd.to_datetime(core_summary['date']).dt.normalize()
+    native_cores = core_summary.loc[
+        core_summary['event_id'].astype(str).eq(event_id)
+        & core_summary['date'].isin((start, end))
+    ].copy()
+    if set(native_cores['date']) != {start, end}:
+        raise ValueError('Formal endpoint half-amplitude cores are missing.')
+    peak_release = pd.read_parquet(peak_release_path)
+    peak_release['date'] = pd.to_datetime(peak_release['date']).dt.normalize()
+    peak_release = peak_release.loc[peak_release['day_since_peak'].eq(0)].copy()
+    if (
+        set(peak_release['event_id'].astype(str)) != {event_id}
+        or set(peak_release['date']) != {end}
+        or peak_release['particle_index'].duplicated().any()
+        or peak_release['status'].ne('active').any()
+    ):
+        raise ValueError('Peak-date release context has a wrong or incomplete identity.')
+    halo = float(case_spec['profile_halo_degrees'])
+    map_halo = float(case_spec['map_halo_degrees'])
+    if not np.isfinite([halo, map_halo]).all() or halo <= 0 or map_halo < 1.0:
+        raise ValueError('Local profile/map halos are invalid.')
+    formal_config = make_detection_config('do')
+    association_rule = dict(case_spec['association_rule'])
+    if (
+        association_rule.get('version') != _OFES_DO50_DETECTABILITY_RULE_VERSION
+        or not np.isclose(float(association_rule['half_window_m']), float(formal_config.depth_interval), rtol=0, atol=0)
+        or float(association_rule['half_amplitude_fraction']) != .5
+        or not np.isfinite(float(association_rule['depth_tolerance_m']))
+        or float(association_rule['depth_tolerance_m']) < 0
+    ):
+        raise ValueError('Profile association rule differs from the formal E225 rule.')
+    structure_settings = dict(case_spec['structure_settings'])
+    structure_settings['velocity_ring'] = dict(structure_settings['velocity_ring'])
+    source_manifest = source / 'manifest.json'
+    identity = {
+        'case_id': str(case_spec['case_id']), 'event_id': event_id,
+        'review_mode': mode, 'source_dir': str(source), 'output_dir': str(root),
+        'source_manifest_sha256': hashlib.sha256(source_manifest.read_bytes()).hexdigest(),
+        'paired_source_size_mtime': [paired_path.stat().st_size, paired_path.stat().st_mtime_ns],
+        'peak_release_source_size_mtime': [peak_release_path.stat().st_size, peak_release_path.stat().st_mtime_ns],
+        'object_catalog_path': str(object_path),
+        'object_catalog_size_mtime': [object_path.stat().st_size, object_path.stat().st_mtime_ns],
+        'start_date': start.date().isoformat(), 'end_date': end.date().isoformat(),
+        'seed_ids': [int(value) for value in seeds],
+        'representative_dates': [date.date().isoformat() for date in representative_dates],
+        'profile_halo_degrees': halo, 'map_halo_degrees': map_halo,
+        'association_rule': association_rule,
+        'structure_settings': structure_settings,
+        'formal_detection_config': asdict(formal_config),
+    }
+    _ofes_single_event_review_prepare(root, identity)
+    reference_sigma = paired.loc[paired['date'].eq(start)].set_index('particle_index')['sigma0_3d'].sort_index()
+    association_rows = []
+    virtual_profiles = []
+    field_inventory = []
+    cross = {}
+    maps = {}
+    centers = []
+    velocity_candidates = []
+    radial_profiles = []
+    for date in dates:
+        day = paired.loc[paired['date'].eq(date)].sort_values('particle_index').copy()
+        neighboring = [stamp for stamp in (date - pd.Timedelta(days=1), date, date + pd.Timedelta(days=1)) if stamp in set(dates)] if mode == 'divergence' else [date]
+        required = pd.concat([
+            paired.loc[paired['date'].eq(stamp), ['lon_3d','lat_3d']].rename(columns={'lon_3d':'lon','lat_3d':'lat'})
+            for stamp in neighboring
+        ], ignore_index=True)
+        tracer_snapshot, inventory = _ofes_single_event_review_tracers(
+            date, required, source, event_id, halo, day,
+        )
+        field_inventory.append(inventory)
+        samples = pd.DataFrame({
+            'seed_id': day['particle_index'].astype(str), 'date': date,
+            'depth_m': day['depth_3d_m'], 'lon': day['lon_3d'],
+            'lat': day['lat_3d'], 'do2': day['do2_3d'],
+            'project_profile_delta_do_umol_kg': np.nan,
+        })
+        associated, profiles = _ofes_cached_transport_associate_day(
+            tracer_snapshot, samples, formal_config, association_rule,
+        )
+        association_rows.extend(associated)
+        virtual_profiles.extend(profiles)
+        if mode == 'divergence':
+            for position_date in neighboring:
+                position_day = paired.loc[paired['date'].eq(position_date)].sort_values('particle_index')
+                positions = position_day[['particle_index']].copy()
+                positions['lon'] = position_day['lon_3d'].to_numpy()
+                positions['lat'] = position_day['lat_3d'].to_numpy()
+                crossing, _ = _ofes_depth_profile_samples(tracer_snapshot, positions, reference_sigma)
+                cross[(date, position_date)] = crossing
+        if date in representative_dates:
+            object_row = objects.loc[objects['date'].eq(date)].iloc[0]
+            cache = source / 'field_cache' / f'{event_id}_{date:%Y%m%d}.npz'
+            if not cache.is_file():
+                raise FileNotFoundError(cache)
+            field, diagnostic = _ofes_single_event_review_rep_field(cache, date, object_row, day, identity)
+            maps[date] = field
+            centers.append(diagnostic['center'])
+            velocity_candidates.extend(diagnostic['velocity_candidates'])
+            radial_profiles.extend(diagnostic['radial_profiles'])
+    association = pd.DataFrame(association_rows)
+    if len(association) != len(paired) or association.duplicated(['date','seed_id']).any():
+        raise ValueError('Particle-layer profile association has incomplete seed/date coverage.')
+    association['particle_index'] = association['seed_id'].astype(int)
+    paired = paired.merge(association.drop(columns=['seed_id','particle_depth_m']),
+                          on=['date','particle_index'], how='left', validate='one_to_one')
+    object_fields = objects[['date','daily_object_key','centroid_lon','centroid_lat',
+                             'peak_depth_at_max','depth_min','depth_max',
+                             'equivalent_radius_km','delta_do_max']].rename(columns={
+        'daily_object_key':'catalog_object_key',
+        'peak_depth_at_max':'catalog_peak_depth_m',
+        'depth_min':'catalog_peak_pixel_depth_min_m',
+        'depth_max':'catalog_peak_pixel_depth_max_m',
+    })
+    paired = paired.merge(object_fields, on='date', how='left', validate='many_to_one')
+    paired['object_available'] = paired['catalog_object_key'].notna()
+    paired['distance_to_object_centroid_km'] = great_circle_distance_m(
+        paired['lon_3d'], paired['lat_3d'], paired['centroid_lon'], paired['centroid_lat'],
+    ) / 1000.0
+    for column in ('within_equivalent_radius_approx', 'within_detected_peak_level_range'):
+        paired[column] = pd.Series(pd.NA, index=paired.index, dtype='boolean')
+    available = paired['object_available']
+    paired.loc[available, 'within_equivalent_radius_approx'] = (
+        paired.loc[available, 'distance_to_object_centroid_km']
+        <= paired.loc[available, 'equivalent_radius_km']
+    ).to_numpy(bool)
+    paired.loc[available, 'within_detected_peak_level_range'] = (
+        paired.loc[available, 'depth_3d_m'].between(
+            paired.loc[available, 'catalog_peak_pixel_depth_min_m'],
+            paired.loc[available, 'catalog_peak_pixel_depth_max_m'],
+        )
+    ).to_numpy(bool)
+    peak_object = objects.loc[objects['date'].eq(end)].iloc[0]
+    start_arrived = paired.loc[paired['date'].eq(end)]
+    cohort_context = pd.DataFrame([
+        {
+            'cohort': 'start_date_release_at_peak',
+            'release_date': start.date().isoformat(),
+            'comparison_date': end.date().isoformat(),
+            'seed_count': len(start_arrived),
+            'median_lon': float(start_arrived['lon_3d'].median()),
+            'median_lat': float(start_arrived['lat_3d'].median()),
+            'median_depth_m': float(start_arrived['depth_3d_m'].median()),
+            'median_distance_to_peak_object_km': float(start_arrived['distance_to_object_centroid_km'].median()),
+        },
+        {
+            'cohort': 'independent_peak_date_release',
+            'release_date': end.date().isoformat(),
+            'comparison_date': end.date().isoformat(),
+            'seed_count': len(peak_release),
+            'median_lon': float(peak_release['lon'].median()),
+            'median_lat': float(peak_release['lat'].median()),
+            'median_depth_m': float(peak_release['depth_m'].median()),
+            'median_distance_to_peak_object_km': float(np.median(
+                great_circle_distance_m(
+                    peak_release['lon'], peak_release['lat'],
+                    float(peak_object['centroid_lon']), float(peak_object['centroid_lat']),
+                ) / 1000.0
+            )),
+        },
+    ])
+    paired.to_parquet(root / 'member_daily.parquet', index=False)
+    cohort_context.to_csv(root / 'release_cohort_context.csv', index=False)
+    association.to_parquet(root / 'association.parquet', index=False)
+    pd.DataFrame(virtual_profiles).to_parquet(root / 'virtual_profiles.parquet', index=False)
+    objects.to_csv(root / 'object_daily.csv', index=False)
+    native_cores.to_csv(root / 'native_endpoint_cores.csv', index=False)
+    pd.DataFrame(centers).to_csv(root / 'representative_centers.csv', index=False)
+    pd.DataFrame(velocity_candidates).to_csv(root / 'representative_velocity_candidates.csv', index=False)
+    pd.DataFrame(radial_profiles).to_csv(root / 'representative_ring_profiles.csv', index=False)
+    pd.DataFrame(field_inventory).to_csv(root / 'field_inventory.csv', index=False)
+    pd.DataFrame([item['support'] for item in maps.values()]).to_csv(
+        root / 'representative_field_support.csv', index=False,
+    )
+    density_daily = density_steps = None
+    cross_status = None
+    if mode == 'divergence':
+        density_daily, density_steps = _ofes_single_event_review_density(paired, cross)
+        cross_status = pd.concat([
+            frame.assign(field_date=field_date, position_date=position_date)
+            for (field_date, position_date), frame in cross.items()
+        ], ignore_index=True)
+        density_daily.to_parquet(root / 'density_daily.parquet', index=False)
+        density_steps.to_parquet(root / 'density_steps.parquet', index=False)
+        cross_status.to_parquet(root / 'density_cross_time_status.parquet', index=False)
+    figures = _ofes_single_event_review_field_figure(
+        root, paired, objects, maps, pd.DataFrame(centers), mode,
+    )
+    if mode == 'divergence':
+        figures.extend(_ofes_single_event_review_divergence_figures(
+            root, paired, objects, native_cores, density_daily, density_steps,
+        ))
+    validation = {
+        'analysis': 'ofes_single_event_material_review', 'complete': True,
+        'status': 'complete', 'case_id': identity['case_id'], 'event_id': event_id,
+        'review_mode': mode, 'seed_count': len(seeds), 'date_count': len(dates),
+        'member_rows': len(paired), 'association_rows': len(association),
+        'particle_layer_positive_count': int(association['particle_within_positive_core'].sum()),
+        'object_detected_dates': len(objects), 'object_missing_dates': len(dates) - len(objects),
+        'representative_field_dates': len(maps),
+        'independent_peak_release_seed_count': len(peak_release),
+        'density_unique_crossing_rows': int(density_daily['crossing_count'].eq(1).sum()) if mode == 'divergence' else None,
+        'density_valid_step_rows': int(density_steps['closure_error_m'].notna().sum()) if mode == 'divergence' else None,
+        'density_full_decomposition_seed_count': int(density_steps.groupby('particle_index')['closure_error_m'].apply(lambda x:x.notna().all()).sum()) if mode == 'divergence' else None,
+        'density_cross_time_nonunique_count': int(cross_status['crossing_count'].ne(1).sum()) if mode == 'divergence' else None,
+        'density_max_closure_error_m': float(density_steps['closure_error_m'].abs().max()) if mode == 'divergence' else None,
+        'resolved_case_spec_sha256': hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+    }
+    _ofes_cached_transport_write_json(root / 'validation.json', validation)
+    outputs = [
+        'member_daily.parquet', 'association.parquet', 'virtual_profiles.parquet',
+        'release_cohort_context.csv',
+        'object_daily.csv', 'native_endpoint_cores.csv',
+        'representative_centers.csv', 'representative_velocity_candidates.csv',
+        'representative_ring_profiles.csv', 'field_inventory.csv',
+        'representative_field_support.csv', *figures, 'validation.json',
+    ]
+    if mode == 'divergence':
+        outputs.extend(['density_daily.parquet','density_steps.parquet','density_cross_time_status.parquet'])
+    manifest = {
+        'analysis': validation['analysis'], 'complete': True, 'status': 'complete',
+        'case_id': identity['case_id'], 'event_id': event_id,
+        'resolved_case_spec': identity, 'source_manifest': str(source_manifest),
+        'outputs': outputs,
+        'density_decomposition': 'E239_symmetric_two_order_geometry' if mode == 'divergence' else None,
+        'structure_center_scope': 'representative_formal_object_days_only',
+    }
+    _ofes_cached_transport_write_json(root / 'manifest.json', manifest)
+    return {
+        'output_dir': root, 'manifest': root / 'manifest.json',
+        'validation': root / 'validation.json', 'members': root / 'member_daily.parquet',
+        'association': root / 'association.parquet',
+        'figures': [root / name for name in figures],
+    }
+
+
+def load_ofes_single_event_material_review(output_dir: str | Path) -> dict[str, Any]:
+    """只读已完成的单事件材料机制审查轻量表图。
+
+    参数:
+        - output_dir (str | Path): 含同身份 manifest/validation 的审查目录。
+    返回:
+        - dict[str, Any]: manifest、validation、逐日成员、关联峰、对象、密度表和图路径。
+    说明:
+        - 拒绝未完成状态、改变的来源 manifest 或缺失的必需输出。
+    """
+    import hashlib
+
+    root = Path(output_dir).expanduser().resolve()
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    identity = manifest.get('resolved_case_spec')
+    if (
+        manifest.get('analysis') != 'ofes_single_event_material_review'
+        or validation.get('analysis') != manifest['analysis']
+        or not manifest.get('complete') or not validation.get('complete')
+        or manifest.get('status') != 'complete'
+        or validation.get('status') != 'complete'
+        or not isinstance(identity, Mapping)
+        or str(root) != identity.get('output_dir')
+        or manifest.get('case_id') != identity.get('case_id')
+        or validation.get('case_id') != identity.get('case_id')
+        or validation.get('resolved_case_spec_sha256')
+        != hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    ):
+        raise ValueError('Single-event review identity or completion status is invalid.')
+    source = Path(manifest['source_manifest'])
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != identity['source_manifest_sha256']:
+        raise ValueError('Single-event source manifest changed after review.')
+    if any(not (root / name).is_file() or (root / name).stat().st_size == 0 for name in manifest['outputs']):
+        raise FileNotFoundError('A required single-event review output is missing or empty.')
+    members = pd.read_parquet(root / 'member_daily.parquet')
+    association = pd.read_parquet(root / 'association.parquet')
+    dates = set(pd.date_range(identity['start_date'], identity['end_date']))
+    keys = {(int(seed), day) for seed in identity['seed_ids'] for day in dates}
+    member_keys = set(zip(members['particle_index'], pd.to_datetime(members['date']).dt.normalize()))
+    association_keys = set(zip(association['particle_index'], pd.to_datetime(association['date']).dt.normalize()))
+    if (
+        len(members) != len(keys) or len(association) != len(keys)
+        or member_keys != keys or association_keys != keys
+        or members['event_id'].astype(str).ne(identity['event_id']).any()
+        or int(validation['member_rows']) != len(members)
+    ):
+        raise ValueError('Single-event seed/date identity is inconsistent.')
+    objects = pd.read_csv(root / 'object_daily.csv')
+    detected_dates = set(pd.to_datetime(objects['date']).dt.normalize())
+    expected_available = pd.to_datetime(members['date']).dt.normalize().isin(detected_dates)
+    actual_available = members['object_available']
+    if (
+        actual_available.isna().any()
+        or not np.array_equal(actual_available.to_numpy(bool), expected_available)
+        or members.loc[~expected_available, [
+            'within_equivalent_radius_approx', 'within_detected_peak_level_range',
+        ]].notna().any().any()
+        or members.loc[expected_available, [
+            'within_equivalent_radius_approx', 'within_detected_peak_level_range',
+        ]].isna().any().any()
+    ):
+        raise ValueError('Missing-day object flags must remain unknown, not outside.')
+    figures = [root / name for name in manifest['outputs'] if name.startswith('figure_') and name.endswith('.png')]
+    result = {
+        'manifest': manifest, 'validation': validation,
+        'members': members, 'association': association,
+        'objects': objects,
+        'centers': pd.read_csv(root / 'representative_centers.csv'),
+        'figures': figures,
+    }
+    if identity['review_mode'] == 'divergence':
+        result['density_daily'] = pd.read_parquet(root / 'density_daily.parquet')
+        result['density_steps'] = pd.read_parquet(root / 'density_steps.parquet')
+    return result
