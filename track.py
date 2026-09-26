@@ -101150,6 +101150,28 @@ def _ofes_do50_detectability_peak_rows(
     }
 
 
+def _ofes_select_particle_layer_peaks(
+    peak_rows: list[dict], particle_depth_m: float, depth_tolerance_m: float,
+) -> tuple[dict | None, dict | None, int]:
+    """按 E225 顺序返回全水柱最大正峰、粒子半振幅核关联峰和包含峰数。"""
+    if not np.isfinite(particle_depth_m) or not np.isfinite(depth_tolerance_m) or depth_tolerance_m < 0:
+        raise ValueError('Particle depth and core tolerance must be finite and valid.')
+    order = lambda item: (
+        -float(item['delta_do_umol_kg']),
+        abs(float(item['peak_depth_m']) - particle_depth_m),
+        float(item['peak_depth_m']),
+    )
+    global_peak = min(peak_rows, key=order) if peak_rows else None
+    containing = [
+        item for item in peak_rows
+        if float(item['half_amplitude_upper_depth_m']) - depth_tolerance_m
+        <= particle_depth_m
+        <= float(item['half_amplitude_lower_depth_m']) + depth_tolerance_m
+    ]
+    associated = min(containing, key=order) if containing else None
+    return global_peak, associated, len(containing)
+
+
 def _ofes_do50_detectability_load_snapshots(
     properties: pd.DataFrame,
     dates: pd.DatetimeIndex,
@@ -102152,39 +102174,8 @@ def build_ofes_do50_detectability_diagnostic(
             else np.nan
         )
         peak_rows = peak_info['peak_rows']
-        global_peak = (
-            sorted(
-                peak_rows,
-                key=lambda item: (
-                    -float(item['delta_do_umol_kg']),
-                    abs(float(item['peak_depth_m']) - float(record['depth_m'])),
-                    float(item['peak_depth_m']),
-                ),
-            )[0]
-            if peak_rows
-            else None
-        )
-        associated_rows = [
-            item for item in peak_rows
-            if (
-                float(item['half_amplitude_upper_depth_m'])
-                - float(rule['depth_tolerance_m'])
-                <= float(record['depth_m'])
-                <= float(item['half_amplitude_lower_depth_m'])
-                + float(rule['depth_tolerance_m'])
-            )
-        ]
-        associated = (
-            sorted(
-                associated_rows,
-                key=lambda item: (
-                    -float(item['delta_do_umol_kg']),
-                    abs(float(item['peak_depth_m']) - float(record['depth_m'])),
-                    float(item['peak_depth_m']),
-                ),
-            )[0]
-            if associated_rows
-            else None
+        global_peak, associated, _ = _ofes_select_particle_layer_peaks(
+            peak_rows, float(record['depth_m']), float(rule['depth_tolerance_m']),
         )
         profile_status = str(peak_info['status'])
         if profile_status != 'evaluated':
@@ -109530,3 +109521,744 @@ def load_ofes_structure_organization_review(output_dir: str | Path) -> dict[str,
         if not Path(path).is_file():
             raise FileNotFoundError(f'Structure figure is missing: {path}')
     return {'output_dir': root, 'manifest': manifest, **tables, 'figures': manifest['figures']}
+
+
+_OFES_CACHED_TRANSPORT_OUTPUTS = (
+    'member_daily.parquet', 'particle_layer_peak_association.parquet',
+    'virtual_profiles.parquet', 'declared_date_hits.csv',
+    'three_event_passage.csv', 'structure_centers_daily.csv',
+    'member_relative_daily.csv', 'oxygen_candidate_branches.csv',
+    'velocity_center_candidates.csv', 'velocity_ring_radial_profiles.csv',
+    'field_cache_inventory.csv', 'chain_fields_and_paths.png',
+    'all_member_properties.png', 'member_motion_relative_to_center.png',
+    'validation.json',
+)
+
+
+def _ofes_cached_transport_read_day(
+    source: Path, stamp: pd.Timestamp, center_lon: float, center_lat: float,
+    target_depth: float, half_width_deg: float,
+) -> tuple[dict, dict, list[dict]]:
+    """复用并核对当日缓存网格，返回同层流场和全深度示踪物剖面场。"""
+    snapshot: dict[str, Any] = {}
+    tracer_profile: dict[str, Any] = {}
+    inventory = []
+    for role, stem, variables in (
+        ('velocity', 'field_cache/uvws', ('u', 'v')),
+        ('tracer', 'tracer_cache/tracers', ('do2', 'temp', 'salinity')),
+    ):
+        path = source / f'{stem}_{stamp:%Y%m%d}.npz'
+        with np.load(path, allow_pickle=False) as cached:
+            if pd.Timestamp(str(cached['date'].item())).normalize() != stamp:
+                raise ValueError(f'Cache date identity mismatch: {path}')
+            lon = np.asarray(cached['lon'], dtype=float)
+            lat = np.asarray(cached['lat'], dtype=float)
+            depth = np.asarray(cached['depth'], dtype=float)
+            lon_mask = np.abs(_minimal_lon_diff_deg(lon, center_lon)) <= half_width_deg
+            lat_mask = np.abs(lat - center_lat) <= half_width_deg
+            if lon_mask.sum() < 5 or lat_mask.sum() < 5:
+                raise ValueError(f'Insufficient cached local domain on {stamp:%Y-%m-%d}.')
+            level = int(np.argmin(np.abs(depth - target_depth)))
+            if role == 'velocity':
+                snapshot.update({
+                    'lon': lon[lon_mask], 'lat': lat[lat_mask],
+                    'depth': depth[level:level + 1],
+                })
+                for variable in variables:
+                    snapshot[variable] = cached[variable][level][np.ix_(lat_mask, lon_mask)][None, :, :]
+            else:
+                if not (
+                    np.allclose(snapshot['lon'], lon[lon_mask])
+                    and np.allclose(snapshot['lat'], lat[lat_mask])
+                    and np.isclose(snapshot['depth'][0], depth[level])
+                ):
+                    raise ValueError(f'Velocity/tracer grid identity mismatch on {stamp:%Y-%m-%d}.')
+                tracer_profile = {
+                    'lon': lon[lon_mask], 'lat': lat[lat_mask], 'depth': depth,
+                    'metadata': {'variable_dims': {
+                        name: ('depth', 'lat', 'lon') for name in variables
+                    }},
+                }
+                for variable in variables:
+                    volume = np.asarray(cached[variable], dtype=float)
+                    tracer_profile[variable] = volume[:, lat_mask][:, :, lon_mask]
+                    snapshot[variable] = tracer_profile[variable][level:level + 1]
+        inventory.append({
+            'date': stamp.date().isoformat(), 'role': role, 'path': str(path),
+            'size_bytes': path.stat().st_size, 'mtime_ns': path.stat().st_mtime_ns,
+            'layer_depth_m': float(snapshot['depth'][0]),
+            'full_tracer_depth_count': int(len(tracer_profile.get('depth', []))) if role == 'tracer' else 0,
+        })
+    return snapshot, tracer_profile, inventory
+
+
+def _ofes_cached_transport_associate_day(
+    tracer_snapshot: dict, day: pd.DataFrame, formal_config: DetectionConfig,
+    association_rule: Mapping[str, Any],
+) -> tuple[list[dict], list[dict]]:
+    """复用 E225 正峰与半振幅核定义，对全部同批粒子逐日配准剖面。"""
+    associated_rows = []
+    profile_rows = []
+    tolerance = float(association_rule['depth_tolerance_m'])
+    for record in day.itertuples(index=False):
+        profile = extract_ofes_profile_interp(
+            tracer_snapshot, float(record.lon), float(record.lat),
+            variables=['do2', 'temp', 'salinity'],
+        )
+        peak_info = _ofes_do50_detectability_peak_rows(
+            profile, formal_config,
+            half_window_m=float(association_rule['half_window_m']),
+            half_amplitude_fraction=float(association_rule['half_amplitude_fraction']),
+        )
+        global_peak, associated, containing_count = _ofes_select_particle_layer_peaks(
+            peak_info['peak_rows'], float(record.depth_m), tolerance,
+        )
+        if global_peak is not None and not np.isclose(
+            float(global_peak['delta_do_umol_kg']),
+            float(record.project_profile_delta_do_umol_kg),
+            atol=1e-3, rtol=0,
+        ):
+            raise ValueError('Reconstructed global profile peak differs from the saved family property.')
+        clean_profile = peak_info['profile']
+        raw_at_particle = (
+            float(np.interp(
+                float(record.depth_m), clean_profile['Depth'].to_numpy(float),
+                clean_profile['do2'].to_numpy(float),
+            )) if peak_info['status'] == 'evaluated' else np.nan
+        )
+        if np.isfinite(raw_at_particle) and not np.isclose(
+            raw_at_particle, float(record.do2), atol=1e-3, rtol=0,
+        ):
+            raise ValueError('Virtual profile raw oxygen differs from saved particle sampling.')
+        associated_rows.append({
+            'seed_id': str(record.seed_id), 'date': pd.Timestamp(record.date),
+            'particle_depth_m': float(record.depth_m),
+            'profile_status': str(peak_info['status']),
+            'profile_positive_peak_count': int(peak_info['positive_peak_count']),
+            'particle_containing_peak_count': containing_count,
+            'particle_within_positive_core': bool(associated is not None),
+            'global_peak_delta_do_umol_kg': float(global_peak['delta_do_umol_kg']) if global_peak else np.nan,
+            'global_peak_depth_m': float(global_peak['peak_depth_m']) if global_peak else np.nan,
+            'global_core_upper_depth_m': float(global_peak['half_amplitude_upper_depth_m']) if global_peak else np.nan,
+            'global_core_lower_depth_m': float(global_peak['half_amplitude_lower_depth_m']) if global_peak else np.nan,
+            'associated_peak_delta_do_umol_kg': float(associated['delta_do_umol_kg']) if associated else np.nan,
+            'associated_peak_depth_m': float(associated['peak_depth_m']) if associated else np.nan,
+            'associated_core_upper_depth_m': float(associated['half_amplitude_upper_depth_m']) if associated else np.nan,
+            'associated_core_lower_depth_m': float(associated['half_amplitude_lower_depth_m']) if associated else np.nan,
+            'raw_do_profile_at_particle_umol_kg': raw_at_particle,
+        })
+        for level in profile.itertuples(index=False):
+            profile_rows.append({
+                'date': pd.Timestamp(record.date), 'seed_id': str(record.seed_id),
+                'particle_depth_m': float(record.depth_m),
+                'native_depth_m': float(level.Depth), 'do2': float(level.do2),
+                'theta': float(level.temp), 'salinity': float(level.salinity),
+            })
+    return associated_rows, profile_rows
+
+
+def _ofes_cached_transport_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """以原子替换写入状态 JSON，避免半截 manifest 被误读。"""
+    temporary = path.with_suffix(path.suffix + '.partial')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    temporary.replace(path)
+
+
+def _ofes_cached_transport_prepare_run(root: Path, identity: dict) -> None:
+    """拒绝不同身份复用，先撤销旧 complete 再允许覆盖分析表图。"""
+    manifest_path = root / 'manifest.json'
+    saved = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else None
+    if saved is not None:
+        if saved.get('analysis') != 'cached_transport_structure_review':
+            raise ValueError('Existing output belongs to a different analysis.')
+        if saved.get('resolved_case_spec') != identity:
+            raise ValueError('Existing output lacks a matching resolved case identity.')
+    elif root.exists() and any(
+        (root / name).exists() for name in (
+            'member_daily.parquet', 'structure_centers_daily.csv',
+            'chain_fields_and_paths.png', 'validation.json',
+        )
+    ):
+        raise ValueError('Generated transport outputs exist without a matching manifest.')
+    root.mkdir(parents=True, exist_ok=True)
+    _ofes_cached_transport_write_json(manifest_path, {
+        'analysis': 'cached_transport_structure_review',
+        'complete': False, 'status': 'in_progress',
+        'case_id': identity['case_id'], 'source_case_id': identity['source_case_id'],
+        'source_manifest_sha256': identity['source_manifest_sha256'],
+        'arm_id': identity['arm_id'], 'resolved_case_spec': identity,
+    })
+    _ofes_cached_transport_write_json(root / 'validation.json', {
+        'analysis': 'cached_transport_structure_review',
+        'complete': False, 'status': 'in_progress',
+        'case_id': identity['case_id'], 'arm_id': identity['arm_id'],
+    })
+
+
+def _ofes_cached_transport_structure_day(
+    snapshot: dict, stamp: pd.Timestamp, anchor_lon: float, anchor_lat: float,
+    centroid_lon: float, centroid_lat: float, declared: pd.DataFrame,
+    settings: Mapping[str, Any],
+) -> dict:
+    """沿上一日性质峰追踪并独立保存同层速度中心的全部竞争证据。"""
+    search_km = float(settings['oxygen_search_radius_km'])
+    inventory_km = float(settings['candidate_inventory_radius_km'])
+    candidate_count = int(settings['candidate_display_count'])
+    separation_km = float(settings['candidate_min_separation_km'])
+    spice_km = float(settings['spice_centroid_radius_km'])
+    spice_quantile = float(settings['spice_centroid_quantile'])
+    ring_kwargs = dict(settings['velocity_ring'])
+    candidate_rows = []
+    velocity_candidates = []
+    radial_rows = []
+    grid_lon, grid_lat = np.meshgrid(snapshot['lon'], snapshot['lat'])
+    distance = local_xy_distance_m(grid_lon, grid_lat, anchor_lon, anchor_lat) / 1000.0
+    oxygen = np.asarray(snapshot['do2'][0], dtype=float)
+    local_oxygen = np.where(distance <= search_km, oxygen, np.nan)
+    if not np.isfinite(local_oxygen).any():
+        raise ValueError(f'No finite oxygen near prior-day object center on {stamp:%Y-%m-%d}.')
+    r, c = np.unravel_index(np.nanargmax(local_oxygen), local_oxygen.shape)
+    oxygen_lon = float(snapshot['lon'][c])
+    oxygen_lat = float(snapshot['lat'][r])
+    anchor_step_km = float(distance[r, c])
+    alternative = np.where(distance <= inventory_km, oxygen, np.nan).copy()
+    for candidate_rank in range(1, candidate_count + 1):
+        if not np.isfinite(alternative).any():
+            break
+        rr, cc = np.unravel_index(np.nanargmax(alternative), alternative.shape)
+        alternative_lon = float(snapshot['lon'][cc])
+        alternative_lat = float(snapshot['lat'][rr])
+        candidate_rows.append({
+            'date': stamp, 'rank': candidate_rank,
+            'lon': alternative_lon, 'lat': alternative_lat,
+            'raw_do_umol_kg': float(oxygen[rr, cc]),
+            'distance_from_prior_peak_km': float(distance[rr, cc]),
+            'inside_continuity_gate': bool(distance[rr, cc] <= search_km),
+            'selected': bool(rr == r and cc == c),
+        })
+        remove = local_xy_distance_m(grid_lon, grid_lat, alternative_lon, alternative_lat) <= separation_km * 1000.0
+        alternative[remove] = np.nan
+    anchor_lon, anchor_lat = oxygen_lon, oxygen_lat
+    spice = _ofes_structure_spiciness_volume(snapshot)[0]
+    thermohaline_mask = (
+        np.isfinite(spice)
+        & (local_xy_distance_m(grid_lon, grid_lat, oxygen_lon, oxygen_lat) <= spice_km * 1000.0)
+    )
+    local_spice = spice[thermohaline_mask]
+    spice_cut = float(np.nanquantile(local_spice, spice_quantile))
+    weight = np.where(thermohaline_mask, np.maximum(spice - spice_cut, 0.0), 0.0)
+    if np.nansum(weight) > 0:
+        thermal_lon = float(np.nansum(grid_lon * weight) / np.nansum(weight))
+        thermal_lat = float(np.nansum(grid_lat * weight) / np.nansum(weight))
+    else:
+        thermal_lon = np.nan
+        thermal_lat = np.nan
+    ring = _ofes_velocity_ring_pilot(
+        snapshot, oxygen_lon, oxygen_lat, float(snapshot['depth'][0]),
+        **ring_kwargs,
+    )
+    velocity_candidates.extend({
+        'date': stamp, 'rank': rank, **candidate,
+    } for rank, candidate in enumerate(ring['center_candidates'], start=1))
+    radial_rows.extend({
+        'date': stamp, **row,
+    } for row in ring['radial_profile'].to_dict('records'))
+    center = {
+        'date': stamp, 'field_layer_depth_m': float(snapshot['depth'][0]),
+        'material_median_lon': centroid_lon, 'material_median_lat': centroid_lat,
+        'oxygen_peak_lon': oxygen_lon, 'oxygen_peak_lat': oxygen_lat,
+        'oxygen_peak_raw_umol_kg': float(oxygen[r, c]),
+        'oxygen_peak_theta_deg_c': float(snapshot['temp'][0, r, c]),
+        'oxygen_peak_salinity_psu': float(snapshot['salinity'][0, r, c]),
+        'oxygen_peak_spiciness0': float(spice[r, c]),
+        'oxygen_peak_step_from_prior_km': anchor_step_km,
+        'oxygen_peak_from_formal_object_km': float(
+            great_circle_distance_m(
+                oxygen_lon, oxygen_lat,
+                float(declared.loc[declared['date'].eq(stamp), 'object_centroid_lon'].iloc[0]),
+                float(declared.loc[declared['date'].eq(stamp), 'object_centroid_lat'].iloc[0]),
+            ) / 1000.0
+        ) if declared['date'].eq(stamp).any() else np.nan,
+        'spice_upper_decile_centroid_lon': thermal_lon,
+        'spice_upper_decile_centroid_lat': thermal_lat,
+        'velocity_center_lon': ring['velocity_center_lon'],
+        'velocity_center_lat': ring['velocity_center_lat'],
+        'velocity_center_offset_from_oxygen_km': ring['velocity_center_offset_km'],
+        'velocity_center_zeta_over_f': ring['velocity_center_signed_zeta_over_f'],
+        'velocity_center_status': ring['center_status'],
+        'ring_profile_status': ring['profile_status'],
+        'ring_ro_v': ring['ro_v'],
+    }
+    return {
+        'center': center, 'ring': ring, 'spice': spice,
+        'oxygen_candidates': candidate_rows,
+        'velocity_candidates': velocity_candidates,
+        'radial_profiles': radial_rows,
+    }
+
+
+def build_ofes_cached_transport_structure_review(
+    case_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    """复用已保存的 OFES 同批轨迹和逐日场，审查输送材料的结构关系。
+
+    入口只消费现成的三维轨迹、性质、命中表及按日 u/v/示踪剂缓存。
+    首日以正式源端点对象质心定位同层氧峰，其后沿前日氧峰逐日追踪；
+    再用速度场的既有 velocity-ring 诊断寻找动力中心。氧峰、局地热盐
+    质心与动力中心分别保存，不借粒子当日位置选择性质峰。
+
+    参数:
+        - case_spec (Mapping[str, Any]): 必含 case_id、family_output_dir、output_dir、forward arm_id、1–5 个代表日期；几何、速度环与正式半振幅核参数可显式给出，resolved 值写入 manifest。
+    返回:
+        - dict[str, Any]: 含 output_dir、validation、manifest、centers、members、relative 路径。
+    说明:
+        - 先核对已有 manifest 的完整身份，再将运行状态置为 incomplete；只有全部表图完成才标记 complete。支持同身份重跑，拒绝异身份覆盖。
+        - `member_daily.parquet` 分列原全水柱最大峰、粒子层关联峰及固定深度局地 DO 对比；`virtual_profiles.parquet` 与 `particle_layer_peak_association.parquet` 保存核依据。
+        - 结构中心是每日局地诊断，不将相邻中心自动视为同一物质结构；不估氧通量。
+    """
+    import hashlib
+    from dataclasses import asdict
+
+    source = Path(case_spec['family_output_dir']).expanduser().resolve()
+    root = Path(case_spec['output_dir']).expanduser().resolve()
+    if not str(case_spec.get('case_id', '')).strip():
+        raise ValueError('Transport case_id must be non-empty.')
+    if root == source or source.is_relative_to(root) or root.is_relative_to(source):
+        raise ValueError('Output and existing formal source directories must not overlap.')
+    arm_id = str(case_spec['arm_id'])
+    representative_dates = [pd.Timestamp(value).normalize() for value in case_spec['representative_dates']]
+    if not (1 <= len(representative_dates) <= 5) or len(representative_dates) != len(set(representative_dates)):
+        raise ValueError('Representative dates must be unique and at most five.')
+    formal = json.loads((source / 'manifest.json').read_text(encoding='utf-8'))
+    formal_validation = json.loads((source / 'validation.json').read_text(encoding='utf-8'))
+    if formal.get('analysis') != 'family_endpoint_connection' or not formal_validation.get('all_real_seeds_retained'):
+        raise ValueError('Formal family source has the wrong identity or is incomplete.')
+    specs = json.loads((source / 'case_specs.json').read_text(encoding='utf-8'))
+    selected_arms = [arm for arm in specs['arms'] if str(arm['arm_id']) == arm_id]
+    if len(selected_arms) != 1 or selected_arms[0]['direction'] != 'forward':
+        raise ValueError('Requested forward arm is absent from formal case specification.')
+    arm = selected_arms[0]
+    source_endpoint = [endpoint for endpoint in specs['endpoint_definitions']
+                       if str(endpoint['label']) == str(arm['source_label'])]
+    if len(source_endpoint) != 1:
+        raise ValueError('Requested arm source endpoint is not unique.')
+    declared = pd.read_csv(source / 'family_structure_context.csv')
+    declared['date'] = pd.to_datetime(declared['date']).dt.normalize()
+    source_event_id = str(source_endpoint[0]['event_id'])
+    anchor_row = declared.loc[
+        declared['event_id'].astype(str).eq(source_event_id)
+        & declared['date'].eq(pd.Timestamp(arm['release_date']).normalize())
+    ]
+    if len(anchor_row) != 1:
+        raise ValueError('Exactly one formal source object is required to anchor the structure path.')
+    anchor_lon = float(anchor_row.iloc[0]['object_centroid_lon'])
+    anchor_lat = float(anchor_row.iloc[0]['object_centroid_lat'])
+    positions = pd.read_parquet(source / 'trajectory_positions.parquet')
+    properties = pd.read_parquet(source / 'particle_properties.parquet')
+    positions['date'] = pd.to_datetime(positions['date']).dt.normalize()
+    properties['date'] = pd.to_datetime(properties['date']).dt.normalize()
+    member = properties.loc[
+        properties['arm_id'].astype(str).eq(arm_id)
+        & properties['vertical_mode'].astype(str).eq('three_dimensional')
+    ].copy()
+    position_member = positions.loc[
+        positions['arm_id'].astype(str).eq(arm_id)
+        & positions['vertical_mode'].astype(str).eq('three_dimensional')
+    ].copy()
+    paired_keys = ['arm_id', 'vertical_mode', 'seed_id', 'date']
+    if member.duplicated(paired_keys).any() or position_member.duplicated(paired_keys).any():
+        raise ValueError('Duplicate seed-day keys in saved trajectory or property table.')
+    joined = member.merge(
+        position_member[paired_keys + ['lon', 'lat', 'depth_m', 'status']],
+        on=paired_keys, how='outer', suffixes=('', '_trajectory'), indicator=True,
+        validate='one_to_one',
+    )
+    if not joined['_merge'].eq('both').all():
+        raise ValueError('Saved positions and properties do not have identical seed-days.')
+    for column in ('lon', 'lat', 'depth_m'):
+        if not np.allclose(joined[column], joined[f'{column}_trajectory'], equal_nan=True, atol=1e-7):
+            raise ValueError(f'Saved position/property {column} identity differs.')
+    dates = pd.date_range(member['date'].min(), member['date'].max(), freq='D')
+    if dates[0] != pd.Timestamp(arm['release_date']) or dates[-1] != pd.Timestamp(arm['target_date']):
+        raise ValueError('Saved trajectory dates differ from the declared forward arm.')
+    seed_ids = sorted(member['seed_id'].astype(str).unique())
+    if len(member) != len(seed_ids) * len(dates) or not set(representative_dates).issubset(set(dates)):
+        raise ValueError('Main trajectory does not cover each declared seed-day.')
+    if not member['status'].eq('active').all() or not member['property_sample_status'].eq('sampled').all():
+        raise ValueError('The saved main trajectory has inactive or unsampled rows.')
+    passage = pd.read_csv(source / 'same_release_three_event_passage.csv')
+    passage = passage.loc[passage['arm_id'].astype(str).eq(arm_id)].copy()
+    if set(passage['seed_id']) != set(seed_ids) or passage['seed_id'].duplicated().any():
+        raise ValueError('Passage seed identity does not match the trajectory.')
+    passage['connected'] = passage['passed_declared_events_at_least_once'].astype(bool)
+    member = member.merge(
+        passage[['seed_id', 'connected', 'strict_all_declared_dates']],
+        on='seed_id', how='left', validate='many_to_one',
+    )
+    hits = pd.read_csv(source / 'same_release_three_segment_intersection.csv')
+    hits = hits.loc[hits['arm_id'].astype(str).eq(arm_id)].copy()
+    if set(hits['seed_id']) != set(seed_ids):
+        raise ValueError('Exact-day hit table has a different seed set.')
+    half_width = float(case_spec.get('field_half_width_deg', 1.6))
+    search_km = float(case_spec.get('oxygen_search_radius_km', 45.0))
+    inventory_km = float(case_spec.get('candidate_inventory_radius_km', 70.0))
+    separation_km = float(case_spec.get('candidate_min_separation_km', 12.0))
+    candidate_count = int(case_spec.get('candidate_display_count', 5))
+    spice_km = float(case_spec.get('spice_centroid_radius_km', 45.0))
+    spice_quantile = float(case_spec.get('spice_centroid_quantile', 0.9))
+    ring_kwargs = {
+        'smoothing_sigma_pixels': 1.0, 'center_search_radius_km': 65.0,
+        'profile_max_radius_km': 100.0, 'background_inner_radius_km': 75.0,
+        'background_outer_radius_km': 95.0,
+        **dict(case_spec.get('velocity_ring', {})),
+    }
+    ring_keys = {
+        'smoothing_sigma_pixels', 'center_search_radius_km',
+        'profile_max_radius_km', 'background_inner_radius_km',
+        'background_outer_radius_km',
+    }
+    if (
+        set(ring_kwargs) != ring_keys
+        or not np.isfinite(list(ring_kwargs.values())).all()
+        or ring_kwargs['smoothing_sigma_pixels'] < 0
+        or ring_kwargs['center_search_radius_km'] <= 0
+        or ring_kwargs['profile_max_radius_km'] <= 0
+        or not (0 < ring_kwargs['background_inner_radius_km']
+                < ring_kwargs['background_outer_radius_km']
+                <= ring_kwargs['profile_max_radius_km'])
+    ):
+        raise ValueError('Velocity-ring settings are invalid.')
+    formal_config = make_detection_config('do')
+    association_rule = {
+        'version': _OFES_DO50_DETECTABILITY_RULE_VERSION,
+        'half_window_m': float(formal_config.depth_interval),
+        'half_amplitude_fraction': 0.5, 'depth_tolerance_m': 1e-6,
+        **dict(case_spec.get('association_rule', {})),
+    }
+    if not (
+        np.isfinite([half_width, search_km, inventory_km, separation_km, spice_km, spice_quantile]).all()
+        and half_width > 0 and 0 < search_km <= inventory_km
+        and separation_km > 0 and 1 <= candidate_count <= 8
+        and spice_km > 0 and 0 < spice_quantile < 1
+        and association_rule['version'] == _OFES_DO50_DETECTABILITY_RULE_VERSION
+        and float(association_rule['half_window_m']) == float(formal_config.depth_interval)
+        and float(association_rule['half_amplitude_fraction']) == 0.5
+        and np.isfinite(float(association_rule['depth_tolerance_m']))
+        and float(association_rule['depth_tolerance_m']) >= 0
+    ):
+        raise ValueError('Transport geometry or formal peak association settings are invalid.')
+    source_hash = hashlib.sha256((source / 'manifest.json').read_bytes()).hexdigest()
+    identity = {
+        'case_id': str(case_spec['case_id']), 'family_output_dir': str(source),
+        'output_dir': str(root), 'source_case_id': str(specs['case_id']),
+        'source_manifest_sha256': source_hash, 'arm_id': arm_id,
+        'source_endpoint_label': str(arm['source_label']),
+        'release_date': dates[0].date().isoformat(),
+        'end_date': dates[-1].date().isoformat(), 'seed_ids': seed_ids,
+        'representative_dates': [stamp.date().isoformat() for stamp in representative_dates],
+        'field_half_width_deg': half_width, 'oxygen_search_radius_km': search_km,
+        'candidate_inventory_radius_km': inventory_km,
+        'candidate_min_separation_km': separation_km,
+        'candidate_display_count': candidate_count,
+        'spice_centroid_radius_km': spice_km,
+        'spice_centroid_quantile': spice_quantile,
+        'velocity_ring': {key: float(value) for key, value in ring_kwargs.items()},
+        'association_rule': association_rule,
+        'formal_detection_config': asdict(formal_config),
+    }
+    _ofes_cached_transport_prepare_run(root, identity)
+    centers = []
+    relative_rows = []
+    candidate_rows = []
+    velocity_candidates = []
+    radial_rows = []
+    profile_associations = []
+    virtual_profiles = []
+    field_inventory = []
+    snapshots = {}
+    for stamp in dates:
+        day = member.loc[member['date'].eq(stamp)].copy()
+        centroid_lon = float(day['lon'].median())
+        centroid_lat = float(day['lat'].median())
+        layer_target = float(day['depth_m'].median())
+        snapshot, tracer_profile, day_inventory = _ofes_cached_transport_read_day(
+            source, stamp, centroid_lon, centroid_lat, layer_target, half_width,
+        )
+        field_inventory.extend(day_inventory)
+        day_associations, day_profiles = _ofes_cached_transport_associate_day(
+            tracer_profile, day, formal_config, association_rule,
+        )
+        profile_associations.extend(day_associations)
+        virtual_profiles.extend(day_profiles)
+        diagnostic = _ofes_cached_transport_structure_day(
+            snapshot, stamp, anchor_lon, anchor_lat,
+            centroid_lon, centroid_lat, declared, identity,
+        )
+        center = diagnostic['center']
+        ring = diagnostic['ring']
+        spice = diagnostic['spice']
+        oxygen = np.asarray(snapshot['do2'][0], dtype=float)
+        candidate_rows.extend(diagnostic['oxygen_candidates'])
+        velocity_candidates.extend(diagnostic['velocity_candidates'])
+        radial_rows.extend(diagnostic['radial_profiles'])
+        centers.append(center)
+        anchor_lon = float(center['oxygen_peak_lon'])
+        anchor_lat = float(center['oxygen_peak_lat'])
+        for point in day.itertuples(index=False):
+            dx, dy = _ofes_transport_organization_signed_xy(
+                point.lon, point.lat, ring['velocity_center_lon'], ring['velocity_center_lat']
+            )
+            relative_rows.append({
+                'date': stamp, 'seed_id': point.seed_id, 'connected': bool(point.connected),
+                'depth_m': float(point.depth_m), 'distance_to_velocity_center_km': float(np.hypot(dx, dy) / 1000.0),
+                'azimuth_about_velocity_center_deg': float(np.degrees(np.arctan2(dy, dx))),
+                'east_of_velocity_center_km': dx / 1000.0,
+                'north_of_velocity_center_km': dy / 1000.0,
+            })
+        if stamp in representative_dates:
+            snapshots[stamp] = {
+                'lon': snapshot['lon'], 'lat': snapshot['lat'],
+                'do2': oxygen, 'u': snapshot['u'][0], 'v': snapshot['v'][0],
+                'spice': spice,
+            }
+    association_frame = pd.DataFrame(profile_associations)
+    if len(association_frame) != len(member) or association_frame.duplicated(['seed_id', 'date']).any():
+        raise ValueError('Virtual profile association does not cover unique seed-days.')
+    member = member.merge(association_frame.drop(columns='particle_depth_m'),
+                          on=['seed_id', 'date'], how='left', validate='one_to_one')
+    member['full_column_peak_delta_do_umol_kg'] = member['project_profile_delta_do_umol_kg']
+    center_frame = pd.DataFrame(centers)
+    relative = pd.DataFrame(relative_rows)
+    member.to_parquet(root / 'member_daily.parquet', index=False)
+    hits.to_csv(root / 'declared_date_hits.csv', index=False)
+    passage.to_csv(root / 'three_event_passage.csv', index=False)
+    association_frame.to_parquet(root / 'particle_layer_peak_association.parquet', index=False)
+    pd.DataFrame(virtual_profiles).to_parquet(root / 'virtual_profiles.parquet', index=False)
+    center_frame.to_csv(root / 'structure_centers_daily.csv', index=False)
+    relative.to_csv(root / 'member_relative_daily.csv', index=False)
+    pd.DataFrame(candidate_rows).to_csv(root / 'oxygen_candidate_branches.csv', index=False)
+    pd.DataFrame(velocity_candidates).to_csv(root / 'velocity_center_candidates.csv', index=False)
+    pd.DataFrame(radial_rows).to_csv(root / 'velocity_ring_radial_profiles.csv', index=False)
+    pd.DataFrame(field_inventory).to_csv(root / 'field_cache_inventory.csv', index=False)
+    _ofes_cached_transport_review_figures(root, member, center_frame, relative, snapshots, representative_dates)
+    qa = {
+        'analysis': 'cached_transport_structure_review',
+        'complete': True,
+        'seed_count': len(seed_ids), 'date_count': len(dates), 'member_rows': len(member),
+        'connected_count': int(passage['connected'].sum()),
+        'strict_all_declared_count': int(passage['strict_all_declared_dates'].sum()),
+        'daily_velocity_center_count': int(np.isfinite(center_frame['velocity_center_lon']).sum()),
+        'velocity_ring_estimable_count': int(center_frame['ring_profile_status'].eq('estimable_conditional_velocity_ring').sum()),
+        'minimum_full_column_peak_delta_do_umol_kg': float(member['full_column_peak_delta_do_umol_kg'].min()),
+        'particle_layer_associated_day_count': int(member['particle_within_positive_core'].sum()),
+        'minimum_associated_peak_delta_do_umol_kg': float(member['associated_peak_delta_do_umol_kg'].min()),
+        'virtual_profile_row_count': len(virtual_profiles),
+        'minimum_fixed_depth_local_do_contrast': float(member['fixed_depth_local_do_contrast'].min()),
+        'maximum_oxygen_peak_step_km': float(center_frame['oxygen_peak_step_from_prior_km'].max()),
+        'same_seed_day_qa': True, 'source_property_sample_status': 'all_sampled',
+    }
+    qa['case_id'] = identity['case_id']
+    qa['arm_id'] = identity['arm_id']
+    qa['resolved_case_spec_sha256'] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    _ofes_cached_transport_write_json(root / 'validation.json', qa)
+    manifest = {
+        'analysis': qa['analysis'], 'complete': True, 'status': 'complete',
+        'case_id': identity['case_id'], 'resolved_case_spec': identity,
+        'source_case_id': specs['case_id'], 'source_manifest': str((source / 'manifest.json').resolve()),
+        'source_manifest_sha256': source_hash,
+        'arm_id': arm_id, 'release_date': dates[0].date().isoformat(),
+        'end_date': dates[-1].date().isoformat(), 'seed_ids': seed_ids,
+        'representative_dates': [stamp.date().isoformat() for stamp in representative_dates],
+        'field_layer_rule': 'nearest_to_daily_median_particle_depth',
+        'oxygen_peak_rule': f'raw_oxygen_max_within_{search_km:g}_km_of_prior_day_peak',
+        'first_day_anchor': 'formal_source_endpoint_object_centroid',
+        'source_endpoint_label': str(arm['source_label']),
+        'candidate_branch_table': 'oxygen_candidate_branches.csv',
+        'thermal_centroid_rule': 'spiciness0_excess_over_local_quantile_within_configured_radius',
+        'velocity_center_rule': 'existing_velocity_ring_pilot_near_oxygen_peak_independent_uv',
+        'candidate_scope': 'daily_local_oxygen_branches_anchored_to_formal_source_object',
+        'outputs': list(_OFES_CACHED_TRANSPORT_OUTPUTS),
+    }
+    _ofes_cached_transport_write_json(root / 'manifest.json', manifest)
+    return {'output_dir': root, 'validation': root / 'validation.json',
+            'manifest': root / 'manifest.json', 'centers': root / 'structure_centers_daily.csv',
+            'members': root / 'member_daily.parquet', 'relative': root / 'member_relative_daily.csv'}
+
+
+def _ofes_cached_transport_review_property_figure(root: Path, member: pd.DataFrame) -> None:
+    """由已保存的同批逐日性质表单独重绘六面板，不读取原始场。"""
+    fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True, constrained_layout=True)
+    variables = [('do2', 'Raw DO (µmol kg⁻¹)'),
+                 ('associated_peak_delta_do_umol_kg', 'Particle-layer core ΔDO (µmol kg⁻¹)'),
+                 ('sigma0', 'σ₀ (kg m⁻³)'),
+                 ('fixed_depth_local_do_contrast', 'DO minus local depth background (µmol kg⁻¹)'),
+                 ('spiciness0', 'Spiciness₀'), ('depth_m', 'Depth (m, down positive)')]
+    for ax, (variable, label) in zip(axes.ravel(), variables):
+        for _, group in member.groupby('seed_id'):
+            group = group.sort_values('date')
+            connected = bool(group['connected'].iloc[0])
+            ax.plot(group['date'], group[variable], color='#cb3f64' if connected else '#808b96',
+                    linewidth=1.35 if connected else 0.8, alpha=0.9 if connected else 0.45)
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.2)
+    for ax in axes[-1]:
+        ax.tick_params(axis='x', rotation=30)
+    fig.savefig(root / 'all_member_properties.png', dpi=220)
+    plt.close(fig)
+
+
+
+def _ofes_cached_transport_review_figures(
+    root: Path, member: pd.DataFrame, centers: pd.DataFrame,
+    relative: pd.DataFrame, snapshots: dict, representative_dates: list[pd.Timestamp],
+) -> None:
+    """绘制实际局地场、同批材料性质和相对动力中心运动。"""
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    axes = axes.ravel()
+    for ax, stamp in zip(axes, representative_dates):
+        field = snapshots[stamp]
+        center = centers.loc[centers['date'].eq(stamp)].iloc[0]
+        day = member.loc[member['date'].eq(stamp)]
+        image = ax.pcolormesh(field['lon'], field['lat'], field['do2'], cmap='viridis',
+                              vmin=150, vmax=235, shading='auto', rasterized=True)
+        stride = 5
+        ax.quiver(field['lon'][::stride], field['lat'][::stride],
+                  field['u'][::stride, ::stride], field['v'][::stride, ::stride],
+                  color='white', alpha=0.75, scale=5, width=0.0024)
+        for connected, marker, color in [(False, 'o', '#f0b775'), (True, 'D', '#ed4968')]:
+            subset = day.loc[day['connected'].eq(connected)]
+            ax.scatter(subset['lon'], subset['lat'], marker=marker, s=25,
+                       c=color, edgecolor='black', linewidth=0.4, zorder=4)
+        ax.scatter(center['oxygen_peak_lon'], center['oxygen_peak_lat'],
+                   marker='+', s=85, c='white', linewidth=2.0, zorder=6)
+        ax.scatter(center['spice_upper_decile_centroid_lon'], center['spice_upper_decile_centroid_lat'],
+                   marker='s', s=55, facecolor='none', edgecolor='#ffce2e', linewidth=1.8, zorder=6)
+        ax.scatter(center['velocity_center_lon'], center['velocity_center_lat'],
+                   marker='x', s=65, c='#ff3dd1', linewidth=2.0, zorder=6)
+        ax.set(xlim=(center['material_median_lon'] - 0.85, center['material_median_lon'] + 0.85),
+               ylim=(center['material_median_lat'] - 0.75, center['material_median_lat'] + 0.75),
+               title=f'{stamp:%Y-%m-%d}  {center["field_layer_depth_m"]:.0f} m', xlabel='Longitude (°E)', ylabel='Latitude (°N)')
+        ax.set_aspect(1.0 / np.cos(np.radians(center['material_median_lat'])))
+    path_ax = axes[-1]
+    for seed_id, group in member.groupby('seed_id'):
+        group = group.sort_values('date')
+        color = '#ed4968' if bool(group['connected'].iloc[0]) else '#a6a6a6'
+        path_ax.plot(group['lon'], group['lat'], color=color, linewidth=1.1, alpha=0.8)
+    path_ax.plot(centers['velocity_center_lon'], centers['velocity_center_lat'],
+                 color='#782b84', linewidth=2.3, marker='x', markersize=3)
+    path_ax.set(title=f'{centers["date"].nunique()}-day material paths and velocity centers', xlabel='Longitude (°E)', ylabel='Latitude (°N)')
+    path_ax.grid(alpha=0.25)
+    from matplotlib.lines import Line2D
+    legend_items = [
+        Line2D([], [], marker='o', linestyle='none', color='#f0b775', markeredgecolor='black', label='Other source seeds'),
+        Line2D([], [], marker='D', linestyle='none', color='#ed4968', markeredgecolor='black', label=f"{int(member.groupby('seed_id')['connected'].first().sum())} event-passage seeds"),
+        Line2D([], [], marker='+', linestyle='none', color='white', markeredgecolor='black', label='Raw DO peak'),
+        Line2D([], [], marker='s', linestyle='none', markerfacecolor='none', markeredgecolor='#b78e00', label='Local spice centroid'),
+        Line2D([], [], marker='x', linestyle='none', color='#a92896', label='Velocity center'),
+    ]
+    path_ax.legend(handles=legend_items, loc='lower right', fontsize=6, framealpha=0.9)
+    fig.colorbar(image, ax=axes[:5], label='Raw DO (µmol kg⁻¹)', shrink=0.65)
+    fig.savefig(root / 'chain_fields_and_paths.png', dpi=220)
+    plt.close(fig)
+
+    _ofes_cached_transport_review_property_figure(root, member)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
+    for seed_id, group in relative.groupby('seed_id'):
+        group = group.sort_values('date')
+        connected = bool(group['connected'].iloc[0])
+        color = '#cb3f64' if connected else '#808b96'
+        axes[0].plot(group['date'], group['distance_to_velocity_center_km'],
+                     color=color, linewidth=1.3 if connected else 0.8, alpha=0.85 if connected else 0.45)
+        unwrapped = np.degrees(np.unwrap(np.radians(group['azimuth_about_velocity_center_deg'])))
+        axes[1].plot(group['date'], unwrapped - unwrapped[0],
+                     color=color, linewidth=1.3 if connected else 0.8, alpha=0.85 if connected else 0.45)
+    axes[0].set_ylabel('Distance to daily velocity center (km)')
+    axes[1].set_ylabel('Daily-sampled unwrapped azimuth (°)')
+    axes[1].tick_params(axis='x', rotation=30)
+    for ax in axes:
+        ax.grid(alpha=0.2)
+    fig.savefig(root / 'member_motion_relative_to_center.png', dpi=220)
+    plt.close(fig)
+
+
+def load_ofes_cached_transport_structure_review(output_dir: str | Path) -> dict[str, Any]:
+    """读取已完成的 OFES 同批输送结构审查表图。
+
+    仅加载小型逐日结果，适合 Notebook 已执行的审阅单元。
+
+    参数:
+        - output_dir (str | Path): 已完成审查的输出目录。
+    返回:
+        - dict[str, Any]: 含 manifest、validation、centers、members、association、relative 和三张 figures 路径。
+    说明:
+        - 校验 complete 状态、resolved 规格和来源 manifest、全部必要文件及 seed/date 契约；不读取昂贵原始场。
+    """
+    import hashlib
+
+    root = Path(output_dir).expanduser().resolve()
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    validation = json.loads((root / 'validation.json').read_text(encoding='utf-8'))
+    identity = manifest.get('resolved_case_spec')
+    if (
+        manifest.get('analysis') != 'cached_transport_structure_review'
+        or validation.get('analysis') != manifest['analysis']
+        or not manifest.get('complete') or manifest.get('status') != 'complete'
+        or not validation.get('complete')
+        or not isinstance(identity, Mapping)
+        or str(root) != identity.get('output_dir')
+        or manifest.get('case_id') != identity.get('case_id')
+        or validation.get('case_id') != identity.get('case_id')
+        or manifest.get('arm_id') != identity.get('arm_id')
+        or validation.get('arm_id') != identity.get('arm_id')
+        or manifest.get('source_manifest_sha256') != identity.get('source_manifest_sha256')
+        or validation.get('resolved_case_spec_sha256')
+        != hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    ):
+        raise ValueError('Saved OFES transport review identity is incomplete or mismatched.')
+    source_manifest = Path(manifest['source_manifest'])
+    if (
+        not source_manifest.is_file()
+        or hashlib.sha256(source_manifest.read_bytes()).hexdigest()
+        != identity['source_manifest_sha256']
+    ):
+        raise ValueError('Saved OFES transport review source manifest has changed.')
+    expected_outputs = set(_OFES_CACHED_TRANSPORT_OUTPUTS)
+    if set(manifest.get('outputs', [])) != expected_outputs or any(
+        not (root / name).is_file() or (root / name).stat().st_size == 0
+        for name in expected_outputs
+    ):
+        raise FileNotFoundError('A required transport review output is missing or empty.')
+    members = pd.read_parquet(root / 'member_daily.parquet')
+    association = pd.read_parquet(root / 'particle_layer_peak_association.parquet')
+    centers = pd.read_csv(root / 'structure_centers_daily.csv')
+    relative = pd.read_csv(root / 'member_relative_daily.csv')
+    dates = set(pd.date_range(identity['release_date'], identity['end_date'], freq='D'))
+    member_dates = pd.to_datetime(members['date']).dt.normalize()
+    center_dates = pd.to_datetime(centers['date']).dt.normalize()
+    relative_dates = pd.to_datetime(relative['date']).dt.normalize()
+    associated_dates = pd.to_datetime(association['date']).dt.normalize()
+    seed_ids = set(identity['seed_ids'])
+    expected_keys = {(seed, stamp) for seed in seed_ids for stamp in dates}
+    if (
+        set(zip(members['seed_id'], member_dates)) != expected_keys
+        or set(zip(relative['seed_id'], relative_dates)) != expected_keys
+        or set(zip(association['seed_id'], associated_dates)) != expected_keys
+        or len(members) != len(relative) or len(members) != len(association)
+        or len(members) != len(expected_keys)
+        or len(centers) != len(dates) or set(center_dates) != dates
+        or members['arm_id'].astype(str).ne(identity['arm_id']).any()
+        or int(validation['member_rows']) != len(members)
+        or int(validation['particle_layer_associated_day_count'])
+        != int(association['particle_within_positive_core'].sum())
+    ):
+        raise ValueError('Saved OFES transport review seed/date contract is inconsistent.')
+    figures = [root / name for name in (
+        'chain_fields_and_paths.png', 'all_member_properties.png',
+        'member_motion_relative_to_center.png',
+    )]
+    return {
+        'manifest': manifest, 'validation': validation,
+        'centers': centers, 'members': members, 'association': association,
+        'relative': relative, 'figures': figures,
+    }
