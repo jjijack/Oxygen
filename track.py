@@ -108817,3 +108817,716 @@ def _ofes_dual_endpoint_build_arrival_stability(
             }
         )
     return pd.DataFrame(rows)
+
+
+def _ofes_structure_review_fields(
+    date: pd.Timestamp, spec: Mapping[str, Any], root: Path,
+) -> dict[str, np.ndarray]:
+    """Read one identity-checked local cache, or create it from the native daily fields."""
+    cache = root / 'field_cache' / f'fields_{date:%Y%m%d}.npz'
+    requested = {
+        'requested_lon_bounds': np.asarray(spec['lon_bounds'], dtype=float),
+        'requested_lat_bounds': np.asarray(spec['lat_bounds'], dtype=float),
+        'requested_depth_bounds_m': np.asarray(spec['depth_bounds_m'], dtype=float),
+    }
+    if cache.is_file():
+        with np.load(cache, allow_pickle=False) as saved:
+            fields = {name: saved[name] for name in saved.files}
+        if str(fields.get('date', '')) != date.date().isoformat():
+            raise ValueError(f'Cached OFES field date differs: {cache}')
+        if any(
+            key not in fields or not np.array_equal(fields[key], value)
+            for key, value in requested.items()
+        ):
+            raise ValueError(f'Cached OFES read bounds differ: {cache}')
+    else:
+        snapshot = load_ofes_snapshot(
+            date, variables=['do2', 'temp', 'salinity', 'u', 'v'],
+            lon_bounds=tuple(spec['lon_bounds']),
+            lat_bounds=tuple(spec['lat_bounds']),
+            depth_bounds=tuple(spec['depth_bounds_m']),
+        )
+        fields = {
+            name: np.asarray(snapshot[name])
+            for name in ('lon', 'lat', 'depth', 'do2', 'temp', 'salinity', 'u', 'v')
+        }
+        fields.update(requested)
+        fields['date'] = np.asarray(date.date().isoformat())
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache, **fields)
+    shape = (
+        len(fields['depth']), len(fields['lat']), len(fields['lon'])
+    )
+    if (
+        any(np.asarray(fields[name]).shape != shape for name in ('do2', 'temp', 'salinity', 'u', 'v'))
+        or any(
+            not np.all(np.diff(np.asarray(fields[name], dtype=float)) > 0)
+            for name in ('depth', 'lat', 'lon')
+        )
+    ):
+        raise ValueError(f'OFES tracer and collocated velocity shapes or coordinates differ: {cache}')
+    return fields
+
+
+def _ofes_structure_review_density_section(
+    fields: Mapping[str, np.ndarray], lon_index: int,
+) -> np.ndarray:
+    """Calculate sigma0 on a native meridional section using project TEOS-10 order."""
+    depth = np.asarray(fields['depth'], dtype=float)
+    latitude = np.asarray(fields['lat'], dtype=float)
+    longitude = float(fields['lon'][lon_index])
+    pressure = gsw.p_from_z(-depth[:, None], latitude[None, :])
+    absolute_salinity = gsw.SA_from_SP(
+        fields['salinity'][:, :, lon_index], pressure,
+        longitude, latitude[None, :],
+    )
+    return gsw.sigma0(
+        absolute_salinity,
+        gsw.CT_from_pt(
+            absolute_salinity, fields['temp'][:, :, lon_index]
+        ),
+    )
+
+
+def _ofes_structure_review_ridge(
+    u_at: Any, v_at: Any, latitude: np.ndarray, longitude: float, depth: float,
+) -> dict[str, float | int]:
+    """Sample velocity at exact z/lon and retain competing latitude peaks."""
+    from scipy.signal import find_peaks
+
+    points = np.column_stack((
+        np.full(len(latitude), depth), latitude,
+        np.full(len(latitude), longitude),
+    ))
+    speed = np.hypot(u_at(points), v_at(points))
+    if not np.isfinite(speed).any():
+        raise ValueError('No finite speed along the jet-search latitude section.')
+    best = int(np.nanargmax(speed))
+    peaks, _ = find_peaks(speed, prominence=.04, distance=4)
+    ranked = sorted(peaks, key=lambda index: speed[index], reverse=True)
+    second = next((index for index in ranked if index != best), None)
+    return {
+        'lat': float(latitude[best]),
+        'speed_m_s': float(speed[best]),
+        'peak_count': int(len(peaks)),
+        'second_lat': float(latitude[second]) if second is not None else np.nan,
+        'second_to_first_speed_ratio': (
+            float(speed[second] / speed[best]) if second is not None else np.nan
+        ),
+    }
+
+
+def _ofes_structure_review_inner_contour(
+    eta: np.ndarray, lon: np.ndarray, lat: np.ndarray,
+    center_index: tuple[int, int], material: pd.DataFrame,
+) -> tuple[float, bool, int | None]:
+    """Check an inner SSH contour without treating it as a material boundary."""
+    import matplotlib.pyplot as plt
+    from matplotlib.path import Path as MplPath
+
+    i, j = center_index
+    level = float(eta[i, j] + .05)
+    fig, ax = plt.subplots()
+    contours = ax.contour(lon, lat, eta, levels=[level])
+    center = (float(lon[j]), float(lat[i]))
+    closed = [
+        MplPath(segment) for segment in contours.allsegs[0]
+        if len(segment) >= 5
+        and np.allclose(segment[0], segment[-1], atol=1e-6)
+        and MplPath(segment).contains_point(center)
+    ]
+    plt.close(fig)
+    if not closed:
+        return level, False, None
+    points = material[['lon', 'lat']].to_numpy(dtype=float)
+    return level, True, int(sum(
+        any(path.contains_point(point) for path in closed)
+        for point in points
+    ))
+
+
+def _ofes_structure_review_plot(
+    root: Path, spec: Mapping[str, Any], dates: Sequence[pd.Timestamp],
+    positions: pd.DataFrame, fields_by_day: Mapping[str, Mapping[str, np.ndarray]],
+    eta_by_day: Mapping[str, np.ndarray], troughs: pd.DataFrame,
+    ridge_continuity: pd.DataFrame,
+) -> dict[str, str]:
+    """Draw four-day jet/SSH maps and two native-depth cross-jet sections."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    ncols = min(2, len(dates))
+    nrows = int(np.ceil(len(dates) / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(12, 4.4 * nrows),
+        squeeze=False, constrained_layout=True,
+    )
+    map_axes = axes.ravel()
+    section_dates = [dates[0]] if len(dates) == 1 else [dates[0], dates[-1]]
+    section_data = []
+    map_image = None
+    for index, date in enumerate(dates):
+        key = date.date().isoformat()
+        fields = fields_by_day[key]
+        lon = np.asarray(fields['lon'], dtype=float)
+        lat = np.asarray(fields['lat'], dtype=float)
+        depth = np.asarray(fields['depth'], dtype=float)
+        level = int(np.argmin(np.abs(depth - float(spec['reference_depth_m']))))
+        u = np.asarray(fields['u'][level], dtype=float)
+        v = np.asarray(fields['v'][level], dtype=float)
+        speed = np.hypot(u, v)
+        ax = map_axes[index]
+        map_image = ax.pcolormesh(
+            lon, lat, speed, cmap='viridis', vmin=0, vmax=1.15,
+            shading='auto', rasterized=True,
+        )
+        eta = eta_by_day[key]
+        levels = np.arange(
+            np.ceil(np.nanmin(eta) * 5) / 5,
+            np.floor(np.nanmax(eta) * 5) / 5 + .01, .2,
+        )
+        if len(levels):
+            contours = ax.contour(lon, lat, eta, levels=levels, colors='white', linewidths=.7)
+            ax.clabel(contours, fontsize=7, fmt='%.1f')
+        step = max(1, len(lat) // 25)
+        ax.quiver(
+            lon[::step], lat[::step], u[::step, ::step], v[::step, ::step],
+            color='0.12', alpha=.55, scale=10, width=.0018,
+        )
+        day_ridges = ridge_continuity.loc[ridge_continuity['date'].eq(key)]
+        ax.scatter(
+            day_ridges['lon'], day_ridges['reference_ridge_lat'],
+            s=7, color='white', edgecolor='0.15', linewidth=.2, zorder=4,
+        )
+        second = day_ridges.loc[
+            day_ridges['second_to_first_speed_ratio'].ge(.8)
+        ]
+        ax.scatter(
+            second['lon'], second['second_peak_lat'],
+            s=7, color='#CC79A7', edgecolor='0.15', linewidth=.2, zorder=4,
+        )
+        for arm, color, marker in (
+            ('3d', '#E69F00', 'o'), ('c2', '#56B4E9', 'x')
+        ):
+            group = positions.loc[
+                positions['date'].eq(date) & positions['arm'].eq(arm)
+            ]
+            ax.scatter(
+                group['lon'], group['lat'], color=color, marker=marker,
+                s=15, linewidths=.7, zorder=5,
+            )
+        selected = troughs.loc[
+            troughs['date'].eq(key) & troughs['selected']
+        ]
+        if len(selected) > 1:
+            raise ValueError(f'Multiple SSH troughs selected for {key}.')
+        if len(selected) == 1:
+            ax.scatter(
+                selected['lon'], selected['lat'], s=80, marker='+',
+                color='#D55E00', linewidths=2, zorder=6,
+            )
+        ax.set(
+            xlim=spec['lon_bounds'], ylim=spec['lat_bounds'],
+            title=f'{key}  |  z={depth[level]:.0f} m',
+            xlabel='Longitude (°E)', ylabel='Latitude (°N)',
+        )
+        ax.set_aspect(1.2)
+        if date in section_dates:
+            material = positions.loc[
+                positions['date'].eq(date) & positions['arm'].eq('3d')
+            ]
+            section_lon = float(lon[np.argmin(np.abs(lon - material['lon'].median()))])
+            ax.axvline(section_lon, color='#CC79A7', linestyle='--', linewidth=1)
+            section_data.append((date, section_lon, fields, material))
+    for ax in map_axes[len(dates):]:
+        ax.set_visible(False)
+    fig.colorbar(map_image, ax=map_axes[:len(dates)], shrink=.75, label='Speed at reference z (m s⁻¹)')
+    map_axes[0].legend(handles=[
+        Line2D([0], [0], marker='o', color='none', markerfacecolor='#E69F00', label='3-D material'),
+        Line2D([0], [0], marker='x', color='#56B4E9', linestyle='none', label='same-seed C2'),
+        Line2D([0], [0], marker='+', color='#D55E00', linestyle='none', label='selected SSH low'),
+        Line2D([0], [0], marker='o', color='white', markeredgecolor='0.15', linestyle='none', label='strongest 448-m ridge'),
+        Line2D([0], [0], marker='o', color='#CC79A7', linestyle='none', label='second peak ≥80%'),
+        Line2D([0], [0], color='#CC79A7', linestyle='--', label='section longitude'),
+    ], loc='lower left', ncol=1, fontsize=7, framealpha=.9)
+    map_path = root / 'jet_ssh_material_maps.png'
+    fig.savefig(map_path, dpi=220, bbox_inches='tight')
+    plt.close(fig)
+
+    nrows = len(section_data)
+    fig, axes = plt.subplots(nrows, 4, figsize=(17, 4.2 * nrows), squeeze=False, constrained_layout=True)
+    section_arrays = []
+    for date, section_lon, fields, material in section_data:
+        j = int(np.argmin(np.abs(fields['lon'] - section_lon)))
+        sigma = _ofes_structure_review_density_section(fields, j)
+        arrays = (
+            np.hypot(fields['u'][:, :, j], fields['v'][:, :, j]),
+            np.asarray(fields['temp'][:, :, j]),
+            np.asarray(fields['salinity'][:, :, j]),
+            np.asarray(fields['do2'][:, :, j]),
+        )
+        section_arrays.append((date, section_lon, fields, material, sigma, arrays))
+    labels = (
+        ('Speed (m s⁻¹)', 'viridis'),
+        ('Potential temperature (°C)', 'plasma'),
+        ('Salinity (PSS-78)', 'BrBG'),
+        ('Dissolved oxygen (µmol kg⁻¹)', 'turbo'),
+    )
+    limits = [
+        np.nanpercentile(
+            np.concatenate([item[-1][col].ravel() for item in section_arrays]),
+            [2, 98],
+        )
+        for col in range(4)
+    ]
+    for row_index, (date, section_lon, fields, material, sigma, arrays) in enumerate(section_arrays):
+        lat = np.asarray(fields['lat'], dtype=float)
+        depth = np.asarray(fields['depth'], dtype=float)
+        for col, (label, cmap) in enumerate(labels):
+            ax = axes[row_index, col]
+            image = ax.pcolormesh(
+                lat, depth, arrays[col], cmap=cmap,
+                vmin=float(limits[col][0]), vmax=float(limits[col][1]),
+                shading='auto', rasterized=True,
+            )
+            finite = sigma[np.isfinite(sigma)]
+            density_levels = np.arange(
+                np.ceil(finite.min() * 5) / 5,
+                np.floor(finite.max() * 5) / 5 + .01, .2,
+            )
+            contours = ax.contour(lat, depth, sigma, levels=density_levels, colors='black', linewidths=.55)
+            ax.clabel(contours, fontsize=6, fmt='%.1f')
+            ax.scatter(
+                material['lat'], material['depth_m'],
+                color='#D55E00', s=9, edgecolor='white', linewidth=.2,
+                zorder=5,
+            )
+            ax.set(
+                xlim=spec['section_lat_bounds'], ylim=(spec['depth_bounds_m'][1], 0),
+                xlabel='Latitude (°N)', ylabel='Depth (m)',
+                title=f'{date:%m-%d}  {label}',
+            )
+            fig.colorbar(image, ax=ax, shrink=.75)
+        axes[row_index, 0].text(
+            .02, .02, f'{section_lon:.3f}°E', transform=axes[row_index, 0].transAxes,
+            fontsize=8, color='white', bbox={'facecolor':'black','alpha':.55,'edgecolor':'none'},
+        )
+    fig.suptitle('Cross-jet sections: σ₀ contours; 3-D members projected to each section longitude', fontsize=12)
+    section_path = root / 'jet_front_vertical_sections.png'
+    fig.savefig(section_path, dpi=220, bbox_inches='tight')
+    plt.close(fig)
+    return {'maps': str(map_path.resolve()), 'sections': str(section_path.resolve())}
+
+
+def build_ofes_structure_organization_review(
+    case_spec: Mapping[str, Any], *, overwrite: bool = False,
+) -> dict[str, Any]:
+    """定位 OFES 材料路径所处的急流锋面及附近旋转结构。
+
+    读取已保存的同 seed 材料/C2 日位置和局地 OFES 日场。在每个成员精确经度和深度线性插值速度后，以规定纬度带内的速率最大值定义急流脊线；用平滑 SSH 的局地低值和原生层速度排列描述邻近气旋式回流。图示与逐日表均保留成员身份，结构名称由具体案例审阅给出。
+
+    参数:
+        - case_spec (Mapping[str, Any]): 事件、基线、输出、日期/空间范围、急流搜索带、SSH 低值搜索带及截面纬度范围。
+        - overwrite (bool): 是否重建同一输入规格的结果；默认 False。
+
+    返回:
+        - dict: 输出目录、逐成员/逐日关系表、旋转候选表、manifest 及两张图路径。
+
+    输出:
+        - `output_dir/field_cache/fields_YYYYMMDD.npz` 与 `eta_YYYYMMDD.npz`、五张 CSV、两张 PNG、`case_spec.json` 和 `manifest.json`。
+
+    说明:
+        - 速度脊线是局地几何参照，不自动构成涡心或物质边界；SSH 低值与速度旋向只支持欧拉旋转组织。
+        - 不重新积分、不读取 w、不做新释放或氧收支。
+    """
+    required = {
+        'event_id', 'baseline_output_dir', 'output_dir', 'start_date',
+        'end_date', 'lon_bounds', 'lat_bounds', 'depth_bounds_m',
+        'reference_depth_m', 'jet_search_lat_bounds',
+        'trough_search_lon_bounds', 'trough_search_lat_bounds',
+        'trough_eta_max_m', 'section_lat_bounds', 'rotation_depths_m',
+        'ssh_smoothing_sigma_grid', 'ssh_minimum_window_grid',
+        'rotation_meridional_offset_deg', 'rotation_zonal_offset_deg',
+    }
+    if not isinstance(case_spec, Mapping) or required - set(case_spec):
+        raise ValueError(f'Structure case specification lacks fields: {sorted(required - set(case_spec))}')
+    spec = json.loads(json.dumps(dict(case_spec), default=str))
+    root = Path(spec['output_dir']).expanduser().resolve()
+    baseline = Path(spec['baseline_output_dir']).expanduser().resolve()
+    if root == baseline or root.is_relative_to(baseline) or baseline.is_relative_to(root):
+        raise ValueError('Structure output must be separate from the accepted baseline.')
+    baseline_spec = json.loads((baseline / 'case_spec.json').read_text(encoding='utf-8'))
+    baseline_validation = json.loads((baseline / 'validation.json').read_text(encoding='utf-8'))
+    start = pd.Timestamp(spec['start_date']).normalize()
+    end = pd.Timestamp(spec['end_date']).normalize()
+    if (
+        baseline_validation.get('status') != 'pass'
+        or str(spec['event_id']) != baseline_spec['event_id']
+        or start != pd.Timestamp(baseline_spec['start_date']).normalize()
+        or end != pd.Timestamp(baseline_spec['end_date']).normalize()
+        or end < start
+    ):
+        raise ValueError('Structure case does not match the accepted event and date identity.')
+    dates = tuple(pd.date_range(start, end, freq='D'))
+    for name in (
+        'lon_bounds', 'lat_bounds', 'depth_bounds_m', 'jet_search_lat_bounds',
+        'trough_search_lon_bounds', 'trough_search_lat_bounds', 'section_lat_bounds',
+    ):
+        bounds = np.asarray(spec[name], dtype=float)
+        if bounds.shape != (2,) or not np.isfinite(bounds).all() or bounds[0] >= bounds[1]:
+            raise ValueError(f'{name} must contain increasing finite bounds.')
+        spec[name] = bounds.tolist()
+    if not np.isfinite(float(spec['trough_eta_max_m'])):
+        raise ValueError('The SSH low cutoff must be finite.')
+    if (
+        float(spec['ssh_smoothing_sigma_grid']) <= 0
+        or int(spec['ssh_minimum_window_grid']) < 3
+        or int(spec['ssh_minimum_window_grid']) % 2 != 1
+        or float(spec['rotation_meridional_offset_deg']) <= 0
+        or float(spec['rotation_zonal_offset_deg']) <= 0
+        or not spec['rotation_depths_m']
+        or not np.isfinite(np.asarray(spec['rotation_depths_m'], dtype=float)).all()
+    ):
+        raise ValueError('SSH and rotation sampling settings must be positive and finite.')
+    spec['baseline_output_dir'] = str(baseline)
+    spec['output_dir'] = str(root)
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        saved = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if (
+            saved.get('analysis') != 'ofes_structure_organization_review'
+            or saved.get('case_spec') != spec
+        ):
+            raise ValueError('Existing structure output has different input settings.')
+        if not overwrite:
+            return load_ofes_structure_organization_review(root)
+    elif root.exists() and any(root.iterdir()):
+        raise ValueError('Non-empty structure output lacks a matching manifest.')
+    daily = pd.read_parquet(baseline / 'daily.parquet')
+    daily['date'] = pd.to_datetime(daily['date']).dt.normalize()
+    labels = {
+        '3d': 'forward_observed_start_to_peak',
+        'c2': 'forward_same_seed_fixed_depth_control',
+    }
+    parts = []
+    for arm, label in labels.items():
+        part = daily.loc[
+            daily['integration_label'].eq(label) & daily['date'].isin(dates)
+            & daily['status'].eq('active')
+        ].copy()
+        part['arm'] = arm
+        parts.append(part)
+    positions = pd.concat(parts, ignore_index=True)
+    if set(positions['event_id'].astype(str)) != {str(spec['event_id'])}:
+        raise ValueError('Baseline positions have a different event identity.')
+    seeds = set(parts[0].loc[parts[0]['date'].eq(start), 'particle_index'])
+    expected = {(date, seed) for date in dates for seed in seeds}
+    if not seeds:
+        raise ValueError('No active initial material seeds.')
+    for arm, part in zip(labels, parts):
+        actual = set(zip(part['date'], part['particle_index']))
+        if actual != expected or len(part) != len(expected):
+            raise ValueError(f'Incomplete or duplicate {arm} member/date identities.')
+        if not part.groupby('particle_index')[['particle_id', 'release_date']].nunique().eq(1).all().all():
+            raise ValueError(f'{arm} seed has changing particle or release identity.')
+    identity = ['date', 'particle_index']
+    paired_identity = parts[0][identity + ['particle_id', 'release_date']].merge(
+        parts[1][identity + ['particle_id', 'release_date']], on=identity,
+        validate='one_to_one', suffixes=('_3d', '_c2'),
+    )
+    if (
+        not paired_identity['particle_id_3d'].astype(str).equals(paired_identity['particle_id_c2'].astype(str))
+        or not pd.to_datetime(paired_identity['release_date_3d']).equals(
+            pd.to_datetime(paired_identity['release_date_c2'])
+        )
+    ):
+        raise ValueError('The same-seed arms have mismatched particle or release identities.')
+    first_3d = parts[0].loc[parts[0]['date'].eq(start)].set_index('particle_index')
+    first_c2 = parts[1].loc[parts[1]['date'].eq(start)].set_index('particle_index')
+    for coordinate in (
+        'lon', 'lat', 'depth_m', 'reference_sigma0', 'do2',
+        'theta', 'salinity', 'sigma0', 'u_m_s', 'v_m_s',
+    ):
+        delta = (first_3d[coordinate] - first_c2[coordinate]).abs()
+        if not np.isfinite(delta).all() or delta.max() > 1e-8:
+            raise ValueError(f'The same-seed arms have different initial {coordinate}.')
+    root.mkdir(parents=True, exist_ok=True)
+    fields_by_day = {}
+    eta_by_day = {}
+    member_rows = []
+    candidate_rows = []
+    rotation_rows = []
+    ridge_rows = []
+    low_availability = {}
+    for date in dates:
+        key = date.date().isoformat()
+        fields = _ofes_structure_review_fields(date, spec, root)
+        fields_by_day[key] = fields
+        lon = np.asarray(fields['lon'], dtype=float)
+        lat = np.asarray(fields['lat'], dtype=float)
+        depth = np.asarray(fields['depth'], dtype=float)
+        sampled_depths = np.asarray(
+            [spec['reference_depth_m'], *spec['rotation_depths_m']], dtype=float
+        )
+        if not np.isfinite(sampled_depths).all() or (sampled_depths < depth[0]).any() or (sampled_depths > depth[-1]).any():
+            raise ValueError('Reference and rotation depths must lie within delivered levels.')
+        if not (
+            spec['jet_search_lat_bounds'][0] >= lat[0]
+            and spec['jet_search_lat_bounds'][1] <= lat[-1]
+            and spec['section_lat_bounds'][0] >= lat[0]
+            and spec['section_lat_bounds'][1] <= lat[-1]
+        ):
+            raise ValueError('Jet or section bounds fall outside the loaded field.')
+        eta_cache = root / 'field_cache' / f'eta_{date:%Y%m%d}.npz'
+        if eta_cache.is_file():
+            with np.load(eta_cache, allow_pickle=False) as saved:
+                if str(saved['date']) != key or not np.array_equal(saved['lon'], lon) or not np.array_equal(saved['lat'], lat):
+                    raise ValueError(f'Cached SSH identity differs: {eta_cache}')
+                eta = saved['eta']
+        else:
+            surface = load_ofes_snapshot(
+                date, variables=['eta'],
+                lon_bounds=tuple(spec['lon_bounds']),
+                lat_bounds=tuple(spec['lat_bounds']),
+                depth_bounds=tuple(spec['depth_bounds_m']),
+            )
+            if not np.array_equal(surface['lon'], lon) or not np.array_equal(surface['lat'], lat):
+                raise ValueError('SSH and 3-D fields do not share tracer-center coordinates.')
+            eta = np.asarray(surface['eta'])
+            np.savez_compressed(eta_cache, date=np.asarray(key), lon=lon, lat=lat, eta=eta)
+        eta_by_day[key] = eta
+        from scipy.interpolate import RegularGridInterpolator
+        from scipy.ndimage import gaussian_filter, minimum_filter
+        eta_at = RegularGridInterpolator((lat, lon), eta, bounds_error=False, fill_value=np.nan)
+        u_at = RegularGridInterpolator(
+            (depth, lat, lon), fields['u'], bounds_error=False, fill_value=np.nan
+        )
+        v_at = RegularGridInterpolator(
+            (depth, lat, lon), fields['v'], bounds_error=False, fill_value=np.nan
+        )
+        jet_lat = lat[
+            (lat >= spec['jet_search_lat_bounds'][0])
+            & (lat <= spec['jet_search_lat_bounds'][1])
+        ]
+        if len(jet_lat) < 5:
+            raise ValueError('The jet search band has too few native latitude rows.')
+        day_positions = positions.loc[positions['date'].eq(date)]
+        ridge_lon = lon[
+            (lon >= day_positions['lon'].min() - .1)
+            & (lon <= day_positions['lon'].max() + .1)
+        ]
+        previous_ridge_lat = None
+        for longitude in ridge_lon:
+            ridge = _ofes_structure_review_ridge(
+                u_at, v_at, jet_lat, float(longitude),
+                float(spec['reference_depth_m']),
+            )
+            ridge_rows.append({
+                'date': key, 'lon': float(longitude),
+                'reference_ridge_lat': ridge['lat'],
+                'reference_ridge_speed_m_s': ridge['speed_m_s'],
+                'peak_count': ridge['peak_count'],
+                'second_peak_lat': ridge['second_lat'],
+                'second_to_first_speed_ratio': ridge['second_to_first_speed_ratio'],
+                'adjacent_ridge_jump_deg': (
+                    np.nan if previous_ridge_lat is None
+                    else abs(float(ridge['lat']) - previous_ridge_lat)
+                ),
+            })
+            previous_ridge_lat = float(ridge['lat'])
+        for arm in labels:
+            group = day_positions.loc[day_positions['arm'].eq(arm)]
+            for row in group.itertuples(index=False):
+                actual = _ofes_structure_review_ridge(
+                    u_at, v_at, jet_lat, float(row.lon), float(row.depth_m),
+                )
+                common = _ofes_structure_review_ridge(
+                    u_at, v_at, jet_lat, float(row.lon),
+                    float(spec['reference_depth_m']),
+                )
+                signed_km = float(great_circle_distance_m(
+                    row.lon, row.lat, row.lon, actual['lat']
+                )) / 1000 * np.sign(float(actual['lat']) - row.lat)
+                common_km = float(great_circle_distance_m(
+                    row.lon, row.lat, row.lon, common['lat']
+                )) / 1000 * np.sign(float(common['lat']) - row.lat)
+                member_rows.append({
+                    'date': key, 'arm': arm, 'particle_index': row.particle_index,
+                    'lon': float(row.lon), 'lat': float(row.lat), 'depth_m': float(row.depth_m),
+                    'ridge_lat': actual['lat'], 'ridge_sampling_depth_m': float(row.depth_m),
+                    'south_of_ridge_km': signed_km,
+                    'reference_ridge_lat': common['lat'],
+                    'south_of_reference_ridge_km': common_km,
+                    'actual_peak_count': actual['peak_count'],
+                    'actual_second_to_first_speed_ratio': actual['second_to_first_speed_ratio'],
+                    'reference_peak_count': common['peak_count'],
+                    'reference_second_to_first_speed_ratio': common['second_to_first_speed_ratio'],
+                    'eta_m': float(eta_at([[row.lat, row.lon]])[0]),
+                })
+        material = positions.loc[positions['date'].eq(date) & positions['arm'].eq('3d')]
+        median_lon = float(material['lon'].median())
+        median_lat = float(material['lat'].median())
+        smooth = gaussian_filter(eta, sigma=float(spec['ssh_smoothing_sigma_grid']))
+        local = smooth == minimum_filter(
+            smooth, size=int(spec['ssh_minimum_window_grid'])
+        )
+        search = (
+            (lon[None, :] >= spec['trough_search_lon_bounds'][0])
+            & (lon[None, :] <= spec['trough_search_lon_bounds'][1])
+            & (lat[:, None] >= spec['trough_search_lat_bounds'][0])
+            & (lat[:, None] <= spec['trough_search_lat_bounds'][1])
+        )
+        candidates = []
+        for i, j in np.argwhere(local & search & (smooth <= float(spec['trough_eta_max_m']))):
+            distance = float(great_circle_distance_m(
+                median_lon, median_lat, float(lon[j]), float(lat[i])
+            )) / 1000
+            candidates.append((distance, int(i), int(j)))
+        if not candidates:
+            low_availability[key] = 'none_in_search_box'
+            candidate_rows.append({
+                'date': key, 'lon': np.nan, 'lat': np.nan,
+                'eta_smoothed_m': np.nan, 'distance_to_material_km': np.nan,
+                'selected': False, 'inner_contour_level_m': np.nan,
+                'inner_contour_closed': False, 'material_inside_inner_contour_count': np.nan,
+            })
+            continue
+        low_availability[key] = 'local_minimum_found'
+        selected = min(candidates)[1:]
+        contour_level, contour_closed, enclosed_count = (
+            _ofes_structure_review_inner_contour(
+                eta, lon, lat, selected, material
+            )
+        )
+        for distance, i, j in candidates:
+            candidate_rows.append({
+                'date': key, 'lon': float(lon[j]), 'lat': float(lat[i]),
+                'eta_smoothed_m': float(smooth[i, j]), 'distance_to_material_km': distance,
+                'selected': (i, j) == selected,
+                'inner_contour_level_m': (
+                    contour_level if (i, j) == selected else np.nan
+                ),
+                'inner_contour_closed': (
+                    contour_closed if (i, j) == selected else False
+                ),
+                'material_inside_inner_contour_count': (
+                    enclosed_count if (i, j) == selected else np.nan
+                ),
+            })
+        i, j = selected
+        meridional = float(spec['rotation_meridional_offset_deg'])
+        zonal = float(spec['rotation_zonal_offset_deg'])
+        if (
+            lat[i] - meridional < lat[0]
+            or lat[i] + meridional > lat[-1]
+            or lon[j] - zonal < lon[0]
+            or lon[j] + zonal > lon[-1]
+        ):
+            low_availability[key] = 'low_found_rotation_offsets_outside_domain'
+            continue
+        for target in spec['rotation_depths_m']:
+            k = int(np.argmin(np.abs(depth - float(target))))
+            south = int(np.argmin(np.abs(lat - (lat[i] - meridional))))
+            north = int(np.argmin(np.abs(lat - (lat[i] + meridional))))
+            west = int(np.argmin(np.abs(lon - (lon[j] - zonal))))
+            east = int(np.argmin(np.abs(lon - (lon[j] + zonal))))
+            rotation_rows.append({
+                'date': key, 'low_lon': float(lon[j]), 'low_lat': float(lat[i]),
+                'depth_m': float(depth[k]),
+                'u_south_m_s': float(fields['u'][k, south, j]),
+                'u_north_m_s': float(fields['u'][k, north, j]),
+                'v_west_m_s': float(fields['v'][k, i, west]),
+                'v_east_m_s': float(fields['v'][k, i, east]),
+            })
+    members = pd.DataFrame(member_rows)
+    troughs = pd.DataFrame(candidate_rows)
+    rotation = pd.DataFrame(rotation_rows, columns=[
+        'date', 'low_lon', 'low_lat', 'depth_m',
+        'u_south_m_s', 'u_north_m_s', 'v_west_m_s', 'v_east_m_s',
+    ])
+    ridge_continuity = pd.DataFrame(ridge_rows)
+    summary = members.groupby(['date', 'arm'], sort=True).agg(
+        member_count=('particle_index', 'nunique'),
+        median_south_of_ridge_km=('south_of_ridge_km', 'median'),
+        south_of_ridge_count=('south_of_ridge_km', lambda values: int((values > 0).sum())),
+        median_south_of_reference_ridge_km=('south_of_reference_ridge_km', 'median'),
+        south_of_reference_ridge_count=('south_of_reference_ridge_km', lambda values: int((values > 0).sum())),
+        median_eta_m=('eta_m', 'median'),
+        median_lon=('lon', 'median'), median_lat=('lat', 'median'),
+        median_depth_m=('depth_m', 'median'),
+    ).reset_index()
+    for name, frame in (
+        ('jet_flank_members.csv', members), ('jet_flank_daily.csv', summary),
+        ('ssh_low_candidates.csv', troughs), ('ssh_low_depth_velocity.csv', rotation),
+        ('jet_ridge_continuity.csv', ridge_continuity),
+    ):
+        frame.to_csv(root / name, index=False)
+    figures = _ofes_structure_review_plot(
+        root, spec, dates, positions, fields_by_day, eta_by_day, troughs,
+        ridge_continuity,
+    )
+    (root / 'case_spec.json').write_text(
+        json.dumps(spec, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
+    manifest = {
+        'analysis': 'ofes_structure_organization_review',
+        'case_spec': spec,
+        'complete': True,
+        'dates': [date.date().isoformat() for date in dates],
+        'member_count': len(seeds),
+        'ssh_low_availability_by_day': low_availability,
+        'ridge_sampling': 'linear u/v interpolation at exact member longitude and depth; speed maximum within specified latitude band',
+        'reference_ridge_depth_m': float(spec['reference_depth_m']),
+        'field_grid_shape_by_day': {
+            key: list(fields['u'].shape) for key, fields in fields_by_day.items()
+        },
+        'source_variables': ['do2', 'temp', 'salinity', 'u', 'v', 'eta'],
+        'source_units': {'u': 'm s-1', 'v': 'm s-1', 'eta': 'm'},
+        'source_depth_semantics': 'OFES native z-level, positive downward',
+        'no_reintegration': True,
+        'figures': figures,
+    }
+    (root / 'manifest.json').write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+    )
+    return load_ofes_structure_organization_review(root)
+
+
+def load_ofes_structure_organization_review(output_dir: str | Path) -> dict[str, Any]:
+    """读取 OFES 急流与邻近旋转结构诊断小表和图。
+
+    本入口只读取 producer 已生成的 manifest、CSV 和 PNG，不读取原场或修改文件。
+
+    参数:
+        - output_dir (str | pathlib.Path): 完整诊断目录。
+
+    返回:
+        - dict: 含 manifest、成员/逐日关系、脊线连续性、SSH 候选和分层旋向表及图路径。
+    """
+    root = Path(output_dir).expanduser().resolve()
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_structure_organization_review' or not manifest.get('complete'):
+        raise ValueError('Structure review manifest is incomplete or has a wrong identity.')
+    tables = {
+        'members': pd.read_csv(root / 'jet_flank_members.csv'),
+        'daily': pd.read_csv(root / 'jet_flank_daily.csv'),
+        'ssh_lows': pd.read_csv(root / 'ssh_low_candidates.csv'),
+        'rotation': pd.read_csv(root / 'ssh_low_depth_velocity.csv'),
+        'ridge_continuity': pd.read_csv(root / 'jet_ridge_continuity.csv'),
+    }
+    dates = set(manifest['dates'])
+    n = int(manifest['member_count'])
+    if (
+        set(tables['daily']['date']) != dates
+        or len(tables['members']) != 2 * n * len(dates)
+        or tables['members'].duplicated(['date', 'arm', 'particle_index']).any()
+        or tables['members'].groupby(['date', 'arm']).size().ne(n).any()
+        or set(tables['ssh_lows']['date']) != dates
+        or tables['ssh_lows'].groupby('date')['selected'].sum().gt(1).any()
+        or set(tables['ridge_continuity']['date']) != dates
+    ):
+        raise ValueError('Saved structure tables do not match member/date identity counts.')
+    for path in manifest['figures'].values():
+        if not Path(path).is_file():
+            raise FileNotFoundError(f'Structure figure is missing: {path}')
+    return {'output_dir': root, 'manifest': manifest, **tables, 'figures': manifest['figures']}
