@@ -86439,6 +86439,465 @@ def plot_ofes_scv_reverse_risk_differences(
     return {'figure': fig, 'figure_path': path, 'plot_data': plot_data}
 
 
+_OFES_GRID_LENS_SPICE_BATCHES = {'minty': 1.0, 'spicy': 2.0}
+_OFES_GRID_LENS_TRACK_PREFIX = {1.0: 'LENS_M', 2.0: 'LENS_S'}
+_OFES_GRID_LENS_POPULATIONS = ('south_of_jet', 'north_of_jet', 'all')
+_OFES_GRID_LENS_SPICE_SCOPES = ('all', 'minty', 'spicy')
+
+
+def _ofes_grid_lens_unit_settings(overrides: Mapping[str, Any] | None = None) -> dict:
+    """解析 grid-lens 实验单位设置；S5 起点、回溯时长与携氧阈值沿用既有配置。"""
+    raw = dict(_OFES_CFG.get('grid_lens_units', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(f'Unknown grid_lens_units overrides: {unknown}')
+        raw.update(dict(overrides))
+    reverse = _OFES_CFG.get('scv_reverse_enrichment', {}) or {}
+    ventilation = _OFES_CFG.get('trajectory_ventilation', {}) or {}
+    s5 = _OFES_CFG.get('grid_scv_v2_s5', {}) or {}
+    settings = {
+        'carrying_threshold': float(raw.get('carrying_threshold', 20.0)),
+        'carriage_thresholds': tuple(float(value) for value in reverse.get('thresholds', (20.0, 35.0, 50.0))),
+        'season_window_days': int(raw.get('season_window_days', 40)),
+        'jet_search_lat_bounds': tuple(float(value) for value in raw.get('jet_search_lat_bounds', (30.0, 40.0))),
+        'jet_competing_peak_ratio': float(raw.get('jet_competing_peak_ratio', 0.8)),
+        'output_subdir': str(raw.get('output_subdir', 'grid_lens_units')),
+        's5_start_date': str(s5.get('start_date', '2003-01-01')),
+        's5_stride_days': int(s5.get('stride_days', 5)),
+        'maximum_backtrack_days': int(ventilation.get('maximum_backtrack_days', 90)),
+        'reporting_horizons_days': tuple(int(value) for value in ventilation.get('reporting_horizons_days', (30, 60, 90))),
+    }
+    if settings['carrying_threshold'] not in settings['carriage_thresholds']:
+        raise ValueError('carrying_threshold must be one of the reverse-enrichment thresholds.')
+    if settings['season_window_days'] <= 0 or settings['s5_stride_days'] <= 0:
+        raise ValueError('season_window_days and the S5 stride must be positive.')
+    if not settings['jet_search_lat_bounds'][0] < settings['jet_search_lat_bounds'][1]:
+        raise ValueError('jet_search_lat_bounds must be increasing.')
+    return settings
+
+
+def _ofes_grid_lens_output_root(output_dir: str | Path | None, settings: Mapping[str, Any]) -> Path:
+    """返回 grid-lens 实验单位的固定语义输出目录。"""
+    if output_dir is not None:
+        return Path(output_dir).expanduser()
+    return plots_output_root / 'do' / 'ofes_np30_ke' / settings['output_subdir']
+
+
+def _ofes_grid_lens_objects(reverse_cache_dir: Path, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """读取可评估的 Tier-1 透镜-日，由逐日 footprint 补网格包围盒，并换算 S5 采样步。"""
+    scope_root = reverse_cache_dir / 'primary_300_1000'
+    objects = pd.read_parquet(scope_root / 'analysis2_objects.parquet')
+    # 不可评估对象没有 footprint 和携氧状态；连接允许缺一个采样，所以不会因此断轨
+    objects = objects.loc[objects['object_evaluable'].astype(bool)].copy()
+    objects['date'] = pd.to_datetime(objects['date']).dt.normalize()
+    boxes = []
+    for date in sorted(objects['date'].unique()):
+        footprint = pd.read_parquet(
+            scope_root / f'{pd.Timestamp(date):%Y%m%d}' / 'analysis2_footprints.parquet',
+            columns=['object_id', 'global_lat_index', 'global_lon_index'],
+        )
+        boxes.append(footprint.groupby('object_id').agg(
+            row_min=('global_lat_index', 'min'), row_max=('global_lat_index', 'max'),
+            column_min=('global_lon_index', 'min'), column_max=('global_lon_index', 'max'),
+        ))
+    objects = objects.join(pd.concat(boxes), on='object_id', validate='one_to_one')
+    if objects[['row_min', 'row_max', 'column_min', 'column_max']].isna().any().any():
+        raise ValueError('Evaluable grid lenses lack footprint rows.')
+    offset = (objects['date'] - pd.Timestamp(settings['s5_start_date'])).dt.days
+    if (offset % settings['s5_stride_days']).any():
+        raise ValueError('Grid-lens dates are not on the S5 sampling grid.')
+    objects['s5_step'] = (offset // settings['s5_stride_days']).astype(int)
+    for threshold in settings['carriage_thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        carriage = objects[f'{tag}_3d_carriage']
+        if carriage.isna().any():
+            raise ValueError(f'Evaluable grid lenses lack {tag} carriage.')
+        objects[f'carry_{tag}'] = carriage.astype(bool)
+    unknown = set(objects['spice_sign']) - set(_OFES_GRID_LENS_SPICE_BATCHES)
+    if unknown:
+        raise ValueError(f'Unexpected grid-lens spice signs: {sorted(unknown)}')
+    return objects.reset_index(drop=True)
+
+
+def _ofes_grid_lens_link(objects: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """用 DO 事件目录的一对一链接函数串联同 spice 透镜；链接函数的“天”换算为 S5 采样步。"""
+    anchor = pd.Timestamp(settings['s5_start_date'])
+    batch = objects['spice_sign'].map(_OFES_GRID_LENS_SPICE_BATCHES)
+    linker_input = pd.DataFrame({
+        'date': anchor + pd.to_timedelta(objects['s5_step'], unit='D'),
+        'threshold': batch,
+        'threshold_tag': objects['spice_sign'],
+        'daily_object_key': objects['object_id'],
+        'daily_object_id': np.arange(len(objects)),
+        'centroid_lon': objects['center_lon'],
+        'centroid_lat': objects['center_lat'],
+        'row_min': objects['row_min'],
+        'row_max': objects['row_max'],
+        'column_min': objects['column_min'],
+        'column_max': objects['column_max'],
+        'depth_mean': objects['centroid_depth_m'],
+        'depth_min': objects['depth_min_m'],
+        'depth_max': objects['depth_max_m'],
+        'thickness_max_m': objects['thickness_m'],
+        'area_km2': np.pi * objects['radius_km'] ** 2,
+        'equivalent_radius_km': objects['radius_km'],
+        # 以下只进入链接函数的事件汇总，不参与连接
+        'delta_do_max': 0.0,
+        'delta_do_mean': 0.0,
+        'peak_lon': objects['center_lon'],
+        'peak_lat': objects['center_lat'],
+        'peak_depth_at_max': objects['centroid_depth_m'],
+    })
+    linked, _ = _ofes_link_daily_objects(linker_input, _ofes_delta_do_catalog_settings())
+    number = linked['event_id'].str.extract(r'_E(\d+)$', expand=False).astype(int)
+    linked['track_id'] = [
+        f'{_OFES_GRID_LENS_TRACK_PREFIX[float(value)]}{int(n):04d}'
+        for value, n in zip(linked['threshold'], number)
+    ]
+    linked['link_status'] = linked['link_status'].replace({'matched_next_day': 'matched_next_step'})
+    columns = {
+        'daily_object_key': 'object_id',
+        'event_day_index': 'track_detection_index',
+        'predecessor_daily_object_key': 'predecessor_object_id',
+        'link_gap_days': 'link_gap_steps',
+    }
+    keep = linked[[*columns, 'track_id', 'link_status', 'link_distance_km', 'link_depth_difference_m', 'link_cost']]
+    tracks = objects.merge(keep.rename(columns=columns), on='object_id', validate='one_to_one')
+    return tracks.sort_values(['track_id', 'date']).reset_index(drop=True)
+
+
+def _ofes_grid_lens_structure_groups(objects: pd.DataFrame) -> pd.Series:
+    """把满足同一套链接门限的全部透镜-日对连通成结构组，承接一对一链接拆开的同一结构碎片。"""
+    link = _ofes_delta_do_catalog_settings()
+    max_gap = int(link['event_max_missing_days']) + 1
+    max_distance = float(link['event_max_centroid_distance_km'])
+    max_depth = float(link['event_max_depth_difference_m'])
+    padding = int(link['event_bbox_padding_pixels'])
+    step = objects['s5_step'].to_numpy(dtype=int)
+    spice = objects['spice_sign'].to_numpy()
+    lon = objects['center_lon'].to_numpy(dtype=float)
+    lat = objects['center_lat'].to_numpy(dtype=float)
+    depth = objects['centroid_depth_m'].to_numpy(dtype=float)
+    box = objects[['row_min', 'row_max', 'column_min', 'column_max']].to_numpy(dtype=float)
+    parent = np.arange(len(objects))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(objects)):
+        later = np.flatnonzero((step > step[i]) & (step - step[i] <= max_gap) & (spice == spice[i]))
+        if not later.size:
+            continue
+        gap = (step[later] - step[i]).astype(float)
+        distance = np.asarray(adaptive_distance_m(lon[later], lat[later], lon[i], lat[i]), dtype=float) / 1000.0
+        pad = padding * gap
+        overlap = (
+            (box[later, 0] <= box[i, 1] + pad) & (box[later, 1] >= box[i, 0] - pad)
+            & (box[later, 2] <= box[i, 3] + pad) & (box[later, 3] >= box[i, 2] - pad)
+        )
+        admissible = (distance <= max_distance * gap) & (np.abs(depth[later] - depth[i]) <= max_depth) & overlap
+        for j in later[admissible]:
+            parent[find(int(j))] = find(i)
+    roots = np.array([find(i) for i in range(len(objects))])
+    order = pd.Series(roots).drop_duplicates()
+    names = {root: f'SG{number:04d}' for number, root in enumerate(order)}
+    groups = pd.Series([names[root] for root in roots], index=objects.index, name='structure_group')
+    if (groups.groupby(objects['track_id']).nunique() > 1).any():
+        raise RuntimeError('A one-to-one lens track spans several structure groups.')
+    return groups
+
+
+def _ofes_grid_lens_unit_table(objects: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """每条透镜轨迹生成一个实验单位：组别、零时刻、状态变化标记与可用回溯天数。"""
+    anchor = pd.Timestamp(settings['s5_start_date'])
+    carrying = f"carry_{_ofes_threshold_tag(settings['carrying_threshold'])}"
+    rows = []
+    for track_id, track in objects.sort_values('date').groupby('track_id', sort=True):
+        carry = track[carrying].to_numpy(dtype=bool)
+        hits = np.flatnonzero(carry)
+        if hits.size:
+            release = track.iloc[hits[0]]
+            previous = track.iloc[hits[0] - 1] if hits[0] > 0 else None
+            loss_observed = bool(hits[-1] < len(track) - 1)
+        else:
+            release, previous, loss_observed = track.iloc[0], None, False
+        carried = [value for value in settings['carriage_thresholds'] if track[f'carry_{_ofes_threshold_tag(value)}'].any()]
+        available = int(min(settings['maximum_backtrack_days'], (release['date'] - anchor).days))
+        row = {
+            'track_id': track_id,
+            'structure_group': release['structure_group'],
+            'spice_sign': release['spice_sign'],
+            'carrying_group': 'carrying' if hits.size else 'never',
+            'max_threshold_carried': max(carried, default=0.0),
+            'n_detections': len(track),
+            'first_date': track['date'].iloc[0],
+            'last_date': track['date'].iloc[-1],
+            'carrying_runs': int(np.sum(np.diff(np.r_[0, carry.astype(int)]) == 1)),
+            'release_date': release['date'],
+            'release_object_id': release['object_id'],
+            'release_lat': release['center_lat'],
+            'release_lon': release['center_lon'],
+            'release_centroid_depth_m': release['centroid_depth_m'],
+            'release_depth_min_m': release['depth_min_m'],
+            'release_depth_max_m': release['depth_max_m'],
+            'release_radius_km': release['radius_km'],
+            'release_object_density': release['object_density'],
+            'release_core_zeta_anomaly_mean': release['core_zeta_anomaly_mean'],
+            'release_weak_native': bool(release['weak_native']),
+            'onset_observed': previous is not None,
+            'pre_onset_object_id': None if previous is None else previous['object_id'],
+            'pre_onset_date': pd.NaT if previous is None else previous['date'],
+            'loss_observed': loss_observed,
+            'left_censored': bool(track['date'].iloc[0] == anchor),
+            'available_backtrack_days': available,
+            'season_window_index': int((release['date'] - anchor).days // settings['season_window_days']),
+        }
+        for value in settings['carriage_thresholds']:
+            tag = _ofes_threshold_tag(value)
+            row[f'carriage_sequence_{tag}'] = ''.join('C' if flag else 'n' for flag in track[f'carry_{tag}'])
+            row[f'release_carry_{tag}'] = bool(release[f'carry_{tag}'])
+        for horizon in settings['reporting_horizons_days']:
+            row[f'horizon_{horizon}_available'] = available >= horizon
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_release_jet_side(units: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """用 E239 急流脊函数在释放日原始表层场上判定透镜中心位于急流脊哪一侧。"""
+    from scipy.interpolate import RegularGridInterpolator
+
+    low, high = settings['jet_search_lat_bounds']
+    rows = []
+    for date, group in units.groupby('release_date', sort=True):
+        date = pd.Timestamp(date)
+        levels = np.asarray(_ofes_tracer_coordinates(date)[2], dtype=float)
+        snapshot = load_ofes_snapshot(
+            date, variables=['u', 'v'],
+            lon_bounds=(float(group['release_lon'].min()) - 0.2, float(group['release_lon'].max()) + 0.2),
+            lat_bounds=(low - 0.5, high + 0.5),
+            depth_bounds=(float(levels[0]), float(levels[1])),
+        )
+        depth, lat, lon = (np.asarray(snapshot[name], dtype=float) for name in ('depth', 'lat', 'lon'))
+        u_at = RegularGridInterpolator((depth, lat, lon), np.asarray(snapshot['u'], dtype=float), bounds_error=False, fill_value=np.nan)
+        v_at = RegularGridInterpolator((depth, lat, lon), np.asarray(snapshot['v'], dtype=float), bounds_error=False, fill_value=np.nan)
+        band = lat[(lat >= low) & (lat <= high)]
+        for row in group.itertuples(index=False):
+            try:
+                ridge = _ofes_structure_review_ridge(u_at, v_at, band, float(row.release_lon), float(depth[0]))
+            except ValueError:
+                # 整条经向剖面无有效流速（陆地或域边界）时不判定一侧
+                ridge = {'lat': np.nan, 'speed_m_s': np.nan, 'peak_count': 0, 'second_to_first_speed_ratio': np.nan}
+            ratio = float(ridge['second_to_first_speed_ratio'])
+            rows.append({
+                'track_id': row.track_id,
+                'release_surface_ridge_lat': float(ridge['lat']),
+                'release_surface_ridge_speed_m_s': float(ridge['speed_m_s']),
+                'release_surface_ridge_peak_count': int(ridge['peak_count']),
+                'release_surface_ridge_second_to_first_ratio': ratio,
+                'release_surface_ridge_ambiguous': bool(
+                    ridge['peak_count'] >= 2 and np.isfinite(ratio) and ratio >= settings['jet_competing_peak_ratio']
+                ),
+            })
+    side = pd.DataFrame(rows)
+    side = units[['track_id', 'release_lat']].merge(side, on='track_id', validate='one_to_one')
+    side['release_lat_minus_ridge'] = side['release_lat'] - side['release_surface_ridge_lat']
+    side['jet_side'] = np.select(
+        [side['release_lat_minus_ridge'] > 0, side['release_lat_minus_ridge'] <= 0], ['north', 'south'], default='unknown'
+    )
+    return side.drop(columns='release_lat')
+
+
+def _ofes_grid_lens_population_mask(units: pd.DataFrame, population: str) -> pd.Series:
+    """返回比较人群掩膜：释放日在急流脊以南、以北或全部。"""
+    if population == 'south_of_jet':
+        return units['jet_side'].eq('south')
+    if population == 'north_of_jet':
+        return units['jet_side'].eq('north')
+    return pd.Series(True, index=units.index)
+
+
+def _ofes_grid_lens_season_weights(units: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """把从未携氧组按释放季节窗直接标准化到携氧组的释放分布；携氧单位所在窗无对照时权重记 0。"""
+    rows = []
+    for population in _OFES_GRID_LENS_POPULATIONS:
+        in_population = _ofes_grid_lens_population_mask(units, population)
+        for horizon in settings['reporting_horizons_days']:
+            for spice in _OFES_GRID_LENS_SPICE_SCOPES:
+                subset = units.loc[in_population & units[f'horizon_{horizon}_available']]
+                if spice != 'all':
+                    subset = subset.loc[subset['spice_sign'].eq(spice)]
+                carrying = subset.loc[subset['carrying_group'].eq('carrying'), 'season_window_index'].value_counts()
+                never = subset.loc[subset['carrying_group'].eq('never'), 'season_window_index'].value_counts()
+                for row in subset.itertuples(index=False):
+                    window = row.season_window_index
+                    if row.carrying_group == 'carrying':
+                        weight = 1.0 if never.get(window, 0) > 0 else 0.0
+                    elif carrying.get(window, 0) > 0:
+                        weight = float((carrying[window] / carrying.sum()) / (never[window] / never.sum()))
+                    else:
+                        weight = 0.0
+                    rows.append({
+                        'track_id': row.track_id, 'population': population, 'horizon_days': horizon,
+                        'spice_scope': spice, 'season_weight': weight,
+                    })
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_unit_summary(units: pd.DataFrame, weights: pd.DataFrame) -> pd.DataFrame:
+    """按人群、回溯时长、spice 范围与组别汇总单位数、季节匹配后的有效样本量和释放时的透镜特征。"""
+    rows = []
+    for (population, horizon, spice), part in weights.groupby(['population', 'horizon_days', 'spice_scope'], sort=False):
+        weighted = units.merge(part[['track_id', 'season_weight']], on='track_id', validate='one_to_one')
+        for group in ('carrying', 'never'):
+            g = weighted.loc[weighted['carrying_group'].eq(group)]
+            w = g['season_weight'].to_numpy(dtype=float)
+            rows.append({
+                'population': population,
+                'horizon_days': horizon,
+                'spice': spice,
+                'carrying_group': group,
+                'units': len(g),
+                'structure_groups': g['structure_group'].nunique(),
+                'units_do35': int((g['max_threshold_carried'] >= 35).sum()),
+                'units_do50': int((g['max_threshold_carried'] >= 50).sum()),
+                'units_matched': int((w > 0).sum()),
+                'effective_n_after_weighting': float(w.sum() ** 2 / (w ** 2).sum()) if (w > 0).any() else 0.0,
+                'weighted_mean_release_doy': float(np.average(g['release_date'].dt.dayofyear, weights=w)) if w.sum() > 0 else np.nan,
+                'median_depth_m': g['release_centroid_depth_m'].median(),
+                'median_lat': g['release_lat'].median(),
+                'median_lon': g['release_lon'].median(),
+                'median_sigma0': g['release_object_density'].median(),
+                'median_radius_km': g['release_radius_km'].median(),
+                'weak_native_share': g['release_weak_native'].mean(),
+                'median_lat_minus_ridge': g['release_lat_minus_ridge'].median(),
+                'ridge_ambiguous_share': g['release_surface_ridge_ambiguous'].mean(),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_ofes_grid_lens_units(
+    reverse_cache_dir: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    settings: Mapping[str, Any] | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """把 S5 Tier-1 透镜-日串成一对一轨迹，定义携氧与从未携氧透镜比较的实验单位。
+
+    透镜-日取 reverse enrichment 逐日片段中可评估的 Tier-1 grid lens，携氧状态沿用其 `do*_3d_carriage`。同 spice 的透镜-日用 DO 事件目录的一对一链接函数 `_ofes_link_daily_objects` 及其门限串联，链接函数的“天”换算为 S5 采样步；满足同一套门限的全部透镜-日对再连通为结构组，承接一对一链接拆开的同一结构碎片。
+
+    每条轨迹是一个实验单位：任一 S5 日期达到携氧阈值记为携氧，零时刻取首个携氧日期；从未携氧的取首次检出日期。单位表记录开始携氧前、不再携氧后的检出，释放日可用的后向回溯天数（在 S5 起点截断），以及释放日透镜中心位于表层急流脊哪一侧（E239 的 `_ofes_structure_review_ridge`）。季节权重按释放季节窗把从未携氧组直接标准化到携氧组的释放分布。
+
+    参数:
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取其中 `primary_300_1000/analysis2_objects.parquet` 与逐日 `analysis2_footprints.parquet`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+        - settings (Mapping | None): 覆盖 `processing.yml` 的 `ofes.grid_lens_units` 键；默认不覆盖。
+        - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
+
+    返回:
+        - dict: `load_ofes_grid_lens_units` 的结果，含 output_dir、manifest、objects、units、season_weights 与 summary。
+
+    输出:
+        - `output_dir/grid_lens_objects.parquet`：逐透镜-日的轨迹、结构组与链接记录。
+        - `output_dir/grid_lens_units.parquet`：每条轨迹一个实验单位。
+        - `output_dir/grid_lens_season_weights.parquet`：各人群、回溯时长、spice 范围下的季节权重。
+        - `output_dir/grid_lens_unit_summary.csv`：各组单位数、有效样本量与释放时特征。
+        - `output_dir/manifest.json`：请求、链接门限与计数。
+
+    说明:
+        - 不做粒子积分；急流一侧逐释放日读取一次表层 u/v。
+        - 比较人群建议取释放日位于急流脊以南的单位：从未携氧的 minty 透镜多在急流北侧，全域比较会把透镜所在一侧混成来源差异。
+        - 开始携氧前的检出只用于同一透镜携氧前后的配对描述；不再携氧后的检出属于保持问题，不进入组间比较。
+    """
+    params = _ofes_grid_lens_unit_settings(settings)
+    cache_root = Path(reverse_cache_dir).expanduser().resolve()
+    root = _ofes_grid_lens_output_root(output_dir, params)
+    request = {'reverse_cache_dir': str(cache_root), 'settings': params}
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        same_request = _ofes_requests_equal(existing.get('request'), request)
+        if not same_request and not overwrite:
+            raise RuntimeError(
+                'Existing grid-lens unit output was built from a different request; '
+                'use another output_dir or overwrite=True.'
+            )
+        if same_request and existing.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_units(root)
+    objects = _ofes_grid_lens_link(_ofes_grid_lens_objects(cache_root, params), params)
+    objects['structure_group'] = _ofes_grid_lens_structure_groups(objects)
+    units = _ofes_grid_lens_unit_table(objects, params)
+    units = units.merge(_ofes_grid_lens_release_jet_side(units, params), on='track_id', validate='one_to_one')
+    weights = _ofes_grid_lens_season_weights(units, params)
+    summary = _ofes_grid_lens_unit_summary(units, weights)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(objects, root / 'grid_lens_objects.parquet')
+    _atomic_write_parquet(units, root / 'grid_lens_units.parquet')
+    _atomic_write_parquet(weights, root / 'grid_lens_season_weights.parquet')
+    summary.to_csv(root / 'grid_lens_unit_summary.csv', index=False)
+    link = _ofes_delta_do_catalog_settings()
+    carrying = units['carrying_group'].eq('carrying')
+    manifest = {
+        'analysis': 'ofes_grid_lens_units',
+        'status': 'complete',
+        'request': request,
+        'link_gates': {
+            key: link[key] for key in (
+                'event_max_missing_days', 'event_max_centroid_distance_km', 'event_max_depth_difference_m',
+                'event_bbox_padding_pixels', 'event_gap_cost_per_missing_day',
+            )
+        },
+        'link_time_unit': f"S5 step ({params['s5_stride_days']} days)",
+        'counts': {
+            'lens_days': int(len(objects)),
+            'tracks': int(len(units)),
+            'structure_groups': int(units['structure_group'].nunique()),
+            'carrying_tracks': int(carrying.sum()),
+            'never_tracks': int((~carrying).sum()),
+            'carrying_tracks_with_one_run': int(units.loc[carrying, 'carrying_runs'].eq(1).sum()),
+            'onset_observed': int(units['onset_observed'].sum()),
+            'loss_observed': int(units['loss_observed'].sum()),
+            'jet_side': {str(key): int(value) for key, value in units['jet_side'].value_counts().items()},
+            'surface_ridge_ambiguous': int(units['release_surface_ridge_ambiguous'].sum()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_units(root)
+
+
+def load_ofes_grid_lens_units(output_dir: str | Path | None = None) -> dict:
+    """读取已保存的 grid-lens 实验单位表、季节权重与汇总。
+
+    只读取 `build_ofes_grid_lens_units` 写出的表格和 manifest，不读取 OFES 原始场，也不修改结果目录。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+
+    返回:
+        - dict: output_dir、manifest，以及 objects（逐透镜-日）、units（逐轨迹单位）、season_weights 与 summary 四张表。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _ofes_grid_lens_unit_settings())
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Grid-lens unit manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_units' or manifest.get('status') != 'complete':
+        raise ValueError(f'Grid-lens unit output is incomplete or belongs to another analysis: {root}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'objects': pd.read_parquet(root / 'grid_lens_objects.parquet'),
+        'units': pd.read_parquet(root / 'grid_lens_units.parquet'),
+        'season_weights': pd.read_parquet(root / 'grid_lens_season_weights.parquet'),
+        'summary': pd.read_csv(root / 'grid_lens_unit_summary.csv'),
+    }
+
+
 def _ofes_dualtrack_read_table(path: str | Path, columns: Sequence[str] | None = None) -> pd.DataFrame:
     """Read an OFES dual-track parquet table and normalize date columns."""
     df = pd.read_parquet(path, columns=list(columns) if columns else None)
