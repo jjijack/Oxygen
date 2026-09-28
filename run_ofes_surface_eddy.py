@@ -79,6 +79,7 @@ def _build_request(
     config: Mapping[str, Any], start: dt.date, end: dt.date
 ) -> dict[str, Any]:
     return {
+        "detector_semantics": "pet_native_filter_connected_contours_v1",
         "date_start": start.isoformat(),
         "date_end": end.isoformat(),
         "region": dict(config["input"].get("region", {})),
@@ -296,7 +297,7 @@ def run_catalog(
     manifest = _read_json(paths["manifest"]) if paths["manifest"].is_file() else None
     if manifest is not None:
         existing_request = manifest.get("request")
-        if existing_request is not None and existing_request != request:
+        if existing_request != request:
             raise ValueError(
                 "Existing surface-eddy output has a different scientific request; "
                 "pass a new output_dir or remove the fixed directory explicitly."

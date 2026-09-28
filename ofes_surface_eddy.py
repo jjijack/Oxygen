@@ -11,6 +11,8 @@ import datetime as dt
 import logging
 import os
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -276,35 +278,66 @@ def load_eta_snapshot(
     )
 
 
-def _kernel_valid_mask(
-    grid: RegularGridDataset,
-    wave_length_km: float,
-    order: int,
-    lat_max: float,
-) -> np.ndarray:
-    """Return the complete-kernel interior mask in PET ``(lon, lat)`` order."""
+def _split_connected_contour_paths(path: Any) -> list[Any]:
+    """Expose each MOVETO-delimited contour to PET as a separate Path."""
+    from matplotlib.path import Path as MplPath
 
-    valid = np.zeros((grid.x_c.size, grid.y_c.size), dtype=bool)
-    x_indices = np.arange(grid.x_c.size)
-    for j, latitude in enumerate(np.asarray(grid.y_c)):
-        if abs(float(latitude)) > lat_max:
-            continue
-        kernel = grid.kernel_bessel(float(latitude), wave_length_km, order=order)
-        half_x = (kernel.shape[0] - 1) // 2
-        half_y = (kernel.shape[1] - 1) // 2
-        valid[:, j] = (x_indices >= half_x) & (
-            x_indices < grid.x_c.size - half_x
-        )
-        if j < half_y or j >= grid.y_c.size - half_y:
-            valid[:, j] = False
-    return valid
+    vertices = np.asarray(path.vertices)
+    codes = getattr(path, "codes", None)
+    if codes is None or vertices.shape[0] == 0:
+        return [path]
+    starts = np.flatnonzero(np.asarray(codes) == MplPath.MOVETO)
+    if starts.size <= 1:
+        return [path]
+    pieces = [
+        MplPath(vertices[start:stop].copy(), codes[start:stop].copy())
+        for start, stop in zip(starts, np.r_[starts[1:], vertices.shape[0]])
+        if stop - start >= 2
+    ]
+    return pieces or [path]
+
+
+@contextmanager
+def _pet_connected_contours() -> Iterator[None]:
+    """Adapt Matplotlib 3.8 compound contours only during PET identification."""
+    from matplotlib.axes import Axes
+
+    original = Axes.contour
+
+    def contour_with_connected_paths(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, *args, **kwargs)
+        # PET 3.6.1 consumes collections; each path must be one connected contour.
+        for collection in result.collections:
+            collection._paths = [
+                piece
+                for path in collection.get_paths()
+                for piece in _split_connected_contour_paths(path)
+            ]
+        return result
+
+    Axes.contour = contour_with_connected_paths
+    try:
+        yield
+    finally:
+        Axes.contour = original
 
 
 def prepare_pet_grid(snapshot: EtaSnapshot, config: Mapping[str, Any]) -> PreparedPetGrid:
-    """Build a PET grid, apply the configured filter, and add PET geostrophic speed.
+    """构建采用原生 SSH 地转速度与 PET 高通滤波的网格。
 
-    PET is loaded lazily here so ordinary Oxygen imports and loaders work in the
-    main environment without the dedicated detector installation.
+    先从未滤波 SSH 计算速度，再对检测用 SSH 高通滤波，沿用已核验的修正版
+    目录顺序。有效域采用 PET 自身的滤波掩码，不额外侵蚀完整核宽度。
+
+    参数:
+        - snapshot (EtaSnapshot): 已转换为米的原生 SSH 快照。
+        - config (Mapping[str, Any]): 含 filter 与 detection 参数的 producer 配置。
+
+    返回:
+        - PreparedPetGrid: PET 网格、原生滤波有效域与原始海洋掩码。
+
+    说明:
+        - PET 仅在调用时导入；普通加载器不要求安装 PET。
+        - 有效域不代表裁剪边界外具有完整的滤波支撑。
     """
     from py_eddy_tracker.dataset.grid import RegularGridDataset
 
@@ -321,6 +354,11 @@ def prepare_pet_grid(snapshot: EtaSnapshot, config: Mapping[str, Any]) -> Prepar
         variables_description={"eta": {"units": "m", "long_name": "model SSH"}},
         centered=True,
     )
+    # Retain the corrected catalogue's native-SSH geostrophic velocities.
+    grid.add_uv(
+        "eta", "u", "v",
+        stencil_halfwidth=int(config["detection"]["stencil_halfwidth"]),
+    )
     grid.bessel_high_filter(
         "eta",
         float(filter_config["wavelength_km"]),
@@ -328,28 +366,10 @@ def prepare_pet_grid(snapshot: EtaSnapshot, config: Mapping[str, Any]) -> Prepar
         lat_max=float(filter_config["lat_max"]),
         extend=bool(filter_config["extend"]),
     )
-    filter_valid = _kernel_valid_mask(
-        grid,
-        float(filter_config["wavelength_km"]),
-        int(filter_config["order"]),
-        float(filter_config["lat_max"]),
-    )
     filtered = np.ma.array(grid.grid("eta"), copy=True)
-    # A complete kernel footprint is necessary but not sufficient: PET may
-    # still return a masked high-pass value when the source mask intersects
-    # the convolution.  Keep that distinction in the audit mask instead of
-    # treating a numerically present contour as scientifically valid.
-    filtered_mask = np.ma.getmaskarray(filtered)
-    filter_valid &= ~filtered_mask
-    filtered.mask = filtered_mask | ~filter_valid
+    # Use PET's available-data convolution mask without an extra kernel erosion.
+    filter_valid = ~np.ma.getmaskarray(filtered)
     grid.vars["eta"] = filtered
-    # PET's documented order is high-pass ETA first, then stencil u/v.
-    grid.add_uv(
-        "eta",
-        "u",
-        "v",
-        stencil_halfwidth=int(config["detection"]["stencil_halfwidth"]),
-    )
     return PreparedPetGrid(
         grid=grid,
         filter_valid_mask=filter_valid,
@@ -381,34 +401,6 @@ def _contour_indices(
     x = np.searchsorted(grid_lon, lon_array).clip(0, grid_lon.size - 1)
     y = np.searchsorted(grid_lat, lat_array).clip(0, grid_lat.size - 1)
     return x.astype(int), y.astype(int)
-
-
-def _contour_boundary_flags(
-    contour_lon: Sequence[float],
-    contour_lat: Sequence[float],
-    prepared: PreparedPetGrid,
-) -> tuple[bool, bool]:
-    """Return ``(boundary_censored, filter_valid)`` for one contour."""
-
-    if not contour_lon or not contour_lat:
-        return True, False
-    lon_array = np.asarray(contour_lon, dtype="f8")
-    lat_array = np.asarray(contour_lat, dtype="f8")
-    finite = np.isfinite(lon_array) & np.isfinite(lat_array)
-    if not finite.all():
-        return True, False
-    x, y = _contour_indices(lon_array, lat_array, prepared.lon, prepared.lat)
-    outside = (
-        (lon_array < prepared.lon[0])
-        | (lon_array > prepared.lon[-1])
-        | (lat_array < prepared.lat[0])
-        | (lat_array > prepared.lat[-1])
-    )
-    filter_ok = bool((~outside).all() and prepared.filter_valid_mask[x, y].all())
-    outer = (x == 0) | (x == prepared.lon.size - 1) | (y == 0) | (
-        y == prepared.lat.size - 1
-    )
-    return bool(outside.any() or outer.any() or not filter_ok), filter_ok
 
 
 def _contour_is_coastal(
@@ -456,12 +448,7 @@ def _observation_records(
         speed_lon, speed_lat = _finite_contour(
             observations.contour_lon_s[index], observations.contour_lat_s[index]
         )
-        effective_boundary, effective_valid = _contour_boundary_flags(
-            effective_lon, effective_lat, prepared
-        )
-        speed_boundary, speed_valid = _contour_boundary_flags(
-            speed_lon, speed_lat, prepared
-        )
+
         object_id = f"{date_value:%Y%m%d}_{polarity[0].upper()}_{index:04d}"
         records.append(
             {
@@ -501,8 +488,9 @@ def _observation_records(
                 "speed_contour_lon": speed_lon,
                 "speed_contour_lat": speed_lat,
                 "is_virtual": False,
-                "boundary_censored": bool(effective_boundary or speed_boundary),
-                "filter_valid": bool(effective_valid and speed_valid),
+                # PET already accepted these contours; add no project veto.
+                "boundary_censored": False,
+                "filter_valid": True,
                 "coastal": bool(
                     _contour_is_coastal(effective_lon, effective_lat, prepared)
                 ),
@@ -575,26 +563,27 @@ def detect_ofes_eddies_day(
     prepared = prepare_pet_grid(snapshot, config)
     detection = config["detection"]
     pet_date = dt.datetime.combine(day, dt.time())
-    observations = prepared.grid.eddy_identification(
-        "eta",
-        "u",
-        "v",
-        pet_date,
-        step=float(detection["contour_interval_m"]),
-        shape_error=float(detection["shape_error_pct"]),
-        pixel_limit=(
-            int(detection["pixel_limit_min"]),
-            int(detection["pixel_limit_max"]),
-        ),
-        presampling_multiplier=int(detection["presampling_multiplier"]),
-        sampling=int(detection["sampling"]),
-        sampling_method=str(detection["sampling_method"]),
-        mle=int(detection["maximum_local_extrema"]),
-        nb_step_min=int(detection["nb_step_min"]),
-        nb_step_to_be_mle=int(detection["nb_step_to_be_mle"]),
-        force_height_unit=str(detection["force_height_unit"]),
-        force_speed_unit=str(detection["force_speed_unit"]),
-    )
+    with _pet_connected_contours():
+        observations = prepared.grid.eddy_identification(
+            "eta",
+            "u",
+            "v",
+            pet_date,
+            step=float(detection["contour_interval_m"]),
+            shape_error=float(detection["shape_error_pct"]),
+            pixel_limit=(
+                int(detection["pixel_limit_min"]),
+                int(detection["pixel_limit_max"]),
+            ),
+            presampling_multiplier=int(detection["presampling_multiplier"]),
+            sampling=int(detection["sampling"]),
+            sampling_method=str(detection["sampling_method"]),
+            mle=int(detection["maximum_local_extrema"]),
+            nb_step_min=int(detection["nb_step_min"]),
+            nb_step_to_be_mle=int(detection["nb_step_to_be_mle"]),
+            force_height_unit=str(detection["force_height_unit"]),
+            force_speed_unit=str(detection["force_speed_unit"]),
+        )
     records: list[dict[str, Any]] = []
     native: dict[str, Any] = {}
     for obs in observations:
