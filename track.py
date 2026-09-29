@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.ticker import FormatStrFormatter
+from matplotlib.ticker import FixedLocator, FormatStrFormatter, FuncFormatter, MultipleLocator, NullLocator
 from matplotlib.path import Path as MplPath
 import geopandas as gpd
 import inspect
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import pickle
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Colormap, ListedColormap, Normalize, PowerNorm
+from matplotlib.colors import BoundaryNorm, Colormap, LinearSegmentedColormap, ListedColormap, LogNorm, Normalize, PowerNorm
 import glob
 import scipy
 from scipy.interpolate import RegularGridInterpolator
@@ -42,7 +42,7 @@ import time as tm
 import shutil
 from dataclasses import dataclass, field
 from matplotlib.lines import Line2D
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Patch
 from matplotlib.text import Text
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster, as_completed
@@ -788,6 +788,28 @@ _REPRESENTATION_STATUS_COLORS = _load_plot_mapping(
         'status_unavailable': '#7c3aed',
     },
 )
+
+
+_JOURNAL_COLORS = _load_plot_mapping(
+    'journal_colors',
+    {
+        'ink': '#1f2933', 'muted': '#52606d', 'grid': '#e4e7eb', 'neutral': '#9aa5b1', 'light': '#cbd2d9',
+        'band': '#eef3f7', 'accent': '#e07b39', 'land': '#d5dbe1', 'sparse': '#e3e7ec', 'zero': '#fdf9f1',
+        'lens': '#f8e3e6', 'brick': '#a63d22', 'minty': '#2a9d8f', 'minty_light': '#bfe6df', 'minty_dark': '#12524a',
+        'spicy': '#d1495b', 'eke_low': '#f4f6f8',
+        'DO20': '#8fbcdb', 'DO35': '#3b7fb6', 'DO50': '#12355b',
+    },
+)
+_JOURNAL_OCCURRENCE_BINS = [
+    float(value) for value in _PROC_CFG.get('plot', {}).get(
+        'journal_occurrence_bins', [0.0, 0.025, 0.05, 0.10, 0.20, 0.40, 1.0]
+    )
+]
+_JOURNAL_OCCURRENCE_COLORS = [
+    str(value) for value in _PROC_CFG.get('plot', {}).get(
+        'journal_occurrence_colors', ['#f9e5bd', '#f3c77f', '#ea9a4f', '#d4652e', '#a63d22', '#6b2416']
+    )
+]
 
 
 def _apply_plot_typography(fig) -> None:
@@ -2612,18 +2634,20 @@ def process_argo_txt_to_yearly_parquet_dask(
 
 def load_argo_data(year: int, data_dir: str | Path = None,
                    variable_selection: dict | None = None,
-                   verbose: bool = False) -> pd.DataFrame:
+                   verbose: bool = False,
+                   profile_ids: set[int] | None = None) -> pd.DataFrame:
     """
     加载指定年份的 Argo Parquet 数据文件，并进行列名规范化和变量选择。
 
     自动将旧版列名（如 'Depth_m'）转换为新版标准名；并通过 variable_selection 灵活指定 Temperature/DO/
-    Salinity 三个标准变量分别来源于文件中的哪一列。
+    Salinity 三个标准变量分别来源于文件中的哪一列。给出 profile_ids 时只读取这些剖面的行。
 
     参数:
         - year (int): 需要加载的数据年份（如 2014）。
         - data_dir (str | Path | None): Argo Parquet 所在目录；None 时取配置 paths.argo_parquet。
         - variable_selection (dict | None): 覆盖默认变量来源映射，如 {'Salinity': 'PSAL_WOA'}；默认 {'Temperature': 'Temp_Adjusted', 'DO': 'DOXY_Adjusted', 'Salinity': 'PSAL_Adjusted'}。
         - verbose (bool): 是否输出详细日志，默认 False。
+        - profile_ids (set[int] | None): 只读取这些 Profile_number；None 时读取全年，默认 None。
 
     返回:
         - pd.DataFrame: 处理后的 Argo 数据，列名与数据源均已按参数标准化。
@@ -2657,7 +2681,12 @@ def load_argo_data(year: int, data_dir: str | Path = None,
     if not file_path.exists():
         raise FileNotFoundError(f"Error: The file '{file_path}' was not found.")
     try:
-        argo_df = pd.read_parquet(file_path)
+        if profile_ids is None:
+            argo_df = pd.read_parquet(file_path)
+        else:
+            argo_df = pd.read_parquet(
+                file_path, filters=[('Profile_number', 'in', sorted(int(v) for v in profile_ids))]
+            )
     except Exception as e:
         raise RuntimeError(f"Failed to read Argo parquet file: {file_path}") from e
 
@@ -16894,7 +16923,11 @@ def plot_glorys_detail_loss_residual_atlas(
     if not Path(anomalies_path).exists():
         raise FileNotFoundError(f"Anomalies file not found: {anomalies_path}")
 
-    anomalies = load_corrected_anomalies(anomalies_path=anomalies_path, detection_config=cfg)
+    # 残差明细是数据产物，直接读纯自动表：人工分类修正只作展示，其 exclude 不得改变参与计算的剖面集合
+    anomalies = pd.read_parquet(anomalies_path)
+    if 'detection_method' in anomalies.columns:
+        method_mask = anomalies['detection_method'].astype(str).str.lower().eq(cfg.method)
+        anomalies = anomalies[method_mask].copy()
     required_cols = ['Year', 'Profile_number', 'Longitude', 'Latitude', 'Month', 'Day']
     missing_cols = [c for c in required_cols if c not in anomalies.columns]
     if missing_cols:
@@ -16981,7 +17014,7 @@ def plot_glorys_detail_loss_residual_atlas(
         _save_residual_curves(resolved_curves_path, list(curves_store.values()))
         print(f"[*] GLORYS residual rows saved: {resolved_rows_path}")
 
-    # hotspot_type 始终从（已叠加修正的）anomalies 现取，避免复用旧 rows 时沿用过期分类
+    # hotspot_type 始终从 anomalies 现取，避免复用旧 rows 时沿用过期分类
     rows_df = rows_df.drop(columns=['hotspot_type'], errors='ignore').merge(
         anomalies[['Profile_number', 'hotspot_type']].rename(columns={'Profile_number': 'profile_number'}),
         on='profile_number', how='left')
@@ -20242,7 +20275,7 @@ def load_corrected_anomalies(
 ) -> pd.DataFrame:
     """读取 plot_argo_hotspots 落盘的纯自动 anomalies parquet，叠加人工分类修正后返回。
 
-    所有需要「带订正分类」的下游（残差图谱、notebook 自定义分析等）统一走此入口，避免各处
+    所有需要「带订正分类」的展示性下游（如 notebook 自定义分析）统一走此入口，避免各处
     重复 read_parquet + 施加修正、也避免漏施。落盘 parquet 始终是纯自动结果，修正只在此读取
     时叠加（覆盖 hotspot_type / spice_type、剔除 exclude 行）。
 
@@ -22085,18 +22118,23 @@ def build_euler_occurrence_summary(
     *,
     grid_step_deg: float = 1.0,
     detection_config: DetectionConfig | None = None,
+    profiles: pd.DataFrame | None = None,
+    anomaly_col: str | None = None,
 ) -> dict:
     """构建只含 Argo 异常出现率的欧拉网格汇总。
 
     该函数读取已落盘的区域 baseline parquet 与 `plot_argo_hotspots` anomalies parquet，
     按当前区域的欧拉网格计算 anomaly_profiles / argo_baseline_profiles。它用于需要比较多个
-    detector 或多个阈值的轻量地图，不加载 META 轨迹，也不重做异常检测。
+    detector 或多个阈值的轻量地图，不加载 META 轨迹，也不重做异常检测。给出 profiles 时改以该
+    逐剖面表为分母、以其 anomaly_col 列为分子（如 `build_argo_do_occurrence_table` 的剖面总体）。
 
     参数:
         - start_year (int): 统计起始年份（闭区间），默认 2002。
         - end_year (int): 统计结束年份（闭区间），默认 2022。
         - grid_step_deg (float): 欧拉网格步长（°），默认 1.0。
-        - detection_config (DetectionConfig | None): 异常识别配置；None 时用默认。
+        - detection_config (DetectionConfig | None): 异常识别配置；None 时用默认。给出 profiles 时只用于记录方法与阈值。
+        - profiles (pd.DataFrame | None): 逐剖面表，需含 Profile_number、year、lon、lat 与 anomaly_col；None 时读取缓存。
+        - anomaly_col (str | None): profiles 中标记异常剖面的布尔列；给出 profiles 时必填。
 
     返回:
         - dict: 含 `grid`、`meta`、`anomaly_profiles`、`anomaly_occurrence_ratio`、`argo_baseline_profiles` 与掩膜数组的汇总字典。
@@ -22109,22 +22147,33 @@ def build_euler_occurrence_summary(
         raise ValueError("end_year 必须大于等于 start_year")
 
     cfg = _resolve_detection_config(detection_config)
-    cached_tables = _load_cached_euler_argo_tables(
-        start_year=start_year,
-        end_year=end_year,
-        detection_config=cfg,
-    )
-    if cached_tables is None:
-        raise FileNotFoundError(
-            f"Missing cached baseline/anomaly parquet for Euler occurrence summary: {cfg.file_stem()}"
+    if profiles is not None:
+        if anomaly_col is None:
+            raise ValueError('anomaly_col is required when profiles is given.')
+        year = pd.to_numeric(profiles['year'], errors='coerce')
+        selected = profiles[year.between(int(start_year), int(end_year))]
+        selected = _filter_table_to_current_region(
+            selected.rename(columns={'lon': 'Longitude', 'lat': 'Latitude'})
         )
+        baseline_df = selected[['Longitude', 'Latitude']].assign(profile_uid=selected['Profile_number'].to_numpy())
+        anomaly_df = baseline_df[selected[anomaly_col].astype(bool).to_numpy()]
+        cached_tables = {'baseline_path': 'profiles', 'anomaly_path': f'profiles[{anomaly_col}]'}
+    else:
+        cached_tables = _load_cached_euler_argo_tables(
+            start_year=start_year,
+            end_year=end_year,
+            detection_config=cfg,
+        )
+        if cached_tables is None:
+            raise FileNotFoundError(
+                f"Missing cached baseline/anomaly parquet for Euler occurrence summary: {cfg.file_stem()}"
+            )
+        baseline_df = cached_tables['baseline']
+        anomaly_df = cached_tables['anomalies']
 
     lon_edges, lat_edges, grid_meta = _build_euler_grid_edges(grid_step_deg=grid_step_deg)
     lon_ref = float(grid_meta['lon_start_continuous'])
     crosses_dateline = bool(grid_meta['crosses_dateline'])
-
-    baseline_df = cached_tables['baseline']
-    anomaly_df = cached_tables['anomalies']
     baseline_grid, baseline_grouped = _grid_count_from_points(
         baseline_df,
         lon_col='Longitude',
@@ -22171,7 +22220,7 @@ def build_euler_occurrence_summary(
             'detection_file_stem': cfg.file_stem(),
             'anomaly_min_depth': float(cfg.anomaly_min_depth) if cfg.anomaly_min_depth is not None else np.nan,
             'do_threshold': float(cfg.do_threshold),
-            'summary_source': 'cached',
+            'summary_source': 'profiles' if profiles is not None else 'cached',
             'baseline_source': str(cached_tables['baseline_path']),
             'anomaly_source': str(cached_tables['anomaly_path']),
         },
@@ -22671,6 +22720,8 @@ def build_do_threshold_eke_binned_summary(
     labels: list[str] | tuple[str, ...] = ('DO20', 'DO35', 'DO50'),
     n_quantile_bins: int = 5,
     min_profiles_per_cell: int = 1,
+    bin_edges: np.ndarray | list[float] | None = None,
+    land_mask: bool = True,
     output_dir: str | Path | None = None,
     output_name: str = 'do_threshold_eke_binned_summary_2002_2022_depth300m',
     save_data: bool = True,
@@ -22678,7 +22729,8 @@ def build_do_threshold_eke_binned_summary(
     """按 EKE 分位箱汇总 DO20/DO35/DO50 occurrence rate。
 
     分位箱由有采样的 Euler 网格 EKE 值定义；每个箱内先加总 anomaly numerator 与 sampled-profile
-    denominator，再计算发生率和 Wilson 区间。它是 denominator-aware 的地理共同定位描述。
+    denominator，再计算发生率和 Wilson 区间。它是 denominator-aware 的地理共同定位描述。给出 bin_edges
+    时沿用这组固定边界而不重算分位数。
 
     参数:
         - summaries (list[dict] | tuple[dict, ...]): DO20/DO35/DO50 Euler occurrence summaries。
@@ -22686,6 +22738,8 @@ def build_do_threshold_eke_binned_summary(
         - labels (list[str] | tuple[str, ...]): 阈值标签，默认 ('DO20', 'DO35', 'DO50')。
         - n_quantile_bins (int): EKE 分位箱数，默认 5。
         - min_profiles_per_cell (int): 入选网格的最小 sampled-profile 数，默认 1。
+        - bin_edges (np.ndarray | list[float] | None): 固定的 EKE 分箱边界（升序，含两端）；None 时按分位数计算。
+        - land_mask (bool): 是否要求网格中心落在 Natural Earth 海洋内；False 时只以 EKE 有效值界定入选网格，默认 True。
         - output_dir (str | Path | None): 输出目录；None 使用 DO/global 默认目录。
         - output_name (str): CSV 文件主干。
         - save_data (bool): 是否保存 CSV，默认 True。
@@ -22712,19 +22766,22 @@ def build_do_threshold_eke_binned_summary(
     if eke_grid.shape != baseline.shape:
         raise ValueError('EKE grid shape does not match Euler summaries.')
     common_mask = (
-        np.asarray(summaries[0]['ocean_mask'], dtype=bool)
+        (np.asarray(summaries[0]['ocean_mask'], dtype=bool) if land_mask else True)
         & np.isfinite(eke_grid)
         & (eke_grid >= 0)
         & np.isfinite(baseline)
         & (baseline >= int(min_profiles_per_cell))
     )
-    eke_values = eke_grid[common_mask]
-    if eke_values.size < int(n_quantile_bins):
-        raise ValueError('Not enough sampled cells for the requested EKE quantile bins.')
-    quantile_edges = np.quantile(
-        eke_values,
-        np.linspace(0.0, 1.0, int(n_quantile_bins) + 1),
-    )
+    if bin_edges is not None:
+        quantile_edges = np.asarray(bin_edges, dtype=float)
+    else:
+        eke_values = eke_grid[common_mask]
+        if eke_values.size < int(n_quantile_bins):
+            raise ValueError('Not enough sampled cells for the requested EKE quantile bins.')
+        quantile_edges = np.quantile(
+            eke_values,
+            np.linspace(0.0, 1.0, int(n_quantile_bins) + 1),
+        )
     quantile_edges = np.unique(quantile_edges)
     if quantile_edges.size < 3:
         raise ValueError('EKE values do not support at least two distinct quantile bins.')
@@ -22777,6 +22834,77 @@ def build_do_threshold_eke_binned_summary(
         path = out_dir / f'{safe_name}.csv'
         table.to_csv(path, index=False)
         print(f'[*] DO threshold/EKE binned summary saved: {path}')
+    return table
+
+
+def summarize_argo_do_occurrence_by_eke(
+    start_year: int = 2002,
+    end_year: int = 2022,
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    anomaly_min_depth: float = 300.0,
+    eke_file_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """按 GLORYS 平均 EKE 的五档汇总全局氧剖面总体中 ΔDO 峰的发生比例。
+
+    分子与分母取 `build_argo_do_occurrence_table` 已写出的剖面总体（EKE 覆盖年份内），经 `build_euler_occurrence_summary`
+    在 1° 欧拉网格上计数，按网格平均 EKE 分入五档，档内加总后求比例。分档边界沿用全体 Argo 剖面的 EKE
+    五分位（`build_do_threshold_eke_binned_summary` 在缓存汇总上算出），使五档与既有 EKE 描述一致；入选网格
+    只以 EKE 有效值界定，不另加陆地掩膜。
+
+    参数:
+        - start_year (int): 起始年，默认 2002。
+        - end_year (int): 结束年（含），默认 2022，即 EKE 缓存覆盖的最后一年。
+        - thresholds (tuple[float, ...]): ΔDO 阈值，默认 (20, 35, 50)。
+        - anomaly_min_depth (float): 检测器最浅深度（m），默认 300。
+        - eke_file_path (str | Path | None): 原生 EKE zarr；None 使用 `GLORYS_processed/eke.zarr`。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `argo_do_occurrence_eke` 目录。
+        - save_data (bool): 是否写出结果表，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个阈值 × EKE 档一行，含档边界、网格数、峰剖面数、剖面数、发生比例与 Wilson 区间。
+
+    输出:
+        - `argo_do_occurrence_eke_bins.parquet`：返回表（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    eke_path = Path(eke_file_path) if eke_file_path is not None else glorys_processed_root / 'eke.zarr'
+    eke_euler = remap_glorys_eke_to_euler_grid(
+        load_glorys_eke_native(eke_path, include_count=False), grid_step_deg=1.0, method='linear'
+    )
+    configs = [
+        make_detection_config('do', do_threshold=float(threshold), anomaly_min_depth=float(anomaly_min_depth))
+        for threshold in thresholds
+    ]
+    labels = [f'DO{_format_detection_value(float(threshold))}' for threshold in thresholds]
+    reference = build_do_threshold_eke_binned_summary(
+        [build_euler_occurrence_summary(start_year, end_year, detection_config=cfg) for cfg in configs],
+        eke_euler, labels=labels, save_data=False,
+    )
+    edges = reference.drop_duplicates('eke_bin').sort_values('eke_bin')
+    bin_edges = np.r_[edges['eke_lower'].to_numpy(float), float(edges['eke_upper'].iloc[-1])]
+    profiles_path = (make_detection_config('do').output_dir('argo_do_occurrence', region_slug)
+                     / 'argo_do_occurrence_profiles.parquet')
+    if not profiles_path.exists():
+        raise FileNotFoundError(f'Missing {profiles_path}; run build_argo_do_occurrence_table first.')
+    profiles = pd.read_parquet(profiles_path)
+    summaries = [
+        build_euler_occurrence_summary(
+            start_year, end_year, detection_config=cfg, profiles=profiles,
+            anomaly_col=f'has_delta_do_{_format_detection_value(float(threshold))}',
+        )
+        for cfg, threshold in zip(configs, thresholds)
+    ]
+    table = build_do_threshold_eke_binned_summary(
+        summaries, eke_euler, labels=labels, bin_edges=bin_edges, land_mask=False, save_data=False,
+    )
+    if save_data:
+        out_dir = (Path(output_dir) if output_dir is not None
+                   else make_detection_config('do').output_dir('argo_do_occurrence_eke', region_slug))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        table.to_parquet(out_dir / 'argo_do_occurrence_eke_bins.parquet', index=False)
+        print(f'[*] Argo ΔDO occurrence by EKE saved: {out_dir / "argo_do_occurrence_eke_bins.parquet"}')
     return table
 
 
@@ -24885,6 +25013,38 @@ def _prepare_do_profile_for_detection(
     return cleaned, diagnostics
 
 
+def _endpoint_delta(
+    depth_values: np.ndarray,
+    values: np.ndarray,
+    target_depth: float,
+    half_window: float,
+) -> tuple[float, float, float, float, float]:
+    """以目标深度 ±half_window 内最外两个有效层的连线为参考，返回 (观测-参考, 观测, 参考, 上端点深度, 下端点深度)。"""
+    d_lower = max(0.0, float(target_depth) - float(half_window))
+    d_upper = float(target_depth) + float(half_window)
+
+    mask = (
+        np.isfinite(depth_values)
+        & np.isfinite(values)
+        & (depth_values >= d_lower)
+        & (depth_values <= d_upper)
+    )
+    if np.count_nonzero(mask) < 2:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    d = depth_values[mask]
+    v = values[mask]
+    order = np.argsort(d)
+    d = d[order]
+    v = v[order]
+    if len(d) < 2 or np.isclose(d[0], d[-1]):
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    obs = float(np.interp(target_depth, d, v))
+    ref = float(np.interp(target_depth, [d[0], d[-1]], [v[0], v[-1]]))
+    return obs - ref, obs, ref, float(d[0]), float(d[-1])
+
+
 def calculate_delta_do(
     data: pd.DataFrame,
     detection_config: DetectionConfig | None = None,
@@ -25009,36 +25169,6 @@ def calculate_delta_do(
             elif prev_s < 0 and next_s > 0:
                 peaks.append((i, 'negative', float(depth_values[i])))
         return peaks
-
-    def _endpoint_delta(
-        depth_values: np.ndarray,
-        values: np.ndarray,
-        target_depth: float,
-        half_window: float,
-    ) -> tuple[float, float, float, float, float]:
-        d_lower = max(0.0, float(target_depth) - float(half_window))
-        d_upper = float(target_depth) + float(half_window)
-
-        mask = (
-            np.isfinite(depth_values)
-            & np.isfinite(values)
-            & (depth_values >= d_lower)
-            & (depth_values <= d_upper)
-        )
-        if np.count_nonzero(mask) < 2:
-            return np.nan, np.nan, np.nan, np.nan, np.nan
-
-        d = depth_values[mask]
-        v = values[mask]
-        order = np.argsort(d)
-        d = d[order]
-        v = v[order]
-        if len(d) < 2 or np.isclose(d[0], d[-1]):
-            return np.nan, np.nan, np.nan, np.nan, np.nan
-
-        obs = float(np.interp(target_depth, d, v))
-        ref = float(np.interp(target_depth, [d[0], d[-1]], [v[0], v[-1]]))
-        return obs - ref, obs, ref, float(d[0]), float(d[-1])
 
     def _window_extrema_delta(
         depth_values: np.ndarray,
@@ -25586,6 +25716,89 @@ def calculate_delta_do(
         )
 
     return results_df
+
+def describe_delta_do_construction(
+    profile_number: int,
+    year: int,
+    threshold: float = 20.0,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """给出单条 Argo 剖面上 ΔDO 的构造：清洗后的有效层、检测器搜索层、最强峰与其端点参考线。
+
+    剖面先经 DO detector 共用预处理（`_prepare_do_profile_for_detection`），再由 `calculate_delta_do` 按 do 模式
+    找出达到阈值的候选峰，取搜索层 [anomaly_min_depth, anomaly_max_depth] 内 ΔDO 最大者；参考线沿用检测器
+    自身的 `_endpoint_delta`，即峰深 ±depth_interval 窗口内最外两个有效层的连线。
+
+    参数:
+        - profile_number (int): Argo 剖面编号（全局唯一）。
+        - year (int): 剖面所在年份，用于定位年度 parquet。
+        - threshold (float): ΔDO 阈值（μmol/kg），默认 20。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `delta_do_construction` 目录。
+        - save_data (bool): 是否写出两张表，默认 True。
+
+    返回:
+        - dict: 含 levels（逐层表）、construction（单行构造表）与 output_dir。
+
+    输出:
+        - `delta_do_construction_<profile_number>_levels.parquet`：清洗后逐层的深度、DO、参考窗口与搜索层标记（save_data 时）。
+        - `delta_do_construction_<profile_number>.parquet`：剖面元数据、峰深、峰值、参考值、ΔDO 与两端点（save_data 时）。
+    """
+    cfg = make_detection_config('do', do_threshold=float(threshold))
+    raw = load_argo_data(int(year), profile_ids={int(profile_number)})
+    if raw.empty:
+        raise ValueError(f'Profile {profile_number} is not in the {year} Argo parquet.')
+    clean, _ = _prepare_do_profile_for_detection(raw, cfg)
+    if clean is None:
+        raise ValueError(f'Profile {profile_number} does not pass the DO detector preprocessing.')
+    candidates = calculate_delta_do(raw, detection_config=cfg, include_aou=False)
+    in_layer = (candidates['depth'].between(cfg.anomaly_min_depth, cfg.anomaly_max_depth)
+                if not candidates.empty else pd.Series(dtype=bool))
+    if not in_layer.any():
+        raise ValueError(f'Profile {profile_number} has no ΔDO peak of at least {threshold:g} in the search layer.')
+    peak_depth = float(candidates[in_layer].nlargest(1, 'delta_do')['depth'].iloc[0])
+
+    depth = clean['Depth'].to_numpy(float)
+    oxygen = clean['DO'].to_numpy(float)
+    half = float(cfg.depth_interval)
+    delta, observed, reference, upper, lower = _endpoint_delta(depth, oxygen, peak_depth, half)
+    window = np.isfinite(oxygen) & (depth >= max(0.0, peak_depth - half)) & (depth <= peak_depth + half)
+    levels = pd.DataFrame({
+        'depth_m': depth,
+        'do_umol_kg': oxygen,
+        'in_reference_window': window,
+        'in_search_layer': (depth >= cfg.anomaly_min_depth) & (depth <= cfg.anomaly_max_depth),
+    })
+    meta = raw.iloc[0]
+    construction = pd.DataFrame([{
+        'profile_number': int(profile_number),
+        'platform_number': int(meta['Platform_number']),
+        'date': pd.Timestamp(int(meta['Year']), int(meta['Month']), int(meta['Day'])),
+        'lon': float(meta['Longitude']),
+        'lat': float(meta['Latitude']),
+        'threshold_umol_kg': float(threshold),
+        'peak_depth_m': peak_depth,
+        'peak_do': observed,
+        'reference_do_at_peak': reference,
+        'delta_do': delta,
+        'upper_endpoint_depth_m': upper,
+        'upper_endpoint_do': float(oxygen[window][0]),
+        'lower_endpoint_depth_m': lower,
+        'lower_endpoint_do': float(oxygen[window][-1]),
+        'half_window_m': half,
+        'search_layer_top_m': float(cfg.anomaly_min_depth),
+        'search_layer_bottom_m': float(cfg.anomaly_max_depth),
+    }])
+
+    out_dir = (Path(output_dir) if output_dir is not None
+               else cfg.output_dir('delta_do_construction', _current_region_key()))
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        levels.to_parquet(out_dir / f'delta_do_construction_{int(profile_number)}_levels.parquet', index=False)
+        construction.to_parquet(out_dir / f'delta_do_construction_{int(profile_number)}.parquet', index=False)
+        print(f'[*] ΔDO construction for profile {int(profile_number)} saved to {out_dir}')
+    return {'levels': levels, 'construction': construction, 'output_dir': str(out_dir)}
+
 
 def _export_interacting_argo_worker(args):
     """
@@ -28183,21 +28396,22 @@ def plot_do_density_coordinate_sensitivity(
     show_fig: bool = True,
     save_fig: bool = True,
 ) -> dict:
-    """绘制 ΔDO prominence 的深度坐标复现与 σ₀ 坐标存活诊断。
+    """对照 ΔDO 峰振幅在深度参考与 σ₀ 参考下的取值（期刊版式）。
 
-    三个面板依次比较落盘与重算的深度坐标 prominence、深度与密度坐标 prominence，以及
-    `ΔDOσ₀ / ΔDOz` 分布。第二图区分窗口内密度是否严格单调，存活率直方图与标题阈值比例使用
-    更保守的密度单调子集；全部端点可投影剖面仍保留在散点图中。
+    (a) 对每个已识别峰，比较参考线按深度插值与按 σ₀ 插值得到的振幅（对数轴），区分窗口内 σ₀ 是否严格单调，
+    并给出 σ₀ 参考下仍达到原阈值的比例（全部与单调子集）；(b) 画两者之比的分布（单调与非单调堆叠），给出
+    两组的中位比。坐标范围按阈值给出默认值，数据超出时向外扩。深度参考值已由 `calculate_do_density_coordinate_sensitivity` 在 reproduction_tolerance 内复现
+    落盘 ΔDO，故不再单独画复现检查。全图 7 in 宽。
 
     参数:
         - details (pd.DataFrame): `calculate_do_density_coordinate_sensitivity` 返回的逐异常表。
-        - summary (pd.DataFrame | None): 同函数返回的单行摘要；None 时从 details 现场汇总标题数字。
+        - summary (pd.DataFrame | None): 同函数返回的单行摘要，提供阈值与文件名主干；None 时不画阈值线，文件名主干取 'do'。
         - output_dir (str | Path | None): 图输出目录；None 使用 DO/global 默认目录。
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存 PNG，默认 True。
 
     返回:
-        - dict: 含有效绘图数据与 `figure_path`（save_fig 时）。
+        - dict: 含参与绘图的 rows、单调子集中位比 median_survival_ratio、全部中位比 all_median_survival_ratio 与 `figure_path`（save_fig 时）。
 
     输出:
         - `plot_outputs/do/<region>/do_density_coordinate_sensitivity/do_density_coordinate_sensitivity_<stem>.png`（save_fig 时）。
@@ -28205,178 +28419,87 @@ def plot_do_density_coordinate_sensitivity(
     说明:
         - 1:1 线附近的密度坐标 prominence 表示局地峰值不会因坐标重投影而消失；它不是水团来源诊断。
     """
-    required = {
-        'status', 'stored_delta_do', 'recomputed_delta_do_depth',
-        'delta_do_sigma0', 'density_survival_ratio',
-        'survives_original_threshold',
-    }
-    missing = required.difference(details.columns)
-    if missing:
-        raise ValueError(
-            f'Density sensitivity details missing columns: {sorted(missing)}'
-        )
     valid = details[details['status'].astype(str).eq('ok')].copy()
     if valid.empty:
         raise ValueError('No valid density-coordinate profiles to plot.')
-    monotonic_mask = valid.get(
-        'sigma0_monotonic_in_window',
-        pd.Series(False, index=valid.index),
-    ).fillna(False).astype(bool)
-    monotonic = valid[monotonic_mask].copy()
-    nonmonotonic = valid[~monotonic_mask].copy()
-    if monotonic.empty:
-        raise ValueError(
-            'No density-monotonic windows are available to plot.'
-        )
-    if summary is not None and not summary.empty:
-        record = summary.iloc[0]
-        threshold = float(record.get('threshold_umol_kg', np.nan))
-        detector_stem = str(record.get('detector_stem', 'do'))
-        median_ratio = float(
-            record.get(
-                'monotonic_median_density_survival_ratio', np.nan
-            )
-        )
-        survival_rate = float(
-            record.get('monotonic_threshold_survival_rate', np.nan)
-        )
-        positive_retention_rate = float(
-            record.get(
-                'positive_prominence_retention_rate', np.nan
-            )
-        )
-    else:
-        threshold = np.nan
-        detector_stem = 'do'
-        median_ratio = float(pd.to_numeric(
-            monotonic['density_survival_ratio'], errors='coerce'
-        ).median())
-        survival_rate = float(
-            monotonic['survives_original_threshold'].astype(bool).mean()
-        )
-        positive_retention_rate = float(
-            valid.get(
-                'retains_positive_prominence',
-                pd.Series(False, index=valid.index),
-            ).fillna(False).astype(bool).mean()
-        )
+    record = summary.iloc[0] if summary is not None and not summary.empty else pd.Series(dtype=object)
+    threshold = float(record.get('threshold_umol_kg', np.nan))
+    detector_stem = str(record.get('detector_stem', 'do'))
+    mono = valid['sigma0_monotonic_in_window'].fillna(False).astype(bool)
+    survives = valid['survives_original_threshold'].astype(bool)
+    ratio = pd.to_numeric(valid['density_survival_ratio'], errors='coerce')
+    n_all, n_mono = len(valid), int(mono.sum())
+    surv_all, surv_mono = int(survives.sum()), int(survives[mono].sum())
+    median_all, median_mono = float(ratio.median()), float(ratio[mono].median())
+    colors = _JOURNAL_COLORS
+    tag = _format_detection_value(threshold) if np.isfinite(threshold) else ''
+    depth_delta = pd.to_numeric(valid['recomputed_delta_do_depth'], errors='coerce')
+    density_delta = pd.to_numeric(valid['delta_do_sigma0'], errors='coerce')
+    # 以阈值给出默认范围（ΔDO50 时为 40/8/400），数据超出时向外扩
+    scale = threshold if np.isfinite(threshold) else float(depth_delta.min())
+    x_low = min(0.8 * scale, 0.9 * float(depth_delta[depth_delta > 0].min()))
+    lim = (min(0.16 * scale, 0.9 * float(density_delta[density_delta > 0].min())),
+           max(8.0 * scale, 1.05 * float(np.nanmax([depth_delta.max(), density_delta.max()]))))
+    ratio_bins = np.arange(min(0.15, np.floor(ratio.min() / 0.025) * 0.025), max(1.42, ratio.max() + 0.025), 0.025)
 
-    stored = pd.to_numeric(
-        valid['stored_delta_do'], errors='coerce'
-    ).to_numpy(dtype=float)
-    depth_delta = pd.to_numeric(
-        valid['recomputed_delta_do_depth'], errors='coerce'
-    ).to_numpy(dtype=float)
-    density_delta = pd.to_numeric(
-        valid['delta_do_sigma0'], errors='coerce'
-    ).to_numpy(dtype=float)
-    ratios = pd.to_numeric(
-        monotonic['density_survival_ratio'], errors='coerce'
-    ).dropna().to_numpy(dtype=float)
+    def share(k: int, n: int) -> str:
+        return f'{k}/{n} ({100 * k / n:.1f}%)' if n else f'{k}/{n}'
 
-    fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.6))
-    finite_stored = np.isfinite(stored) & np.isfinite(depth_delta)
-    stored_limits = [
-        float(np.nanmin(np.r_[stored[finite_stored], depth_delta[finite_stored]])),
-        float(np.nanmax(np.r_[stored[finite_stored], depth_delta[finite_stored]])),
-    ]
-    axes[0].scatter(
-        stored[finite_stored], depth_delta[finite_stored],
-        s=22, color=_THRESHOLD_COLORS.get('DO50', '#b91c1c'),
-        alpha=0.55, edgecolors='none',
-    )
-    axes[0].plot(stored_limits, stored_limits, color='0.3', linestyle='--')
-    axes[0].set_xlabel('Stored ΔDO (μmol kg⁻¹)')
-    axes[0].set_ylabel('Recomputed ΔDOz (μmol kg⁻¹)')
-    axes[0].set_title('Depth-coordinate reproduction')
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 2.85))
+        left, right = fig.subfigures(1, 2, wspace=0)
+        ax = _inch_axes(left, 0.62, 0.45, 0.15, 0.22)
+        ax.plot(lim, lim, color=colors['muted'], lw=0.6, zorder=1)
+        if np.isfinite(threshold):
+            ax.fill_between(lim, [lim[0], lim[0]], [threshold, threshold], color=colors['band'], lw=0, zorder=0)
+            ax.axhline(threshold, color=colors['ink'], lw=0.6, ls=(0, (4, 2)), zorder=1)
+        for sel, color, label in ((~mono, colors['DO20'], f'σ$_0$ not monotonic in window (n = {n_all - n_mono})'),
+                                  (mono, colors['DO50'], f'σ$_0$ monotonic in window (n = {n_mono})')):
+            ax.scatter(valid.loc[sel, 'recomputed_delta_do_depth'], valid.loc[sel, 'delta_do_sigma0'], s=5, color=color,
+                       edgecolors='white', linewidths=0.2, zorder=3, label=label)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlim(x_low, lim[1])
+        ax.set_ylim(*lim)
+        for axis in (ax.xaxis, ax.yaxis):
+            _journal_log_axis(axis, [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000])
+        ax.set_xlabel(f'ΔDO, depth-referenced ({_JOURNAL_UNIT})')
+        ax.set_ylabel(f'ΔDO, σ$_0$-referenced ({_JOURNAL_UNIT})')
+        ax.text(0.97, 0.05, f'≥{tag or " threshold"} with σ$_0$ reference:\nall {share(surv_all, n_all)}\n'
+                f'monotonic {share(surv_mono, n_mono)}', transform=ax.transAxes, ha='right', va='bottom', fontsize=6.4)
+        ax.legend(loc='upper left', fontsize=6.3, handletextpad=0.2, markerscale=1.6)
+        _journal_panel_label(left, '(a)')
 
-    finite_density = np.isfinite(depth_delta) & np.isfinite(density_delta)
-    density_limits = [
-        float(np.nanmin(np.r_[
-            depth_delta[finite_density], density_delta[finite_density]
-        ])),
-        float(np.nanmax(np.r_[
-            depth_delta[finite_density], density_delta[finite_density]
-        ])),
-    ]
-    nonmonotonic_depth = pd.to_numeric(
-        nonmonotonic['recomputed_delta_do_depth'], errors='coerce'
-    ).to_numpy(dtype=float)
-    nonmonotonic_density = pd.to_numeric(
-        nonmonotonic['delta_do_sigma0'], errors='coerce'
-    ).to_numpy(dtype=float)
-    monotonic_depth = pd.to_numeric(
-        monotonic['recomputed_delta_do_depth'], errors='coerce'
-    ).to_numpy(dtype=float)
-    monotonic_density = pd.to_numeric(
-        monotonic['delta_do_sigma0'], errors='coerce'
-    ).to_numpy(dtype=float)
-    axes[1].scatter(
-        nonmonotonic_depth, nonmonotonic_density,
-        s=18, color='#9ca3af', alpha=0.35, edgecolors='none',
-        label=f'Non-monotonic (n={len(nonmonotonic)})',
-    )
-    axes[1].scatter(
-        monotonic_depth, monotonic_density,
-        s=22, color='#3478a8', alpha=0.6, edgecolors='none',
-        label=f'Monotonic (n={len(monotonic)})',
-    )
-    axes[1].plot(density_limits, density_limits, color='0.3', linestyle='--')
-    axes[1].set_xlabel('ΔDOz (μmol kg⁻¹)')
-    axes[1].set_ylabel('ΔDOσ₀ (μmol kg⁻¹)')
-    axes[1].set_title('Density-coordinate persistence')
-    axes[1].legend(frameon=False, loc='lower right')
-
-    axes[2].hist(
-        ratios, bins=30, color='#3478a8', alpha=0.82,
-        edgecolor='white', linewidth=0.5,
-    )
-    axes[2].axvline(1.0, color='0.3', linestyle='--', linewidth=1.3)
-    axes[2].axvline(
-        median_ratio, color=_THRESHOLD_COLORS.get('DO50', '#b91c1c'),
-        linewidth=2.0, label=f'median {median_ratio:.3f}',
-    )
-    axes[2].set_xlabel('ΔDOσ₀ / ΔDOz')
-    axes[2].set_ylabel('Anomaly profiles')
-    axes[2].set_title('Prominence survival ratio')
-    axes[2].legend(frameon=False, loc='best')
-
-    threshold_label = (
-        f'ΔDO{_format_detection_value(threshold)}'
-        if np.isfinite(threshold) else 'ΔDO'
-    )
-    fig.suptitle(
-        f'{threshold_label} density-coordinate sensitivity '
-        f'(all n={len(valid)}, positive={100.0 * positive_retention_rate:.1f}%; '
-        f'monotonic n={len(monotonic)}, ≥ threshold={100.0 * survival_rate:.1f}%)'
-    )
-    for axis in axes:
-        axis.grid(alpha=0.18)
-        _apply_axis_typography(axis)
-    _apply_plot_typography(fig)
-    fig.tight_layout()
-
-    region_slug = _current_region_key()
-    result = {'rows': valid, 'median_survival_ratio': median_ratio}
-    if save_fig:
-        out_dir = (
-            Path(output_dir)
-            if output_dir is not None
-            else make_detection_config('do').output_dir(
-                'do_density_coordinate_sensitivity', region_slug
-            )
+        ax = _inch_axes(right, 0.62, 0.45, 0.15, 0.22)
+        ax.hist([ratio[mono], ratio[~mono]], bins=ratio_bins, stacked=True,
+                color=[colors['DO50'], colors['DO20']], lw=0, zorder=2)
+        ax.axvline(1.0, color=colors['ink'], lw=0.6, ls=(0, (4, 2)), zorder=3)
+        ax.set_xlabel('Amplitude ratio, σ$_0$-referenced / depth-referenced')
+        ax.set_ylabel(f'ΔDO{tag} profiles')
+        monotonic_median = f'{median_mono:.3f}' if n_mono else '–'
+        ax.text(0.03, 0.95, f'Median ratio\nall {median_all:.3f}\nmonotonic {monotonic_median}',
+                transform=ax.transAxes, ha='left', va='top', fontsize=6.4)
+        _journal_light_grid(ax, 'y')
+        _journal_panel_label(right, '(b)')
+        out_dir = Path(output_dir) if output_dir is not None else make_detection_config('do').output_dir(
+            'do_density_coordinate_sensitivity', _current_region_key()
         )
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / (
-            f'do_density_coordinate_sensitivity_{detector_stem}.png'
-        )
-        fig.savefig(path, dpi=240, bbox_inches='tight')
-        result['figure_path'] = str(path)
-        print(f'[*] DO density sensitivity figure saved: {path}')
-    if show_fig:
-        plt.show()
-    plt.close(fig)
+        figure_path = _journal_save(fig, out_dir, f'do_density_coordinate_sensitivity_{detector_stem}', show_fig,
+                                    save_fig)
+
+    result = {'rows': valid, 'median_survival_ratio': median_mono, 'all_median_survival_ratio': median_all}
+    if figure_path is not None:
+        result['figure_path'] = figure_path
     return result
+
+
+def _meta_association_sensitivity_stem(
+    start_year: int, end_year: int, anomaly_min_depth: float, radius_factors,
+) -> str:
+    """返回 `summarize_meta_association_sensitivity` 输出文件的主干名。"""
+    depth_tag = _format_detection_value(float(anomaly_min_depth))
+    radius_tag = '-'.join(_format_detection_value(value) for value in sorted({float(v) for v in radius_factors}))
+    return f'meta_association_sensitivity_{int(start_year)}_{int(end_year)}_depth{depth_tag}m_radius{radius_tag}x'
 
 
 def summarize_meta_association_sensitivity(
@@ -28399,9 +28522,9 @@ def summarize_meta_association_sensitivity(
     """检验 ΔDO–META association 对半径倍数和 baseline 口径的敏感性。
 
     函数以 profile 到最近同日 META 涡的 `distance / radius` 缓存重建不同半径倍数下的
-    membership，并同时比较全体 Argo、DO-evaluable Argo、完整请求时段和 META 实际时间覆盖
-    四种 denominator。正式 OR 使用互斥的 anomaly 与 non-anomaly profiles，而不是把 anomaly
-    同时包含在 baseline 行中。
+    membership，并在完整请求时段与 META 实际时间覆盖内，分别以全体 Argo、DO-evaluable Argo 和
+    全局氧剖面总体（通过 DO detector 共用预处理、搜索层内有有效观测）为 denominator。正式 OR
+    使用互斥的 anomaly 与 non-anomaly profiles，而不是把 anomaly 同时包含在 baseline 行中。
 
     参数:
         - thresholds (tuple[float, ...] | list[float]): ΔDO 阈值，默认 (20, 35, 50)。
@@ -28534,7 +28657,7 @@ def summarize_meta_association_sensitivity(
             if profile_eligibility_path is not None
             else None
         )
-    required_eligibility = {'Profile_number', 'do_evaluable'}
+    required_eligibility = {'Profile_number', 'do_evaluable', 'detector_preprocessed', 'n_search_layer_levels'}
     missing_eligibility = required_eligibility.difference(
         profile_eligibility.columns
     )
@@ -28552,6 +28675,11 @@ def summarize_meta_association_sensitivity(
             & profile_eligibility['do_evaluable'].fillna(False).astype(bool)
         ].astype(int)
     ) & all_ids
+    qualified_ids = set(
+        eligibility_ids.loc[
+            eligibility_ids.notna() & _argo_qualified_profile_mask(profile_eligibility)
+        ].astype(int)
+    ) & all_ids
     covered_ids = set(
         meta_distance.loc[
             meta_distance['meta_catalog_covered'].fillna(False).astype(bool)
@@ -28560,8 +28688,10 @@ def summarize_meta_association_sensitivity(
     denominator_modes = {
         'all_argo_requested_period': all_ids,
         'do_evaluable_requested_period': do_evaluable_ids,
+        'qualified_requested_period': qualified_ids,
         'all_argo_meta_period': all_ids & covered_ids,
         'do_evaluable_meta_period': do_evaluable_ids & covered_ids,
+        'qualified_meta_period': qualified_ids & covered_ids,
     }
 
     anomaly_lookup, anomaly_paths = _do_threshold_anomaly_lookup(
@@ -28662,14 +28792,7 @@ def summarize_meta_association_sensitivity(
             )
         )
         out_dir.mkdir(parents=True, exist_ok=True)
-        depth_tag = _format_detection_value(float(anomaly_min_depth))
-        radius_tag = '-'.join(
-            _format_detection_value(value) for value in radius_values
-        )
-        stem = (
-            f'meta_association_sensitivity_{int(start_year)}_'
-            f'{int(end_year)}_depth{depth_tag}m_radius{radius_tag}x'
-        )
+        stem = _meta_association_sensitivity_stem(start_year, end_year, anomaly_min_depth, radius_values)
         _atomic_write_parquet(summary, out_dir / f'{stem}.parquet')
         summary.to_csv(out_dir / f'{stem}.csv', index=False)
         print(
@@ -30188,6 +30311,7 @@ def _scv_matched_control_config() -> dict:
         'bootstrap_cluster_unit': 'anchor_platform',
         'bootstrap_iterations': 2000,
         'random_seed': 42,
+        'core_alignment_permutations': 10000,
     }
     configured = _PROC_CFG.get('processing', {}).get('scv_matched_control', {})
     return {**defaults, **(configured if isinstance(configured, dict) else {})}
@@ -30340,6 +30464,22 @@ def _argo_profile_eligibility_path(
     )
 
 
+_ARGO_ELIGIBILITY_DETECTOR_COLUMNS = (
+    'detector_preprocessed', 'preprocess_reason', 'near_zero_count', 'near_zero_triggered', 'n_search_layer_levels',
+)
+
+
+def _require_eligibility_detector_columns(table: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """确认资格缓存含 DO detector 预处理列；旧版缓存缺列时报错，提示以 force=True 重建。"""
+    missing = [column for column in _ARGO_ELIGIBILITY_DETECTOR_COLUMNS if column not in table.columns]
+    if missing:
+        raise ValueError(
+            f'Eligibility cache {path} lacks {missing}; rebuild it with '
+            'build_argo_profile_eligibility_table(force=True).'
+        )
+    return table
+
+
 def build_argo_profile_eligibility_table(
     *,
     baseline_start_year: int = 2002,
@@ -30358,7 +30498,9 @@ def build_argo_profile_eligibility_table(
     函数逐年读取 Argo parquet 的必要列，将垂向长表压缩为一行一个 profile，并严格限制到既有
     `all_region_argo` shared baseline。输出记录 DO/T/S 垂向覆盖、platform、日期、海盆和 KE 标记；
     `mccoy_eligible_proxy` 表示该 profile 同时具备 depth gate 以下的 DO 与 T/S，而不是声称它已经通过
-    McCoy detector。
+    McCoy detector。每条剖面另经 DO detector 的共用预处理 `_prepare_do_profile_for_detection`，记录是否
+    通过（detector_preprocessed、preprocess_reason、近零计数与是否触发），以及清洗后检测器搜索层
+    [anomaly_min_depth, anomaly_max_depth] 内的有效层数 n_search_layer_levels。
 
     参数:
         - baseline_start_year (int): 分析起始年份（闭区间），默认 2002。
@@ -30381,6 +30523,9 @@ def build_argo_profile_eligibility_table(
     说明:
         - DO evaluability 与现有 frequency analysis 一致，至少要求 depth gate 以下有一个有效 DO 值。
         - `mccoy_eligible_proxy` 只控制观测资格；非目录 control 必须称为 non-catalogued，而不是已证实的 non-SCV。
+        - 覆盖统计沿用各年可用的数据列；共用预处理按 `load_argo_data` 的默认来源（adjusted 值及其 QC 旗标）。
+        - 未通过预处理的剖面 n_search_layer_levels 记为 0。
+        - 已有缓存缺少上述预处理列（旧版缓存）时报错，需以 force=True 重建。
     """
     if int(baseline_end_year) < int(baseline_start_year):
         raise ValueError('baseline_end_year must be >= baseline_start_year.')
@@ -30413,14 +30558,14 @@ def build_argo_profile_eligibility_table(
         min_ts_levels_below_gate=min_ts,
     )
     if path.exists() and not force:
-        return pd.read_parquet(path)
+        return _require_eligibility_detector_columns(pd.read_parquet(path), path)
     legacy_path = out_dir / (
         f'argo_profile_eligibility_{int(baseline_start_year)}_'
         f'{int(baseline_end_year)}_depth'
         f'{_format_detection_value(float(anomaly_min_depth))}m.parquet'
     )
     if legacy_path.exists() and not force:
-        legacy = pd.read_parquet(legacy_path)
+        legacy = _require_eligibility_detector_columns(pd.read_parquet(legacy_path), legacy_path)
         legacy_do_values = (
             legacy['minimum_do_levels']
             if 'minimum_do_levels' in legacy.columns
@@ -30471,6 +30616,14 @@ def build_argo_profile_eligibility_table(
     )
 
     data_dir = Path(argo_data_dir) if argo_data_dir is not None else Path(argo_path)
+    detector_cfg = make_detection_config('do', anomaly_min_depth=float(anomaly_min_depth))
+    search_min_depth = float(detector_cfg.anomaly_min_depth)
+    search_max_depth = float(detector_cfg.anomaly_max_depth)
+    qualification_sources = {
+        'DO': 'DOXY_Adjusted', 'DO_Flag': 'DOXY_Adjusted_Flag',
+        'Temperature': 'Temp_Adjusted', 'Temperature_Flag': 'Temp_Adjusted_Flag',
+        'Salinity': 'PSAL_Adjusted', 'Salinity_Flag': 'PSAL_Adjusted_Flag',
+    }
     yearly_tables: list[pd.DataFrame] = []
     for year in range(int(baseline_start_year), int(baseline_end_year) + 1):
         year_path = data_dir / f'Argo{year}.parquet'
@@ -30497,12 +30650,27 @@ def build_argo_profile_eligibility_table(
             raise ValueError(
                 f'Argo{year}.parquet lacks required columns: base={missing_base}, data={missing_data}'
             )
-        selected_columns = list(base_cols | {column for column in required_map.values() if column})
-        frame = pd.read_parquet(year_path, columns=selected_columns).rename(
+        missing_qualification = sorted(set(qualification_sources.values()).difference(schema_names))
+        if missing_qualification:
+            raise ValueError(f'Argo{year}.parquet lacks qualification columns: {missing_qualification}')
+        selected_columns = list(
+            base_cols
+            | {column for column in required_map.values() if column}
+            | set(qualification_sources.values())
+        )
+        raw_frame = pd.read_parquet(year_path, columns=selected_columns)
+        qualification_input = pd.DataFrame(
+            {name: raw_frame[source] for name, source in qualification_sources.items()}
+        )
+        qualification_input['Depth'] = raw_frame[depth_col]
+        qualification_input['Profile_number'] = raw_frame['Profile_number']
+        frame = raw_frame[list(base_cols | {column for column in required_map.values() if column})].rename(
             columns={column: name for name, column in required_map.items()}
         )
         profile_number = pd.to_numeric(frame['Profile_number'], errors='coerce')
-        frame = frame[profile_number.isin(baseline_ids)].copy()
+        in_baseline = profile_number.isin(baseline_ids)
+        frame = frame[in_baseline].copy()
+        qualification_input = qualification_input[in_baseline]
         if frame.empty:
             print(f'[eligibility] {year}: 0 profiles in shared baseline')
             continue
@@ -30560,10 +30728,26 @@ def build_argo_profile_eligibility_table(
             profile['lon'].between(140.0, 170.0)
             & profile['lat'].between(25.0, 45.0)
         )
+        qualification_rows = []
+        for number, rows in qualification_input.groupby('Profile_number', sort=False):
+            cleaned, diagnostics = _prepare_do_profile_for_detection(rows, detector_cfg)
+            depth = pd.to_numeric(cleaned['Depth'], errors='coerce') if cleaned is not None else pd.Series(dtype=float)
+            qualification_rows.append({
+                'Profile_number': int(number),
+                'detector_preprocessed': bool(diagnostics['detector_preprocessed']),
+                'preprocess_reason': diagnostics['preprocess_reason'],
+                'near_zero_count': int(diagnostics['near_zero_count']),
+                'near_zero_triggered': bool(diagnostics['near_zero_triggered']),
+                'n_search_layer_levels': int(depth.between(search_min_depth, search_max_depth).sum()),
+            })
+        profile = profile.merge(
+            pd.DataFrame(qualification_rows), on='Profile_number', how='left', validate='one_to_one'
+        )
         yearly_tables.append(profile)
         print(
             f'[eligibility] {year}: {len(profile)} profiles, '
-            f'{int(profile["do_evaluable"].sum())} DO-evaluable'
+            f'{int(profile["do_evaluable"].sum())} DO-evaluable, '
+            f'{int(profile["detector_preprocessed"].sum())} detector-preprocessed'
         )
 
     if not yearly_tables:
@@ -30584,6 +30768,140 @@ def build_argo_profile_eligibility_table(
         _atomic_write_parquet(table, path)
         print(f'[*] Argo profile eligibility table saved: {path}')
     return table
+
+
+def _argo_qualified_profile_mask(eligibility: pd.DataFrame) -> pd.Series:
+    """返回全局氧剖面总体的掩膜：通过 DO detector 共用预处理，且检测器搜索层内至少有一个有效观测。"""
+    return (
+        eligibility['detector_preprocessed'].fillna(False).astype(bool)
+        & pd.to_numeric(eligibility['n_search_layer_levels'], errors='coerce').ge(1)
+    )
+
+
+_ARGO_OCCURRENCE_REGIONS = ('KE', 'Pacific excluding KE', 'Southern Ocean', 'Atlantic', 'Indian', 'Arctic')
+
+
+def _argo_occurrence_region(basin: pd.Series, is_ke: pd.Series) -> pd.Series:
+    """把剖面划入互斥区域：KE 框优先，其余按海盆，太平洋剩余部分记为 Pacific excluding KE。"""
+    region = basin.astype(str).replace({'Pacific': 'Pacific excluding KE', 'SO': 'Southern Ocean'})
+    return region.mask(is_ke.fillna(False).astype(bool), 'KE')
+
+
+def build_argo_do_occurrence_table(
+    start_year: int = 2002,
+    end_year: int = 2023,
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    anomaly_min_depth: float = 300.0,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """为全局氧剖面总体逐剖面标记 ΔDO 峰、META 表层涡关联与 McCoy SCV 关联，并汇总三个人群的发生比例。
+
+    剖面总体取 `build_argo_profile_eligibility_table` 中通过 DO detector 共用预处理、且检测器搜索层内至少
+    有一个有效观测的剖面。各阈值的 has_delta_do_* 取自 `plot_argo_hotspots` 已落盘的异常表；META 关联
+    沿用 `build_argo_meta_radius_distance_table` 的距离缓存，在 META 目录时间覆盖内、且到最近同日涡的
+    距离不超过 circle_enlargement_factor 倍有效半径时成立；SCV 关联取 `audit_scv_profile_identity`
+    裁决为 metadata-supported 的当前剖面。人群汇总给出 Global（全部）、META（META 关联）与 SCV
+    （SCV 关联）三个人群各阈值的剖面数、峰剖面数与发生比例；年份 × 区域汇总把剖面划入 KE 框与其余
+    各海盆（太平洋剩余部分记为 Pacific excluding KE）六个互斥区域，逐年给出同样三项。
+
+    参数:
+        - start_year (int): 起始年，默认 2002。
+        - end_year (int): 结束年（含），默认 2023。
+        - thresholds (tuple[float, ...]): ΔDO 阈值，默认 (20, 35, 50)。
+        - anomaly_min_depth (float): 检测器最浅深度（m），默认 300。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `argo_do_occurrence` 目录。
+        - save_data (bool): 是否写出三张表，默认 True。
+
+    返回:
+        - dict: 含 profiles（逐剖面表）、populations（人群汇总）、regions（年份 × 区域汇总）与 output_dir。
+
+    输出:
+        - `argo_do_occurrence_profiles.parquet`：逐剖面的位置、日期、海盆、KE 标记、区域、搜索层层数、各阈值 has_delta_do_*、META 覆盖与关联、SCV 关联（save_data 时）。
+        - `argo_do_occurrence_by_population.parquet`：人群汇总（save_data 时）。
+        - `argo_do_occurrence_by_region_year.parquet`：年份 × 区域汇总（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    eligibility = build_argo_profile_eligibility_table(
+        baseline_start_year=int(start_year), baseline_end_year=int(end_year),
+        anomaly_min_depth=float(anomaly_min_depth),
+    )
+    profiles = eligibility.loc[
+        _argo_qualified_profile_mask(eligibility),
+        ['Profile_number', 'date', 'year', 'lon', 'lat', 'platform_number', 'basin', 'is_ke', 'n_search_layer_levels'],
+    ].reset_index(drop=True)
+    profiles.insert(
+        profiles.columns.get_loc('is_ke') + 1, 'region', _argo_occurrence_region(profiles['basin'], profiles['is_ke'])
+    )
+    meta = build_argo_meta_radius_distance_table(int(start_year), int(end_year))
+    profiles = profiles.merge(
+        meta[['Profile_number', 'meta_catalog_covered', 'nearest_meta_radius_ratio']],
+        on='Profile_number', how='left', validate='one_to_one',
+    )
+    if profiles['meta_catalog_covered'].isna().any():
+        raise ValueError('The META distance cache does not cover every qualified profile.')
+    profiles['meta_catalog_covered'] = profiles['meta_catalog_covered'].astype(bool)
+    profiles['meta_associated'] = (
+        profiles['meta_catalog_covered']
+        & pd.to_numeric(profiles['nearest_meta_radius_ratio'], errors='coerce').le(circle_enlargement_factor)
+    )
+    lookups, _ = _do_threshold_anomaly_lookup(
+        list(thresholds), start_year=int(start_year), end_year=int(end_year),
+        anomaly_min_depth=float(anomaly_min_depth), region_slug=region_slug,
+    )
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        profiles[f'has_delta_do_{tag}'] = profiles['Profile_number'].isin(lookups[float(threshold)].index)
+    adjudication = load_scv_profile_identity()['adjudication']
+    supported = adjudication.loc[
+        adjudication['current_date_position_status'].eq('metadata-supported'), 'current_profile_number'
+    ].astype(int)
+    profiles['scv_associated'] = profiles['Profile_number'].isin(set(supported))
+
+    rows = []
+    for population, mask in (
+        ('Global', pd.Series(True, index=profiles.index)),
+        ('META', profiles['meta_associated']),
+        ('SCV', profiles['scv_associated']),
+    ):
+        group = profiles.loc[mask]
+        for threshold in thresholds:
+            positive = int(group[f'has_delta_do_{_format_detection_value(float(threshold))}'].sum())
+            rows.append({
+                'population': population, 'threshold_umol_kg': float(threshold),
+                'eligible_profiles': int(len(group)), 'anomaly_profiles': positive,
+                'occurrence': positive / len(group) if len(group) else np.nan,
+            })
+    populations = pd.DataFrame(rows)
+
+    flag_cols = {float(t): f'has_delta_do_{_format_detection_value(float(t))}' for t in thresholds}
+    grouped = profiles.groupby(['year', 'region'])
+    counts = grouped[list(flag_cols.values())].sum().join(grouped.size().rename('eligible_profiles'))
+    full_index = pd.MultiIndex.from_product(
+        [range(int(start_year), int(end_year) + 1), _ARGO_OCCURRENCE_REGIONS], names=['year', 'region']
+    )
+    counts = counts.reindex(full_index, fill_value=0).reset_index()
+    regions = pd.concat([
+        counts[['year', 'region', 'eligible_profiles']].assign(
+            threshold_umol_kg=threshold, anomaly_profiles=counts[col].astype(int),
+        )
+        for threshold, col in flag_cols.items()
+    ], ignore_index=True)
+    regions['eligible_profiles'] = regions['eligible_profiles'].astype(int)
+    regions['occurrence'] = regions['anomaly_profiles'] / regions['eligible_profiles'].where(
+        regions['eligible_profiles'] > 0
+    )
+    regions = regions[['year', 'region', 'threshold_umol_kg', 'eligible_profiles', 'anomaly_profiles', 'occurrence']]
+
+    out_dir = (Path(output_dir) if output_dir is not None
+               else make_detection_config('do').output_dir('argo_do_occurrence', region_slug))
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        profiles.to_parquet(out_dir / 'argo_do_occurrence_profiles.parquet', index=False)
+        populations.to_parquet(out_dir / 'argo_do_occurrence_by_population.parquet', index=False)
+        regions.to_parquet(out_dir / 'argo_do_occurrence_by_region_year.parquet', index=False)
+        print(f'[*] Argo ΔDO occurrence tables saved to {out_dir}')
+    return {'profiles': profiles, 'populations': populations, 'regions': regions, 'output_dir': str(out_dir)}
 
 
 def _do_threshold_anomaly_lookup(
@@ -30626,6 +30944,2608 @@ def _do_threshold_anomaly_lookup(
         lookups[float(threshold)] = lookup
         paths[float(threshold)] = path
     return lookups, paths
+
+
+_scv_identity_match_days = int(
+    _PROC_CFG.get('processing', {}).get('scv_profile_identity', {}).get('match_days', 5)
+)
+
+
+def _catalog_decimal_places(value) -> int:
+    """返回目录坐标原始文本的小数位数；科学计数法按 6 位处理。"""
+    text = str(value).strip()
+    if not text or text.lower() in {'nan', 'none'}:
+        return 0
+    if 'e' in text.lower():
+        return 6
+    return len(text.split('.', 1)[1]) if '.' in text else 0
+
+
+def _read_scv_identity_catalog(path: Path) -> pd.DataFrame:
+    """读取 McCoy 目录；数值列由原始文本转换，并保留坐标的原始小数位数。"""
+    raw = pd.read_csv(path, dtype=str)
+    catalog = raw.copy()
+    catalog['catalog_row_id'] = np.arange(len(catalog), dtype=int)
+    for column in ('ID', 'Platform', 'Cycle', 'Longitude', 'Latitude',
+                   'Core_Pressure', 'Shallow_Pressure', 'Deep_Pressure'):
+        catalog[column] = pd.to_numeric(catalog[column], errors='coerce')
+    catalog['Platform'] = catalog['Platform'].astype('Int64')
+    catalog['catalog_date'] = pd.to_datetime(
+        catalog['Cycle_ISO_DateTime_UTC'], errors='coerce', utc=True
+    ).dt.tz_localize(None)
+    catalog['duplicate_platform_cycle'] = catalog.duplicated(['Platform', 'Cycle'], keep=False)
+    catalog['lon_decimals'] = raw['Longitude'].map(_catalog_decimal_places)
+    catalog['lat_decimals'] = raw['Latitude'].map(_catalog_decimal_places)
+    return catalog
+
+
+def _scv_identity_profile_index(argo_data_dir: Path, start_year: int, end_year: int) -> pd.DataFrame:
+    """读取年度 Argo 分片的剖面级身份字段，每个 Profile_number 保留一行。"""
+    columns = ['Profile_number', 'Platform_number', 'Year', 'Month', 'Day', 'Longitude', 'Latitude']
+    frames = []
+    for year in range(int(start_year), int(end_year) + 1):
+        path = Path(argo_data_dir) / f'Argo{year}.parquet'
+        if path.exists():
+            frame = pq.read_table(path, columns=columns).to_pandas()
+            frames.append(frame.groupby('Profile_number', as_index=False, sort=False).first())
+    if not frames:
+        return pd.DataFrame(columns=columns + ['profile_date'])
+    index = pd.concat(frames, ignore_index=True)
+    for column in ('Profile_number', 'Platform_number'):
+        index[column] = pd.to_numeric(index[column], errors='coerce').astype('Int64')
+    index['profile_date'] = pd.to_datetime(
+        {
+            'year': pd.to_numeric(index['Year'], errors='coerce'),
+            'month': pd.to_numeric(index['Month'], errors='coerce'),
+            'day': pd.to_numeric(index['Day'], errors='coerce'),
+        },
+        errors='coerce',
+    )
+    return index.drop_duplicates('Profile_number', keep='first').reset_index(drop=True)
+
+
+_SCV_IDENTITY_PAIR_COLUMNS = (
+    'association_row', 'current_profile_number', 'current_profile_year', 'current_profile_date_cached',
+    'catalog_row_id', 'catalog_id', 'catalog_platform', 'catalog_cycle', 'catalog_date', 'catalog_lon', 'catalog_lat',
+    'catalog_lon_decimals', 'catalog_lat_decimals', 'catalog_core_pressure_db', 'catalog_shallow_pressure_db',
+    'catalog_deep_pressure_db', 'catalog_duplicate_platform_cycle', 'candidate_profile_number', 'candidate_profile_year',
+    'candidate_platform_number', 'candidate_profile_date', 'candidate_lon', 'candidate_lat', 'candidate_date_delta_days',
+    'candidate_cross_year', 'candidate_is_current_profile', 'position_distance_km',
+)
+
+
+def _scv_identity_candidate_pairs(
+    anchored: pd.DataFrame,
+    index: pd.DataFrame,
+    catalog: pd.DataFrame,
+    match_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """为每条目录关联枚举同浮标、日期窗口内的（目录行, Argo 剖面）候选对，并汇总候选情况。"""
+    idx = index.dropna(subset=['Profile_number', 'Platform_number', 'profile_date']).copy()
+    idx['Profile_number'] = idx['Profile_number'].astype(int)
+    idx['Platform_number'] = idx['Platform_number'].astype(int)
+    by_platform = {
+        int(platform): group.sort_values('profile_date').reset_index(drop=True)
+        for platform, group in idx.groupby('Platform_number', sort=False)
+    }
+    idx_map = idx.set_index('Profile_number').to_dict(orient='index')
+    window = pd.Timedelta(days=match_days)
+    pair_rows: list[dict] = []
+    summary_rows: list[dict] = []
+    for association_row, rec in enumerate(anchored.itertuples(index=False), start=1):
+        pn = int(rec.profile_number)
+        actual = idx_map.get(pn, {})
+        platform = int(actual['Platform_number']) if 'Platform_number' in actual else None
+        profile_date = pd.Timestamp(actual['profile_date']) if 'profile_date' in actual else pd.NaT
+        if platform is not None and pd.notna(profile_date):
+            catalog_rows = catalog.loc[
+                catalog['Platform'].eq(platform)
+                & catalog['catalog_date'].notna()
+                & (catalog['catalog_date'] - profile_date).abs().le(window)
+            ]
+        else:
+            catalog_rows = catalog.iloc[0:0]
+        platform_profiles = by_platform.get(platform, idx.iloc[0:0]) if platform is not None else idx.iloc[0:0]
+        pairs: list[dict] = []
+        for cat in catalog_rows.itertuples(index=False):
+            if platform_profiles.empty:
+                continue
+            delta_days = (platform_profiles['profile_date'] - cat.catalog_date).dt.total_seconds() / 86400.0
+            for cand in platform_profiles.loc[delta_days.abs().le(match_days)].itertuples(index=False):
+                pairs.append({
+                    'association_row': association_row,
+                    'current_profile_number': pn,
+                    'current_profile_year': int(rec.year),
+                    'current_profile_date_cached': rec.date,
+                    'catalog_row_id': int(cat.catalog_row_id),
+                    'catalog_id': int(cat.ID),
+                    'catalog_platform': int(cat.Platform),
+                    'catalog_cycle': int(cat.Cycle),
+                    'catalog_date': cat.catalog_date,
+                    'catalog_lon': float(cat.Longitude),
+                    'catalog_lat': float(cat.Latitude),
+                    'catalog_lon_decimals': int(cat.lon_decimals),
+                    'catalog_lat_decimals': int(cat.lat_decimals),
+                    'catalog_core_pressure_db': float(cat.Core_Pressure),
+                    'catalog_shallow_pressure_db': float(cat.Shallow_Pressure),
+                    'catalog_deep_pressure_db': float(cat.Deep_Pressure),
+                    'catalog_duplicate_platform_cycle': bool(cat.duplicate_platform_cycle),
+                    'candidate_profile_number': int(cand.Profile_number),
+                    'candidate_profile_year': int(cand.Year),
+                    'candidate_platform_number': int(cand.Platform_number),
+                    'candidate_profile_date': cand.profile_date,
+                    'candidate_lon': float(cand.Longitude),
+                    'candidate_lat': float(cand.Latitude),
+                    'candidate_date_delta_days': float((cand.profile_date - cat.catalog_date).total_seconds() / 86400.0),
+                    'candidate_cross_year': bool(int(cand.Year) != cat.catalog_date.year),
+                    'candidate_is_current_profile': bool(int(cand.Profile_number) == pn),
+                    'position_distance_km': float(
+                        great_circle_distance_m(cand.Longitude, cand.Latitude, cat.Longitude, cat.Latitude) / 1000.0
+                    ),
+                })
+        pairs_df = pd.DataFrame(pairs)
+        if pairs_df.empty:
+            status = 'unresolved'
+        elif pairs_df['candidate_profile_number'].nunique() > 1 or pairs_df['catalog_row_id'].nunique() > 1:
+            status = 'ambiguous'
+        elif not pairs_df['candidate_is_current_profile'].any():
+            status = 'conflicting'
+        else:
+            # 年度分片没有 Cycle 列，单一候选只能由浮标、日期和位置支持，不能确认到 Cycle。
+            status = 'time-position-supported'
+        current_pair = pairs_df.loc[pairs_df['candidate_is_current_profile']] if not pairs_df.empty else pairs_df
+        summary_rows.append({
+            'association_row': association_row,
+            'current_profile_number': pn,
+            'current_profile_year': int(rec.year),
+            'current_profile_platform': platform,
+            'current_profile_date': profile_date,
+            'current_profile_lon': float(actual.get('Longitude', np.nan)),
+            'current_profile_lat': float(actual.get('Latitude', np.nan)),
+            'n_catalog_rows_in_window': int(pairs_df['catalog_row_id'].nunique()) if not pairs_df.empty else 0,
+            'n_candidate_pairs': int(len(pairs_df)),
+            'n_candidate_profile_numbers': int(pairs_df['candidate_profile_number'].nunique()) if not pairs_df.empty else 0,
+            'n_cross_year_candidate_pairs': int(pairs_df['candidate_cross_year'].sum()) if not pairs_df.empty else 0,
+            'current_profile_in_candidate_set': bool(not current_pair.empty),
+            'current_pair_min_position_distance_km': float(current_pair['position_distance_km'].min()) if not current_pair.empty else np.nan,
+            'current_pair_max_position_distance_km': float(current_pair['position_distance_km'].max()) if not current_pair.empty else np.nan,
+            'identity_status': status,
+        })
+        pair_rows.extend(pairs)
+    return pd.DataFrame(pair_rows, columns=list(_SCV_IDENTITY_PAIR_COLUMNS)), pd.DataFrame(summary_rows)
+
+
+def _adjudicate_scv_profile_identity(pairs: pd.DataFrame, anchored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按目录原始精度裁决每条关联的剖面身份，返回（逐关联裁决, 加注证据的候选对）。
+
+    先用来源关联记录的核心压力找回唯一的原目录行，再在该行内比较当前剖面与其他候选的日历日期
+    和目录精度下的坐标；目录行与物理剖面候选分开计数。每条来源关联都有一行裁决，日期窗口内没有任何
+    候选对的关联记为 unresolved-no-candidate。
+    """
+    source = anchored.reset_index(drop=True).rename(columns={
+        'profile_number': 'source_profile_number',
+        'mccoy_core_pressure_db': 'source_core_pressure_db',
+        'date': 'source_profile_date',
+        'lon': 'source_profile_lon',
+        'lat': 'source_profile_lat',
+        'scv_type': 'source_scv_type',
+        'basin': 'source_basin',
+    })
+    source.insert(0, 'association_row', np.arange(1, len(source) + 1, dtype=int))
+    source_fields = [
+        'association_row', 'source_profile_number', 'source_core_pressure_db',
+        'source_profile_date', 'source_profile_lon', 'source_profile_lat',
+        'source_scv_type', 'source_basin',
+    ]
+    work = pairs.merge(source[source_fields], on='association_row', how='left', validate='many_to_one')
+    candidate_lon = pd.to_numeric(work['candidate_lon'], errors='coerce')
+    candidate_lat = pd.to_numeric(work['candidate_lat'], errors='coerce')
+    catalog_lon = pd.to_numeric(work['catalog_lon'], errors='coerce')
+    catalog_lat = pd.to_numeric(work['catalog_lat'], errors='coerce')
+    lon_decimals = work['catalog_lon_decimals'].astype(int)
+    lat_decimals = work['catalog_lat_decimals'].astype(int)
+    work['minimal_lon_diff_deg'] = [
+        float(np.asarray(_minimal_lon_diff_deg(candidate, reference)))
+        if np.isfinite(candidate) and np.isfinite(reference) else np.nan
+        for candidate, reference in zip(candidate_lon, catalog_lon)
+    ]
+    work['lat_diff_deg'] = candidate_lat - catalog_lat
+    for name, values, decimals in (
+        ('candidate_lon_at_catalog_precision', candidate_lon, lon_decimals),
+        ('catalog_lon_at_source_precision', catalog_lon, lon_decimals),
+        ('candidate_lat_at_catalog_precision', candidate_lat, lat_decimals),
+        ('catalog_lat_at_source_precision', catalog_lat, lat_decimals),
+    ):
+        work[name] = [
+            round(float(value), int(digits)) if np.isfinite(value) else np.nan
+            for value, digits in zip(values, decimals)
+        ]
+    work['same_calendar_date'] = (
+        pd.to_datetime(work['catalog_date']).dt.normalize()
+        == pd.to_datetime(work['candidate_profile_date']).dt.normalize()
+    )
+    work['coordinate_precision_match'] = (
+        work['candidate_lon_at_catalog_precision'].eq(work['catalog_lon_at_source_precision'])
+        & work['candidate_lat_at_catalog_precision'].eq(work['catalog_lat_at_source_precision'])
+    )
+    work['metadata_exact'] = work['same_calendar_date'] & work['coordinate_precision_match']
+    work['original_catalog_core_match'] = (
+        pd.to_numeric(work['catalog_core_pressure_db'], errors='coerce')
+        == pd.to_numeric(work['source_core_pressure_db'], errors='coerce')
+    )
+    original_rows = {
+        int(association_row): sorted(
+            group.loc[group['original_catalog_core_match'], 'catalog_row_id'].astype(int).unique()
+        )
+        for association_row, group in work.groupby('association_row', sort=True)
+    }
+
+    def _row_resolution(rows: list[int]) -> str:
+        if len(rows) == 1:
+            return 'unique'
+        return 'multiple_same_core_records' if rows else 'unavailable'
+
+    work['original_catalog_row_ids'] = work['association_row'].map(original_rows)
+    work['original_catalog_row_resolution'] = work['association_row'].map(
+        lambda value: _row_resolution(original_rows.get(int(value), []))
+    )
+    work['original_catalog_row'] = [
+        int(row.catalog_row_id) in original_rows.get(int(row.association_row), [])
+        for row in work.itertuples(index=False)
+    ]
+    work['metadata_exact_original_row'] = work['metadata_exact'] & work['original_catalog_row']
+
+    evidence = {
+        'metadata-supported': 'current profile matches the uniquely recovered original catalog row at calendar-date and source-coordinate precision',
+        'confirmed-mismatch': 'unique alternative matches the uniquely recovered original catalog row at calendar-date and source-coordinate precision',
+        'unresolved-original-catalog-row': 'original catalog row is not uniquely recoverable from the source core-pressure record',
+        'unresolved-current-and-alternative': 'the uniquely recovered original catalog row has both current and alternative metadata matches',
+        'unresolved': 'no source-precision comparison distinguishes current from alternatives',
+        'unresolved-no-candidate': 'no catalog row and Argo profile of the same float fall within the date window',
+    }
+    groups = {int(key): group for key, group in work.groupby('association_row', sort=True)}
+    rows = []
+    for association_row, current_profile in zip(source['association_row'], source['source_profile_number']):
+        group = groups.get(int(association_row), work.iloc[0:0])
+        row_ids = original_rows.get(int(association_row), [])
+        original_group = group.loc[group['original_catalog_row']]
+        is_current = original_group['candidate_is_current_profile'].astype(bool)
+        current = original_group.loc[is_current]
+        alternatives = original_group.loc[~is_current]
+        current_exact = current.loc[current['metadata_exact_original_row']]
+        alternative_exact = alternatives.loc[alternatives['metadata_exact_original_row']]
+        replacements = sorted(alternative_exact['candidate_profile_number'].astype(int).unique())
+        resolution = _row_resolution(row_ids)
+        if group.empty:
+            status = 'unresolved-no-candidate'
+        elif resolution != 'unique':
+            status = 'unresolved-original-catalog-row'
+        elif len(current_exact) and len(alternative_exact):
+            status = 'unresolved-current-and-alternative'
+        elif len(current_exact):
+            status = 'metadata-supported'
+        elif len(alternative_exact) and len(replacements) == 1:
+            status = 'confirmed-mismatch'
+        else:
+            status = 'unresolved'
+        current_dist = pd.to_numeric(current['position_distance_km'], errors='coerce')
+        rows.append({
+            'association_row': int(association_row),
+            'current_profile_number': int(current_profile),
+            'catalog_rows_in_window': int(group['catalog_row_id'].nunique()),
+            'original_catalog_row_ids': row_ids,
+            'original_catalog_row_id': int(row_ids[0]) if len(row_ids) == 1 else np.nan,
+            'original_catalog_row_resolution': resolution,
+            'physical_profile_candidates': int(group['candidate_profile_number'].nunique()),
+            'physical_profile_candidates_original_row': int(original_group['candidate_profile_number'].nunique()),
+            'current_metadata_exact_catalog_rows': sorted(current_exact['catalog_row_id'].astype(int).unique()),
+            'alternative_metadata_exact_catalog_rows': sorted(alternative_exact['catalog_row_id'].astype(int).unique()),
+            'replacement_candidate_profiles': replacements,
+            'current_min_position_distance_km': float(current_dist.min()) if len(current_dist) else np.nan,
+            'current_max_position_distance_km': float(current_dist.max()) if len(current_dist) else np.nan,
+            'current_date_position_status': status,
+            'current_candidate_count': int(len(current)),
+            'alternative_candidate_count': int(len(alternatives)),
+            'position_gt_10km': bool(current_dist.min() > 10.0) if len(current_dist) else False,
+            'evidence': evidence[status],
+        })
+    return pd.DataFrame(rows), work
+
+
+def audit_scv_profile_identity(
+    anchored_path: str | Path | None = None,
+    mccoy_csv: str | Path | None = None,
+    argo_data_dir: str | Path | None = None,
+    start_year: int = 2002,
+    end_year: int = 2023,
+    match_days: int = _scv_identity_match_days,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """审计 McCoy SCV 目录关联的 Argo 剖面身份，并逐条裁决当前关联是否得到目录元数据支持。
+
+    `screen_mccoy_scvs_against_glorys` 的 Argo 锚定表按浮标与日期把目录条目关联到剖面。本函数对每条
+    关联，在同一浮标、目录日期 ±match_days 天内枚举全部（目录行, Argo 剖面）候选对，再用来源记录的
+    核心压力找回唯一的原目录行，在该行内比较当前剖面与其他候选的日历日期及目录精度下的坐标：当前剖面
+    唯一吻合为 metadata-supported，唯一的其他剖面吻合为 confirmed-mismatch，其余情形保留为未决。
+    年度 Argo 分片没有 Cycle 列，身份只由浮标、日期和位置判定。
+
+    参数:
+        - anchored_path (str | Path | None): Argo 锚定 McCoy 表路径；None 时取 DO 主线 `screen_mccoy_scvs_against_glorys` 的默认输出。
+        - mccoy_csv (str | Path | None): McCoy SCV 目录 CSV；None 时使用 paths.yml 中的 mccoy_scv_csv。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 时使用配置中的 argo_parquet。
+        - start_year (int): 读取身份索引的起始年，默认 2002。
+        - end_year (int): 读取身份索引的结束年（含），默认 2023。
+        - match_days (int): 目录日期与候选剖面日期的最大相差天数，默认来自 processing.yml:processing.scv_profile_identity.match_days。
+        - output_dir (str | Path | None): 输出目录；None 时为共享输出目录下的 `scv_profile_identity`。
+        - save_data (bool): 是否写出三张表，默认 True。
+
+    返回:
+        - dict: 含 candidates（加注证据的候选对）、summary（逐关联候选汇总）、adjudication（逐关联裁决）三个 DataFrame，status_counts（裁决状态计数）与 output_dir。
+
+    输出:
+        - `scv_identity_candidates.parquet`：每个（关联, 目录行, 候选剖面）一行，含日期差、距离、目录精度下的坐标比较与原目录行判定。
+        - `scv_identity_summary.parquet`：每条关联一行的候选数量与粗分状态（unresolved / ambiguous / conflicting / time-position-supported）。
+        - `scv_identity_adjudication.parquet`：每条关联一行的裁决状态 current_date_position_status、原目录行与替代候选剖面。
+
+    说明:
+        - 位置只在目录报告的小数位精度下比较，不设距离阈值；position_distance_km 仅作描述。
+        - 裁决不读取任何氧结果，未决关联不按结果挑选剖面。
+        - 每条输入关联都有一行裁决；日期窗口内没有候选的关联记为 unresolved-no-candidate。
+    """
+    region_slug = _current_region_key()
+    anchored_path = Path(anchored_path) if anchored_path is not None else _default_mccoy_anchored_path(region_slug)
+    catalog_path = Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv
+    data_dir = Path(argo_data_dir) if argo_data_dir is not None else argo_path
+    out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('scv_profile_identity', region_slug)
+
+    anchored = pd.read_parquet(anchored_path)
+    anchored['profile_number'] = pd.to_numeric(anchored['profile_number'], errors='coerce').astype(int)
+    catalog = _read_scv_identity_catalog(catalog_path)
+    index = _scv_identity_profile_index(data_dir, start_year, end_year)
+    pairs, summary = _scv_identity_candidate_pairs(anchored, index, catalog, int(match_days))
+    adjudication, candidates = _adjudicate_scv_profile_identity(pairs, anchored)
+    status_counts = adjudication['current_date_position_status'].value_counts().to_dict()
+    print(f"[SCV identity] {len(adjudication)} associations: "
+          + ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items())))
+
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        candidates.to_parquet(out_dir / 'scv_identity_candidates.parquet', index=False)
+        summary.to_parquet(out_dir / 'scv_identity_summary.parquet', index=False)
+        adjudication.to_parquet(out_dir / 'scv_identity_adjudication.parquet', index=False)
+        print(f"[SCV identity] saved to {out_dir}")
+    return {
+        'candidates': candidates,
+        'summary': summary,
+        'adjudication': adjudication,
+        'status_counts': status_counts,
+        'output_dir': str(out_dir),
+    }
+
+
+def load_scv_profile_identity(output_dir: str | Path | None = None) -> dict[str, pd.DataFrame]:
+    """读取 `audit_scv_profile_identity` 写出的三张身份表。
+
+    供匹配效应等下游直接取用已落盘的身份裁决，不重读 Argo 分片或目录；任一张表缺失即报错，提示先运行生产函数。
+
+    参数:
+        - output_dir (str | Path | None): 身份表目录；None 时为当前区域共享输出目录下的 `scv_profile_identity`。
+
+    返回:
+        - dict[str, pd.DataFrame]: candidates、summary、adjudication 三张表。
+    """
+    out_dir = Path(output_dir) if output_dir is not None else _shared_output_dir('scv_profile_identity')
+    tables = {}
+    for key in ('candidates', 'summary', 'adjudication'):
+        path = out_dir / f'scv_identity_{key}.parquet'
+        if not path.exists():
+            raise FileNotFoundError(f'Missing SCV identity table: {path}; run audit_scv_profile_identity first.')
+        tables[key] = pd.read_parquet(path)
+    return tables
+
+
+def summarize_scv_glorys_meta_representation(
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """汇总身份得到支持的 McCoy SCV 关联剖面在 GLORYS 与 META 中能否被表示。
+
+    取 `screen_mccoy_scvs_against_glorys` 的 Argo 锚定诊断表，只保留 `audit_scv_profile_identity` 裁决为
+    metadata-supported 的当前剖面，标记 GLORYS 诊断可评估（status 为 ok 且有 glorys_misses 判定）与 META
+    诊断可评估（有 meta_miss 判定）的记录，并计数两边的可评估数、漏检数与共同可评估数。不重做任何几何或
+    温盐判定。
+
+    参数:
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `scv_glorys_meta_representation` 目录。
+        - save_data (bool): 是否写出两张表，默认 True。
+
+    返回:
+        - dict: 含 rows（逐关联诊断行及 evaluated_glorys、evaluated_meta 标记）、counts（metric, n）与 output_dir。
+
+    输出:
+        - `scv_glorys_meta_representation_rows.parquet`：逐关联诊断行（save_data 时）。
+        - `scv_glorys_meta_representation_counts.parquet`：计数表（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    diagnostic = pd.read_parquet(_default_mccoy_anchored_path(region_slug))
+    adjudication = load_scv_profile_identity()['adjudication']
+    supported = set(adjudication.loc[
+        adjudication['current_date_position_status'].eq('metadata-supported'), 'current_profile_number'
+    ].astype(int))
+    rows = diagnostic[diagnostic['profile_number'].astype(int).isin(supported)].copy()
+    rows['evaluated_glorys'] = rows['status'].astype(str).eq('ok') & rows['glorys_misses'].notna()
+    rows['evaluated_meta'] = rows['meta_miss'].notna()
+    joint = rows['evaluated_glorys'] & rows['evaluated_meta']
+    counts = pd.DataFrame([
+        {'metric': 'identity_supported', 'n': len(supported)},
+        {'metric': 'valid_identity_diagnostic_rows', 'n': len(rows)},
+        {'metric': 'GLORYS_evaluated', 'n': int(rows['evaluated_glorys'].sum())},
+        {'metric': 'META_evaluated', 'n': int(rows['evaluated_meta'].sum())},
+        {'metric': 'GLORYS_misses_among_evaluated',
+         'n': int((rows['evaluated_glorys'] & rows['glorys_misses'].fillna(False).astype(bool)).sum())},
+        {'metric': 'META_misses_among_evaluated',
+         'n': int((rows['evaluated_meta'] & rows['meta_miss'].fillna(False).astype(bool)).sum())},
+        {'metric': 'GLORYS_unavailable', 'n': int((~rows['evaluated_glorys']).sum())},
+        {'metric': 'META_unavailable', 'n': int((~rows['evaluated_meta']).sum())},
+        {'metric': 'jointly_evaluated', 'n': int(joint.sum())},
+        {'metric': 'supported_without_diagnostic', 'n': len(supported - set(rows['profile_number'].astype(int)))},
+    ])
+    out_dir = (Path(output_dir) if output_dir is not None
+               else make_detection_config('do').output_dir('scv_glorys_meta_representation', region_slug))
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rows.to_parquet(out_dir / 'scv_glorys_meta_representation_rows.parquet', index=False)
+        counts.to_parquet(out_dir / 'scv_glorys_meta_representation_counts.parquet', index=False)
+        print(f'[*] SCV GLORYS/META representation saved to {out_dir}')
+    return {'rows': rows, 'counts': counts, 'output_dir': str(out_dir)}
+
+
+def _profile_value_on_isopycnal(sigma0: np.ndarray, values: np.ndarray, target: float) -> float:
+    """在单调化的 σ0 包络上线性插值目标等密面处的值；包络平台层先剔除，σ0 范围不含目标时返回 NaN。"""
+    envelope = np.maximum.accumulate(np.asarray(sigma0, dtype=float))
+    if not (envelope.min() <= target <= envelope.max()):
+        return np.nan
+    keep = np.r_[True, np.diff(envelope) > 0]
+    return float(np.interp(target, envelope[keep], np.asarray(values, dtype=float)[keep]))
+
+
+def build_argo_lens_case(
+    name: str,
+    platforms: tuple[int, int],
+    period: tuple[str, str],
+    event_period: tuple[str, str],
+    sigma0: float,
+    scv_match_set: str,
+    event_threshold: float = 50.0,
+    peak_threshold: float = 20.0,
+    box_margin_deg: float = 0.5,
+    grid_step_m: float = 5.0,
+    baseline_start_year: int = 2002,
+    baseline_end_year: int = 2023,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """为一个高频采样浮标阵列整理氧透镜个例：冷事件、同期背景、目标等密面氧序列与一个 SCV 匹配组。
+
+    阵列取 platforms 编号区间内、period 期间的全部剖面，逐层经 DO detector 共用预处理后补算压力、位温与 σ0。
+    冷事件为 event_period 内达到 event_threshold 的剖面，峰深与 ΔDO 取检测器异常表中该剖面的最强峰；
+    背景为同期、位于事件包围矩形（四边外扩 box_margin_deg）内、属于全局氧剖面总体且没有 peak_threshold
+    峰的剖面，给出逐深度 10/50/90 百分位氧。每条剖面在 σ0 单调包络上插值目标等密面的氧与深度。SCV 匹配组
+    取 `run_scv_matched_effects.py` 主队列中的 scv_match_set，锚点经 `audit_scv_profile_identity` 裁决回溯
+    McCoy 目录记录，比较锚点 ΔDO 峰与目录核心和垂向范围的深度与密度。
+
+    参数:
+        - name (str): 个例名，作为输出子目录名。
+        - platforms (tuple[int, int]): 阵列浮标编号闭区间。
+        - period (tuple[str, str]): 阵列剖面的起止日期（含）。
+        - event_period (tuple[str, str]): 冷事件与背景的起止日期（含）。
+        - sigma0 (float): 目标等密面 σ0（kg/m³ − 1000）。
+        - scv_match_set (str): 主匹配队列中的 match_set_id。
+        - event_threshold (float): 冷事件的 ΔDO 阈值（μmol/kg），默认 50。
+        - peak_threshold (float): 背景排除与 SCV 匹配组峰的 ΔDO 阈值（μmol/kg），默认 20。
+        - box_margin_deg (float): 事件包围矩形四边外扩（°），默认 0.5。
+        - grid_step_m (float): 背景百分位的深度网格间距（m），网格从海表到检测器搜索层底，默认 5。
+        - baseline_start_year (int): 全局剖面资格表与异常表的起始年，默认 2002。
+        - baseline_end_year (int): 全局剖面资格表与异常表的结束年，默认 2023。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `argo_lens_case/<name>` 目录。
+        - save_data (bool): 是否写出五张表与个例参数，默认 True。
+
+    返回:
+        - dict: 含 levels、profiles、background_do、scv_set、scv_core 五张表，个例参数 spec（含事件包围矩形 box）与 output_dir。
+
+    输出:
+        - `lens_case_levels.parquet`：阵列剖面逐层的深度、压力、温盐、氧、位温与 σ0（save_data 时）。
+        - `lens_case_profiles.parquet`：逐剖面位置、日期、冷事件与背景标记、事件峰、SCV 匹配组角色与目标等密面上的氧和深度（save_data 时）。
+        - `lens_case_background_do.parquet`：背景剖面逐深度氧百分位（save_data 时）。
+        - `lens_case_scv_set.parquet`：SCV 匹配组成员及其 ΔDO 峰（save_data 时）。
+        - `lens_case_scv_core.parquet`：锚点 ΔDO 峰与 McCoy 目录核心、垂向范围的深度和密度对照（save_data 时）。
+        - `lens_case_spec.json`：个例参数与事件包围矩形，供 `plot_argo_lens_case` 读取（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do', do_threshold=float(event_threshold))
+    start, end = pd.Timestamp(period[0]), pd.Timestamp(period[1])
+    event_start, event_end = pd.Timestamp(event_period[0]), pd.Timestamp(event_period[1])
+
+    parts = []
+    for year in range(start.year, end.year + 1):
+        raw = load_argo_data(year)
+        raw = raw[raw['Platform_number'].between(*platforms)]
+        dates = pd.to_datetime(dict(year=raw['Year'], month=raw['Month'], day=raw['Day']))
+        raw = raw[dates.between(start, end)]
+        for profile_number, profile in raw.groupby('Profile_number', sort=False):
+            clean, _ = _prepare_do_profile_for_detection(profile, cfg)
+            if clean is None:
+                continue
+            head = profile.iloc[0]
+            lon, lat = float(head['Longitude']), float(head['Latitude'])
+            depth = clean['Depth'].to_numpy(float)
+            pressure = gsw.p_from_z(-depth, lat)
+            salinity = clean['Salinity'].to_numpy(float)
+            temperature = clean['Temperature'].to_numpy(float)
+            absolute_salinity = gsw.SA_from_SP(salinity, pressure, lon, lat)
+            parts.append(pd.DataFrame({
+                'profile_number': int(profile_number),
+                'platform_number': int(head['Platform_number']),
+                'date': pd.Timestamp(int(head['Year']), int(head['Month']), int(head['Day'])),
+                'lon': lon, 'lat': lat, 'depth_m': depth, 'pressure_dbar': pressure,
+                'temperature': temperature, 'salinity': salinity, 'do_umol_kg': clean['DO'].to_numpy(float),
+                'theta': gsw.pt0_from_t(absolute_salinity, temperature, pressure),
+                'sigma0': gsw.sigma0(absolute_salinity, gsw.CT_from_t(absolute_salinity, temperature, pressure)),
+            }))
+    levels = pd.concat(parts, ignore_index=True).sort_values(['profile_number', 'depth_m'], ignore_index=True)
+    profiles = levels.drop_duplicates('profile_number')[
+        ['profile_number', 'platform_number', 'date', 'lon', 'lat']
+    ].reset_index(drop=True)
+
+    eligibility = build_argo_profile_eligibility_table(
+        baseline_start_year=int(baseline_start_year), baseline_end_year=int(baseline_end_year),
+        anomaly_min_depth=float(cfg.anomaly_min_depth),
+    )
+    qualified = set(eligibility.loc[_argo_qualified_profile_mask(eligibility), 'Profile_number'].astype(int))
+    lookups, _ = _do_threshold_anomaly_lookup(
+        [float(peak_threshold), float(event_threshold)], start_year=int(baseline_start_year),
+        end_year=int(baseline_end_year), anomaly_min_depth=float(cfg.anomaly_min_depth), region_slug=region_slug,
+    )
+    event_peaks = lookups[float(event_threshold)]
+    in_event_period = profiles['date'].between(event_start, event_end)
+    profiles['cold_event'] = in_event_period & profiles['profile_number'].isin(event_peaks.index)
+    events = profiles.loc[profiles['cold_event']]
+    lon_ref = float(events['lon'].iloc[0])
+    lon_offset = _minimal_lon_diff_deg(profiles['lon'].to_numpy(float), lon_ref)
+    event_offset = lon_offset[profiles['cold_event'].to_numpy()]
+    box = (
+        float(_normalize_lon_array(lon_ref + event_offset.min() - box_margin_deg)),
+        float(_normalize_lon_array(lon_ref + event_offset.max() + box_margin_deg)),
+        float(events['lat'].min() - box_margin_deg),
+        float(events['lat'].max() + box_margin_deg),
+    )
+    in_box = (
+        (lon_offset >= event_offset.min() - box_margin_deg) & (lon_offset <= event_offset.max() + box_margin_deg)
+        & profiles['lat'].between(box[2], box[3]).to_numpy()
+    )
+    profiles['background'] = (
+        in_event_period & in_box & profiles['profile_number'].isin(qualified)
+        & ~profiles['profile_number'].isin(lookups[float(peak_threshold)].index)
+    )
+    event_tag = _format_detection_value(float(event_threshold))
+    profiles[f'delta_do_value_{event_tag}'] = profiles['profile_number'].map(event_peaks['delta_do']).where(
+        profiles['cold_event']
+    )
+    profiles[f'delta_do_peak_depth_m_{event_tag}'] = profiles['profile_number'].map(event_peaks['depth']).where(
+        profiles['cold_event']
+    )
+
+    queue = pd.read_parquet(_scv_matched_queue_path(region_slug))
+    peak_tag = _format_detection_value(float(peak_threshold))
+    scv_set = queue.loc[queue['match_set_id'].eq(scv_match_set)].assign(
+        role=lambda frame: np.where(frame['is_scv'], 'anchor', 'control')
+    )[['match_set_id', 'role', 'profile_number', 'platform_number', 'date', 'lon', 'lat', 'match_distance_km',
+       f'has_delta_do_{peak_tag}', f'delta_do_value_{peak_tag}', f'delta_do_peak_depth_m_{peak_tag}']]
+    missing = set(scv_set['profile_number'].astype(int)) - set(profiles['profile_number'])
+    if scv_set.empty or missing:
+        raise ValueError(f'Match set {scv_match_set} is empty or has profiles outside the array: {sorted(missing)}')
+    profiles['scv_set_role'] = profiles['profile_number'].map(
+        scv_set.set_index('profile_number')['role']
+    ).fillna('')
+
+    by_profile = dict(tuple(levels.groupby('profile_number')))
+    on_isopycnal = [
+        (
+            _profile_value_on_isopycnal(by_profile[pn]['sigma0'], by_profile[pn]['do_umol_kg'], float(sigma0)),
+            _profile_value_on_isopycnal(by_profile[pn]['sigma0'], by_profile[pn]['depth_m'], float(sigma0)),
+        )
+        for pn in profiles['profile_number']
+    ]
+    profiles['do_on_isopycnal'] = [value for value, _ in on_isopycnal]
+    profiles['depth_of_isopycnal_m'] = [depth for _, depth in on_isopycnal]
+
+    grid = np.arange(0.0, float(cfg.anomaly_max_depth) + 0.5 * grid_step_m, float(grid_step_m))
+    background_do = np.vstack([
+        np.interp(grid, by_profile[pn]['depth_m'], by_profile[pn]['do_umol_kg'], left=np.nan, right=np.nan)
+        for pn in profiles.loc[profiles['background'], 'profile_number']
+    ])
+    percentiles = np.full((3, grid.size), np.nan)
+    observed = np.isfinite(background_do).any(axis=0)
+    percentiles[:, observed] = np.nanpercentile(background_do[:, observed], [10, 50, 90], axis=0)
+    background = pd.DataFrame({
+        'depth_m': grid,
+        'background_do_p10': percentiles[0],
+        'background_do_median': percentiles[1],
+        'background_do_p90': percentiles[2],
+    })
+
+    anchor = scv_set.loc[scv_set['role'].eq('anchor')].iloc[0]
+    anchor_row = queue.loc[queue['match_set_id'].eq(scv_match_set) & queue['is_scv']].iloc[0]
+    adjudication = load_scv_profile_identity()['adjudication']
+    row_id = int(adjudication.loc[
+        adjudication['current_profile_number'].eq(int(anchor['profile_number']))
+        & adjudication['current_date_position_status'].eq('metadata-supported'),
+        'original_catalog_row_id',
+    ].iloc[0])
+    catalog = _read_scv_identity_catalog(_mccoy_scv_csv)
+    record = catalog.loc[catalog['catalog_row_id'].eq(row_id)].iloc[0]
+    anchor_levels = by_profile[int(anchor['profile_number'])]
+    peak_depth = float(anchor[f'delta_do_peak_depth_m_{peak_tag}'])
+    core_depth = float(anchor_row['anchor_core_depth_m'])
+    shallow_depth = -float(gsw.z_from_p(float(record['Shallow_Pressure']), float(anchor['lat'])))
+    deep_depth = -float(gsw.z_from_p(float(record['Deep_Pressure']), float(anchor['lat'])))
+    scv_core = pd.DataFrame([{
+        'anchor_profile': int(anchor['profile_number']),
+        'mccoy_platform': int(record['Platform']),
+        'mccoy_cycle': int(record['Cycle']),
+        'mccoy_scv_type': str(record['SCV_Type']),
+        'peak_depth_m': peak_depth,
+        'peak_delta_do': float(anchor[f'delta_do_value_{peak_tag}']),
+        'sigma0_at_peak': float(np.interp(peak_depth, anchor_levels['depth_m'], anchor_levels['sigma0'])),
+        'core_depth_m': core_depth,
+        'sigma0_at_core_from_profile': float(np.interp(core_depth, anchor_levels['depth_m'], anchor_levels['sigma0'])),
+        'mccoy_core_density': float(record['Core_Density']),
+        'mccoy_shallow_pressure_dbar': float(record['Shallow_Pressure']),
+        'mccoy_deep_pressure_dbar': float(record['Deep_Pressure']),
+        'mccoy_shallow_depth_m': shallow_depth,
+        'mccoy_deep_depth_m': deep_depth,
+        'mccoy_shallow_density': float(record['Shallow_Density']),
+        'mccoy_deep_density': float(record['Deep_Density']),
+        'peak_above_mccoy_extent_m': shallow_depth - peak_depth,
+    }])
+
+    spec = {
+        'name': name, 'platforms': [int(v) for v in platforms], 'period': [str(v) for v in period],
+        'event_period': [str(v) for v in event_period], 'sigma0': float(sigma0), 'scv_match_set': scv_match_set,
+        'event_threshold': float(event_threshold), 'peak_threshold': float(peak_threshold),
+        'box_margin_deg': float(box_margin_deg), 'grid_step_m': float(grid_step_m), 'box': list(box),
+    }
+    out_dir = (Path(output_dir) if output_dir is not None
+               else cfg.output_dir('argo_lens_case', region_slug) / name)
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / 'lens_case_spec.json').write_text(json.dumps(spec, indent=2, ensure_ascii=False))
+        levels.to_parquet(out_dir / 'lens_case_levels.parquet', index=False)
+        profiles.to_parquet(out_dir / 'lens_case_profiles.parquet', index=False)
+        background.to_parquet(out_dir / 'lens_case_background_do.parquet', index=False)
+        scv_set.to_parquet(out_dir / 'lens_case_scv_set.parquet', index=False)
+        scv_core.to_parquet(out_dir / 'lens_case_scv_core.parquet', index=False)
+        print(f'[*] Argo lens case {name} saved to {out_dir}')
+    return {
+        'levels': levels, 'profiles': profiles, 'background_do': background, 'scv_set': scv_set,
+        'scv_core': scv_core, 'spec': spec, 'output_dir': str(out_dir),
+    }
+
+
+_JOURNAL_UNIT = 'μmol kg$^{-1}$'
+_JOURNAL_FULL_WIDTH_IN = 7.0
+
+
+def _journal_rc() -> dict:
+    """期刊版式组合图的 rcParams：7.5 pt 无衬线字、细轴线、去上右边框、400 dpi 保存。"""
+    ink = _JOURNAL_COLORS['ink']
+    return {
+        'font.family': ['Liberation Sans', 'DejaVu Sans'],
+        'font.size': 7.5, 'axes.labelsize': 7.5, 'axes.titlesize': 7.5,
+        'xtick.labelsize': 7, 'ytick.labelsize': 7, 'legend.fontsize': 6.5,
+        'axes.edgecolor': ink, 'axes.labelcolor': ink, 'xtick.color': ink, 'ytick.color': ink, 'text.color': ink,
+        'axes.linewidth': 0.6, 'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
+        'xtick.minor.width': 0.5, 'ytick.minor.width': 0.5,
+        'xtick.major.size': 2.5, 'ytick.major.size': 2.5, 'xtick.minor.size': 1.5, 'ytick.minor.size': 1.5,
+        'axes.spines.top': False, 'axes.spines.right': False, 'legend.frameon': False,
+        'savefig.dpi': 400, 'figure.dpi': 100, 'mathtext.default': 'regular',
+    }
+
+
+def _inch_size(fig) -> tuple[float, float]:
+    """返回 Figure 或 SubFigure 的宽高（英寸）。"""
+    return fig.bbox.width / fig.figure.dpi, fig.bbox.height / fig.figure.dpi
+
+
+def _inch_rect(fig, left: float, bottom: float, right: float | None = None, top: float | None = None,
+               width: float | None = None, height: float | None = None) -> list[float]:
+    """把英寸边距换成（子）图的分数坐标矩形，使同一面板在任意组合图中保持实际尺寸。"""
+    w, h = _inch_size(fig)
+    ww = width if width is not None else w - left - right
+    hh = height if height is not None else h - bottom - top
+    return [left / w, bottom / h, ww / w, hh / h]
+
+
+def _inch_axes(fig, *args, projection=None, **kwargs):
+    """按英寸边距在（子）图中添加坐标轴。"""
+    rect = _inch_rect(fig, *args, **kwargs)
+    return fig.add_axes(rect, projection=projection) if projection is not None else fig.add_axes(rect)
+
+
+def _inch_point(fig, x: float, y: float) -> tuple[float, float]:
+    """把英寸位置换成（子）图的分数坐标。"""
+    w, h = _inch_size(fig)
+    return x / w, y / h
+
+
+def _journal_panel_label(fig, text: str) -> None:
+    """在（子）图左上角写面板标号。"""
+    w, h = _inch_size(fig)
+    fig.text(0.03 / w, 1 - 0.03 / h, text, ha='left', va='top', fontsize=9, fontweight='bold')
+
+
+def _journal_light_grid(ax, axis: str = 'y') -> None:
+    """在坐标轴下层画浅色网格线。"""
+    ax.grid(axis=axis, color=_JOURNAL_COLORS['grid'], linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+
+def _journal_threshold_style(threshold: float) -> tuple[str, str]:
+    """返回 ΔDO 阈值在期刊图中的颜色与 marker。"""
+    key = f'DO{_format_detection_value(float(threshold))}'
+    return _JOURNAL_COLORS[key], _THRESHOLD_MARKERS[key]
+
+
+def _journal_map_axes(fig, rect, central_longitude: float = 180.0):
+    """添加以太平洋为中心的全球 Robinson 地图轴。"""
+    ax = fig.add_axes(rect, projection=ccrs.Robinson(central_longitude=central_longitude))
+    ax.set_global()
+    ax.spines['geo'].set_linewidth(0.5)
+    ax.spines['geo'].set_edgecolor(_JOURNAL_COLORS['muted'])
+    return ax
+
+
+def _journal_add_land(ax, scale: str = '110m', zorder: float = 3) -> None:
+    """填充陆地；不描边，因为太平洋中心投影上多边形边与海岸线都会在南极显出日界线切口。"""
+    land = cfeature.NaturalEarthFeature('physical', 'land', scale)
+    ax.add_feature(land, facecolor=_JOURNAL_COLORS['land'], edgecolor='none', zorder=zorder)
+
+
+def _box_outline(lon0: float, lon1: float, lat0: float, lat1: float, n: int = 60) -> tuple[np.ndarray, np.ndarray]:
+    """返回经纬度矩形的加密边线，供非等距投影上画成曲边。"""
+    lons = np.concatenate([np.linspace(lon0, lon1, n), np.full(n, lon1), np.linspace(lon1, lon0, n), np.full(n, lon0)])
+    lats = np.concatenate([np.full(n, lat0), np.linspace(lat0, lat1, n), np.full(n, lat1), np.linspace(lat1, lat0, n)])
+    return lons, lats
+
+
+def _grid_to_lon360(lon_edges: np.ndarray, *grids: np.ndarray) -> tuple[np.ndarray, ...]:
+    """把 -180–180 欧拉网格的列重排到 0–360，使太平洋中心地图的接缝落在图边而非日界线。"""
+    left = np.mod(np.asarray(lon_edges[:-1], dtype=float), 360.0)
+    order = np.argsort(left)
+    step = float(lon_edges[1] - lon_edges[0])
+    return (np.r_[left[order], left[order][-1] + step], *[np.asarray(g)[:, order] for g in grids])
+
+
+def _journal_occurrence_mesh(ax, lon_edges: np.ndarray, lat_edges: np.ndarray, count: np.ndarray,
+                             positive: np.ndarray, min_profiles: int):
+    """画网格发生比例：剖面不足的格子灰底，达到门槛但无峰的格子浅底，其余按分档色阶着色。"""
+    shown = count >= min_profiles
+    rate = np.where(shown & (positive > 0), positive / np.where(count > 0, count, 1), np.nan)
+    zero = np.where(shown & (positive == 0), 1.0, np.nan)
+    sparse = np.where((count > 0) & ~shown, 1.0, np.nan)
+    pc = ccrs.PlateCarree()
+    ax.pcolormesh(lon_edges, lat_edges, sparse, cmap=ListedColormap([_JOURNAL_COLORS['sparse']]), transform=pc,
+                  zorder=1)
+    ax.pcolormesh(lon_edges, lat_edges, zero, cmap=ListedColormap([_JOURNAL_COLORS['zero']]), transform=pc,
+                  zorder=1)
+    cmap = ListedColormap(_JOURNAL_OCCURRENCE_COLORS)
+    return ax.pcolormesh(lon_edges, lat_edges, rate, cmap=cmap, norm=BoundaryNorm(_JOURNAL_OCCURRENCE_BINS, cmap.N),
+                         transform=pc, zorder=1)
+
+
+def _journal_occurrence_colorbar(fig, mesh, cax, label: str) -> None:
+    """画发生比例的水平分档色标（百分数刻度）。"""
+    cb = fig.colorbar(mesh, cax=cax, orientation='horizontal', ticks=_JOURNAL_OCCURRENCE_BINS)
+    cb.ax.set_xticklabels([f'{100 * value:g}' for value in _JOURNAL_OCCURRENCE_BINS])
+    cb.outline.set_linewidth(0.4)
+    cb.ax.tick_params(length=2, labelsize=6.5)
+    cb.set_label(label, fontsize=6.8, labelpad=2)
+
+
+def _journal_occurrence_handles(threshold: float, min_profiles: int) -> list:
+    """发生比例地图中两种底色格子的图例。"""
+    tag = _format_detection_value(float(threshold))
+    return [
+        Patch(facecolor=_JOURNAL_COLORS['zero'], edgecolor=_JOURNAL_COLORS['light'], lw=0.4,
+              label=f'≥{min_profiles} profiles, none with ΔDO{tag}'),
+        Patch(facecolor=_JOURNAL_COLORS['sparse'], edgecolor='none',
+              label=f'1–{min_profiles - 1} profiles; occurrence not mapped'),
+    ]
+
+
+def _journal_log_axis(axis, ticks) -> None:
+    """对数轴只标给定刻度、不画次刻度，刻度值取最短写法。"""
+    axis.set_major_locator(FixedLocator(ticks))
+    axis.set_major_formatter(FuncFormatter(lambda value, _pos: f'{value:g}'))
+    axis.set_minor_locator(NullLocator())
+
+
+def _journal_panel_grid(rows: list[tuple[float, int]]):
+    """按行布置等宽面板：rows 为 (行高英寸, 面板数)；返回整图与按行展开的面板子图列表。"""
+    fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, sum(height for height, _ in rows)))
+    row_figs = np.atleast_1d(fig.subfigures(len(rows), 1, height_ratios=[height for height, _ in rows], hspace=0))
+    cells = []
+    for row_fig, (_, n_panels) in zip(row_figs, rows):
+        cells.extend(np.atleast_1d(row_fig.subfigures(1, n_panels, wspace=0)) if n_panels > 1 else [row_fig])
+    return fig, cells
+
+
+def _journal_save(fig, out_dir: Path, stem: str, show_fig: bool, save_fig: bool) -> str | None:
+    """按开关保存并显示期刊图，然后关闭；返回图路径（未保存时为 None）。"""
+    path = None
+    if save_fig:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f'{stem}.png'
+        fig.savefig(path)
+        print(f'[*] Figure saved to {path}')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+    return str(path) if path is not None else None
+
+
+def _journal_write_sources(out_dir: Path, sources: dict[str, pd.DataFrame]) -> None:
+    """把各面板的来源数据写成同目录 CSV。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, frame in sources.items():
+        frame.to_csv(out_dir / f'{name}.csv', index=False)
+
+
+def _meta_association_sensitivity_path(region_slug: str | None = None) -> Path:
+    """返回全局氧剖面总体所用 META 关联敏感性表（2002–2023、300 m、1/1.2/1.5/2 倍半径）的路径。"""
+    stem = _meta_association_sensitivity_stem(2002, 2023, 300.0, (1.0, 1.2, 1.5, 2.0))
+    return make_detection_config('do').output_dir('meta_association_sensitivity', region_slug) / f'{stem}.parquet'
+
+
+def _scv_matched_effects_path(region_slug: str | None = None) -> Path:
+    """返回 `run_scv_matched_effects.py` 写出的匹配效应表路径。"""
+    return _scv_matched_queue_path(region_slug).with_name('scv_matched_effects.parquet')
+
+
+def _occurrence_grid_display(profiles: pd.DataFrame, threshold: float, grid_step_deg: float,
+                             min_profiles: int) -> tuple[dict, pd.DataFrame]:
+    """由逐剖面发生表经 `build_euler_occurrence_summary` 计数，返回 0–360 排列的网格与逐格来源表。"""
+    tag = _format_detection_value(float(threshold))
+    summary = build_euler_occurrence_summary(
+        int(profiles['year'].min()), int(profiles['year'].max()), grid_step_deg=float(grid_step_deg),
+        profiles=profiles, anomaly_col=f'has_delta_do_{tag}',
+    )
+    lon_edges, count, positive = _grid_to_lon360(
+        summary['grid']['lon_edges'], summary['argo_baseline_profiles'], summary['anomaly_profiles']
+    )
+    lat_edges = np.asarray(summary['grid']['lat_edges'], dtype=float)
+    cells = np.argwhere(count > 0)
+    table = pd.DataFrame({
+        'lon_min': lon_edges[cells[:, 1]], 'lon_max': lon_edges[cells[:, 1] + 1],
+        'lat_min': lat_edges[cells[:, 0]], 'lat_max': lat_edges[cells[:, 0] + 1],
+        'eligible_profiles': count[cells[:, 0], cells[:, 1]].astype(int),
+        f'do{tag}_profiles': positive[cells[:, 0], cells[:, 1]].astype(int),
+    })
+    table['shown'] = table['eligible_profiles'] >= int(min_profiles)
+    table[f'do{tag}_occurrence'] = (table[f'do{tag}_profiles'] / table['eligible_profiles']).where(table['shown'])
+    table = table.sort_values(['lat_min', 'lon_min']).reset_index(drop=True)
+    grid = {'lon_edges': lon_edges, 'lat_edges': lat_edges, 'count': count, 'positive': positive}
+    return grid, table
+
+
+def _mean_eke_display(percentile: float) -> dict:
+    """读取 GLORYS 平均 EKE 并重映射到 1° 网格（0–360 排列），给出海洋格点正值 EKE 的给定分位。"""
+    eke_euler = remap_glorys_eke_to_euler_grid(
+        load_glorys_eke_native(glorys_processed_root / 'eke.zarr', include_count=False),
+        grid_step_deg=1.0, method='linear',
+    )
+    lon_edges, eke_grid = _grid_to_lon360(eke_euler['grid']['lon_edges'], eke_euler['eke_grid'])
+    lat_edges = np.asarray(eke_euler['grid']['lat_edges'], dtype=float)
+    return {
+        'lon': 0.5 * (lon_edges[:-1] + lon_edges[1:]), 'lat': 0.5 * (lat_edges[:-1] + lat_edges[1:]),
+        'eke': eke_grid, 'level': float(np.nanpercentile(eke_grid[np.isfinite(eke_grid) & (eke_grid > 0)], percentile)),
+        'label': f'EKE {percentile:g}th percentile (2002–2022)',
+    }
+
+
+def _draw_delta_do_construction_panel(fig, construction: pd.Series, levels: pd.DataFrame) -> None:
+    """画单条剖面的 ΔDO 构造：有效层、搜索层、±窗口端点参考线与峰值差。"""
+    colors = _JOURNAL_COLORS
+    depth = levels['depth_m'].to_numpy(float)
+    oxygen = levels['do_umol_kg'].to_numpy(float)
+    peak = float(construction['peak_depth_m'])
+    observed = float(construction['peak_do'])
+    reference = float(construction['reference_do_at_peak'])
+    half = float(construction['half_window_m'])
+    top, bottom = float(construction['search_layer_top_m']), float(construction['search_layer_bottom_m'])
+    ends_do = [float(construction['upper_endpoint_do']), float(construction['lower_endpoint_do'])]
+    ends_depth = [float(construction['upper_endpoint_depth_m']), float(construction['lower_endpoint_depth_m'])]
+
+    ax = _inch_axes(fig, 0.47, 1.3, 0.1, 0.45)
+    ax.axhspan(top, bottom, color=colors['band'], lw=0, zorder=0)
+    ax.plot(oxygen, depth, color=colors['muted'], lw=0.9, zorder=2)
+    layer = levels['in_search_layer'].to_numpy(bool)
+    ax.plot(oxygen[layer], depth[layer], 'o', ms=1.7, mfc=colors['muted'], mec='none', zorder=3)
+    ax.plot(ends_do, ends_depth, color=colors['ink'], lw=0.9, ls=(0, (3, 1.6)), zorder=4)
+    ax.plot(ends_do, ends_depth, ls='none', marker='^', ms=4.2, mfc='white', mec=colors['ink'], mew=0.8, zorder=5)
+    ax.annotate('', xy=(observed, peak), xytext=(reference, peak),
+                arrowprops=dict(arrowstyle='<->', color=colors['accent'], lw=1.0, shrinkA=0, shrinkB=0), zorder=6)
+    ax.plot(observed, peak, 'o', ms=3.6, mfc=colors['accent'], mec='white', mew=0.5, zorder=7)
+    ax.text(reference - 10, peak + 4, f'ΔDO = {observed - reference:.0f}\n{_JOURNAL_UNIT}',
+            ha='right', va='center', fontsize=7, color=colors['accent'], linespacing=1.15)
+    xmin = np.nanmin(oxygen[depth <= 1200]) - 10
+    xmax = np.nanmax(oxygen) + 25
+    xb = xmax - 4
+    ax.plot([xb, xb], [peak - half, peak + half], color=colors['ink'], lw=0.7)
+    for yy in (peak - half, peak + half):
+        ax.plot([xb - 4, xb], [yy, yy], color=colors['ink'], lw=0.7)
+    ax.text(xb - 2, peak + half + 14, f'±{half:g} m', ha='right', va='top', fontsize=6.5, color=colors['ink'])
+    ax.text(xmin + 4, top + 14, f'Search layer\n{top:,.0f}–{bottom:,.0f} m', ha='left', va='top', fontsize=6.5,
+            color=colors['muted'])
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(1200, 0)
+    ax.set_xlabel(f'Dissolved oxygen\n({_JOURNAL_UNIT})')
+    ax.set_ylabel('Depth (m)')
+    ax.xaxis.set_major_locator(MultipleLocator(100))
+    ax.yaxis.set_major_locator(MultipleLocator(200))
+    date = pd.Timestamp(construction['date'])
+    ax.set_title(f"Float {int(construction['platform_number'])}, {date:%-d %b %Y}", loc='left', fontsize=7,
+                 color=colors['muted'], pad=5)
+    handles = [
+        Line2D([], [], color=colors['muted'], lw=0.9, marker='o', ms=1.7, mfc=colors['muted'], mec='none',
+               label='Valid observations'),
+        Line2D([], [], ls='none', marker='^', ms=4.2, mfc='white', mec=colors['ink'], mew=0.8,
+               label=f'Reference endpoints:\noutermost valid levels\nwithin ±{half:g} m of the peak'),
+        Line2D([], [], color=colors['ink'], lw=0.9, ls=(0, (3, 1.6)), label='Reference line'),
+        Line2D([], [], ls='none', marker='o', ms=3.6, mfc=colors['accent'], mec='white', mew=0.5,
+               label='Local maximum'),
+    ]
+    fig.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.05, 0.82), fontsize=6.4,
+               handlelength=1.5, handletextpad=0.5, labelspacing=0.45)
+
+
+def _draw_occurrence_map_panel(fig, grid: dict, points: pd.DataFrame, eke: dict, *, map_threshold: float,
+                               point_threshold: float, min_profiles: int, grid_step_deg: float,
+                               ke_box: tuple[float, float, float, float]) -> None:
+    """画全球网格发生比例、较高阈值峰剖面位置、EKE 分位等值线与 KE 框。"""
+    colors = _JOURNAL_COLORS
+    pc = ccrs.PlateCarree()
+    ax = _journal_map_axes(fig, _inch_rect(fig, 0.05, 0.8, 0.05, 0.08))
+    mesh = _journal_occurrence_mesh(ax, grid['lon_edges'], grid['lat_edges'], grid['count'], grid['positive'],
+                                    min_profiles)
+    ax.contour(eke['lon'], eke['lat'], eke['eke'], levels=[eke['level']], colors=[colors['muted']], linewidths=0.45,
+               transform=pc, zorder=2)
+    _journal_add_land(ax)
+    bx, by = _box_outline(*ke_box)
+    ax.plot(bx, by, color=colors['ink'], lw=0.8, transform=pc, zorder=5)
+    point_color, _ = _journal_threshold_style(point_threshold)
+    ax.scatter(points['lon'], points['lat'], s=2.2, color=point_color, edgecolors='white', linewidths=0.12,
+               transform=pc, zorder=6)
+    map_tag = _format_detection_value(float(map_threshold))
+    point_tag = _format_detection_value(float(point_threshold))
+    cax = _inch_axes(fig, 0.3, 0.55, width=2.1, height=0.085)
+    _journal_occurrence_colorbar(
+        fig, mesh, cax, f'ΔDO{map_tag} occurrence (%)\n{grid_step_deg:g}° cells with ≥{min_profiles} profiles'
+    )
+    handles = _journal_occurrence_handles(map_threshold, min_profiles) + [
+        Line2D([], [], ls='none', marker='o', ms=2.6, mfc=point_color, mec='white', mew=0.2,
+               label=f'ΔDO{point_tag} profile'),
+        Line2D([], [], color=colors['muted'], lw=0.6, label=eke['label']),
+        Line2D([], [], color=colors['ink'], lw=0.8, label='KE box'),
+    ]
+    fig.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(fig, 2.72, 0.76), fontsize=6.3,
+               handlelength=1.4, handletextpad=0.5, labelspacing=0.3)
+
+
+def _draw_regional_share_panel(fig, share: pd.DataFrame, thresholds: tuple[float, ...]) -> None:
+    """画各区域在全部剖面与各阈值峰剖面中的占比；连线只连接同一区域的几个占比，不是区间。"""
+    colors = _JOURNAL_COLORS
+    ax = _inch_axes(fig, 1.22, 0.36, 0.15, 0.1)
+    names = list(share.index)
+    ypos = np.arange(len(names))[::-1]
+    columns = ['eligible'] + [f'do{_format_detection_value(float(t))}' for t in thresholds]
+    for y, name in zip(ypos, names):
+        values = share.loc[name, columns].to_numpy(float)
+        ax.plot([values.min(), values.max()], [y, y], color=colors['light'], lw=1.0, zorder=1)
+        ax.plot(values[0], y, 'o', ms=5, mfc='white', mec=colors['ink'], mew=0.9, zorder=3)
+        for threshold, value in zip(thresholds, values[1:]):
+            color, marker = _journal_threshold_style(threshold)
+            ax.plot(value, y, marker, ms=4.2, mfc=color, mec='white', mew=0.4, zorder=4)
+    ax.set_yticks(ypos, names)
+    ax.set_ylim(-0.6, len(names) - 0.4)
+    ax.set_xlim(-1, 70)
+    ax.set_xlabel('Share of profiles (%)')
+    _journal_light_grid(ax, 'x')
+    ax.tick_params(axis='y', length=0)
+    ax.spines['left'].set_visible(False)
+    handles = [Line2D([], [], ls='none', marker='o', ms=5, mfc='white', mec=colors['ink'], mew=0.9,
+                      label='All eligible profiles')]
+    for threshold in thresholds:
+        color, marker = _journal_threshold_style(threshold)
+        handles.append(Line2D([], [], ls='none', marker=marker, ms=4.2, mfc=color, mec='white', mew=0.4,
+                              label=f'Profiles with ΔDO{_format_detection_value(float(threshold))}'))
+    ax.legend(handles=handles, loc='lower right', ncol=2, fontsize=6.4, handletextpad=0.3, labelspacing=0.4,
+              columnspacing=1.0)
+
+
+def plot_argo_do_occurrence_overview(
+    example_profile: int,
+    map_threshold: float = 20.0,
+    point_threshold: float = 50.0,
+    grid_step_deg: float = 3.0,
+    min_cell_profiles: int = 20,
+    eke_percentile: float = 90.0,
+    ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
+    ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制全局氧剖面总体中 ΔDO 峰的定义、全球分布与区域构成。
+
+    (a) 读取 `describe_delta_do_construction` 为 example_profile 写出的构造表，画有效层、搜索层、端点参考线
+    与峰值差；(b) 由 `build_argo_do_occurrence_table` 的逐剖面表经 `build_euler_occurrence_summary` 计数，
+    在太平洋中心全球图上画 map_threshold 的网格发生比例（剖面不足 min_cell_profiles 的格子只标灰），叠加
+    point_threshold 峰剖面位置、GLORYS 平均 EKE 的 eke_percentile 分位等值线与 KE 框；(c) 取同一总体的年份 ×
+    区域汇总，画六个区域在全部剖面与各阈值峰剖面中的占比。全图 7 in 宽，按期刊版式字号与配色绘制。
+
+    参数:
+        - example_profile (int): (a) 使用的剖面编号，需已由 `describe_delta_do_construction` 写出。
+        - map_threshold (float): (b) 网格发生比例的 ΔDO 阈值，默认 20。
+        - point_threshold (float): (b) 画出位置的 ΔDO 阈值，默认 50。
+        - grid_step_deg (float): (b) 网格步长（°），默认 3。
+        - min_cell_profiles (int): (b) 着色所需的最少剖面数，默认 20。
+        - eke_percentile (float): (b) EKE 等值线的分位（%），取海洋格点正值 EKE，默认 90。
+        - ke_lon_bounds (tuple[float, float]): KE 框经度范围，默认 `(140, 170)`。
+        - ke_lat_bounds (tuple[float, float]): KE 框纬度范围，默认 `(25, 45)`。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_overview` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、EKE 等值线数值 eke_level、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `argo_do_occurrence_overview.png`（save_fig 时）。
+        - `a_delta_do_construction_levels.csv`、`a_delta_do_construction.csv`、`b_occurrence_grid.csv`、`b_point_positions.csv`、`c_regional_share.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    construction_dir = cfg.output_dir('delta_do_construction', region_slug)
+    construction = pd.read_parquet(construction_dir / f'delta_do_construction_{int(example_profile)}.parquet')
+    levels = pd.read_parquet(construction_dir / f'delta_do_construction_{int(example_profile)}_levels.parquet')
+    occurrence_dir = cfg.output_dir('argo_do_occurrence', region_slug)
+    profiles = pd.read_parquet(occurrence_dir / 'argo_do_occurrence_profiles.parquet')
+    region_year = pd.read_parquet(occurrence_dir / 'argo_do_occurrence_by_region_year.parquet')
+
+    point_tag = _format_detection_value(float(point_threshold))
+    grid, grid_table = _occurrence_grid_display(profiles, map_threshold, grid_step_deg, min_cell_profiles)
+    points = profiles.loc[profiles[f'has_delta_do_{point_tag}'], ['lon', 'lat']].reset_index(drop=True)
+    eke = _mean_eke_display(eke_percentile)
+    eke_level = eke['level']
+
+    thresholds = tuple(sorted(float(t) for t in region_year['threshold_umol_kg'].unique()))
+    totals = region_year.groupby(['region', 'threshold_umol_kg'])[['eligible_profiles', 'anomaly_profiles']].sum()
+    table = pd.DataFrame({'eligible': totals.xs(thresholds[0], level='threshold_umol_kg')['eligible_profiles']})
+    for threshold in thresholds:
+        table[f'do{_format_detection_value(threshold)}'] = totals.xs(threshold, level='threshold_umol_kg')[
+            'anomaly_profiles'
+        ]
+    table = table.reindex(list(_ARGO_OCCURRENCE_REGIONS)).rename(
+        index={'KE': 'KE box', 'Pacific excluding KE': 'Pacific (excluding KE)'}
+    )
+    table.index.name = 'region'
+    share = table / table.sum() * 100
+    share_table = table.join(share.add_suffix('_share_pct')).reset_index()
+
+    ke_box = (*ke_lon_bounds, *ke_lat_bounds)
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 5.2))
+        left, right = fig.subfigures(1, 2, width_ratios=[1.95, 5.05], wspace=0)
+        upper, lower = right.subfigures(2, 1, height_ratios=[3.25, 1.95], hspace=0)
+        _draw_delta_do_construction_panel(left, construction.iloc[0], levels)
+        _journal_panel_label(left, '(a)')
+        _draw_occurrence_map_panel(upper, grid, points, eke, map_threshold=map_threshold,
+                                   point_threshold=point_threshold, min_profiles=int(min_cell_profiles),
+                                   grid_step_deg=float(grid_step_deg), ke_box=ke_box)
+        _journal_panel_label(upper, '(b)')
+        _draw_regional_share_panel(lower, share, thresholds)
+        _journal_panel_label(lower, '(c)')
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir(
+            'plot_argo_do_occurrence_overview', region_slug
+        )
+        figure_path = _journal_save(fig, out_dir, 'argo_do_occurrence_overview', show_fig, save_fig)
+
+    sources = {
+        'a_delta_do_construction_levels': levels,
+        'a_delta_do_construction': construction,
+        'b_occurrence_grid': grid_table,
+        'b_point_positions': points,
+        'c_regional_share': share_table,
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'eke_level': eke_level, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def _draw_eke_bin_panel(fig, table: pd.DataFrame) -> None:
+    """画五档 EKE 中各阈值 ΔDO 峰的发生比例（对数轴），横轴标注各档剖面数。"""
+    ax = _inch_axes(fig, 0.6, 0.55, 0.12, 0.22)
+    thresholds = sorted(table['threshold_umol_kg'].unique())
+    bins = sorted(table['eke_bin'].unique())
+    x = np.arange(1, len(bins) + 1)
+    for threshold in thresholds:
+        sub = table[table['threshold_umol_kg'] == threshold].sort_values('eke_bin')
+        color, marker = _journal_threshold_style(threshold)
+        ax.plot(x, 100 * sub['occurrence_rate'], color=color, lw=1.3, zorder=2)
+        ax.plot(x, 100 * sub['occurrence_rate'], marker, ms=4.2, mfc=color, mec='white', mew=0.5, zorder=3,
+                label=f'ΔDO{_format_detection_value(float(threshold))}')
+    ax.set_yscale('log')
+    ax.set_ylim(0.02, 30)
+    _journal_log_axis(ax.yaxis, [0.03, 0.1, 0.3, 1, 3, 10, 30])
+    n = table[table['threshold_umol_kg'] == thresholds[0]].sort_values('eke_bin')['sampled_profile_denominator']
+    step = 100 / len(bins)
+    labels = [f'{step * k:g}–{step * (k + 1):g}' for k in range(len(bins))]
+    ax.set_xticks(x, [f'{label}\n{int(value):,}' for label, value in zip(labels, n)])
+    ax.tick_params(axis='x', labelsize=6.6)
+    ax.set_xlabel('Mean surface EKE percentile (profiles per bin)')
+    ax.set_ylabel('Occurrence (%)')
+    _journal_light_grid(ax, 'y')
+    ax.legend(loc='upper left', fontsize=6.6, handletextpad=0.3)
+
+
+def _draw_meta_association_panel(fig, table: pd.DataFrame, radius_factor: float) -> None:
+    """画各阈值峰剖面落在 META 涡给定倍数半径内的比例，与同期全部剖面的比例对照。"""
+    colors = _JOURNAL_COLORS
+    ax = _inch_axes(fig, 0.62, 0.55, 0.12, 0.22)
+    background = 100 * float(table['baseline_membership_rate'].iloc[0])
+    ax.axhline(background, color=colors['ink'], lw=0.8, ls=(0, (4, 2)), zorder=1)
+    ax.text(3.5, background - 0.6, f'All eligible profiles\nin the META period ({background:.1f}%)',
+            ha='right', va='top', fontsize=6.5, color=colors['ink'])
+    for i, row in enumerate(table.itertuples()):
+        color, marker = _journal_threshold_style(row.threshold_umol_kg)
+        y = 100 * row.anomaly_membership_rate
+        # 竖线从背景线连到观测比例，不是区间
+        ax.plot([i + 1, i + 1], [background, y], color=color, lw=1.2, zorder=2)
+        ax.plot(i + 1, y, marker, ms=5, mfc=color, mec='white', mew=0.5, zorder=3)
+        ax.text(i + 1.1, y, f'{y:.1f}%', ha='left', va='center', fontsize=6.8)
+    ax.set_xlim(0.5, 3.6)
+    ax.set_ylim(40, 65)
+    ax.set_xticks(range(1, len(table) + 1),
+                  [f'ΔDO{_format_detection_value(float(t))}' for t in table['threshold_umol_kg']])
+    ax.set_ylabel(f'Profiles with maxima within\n{radius_factor:g} META radii (%)')
+    _journal_light_grid(ax, 'y')
+
+
+def _draw_population_panel(fig, table: pd.DataFrame) -> None:
+    """画全部剖面、META 关联与 SCV 关联三个人群在各阈值的发生比例（对数轴）。"""
+    colors = _JOURNAL_COLORS
+    styles = {
+        'Global': (colors['neutral'], (0, (4, 2)), 'All eligible profiles'),
+        'META': (colors['muted'], '-', 'META-associated'),
+        'SCV': (colors['accent'], '-', 'SCV-associated'),
+    }
+    offsets = {'Global': -0.16, 'META': 0.16, 'SCV': 0.0}
+    ax = _inch_axes(fig, 0.6, 0.45, 0.12, 0.42)
+    thresholds = sorted(table['threshold_umol_kg'].unique())
+    x = np.arange(1, len(thresholds) + 1)
+    for population, (color, ls, label) in styles.items():
+        sub = table[table['population'] == population].sort_values('threshold_umol_kg')
+        y = 100 * sub['occurrence'].to_numpy(float)
+        ax.plot(x, y, color=color, lw=1.4, ls=ls, zorder=2)
+        for xi, yi, threshold in zip(x, y, thresholds):
+            ax.plot(xi, yi, _journal_threshold_style(threshold)[1], ms=4.4, mfc=color, mec='white', mew=0.5,
+                    zorder=3)
+        n = int(sub['eligible_profiles'].iloc[0])
+        ax.text(3.12, y[-1] * (10 ** offsets[population]), f'{label}\n(n = {n:,})', ha='left', va='center',
+                fontsize=6.5, color=color if population != 'Global' else colors['muted'])
+    ax.set_yscale('log')
+    ax.set_ylim(0.2, 50)
+    _journal_log_axis(ax.yaxis, [0.3, 1, 3, 10, 30])
+    ax.set_xlim(0.7, 4.5)
+    ax.set_xticks(x, [f'ΔDO{_format_detection_value(float(t))}' for t in thresholds])
+    ax.spines['bottom'].set_bounds(0.7, 3.3)
+    ax.set_ylabel('Occurrence (%)')
+    _journal_light_grid(ax, 'y')
+
+
+def _draw_matched_or_panel(fig, table: pd.DataFrame) -> None:
+    """画各阈值匹配 OR 与两种聚类 bootstrap 区间；上界无穷时以箭头示意。"""
+    colors = _JOURNAL_COLORS
+    xmin, xmax = 0.7, 60.0
+    ax = _inch_axes(fig, 0.5, 0.45, 0.12, 0.42)
+    ax.axvline(1.0, color=colors['ink'], lw=0.7, ls=(0, (4, 2)), zorder=1)
+    n_rows = len(table)
+    for k, row in enumerate(table.itertuples()):
+        color, marker = _journal_threshold_style(row.threshold_umol_kg)
+        y0 = n_rows - k
+        estimate = float(row.matched_mantel_haenszel_or)
+        for dy, prefix, filled, ls in ((0.14, 'anchor_platform_bootstrap', True, '-'),
+                                       (-0.14, 'dependency_component_bootstrap', False, (0, (3, 1.5)))):
+            low, high = float(getattr(row, f'{prefix}_ci_low_raw')), float(getattr(row, f'{prefix}_ci_high_raw'))
+            y = y0 + dy
+            hi_plot = min(high, xmax) if np.isfinite(high) else xmax
+            ax.plot([max(low, xmin), hi_plot], [y, y], color=color, lw=1.1, ls=ls, zorder=2)
+            if not np.isfinite(high):
+                ax.annotate('', xy=(xmax, y), xytext=(xmax / 1.35, y),
+                            arrowprops=dict(arrowstyle='-|>', color=color, lw=1.0, mutation_scale=6))
+            ax.plot(estimate, y, marker, ms=4.6, mfc=color if filled else 'white', mec=color, mew=0.9, zorder=3)
+        ax.text(estimate, y0 + 0.3, f'{estimate:.2f}', ha='center', va='bottom', fontsize=6.8)
+    ax.set_xscale('log')
+    ax.set_xlim(xmin, xmax)
+    _journal_log_axis(ax.xaxis, [1, 2, 5, 10, 20, 50])
+    ax.set_yticks(range(n_rows, 0, -1),
+                  [f'ΔDO{_format_detection_value(float(t))}' for t in table['threshold_umol_kg']])
+    ax.set_ylim(0.45, n_rows + 0.65)
+    ax.tick_params(axis='y', length=0)
+    ax.spines['left'].set_visible(False)
+    ax.set_xlabel('Matched odds ratio (SCV anchors vs controls)')
+    handles = [
+        Line2D([], [], color=colors['muted'], lw=1.1, marker='o', ms=4.2, mfc=colors['muted'], mec=colors['muted'],
+               label='Anchor-float bootstrap'),
+        Line2D([], [], color=colors['muted'], lw=1.1, ls=(0, (3, 1.5)), marker='o', ms=4.2, mfc='white',
+               mec=colors['muted'], label='Dependency-component bootstrap'),
+    ]
+    ax.legend(handles=handles, loc='lower center', fontsize=6.4, handlelength=2.2, ncol=2,
+              bbox_to_anchor=(0.45, 1.02), columnspacing=1.2)
+    _journal_light_grid(ax, 'x')
+
+
+def plot_argo_do_occurrence_by_eddy_setting(
+    meta_radius_factor: float = circle_enlargement_factor,
+    matched_queue: str = 'primary_metadata_supported',
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制 ΔDO 峰发生比例随涡旋环境的变化：EKE 档、META 表层涡、SCV 关联与匹配比较。
+
+    (a) 读取 `summarize_argo_do_occurrence_by_eke` 的五档发生比例；(b) 读取 `summarize_meta_association_sensitivity`
+    在 META 覆盖期合格剖面口径、meta_radius_factor 倍半径下各阈值峰剖面的 META 关联比例及全部剖面的背景比例；
+    (c) 读取 `build_argo_do_occurrence_table` 的 Global/META/SCV 三个人群发生比例；(d) 读取
+    `run_scv_matched_effects.py` 匹配效应表中 matched_queue 队列、整剖面结局、Global 范围的 Mantel–Haenszel OR
+    与锚点浮标、依赖分量两种聚类 bootstrap 区间。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - meta_radius_factor (float): (b) 使用的 META 半径倍数，默认 circle_enlargement_factor。
+        - matched_queue (str): (d) 使用的匹配队列名，默认 'primary_metadata_supported'。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_by_eddy_setting` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `argo_do_occurrence_by_eddy_setting.png`（save_fig 时）。
+        - `a_eke_bins.csv`、`b_meta_association.csv`、`c_populations.csv`、`d_matched_or.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    eke = pd.read_parquet(cfg.output_dir('argo_do_occurrence_eke', region_slug) / 'argo_do_occurrence_eke_bins.parquet')
+    meta = pd.read_parquet(_meta_association_sensitivity_path(region_slug))
+    meta = meta[
+        meta['denominator_mode'].eq('qualified_meta_period')
+        & np.isclose(meta['radius_factor'], float(meta_radius_factor))
+    ].sort_values('threshold_umol_kg').reset_index(drop=True)
+    populations = pd.read_parquet(
+        cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_by_population.parquet'
+    )
+    effects = pd.read_parquet(_scv_matched_effects_path(region_slug))
+    effects = effects[
+        effects['queue'].eq(matched_queue) & effects['outcome'].eq('profile') & effects['scope'].eq('Global')
+    ].sort_values('threshold_umol_kg').reset_index(drop=True)
+
+    with plt.rc_context(_journal_rc()):
+        fig, cells = _journal_panel_grid([(2.5, 2), (2.5, 2)])
+        _draw_eke_bin_panel(cells[0], eke)
+        _draw_meta_association_panel(cells[1], meta, meta_radius_factor)
+        _draw_population_panel(cells[2], populations)
+        _draw_matched_or_panel(cells[3], effects)
+        for cell, label in zip(cells, 'abcd'):
+            _journal_panel_label(cell, f'({label})')
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir(
+            'plot_argo_do_occurrence_by_eddy_setting', region_slug
+        )
+        figure_path = _journal_save(fig, out_dir, 'argo_do_occurrence_by_eddy_setting', show_fig, save_fig)
+
+    sources = {
+        'a_eke_bins': eke,
+        'b_meta_association': meta[['threshold_umol_kg', 'radius_factor', 'denominator_mode', 'baseline_n',
+                                    'baseline_meta_n', 'baseline_membership_rate', 'anomaly_n', 'anomaly_meta_n',
+                                    'anomaly_membership_rate']],
+        'c_populations': populations,
+        'd_matched_or': effects[[
+            'queue', 'outcome', 'scope', 'threshold_umol_kg', 'n_matched_sets', 'n_anchor_profiles',
+            'n_control_profiles', 'scv_numerator', 'control_numerator', 'matched_mantel_haenszel_or',
+            'anchor_platform_bootstrap_ci_low_raw', 'anchor_platform_bootstrap_ci_high_raw',
+            'dependency_component_bootstrap_ci_low_raw', 'dependency_component_bootstrap_ci_high_raw',
+            'anchor_platform_bootstrap_valid', 'dependency_component_bootstrap_valid',
+        ]],
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def _scv_matched_queue_display(queue: pd.DataFrame) -> pd.DataFrame:
+    """给匹配队列补角色、SCV 类型与锚点区域（KE 框内外）三个展示列。"""
+    return queue.assign(
+        role=np.where(queue['is_scv'], 'anchor', 'control'),
+        type=queue['anchor_scv_type'].map({'M': 'minty', 'S': 'spicy'}),
+        region=np.where(queue['anchor_is_ke'], 'KE box', 'Outside KE'),
+    )
+
+
+def _draw_scv_anchor_map_panel(fig, queue: pd.DataFrame, ke_box: tuple[float, float, float, float],
+                               zoom_extent: tuple[float, float, float, float], threshold: float) -> None:
+    """画 SCV 锚点（按类型与有无峰区分）与匹配对照的全球位置，并放大 KE 框。"""
+    colors = _JOURNAL_COLORS
+    tag = _format_detection_value(float(threshold))
+    anchors = queue[queue['role'] == 'anchor']
+    controls = queue[queue['role'] == 'control']
+    pc = ccrs.PlateCarree()
+
+    def draw(ax, size_scale: float) -> None:
+        ax.scatter(controls['lon'], controls['lat'], s=3.5 * size_scale, color=colors['neutral'], alpha=0.55,
+                   linewidths=0, transform=pc, zorder=4)
+        for kind in ('minty', 'spicy'):
+            sub = anchors[anchors['type'] == kind]
+            positive = sub[f'has_delta_do_{tag}'].astype(bool)
+            ax.scatter(sub.loc[~positive, 'lon'], sub.loc[~positive, 'lat'], s=9 * size_scale, facecolors='white',
+                       edgecolors=colors[kind], linewidths=0.7, transform=pc, zorder=5)
+            ax.scatter(sub.loc[positive, 'lon'], sub.loc[positive, 'lat'], s=9 * size_scale, color=colors[kind],
+                       edgecolors='white', linewidths=0.3, transform=pc, zorder=6)
+
+    ax = _journal_map_axes(fig, _inch_rect(fig, 0.05, 0.3, width=4.6, height=2.4))
+    _journal_add_land(ax, zorder=3)
+    draw(ax, 1.0)
+    bx, by = _box_outline(*ke_box)
+    ax.plot(bx, by, color=colors['ink'], lw=0.8, transform=pc, zorder=7)
+
+    zoom = _inch_axes(fig, 5.02, 0.42, 0.08, 0.3, projection=ccrs.PlateCarree(central_longitude=180))
+    zoom.set_extent(list(zoom_extent), crs=pc)
+    _journal_add_land(zoom, scale='50m', zorder=3)
+    draw(zoom, 1.6)
+    zoom.plot(bx, by, color=colors['ink'], lw=0.8, transform=pc, zorder=7)
+    gl = zoom.gridlines(draw_labels=True, linewidth=0.3, color=colors['grid'],
+                        xlocs=list(range(int(ke_box[0]), int(ke_box[1]) + 1, 10)),
+                        ylocs=list(range(int(ke_box[2]), int(ke_box[3]) + 1, 5)))
+    gl.top_labels = gl.right_labels = False
+    gl.xlabel_style = gl.ylabel_style = {'size': 6.3, 'color': colors['ink']}
+    zoom.spines['geo'].set_linewidth(0.5)
+    zoom.spines['geo'].set_edgecolor(colors['muted'])
+    zoom.set_title(f"KE box: {anchors['region'].eq('KE box').sum()} anchors, "
+                   f"{controls['region'].eq('KE box').sum()} controls", fontsize=7, pad=3)
+    handles = []
+    for kind in ('minty', 'spicy'):
+        handles += [
+            Line2D([], [], ls='none', marker='o', ms=4, mfc=colors[kind], mec='white', mew=0.3,
+                   label=f'{kind.capitalize()} anchor, ΔDO{tag}'),
+            Line2D([], [], ls='none', marker='o', ms=4, mfc='white', mec=colors[kind], mew=0.7,
+                   label=f'{kind.capitalize()} anchor, no ΔDO{tag}'),
+        ]
+    handles.append(Line2D([], [], ls='none', marker='o', ms=2.6, mfc=colors['neutral'], mec='none', alpha=0.7,
+                          label='Matched control'))
+    fig.legend(handles=handles, loc='lower left', bbox_to_anchor=_inch_point(fig, 0.2, 0.02), ncol=5, fontsize=6.4,
+               handletextpad=0.2, columnspacing=1.2)
+
+
+def _scv_peak_core_offsets(queue: pd.DataFrame, thresholds: tuple[float, ...]) -> pd.DataFrame:
+    """逐阈值列出有峰剖面的峰深减锚点目录核心深度，及是否在核心容差内。"""
+    rows = []
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        sub = queue[queue[f'has_delta_do_{tag}'].astype(bool)].copy()
+        sub['offset_m'] = sub[f'delta_do_peak_depth_m_{tag}'] - sub['anchor_core_depth_m']
+        sub['within_tolerance'] = sub['offset_m'].abs() <= sub['core_anomaly_tolerance_m']
+        sub['threshold_umol_kg'] = float(threshold)
+        rows.append(sub[['threshold_umol_kg', 'match_set_id', 'role', 'type', 'region', 'profile_number',
+                         f'delta_do_peak_depth_m_{tag}', 'anchor_core_depth_m', 'offset_m', 'within_tolerance']]
+                    .rename(columns={f'delta_do_peak_depth_m_{tag}': 'peak_depth_m'}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def _draw_peak_core_offset_panel(fig, table: pd.DataFrame, tolerance_m: float, rng: np.random.Generator) -> None:
+    """画锚点与对照的峰深相对锚点核心深度的偏移（抖动散点），标注各组落在容差内的比例。"""
+    colors = _JOURNAL_COLORS
+    ax = _inch_axes(fig, 0.66, 0.8, 0.08, 0.2)
+    ax.axhspan(-tolerance_m, tolerance_m, color=colors['band'], lw=0, zorder=0)
+    ax.axhline(0, color=colors['muted'], lw=0.6, zorder=1)
+    lim = np.ceil(table['offset_m'].abs().max() / 100) * 100
+    thresholds = sorted(table['threshold_umol_kg'].unique())
+    for k, threshold in enumerate(thresholds):
+        for role, dx in (('anchor', -0.21), ('control', 0.21)):
+            sub = table[(table['threshold_umol_kg'] == threshold) & (table['role'] == role)]
+            x = k + dx + rng.uniform(-0.08, 0.08, len(sub))
+            point_colors = sub['type'].map(colors) if role == 'anchor' else colors['neutral']
+            ax.scatter(x, sub['offset_m'], s=9, c=point_colors, edgecolors='white', linewidths=0.3, zorder=3)
+            ax.text(k + dx, lim - 45, f"{int(sub['within_tolerance'].sum())}/{len(sub)}", ha='center', va='center',
+                    fontsize=6.4, color=colors['ink'])
+            ax.text(k + dx, -0.035, role.capitalize(), transform=ax.get_xaxis_transform(), ha='center', va='top',
+                    fontsize=6.0, color=colors['muted'])
+    ax.text(-0.58, lim - 105, f'Within ±{tolerance_m:g} m of core:', ha='left', va='center', fontsize=6.3,
+            color=colors['muted'])
+    ax.set_xticks(range(len(thresholds)), [f'ΔDO{_format_detection_value(float(t))}' for t in thresholds])
+    ax.tick_params(axis='x', length=0, pad=11)
+    ax.set_xlim(-0.6, len(thresholds) - 0.4)
+    ax.set_ylim(lim, -lim)
+    ax.set_ylabel('Peak depth − anchor core depth (m)\n(negative = peak shallower)')
+    _journal_light_grid(ax, 'y')
+    handles = [
+        Line2D([], [], ls='none', marker='o', ms=4, mfc=colors['minty'], mec='white', mew=0.3, label='Minty anchor'),
+        Line2D([], [], ls='none', marker='o', ms=4, mfc=colors['spicy'], mec='white', mew=0.3, label='Spicy anchor'),
+        Line2D([], [], ls='none', marker='o', ms=4, mfc=colors['neutral'], mec='white', mew=0.3,
+               label='Matched control'),
+        Patch(facecolor=colors['band'], edgecolor='none', label=f'±{tolerance_m:g} m of anchor catalogue core'),
+    ]
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=_inch_point(fig, 1.9, 0.36), ncol=2,
+               fontsize=6.4, handletextpad=0.3, columnspacing=1.0)
+
+
+def _draw_type_region_panel(fig, table: pd.DataFrame, threshold: float) -> None:
+    """按锚点区域与 SCV 类型分组，画锚点及其对照中有峰剖面的比例；KE 框内 spicy 组样本少，淡化显示。"""
+    colors = _JOURNAL_COLORS
+    tag = _format_detection_value(float(threshold))
+    groups = [('KE box', 'minty'), ('KE box', 'spicy'), ('Outside KE', 'minty'), ('Outside KE', 'spicy')]
+    ax = _inch_axes(fig, 0.55, 0.8, 0.08, 0.2)
+    width = 0.36
+    centres = {}
+    for g, (region, kind) in enumerate(groups):
+        x0 = g + (0.35 if region == 'Outside KE' else 0.0)
+        centres[(region, kind)] = x0
+        faded = region == 'KE box' and kind == 'spicy'
+        for role, dx in (('anchor', -width / 2), ('control', width / 2)):
+            row = table[(table['region'] == region) & (table['type'] == kind) & (table['role'] == role)].iloc[0]
+            rate = 100 * row[f'do{tag}'] / row['n']
+            ax.bar(x0 + dx, rate, width=width * 0.92, color=colors[kind] if role == 'anchor' else colors['neutral'],
+                   alpha=0.35 if faded else 1.0, lw=0, zorder=2)
+            ax.text(x0 + dx, rate + 1.2, f"{int(row[f'do{tag}'])}/{int(row['n'])}", ha='center', va='bottom',
+                    fontsize=6.3, color=colors['ink'], alpha=0.6 if faded else 1.0)
+        ax.annotate(kind.capitalize(), xy=(x0, 0), xycoords=('data', 'axes fraction'), xytext=(0, -4),
+                    textcoords='offset points', ha='center', va='top', fontsize=7)
+    for region in ('KE box', 'Outside KE'):
+        xc = np.mean([centres[(region, kind)] for kind in ('minty', 'spicy')])
+        ax.annotate(region, xy=(xc, 0), xycoords=('data', 'axes fraction'), xytext=(0, -15),
+                    textcoords='offset points', ha='center', va='top', fontsize=7.5, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_xlim(-0.55, 3.9)
+    ax.set_ylim(0, 75)
+    ax.set_ylabel(f'Profiles with ΔDO{tag} (%)')
+    _journal_light_grid(ax, 'y')
+    handles = [
+        Patch(facecolor=colors['minty'], label='Minty anchors'),
+        Patch(facecolor=colors['spicy'], label='Spicy anchors'),
+        Patch(facecolor=colors['neutral'], label='Controls matched to them'),
+    ]
+    ax.legend(handles=handles, loc='upper right', fontsize=6.4, handlelength=1.0, handletextpad=0.4)
+
+
+def plot_scv_matched_anchors(
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
+    ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
+    zoom_extent: tuple[float, float, float, float] = (137.0, 173.0, 22.0, 47.0),
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制 SCV 匹配比较的锚点与对照：位置、峰相对核心的深度偏移，以及类型 × 区域的峰比例。
+
+    读取 `run_scv_matched_effects.py` 写出的主匹配队列。(a) 全球图上画锚点（minty/spicy，有无最低阈值峰）与
+    匹配对照，右侧放大 KE 框；(b) 对 thresholds 各阈值，画有峰剖面的峰深减锚点目录核心深度，标出落在队列
+    core_anomaly_tolerance_m 内的比例，横向抖动由项目种子派生；(c) 按锚点区域（KE 框内外）与 SCV 类型分组，
+    画锚点及其对照中带最低阈值峰的比例。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - thresholds (tuple[float, ...]): ΔDO 阈值；(a)(c) 用最低一档，默认 (20, 35, 50)。
+        - ke_lon_bounds (tuple[float, float]): KE 框经度范围，默认 `(140, 170)`。
+        - ke_lat_bounds (tuple[float, float]): KE 框纬度范围，默认 `(25, 45)`。
+        - zoom_extent (tuple[float, float, float, float]): (a) 放大图范围 (lon0, lon1, lat0, lat1)，默认 `(137, 173, 22, 47)`。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_scv_matched_anchors` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `scv_matched_anchors.png`（save_fig 时）。
+        - `a_positions.csv`、`b_peak_core_offsets.csv`、`c_type_region.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    queue = _scv_matched_queue_display(pd.read_parquet(_scv_matched_queue_path(region_slug)))
+    low_tag = _format_detection_value(float(thresholds[0]))
+    offsets = _scv_peak_core_offsets(queue, thresholds)
+    tolerance = float(queue['core_anomaly_tolerance_m'].iloc[0])
+    counts = {'n': ('is_scv', 'size')}
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        counts[f'do{tag}'] = (f'has_delta_do_{tag}', 'sum')
+    type_region = queue.groupby(['region', 'type', 'role']).agg(**counts).reset_index()
+    rng = np.random.default_rng(
+        _stable_analysis_seed(int(_scv_matched_control_config()['random_seed']), 'scv_peak_core_offset_jitter')
+    )
+
+    with plt.rc_context(_journal_rc()):
+        fig, cells = _journal_panel_grid([(2.75, 1), (2.95, 2)])
+        _draw_scv_anchor_map_panel(cells[0], queue, (*ke_lon_bounds, *ke_lat_bounds), zoom_extent, thresholds[0])
+        _draw_peak_core_offset_panel(cells[1], offsets, tolerance, rng)
+        _draw_type_region_panel(cells[2], type_region, thresholds[0])
+        for cell, label in zip(cells, 'abc'):
+            _journal_panel_label(cell, f'({label})')
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_scv_matched_anchors', region_slug)
+        figure_path = _journal_save(fig, out_dir, 'scv_matched_anchors', show_fig, save_fig)
+
+    sources = {
+        'a_positions': queue[['match_set_id', 'role', 'profile_number', 'platform_number', 'date', 'lon', 'lat',
+                              'type', 'region', f'has_delta_do_{low_tag}']],
+        'b_peak_core_offsets': offsets,
+        'c_type_region': type_region,
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+_NUMBER_WORDS = ('zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten')
+
+
+def _count_word(n: int) -> str:
+    """十以内的计数写成英文单词，其余写数字。"""
+    return _NUMBER_WORDS[n] if 0 <= n < len(_NUMBER_WORDS) else f'{n:,}'
+
+
+def _journal_ts_axes(ax, lon: float, lat: float) -> None:
+    """画 T–S 图底：按给定位置换算的 σ0 等值线（0.4 间隔），标注排成盐度约 34.68 附近的一列。"""
+    s_grid, t_grid = np.meshgrid(np.linspace(33.55, 34.95, 120), np.linspace(2.5, 20.5, 120))
+    sa = gsw.SA_from_SP(s_grid, 0.0, lon, lat)
+    sigma = gsw.sigma0(sa, gsw.CT_from_pt(sa, t_grid))
+    cs = ax.contour(s_grid, t_grid, sigma, levels=np.arange(24.8, 27.41, 0.4), colors=_JOURNAL_COLORS['light'],
+                    linewidths=0.5, zorder=0)
+    positions = []
+    for segments in cs.allsegs:
+        points = np.vstack(segments) if segments else np.empty((0, 2))
+        points = points[(points[:, 0] > 34.55) & (points[:, 0] < 34.8) & (points[:, 1] > 3.5) & (points[:, 1] < 18.5)]
+        if len(points):
+            positions.append(tuple(points[np.argmin(np.abs(points[:, 0] - 34.68))]))
+    ax.clabel(cs, fmt='%.1f', fontsize=6, inline_spacing=1, manual=positions)
+    ax.set_xlim(33.6, 34.9)
+    ax.set_ylim(3, 19)
+    ax.xaxis.set_major_locator(MultipleLocator(0.5))
+    ax.set_xlabel('Salinity')
+    ax.set_ylabel('Potential temperature (°C)')
+
+
+def _journal_lens_axes(fig):
+    """个例透镜面板的氧–深度轴与 T–S 轴（两个透镜面板几何一致）。"""
+    ax_do = _inch_axes(fig, 0.5, 1.32, width=1.02, top=0.22)
+    ax_ts = _inch_axes(fig, 2.02, 1.32, 0.08, 0.22)
+    ax_do.set_ylim(1000, 0)
+    ax_do.set_xlim(80, 300)
+    ax_do.set_xlabel(f'Dissolved oxygen\n({_JOURNAL_UNIT})')
+    ax_do.set_ylabel('Depth (m)')
+    ax_do.xaxis.set_major_locator(MultipleLocator(100))
+    ax_do.yaxis.set_major_locator(MultipleLocator(200))
+    return ax_do, ax_ts
+
+
+def _lens_levels(levels: pd.DataFrame, profile_number: int, depth_range: tuple[float, float] | None = None):
+    """取一条剖面的逐层表（按深度排序），可选限定深度范围。"""
+    prof = levels[levels['profile_number'] == int(profile_number)].sort_values('depth_m')
+    return prof if depth_range is None else prof[prof['depth_m'].between(*depth_range)]
+
+
+def _draw_lens_map_panel(fig, profiles: pd.DataFrame, scv_set: pd.DataFrame, spec: dict, warm_color: str,
+                         map_extent: tuple[float, float, float, float], event_labels: dict, scv_labels: dict) -> None:
+    """画阵列剖面位置、按日期着色的冷事件、SCV 锚点与其对照，并标注浮标与日期。"""
+    colors = _JOURNAL_COLORS
+    pc = ccrs.PlateCarree()
+    ax = _inch_axes(fig, 0.42, 0.66, 0.1, 0.5, projection=pc)
+    ax.set_extent(list(map_extent), crs=pc)
+    ax.scatter(profiles['lon'], profiles['lat'], s=1.2, color=colors['light'], linewidths=0, transform=pc, zorder=2)
+    cold = profiles[profiles['cold_event']].sort_values('date')
+    first = cold['date'].min()
+    days = (cold['date'] - first).dt.days
+    cmap = LinearSegmentedColormap.from_list('cold', [colors['minty_light'], colors['minty'], colors['minty_dark']])
+    sc = ax.scatter(cold['lon'], cold['lat'], c=days, cmap=cmap, s=16, edgecolors='white', linewidths=0.4,
+                    transform=pc, zorder=5)
+    anchor = scv_set[scv_set['role'] == 'anchor'].iloc[0]
+    controls = scv_set[scv_set['role'] == 'control']
+    ax.scatter(controls['lon'], controls['lat'], marker='D', s=14, color='white', edgecolors=colors['ink'],
+               linewidths=0.7, transform=pc, zorder=5)
+    ax.scatter([anchor['lon']], [anchor['lat']], marker='*', s=70, color=warm_color, edgecolors='white',
+               linewidths=0.4, transform=pc, zorder=6)
+    tr = pc._as_mpl_transform(ax)
+    for platform, grp in cold.groupby('platform_number'):
+        cx, cy = grp['lon'].mean(), grp['lat'].mean()
+        lx, ly = event_labels.get(int(platform), (cx, cy - 0.5))
+        ax.annotate(f"{platform}\n{grp['date'].min():%d}–{grp['date'].max():%d %b}", xy=(cx, cy), xytext=(lx, ly),
+                    xycoords=tr, textcoords=tr, fontsize=6, color=colors['ink'], ha='center', va='center', zorder=7,
+                    linespacing=1.05, arrowprops=dict(arrowstyle='-', color=colors['muted'], lw=0.4, shrinkA=1,
+                                                      shrinkB=3))
+    lx, ly = scv_labels.get(int(anchor['profile_number']), (anchor['lon'], anchor['lat'] + 0.4))
+    ax.annotate(f"{int(anchor['platform_number'])}\n{pd.Timestamp(anchor['date']):%-d %b}",
+                xy=(anchor['lon'], anchor['lat']), xytext=(lx, ly), xycoords=tr, textcoords=tr, fontsize=6,
+                color=warm_color, ha='center', va='center', zorder=7, linespacing=1.05,
+                arrowprops=dict(arrowstyle='-', color=warm_color, lw=0.4, shrinkA=1, shrinkB=4))
+    for _, row in controls.iterrows():
+        lx, ly = scv_labels.get(int(row['profile_number']), (row['lon'], row['lat'] + 0.4))
+        ax.annotate(f"{int(row['platform_number'])}\n{pd.Timestamp(row['date']):%-d %b}",
+                    xy=(row['lon'], row['lat']), xytext=(lx, ly), xycoords=tr, textcoords=tr, fontsize=6,
+                    color=colors['muted'], ha='center', va='center', zorder=7, linespacing=1.05,
+                    arrowprops=dict(arrowstyle='-', color=colors['muted'], lw=0.4, shrinkA=1, shrinkB=3))
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=colors['grid'],
+                      xlocs=range(int(np.ceil(map_extent[0])), int(np.floor(map_extent[1])) + 1),
+                      ylocs=range(int(np.ceil(map_extent[2])), int(np.floor(map_extent[3])) + 1))
+    gl.top_labels = gl.right_labels = False
+    gl.xlabel_style = gl.ylabel_style = {'size': 6.5, 'color': colors['ink']}
+    cax = _inch_axes(fig, 0.62, _inch_size(fig)[1] - 0.3, width=1.35, height=0.07)
+    ticks = list(range(0, int(days.max()) + 1, 5))
+    cb = fig.colorbar(sc, cax=cax, orientation='horizontal', ticks=ticks)
+    cb.ax.set_xticklabels([f'{(first + pd.Timedelta(days=tick)).day}' for tick in ticks])
+    cb.ax.tick_params(length=2, labelsize=6.3)
+    cb.outline.set_linewidth(0.3)
+    event_tag = _format_detection_value(float(spec['event_threshold']))
+    cb.set_label(f'Selected cold-event ΔDO{event_tag} profiles, day of {first:%B %Y}', fontsize=6.4, labelpad=2)
+    cb.ax.xaxis.set_label_position('top')
+    period = [pd.Timestamp(v) for v in spec['period']]
+    handles = [
+        Line2D([], [], ls='none', marker='*', ms=7, mfc=warm_color, mec='white', label='Warm-lens SCV anchor'),
+        Line2D([], [], ls='none', marker='D', ms=3.5, mfc='white', mec=colors['ink'],
+               label=f'Its {_count_word(len(controls))} matched controls'),
+        Line2D([], [], ls='none', marker='o', ms=2, mfc=colors['light'], mec='none',
+               label=f'All array profiles, {period[0]:%b}–{period[1]:%b %Y}'),
+    ]
+    fig.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.3, 0.36), ncol=2, fontsize=6.4,
+               handletextpad=0.3, labelspacing=0.3, columnspacing=1.0)
+
+
+def _draw_lens_isopycnal_panel(fig, series: pd.DataFrame, window: tuple, sigma0: float, event_tag: str,
+                               n_floats: int, xlim: tuple) -> None:
+    """画冷事件浮标在目标等密面上的氧时间序列，事件剖面着色、事件窗口加底。"""
+    colors = _JOURNAL_COLORS
+    other = series[~series['cold_event']]
+    event = series[series['cold_event']]
+    ax = _inch_axes(fig, 0.62, 0.35, 0.1, 0.22)
+    ax.axvspan(window[0] - pd.Timedelta(hours=12), window[1] + pd.Timedelta(hours=12), color=colors['band'], lw=0,
+               zorder=0)
+    ax.text(window[0] + (window[1] - window[0]) / 2, 1.0, f'{window[0]:%-d}–{window[1]:%-d %b}',
+            transform=ax.get_xaxis_transform(), ha='center', va='bottom', fontsize=6.4, color=colors['muted'])
+    ax.scatter(other['date'], other['do_on_isopycnal'], s=5, facecolors='white', edgecolors=colors['neutral'],
+               linewidths=0.5, zorder=2)
+    ax.scatter(event['date'], event['do_on_isopycnal'], s=11, color=colors['minty'], edgecolors='white',
+               linewidths=0.3, zorder=3)
+    ax.set_ylabel(f'O$_2$ on σ$_0$ = {sigma0:.2f} ({_JOURNAL_UNIT})')
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_minor_locator(mdates.DayLocator(bymonthday=[10, 20]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%-d %b'))
+    ax.set_xlim(*xlim)
+    _journal_light_grid(ax, 'y')
+    handles = [
+        Line2D([], [], ls='none', marker='o', ms=3.4, mfc=colors['minty'], mec='white',
+               label=f'Selected cold-event ΔDO{event_tag} profiles (n = {len(event)})'),
+        Line2D([], [], ls='none', marker='o', ms=2.6, mfc='white', mec=colors['neutral'],
+               label=f'Other profiles, same {_count_word(n_floats)} floats (n = {len(other)})'),
+    ]
+    ax.set_ylim(130, 300)
+    ax.legend(handles=handles, loc='upper left', fontsize=6.4, handletextpad=0.3, labelspacing=0.4,
+              bbox_to_anchor=(0.0, 1.0))
+
+
+def _draw_cold_lens_panel(fig, levels: pd.DataFrame, profiles: pd.DataFrame, background: pd.DataFrame,
+                          highlight: int, spec: dict) -> None:
+    """画冷透镜：事件剖面（高亮一条及其峰）对照同期无峰背景的氧百分位与 T–S 分布。"""
+    colors = _JOURNAL_COLORS
+    event_tag = _format_detection_value(float(spec['event_threshold']))
+    peak_tag = _format_detection_value(float(spec['peak_threshold']))
+    cold = profiles[profiles['cold_event']].sort_values('date')
+    event_ids = cold['profile_number'].tolist()
+    background_ids = profiles.loc[profiles['background'], 'profile_number']
+    bg = levels[levels['profile_number'].isin(background_ids)]
+    ax_do, ax_ts = _journal_lens_axes(fig)
+    ax_do.fill_betweenx(background['depth_m'], background['background_do_p10'], background['background_do_p90'],
+                        color=colors['grid'], lw=0, zorder=0)
+    ax_do.plot(background['background_do_median'], background['depth_m'], color=colors['neutral'], lw=0.9, zorder=1)
+    for pn in event_ids:
+        prof = _lens_levels(levels, pn)
+        bold = pn == highlight
+        ax_do.plot(prof['do_umol_kg'], prof['depth_m'], color=colors['minty'], lw=1.2 if bold else 0.5,
+                   alpha=1.0 if bold else 0.45, zorder=3 if bold else 2)
+    peak_depth = float(cold.loc[cold['profile_number'] == highlight, f'delta_do_peak_depth_m_{event_tag}'].iloc[0])
+    hp = _lens_levels(levels, highlight)
+    ax_do.plot(np.interp(peak_depth, hp['depth_m'], hp['do_umol_kg']), peak_depth, 'o', ms=3.5,
+               mfc=colors['accent'], mec='white', mew=0.4, zorder=4)
+
+    _journal_ts_axes(ax_ts, float(cold['lon'].mean()), float(cold['lat'].mean()))
+    sub_bg = bg[bg['depth_m'].between(100, 1000)]
+    ax_ts.scatter(sub_bg['salinity'], sub_bg['theta'], s=0.6, color=colors['neutral'], alpha=0.35, linewidths=0,
+                  zorder=1)
+    for pn in event_ids:
+        prof = _lens_levels(levels, pn, (100, 1000))
+        bold = pn == highlight
+        ax_ts.plot(prof['salinity'], prof['theta'], color=colors['minty'], lw=1.1 if bold else 0.45,
+                   alpha=1.0 if bold else 0.45, zorder=3 if bold else 2)
+    at_peak = hp.iloc[(hp['depth_m'] - peak_depth).abs().argmin()]
+    ax_ts.plot(at_peak['salinity'], at_peak['theta'], 'o', ms=3.5, mfc=colors['accent'], mec='white', mew=0.4,
+               zorder=4)
+    highlight_date = pd.Timestamp(cold.loc[cold['profile_number'] == highlight, 'date'].iloc[0])
+    event_start = pd.Timestamp(spec['event_period'][0])
+    handles = [
+        Line2D([], [], color=colors['minty'], lw=1.2),
+        Line2D([], [], color=colors['minty'], lw=0.5, alpha=0.6),
+        Line2D([], [], ls='none', marker='o', ms=3.5, mfc=colors['accent'], mec='white'),
+        (Patch(facecolor=colors['grid'], edgecolor='none'), Line2D([], [], color=colors['neutral'], lw=0.9)),
+        Line2D([], [], ls='none', marker='o', ms=1.8, mfc=colors['neutral'], mec='none', alpha=0.6),
+    ]
+    labels = [
+        f'P{highlight} ({highlight_date:%-d %b})',
+        f"Other selected ΔDO{event_tag} profiles ({len(event_ids) - 1}), "
+        f"{cold['date'].min():%-d}–{cold['date'].max():%-d %b}",
+        f'ΔDO{event_tag} peak of P{highlight}',
+        f'No-ΔDO{peak_tag} {event_start:%B} background (n = {len(background_ids)}):\n'
+        'O$_2$ 10–90th percentiles and median',
+        'Same background: T–S at 100–1,000 m levels',
+    ]
+    fig.legend(handles=handles, labels=labels, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.12, 0.84),
+               fontsize=6.4, handlelength=1.8, handletextpad=0.5, labelspacing=0.35)
+
+
+def _draw_warm_lens_panel(fig, levels: pd.DataFrame, scv_set: pd.DataFrame, scv_core: pd.Series, warm_color: str,
+                          warm_type: str, spec: dict) -> None:
+    """画暖透镜：SCV 锚点剖面及其峰，对照其匹配对照，并标出目录核心深度与垂向范围。"""
+    colors = _JOURNAL_COLORS
+    peak_tag = _format_detection_value(float(spec['peak_threshold']))
+    anchor = scv_set[scv_set['role'] == 'anchor'].iloc[0]
+    controls = scv_set[scv_set['role'] == 'control']
+    ap = _lens_levels(levels, anchor['profile_number'])
+    peak_depth = float(scv_core['peak_depth_m'])
+    core_depth = float(scv_core['core_depth_m'])
+    shallow_depth, deep_depth = float(scv_core['mccoy_shallow_depth_m']), float(scv_core['mccoy_deep_depth_m'])
+    ax_do, ax_ts = _journal_lens_axes(fig)
+    ax_do.axhspan(shallow_depth, deep_depth, color=colors['lens'], lw=0, zorder=0)
+    ax_do.axhline(core_depth, color=warm_color, lw=0.7, ls=(0, (4, 2)), zorder=1)
+    for _, row in controls.iterrows():
+        prof = _lens_levels(levels, row['profile_number'])
+        ax_do.plot(prof['do_umol_kg'], prof['depth_m'], color=colors['neutral'], lw=0.7, zorder=2)
+        if row[f'has_delta_do_{peak_tag}']:
+            depth = float(row[f'delta_do_peak_depth_m_{peak_tag}'])
+            ax_do.plot(np.interp(depth, prof['depth_m'], prof['do_umol_kg']), depth, 'o', ms=2.8,
+                       mfc=colors['neutral'], mec='white', mew=0.3, zorder=3)
+    ax_do.plot(ap['do_umol_kg'], ap['depth_m'], color=warm_color, lw=1.2, zorder=4)
+    ax_do.plot(np.interp(peak_depth, ap['depth_m'], ap['do_umol_kg']), peak_depth, 'o', ms=3.5, mfc=colors['accent'],
+               mec='white', mew=0.4, zorder=5)
+
+    _journal_ts_axes(ax_ts, float(anchor['lon']), float(anchor['lat']))
+    for _, row in controls.iterrows():
+        prof = _lens_levels(levels, row['profile_number'], (100, 1000))
+        ax_ts.plot(prof['salinity'], prof['theta'], color=colors['neutral'], lw=0.7, zorder=2)
+    segment = ap[ap['depth_m'].between(100, 1000)]
+    ax_ts.plot(segment['salinity'], segment['theta'], color=warm_color, lw=1.1, zorder=3)
+    lens = ap[ap['depth_m'].between(shallow_depth, deep_depth)]
+    ax_ts.plot(lens['salinity'], lens['theta'], color=warm_color, lw=2.6, alpha=0.35, zorder=2.5,
+               solid_capstyle='round')
+    at_peak = ap.iloc[(ap['depth_m'] - peak_depth).abs().argmin()]
+    at_core = ap.iloc[(ap['depth_m'] - core_depth).abs().argmin()]
+    ax_ts.plot(at_peak['salinity'], at_peak['theta'], 'o', ms=3.5, mfc=colors['accent'], mec='white', mew=0.4,
+               zorder=5)
+    ax_ts.plot(at_core['salinity'], at_core['theta'], 'D', ms=3.2, mfc='white', mec=warm_color, mew=0.9, zorder=5)
+    handles = [
+        Line2D([], [], color=warm_color, lw=1.2),
+        Line2D([], [], color=colors['neutral'], lw=0.7),
+        Line2D([], [], ls='none', marker='o', ms=3.5, mfc=colors['accent'], mec='white'),
+        Line2D([], [], ls='none', marker='o', ms=2.8, mfc=colors['neutral'], mec='white'),
+        (Patch(facecolor=colors['lens'], edgecolor='none'), Line2D([], [], color=warm_color, lw=2.6, alpha=0.35)),
+        (Line2D([], [], color=warm_color, lw=0.7, ls=(0, (4, 2))),
+         Line2D([], [], ls='none', marker='D', ms=3.2, mfc='white', mec=warm_color, mew=0.9)),
+    ]
+    control_dates = pd.to_datetime(controls['date'])
+    labels = [
+        f"{int(anchor['platform_number'])}, {pd.Timestamp(anchor['date']):%-d %b} ({warm_type} SCV anchor)",
+        f'Its {_count_word(len(controls))} matched controls, {control_dates.min():%-d}–{control_dates.max():%-d %b}',
+        f'ΔDO{peak_tag} peak of the anchor',
+        f'ΔDO{peak_tag} peaks of controls',
+        'Catalogue vertical extent of the lens',
+        'Catalogue core',
+    ]
+    fig.legend(handles=handles, labels=labels, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.12, 0.84),
+               fontsize=6.4, handlelength=1.8, handletextpad=0.5, labelspacing=0.35)
+
+
+def plot_argo_lens_case(
+    name: str,
+    highlight_profile: int,
+    series_period: tuple[str, str],
+    map_extent: tuple[float, float, float, float],
+    event_label_positions: dict[int, tuple[float, float]] | None = None,
+    scv_label_positions: dict[int, tuple[float, float]] | None = None,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制一个浮标阵列氧透镜个例：位置、目标等密面氧序列、冷透镜与暖透镜 SCV 对照。
+
+    读取 `build_argo_lens_case` 为 name 写出的五张表与个例参数。(a) 画阵列剖面位置、按日期着色的冷事件、SCV
+    锚点与其匹配对照；(b) 画冷事件所在浮标在 series_period 内目标等密面上的氧，事件剖面着色、事件窗口加底；
+    (c) 画冷事件剖面（highlight_profile 加粗并标峰）对照同期无峰背景的氧百分位与 T–S 分布；(d) 画 SCV 锚点
+    剖面、其峰与匹配对照，并标出 McCoy 目录核心深度与垂向范围。暖透镜颜色取 McCoy 目录类型。标注位置等
+    版式细节由调用处按个例给出，track.py 不保存个例默认值。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - name (str): 个例名，即 `build_argo_lens_case` 的输出子目录名。
+        - highlight_profile (int): (c) 加粗并标峰的冷事件剖面编号。
+        - series_period (tuple[str, str]): (b) 等密面氧序列的起止日期（含）；横轴两端各留 3 天。
+        - map_extent (tuple[float, float, float, float]): (a) 地图范围 (lon0, lon1, lat0, lat1)。
+        - event_label_positions (dict[int, tuple[float, float]] | None): (a) 冷事件浮标标注位置，按浮标编号；缺省时标在浮标事件均位下方 0.5°。
+        - scv_label_positions (dict[int, tuple[float, float]] | None): (a) SCV 锚点与对照标注位置，按剖面编号；缺省时标在点上方 0.4°。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_lens_case/<name>` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `argo_lens_case.png`（save_fig 时）。
+        - `a_positions.csv`、`b_isopycnal_series.csv`、`c_background_do.csv`、`c_profile_roles.csv`、`d_scv_set.csv`、`d_scv_core.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    case_dir = cfg.output_dir('argo_lens_case', region_slug) / name
+    spec = json.loads((case_dir / 'lens_case_spec.json').read_text())
+    levels = pd.read_parquet(case_dir / 'lens_case_levels.parquet')
+    profiles = pd.read_parquet(case_dir / 'lens_case_profiles.parquet')
+    background = pd.read_parquet(case_dir / 'lens_case_background_do.parquet')
+    scv_set = pd.read_parquet(case_dir / 'lens_case_scv_set.parquet')
+    scv_core = pd.read_parquet(case_dir / 'lens_case_scv_core.parquet')
+    warm_type = {'M': 'minty', 'S': 'spicy'}[str(scv_core['mccoy_scv_type'].iloc[0])]
+    warm_color = _JOURNAL_COLORS[warm_type]
+    event_tag = _format_detection_value(float(spec['event_threshold']))
+
+    cold = profiles[profiles['cold_event']]
+    floats = cold['platform_number'].unique()
+    series_start, series_end = pd.Timestamp(series_period[0]), pd.Timestamp(series_period[1])
+    series = profiles.loc[
+        profiles['platform_number'].isin(floats) & profiles['do_on_isopycnal'].notna()
+        & profiles['date'].between(series_start, series_end),
+        ['profile_number', 'platform_number', 'date', 'do_on_isopycnal', 'depth_of_isopycnal_m', 'cold_event'],
+    ].reset_index(drop=True)
+    window = (cold['date'].min(), cold['date'].max())
+    xlim = (series_start - pd.Timedelta(days=3), series_end + pd.Timedelta(days=3))
+
+    with plt.rc_context(_journal_rc()):
+        fig, cells = _journal_panel_grid([(2.9, 2), (3.5, 2)])
+        _draw_lens_map_panel(cells[0], profiles, scv_set, spec, warm_color, map_extent,
+                             event_label_positions or {}, scv_label_positions or {})
+        _draw_lens_isopycnal_panel(cells[1], series, window, float(spec['sigma0']), event_tag, len(floats), xlim)
+        _draw_cold_lens_panel(cells[2], levels, profiles, background, int(highlight_profile), spec)
+        _draw_warm_lens_panel(cells[3], levels, scv_set, scv_core.iloc[0], warm_color, warm_type, spec)
+        for cell, label in zip(cells, 'abcd'):
+            _journal_panel_label(cell, f'({label})')
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_argo_lens_case', region_slug) / name
+        figure_path = _journal_save(fig, out_dir, 'argo_lens_case', show_fig, save_fig)
+
+    box = spec['box']
+    roles = pd.concat([
+        pd.DataFrame({'profile_number': profiles.loc[profiles['background'], 'profile_number'], 'role': 'background'}),
+        pd.DataFrame({'profile_number': cold.sort_values('date')['profile_number'], 'role': 'cold_event'}),
+    ], ignore_index=True).assign(box_lon_min=box[0], box_lon_max=box[1], box_lat_min=box[2], box_lat_max=box[3])
+    sources = {
+        'a_positions': profiles[['profile_number', 'platform_number', 'date', 'lon', 'lat', 'cold_event',
+                                 'scv_set_role']],
+        'b_isopycnal_series': series,
+        'c_background_do': background,
+        'c_profile_roles': roles,
+        'd_scv_set': scv_set,
+        'd_scv_core': scv_core,
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def plot_argo_do_occurrence_maps(
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    grid_step_deg: float = 3.0,
+    min_cell_profiles: int = 20,
+    eke_percentile: float = 90.0,
+    ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
+    ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """并排绘制全局氧剖面总体中各阈值 ΔDO 峰的网格发生比例，以及 GLORYS 平均表层 EKE。
+
+    各阈值面板由 `build_argo_do_occurrence_table` 的逐剖面表经 `build_euler_occurrence_summary` 计数，剖面不足
+    min_cell_profiles 的格子只标灰，达到门槛但无峰的格子浅底，其余按分档色阶着色，并叠加 EKE 分位等值线与
+    KE 框；末一面板画 1° 平均 EKE（对数色阶）与同一分位等值线。四个面板 2 × 2 排列，共用发生比例色标，
+    全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - thresholds (tuple[float, ...]): 三个 ΔDO 阈值，默认 (20, 35, 50)。
+        - grid_step_deg (float): 网格步长（°），默认 3。
+        - min_cell_profiles (int): 着色所需的最少剖面数，默认 20。
+        - eke_percentile (float): EKE 等值线的分位（%），取海洋格点正值 EKE，默认 90。
+        - ke_lon_bounds (tuple[float, float]): KE 框经度范围，默认 `(140, 170)`。
+        - ke_lat_bounds (tuple[float, float]): KE 框纬度范围，默认 `(25, 45)`。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_maps` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含来源数据表 sources、EKE 等值线数值 eke_level、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `argo_do_occurrence_maps.png`（save_fig 时）。
+        - `occurrence_grid_by_threshold.csv`、`eke_percentile_level.csv`：来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    profiles = pd.read_parquet(cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_profiles.parquet')
+    eke = _mean_eke_display(eke_percentile)
+    colors = _JOURNAL_COLORS
+    pc = ccrs.PlateCarree()
+    bx, by = _box_outline(*ke_lon_bounds, *ke_lat_bounds)
+    rows = []
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 4.75))
+        maps, strip = fig.subfigures(2, 1, height_ratios=[4.2, 0.55], hspace=0)
+        cells = maps.subfigures(2, 2, wspace=0, hspace=0).ravel()
+        mesh = None
+        for cell, threshold, label in zip(cells[:3], thresholds, 'abc'):
+            tag = _format_detection_value(float(threshold))
+            grid, table = _occurrence_grid_display(profiles, threshold, grid_step_deg, min_cell_profiles)
+            rows.append(table.assign(threshold_umol_kg=float(threshold)).rename(
+                columns={f'do{tag}_profiles': 'positive_profiles', f'do{tag}_occurrence': 'occurrence'}
+            ))
+            ax = _journal_map_axes(cell, _inch_rect(cell, 0.05, 0.05, 0.05, 0.25))
+            mesh = _journal_occurrence_mesh(ax, grid['lon_edges'], grid['lat_edges'], grid['count'], grid['positive'],
+                                            int(min_cell_profiles))
+            ax.contour(eke['lon'], eke['lat'], eke['eke'], levels=[eke['level']], colors=[colors['muted']],
+                       linewidths=0.4, transform=pc, zorder=2)
+            _journal_add_land(ax)
+            ax.plot(bx, by, color=colors['ink'], lw=0.7, transform=pc, zorder=5)
+            ax.set_title(f"ΔDO{tag}: {int(profiles[f'has_delta_do_{tag}'].sum()):,} of {len(profiles):,} profiles",
+                         fontsize=7, pad=3)
+            _journal_panel_label(cell, f'({label})')
+
+        cell = cells[3]
+        ax = _journal_map_axes(cell, _inch_rect(cell, 0.05, 0.05, 0.55, 0.25))
+        field = LinearSegmentedColormap.from_list(
+            'eke', [colors['eke_low'], colors['DO20'], colors['DO35'], colors['DO50']]
+        )
+        eke_mesh = ax.pcolormesh(eke['lon'], eke['lat'], eke['eke'] * 1e4, cmap=field, norm=LogNorm(10, 3000),
+                                 shading='nearest', transform=pc, zorder=1, rasterized=True)
+        ax.contour(eke['lon'], eke['lat'], eke['eke'], levels=[eke['level']], colors=[colors['brick']],
+                   linewidths=0.5, transform=pc, zorder=2)
+        _journal_add_land(ax)
+        ax.plot(bx, by, color=colors['ink'], lw=0.7, transform=pc, zorder=5)
+        ax.set_title('Mean surface EKE, GLORYS 2002–2022', fontsize=7, pad=3)
+        cax = _inch_axes(cell, 3.02, 0.35, width=0.08, height=1.45)
+        cb = cell.colorbar(eke_mesh, cax=cax)
+        cb.outline.set_linewidth(0.4)
+        cb.ax.tick_params(length=2, labelsize=6.3)
+        cb.set_label('EKE (cm$^2$ s$^{-2}$)', fontsize=6.6)
+        _journal_panel_label(cell, '(d)')
+
+        cax = _inch_axes(strip, 0.45, 0.3, width=2.2, height=0.08)
+        _journal_occurrence_colorbar(
+            strip, mesh, cax,
+            f'Occurrence (%) in {grid_step_deg:g}° cells with ≥{int(min_cell_profiles)} profiles, panels (a)–(c)',
+        )
+        handles = [
+            Patch(facecolor=colors['zero'], edgecolor=colors['light'], lw=0.4,
+                  label=f'≥{int(min_cell_profiles)} profiles, none at the threshold'),
+            Patch(facecolor=colors['sparse'], edgecolor='none',
+                  label=f'1–{int(min_cell_profiles) - 1} profiles; occurrence not mapped'),
+            Line2D([], [], color=colors['muted'], lw=0.6, label=f'EKE {eke_percentile:g}th percentile, (a)–(c)'),
+            Line2D([], [], color=colors['brick'], lw=0.6, label=f'EKE {eke_percentile:g}th percentile, (d)'),
+            Line2D([], [], color=colors['ink'], lw=0.8, label='KE box'),
+        ]
+        strip.legend(handles=handles, loc='center left', bbox_to_anchor=_inch_point(strip, 3.05, 0.3), ncol=2,
+                     fontsize=6.3, handlelength=1.4, handletextpad=0.4, labelspacing=0.3, columnspacing=1.0)
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_argo_do_occurrence_maps', region_slug)
+        figure_path = _journal_save(fig, out_dir, 'argo_do_occurrence_maps', show_fig, save_fig)
+
+    sources = {
+        'occurrence_grid_by_threshold': pd.concat(rows, ignore_index=True),
+        'eke_percentile_level': pd.DataFrame({'eke_percentile': [float(eke_percentile)], 'eke_m2s2': [eke['level']],
+                                              'eke_cm2s2': [eke['level'] * 1e4]}),
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'eke_level': eke['level'], 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def _journal_axes_label(ax, text: str, dx: float = -0.02, dy: float = 1.02) -> None:
+    """在坐标轴左上角外侧写小面板标号（同一子图内有多个坐标轴时用）。"""
+    ax.text(dx, dy, text, transform=ax.transAxes, ha='right', va='bottom', fontsize=8.5, fontweight='bold')
+
+
+def plot_scv_matching_diagnostics(
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制 SCV 匹配比较的诊断：匹配差值与卡尺、300–1,000 m 有效层数，以及峰–核心对准的置换检验。
+
+    读取 `run_scv_matched_effects.py` 的主匹配队列与 `calculate_scv_core_alignment` 的置换摘要。(a)–(e) 画对照
+    相对锚点的距离、年差、月差、EKE 差与最深 DO 层深度差分布，并标出队列记录的卡尺；(f) 画锚点与对照在
+    300–1,000 m 的有效层数分布；(g) 画每个匹配组锚点减对照均值的层数差；(h) 对 thresholds 各阈值，画有峰锚点
+    落在核心容差内的比例与峰–核心偏移中位数，对照区域内置换零分布的均值与 95% 范围，以及对照相对锚点核心的
+    同一指标。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - thresholds (tuple[float, ...]): (h) 的 ΔDO 阈值，默认 (20, 35, 50)。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_scv_matching_diagnostics` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `scv_matching_diagnostics.png`（save_fig 时）。
+        - `matching_and_levels.csv`、`core_alignment_null.csv`：来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    colors = _JOURNAL_COLORS
+    queue = pd.read_parquet(_scv_matched_queue_path(region_slug))
+    null = pd.read_parquet(cfg.output_dir('scv_core_alignment', region_slug) / 'scv_core_alignment_null.parquet')
+    controls = queue[~queue['is_scv']]
+    anchors = queue[queue['is_scv']]
+    first = queue.iloc[0]
+    tolerance = float(first['core_anomaly_tolerance_m'])
+    level_col = 'n_clean_common_levels_300_1000'
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 4.75))
+        top, bottom = fig.subfigures(2, 1, height_ratios=[1.9, 2.85], hspace=0)
+        specs = [
+            ('match_distance_km', 'Distance (km)', np.arange(0, 801, 50), float(first['spatial_caliper_km'])),
+            ('match_year_delta', '|Year difference|', None, float(first['year_caliper'])),
+            ('match_month_delta', '|Month difference|', None, float(first['month_caliper'])),
+            ('match_log_eke_delta', '|Δ ln(1 + EKE)|, EKE in cm$^2$ s$^{-2}$', np.arange(0, 0.72, 0.04), None),
+            ('match_max_depth_delta_m', '|Δ deepest DO level| (m)', np.arange(0, 525, 25),
+             float(first['max_depth_caliper_m'])),
+        ]
+        width, gap, left0 = 1.0, 0.36, 0.45
+        for k, (col, label, bins, caliper) in enumerate(specs):
+            ax = _inch_axes(top, left0 + k * (width + gap), 0.45, width=width, height=1.2)
+            values = controls[col].to_numpy(float)
+            if bins is None:
+                counts = pd.Series(values).value_counts().reindex([0.0, 1.0, 2.0], fill_value=0)
+                ax.bar(counts.index, counts.values, width=0.6, color=colors['neutral'], lw=0, zorder=2)
+                ax.set_xticks([0, 1, 2])
+                ax.set_xlim(-0.6, 2.6)
+            else:
+                ax.hist(values, bins=bins, color=colors['neutral'], lw=0, zorder=2)
+            if caliper is not None:
+                ax.axvline(caliper, color=colors['ink'], lw=0.7, ls=(0, (4, 2)), zorder=3)
+            ax.set_xlabel(label, fontsize=6.8)
+            if k == 0:
+                ax.set_ylabel('Controls')
+            ax.tick_params(labelsize=6.5)
+            _journal_light_grid(ax, 'y')
+            _journal_axes_label(ax, f"({'abcde'[k]})", dx=-0.1, dy=1.07)
+
+        ax = _inch_axes(bottom, 0.5, 0.5, width=1.75, height=2.0)
+        bins = np.geomspace(4, 400, 31)
+        ax.hist(controls[level_col], bins=bins, color=colors['neutral'], alpha=0.8, lw=0, zorder=2,
+                label=f'Controls (median {controls[level_col].median():.0f})')
+        ax.hist(anchors[level_col], bins=bins, histtype='step', color=colors['accent'], lw=1.1, zorder=3,
+                label=f'SCV anchors (median {anchors[level_col].median():.0f})')
+        ax.set_xscale('log')
+        _journal_log_axis(ax.xaxis, [5, 10, 20, 50, 100, 200])
+        ax.set_xlabel('Valid levels at 300–1,000 m')
+        ax.set_ylabel('Profiles')
+        ax.legend(loc='upper right', bbox_to_anchor=(1.0, 1.0), fontsize=6.3, handlelength=1.2)
+        ax.set_ylim(0, 150)
+        _journal_light_grid(ax, 'y')
+        _journal_axes_label(ax, '(f)', dx=-0.1, dy=1.04)
+
+        ax = _inch_axes(bottom, 2.65, 0.5, width=1.6, height=2.0)
+        diff = queue.groupby('match_set_id').apply(
+            lambda g: g.loc[g['is_scv'], level_col].iloc[0] - g.loc[~g['is_scv'], level_col].mean(),
+            include_groups=False,
+        )
+        ax.hist(diff, bins=np.arange(-150, 330, 15), color=colors['muted'], lw=0, zorder=2)
+        ax.axvline(0, color=colors['ink'], lw=0.6, ls=(0, (4, 2)), zorder=3)
+        ax.set_xlabel('Anchor − mean of its controls\n(valid levels, 300–1,000 m)')
+        ax.set_ylabel('Matched sets')
+        ax.text(0.97, 0.95, f'n = {len(diff)} sets\nmedian {diff.median():.0f}\n'
+                f'anchor more: {(diff > 0).sum()}\nequal: {(diff == 0).sum()}\ncontrols more: {(diff < 0).sum()}',
+                transform=ax.transAxes, ha='right', va='top', fontsize=6.3)
+        _journal_light_grid(ax, 'y')
+        _journal_axes_label(ax, '(g)', dx=-0.12, dy=1.04)
+
+        tol_tag = f'{tolerance:g}'
+        for j, (metric, control_metric, label, scale) in enumerate((
+                (f'aligned_{tol_tag}m_fraction', f'control_reference_aligned_{tol_tag}m_fraction',
+                 f'Positive profiles within\n±{tol_tag} m of core (%)', 100),
+                ('median_abs_offset_m', 'control_reference_median_abs_offset_m', 'Median |peak − core| (m)', 1))):
+            ax = _inch_axes(bottom, 4.95, 1.62 - j * 1.12, width=1.95, height=0.88)
+            for k, threshold in enumerate(thresholds):
+                marker = _journal_threshold_style(threshold)[1]
+                r = null[np.isclose(null['threshold'], float(threshold)) & (null['metric'] == metric)].iloc[0]
+                c = null[np.isclose(null['threshold'], float(threshold)) & (null['metric'] == control_metric)].iloc[0]
+                ax.plot([k, k], [scale * r['null_lo'], scale * r['null_hi']], color=colors['light'], lw=4,
+                        solid_capstyle='butt', zorder=1)
+                ax.plot([k - 0.12, k + 0.12], [scale * r['null_mean']] * 2, color=colors['muted'], lw=0.8, zorder=2)
+                ax.plot(k - 0.05, scale * r['observed'], marker, ms=4.4, mfc=colors['accent'], mec='white', mew=0.4,
+                        zorder=3)
+                ax.plot(k + 0.18, scale * c['observed'], marker, ms=4, mfc='white', mec=colors['neutral'], mew=0.8,
+                        zorder=3)
+            ax.set_xlim(-0.5, len(thresholds) - 0.5)
+            ax.set_xticks(range(len(thresholds)),
+                          [f'ΔDO{_format_detection_value(float(t))}' for t in thresholds] if j == 1 else [])
+            ax.set_ylabel(label, fontsize=6.6)
+            ax.tick_params(labelsize=6.5)
+            _journal_light_grid(ax, 'y')
+            if j == 0:
+                _journal_axes_label(ax, '(h)', dx=-0.2)
+        handles = [
+            Line2D([], [], ls='none', marker='o', ms=4.4, mfc=colors['accent'], mec='white', label='Anchors, observed'),
+            Line2D([], [], ls='none', marker='o', ms=4, mfc='white', mec=colors['neutral'], mew=0.8,
+                   label='Controls vs anchor core'),
+            Line2D([], [], color=colors['light'], lw=4, label='Null 95% range'),
+            Line2D([], [], color=colors['muted'], lw=0.8, label='Null mean'),
+        ]
+        bottom.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(bottom, 4.6, 2.85), ncol=2,
+                      fontsize=6.2, handlelength=1.3, handletextpad=0.3, columnspacing=1.2, labelspacing=0.2)
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_scv_matching_diagnostics',
+                                                                                 region_slug)
+        figure_path = _journal_save(fig, out_dir, 'scv_matching_diagnostics', show_fig, save_fig)
+
+    sources = {
+        'matching_and_levels': queue.assign(role=np.where(queue['is_scv'], 'anchor', 'control'))[
+            ['match_set_id', 'role', 'profile_number', 'match_distance_km', 'match_year_delta', 'match_month_delta',
+             'match_log_eke_delta', 'match_max_depth_delta_m', level_col]
+        ],
+        'core_alignment_null': null,
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def plot_scv_glorys_representation(
+    fine_structure_threshold: float = 50.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制 SCV 记录在 GLORYS 与 META 中的表示，以及 ΔDO 峰处 GLORYS 相对 Argo 的温度细结构保留比例。
+
+    上排读取 `summarize_scv_glorys_meta_representation` 的逐记录表与计数，只取身份审计支持且 GLORYS 判据与
+    META 关联都可评估的记录：(a) 按"两者都满足 / 仅 GLORYS / 仅 META / 都不满足"四类画位置；(b) 画 2 × 2
+    列联计数并注明 GLORYS 不可评估的记录数。下排读取 `plot_glorys_detail_loss_residual_atlas` 写出的残差逐行表
+    （fine_structure_threshold 阈值）：(c) 画峰深与最佳匹配 GLORYS 柱高通位温细结构之比，南大洋单独着色；
+    (d) 按六个互斥区域画该比值（横向抖动由项目种子派生）与中位数。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - fine_structure_threshold (float): 下排残差表的 ΔDO 阈值，默认 50。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_scv_glorys_representation` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `scv_glorys_representation.png`（save_fig 时）。
+        - `a_scv_representation.csv`、`c_fine_structure_ratio.csv`、`d_region_medians.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    colors = _JOURNAL_COLORS
+    pc = ccrs.PlateCarree()
+    rep_dir = cfg.output_dir('scv_glorys_meta_representation', region_slug)
+    rows = pd.read_parquet(rep_dir / 'scv_glorys_meta_representation_rows.parquet')
+    counts = pd.read_parquet(rep_dir / 'scv_glorys_meta_representation_counts.parquet').set_index('metric')['n']
+    rep = rows[rows['evaluated_glorys'].astype(bool) & rows['evaluated_meta'].astype(bool)].reset_index(drop=True)
+    met = ~rep['glorys_misses'].astype(bool)
+    meta = rep['in_meta_eddy'].astype(bool)
+    cats = {
+        'Both': (met & meta, colors['DO50']),
+        'GLORYS criterion only': (met & ~meta, colors['DO20']),
+        'META only': (~met & meta, colors['neutral']),
+        'Neither': (~met & ~meta, 'white'),
+    }
+    rep = rep.assign(glorys_criterion_met=met, category=np.select([v[0] for v in cats.values()], list(cats)))
+
+    tag = _format_detection_value(float(fine_structure_threshold))
+    fine = pd.read_parquet(
+        cfg.output_dir('plot_glorys_detail_loss_residual_atlas', region_slug)
+        / f'glorys_residual_rows_do{tag}_depth{_format_detection_value(float(cfg.anomaly_min_depth))}m.parquet'
+    )
+    occurrence = pd.read_parquet(
+        cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_profiles.parquet',
+        columns=['Profile_number', 'region'],
+    )
+    display_region = {'KE': 'KE box', 'Pacific excluding KE': 'Pacific (excluding KE)'}
+    fine = fine.merge(occurrence, left_on='profile_number', right_on='Profile_number', how='left')
+    fine['region'] = fine['region'].replace(display_region)
+    region_order = [display_region.get(r, r) for r in _ARGO_OCCURRENCE_REGIONS]
+    rng = np.random.default_rng(
+        _stable_analysis_seed(int(_scv_matched_control_config()['random_seed']), 'glorys_fine_structure_jitter')
+    )
+
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 5.3))
+        top, bottom = fig.subfigures(2, 1, height_ratios=[2.6, 2.7], hspace=0)
+        n_supported, n_joint = int(counts['identity_supported']), int(counts['jointly_evaluated'])
+        top.text(*_inch_point(top, 0.05, 2.5), f'SCV records with supported profile identity: {n_joint} of '
+                 f'{n_supported} evaluable for both the GLORYS criterion and META association', ha='left', va='top',
+                 fontsize=7.2, fontweight='bold', color=colors['muted'])
+        ax = _journal_map_axes(top, _inch_rect(top, 0.05, 0.3, width=4.3, height=1.95))
+        _journal_add_land(ax)
+        for name, (sel, color) in cats.items():
+            sub = rep[sel]
+            ax.scatter(sub['lon'], sub['lat'], s=10, color=color,
+                       edgecolors=colors['ink'] if name == 'Neither' else 'white',
+                       linewidths=0.5 if name == 'Neither' else 0.3, transform=pc, zorder=5,
+                       label=f'{name} (n = {int(sel.sum())})')
+        top.legend(*ax.get_legend_handles_labels(), loc='lower left', bbox_to_anchor=_inch_point(top, 0.3, 0.0),
+                   ncol=4, fontsize=6.3, handletextpad=0.2, columnspacing=0.9)
+        _journal_axes_label(ax, '(a)', dx=0.02)
+
+        ax = _inch_axes(top, 5.15, 0.6, width=1.5, height=1.4)
+        table = np.array([[int((met & meta).sum()), int((met & ~meta).sum())],
+                          [int((~met & meta).sum()), int((~met & ~meta).sum())]])
+        cell_colors = [[colors['DO50'], colors['DO20']], [colors['neutral'], 'white']]
+        for i in range(2):
+            for j in range(2):
+                ax.add_patch(plt.Rectangle((j, 1 - i), 1, 1, facecolor=cell_colors[i][j], edgecolor=colors['ink'],
+                                           lw=0.5))
+                ax.text(j + 0.5, 1.5 - i, f'{table[i, j]}', ha='center', va='center', fontsize=8,
+                        color='white' if (i, j) == (0, 0) else colors['ink'], fontweight='bold')
+        ax.set_xlim(0, 2)
+        ax.set_ylim(0, 2)
+        ax.set_xticks([0.5, 1.5], ['META\nmatched', 'META not\nmatched'], fontsize=6.5)
+        ax.set_yticks([1.5, 0.5], ['GLORYS\nmet', 'GLORYS\nnot met'], fontsize=6.5)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.xaxis.tick_top()
+        ax.text(1.0, -0.12, f"GLORYS unavailable: {int(counts['GLORYS_unavailable'])} of {n_supported}",
+                transform=ax.transData, ha='center', va='top', fontsize=6.3, color=colors['muted'])
+        _journal_axes_label(ax, '(b)', dx=-0.3, dy=1.2)
+
+        bottom.text(*_inch_point(bottom, 0.05, 2.62), f'All {len(fine)} ΔDO{tag} profiles: GLORYS/Argo ratio of '
+                    'high-pass potential-temperature fine structure (best-matching GLORYS column)', ha='left',
+                    va='top', fontsize=7.2, fontweight='bold', color=colors['muted'])
+        so = fine['region'] == 'Southern Ocean'
+        ax = _inch_axes(bottom, 0.62, 0.45, width=2.6, height=1.85)
+        ax.scatter(fine.loc[~so, 'anomaly_depth_m'], fine.loc[~so, 'fine_ratio_best'], s=5, color=colors['neutral'],
+                   edgecolors='white', linewidths=0.2, zorder=2, label=f'Other regions (n = {int((~so).sum())})')
+        ax.scatter(fine.loc[so, 'anomaly_depth_m'], fine.loc[so, 'fine_ratio_best'], s=7, color=colors['brick'],
+                   edgecolors='white', linewidths=0.2, zorder=3, label=f'Southern Ocean (n = {int(so.sum())})')
+        ax.axhline(1.0, color=colors['ink'], lw=0.6, ls=(0, (4, 2)), zorder=1)
+        ax.set_yscale('log')
+        ax.set_ylim(0.03, 5)
+        _journal_log_axis(ax.yaxis, [0.05, 0.1, 0.2, 0.5, 1, 2, 5])
+        ax.set_xlabel(f'ΔDO{tag} peak depth (m)')
+        ax.set_ylabel('Fine-structure ratio, GLORYS/Argo')
+        ax.legend(loc='upper right', fontsize=6.3, handletextpad=0.2, markerscale=1.5)
+        _journal_light_grid(ax, 'y')
+        _journal_axes_label(ax, '(c)', dx=-0.12)
+
+        ax = _inch_axes(bottom, 4.55, 0.45, width=2.35, height=1.85)
+        order = [r for r in region_order if (fine['region'] == r).any()]
+        medians = []
+        for k, region in enumerate(order):
+            values = fine.loc[fine['region'] == region, 'fine_ratio_best'].to_numpy(float)
+            color = colors['brick'] if region == 'Southern Ocean' else colors['neutral']
+            ax.scatter(k + rng.uniform(-0.18, 0.18, len(values)), values, s=4, color=color, alpha=0.6, linewidths=0,
+                       zorder=2)
+            median = float(np.median(values))
+            ax.plot([k - 0.28, k + 0.28], [median, median], color=colors['ink'], lw=1.1, zorder=3)
+            medians.append({'region': region, 'n': len(values), 'median_ratio': median})
+        ax.axhline(1.0, color=colors['ink'], lw=0.6, ls=(0, (4, 2)), zorder=1)
+        ax.set_yscale('log')
+        ax.set_ylim(0.03, 5)
+        _journal_log_axis(ax.yaxis, [0.05, 0.1, 0.2, 0.5, 1, 2, 5])
+        short = {'Pacific (excluding KE)': 'Pacific\n(excl. KE)', 'Southern Ocean': 'Southern\nOcean'}
+        ax.set_xticks(range(len(order)),
+                      [f"{short.get(r, r)}\nn = {int((fine['region'] == r).sum())}" for r in order], fontsize=6.3)
+        ax.tick_params(axis='x', length=0)
+        ax.set_xlim(-0.6, len(order) - 0.4)
+        _journal_light_grid(ax, 'y')
+        _journal_axes_label(ax, '(d)', dx=-0.12)
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_scv_glorys_representation',
+                                                                                 region_slug)
+        figure_path = _journal_save(fig, out_dir, 'scv_glorys_representation', show_fig, save_fig)
+
+    sources = {
+        'a_scv_representation': rep[['profile_number', 'date', 'lon', 'lat', 'scv_type', 'glorys_dpi_ratio',
+                                     'glorys_criterion_met', 'in_meta_eddy', 'category']],
+        'c_fine_structure_ratio': fine[['profile_number', 'year', 'lat', 'lon', 'anomaly_depth_m', 'fine_argo',
+                                        'fine_glorys_best', 'fine_ratio_best', 'region']],
+        'd_region_medians': pd.DataFrame(medians),
+    }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def plot_meta_radius_and_sampling_sensitivity(
+    meta_radius_factor: float = circle_enlargement_factor,
+    yearly_threshold: float = 50.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制 META 关联对半径倍数的敏感性，以及 KE 框内外逐年的剖面与峰剖面数。
+
+    (a) 读取 `summarize_meta_association_sensitivity` 在 META 覆盖期合格剖面口径下的各半径倍数结果，画全部剖面与
+    各阈值峰剖面的关联比例，并以底色标出正文所用的 meta_radius_factor；(b)(c) 读取 `build_argo_do_occurrence_table`
+    的年份 × 区域汇总，合并为 KE 框与框外两组，画逐年合格剖面数（对数轴）与 yearly_threshold 峰剖面数。只画
+    有剖面的年份。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - meta_radius_factor (float): (a) 标出的正文半径倍数，默认 circle_enlargement_factor。
+        - yearly_threshold (float): (c) 的 ΔDO 阈值，默认 50。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_meta_radius_and_sampling_sensitivity` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `meta_radius_and_sampling_sensitivity.png`（save_fig 时）。
+        - `a_meta_radius_sensitivity.csv`、`bc_yearly_sampling_ke.csv`：各面板来源数据（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    colors = _JOURNAL_COLORS
+    meta = pd.read_parquet(_meta_association_sensitivity_path(region_slug))
+    meta = meta[meta['denominator_mode'].eq('qualified_meta_period')]
+    thresholds = sorted(meta['threshold_umol_kg'].unique())
+    radius = meta[meta['threshold_umol_kg'] == thresholds[0]][
+        ['radius_factor', 'baseline_n', 'baseline_meta_n', 'baseline_membership_rate']
+    ].sort_values('radius_factor').reset_index(drop=True)
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        sub = meta[meta['threshold_umol_kg'] == threshold].sort_values('radius_factor')
+        radius[f'anomaly_n_{tag}'] = sub['anomaly_n'].to_numpy()
+        radius[f'anomaly_meta_n_{tag}'] = sub['anomaly_meta_n'].to_numpy()
+        radius[f'anomaly_membership_rate_{tag}'] = sub['anomaly_membership_rate'].to_numpy()
+
+    region_year = pd.read_parquet(cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_by_region_year.parquet')
+    region_year = region_year.assign(ke=np.where(region_year['region'].eq('KE'), 'KE box', 'Outside KE'))
+    yearly = region_year[region_year['threshold_umol_kg'] == thresholds[0]].groupby(['year', 'ke'])[
+        'eligible_profiles'
+    ].sum().rename('eligible').to_frame()
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        yearly[f'do{tag}'] = region_year[region_year['threshold_umol_kg'] == threshold].groupby(['year', 'ke'])[
+            'anomaly_profiles'
+        ].sum()
+    yearly = yearly[yearly['eligible'] > 0].reset_index().rename(columns={'ke': 'region'})
+    yearly_tag = _format_detection_value(float(yearly_threshold))
+
+    with plt.rc_context(_journal_rc()):
+        fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 2.6))
+        cells = fig.subfigures(1, 3, width_ratios=[2.4, 2.3, 2.3], wspace=0)
+        ax = _inch_axes(cells[0], 0.55, 0.45, 0.1, 0.22)
+        x = radius['radius_factor'].to_numpy(float)
+        ax.axvspan(meta_radius_factor - 0.04, meta_radius_factor + 0.04, color=colors['band'], lw=0, zorder=0)
+        ax.plot(x, 100 * radius['baseline_membership_rate'], color=colors['ink'], lw=1.0, ls=(0, (4, 2)), marker='o',
+                ms=4, mfc='white', mec=colors['ink'], zorder=2, label='All eligible profiles, P(E)')
+        for threshold in thresholds:
+            tag = _format_detection_value(float(threshold))
+            color, marker = _journal_threshold_style(threshold)
+            ax.plot(x, 100 * radius[f'anomaly_membership_rate_{tag}'], color=color, lw=1.2, marker=marker, ms=4,
+                    mec='white', mew=0.4, zorder=3, label=f'Profiles with ΔDO{tag}')
+        ax.set_xticks(x, [f'{v:g}' for v in x])
+        ax.set_xlabel('Association radius (META effective radii)')
+        ax.set_ylabel('Associated with a META eddy (%)')
+        ax.set_ylim(30, 100)
+        ax.legend(loc='upper left', fontsize=6.2, handletextpad=0.3, labelspacing=0.3)
+        _journal_light_grid(ax, 'y')
+        _journal_panel_label(cells[0], '(a)')
+
+        for cell, col, ylabel, label in ((cells[1], 'eligible', 'Eligible profiles per year', '(b)'),
+                                         (cells[2], f'do{yearly_tag}', f'ΔDO{yearly_tag} profiles per year', '(c)')):
+            ax = _inch_axes(cell, 0.55, 0.45, 0.1, 0.22)
+            for region, color, marker in (('KE box', colors['ink'], 'o'), ('Outside KE', colors['neutral'], 's')):
+                sub = yearly[yearly['region'] == region]
+                ax.plot(sub['year'], sub[col], color=color, lw=1.1, marker=marker, ms=3, mec='white', mew=0.3,
+                        label=region)
+            legend_at = 'upper left'
+            if col == 'eligible':
+                ax.set_yscale('log')
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f'{value:,.0f}'))
+                legend_at = 'lower right'
+            ax.set_xlabel('Year')
+            ax.set_ylabel(ylabel)
+            ax.xaxis.set_major_locator(MultipleLocator(5))
+            ax.legend(loc=legend_at, fontsize=6.3, handletextpad=0.3)
+            _journal_light_grid(ax, 'y')
+            _journal_panel_label(cell, label)
+        out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir(
+            'plot_meta_radius_and_sampling_sensitivity', region_slug
+        )
+        figure_path = _journal_save(fig, out_dir, 'meta_radius_and_sampling_sensitivity', show_fig, save_fig)
+
+    sources = {'a_meta_radius_sensitivity': radius, 'bc_yearly_sampling_ke': yearly}
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def _format_or_interval(low: float, high: float) -> str:
+    """把 OR 区间写成 `low–high`；无穷写 ∞，零写 0，其余保留两位小数。"""
+    def one(value: float) -> str:
+        if not np.isfinite(value):
+            return '∞'
+        return '0' if value == 0 else f'{value:.2f}'
+    return f'{one(low)}–{one(high)}'
+
+
+def _matched_effect_rows(effects: pd.DataFrame, label_col: str, label: str, *, valid_draws: bool) -> list[dict]:
+    """把匹配效应表的若干行整理成论文表格行：锚点与对照的阳性数/总数（%）、OR 与两种聚类区间。"""
+    rows = []
+    for _, r in effects.sort_values('threshold_umol_kg').iterrows():
+        row = {
+            label_col: label, 'threshold': int(r['threshold_umol_kg']),
+            'anchors': f"{int(r['scv_numerator'])}/{int(r['n_matched_sets'])} ({100 * r['scv_rate']:.1f})",
+            'controls': f"{int(r['control_numerator'])}/{int(r['n_control_profiles'])} ({100 * r['control_rate']:.1f})",
+            'matched_or': r['matched_mantel_haenszel_or'],
+            'anchor_float_ci': _format_or_interval(r['anchor_platform_bootstrap_ci_low_raw'],
+                                                   r['anchor_platform_bootstrap_ci_high_raw']),
+            'dependency_component_ci': _format_or_interval(r['dependency_component_bootstrap_ci_low_raw'],
+                                                           r['dependency_component_bootstrap_ci_high_raw']),
+        }
+        if valid_draws:
+            row['anchor_float_valid_draws'] = int(r['anchor_platform_bootstrap_valid'])
+            row['dependency_component_valid_draws'] = int(r['dependency_component_bootstrap_valid'])
+        rows.append(row)
+    return rows
+
+
+def _matched_effect_markdown(frame: pd.DataFrame, label_col: str, label_header: str) -> str:
+    """把论文表格行写成 Markdown 表：同组标签只写一次，OR 小于 10 保留两位、否则一位。"""
+    header = [label_header, 'ΔDO threshold (μmol kg⁻¹)', 'Anchors positive/total (%)', 'Controls positive/total (%)',
+              'Matched OR', 'Anchor-float 95% interval', 'Dependency-component 95% interval']
+    columns = [label_col, 'threshold', 'anchors', 'controls', 'matched_or', 'anchor_float_ci', 'dependency_component_ci']
+    lines = ['| ' + ' | '.join(header) + ' |', '|' + '|'.join(['---'] * len(header)) + '|']
+    last = None
+    for _, r in frame.iterrows():
+        cells = []
+        for column in columns:
+            value = r[column]
+            if column == label_col:
+                value, last = ('' if value == last else value), value
+            elif column == 'matched_or':
+                value = '∞' if not np.isfinite(value) else (f'{value:.2f}' if value < 10 else f'{value:.1f}')
+            cells.append(str(value))
+        lines.append('| ' + ' | '.join(cells) + ' |')
+    return '\n'.join(lines)
+
+
+def export_scv_matched_effect_tables(
+    matched_queue: str = 'primary_metadata_supported',
+    level_operator: str = 'cell',
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """把 SCV 匹配比较的正式结果整理成论文表格：主结果、KE 内结果、核心对准置换摘要与共同垂向网格敏感性。
+
+    主结果取 `run_scv_matched_effects.py` 匹配效应表中 matched_queue 队列的 Global 与 Global excluding KE 整剖面结局，
+    以及 Global 的核心附近峰结局；KE 内结果取同一队列 KE 范围的两种结局；置换摘要原样取
+    `calculate_scv_core_alignment` 的输出；共同网格敏感性取 `calculate_scv_matched_level_sensitivity` 中
+    level_operator 算子的 Global 与 Global excluding KE 结果。各表给出锚点与对照的阳性数/总数（%）、
+    Mantel–Haenszel OR 与锚点浮标、依赖分量两种聚类 bootstrap 区间，并汇总成一份 Markdown。
+
+    参数:
+        - matched_queue (str): 匹配队列名，默认 'primary_metadata_supported'。
+        - level_operator (str): 共同垂向网格的降采样算子（'point' 或 'cell'），默认 'cell'。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `export_scv_matched_effect_tables` 目录。
+        - save_data (bool): 是否写出 CSV 与 Markdown，默认 True。
+
+    返回:
+        - dict: 含 matched_results、ke_matched_results、core_alignment_permutation_summary、common_grid_matched_results 四张表、markdown 文本与 output_dir。
+
+    输出:
+        - `matched_results.csv`、`ke_matched_results.csv`、`core_alignment_permutation_summary.csv`、`common_grid_matched_results.csv`：四张表（save_data 时）。
+        - `matched_effect_tables.md`：四张表的 Markdown 汇总（save_data 时）。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    effects = pd.read_parquet(_scv_matched_effects_path(region_slug))
+    effects = effects[effects['queue'].eq(matched_queue)]
+    null = pd.read_parquet(cfg.output_dir('scv_core_alignment', region_slug) / 'scv_core_alignment_null.parquet')
+    level_dir = cfg.output_dir('scv_matched_level_sensitivity', region_slug)
+    levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_effects.parquet')
+    ofes_levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_grid.parquet')['level_depth_m'].to_numpy(float)
+
+    def select(frame: pd.DataFrame, outcome: str, scope: str) -> pd.DataFrame:
+        return frame[frame['outcome'].eq(outcome) & frame['scope'].eq(scope)]
+
+    main = pd.DataFrame(
+        _matched_effect_rows(select(effects, 'profile', 'Global'), 'sample', 'All sets', valid_draws=True)
+        + _matched_effect_rows(select(effects, 'profile', 'Global excluding KE'), 'sample', 'Excluding KE',
+                               valid_draws=True)
+        + _matched_effect_rows(select(effects, 'core_aligned', 'Global'), 'sample', 'Core-near maxima, all sets',
+                               valid_draws=True)
+    )
+    ke = pd.DataFrame(
+        _matched_effect_rows(select(effects, 'profile', 'KE'), 'outcome', 'Whole-profile maxima', valid_draws=False)
+        + _matched_effect_rows(select(effects, 'core_aligned', 'KE'), 'outcome', 'Core-near maxima', valid_draws=False)
+    )
+    common = pd.DataFrame(
+        _matched_effect_rows(select(levels, level_operator, 'Global'), 'sample', 'All sets', valid_draws=False)
+        + _matched_effect_rows(select(levels, level_operator, 'Global excluding KE'), 'sample', 'Excluding KE',
+                               valid_draws=False)
+    )
+    tolerance = float(pd.read_parquet(_scv_matched_queue_path(region_slug), columns=['core_anomaly_tolerance_m'])
+                      ['core_anomaly_tolerance_m'].iloc[0])
+    in_search_layer = int(((ofes_levels >= cfg.anomaly_min_depth) & (ofes_levels <= cfg.anomaly_max_depth)).sum())
+    markdown = '\n'.join([
+        '# Table 1 与 SI 表',
+        '',
+        '由 `export_scv_matched_effect_tables` 从匹配效应、核心对准置换与共同垂向网格敏感性的正式输出生成。',
+        '',
+        '## Table 1',
+        '',
+        _matched_effect_markdown(main, 'sample', 'Sample'),
+        '',
+        '## Table S1（仅 KE）',
+        '',
+        _matched_effect_markdown(ke, 'outcome', 'Outcome'),
+        '',
+        '## Table S2（核心对准置换摘要）',
+        '',
+        f'逐阈值、逐指标的置换摘要见本表 CSV：锚点核心在同区域内置换，±{tolerance:g} m 容差，项目约定种子。',
+        '',
+        f'## Table S3（共同垂向网格，{level_operator} 算子）',
+        '',
+        f'锚点与对照都降到共同的 OFES {len(ofes_levels)} 层网格（{cfg.anomaly_min_depth:,.0f}–{cfg.anomaly_max_depth:,.0f} m '
+        f'内 {in_search_layer} 层），用原检测器重检，沿用原匹配集和统计；其他算子的结果在 '
+        '`calculate_scv_matched_level_sensitivity` 的输出中。',
+        '',
+        _matched_effect_markdown(common, 'sample', 'Sample'),
+        '',
+    ])
+    out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('export_scv_matched_effect_tables',
+                                                                             region_slug)
+    tables = {
+        'matched_results': main, 'ke_matched_results': ke, 'core_alignment_permutation_summary': null,
+        'common_grid_matched_results': common,
+    }
+    if save_data:
+        _journal_write_sources(out_dir, tables)
+        (out_dir / 'matched_effect_tables.md').write_text(markdown, encoding='utf-8')
+        print(f'[*] Matched-effect tables saved to {out_dir}')
+    return {**tables, 'markdown': markdown, 'output_dir': str(out_dir)}
 
 
 def _matched_control_run_tag(
@@ -31941,6 +34861,398 @@ def summarize_scv_matched_control_enrichment(
         summary.to_csv(out_dir / f'{stem}.csv', index=False)
         print(f'[*] SCV matched-control summary saved: {out_dir / f"{stem}.parquet"}')
     return summary
+
+
+def _restore_bootstrap_input_order(queue: pd.DataFrame) -> pd.DataFrame:
+    """按 bootstrap_input_order 恢复匹配队列的原始分析顺序。
+
+    展示行序不等于 bootstrap 顺序；缺失或非法的序号必须从原始输入恢复，不能依据区间端点推断。
+    子集可以保留原序号中的空缺。
+    """
+    if 'bootstrap_input_order' not in queue:
+        raise ValueError('Missing bootstrap_input_order; recover the original analysis order before replay')
+    order = pd.to_numeric(queue['bootstrap_input_order'], errors='coerce')
+    if (not np.isfinite(order).all() or order.lt(0).any()
+            or order.mod(1).ne(0).any() or order.duplicated().any()):
+        raise ValueError('bootstrap_input_order must contain unique nonnegative integer ordinals')
+    return queue.assign(bootstrap_input_order=order.astype(np.int64)).sort_values(
+        'bootstrap_input_order', kind='stable'
+    ).copy()
+
+
+def _bootstrap_draw_facts(requested: int, valid: int, zero: int, infinite: int, low: float, high: float) -> dict:
+    """描述已保存抽样与原始区间端点，不判断推断是否有效。"""
+    undefined = requested - valid
+    if min(requested, valid, zero, infinite, undefined) < 0 or zero + infinite > valid:
+        raise ValueError('Inconsistent bootstrap draw counts')
+    return {
+        'all_draws_defined_finite_and_positive': bool(requested > 0 and valid == requested and zero == 0 and infinite == 0),
+        'has_zero_draws': bool(zero),
+        'has_infinite_draws': bool(infinite),
+        'has_undefined_draws': bool(undefined),
+        'undefined_draws': int(undefined),
+        'interval_unbounded': bool(np.isinf(low) or np.isinf(high)),
+        'degenerate_all_defined_zero': bool(valid > 0 and zero == valid and infinite == 0 and low == 0 and high == 0),
+        'ci_low_raw': low,
+        'ci_high_raw': high,
+    }
+
+
+def _bootstrap_draw_status(requested: int, valid: int, zero: int, infinite: int, low: float, high: float) -> tuple[str, bool]:
+    """返回抽样事实标签，以及是否全部抽样都有定义、有限且为正。"""
+    facts = _bootstrap_draw_facts(requested, valid, zero, infinite, low, high)
+    labels = []
+    if valid == 0:
+        labels.append('no-defined-draws')
+    if facts['degenerate_all_defined_zero']:
+        labels.append('all-defined-draws-zero')
+    for key, label in (('has_zero_draws', 'zero-draws'), ('has_infinite_draws', 'infinite-draws'),
+                       ('has_undefined_draws', 'undefined-draws'), ('interval_unbounded', 'unbounded-interval')):
+        if facts[key]:
+            labels.append(label)
+    return ';'.join(labels) or 'all-draws-finite-positive', facts['all_draws_defined_finite_and_positive']
+
+
+def _summarize_scv_matched_queue(
+    queue: pd.DataFrame,
+    label: str,
+    *,
+    scopes: tuple[str, ...] = ('Global', 'Global excluding KE'),
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    outcome: str = 'profile',
+    outcome_prefix: str | None = None,
+    seed_label: str | None = None,
+    seed_outcome: str | None = None,
+) -> pd.DataFrame:
+    """按恢复后的输入顺序汇总匹配队列的 matched MH OR 与锚点浮标、依赖分量两种聚类 bootstrap 区间。
+
+    outcome 为 profile 时读 has_delta_do_*，为 core_aligned 时读 has_core_aligned_delta_do_*；outcome_prefix
+    可另给结局列前缀。每个范围、阈值、聚类的种子为 _stable_analysis_seed(random_seed, seed_label, scope,
+    threshold, seed_outcome, cluster)，seed_label、seed_outcome 缺省分别取 label、outcome；抽样次数与基础种子
+    取 processing.yml:processing.scv_matched_control。
+    """
+    match_cfg = _scv_matched_control_config()
+    iterations = int(match_cfg['bootstrap_iterations'])
+    base_seed = int(match_cfg['random_seed'])
+    prefix_of_outcome = {'profile': 'has_delta_do_', 'core_aligned': 'has_core_aligned_delta_do_'}
+    outcome_prefix = outcome_prefix or prefix_of_outcome[outcome]
+    seed_label = label if seed_label is None else seed_label
+    seed_outcome = outcome if seed_outcome is None else seed_outcome
+    queue = _restore_bootstrap_input_order(queue)
+    rows = []
+    for scope in scopes:
+        anchors = queue.loc[queue['is_scv'].astype(bool)].drop_duplicates('match_set_id')
+        scope_ids = set(anchors.loc[_scv_matched_scope_mask(anchors, scope), 'match_set_id'].astype(str))
+        scoped = queue.loc[queue['match_set_id'].astype(str).isin(scope_ids)].copy()
+        dependency = _matched_dependency_components(scoped)
+        for threshold in thresholds:
+            cells = _matched_set_cells(scoped, f'{outcome_prefix}{_format_detection_value(float(threshold))}')
+            if not cells.empty:
+                cells = cells.merge(dependency, on='match_set_id', how='left', validate='one_to_one')
+                cells['anchor_platform'] = cells['anchor_platform_number']
+            scv_n = int(len(cells))
+            control_n = int(cells[['c', 'd']].sum(axis=1).sum()) if not cells.empty else 0
+            scv_k = int(cells['a'].sum()) if not cells.empty else 0
+            control_k = int(cells['c'].sum()) if not cells.empty else 0
+            result = {
+                'queue': label, 'outcome': outcome, 'scope': scope, 'threshold_umol_kg': float(threshold),
+                'n_matched_sets': scv_n, 'n_anchor_profiles': scv_n,
+                'n_control_profiles': control_n, 'scv_numerator': scv_k,
+                'control_numerator': control_k,
+                'scv_rate': float(scv_k / scv_n) if scv_n else np.nan,
+                'control_rate': float(control_k / control_n) if control_n else np.nan,
+                'matched_mantel_haenszel_or': _mantel_haenszel_odds_ratio(cells),
+            }
+            for cluster in ('anchor_platform', 'dependency_component'):
+                low, high, valid, zero, infinite = _bootstrap_matched_or_by_cluster(
+                    cells, cluster_col=cluster, iterations=iterations,
+                    random_seed=_stable_analysis_seed(
+                        base_seed, seed_label, scope, float(threshold), seed_outcome, cluster
+                    ),
+                )
+                status, usable = _bootstrap_draw_status(iterations, valid, zero, infinite, low, high)
+                result.update({
+                    f'{cluster}_bootstrap_requested': iterations,
+                    f'{cluster}_bootstrap_valid': int(valid),
+                    f'{cluster}_bootstrap_undefined_draws': int(iterations - valid),
+                    f'{cluster}_bootstrap_zero_draws': int(zero),
+                    f'{cluster}_bootstrap_infinite_draws': int(infinite),
+                    f'{cluster}_bootstrap_ci_low_raw': low,
+                    f'{cluster}_bootstrap_ci_high_raw': high,
+                    f'{cluster}_bootstrap_status': status,
+                    f'{cluster}_bootstrap_all_draws_defined_finite_and_positive': usable,
+                    f'{cluster}_bootstrap_display_interval': (
+                        'undefined' if valid == 0 else f'[{low:g}, {high:g}] ({status}; raw)'
+                    ),
+                })
+                result.update({f'{cluster}_bootstrap_{key}': value for key, value in
+                               _bootstrap_draw_facts(iterations, valid, zero, infinite, low, high).items()})
+            rows.append(result)
+    return pd.DataFrame(rows)
+
+
+def _scv_matched_queue_path(region_slug: str | None = None) -> Path:
+    """返回 `run_scv_matched_effects.py` 写出的主匹配队列路径。"""
+    return (
+        make_detection_config('do').output_dir('scv_matched_effects', region_slug or _current_region_key())
+        / 'qualified_analysis_queue.parquet'
+    )
+
+
+def calculate_scv_core_alignment(
+    queue_path: str | Path | None = None,
+    mccoy_csv: str | Path | None = None,
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    permutations: int | None = None,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> pd.DataFrame:
+    """检验阳性锚点的 ΔDO 峰是否比偶然更靠近其 McCoy SCV 核心，并给出同区域置换核心的零分布。
+
+    对主匹配队列中每个阈值下有峰的锚点，计算峰距目录核心不超过容差的比例、峰落在目录透镜上下界之内的
+    比例、峰与核心距离的中位数，以及该距离与透镜垂向厚度之比的中位数。零分布在同一区域（KE 或锚点所在
+    海盆）内置换锚点的核心、透镜上下界与厚度，保持峰深不变；单侧 p 值取 (置换统计量不劣于观测值的次数 + 1)
+    / (置换次数 + 1)。另给出阳性对照的峰相对其锚点核心与透镜的同类参考值（不置换）。
+
+    参数:
+        - queue_path (str | Path | None): 主匹配队列 parquet；None 时取 `scv_matched_effects` 目录下的 qualified_analysis_queue.parquet。
+        - mccoy_csv (str | Path | None): McCoy SCV 目录 CSV，用于取透镜上下界压力与垂向厚度；None 时使用 paths.yml 中的 mccoy_scv_csv。
+        - thresholds (tuple[float, ...]): ΔDO 阈值，默认 (20, 35, 50)。
+        - permutations (int | None): 置换次数；None 时取 processing.yml:processing.scv_matched_control.core_alignment_permutations。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `scv_core_alignment` 目录。
+        - save_data (bool): 是否写出结果表，默认 True。
+
+    返回:
+        - pd.DataFrame: 每个阈值 × 指标一行，含 n_positive_anchors、observed、null_mean、null_lo、null_hi（2.5/97.5 百分位）与 p_one_sided；对照参考行的零分布列为空。
+
+    输出:
+        - `scv_core_alignment_null.parquet`：返回表（save_data 时）。
+
+    说明:
+        - 对准容差取 processing.yml:processing.scv_matched_control.core_anomaly_tolerance_m；目录压力按锚点纬度换算为深度。
+        - 每个阈值的置换种子为 _stable_analysis_seed(random_seed, 'scv_core_alignment', 阈值)。
+    """
+    match_cfg = _scv_matched_control_config()
+    tolerance = float(match_cfg['core_anomaly_tolerance_m'])
+    base_seed = int(match_cfg['random_seed'])
+    n_perm = int(match_cfg['core_alignment_permutations'] if permutations is None else permutations)
+    region_slug = _current_region_key()
+    queue = pd.read_parquet(Path(queue_path) if queue_path is not None else _scv_matched_queue_path(region_slug))
+    catalog = pd.read_csv(Path(mccoy_csv) if mccoy_csv is not None else _mccoy_scv_csv)
+    catalog['day'] = pd.to_datetime(catalog['Cycle_ISO_DateTime_UTC']).dt.normalize()
+    # 同一剖面可含多个目录 SCV（不同核心深度），连接键须带核心压力
+    catalog['core_key'] = catalog['Core_Pressure'].round(1)
+    anchors = queue.loc[queue['is_scv'].astype(bool)].copy()
+    anchors['day'] = pd.to_datetime(anchors['date']).dt.normalize()
+    anchors['core_key'] = anchors['anchor_core_pressure_db'].round(1)
+    anchors = anchors.merge(
+        catalog[['Platform', 'day', 'core_key', 'Shallow_Pressure', 'Deep_Pressure', 'Vertical_Extent']],
+        left_on=['platform_number', 'day', 'core_key'], right_on=['Platform', 'day', 'core_key'],
+        how='left', validate='many_to_one',
+    )
+    if anchors['Vertical_Extent'].isna().any():
+        raise ValueError('Some anchors have no McCoy catalogue row at their platform, date and core pressure.')
+    for name in ('Shallow', 'Deep'):
+        anchors[f'{name.lower()}_depth_m'] = -gsw.z_from_p(anchors[f'{name}_Pressure'], anchors['lat'])
+    strata = np.where(anchors['anchor_is_ke'].astype(bool), 'KE', anchors['basin'].astype(str))
+    groups = [np.flatnonzero(strata == stratum) for stratum in np.unique(strata)]
+    core = anchors['anchor_core_depth_m'].to_numpy(float)
+    shallow = anchors['shallow_depth_m'].to_numpy(float)
+    deep = anchors['deep_depth_m'].to_numpy(float)
+    extent = anchors['Vertical_Extent'].to_numpy(float)
+    lens_bounds = anchors.set_index('profile_number')[['shallow_depth_m', 'deep_depth_m']]
+    names = ('aligned_150m_fraction', 'inside_lens_fraction', 'median_abs_offset_m', 'median_offset_over_extent')
+
+    rows = []
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        peak = anchors[f'delta_do_peak_depth_m_{tag}'].to_numpy(float)
+        positive = anchors[f'has_delta_do_{tag}'].astype(bool).to_numpy()
+
+        def alignment(core_, shallow_, deep_, extent_):
+            offset = np.abs(peak - core_)[positive]
+            inside = ((peak >= shallow_) & (peak <= deep_))[positive]
+            return ((offset <= tolerance).mean(), inside.mean(), np.median(offset),
+                    np.median((np.abs(peak - core_) / extent_)[positive]))
+
+        observed = alignment(core, shallow, deep, extent)
+        rng = np.random.default_rng(_stable_analysis_seed(base_seed, 'scv_core_alignment', float(threshold)))
+        null = np.empty((n_perm, 4))
+        for i in range(n_perm):
+            perm = np.arange(len(anchors))
+            for group in groups:
+                perm[group] = rng.permutation(group)
+            null[i] = alignment(core[perm], shallow[perm], deep[perm], extent[perm])
+        for j, name in enumerate(names):
+            # 前两个指标越大越对准，后两个越小越对准
+            beyond = null[:, j] >= observed[j] if j < 2 else null[:, j] <= observed[j]
+            rows.append({
+                'threshold': float(threshold), 'n_positive_anchors': int(positive.sum()), 'metric': name,
+                'observed': observed[j], 'null_mean': null[:, j].mean(),
+                'null_lo': np.percentile(null[:, j], 2.5), 'null_hi': np.percentile(null[:, j], 97.5),
+                'p_one_sided': (beyond.sum() + 1) / (n_perm + 1),
+            })
+        controls = queue.loc[~queue['is_scv'].astype(bool) & queue[f'has_delta_do_{tag}'].astype(bool)]
+        control_peak = controls[f'delta_do_peak_depth_m_{tag}']
+        control_offset = (control_peak - controls['anchor_core_depth_m']).abs()
+        control_lens = controls.join(lens_bounds, on='anchor_profile_number')
+        control_inside = ((control_lens[f'delta_do_peak_depth_m_{tag}'] >= control_lens['shallow_depth_m'])
+                          & (control_lens[f'delta_do_peak_depth_m_{tag}'] <= control_lens['deep_depth_m'])).mean()
+        for name, value in (('control_reference_aligned_150m_fraction', (control_offset <= tolerance).mean()),
+                            ('control_reference_inside_anchor_lens_fraction', control_inside),
+                            ('control_reference_median_abs_offset_m', control_offset.median())):
+            rows.append({
+                'threshold': float(threshold), 'n_positive_anchors': int(len(controls)), 'metric': name,
+                'observed': value, 'null_mean': np.nan, 'null_lo': np.nan, 'null_hi': np.nan, 'p_one_sided': np.nan,
+            })
+    result = pd.DataFrame(rows)
+    if save_data:
+        out_dir = (Path(output_dir) if output_dir is not None
+                   else make_detection_config('do').output_dir('scv_core_alignment', region_slug))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        result.to_parquet(out_dir / 'scv_core_alignment_null.parquet', index=False)
+        print(f'[*] SCV core-alignment null saved: {out_dir / "scv_core_alignment_null.parquet"}')
+    return result
+
+
+def _ofes_tracer_level_cells() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """返回 OFES 示踪层深度及各层单元的上下界（m）；单元下界取 w 层界面。"""
+    # 垂向网格不随日期变化，取首日文件
+    reference_date = pd.Timestamp('2003-01-01')
+    depth_scale = float(_OFES_CFG.get('depth_scale', 1.0))
+    with Dataset(_ofes_file_path('do2', reference_date)) as nc:
+        levels = np.asarray(nc.variables['lev'][:], dtype=float) * depth_scale
+    with Dataset(_ofes_file_path('w', reference_date)) as nc:
+        interfaces = np.asarray(nc.variables['lev'][:], dtype=float) * depth_scale
+    return levels, np.r_[0.0, interfaces[:-1]], interfaces
+
+
+def _degrade_profile_to_levels(
+    cleaned: pd.DataFrame,
+    levels: np.ndarray,
+    cell_top: np.ndarray,
+    cell_bottom: np.ndarray,
+    operator: str,
+) -> pd.DataFrame:
+    """把清洗后剖面映射到给定垂向网格：point 取层深插值，cell 取层单元内分段线性廓线的平均。"""
+    z = cleaned['Depth'].to_numpy(float)
+    present = (levels >= z[0]) & (levels <= z[-1])
+    out = {'Depth': levels[present]}
+    top = np.maximum(cell_top[present], z[0])
+    bottom = np.minimum(cell_bottom[present], z[-1])
+    for var in ('DO', 'Temperature', 'Salinity'):
+        values = cleaned[var].to_numpy(float)
+        if operator == 'point':
+            out[var] = np.interp(levels[present], z, values)
+            continue
+        cumulative = np.r_[0.0, np.cumsum(np.diff(z) * (values[1:] + values[:-1]) / 2.0)]
+
+        def integral(depth):
+            j = np.clip(np.searchsorted(z, depth, side='right') - 1, 0, len(z) - 2)
+            return cumulative[j] + (depth - z[j]) * (values[j] + np.interp(depth, z, values)) / 2.0
+
+        out[var] = (integral(bottom) - integral(top)) / (bottom - top)
+    return pd.DataFrame(out)
+
+
+def calculate_scv_matched_level_sensitivity(
+    queue_path: str | Path | None = None,
+    argo_data_dir: str | Path | None = None,
+    thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
+    operators: tuple[str, ...] = ('point', 'cell'),
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """把主匹配队列的锚点与对照放到同一垂向网格上重新检测 ΔDO，重算 matched OR，检验富集是否依赖锚点采样更密。
+
+    锚点在 300–1000 m 的有效层数多于对照。本函数把队列中每条剖面按共同预处理清洗后，映射到 OFES NP30 的
+    75 个示踪层（300–1000 m 内 28 层）：point 取层深插值，cell 取层单元内分段线性廓线的平均（主算子）。
+    原分辨率与各算子下都用阈值 0 检测、取每条剖面最大 ΔDO，再按各阈值判定，沿用原匹配集按
+    `_summarize_scv_matched_queue` 汇总 Global 与 Global excluding KE 的 MH OR 和两种聚类区间；所有结局的
+    bootstrap 种子都取主结局（profile）的种子，使重采样与主结局配对。
+
+    参数:
+        - queue_path (str | Path | None): 主匹配队列 parquet；None 时取 `scv_matched_effects` 目录下的 qualified_analysis_queue.parquet。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 时使用配置中的 argo_parquet。
+        - thresholds (tuple[float, ...]): ΔDO 阈值，默认 (20, 35, 50)。
+        - operators (tuple[str, ...]): 降采样算子，取 'point' 与/或 'cell'，默认两者。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `scv_matched_level_sensitivity` 目录。
+        - save_data (bool): 是否写出三张表，默认 True。
+
+    返回:
+        - dict: 含 profiles（逐剖面 300–1000 m 层数与各分辨率下的最大 ΔDO、峰深）、effects（outcome 为 orig 与各算子的匹配效应）、grid（共同垂向网格）与 output_dir。
+
+    输出:
+        - `scv_matched_level_sensitivity_profiles.parquet`：逐剖面层数与检测结果（save_data 时）。
+        - `scv_matched_level_sensitivity_effects.parquet`：各分辨率的匹配效应（save_data 时）。
+        - `scv_matched_level_sensitivity_grid.parquet`：共同垂向网格的层深与单元上下界（save_data 时）。
+
+    说明:
+        - outcome=orig 的行在原分辨率重检，应与 `run_scv_matched_effects.py` 的主结局一致。
+    """
+    region_slug = _current_region_key()
+    queue = pd.read_parquet(Path(queue_path) if queue_path is not None else _scv_matched_queue_path(region_slug))
+    cfg = make_detection_config('do', do_threshold=0.0, anomaly_min_depth=300.0)
+    levels, cell_top, cell_bottom = _ofes_tracer_level_cells()
+    grid = pd.DataFrame({'level_depth_m': levels, 'cell_top_m': cell_top, 'cell_bottom_m': cell_bottom})
+    raw = pd.concat(
+        [load_argo_data(int(year), argo_data_dir, profile_ids=set(ids.astype(int)))
+         for year, ids in queue.groupby('year')['profile_number']],
+        ignore_index=True,
+    )
+    raw['Profile_number'] = raw['Profile_number'].astype(int)
+
+    def best_peaks(frame: pd.DataFrame) -> pd.DataFrame:
+        detected = calculate_delta_do(frame, detection_config=cfg, remove_outliers=True,
+                                      include_aou=False, verbose=False)
+        if detected.empty:
+            return pd.DataFrame(columns=['Profile_number', 'delta_do', 'depth'])
+        return _keep_best_anomaly_per_profile(detected, cfg)[['Profile_number', 'delta_do', 'depth']]
+
+    info, degraded = [], {operator: [] for operator in operators}
+    for profile_number, profile in raw.groupby('Profile_number', sort=True):
+        cleaned, _ = _prepare_do_profile_for_detection(profile, cfg)
+        if cleaned is None:
+            raise ValueError(f'Queue profile {profile_number} fails the shared DO preprocessing.')
+        z = cleaned['Depth'].to_numpy(float)
+        row = {'Profile_number': int(profile_number),
+               'clean_levels_300_1000': int(((z >= 300.0) & (z <= 1000.0)).sum())}
+        for operator in operators:
+            frame = _degrade_profile_to_levels(cleaned, levels, cell_top, cell_bottom, operator)
+            frame['Profile_number'] = int(profile_number)
+            degraded[operator].append(frame)
+            row[f'{operator}_levels_300_1000'] = int(((frame['Depth'] >= 300) & (frame['Depth'] <= 1000)).sum())
+        info.append(row)
+    profiles = pd.DataFrame(info)
+    peaks = {'orig': best_peaks(raw)}
+    peaks.update({operator: best_peaks(pd.concat(parts, ignore_index=True)) for operator, parts in degraded.items()})
+    for label, best in peaks.items():
+        best = best.rename(columns={'delta_do': f'{label}_delta_do', 'depth': f'{label}_peak_depth_m'})
+        best['Profile_number'] = best['Profile_number'].astype(int)
+        profiles = profiles.merge(best, on='Profile_number', how='left', validate='one_to_one')
+
+    matched = queue.merge(profiles, left_on='profile_number', right_on='Profile_number', how='left', validate='one_to_one')
+    for label in peaks:
+        for threshold in thresholds:
+            tag = _format_detection_value(float(threshold))
+            matched[f'{label}_has_delta_do_{tag}'] = matched[f'{label}_delta_do'].fillna(-np.inf) >= float(threshold)
+    effects = pd.concat([
+        _summarize_scv_matched_queue(
+            matched, 'primary_metadata_supported', thresholds=tuple(thresholds), outcome=label,
+            outcome_prefix=f'{label}_has_delta_do_', seed_outcome='profile',
+        )
+        for label in peaks
+    ], ignore_index=True)
+
+    out_dir = (Path(output_dir) if output_dir is not None
+               else make_detection_config('do').output_dir('scv_matched_level_sensitivity', region_slug))
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        profiles.to_parquet(out_dir / 'scv_matched_level_sensitivity_profiles.parquet', index=False)
+        effects.to_parquet(out_dir / 'scv_matched_level_sensitivity_effects.parquet', index=False)
+        grid.to_parquet(out_dir / 'scv_matched_level_sensitivity_grid.parquet', index=False)
+        print(f'[*] SCV matched level sensitivity saved to {out_dir}')
+    return {'profiles': profiles, 'effects': effects, 'grid': grid, 'output_dir': str(out_dir)}
 
 
 def plot_scv_matched_control_enrichment(
