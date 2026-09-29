@@ -15,12 +15,19 @@ Physical oceanography research project analyzing mesoscale eddy-Argo float disso
 - Main repo instructions live in this file and `AGENTS.md`.
 - Oxygen hot memory is maintained in Claude project memory at `/home/user3/.claude/projects/-mnt-w2-scratch-user3-Oxygen/memory/`.
 - When working on Oxygen in Codex, read and update the relevant files in that Claude memory directory directly instead of maintaining a separate Codex project memory set.
-- Skill docs are mirrored in `.claude/skills/` and `.agents/skills/`. When one side changes, sync the peer file in the same edit.
+- Shared skill docs (`draft-commit`, `post-edit-review`) are mirrored in `.claude/skills/` and `.agents/skills/`. When one side changes, sync the peer file in the same edit.
+- `claude-memory` (routes Oxygen memory work into the Claude project memory) and `oxygen-background-runner` (detached long runs) are Codex-only skills under `.agents/skills/`; they intentionally have no `.claude` peer.
 
 ## User And Workflow Preferences
 
 - Reply to the user in Chinese unless they explicitly ask otherwise.
-- The user commits manually. One commit should carry one headline feature. You may draft commit messages, but do not run `git commit`.
+- Git:
+  - On any branch other than `main`, commit validated work yourself without asking, in the `draft-commit` style: one headline feature per commit. Unpushed commits may be amended or fixed up.
+  - Stage only your own changes; leave another agent's in-flight edits alone.
+  - Ask the user first before committing to or merging into `main`, pushing any branch (including force-pushes), deleting branches, or discarding uncommitted or untracked work.
+  - Explore on a feature branch and commit each piece once it is confirmed. Commit `GLORYS.ipynb` once at the end of a direction; `OFES.ipynb` cells travel with their `track.py` commit.
+  - Run Git mutations from `/mnt/w2/scratch/user3/Oxygen` (the home alias can fail on `.git/index.lock`).
+  - For GitHub over Clash TUN, configure `IPQoS none` in the local SSH host settings and use `git push origin <branch>` normally. If port 22 is unavailable, use `GIT_SSH_COMMAND='ssh -4 -p 443 -o Hostname=ssh.github.com -o HostKeyAlias=github.com -o IPQoS=none' git push origin <branch>`.
 - New datasets should go under `data/<dataset>/` and be registered in `config/paths.yml`. Leave legacy top-level data directories in place.
 - Treat `/home/user3/scratch/Oxygen` and `/mnt/w2/scratch/user3/Oxygen` as the same repo path.
 
@@ -65,6 +72,7 @@ GLORYS NetCDF is not truly local. It is mounted from SJTU HPC through `sshfs`. I
 - **Hotspot maps**: `plot_argo_hotspots(...)` writes to `plot_outputs/<method>/<region>/plot_argo_hotspots/`.
 - **Argo 3D reconstruction**: `collect_argo_pool(...)` -> `_build_argo_3d_field(...)` -> slice and overview plotting helpers.
 - **OFES**: expensive public producers create fixed semantic outputs; lightweight loaders, reducers, and plotters consume them. `OFES.ipynb` keeps producer cells visible but unexecuted and retains executed lightweight summaries and figures.
+- **Argo Letter**: producers (`build_argo_do_occurrence_table`, `audit_scv_profile_identity`, the root-level `run_scv_matched_effects.py`, `calculate_scv_core_alignment`, `calculate_scv_matched_level_sensitivity`, `build_argo_lens_case`) write fixed outputs under `plot_outputs/`; the journal-format `plot_*` figure functions and `export_scv_matched_effect_tables` consume them; `assemble_argo_paper_package.py` copies figures and tables into the untracked `argo_paper_package/`. The `GLORYS.ipynb` section keeps producers unexecuted and figures executed.
 
 ## Running And Validation
 
@@ -80,9 +88,12 @@ export_meta_tracks(ACL, kind='acl', use_dask=True, write_contours=True)
 
 - Watch Dask dashboard saturation before tuning worker counts.
 - Clean `_tmp` folders only after downstream consumers finish reading them.
+- When reworking a producer or plotter, write to a scratch directory first and compare with the existing formal output by content (rows, columns and values; pixels for figures) before replacing it. Do not add hash or checksum checks.
 
 ## Output Layout
 
-- Method-specific plots: `plot_outputs/<method>/<region>/...`
+- Method-specific outputs: `plot_outputs/<method>/<region>/<function name>/` via `DetectionConfig.output_dir(fn_name)`; name directories after what the function does, not after the paper that uses it.
 - Method-independent and shared outputs: `plot_outputs/shared/<region>/...`
-- Filenames follow the current `{dataset}{id}_vertical_{var}_YYYYMMDD_k*b*.png` pattern.
+- Exploration and one-off checks: `plot_outputs/test/`.
+- Vertical-section figures follow the `{dataset}{id}_vertical_{var}_YYYYMMDD_k*b*.png` pattern.
+- Data, caches and results stay out of Git, and so do the paper packages (`argo_paper_package/`, `ofes_paper_package/`). Retired code goes to `old codes/`, retired data and outputs to `old data/`; do not create per-package `archive/` directories.

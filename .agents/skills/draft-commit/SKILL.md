@@ -1,10 +1,10 @@
 ---
-description: Draft a commit message following the project's style, print for review, but never commit automatically.
+description: Draft a commit message following the project's style; commit it directly on branches other than main, print it for review on main.
 ---
 
 ## draft-commit
 
-Draft a commit message for the current changes. The user commits **one big
+Draft a commit message for the current changes. Commits carry **one big
 feature at a time**, usually scoped to `track.py`.
 
 ### Mental model
@@ -54,4 +54,6 @@ too long — cut it back to one feature in one sentence.
 2. `git diff --cached` + `git diff` — read the actual change (focus `track.py`).
 3. `git log --format="%s%n%b" -5` — match current phrasing.
 4. Pick the ONE headline feature; draft a short subject + 1–2 sentence body.
-5. **Print** the message for review. **Never** run `git commit` — the user commits manually.
+5. On a branch other than `main`, once the work is validated, stage only this
+   feature's files and commit with the message. On `main`, **print** the
+   message and wait for the user. Pushing always needs the user's go-ahead.
