@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.37 变更：
+#   - 新增 ofes.grid_lens_surface_expression 小节：透镜海表表达比较的携氧阈值与日历块长；
+#     柱阈值、重抽次数与种子沿用 scv_reverse_enrichment，海表涡隶属半径倍数沿用
+#     processing.circle_enlargement_factor。
 # version 1.36 变更：
 #   - 新增 ofes.grid_lens_units 小节：S5 Tier-1 透镜一对一轨迹与实验单位的携氧阈值、
 #     季节标准化窗、表层急流脊搜索带与竞争峰比例；连接门限沿用 delta_do_catalog，
@@ -149,7 +153,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.36
+version: 1.37
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -486,6 +490,10 @@ ofes:
     jet_search_lat_bounds: [30.0, 40.0]
     jet_competing_peak_ratio: 0.8
     output_subdir: grid_lens_units
+  grid_lens_surface_expression:
+    carrying_thresholds: [20.0, 35.0]
+    block_days: 20
+    output_subdir: grid_lens_surface_expression
 
   event_diagnostics:
     candidate_threshold: 50.0

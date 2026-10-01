@@ -51462,11 +51462,11 @@ def _ofes_surface_expression_day(
     core_lon: float,
     core_lat: float,
     subsurface_rossby_number: float,
-    event_equivalent_radius_km: float,
+    event_equivalent_radius_km: float | None,
     diagnostic_settings: dict,
     population_settings: dict,
 ) -> dict:
-    """诊断事件核心同日 SSH 异常与最上层速度梯度。"""
+    """诊断事件核心同日 SSH 异常与最上层速度梯度；半径为 None 时不算核心加权表层 Ro。"""
     date_ts = pd.Timestamp(date).normalize()
     outer_radius = float(
         diagnostic_settings['background_outer_radius_km']
@@ -51583,51 +51583,53 @@ def _ofes_surface_expression_day(
     else:
         nearby_abs_rossby = 0.0
         nearby_distance = np.nan
-    if (
-        not np.isfinite(event_equivalent_radius_km)
-        or float(event_equivalent_radius_km) <= 0
-    ):
-        raise ValueError(
-            'OFES peak-event equivalent radius must be positive.'
+    if event_equivalent_radius_km is None:
+        weight_scale = weight_support = weighted_surface_rossby = np.nan
+    else:
+        if (
+            not np.isfinite(event_equivalent_radius_km)
+            or float(event_equivalent_radius_km) <= 0
+        ):
+            raise ValueError(
+                'OFES peak-event equivalent radius must be positive.'
+            )
+        weight_scale = (
+            float(event_equivalent_radius_km)
+            * float(population_settings['surface_weight_scale_factor'])
         )
-    weight_scale = (
-        float(event_equivalent_radius_km)
-        * float(population_settings['surface_weight_scale_factor'])
-    )
-    weight_support = (
-        weight_scale
-        * float(population_settings['surface_weight_support_factor'])
-    )
-    if weight_support >= float(
-        diagnostic_settings['background_inner_radius_km']
-    ):
-        raise ValueError(
-            'OFES surface core-weight support overlaps the background '
-            'annulus.'
+        weight_support = (
+            weight_scale
+            * float(population_settings['surface_weight_support_factor'])
         )
-    weight_mask = (
-        (distance_km <= weight_support)
-        & np.isfinite(surface_rossby)
-    )
-    weights = np.exp(
-        -0.5 * (distance_km[weight_mask] / weight_scale) ** 2
-    )
-    weighted_surface_rossby = (
-        float(
-            np.sum(weights * surface_rossby[weight_mask])
-            / np.sum(weights)
+        if weight_support >= float(
+            diagnostic_settings['background_inner_radius_km']
+        ):
+            raise ValueError(
+                'OFES surface core-weight support overlaps the background '
+                'annulus.'
+            )
+        weight_mask = (
+            (distance_km <= weight_support)
+            & np.isfinite(surface_rossby)
         )
-        if weights.size and float(np.sum(weights)) > 0
-        else np.nan
-    )
+        weights = np.exp(
+            -0.5 * (distance_km[weight_mask] / weight_scale) ** 2
+        )
+        weighted_surface_rossby = (
+            float(
+                np.sum(weights * surface_rossby[weight_mask])
+                / np.sum(weights)
+            )
+            if weights.size and float(np.sum(weights)) > 0
+            else np.nan
+        )
     required = (
         eta_core,
         eta_background,
         kinematics['rossby_number'],
         kinematics['normalized_strain'],
         kinematics['normalized_okubo_weiss'],
-        weighted_surface_rossby,
-    )
+    ) + (() if event_equivalent_radius_km is None else (weighted_surface_rossby,))
     failure_reasons: list[str] = []
     if valid_count < int(
         diagnostic_settings['background_min_valid_columns']
@@ -79514,6 +79516,35 @@ def _ofes_surface_eddy_polygon_contains(row: Mapping[str, Any], lon: float, lat:
     return bool(MplPath(vertices, closed=True).contains_point((float(lon), float(lat)), radius=1e-10))
 
 
+def _ofes_surface_eddy_point_matches(rows: pd.DataFrame, lon: float, lat: float) -> pd.DataFrame:
+    """单点相对当日各 PET 涡：有效/速度轮廓是否包含、到涡心距离及其与有效半径之比（逐涡一行）。"""
+    records = rows.to_dict('records')
+    distance = _ofes_surface_eddy_distance_km(
+        rows['center_lon'].to_numpy(float), rows['center_lat'].to_numpy(float), lon, lat
+    )
+    radius = pd.to_numeric(rows['effective_radius_km'], errors='coerce').to_numpy(float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = np.where(radius > 0, distance / radius, np.nan)
+    return pd.DataFrame({
+        'effective_contained': np.array([_ofes_surface_eddy_polygon_contains(row, lon, lat, 'effective') for row in records], dtype=bool),
+        'speed_contained': np.array([_ofes_surface_eddy_polygon_contains(row, lon, lat, 'speed') for row in records], dtype=bool),
+        'center_distance_km': distance,
+        'center_distance_over_effective_radius': ratio,
+    }, index=rows.index)
+
+
+def _ofes_surface_eddy_polarity_category(codes: Any, code: float) -> str:
+    """PET 极性码集合相对给定极性码（反气旋 +1、气旋 −1）的归类：none、same、opposite 或 ambiguous。"""
+    codes = {int(value) for value in codes}
+    if not codes:
+        return 'none'
+    if np.isfinite(code) and int(code) in codes and -int(code) not in codes:
+        return 'same'
+    if np.isfinite(code) and -int(code) in codes and int(code) not in codes:
+        return 'opposite'
+    return 'ambiguous'
+
+
 def _ofes_surface_eddy_valid_objects(objects: pd.DataFrame, date: pd.Timestamp) -> pd.DataFrame:
     """Select non-virtual, filter-valid, non-censored objects for one day."""
 
@@ -79750,18 +79781,13 @@ def _ofes_surface_eddy_associate_event(
     core_ocean_valid = bool(domain['ocean_valid'][lat_index, lon_index])
     eligible = core_filter_valid and core_ocean_valid
     rows = _ofes_surface_eddy_valid_objects(objects, date)
+    matches = _ofes_surface_eddy_point_matches(rows, lon, lat)
     effective_matches = (
-        [
-            row for row in rows.to_dict('records')
-            if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'effective')
-        ]
+        rows.loc[matches['effective_contained']].to_dict('records')
         if eligible else []
     )
     speed_matches = (
-        [
-            row for row in rows.to_dict('records')
-            if _ofes_surface_eddy_polygon_contains(row, lon, lat, 'speed')
-        ]
+        rows.loc[matches['speed_contained']].to_dict('records')
         if eligible else []
     )
     pixels = _ofes_surface_eddy_peak_pixels(delta_do_catalog_dir, event)
@@ -79796,14 +79822,9 @@ def _ofes_surface_eddy_associate_event(
         nearest_vertex = np.nan
         radius_ratio = np.nan
     else:
-        center_distances = _ofes_surface_eddy_distance_km(
-            rows['center_lon'].to_numpy(float), rows['center_lat'].to_numpy(float), lon, lat
-        )
-        nearest_index = int(np.nanargmin(center_distances))
-        nearest_center = float(center_distances[nearest_index])
-        nearest = rows.iloc[nearest_index]
-        radius = pd.to_numeric(pd.Series([nearest.get('effective_radius_km', np.nan)]), errors='coerce').iloc[0]
-        radius_ratio = nearest_center / float(radius) if pd.notna(radius) and radius > 0 else np.nan
+        nearest_index = int(np.nanargmin(matches['center_distance_km'].to_numpy(float)))
+        nearest_center = float(matches['center_distance_km'].iloc[nearest_index])
+        radius_ratio = float(matches['center_distance_over_effective_radius'].iloc[nearest_index])
         vertex_distances: list[float] = []
         for row in rows.to_dict('records'):
             contour_lon = _ofes_surface_eddy_parse_sequence(row.get('effective_contour_lon'))
@@ -79858,7 +79879,7 @@ def _ofes_surface_eddy_associate_event(
         category = 'no-PET'
     else:
         codes = {int(row.get('polarity_code')) for row in effective_matches if pd.notna(row.get('polarity_code'))}
-        category = 'same' if np.isfinite(deep_code) and int(deep_code) in codes and -int(deep_code) not in codes else 'opposite' if np.isfinite(deep_code) and -int(deep_code) in codes and int(deep_code) not in codes else 'ambiguous'
+        category = _ofes_surface_eddy_polarity_category(codes, deep_code)
     return {
         'event_id': event_id,
         'peak_date': date,
@@ -85214,6 +85235,28 @@ def _ofes_scv_reverse_empirical_quantile(values: np.ndarray, probability: float)
     return float(ordered[rank])
 
 
+def _ofes_scv_reverse_calendar_blocks(dates: Any, block_days: int) -> np.ndarray:
+    """返回从 2003-01-01 起算的非重叠日历块编号。"""
+    days = (pd.to_datetime(pd.Series(list(dates))) - pd.Timestamp('2003-01-01')).dt.days
+    return (days // int(block_days)).to_numpy(dtype=int)
+
+
+def _ofes_scv_reverse_block_weights(
+    calendar_dates: Any,
+    block_days: int,
+    replicates: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """在完整抽样日历的块范围内有放回重抽日历块，返回块编号与 replicate × 块的抽中次数。"""
+    blocks = _ofes_scv_reverse_calendar_blocks(calendar_dates, block_days)
+    block_ids = np.arange(int(blocks.min()), int(blocks.max()) + 1, dtype=int)
+    sampled = np.random.default_rng(seed).choice(block_ids, size=(int(replicates), len(block_ids)), replace=True)
+    weights = np.zeros((int(replicates), len(block_ids)), dtype=float)
+    for column, block in enumerate(block_ids):
+        weights[:, column] = np.count_nonzero(sampled == block, axis=1)
+    return block_ids, weights
+
+
 def bootstrap_ofes_scv_reverse_analysis1(
     frames: pd.DataFrame | None = None,
     *,
@@ -85255,19 +85298,12 @@ def bootstrap_ofes_scv_reverse_analysis1(
     work = _ofes_scv_reverse_daily_from_input(frames, strata=strata, daily=daily, min_reference=min_reference)
     if work.empty:
         return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
-    anchor = pd.Timestamp('2003-01-01')
-    work['_block'] = ((work['date'] - anchor).dt.days // int(block_days)).astype(int)
+    work['_block'] = _ofes_scv_reverse_calendar_blocks(work['date'], block_days)
     dates = list(work['date']) if calendar_dates is None else list(pd.to_datetime(calendar_dates, errors='raise').normalize())
     if not dates:
         return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
-    calendar_blocks = ((pd.Series(pd.to_datetime(dates)) - anchor).dt.days // int(block_days)).astype(int)
-    block_ids = np.arange(int(calendar_blocks.min()), int(calendar_blocks.max()) + 1, dtype=int)
-    rng = np.random.default_rng(seed)
-    sampled = rng.choice(block_ids, size=(count, len(block_ids)), replace=True)
-    weights = np.zeros((count, len(block_ids)), dtype=float)
+    block_ids, weights = _ofes_scv_reverse_block_weights(dates, block_days, count, seed)
     block_index = {int(block): index for index, block in enumerate(block_ids)}
-    for column, block in enumerate(block_ids):
-        weights[:, column] = np.count_nonzero(sampled == block, axis=1)
 
     def metric_counts(values: np.ndarray, prefix: str) -> dict[str, Any]:
         finite = np.isfinite(values)
@@ -85778,10 +85814,10 @@ def bootstrap_ofes_scv_reverse_analysis2(
     ctl_scope = controls.copy()
     if not ctl_scope.empty:
         ctl_scope['date'] = pd.to_datetime(ctl_scope['date'], errors='raise').dt.normalize()
-        ctl_scope['_block'] = ((ctl_scope['date'] - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
+        ctl_scope['_block'] = _ofes_scv_reverse_calendar_blocks(ctl_scope['date'], block_days)
     all_objects = objects.copy()
     all_objects['date'] = pd.to_datetime(all_objects['date'], errors='raise').dt.normalize()
-    all_objects['_block'] = ((all_objects['date'] - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
+    all_objects['_block'] = _ofes_scv_reverse_calendar_blocks(all_objects['date'], block_days)
     obj = all_objects.loc[all_objects['matched_object_evaluable'].astype(bool)].copy()
     if calendar_dates is None:
         dates = list(all_objects['date']) + (list(ctl_scope['date']) if not ctl_scope.empty else [])
@@ -85789,13 +85825,7 @@ def bootstrap_ofes_scv_reverse_analysis2(
         dates = list(pd.to_datetime(calendar_dates, errors='raise').normalize())
     if not dates:
         return pd.DataFrame(columns=['scope', 'label', 'threshold', 'block_days', 'replicates'])
-    calendar_blocks = ((pd.Series(pd.to_datetime(dates)) - pd.Timestamp('2003-01-01')).dt.days // int(block_days)).astype(int)
-    block_ids = np.arange(int(calendar_blocks.min()), int(calendar_blocks.max()) + 1, dtype=int)
-    rng = np.random.default_rng(seed)
-    sampled = rng.choice(block_ids, size=(count, len(block_ids)), replace=True)
-    weights = np.zeros((count, len(block_ids)), dtype=float)
-    for index, block in enumerate(block_ids):
-        weights[:, index] = np.count_nonzero(sampled == block, axis=1)
+    block_ids, weights = _ofes_scv_reverse_block_weights(dates, block_days, count, seed)
     rows = []
     scope_values = sorted(all_objects['scope'].dropna().unique())
     for scope in scope_values:
@@ -86895,6 +86925,401 @@ def load_ofes_grid_lens_units(output_dir: str | Path | None = None) -> dict:
         'units': pd.read_parquet(root / 'grid_lens_units.parquet'),
         'season_weights': pd.read_parquet(root / 'grid_lens_season_weights.parquet'),
         'summary': pd.read_csv(root / 'grid_lens_unit_summary.csv'),
+    }
+
+
+_OFES_GRID_LENS_SURFACE_GEOMETRIES = ('strict_contour', 'harmonized')
+_OFES_GRID_LENS_SURFACE_METRICS = {
+    'harmonized': ('flag', 'harmonized'),
+    'strict_contour': ('flag', 'strict_contour'),
+    'harmonized_same_polarity': ('polarity', {'same': 1.0, 'opposite': 0.0, 'ambiguous': 0.0, 'none': 0.0}),
+    'same_polarity_among_harmonized_members': ('polarity', {'same': 1.0, 'opposite': 0.0, 'ambiguous': 0.0}),
+    'surface_colocated_same_sign': ('flag', 'surface_colocated_rotation_polarity_match'),
+    'surface_colocated_weak_or_reversed': ('flag', 'surface_colocated_weak_or_reversed_rotation'),
+    'rotation_dominated': ('flag', 'rotation_dominated'),
+}
+
+
+def _ofes_grid_lens_surface_settings(overrides: Mapping[str, Any] | None = None) -> dict:
+    """解析透镜海表表达设置；柱阈值、重抽次数与种子沿用 reverse enrichment，隶属半径倍数沿用 Argo 涡旋匹配。"""
+    raw = dict(_OFES_CFG.get('grid_lens_surface_expression', {}) or {})
+    if overrides:
+        unknown = sorted(set(overrides) - set(raw))
+        if unknown:
+            raise KeyError(f'Unknown grid_lens_surface_expression overrides: {unknown}')
+        raw.update(dict(overrides))
+    reverse = _OFES_CFG.get('scv_reverse_enrichment', {}) or {}
+    settings = {
+        'column_thresholds': tuple(float(value) for value in reverse.get('thresholds', (20.0, 35.0, 50.0))),
+        'carrying_thresholds': tuple(float(value) for value in raw.get('carrying_thresholds', (20.0, 35.0))),
+        'block_days': int(raw.get('block_days', 20)),
+        'bootstrap_replicates': int(reverse.get('bootstrap_replicates', 10000)),
+        'bootstrap_seed': int(reverse.get('control_random_seed', 20260831)),
+        'membership_radius_factor': float(circle_enlargement_factor),
+        'output_subdir': str(raw.get('output_subdir', 'grid_lens_surface_expression')),
+    }
+    if not set(settings['carrying_thresholds']) <= set(settings['column_thresholds']):
+        raise ValueError('carrying_thresholds must be reverse-enrichment thresholds.')
+    if settings['block_days'] not in _ofes_scv_reverse_block_lengths():
+        raise ValueError('block_days must be one of the reverse-enrichment block lengths.')
+    return settings
+
+
+def _ofes_surface_eddy_membership(
+    lon: Any,
+    lat: Any,
+    rows: pd.DataFrame,
+    radius_factor: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """返回 PET 有效轮廓包含（strict），以及轮廓包含或距任一涡心不超过 radius_factor 倍有效半径（harmonized）。"""
+    lon = np.asarray(lon, dtype=float).ravel()
+    lat = np.asarray(lat, dtype=float).ravel()
+    strict = _ofes_surface_eddy_covered_by_rows(lon, lat, rows, 'effective')
+    near = np.zeros(lon.size, dtype=bool)
+    radii = pd.to_numeric(rows['effective_radius_km'], errors='coerce').to_numpy(dtype=float)
+    for center_lon, center_lat, radius in zip(rows['center_lon'], rows['center_lat'], radii):
+        if np.isfinite(radius) and radius > 0:
+            near |= _ofes_surface_eddy_distance_km(lon, lat, float(center_lon), float(center_lat)) <= radius_factor * radius
+    return strict, strict | near
+
+
+def _ofes_grid_lens_surface_column_day(args: tuple) -> pd.DataFrame:
+    """统计一个 S5 日期的可评估网格柱：SCV 型与否 × 海表涡内外 × ΔDO 阈值阳性数。"""
+    date, scope_root, pet_rows, valid_domain_path, settings = args
+    domain = _ofes_surface_eddy_load_valid_domain({'valid_domain_path': valid_domain_path})
+    tags = [_ofes_threshold_tag(value) for value in settings['column_thresholds']]
+    frame = pd.read_parquet(
+        Path(scope_root) / f'{pd.Timestamp(date):%Y%m%d}' / 'profile_frame.parquet',
+        columns=['global_lat_index', 'global_lon_index', 'classifier_assessable', 'do_evaluable', 'tier0', 'lat', 'lon', *tags],
+    )
+    frame = frame.loc[frame['classifier_assessable'].astype(bool) & frame['do_evaluable'].astype(bool)]
+    row = frame['global_lat_index'].to_numpy(dtype=int)
+    column = frame['global_lon_index'].to_numpy(dtype=int)
+    if not (np.allclose(domain['lat'][row], frame['lat'], atol=1e-4) and np.allclose(domain['lon'][column], frame['lon'], atol=1e-4)):
+        raise ValueError(f'Profile-frame indices disagree with the PET domain on {pd.Timestamp(date):%Y-%m-%d}.')
+    frame = frame.loc[domain['filter_valid'][row, column] & domain['ocean_valid'][row, column]]
+    strict, harmonized = _ofes_surface_eddy_membership(frame['lon'], frame['lat'], pet_rows, settings['membership_radius_factor'])
+    tier0 = frame['tier0'].to_numpy(dtype=bool)
+    hits = {tag: frame[tag].to_numpy(dtype=bool) for tag in tags}
+    records = []
+    for geometry, covered in zip(_OFES_GRID_LENS_SURFACE_GEOMETRIES, (strict, harmonized)):
+        for group, in_group in (('scv_type', tier0), ('not_scv_type', ~tier0)):
+            for membership, inside in (('inside', covered), ('outside', ~covered)):
+                selected = in_group & inside
+                record = {'date': pd.Timestamp(date), 'geometry': geometry, 'group': group, 'membership': membership, 'columns': int(selected.sum())}
+                for tag in tags:
+                    record[f'{tag}_columns'] = int(hits[tag][selected].sum())
+                records.append(record)
+    return pd.DataFrame(records)
+
+
+def _ofes_grid_lens_surface_lens_day(args: tuple) -> list[dict]:
+    """诊断一个 S5 日期各透镜中心的海表涡隶属、核心层旋转与表层表达（事件诊断口径）。"""
+    date, lenses, pet_rows, valid_domain_path, settings = args
+    date = pd.Timestamp(date)
+    domain = _ofes_surface_eddy_load_valid_domain({'valid_domain_path': valid_domain_path})
+    diagnostic = _ofes_event_diagnostic_settings()
+    population = _ofes_event_population_settings()
+    levels = np.asarray(_ofes_tracer_coordinates(date)[2], dtype=float)
+    load_radius_m = (float(diagnostic['background_outer_radius_km']) + float(diagnostic['background_load_margin_km'])) * 1000.0
+    records = []
+    for lens in lenses:
+        lon, lat = float(lens['center_lon']), float(lens['center_lat'])
+        row = int(np.argmin(np.abs(domain['lat'] - lat)))
+        column = int(np.argmin(np.abs(_minimal_lon_diff_deg(domain['lon'], lon))))
+        eligible = bool(domain['filter_valid'][row, column] and domain['ocean_valid'][row, column])
+        # PET 极性：反气旋 +1，气旋 −1；透镜极性取核心层涡度异常的符号
+        lens_code = 1 if float(lens['core_zeta_anomaly_mean']) < 0 else -1
+        record = {'object_id': lens['object_id'], 'pet_eligible': eligible}
+        if eligible and not pet_rows.empty:
+            matches = _ofes_surface_eddy_point_matches(pet_rows, lon, lat)
+            contains = matches['effective_contained'].to_numpy(dtype=bool)
+            ratio = matches['center_distance_over_effective_radius'].to_numpy(dtype=float)
+            member = contains | (ratio <= settings['membership_radius_factor'])
+            nearest = int(np.nanargmin(ratio))
+            record.update({
+                'strict_contour': bool(contains.any()),
+                'harmonized': bool(member.any()),
+                'nearest_center_over_effective_radius': float(ratio[nearest]),
+                'nearest_polarity_code': int(pet_rows['polarity_code'].iloc[nearest]),
+                'nearest_effective_radius_km': float(pet_rows['effective_radius_km'].iloc[nearest]),
+            })
+            for name, mask in (('strict', contains), ('harmonized', member)):
+                record[f'{name}_polarity'] = _ofes_surface_eddy_polarity_category(pet_rows.loc[mask, 'polarity_code'], lens_code)
+        level = float(levels[int(np.argmin(np.abs(levels - float(lens['centroid_depth_m']))))])
+        scale = approximate_degree_length(lat)
+        lon_half = load_radius_m / float(scale['meters_per_degree_lon'])
+        lat_half = load_radius_m / float(scale['meters_per_degree_lat'])
+        snapshot = load_ofes_snapshot(
+            date, variables=['u', 'v'], lon_bounds=(lon - lon_half, lon + lon_half),
+            lat_bounds=(lat - lat_half, lat + lat_half), depth_bounds=(level, level),
+        )
+        fields = _ofes_fixed_depth_kinematic_fields(snapshot, level, float(diagnostic['velocity_smoothing_sigma_pixels']))
+        core = _ofes_kinematics_at_point(fields, snapshot['lon'], snapshot['lat'], lon, lat)
+        record.update({'core_level_m': level, 'rossby_number': core['rossby_number'], 'normalized_strain': core['normalized_strain']})
+        # 核心加权表层 Ro 的支撑须小于背景内环，近半数透镜半径过大，统一不算
+        record.update(_ofes_surface_expression_day(date, lon, lat, core['rossby_number'], None, diagnostic, population))
+        records.append(record)
+    return records
+
+
+def _ofes_grid_lens_surface_column_summary(daily: pd.DataFrame, calendar: Sequence[pd.Timestamp], settings: Mapping[str, Any]) -> pd.DataFrame:
+    """按隶属几何与柱组别汇总海表涡外与涡内的 ΔDO 阳性率、率差与率比及日历块重抽区间。"""
+    block_ids, weights = _ofes_scv_reverse_block_weights(
+        calendar, settings['block_days'], settings['bootstrap_replicates'], settings['bootstrap_seed'],
+    )
+    daily = daily.assign(_block=_ofes_scv_reverse_calendar_blocks(daily['date'], settings['block_days']))
+    tags = [_ofes_threshold_tag(value) for value in settings['column_thresholds']]
+    count_columns = ['columns', *[f'{tag}_columns' for tag in tags]]
+    rows = []
+    for (geometry, group), part in daily.groupby(['geometry', 'group'], sort=False):
+        sums = {
+            membership: part.loc[part['membership'].eq(membership)].groupby('_block')[count_columns].sum()
+            .reindex(block_ids, fill_value=0)
+            for membership in ('inside', 'outside')
+        }
+        row = {'geometry': geometry, 'group': group}
+        for membership, values in sums.items():
+            row[f'columns_{membership}'] = int(values['columns'].sum())
+        row['share_inside'] = row['columns_inside'] / (row['columns_inside'] + row['columns_outside'])
+        for tag in tags:
+            point, boot = {}, {}
+            for membership, values in sums.items():
+                hits = values[f'{tag}_columns'].to_numpy(dtype=float)
+                columns = values['columns'].to_numpy(dtype=float)
+                row[f'{tag}_{membership}'] = int(hits.sum())
+                point[membership] = hits.sum() / columns.sum()
+                row[f'{tag}_rate_{membership}'] = point[membership]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    boot[membership] = (weights @ hits) / (weights @ columns)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                difference = boot['outside'] - boot['inside']
+                ratio = boot['outside'] / boot['inside']
+            row[f'{tag}_rate_difference'] = point['outside'] - point['inside']
+            row[f'{tag}_rate_difference_ci_low'] = _ofes_scv_reverse_empirical_quantile(difference, 0.025)
+            row[f'{tag}_rate_difference_ci_high'] = _ofes_scv_reverse_empirical_quantile(difference, 0.975)
+            row[f'{tag}_rate_ratio'] = point['outside'] / point['inside'] if point['inside'] > 0 else np.nan
+            row[f'{tag}_rate_ratio_ci_low'] = _ofes_scv_reverse_empirical_quantile(ratio, 0.025)
+            row[f'{tag}_rate_ratio_ci_high'] = _ofes_scv_reverse_empirical_quantile(ratio, 0.975)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_surface_indicator(lens: pd.DataFrame, metric: str) -> np.ndarray:
+    """把一个透镜-日海表指标转为 1/0/NaN。"""
+    kind, source = _OFES_GRID_LENS_SURFACE_METRICS[metric]
+    if kind == 'polarity':
+        return lens['harmonized_polarity'].map(source).to_numpy(dtype=float)
+    return lens[source].astype('Float64').to_numpy(dtype=float, na_value=np.nan)
+
+
+def _ofes_grid_lens_surface_contrast(lens: pd.DataFrame, calendar: Sequence[pd.Timestamp], settings: Mapping[str, Any]) -> pd.DataFrame:
+    """比较携氧与不携氧透镜-日的海表指标比例，差值区间按日历块重抽；同时给出涉及的轨迹数。"""
+    block_ids, weights = _ofes_scv_reverse_block_weights(
+        calendar, settings['block_days'], settings['bootstrap_replicates'], settings['bootstrap_seed'],
+    )
+    lens = lens.reset_index(drop=True)
+    block_index = _ofes_scv_reverse_calendar_blocks(lens['date'], settings['block_days']) - int(block_ids[0])
+    rows = []
+    for threshold in settings['carrying_thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        for spice in _OFES_GRID_LENS_SPICE_SCOPES:
+            in_scope = np.ones(len(lens), dtype=bool) if spice == 'all' else lens['spice_sign'].eq(spice).to_numpy()
+            carry = lens[f'carry_{tag}'].to_numpy(dtype=bool)
+            for metric in _OFES_GRID_LENS_SURFACE_METRICS:
+                values = _ofes_grid_lens_surface_indicator(lens, metric)
+                row = {'threshold': threshold, 'spice': spice, 'metric': metric}
+                boot = {}
+                for group, in_group in (('carrying', carry), ('not_carrying', ~carry)):
+                    selected = in_scope & in_group & np.isfinite(values)
+                    row[f'lens_days_{group}'] = int(selected.sum())
+                    row[f'tracks_{group}'] = int(lens.loc[selected, 'track_id'].nunique())
+                    row[f'share_{group}'] = float(values[selected].mean()) if selected.any() else np.nan
+                    numerator = np.bincount(block_index[selected], weights=values[selected], minlength=len(block_ids))
+                    denominator = np.bincount(block_index[selected], minlength=len(block_ids)).astype(float)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        boot[group] = (weights @ numerator) / (weights @ denominator)
+                difference = boot['carrying'] - boot['not_carrying']
+                row['difference'] = row['share_carrying'] - row['share_not_carrying']
+                row['difference_ci_low'] = _ofes_scv_reverse_empirical_quantile(difference, 0.025)
+                row['difference_ci_high'] = _ofes_scv_reverse_empirical_quantile(difference, 0.975)
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_surface_continuous(lens: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """携氧与不携氧透镜-日的连续海表与旋转量四分位数。"""
+    lens = lens.assign(
+        abs_core_rossby_number=lens['rossby_number'].abs(),
+        abs_surface_rossby_number=lens['surface_rossby_number'].abs(),
+        abs_surface_eta_contrast_cm=100.0 * lens['surface_eta_contrast_m'].abs(),
+    )
+    quantities = (
+        'abs_core_rossby_number', 'abs_surface_rossby_number',
+        'surface_to_subsurface_colocated_rotation_ratio', 'surface_to_subsurface_nearby_rotation_ratio',
+        'abs_surface_eta_contrast_cm', 'nearest_center_over_effective_radius',
+    )
+    rows = []
+    for threshold in settings['carrying_thresholds']:
+        tag = _ofes_threshold_tag(threshold)
+        for spice in _OFES_GRID_LENS_SPICE_SCOPES:
+            scoped = lens if spice == 'all' else lens.loc[lens['spice_sign'].eq(spice)]
+            for group, flag in (('carrying', True), ('not_carrying', False)):
+                part = scoped.loc[scoped[f'carry_{tag}'].eq(flag)]
+                row = {
+                    'threshold': threshold, 'spice': spice, 'group': group,
+                    'lens_days': len(part), 'tracks': part['track_id'].nunique(),
+                    'centroid_depth_m_median': part['centroid_depth_m'].median(),
+                    'radius_km_median': part['radius_km'].median(),
+                }
+                for quantity in quantities:
+                    q25, q50, q75 = part[quantity].quantile([0.25, 0.5, 0.75])
+                    row.update({f'{quantity}_q25': q25, f'{quantity}_median': q50, f'{quantity}_q75': q75})
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_ofes_grid_lens_surface_expression(
+    reverse_cache_dir: str | Path,
+    *,
+    units_dir: str | Path | None = None,
+    surface_eddy_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    settings: Mapping[str, Any] | None = None,
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """比较 SCV 型网格柱与携氧透镜在海表涡内外的分布，诊断携氧透镜的海表可见性与旋转垂向结构。
+
+    网格柱层面对应第一篇 Argo 的 SCV × META 四格表：reverse enrichment 逐日片段中可评估的网格柱按 SCV 型（Tier-0）与否、是否在修正版 PET 海表涡附近分组，统计各 ΔDO 阈值的阳性率，以涡外 ÷ 涡内的率比与率差表示。海表涡隶属有两种几何：有效轮廓包含（strict_contour），以及轮廓包含或距任一涡心不超过 `circle_enlargement_factor` 倍有效半径（harmonized，与 Argo 剖面匹配涡旋的判据同式）。
+
+    透镜层面取 `build_ofes_grid_lens_units` 的透镜-日（可评估 Tier-1 透镜），按各阈值的三维携氧标志分为携氧与不携氧，比较海表涡隶属、海表涡与透镜的旋转方向，以及事件诊断口径下的核心层与表层旋转（`_ofes_fixed_depth_kinematic_fields`、`_ofes_surface_expression_day`、`_ofes_add_surface_rotation_metrics`）。独立透镜数按一对一轨迹计。
+
+    参数:
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/<日期>/profile_frame.parquet`。
+        - units_dir (str | pathlib.Path | None): 透镜实验单位目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+        - surface_eddy_dir (str | pathlib.Path | None): PET 海表涡目录；默认 `plot_outputs/do/ofes_np30_ke/surface_eddy`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_surface_expression`。
+        - settings (Mapping | None): 覆盖 `processing.yml` 的 `ofes.grid_lens_surface_expression` 键；默认不覆盖。
+        - workers (int): 按 S5 日期并行的进程数；默认 1。
+        - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
+
+    返回:
+        - dict: `load_ofes_grid_lens_surface_expression` 的结果。
+
+    输出:
+        - `output_dir/column_membership_daily.parquet`：逐日 × 几何 × 柱组别 × 涡内外的柱数与各阈值阳性数。
+        - `output_dir/column_membership_summary.csv`：涡内外阳性率、率差与率比及区间。
+        - `output_dir/lens_day_surface_expression.parquet`：逐透镜-日的海表涡隶属、极性与旋转诊断。
+        - `output_dir/lens_carrying_contrast.csv`：携氧与不携氧透镜-日的海表指标比例差及区间。
+        - `output_dir/lens_carrying_continuous.csv`：两组连续量的四分位数。
+        - `output_dir/manifest.json`：请求与计数。
+
+    说明:
+        - 区间为 reverse enrichment 的日历块重抽（从 2003-01-01 起算，块长、次数与种子见 manifest），分位数沿用其经验分位定义。
+        - 透镜核心层取最近交付层到体积质心深度，透镜极性取 `core_zeta_anomaly_mean` 的符号。核心加权表层 Ro 要求加权支撑小于背景内环，近半数透镜半径过大，故不计算，只用同位与邻近两种表层口径。
+        - 逐透镜读取核心层与表层流速，逐日读取网格柱片段；不做粒子积分。
+    """
+    params = _ofes_grid_lens_surface_settings(settings)
+    cache_root = Path(reverse_cache_dir).expanduser().resolve()
+    scope_root = cache_root / 'primary_300_1000'
+    units = load_ofes_grid_lens_units(units_dir)
+    catalog = load_ofes_surface_eddy_catalog(surface_eddy_dir)
+    root = _ofes_grid_lens_output_root(output_dir, params)
+    request = {
+        'reverse_cache_dir': str(cache_root),
+        'units_dir': str(Path(units['output_dir']).resolve()),
+        'surface_eddy_dir': str(Path(catalog['run_dir']).resolve()),
+        'settings': params,
+    }
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        same_request = _ofes_requests_equal(existing.get('request'), request)
+        if not same_request and not overwrite:
+            raise RuntimeError(
+                'Existing grid-lens surface-expression output was built from a different request; '
+                'use another output_dir or overwrite=True.'
+            )
+        if same_request and existing.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_surface_expression(root)
+    calendar = sorted(pd.Timestamp(path.name) for path in scope_root.iterdir() if path.is_dir() and path.name.isdigit())
+    pet = catalog['daily_objects'].copy()
+    pet['date'] = pd.to_datetime(pet['date']).dt.normalize()
+    pet_by_date = {date: _ofes_surface_eddy_valid_objects(pet.loc[pet['date'].eq(date)], date) for date in calendar}
+    domain_path = str(catalog['valid_domain_path'])
+    lens = units['objects']
+    column_tasks = [(date, scope_root, pet_by_date[date], domain_path, params) for date in calendar]
+    lens_tasks = [
+        (date, part.to_dict('records'), pet_by_date[pd.Timestamp(date)], domain_path, params)
+        for date, part in lens.groupby('date', sort=True)
+    ]
+    if int(workers) > 1:
+        with ProcessPoolExecutor(max_workers=int(workers)) as executor:
+            daily = list(executor.map(_ofes_grid_lens_surface_column_day, column_tasks))
+            lens_records = list(executor.map(_ofes_grid_lens_surface_lens_day, lens_tasks))
+    else:
+        daily = [_ofes_grid_lens_surface_column_day(task) for task in column_tasks]
+        lens_records = [_ofes_grid_lens_surface_lens_day(task) for task in lens_tasks]
+    daily = pd.concat(daily, ignore_index=True)
+    records = pd.DataFrame([record for day in lens_records for record in day])
+    for column in ('strict_contour', 'harmonized'):
+        records[column] = records[column].astype('boolean')
+    lens_days = lens.merge(records, on='object_id', validate='one_to_one')
+    lens_days = _ofes_add_surface_rotation_metrics(lens_days, _ofes_event_population_settings())
+    column_summary = _ofes_grid_lens_surface_column_summary(daily, calendar, params)
+    contrast = _ofes_grid_lens_surface_contrast(lens_days, calendar, params)
+    continuous = _ofes_grid_lens_surface_continuous(lens_days, params)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(daily, root / 'column_membership_daily.parquet')
+    column_summary.to_csv(root / 'column_membership_summary.csv', index=False)
+    _atomic_write_parquet(lens_days, root / 'lens_day_surface_expression.parquet')
+    contrast.to_csv(root / 'lens_carrying_contrast.csv', index=False)
+    continuous.to_csv(root / 'lens_carrying_continuous.csv', index=False)
+    manifest = {
+        'analysis': 'ofes_grid_lens_surface_expression',
+        'status': 'complete',
+        'request': request,
+        'counts': {
+            'calendar_dates': len(calendar),
+            'columns': int(daily.loc[daily['geometry'].eq('harmonized'), 'columns'].sum()),
+            'scv_type_columns': int(daily.loc[daily['geometry'].eq('harmonized') & daily['group'].eq('scv_type'), 'columns'].sum()),
+            'lens_days': int(len(lens_days)),
+            'lens_days_pet_eligible': int(lens_days['pet_eligible'].sum()),
+            'tracks': int(lens_days['track_id'].nunique()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_surface_expression(root)
+
+
+def load_ofes_grid_lens_surface_expression(output_dir: str | Path | None = None) -> dict:
+    """读取已保存的网格柱与透镜海表表达结果。
+
+    只读取 `build_ofes_grid_lens_surface_expression` 写出的表格和 manifest，不读取 OFES 原始场，也不修改结果目录。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_surface_expression`。
+
+    返回:
+        - dict: output_dir、manifest，以及 column_daily、column_summary、lens_days、lens_contrast 与 lens_continuous 五张表。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _ofes_grid_lens_surface_settings())
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Grid-lens surface-expression manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_surface_expression' or manifest.get('status') != 'complete':
+        raise ValueError(f'Grid-lens surface-expression output is incomplete or belongs to another analysis: {root}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'column_daily': pd.read_parquet(root / 'column_membership_daily.parquet'),
+        'column_summary': pd.read_csv(root / 'column_membership_summary.csv'),
+        'lens_days': pd.read_parquet(root / 'lens_day_surface_expression.parquet'),
+        'lens_contrast': pd.read_csv(root / 'lens_carrying_contrast.csv'),
+        'lens_continuous': pd.read_csv(root / 'lens_carrying_continuous.csv'),
     }
 
 
