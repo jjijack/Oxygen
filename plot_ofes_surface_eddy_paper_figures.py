@@ -1,11 +1,11 @@
 """Render the final OFES surface-expression manuscript Figure 6.
 
 The figure consumes completed PET association products and reconstructs the
-representative map from the source tables used by
-``run_ofes_surface_eddy_postprocess._write_plot_outputs``. In particular, it
-does not place an old rendered case-map raster behind the figure: contours,
-centers, and the DO peak pixels are plotted directly from their parquet
-products, so no baked-in axes or annotations can survive into Figure 6a.
+representative map from the PET catalog's daily objects and the ΔDO catalog's
+peak pixels. In particular, it does not place an old rendered case-map raster
+behind the figure: contours, centers, and the DO peak pixels are plotted
+directly from their parquet products, so no baked-in axes or annotations can
+survive into Figure 6a.
 """
 
 from __future__ import annotations
@@ -117,14 +117,14 @@ def _load_outputs(
 
 
 def _load_case_map_data(
-    surface_root: Path,
+    pet_catalog_root: Path,
     do_catalog_root: Path,
     population_path: Path,
     event_id: str,
 ) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     """Load the source rows needed for a pure, data-generated case map."""
 
-    objects = pd.read_parquet(surface_root / "surface_eddy_daily_objects.parquet")
+    objects = pd.read_parquet(pet_catalog_root / "surface_eddy_daily_objects.parquet")
     _require_columns(
         objects,
         (
@@ -449,10 +449,13 @@ def _plot_figure6(
     axes[1].set_title("Rotation events", loc="right", pad=4)
 
     null_rows = [
-        ("local ring", local_audit, BLUE),
-        ("annual stratified", annual_audit, TEAL),
+        ("local\nring", local_audit, BLUE),
+        ("annual\nstratified", annual_audit, TEAL),
     ]
     y = np.arange(len(null_rows))[::-1]
+    bounds = np.array([audit["bootstrap_95ci"] for _, audit, _ in null_rows], dtype=float)
+    left, right = min(bounds.min(), 0.0), max(bounds.max(), 0.0)
+    pad = 0.08 * (right - left)
     for yi, (label, audit, color) in zip(y, null_rows):
         mean = float(
             audit["core_minus_ring_mean"]
@@ -464,11 +467,12 @@ def _plot_figure6(
         axes[2].plot([low, low], [yi - 0.12, yi + 0.12], color=color, linewidth=1.2)
         axes[2].plot([high, high], [yi - 0.12, yi + 0.12], color=color, linewidth=1.2)
         axes[2].plot(mean, yi, "o", color=INK, markersize=7)
-        axes[2].text(high + 0.0006, yi, f"{mean:+.4f}", va="center", fontsize=7.5)
+        axes[2].text(mean, yi + 0.16, f"{mean:+.3f}", ha="center", va="bottom", fontsize=7.5)
     axes[2].axvline(0, color=INK, linestyle="--", linewidth=1)
     axes[2].set_yticks(y, [row[0] for row in null_rows])
+    axes[2].set_ylim(-0.5, len(null_rows) - 0.4)
     axes[2].set_xlabel("Core − null occupancy")
-    axes[2].set_xlim(-0.033, 0.004)
+    axes[2].set_xlim(left - pad, right + pad)
     axes[2].set_title("Occupancy nulls", loc="right")
     _style_axes(axes)
     _add_panel_labels(axes)
@@ -482,6 +486,7 @@ def render_paper_figures(
     summary_path: Path | None = None,
     do_catalog_root: Path | None = None,
     population_path: Path | None = None,
+    pet_catalog_root: Path | None = None,
     case_event_id: str = "OFES_DO50_E000002",
 ) -> list[Path]:
     """Render Figure 6 from completed PET association and map-source products."""
@@ -489,11 +494,11 @@ def render_paper_figures(
     surface_root = surface_root.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    if do_catalog_root is None or population_path is None:
-        raise ValueError("Figure 6 requires --do-catalog-root and --population for a pure case map")
+    if do_catalog_root is None or population_path is None or pet_catalog_root is None:
+        raise ValueError("Figure 6 requires --do-catalog-root, --population and --pet-catalog-root for a pure case map")
     summary, association, quality, rotation = _load_outputs(surface_root, summary_path)
     case, case_rows, pixels = _load_case_map_data(
-        surface_root,
+        pet_catalog_root.expanduser().resolve(),
         do_catalog_root.expanduser().resolve(),
         population_path.expanduser().resolve(),
         str(case_event_id),
@@ -520,6 +525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--summary", type=Path, default=None)
     parser.add_argument("--do-catalog-root", required=True, type=Path)
     parser.add_argument("--population", required=True, type=Path)
+    parser.add_argument("--pet-catalog-root", required=True, type=Path)
     parser.add_argument("--case-event-id", default="OFES_DO50_E000002")
     parser.add_argument("--dpi", type=int, default=600)
     args = parser.parse_args(argv)
@@ -530,6 +536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.summary,
         args.do_catalog_root,
         args.population,
+        args.pet_catalog_root,
         args.case_event_id,
     ):
         print(path)

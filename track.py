@@ -79707,12 +79707,15 @@ def _ofes_surface_eddy_covered_by_rows(
         ])
         if not np.array_equal(vertices[0], vertices[-1]):
             vertices = np.vstack([vertices, vertices[0]])
-        points = np.column_stack([
-            reference + _minimal_lon_diff_deg(lon_values, reference),
-            lat_values,
-        ])
-        covered |= MplPath(vertices, closed=True).contains_points(
-            points,
+        # 只对轮廓外接框内的点做多边形判断，框外的点不可能被覆盖
+        low = vertices.min(axis=0) - 1e-6
+        high = vertices.max(axis=0) + 1e-6
+        candidates = np.flatnonzero((lat_values >= low[1]) & (lat_values <= high[1]))
+        x = reference + _minimal_lon_diff_deg(lon_values[candidates], reference)
+        inside_box = (x >= low[0]) & (x <= high[0])
+        candidates = candidates[inside_box]
+        covered[candidates] |= MplPath(vertices, closed=True).contains_points(
+            np.column_stack([x[inside_box], lat_values[candidates]]),
             radius=1e-10,
         )
     return covered
