@@ -794,7 +794,7 @@ _JOURNAL_COLORS = _load_plot_mapping(
     'journal_colors',
     {
         'ink': '#1f2933', 'muted': '#52606d', 'grid': '#e4e7eb', 'neutral': '#9aa5b1', 'light': '#cbd2d9',
-        'band': '#eef3f7', 'accent': '#e07b39', 'land': '#d5dbe1', 'sparse': '#e3e7ec', 'zero': '#fdf9f1',
+        'band': '#eef3f7', 'accent': '#e07b39', 'land': '#d5dbe1', 'sparse': '#e6edf3', 'zero': '#fdf9f1',
         'lens': '#f8e3e6', 'brick': '#a63d22', 'minty': '#2a9d8f', 'minty_light': '#bfe6df', 'minty_dark': '#12524a',
         'spicy': '#d1495b', 'eke_low': '#f4f6f8',
         'DO20': '#8fbcdb', 'DO35': '#3b7fb6', 'DO50': '#12355b',
@@ -31729,11 +31729,11 @@ def _grid_to_lon360(lon_edges: np.ndarray, *grids: np.ndarray) -> tuple[np.ndarr
 
 def _journal_occurrence_mesh(ax, lon_edges: np.ndarray, lat_edges: np.ndarray, count: np.ndarray,
                              positive: np.ndarray, min_profiles: int):
-    """画网格发生比例：剖面不足的格子灰底，达到门槛但无峰的格子浅底，其余按分档色阶着色。"""
+    """画网格发生比例：剖面不足门槛的格子（含无剖面的格子）浅蓝灰底，达到门槛但无峰的格子浅底，其余按分档色阶着色。"""
     shown = count >= min_profiles
     rate = np.where(shown & (positive > 0), positive / np.where(count > 0, count, 1), np.nan)
     zero = np.where(shown & (positive == 0), 1.0, np.nan)
-    sparse = np.where((count > 0) & ~shown, 1.0, np.nan)
+    sparse = np.where(~shown, 1.0, np.nan)
     pc = ccrs.PlateCarree()
     ax.pcolormesh(lon_edges, lat_edges, sparse, cmap=ListedColormap([_JOURNAL_COLORS['sparse']]), transform=pc,
                   zorder=1)
@@ -31758,9 +31758,9 @@ def _journal_occurrence_handles(threshold: float, min_profiles: int) -> list:
     tag = _format_detection_value(float(threshold))
     return [
         Patch(facecolor=_JOURNAL_COLORS['zero'], edgecolor=_JOURNAL_COLORS['light'], lw=0.4,
-              label=f'≥{min_profiles} profiles, none with ΔDO{tag}'),
+              label=f'0% ΔDO{tag} occurrence'),
         Patch(facecolor=_JOURNAL_COLORS['sparse'], edgecolor='none',
-              label=f'1–{min_profiles - 1} profiles; occurrence not mapped'),
+              label=f'<{min_profiles} profiles'),
     ]
 
 
@@ -31980,7 +31980,7 @@ def plot_argo_do_occurrence_overview(
     point_threshold: float = 50.0,
     grid_step_deg: float = 3.0,
     min_cell_profiles: int = 20,
-    eke_percentile: float = 90.0,
+    eke_percentile: float = 80.0,
     ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
     ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
     output_dir: str | Path | None = None,
@@ -31992,7 +31992,7 @@ def plot_argo_do_occurrence_overview(
 
     (a) 读取 `describe_delta_do_construction` 为 example_profile 写出的构造表，画有效层、搜索层、端点参考线
     与峰值差；(b) 由 `build_argo_do_occurrence_table` 的逐剖面表经 `build_euler_occurrence_summary` 计数，
-    在太平洋中心全球图上画 map_threshold 的网格发生比例（剖面不足 min_cell_profiles 的格子只标灰），叠加
+    在太平洋中心全球图上画 map_threshold 的网格发生比例（剖面不足 min_cell_profiles 的格子只铺底色），叠加
     point_threshold 峰剖面位置、GLORYS 平均 EKE 的 eke_percentile 分位等值线与 KE 框；(c) 取同一总体的年份 ×
     区域汇总，画六个区域在全部剖面与各阈值峰剖面中的占比。全图 7 in 宽，按期刊版式字号与配色绘制。
 
@@ -32002,7 +32002,7 @@ def plot_argo_do_occurrence_overview(
         - point_threshold (float): (b) 画出位置的 ΔDO 阈值，默认 50。
         - grid_step_deg (float): (b) 网格步长（°），默认 3。
         - min_cell_profiles (int): (b) 着色所需的最少剖面数，默认 20。
-        - eke_percentile (float): (b) EKE 等值线的分位（%），取海洋格点正值 EKE，默认 90。
+        - eke_percentile (float): (b) EKE 等值线的分位（%），取海洋格点正值 EKE，默认 80。
         - ke_lon_bounds (tuple[float, float]): KE 框经度范围，默认 `(140, 170)`。
         - ke_lat_bounds (tuple[float, float]): KE 框纬度范围，默认 `(25, 45)`。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_overview` 目录。
@@ -32863,7 +32863,7 @@ def plot_argo_do_occurrence_maps(
     thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
     grid_step_deg: float = 3.0,
     min_cell_profiles: int = 20,
-    eke_percentile: float = 90.0,
+    eke_percentile: float = 80.0,
     ke_lon_bounds: tuple[float, float] = (140.0, 170.0),
     ke_lat_bounds: tuple[float, float] = (25.0, 45.0),
     output_dir: str | Path | None = None,
@@ -32874,7 +32874,7 @@ def plot_argo_do_occurrence_maps(
     """并排绘制全局氧剖面总体中各阈值 ΔDO 峰的网格发生比例，以及 GLORYS 平均表层 EKE。
 
     各阈值面板由 `build_argo_do_occurrence_table` 的逐剖面表经 `build_euler_occurrence_summary` 计数，剖面不足
-    min_cell_profiles 的格子只标灰，达到门槛但无峰的格子浅底，其余按分档色阶着色，并叠加 EKE 分位等值线与
+    min_cell_profiles 的格子只铺底色，达到门槛但无峰的格子浅底，其余按分档色阶着色，并叠加 EKE 分位等值线与
     KE 框；末一面板画 1° 平均 EKE（对数色阶）与同一分位等值线。四个面板 2 × 2 排列，共用发生比例色标，
     全图 7 in 宽，按期刊版式绘制。
 
@@ -32882,7 +32882,7 @@ def plot_argo_do_occurrence_maps(
         - thresholds (tuple[float, ...]): 三个 ΔDO 阈值，默认 (20, 35, 50)。
         - grid_step_deg (float): 网格步长（°），默认 3。
         - min_cell_profiles (int): 着色所需的最少剖面数，默认 20。
-        - eke_percentile (float): EKE 等值线的分位（%），取海洋格点正值 EKE，默认 90。
+        - eke_percentile (float): EKE 等值线的分位（%），取海洋格点正值 EKE，默认 80。
         - ke_lon_bounds (tuple[float, float]): KE 框经度范围，默认 `(140, 170)`。
         - ke_lat_bounds (tuple[float, float]): KE 框纬度范围，默认 `(25, 45)`。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_maps` 目录。
@@ -32953,9 +32953,9 @@ def plot_argo_do_occurrence_maps(
         )
         handles = [
             Patch(facecolor=colors['zero'], edgecolor=colors['light'], lw=0.4,
-                  label=f'≥{int(min_cell_profiles)} profiles, none at the threshold'),
+                  label='0% occurrence'),
             Patch(facecolor=colors['sparse'], edgecolor='none',
-                  label=f'1–{int(min_cell_profiles) - 1} profiles; occurrence not mapped'),
+                  label=f'<{int(min_cell_profiles)} profiles'),
             Line2D([], [], color=colors['muted'], lw=0.6, label=f'EKE {eke_percentile:g}th percentile, (a)–(c)'),
             Line2D([], [], color=colors['brick'], lw=0.6, label=f'EKE {eke_percentile:g}th percentile, (d)'),
             Line2D([], [], color=colors['ink'], lw=0.8, label='KE box'),
