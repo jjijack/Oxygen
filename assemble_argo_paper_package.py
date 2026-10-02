@@ -32,7 +32,7 @@ FIGURES = {
     'FigS2': ('do_density_coordinate_sensitivity', 'do_density_coordinate_sensitivity_do50_depth300m'),
     'FigS3': ('plot_scv_matching_diagnostics', 'scv_matching_diagnostics'),
     'FigS4': ('plot_scv_glorys_representation', 'scv_glorys_representation'),
-    'FigS5': ('plot_meta_radius_and_sampling_sensitivity', 'meta_radius_and_sampling_sensitivity'),
+    'FigS5': ('plot_argo_ke_sampling_by_year', 'argo_ke_sampling_by_year'),
 }
 # Source data written by producers other than the figure's plotter.
 EXTRA_SOURCES = {

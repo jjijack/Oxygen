@@ -31771,13 +31771,15 @@ def _journal_log_axis(axis, ticks) -> None:
     axis.set_minor_locator(NullLocator())
 
 
-def _journal_panel_grid(rows: list[tuple[float, int]]):
-    """按行布置等宽面板：rows 为 (行高英寸, 面板数)；返回整图与按行展开的面板子图列表。"""
+def _journal_panel_grid(rows: list[tuple[float, int | tuple[float, ...]]]):
+    """按行布置面板：rows 为 (行高英寸, 等宽面板数或各面板宽度比)；返回整图与按行展开的面板子图列表。"""
     fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, sum(height for height, _ in rows)))
     row_figs = np.atleast_1d(fig.subfigures(len(rows), 1, height_ratios=[height for height, _ in rows], hspace=0))
     cells = []
-    for row_fig, (_, n_panels) in zip(row_figs, rows):
-        cells.extend(np.atleast_1d(row_fig.subfigures(1, n_panels, wspace=0)) if n_panels > 1 else [row_fig])
+    for row_fig, (_, panels) in zip(row_figs, rows):
+        widths = [1.0] * panels if isinstance(panels, int) else list(panels)
+        cells.extend(np.atleast_1d(row_fig.subfigures(1, len(widths), width_ratios=widths, wspace=0))
+                     if len(widths) > 1 else [row_fig])
     return fig, cells
 
 
@@ -32102,26 +32104,43 @@ def _draw_eke_bin_panel(fig, table: pd.DataFrame) -> None:
     ax.legend(loc='upper left', fontsize=6.6, handletextpad=0.3)
 
 
-def _draw_meta_association_panel(fig, table: pd.DataFrame, radius_factor: float) -> None:
-    """画各阈值峰剖面落在 META 涡给定倍数半径内的比例，与同期全部剖面的比例对照。"""
+def _meta_radius_association_table(region_slug: str) -> pd.DataFrame:
+    """整理 META 覆盖期合格剖面口径下各半径倍数的关联比例：全部剖面一组列，各阈值峰剖面各一组列。"""
+    meta = pd.read_parquet(_meta_association_sensitivity_path(region_slug))
+    meta = meta[meta['denominator_mode'].eq('qualified_meta_period')]
+    thresholds = sorted(meta['threshold_umol_kg'].unique())
+    radius = meta[meta['threshold_umol_kg'] == thresholds[0]][
+        ['radius_factor', 'baseline_n', 'baseline_meta_n', 'baseline_membership_rate']
+    ].sort_values('radius_factor').reset_index(drop=True)
+    for threshold in thresholds:
+        tag = _format_detection_value(float(threshold))
+        sub = meta[meta['threshold_umol_kg'] == threshold].sort_values('radius_factor')
+        radius[f'anomaly_n_{tag}'] = sub['anomaly_n'].to_numpy()
+        radius[f'anomaly_meta_n_{tag}'] = sub['anomaly_meta_n'].to_numpy()
+        radius[f'anomaly_membership_rate_{tag}'] = sub['anomaly_membership_rate'].to_numpy()
+    return radius
+
+
+def _draw_meta_radius_panel(fig, radius: pd.DataFrame, radius_factor: float) -> None:
+    """画各半径倍数下全部剖面与各阈值峰剖面落在同日 META 涡内的比例，底色标出正文所用倍数。"""
     colors = _JOURNAL_COLORS
-    ax = _inch_axes(fig, 0.62, 0.55, 0.12, 0.22)
-    background = 100 * float(table['baseline_membership_rate'].iloc[0])
-    ax.axhline(background, color=colors['ink'], lw=0.8, ls=(0, (4, 2)), zorder=1)
-    ax.text(3.5, background - 0.6, f'All eligible profiles\nin the META period ({background:.1f}%)',
-            ha='right', va='top', fontsize=6.5, color=colors['ink'])
-    for i, row in enumerate(table.itertuples()):
-        color, marker = _journal_threshold_style(row.threshold_umol_kg)
-        y = 100 * row.anomaly_membership_rate
-        # 竖线从背景线连到观测比例，不是区间
-        ax.plot([i + 1, i + 1], [background, y], color=color, lw=1.2, zorder=2)
-        ax.plot(i + 1, y, marker, ms=5, mfc=color, mec='white', mew=0.5, zorder=3)
-        ax.text(i + 1.1, y, f'{y:.1f}%', ha='left', va='center', fontsize=6.8)
-    ax.set_xlim(0.5, 3.6)
-    ax.set_ylim(40, 65)
-    ax.set_xticks(range(1, len(table) + 1),
-                  [f'ΔDO{_format_detection_value(float(t))}' for t in table['threshold_umol_kg']])
-    ax.set_ylabel(f'Profiles with maxima within\n{radius_factor:g} META radii (%)')
+    ax = _inch_axes(fig, 0.55, 0.55, 0.12, 0.22)
+    x = radius['radius_factor'].to_numpy(float)
+    ax.axvspan(radius_factor - 0.04, radius_factor + 0.04, color=colors['band'], lw=0, zorder=0)
+    baseline = 100 * radius['baseline_membership_rate'].to_numpy(float)
+    ax.plot(x, baseline, color=colors['ink'], lw=1.0, ls=(0, (4, 2)), marker='o', ms=3.6, mfc='white',
+            mec=colors['ink'], zorder=4)
+    for column in [c for c in radius.columns if c.startswith('anomaly_membership_rate_')]:
+        color, marker = _journal_threshold_style(float(column.rsplit('_', 1)[1]))
+        ax.plot(x, 100 * radius[column], color=color, lw=1.2, marker=marker, ms=4, mec='white', mew=0.4, zorder=3)
+    label_x = x[-2] + 0.25 * (x[-1] - x[-2])
+    ax.text(label_x, np.interp(label_x, x, baseline) - 2.5, 'All eligible\nprofiles', ha='left', va='top',
+            fontsize=6.5, color=colors['ink'])
+    ax.set_xticks(x, [f'{v:g}' for v in x])
+    ax.set_xlim(x[0] - 0.08, x[-1] + 0.08)
+    ax.set_ylim(30, 100)
+    ax.set_xlabel('Association radius (META radii)')
+    ax.set_ylabel('Within a same-day META eddy (%)')
     _journal_light_grid(ax, 'y')
 
 
@@ -32158,11 +32177,11 @@ def _draw_population_panel(fig, table: pd.DataFrame) -> None:
 
 
 def _draw_matched_or_panel(fig, table: pd.DataFrame) -> None:
-    """画各阈值匹配 OR 与两种聚类 bootstrap 区间；上界无穷时以箭头示意。"""
+    """画各阈值匹配 OR 与两种聚类 bootstrap 区间，阈值标签下写锚点与对照的峰发生比例；上界无穷时以箭头示意。"""
     colors = _JOURNAL_COLORS
-    xmin, xmax = 0.7, 60.0
-    ax = _inch_axes(fig, 0.5, 0.45, 0.12, 0.42)
-    ax.axvline(1.0, color=colors['ink'], lw=0.7, ls=(0, (4, 2)), zorder=1)
+    # 横轴从 OR = 1 起，左边框即参考线；区间越出两端时画箭头
+    xmin, xmax = 1.0, 60.0
+    ax = _inch_axes(fig, 0.95, 0.45, 0.12, 0.42)
     n_rows = len(table)
     for k, row in enumerate(table.itertuples()):
         color, marker = _journal_threshold_style(row.threshold_umol_kg)
@@ -32177,16 +32196,24 @@ def _draw_matched_or_panel(fig, table: pd.DataFrame) -> None:
             if not np.isfinite(high):
                 ax.annotate('', xy=(xmax, y), xytext=(xmax / 1.35, y),
                             arrowprops=dict(arrowstyle='-|>', color=color, lw=1.0, mutation_scale=6))
+            if low < xmin:
+                ax.annotate('', xy=(xmin, y), xytext=(xmin * 1.35, y),
+                            arrowprops=dict(arrowstyle='-|>', color=color, lw=1.0, mutation_scale=6))
             ax.plot(estimate, y, marker, ms=4.6, mfc=color if filled else 'white', mec=color, mew=0.9, zorder=3)
         ax.text(estimate, y0 + 0.3, f'{estimate:.2f}', ha='center', va='bottom', fontsize=6.8)
     ax.set_xscale('log')
     ax.set_xlim(xmin, xmax)
     _journal_log_axis(ax.xaxis, [1, 2, 5, 10, 20, 50])
-    ax.set_yticks(range(n_rows, 0, -1),
-                  [f'ΔDO{_format_detection_value(float(t))}' for t in table['threshold_umol_kg']])
+    ax.set_yticks(range(n_rows, 0, -1), [
+        f'ΔDO{_format_detection_value(float(row.threshold_umol_kg))}\n'
+        f'{100 * row.scv_numerator / row.n_anchor_profiles:.1f}% vs '
+        f'{100 * row.control_numerator / row.n_control_profiles:.1f}%'
+        for row in table.itertuples()
+    ], linespacing=1.3)
+    ax.text(-0.02, 1.02, 'Anchors vs\ncontrols', transform=ax.transAxes, ha='right', va='bottom', fontsize=6.3,
+            color=colors['muted'])
     ax.set_ylim(0.45, n_rows + 0.65)
     ax.tick_params(axis='y', length=0)
-    ax.spines['left'].set_visible(False)
     ax.set_xlabel('Matched odds ratio (SCV anchors vs controls)')
     handles = [
         Line2D([], [], color=colors['muted'], lw=1.1, marker='o', ms=4.2, mfc=colors['muted'], mec=colors['muted'],
@@ -32194,8 +32221,8 @@ def _draw_matched_or_panel(fig, table: pd.DataFrame) -> None:
         Line2D([], [], color=colors['muted'], lw=1.1, ls=(0, (3, 1.5)), marker='o', ms=4.2, mfc='white',
                mec=colors['muted'], label='Dependency-component bootstrap'),
     ]
-    ax.legend(handles=handles, loc='lower center', fontsize=6.4, handlelength=2.2, ncol=2,
-              bbox_to_anchor=(0.45, 1.02), columnspacing=1.2)
+    ax.legend(handles=handles, loc='lower right', fontsize=6.4, handlelength=2.2, bbox_to_anchor=(1.0, 1.0),
+              labelspacing=0.25, borderaxespad=0.1)
     _journal_light_grid(ax, 'x')
 
 
@@ -32210,13 +32237,14 @@ def plot_argo_do_occurrence_by_eddy_setting(
     """组合绘制 ΔDO 峰发生比例随涡旋环境的变化：EKE 档、META 表层涡、SCV 关联与匹配比较。
 
     (a) 读取 `summarize_argo_do_occurrence_by_eke` 的五档发生比例；(b) 读取 `summarize_meta_association_sensitivity`
-    在 META 覆盖期合格剖面口径、meta_radius_factor 倍半径下各阈值峰剖面的 META 关联比例及全部剖面的背景比例；
+    在 META 覆盖期合格剖面口径下各半径倍数的结果，画全部剖面与各阈值峰剖面落在同日 META 涡内的比例，并以底色
+    标出正文所用的 meta_radius_factor；
     (c) 读取 `build_argo_do_occurrence_table` 的 Global/META/SCV 三个人群发生比例；(d) 读取
     `run_scv_matched_effects.py` 匹配效应表中 matched_queue 队列、整剖面结局、Global 范围的 Mantel–Haenszel OR
     与锚点浮标、依赖分量两种聚类 bootstrap 区间。全图 7 in 宽，按期刊版式绘制。
 
     参数:
-        - meta_radius_factor (float): (b) 使用的 META 半径倍数，默认 circle_enlargement_factor。
+        - meta_radius_factor (float): (b) 标出的正文半径倍数，默认 circle_enlargement_factor。
         - matched_queue (str): (d) 使用的匹配队列名，默认 'primary_metadata_supported'。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_do_occurrence_by_eddy_setting` 目录。
         - show_fig (bool): 是否显示图，默认 True。
@@ -32228,16 +32256,12 @@ def plot_argo_do_occurrence_by_eddy_setting(
 
     输出:
         - `argo_do_occurrence_by_eddy_setting.png`（save_fig 时）。
-        - `a_eke_bins.csv`、`b_meta_association.csv`、`c_populations.csv`、`d_matched_or.csv`：各面板来源数据（save_data 时）。
+        - `a_eke_bins.csv`、`b_meta_radius_association.csv`、`c_populations.csv`、`d_matched_or.csv`：各面板来源数据（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
     eke = pd.read_parquet(cfg.output_dir('argo_do_occurrence_eke', region_slug) / 'argo_do_occurrence_eke_bins.parquet')
-    meta = pd.read_parquet(_meta_association_sensitivity_path(region_slug))
-    meta = meta[
-        meta['denominator_mode'].eq('qualified_meta_period')
-        & np.isclose(meta['radius_factor'], float(meta_radius_factor))
-    ].sort_values('threshold_umol_kg').reset_index(drop=True)
+    radius = _meta_radius_association_table(region_slug)
     populations = pd.read_parquet(
         cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_by_population.parquet'
     )
@@ -32247,9 +32271,9 @@ def plot_argo_do_occurrence_by_eddy_setting(
     ].sort_values('threshold_umol_kg').reset_index(drop=True)
 
     with plt.rc_context(_journal_rc()):
-        fig, cells = _journal_panel_grid([(2.5, 2), (2.5, 2)])
+        fig, cells = _journal_panel_grid([(2.35, (4.3, 2.7)), (2.35, (3.0, 4.0))])
         _draw_eke_bin_panel(cells[0], eke)
-        _draw_meta_association_panel(cells[1], meta, meta_radius_factor)
+        _draw_meta_radius_panel(cells[1], radius, meta_radius_factor)
         _draw_population_panel(cells[2], populations)
         _draw_matched_or_panel(cells[3], effects)
         for cell, label in zip(cells, 'abcd'):
@@ -32261,9 +32285,7 @@ def plot_argo_do_occurrence_by_eddy_setting(
 
     sources = {
         'a_eke_bins': eke,
-        'b_meta_association': meta[['threshold_umol_kg', 'radius_factor', 'denominator_mode', 'baseline_n',
-                                    'baseline_meta_n', 'baseline_membership_rate', 'anomaly_n', 'anomaly_meta_n',
-                                    'anomaly_membership_rate']],
+        'b_meta_radius_association': radius,
         'c_populations': populations,
         'd_matched_or': effects[[
             'queue', 'outcome', 'scope', 'threshold_umol_kg', 'n_matched_sets', 'n_anchor_profiles',
@@ -33292,54 +33314,38 @@ def plot_scv_glorys_representation(
     return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
 
 
-def plot_meta_radius_and_sampling_sensitivity(
-    meta_radius_factor: float = circle_enlargement_factor,
+def plot_argo_ke_sampling_by_year(
     yearly_threshold: float = 50.0,
     output_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = True,
     save_data: bool = True,
 ) -> dict:
-    """组合绘制 META 关联对半径倍数的敏感性，以及 KE 框内外逐年的剖面与峰剖面数。
+    """绘制 KE 框内外逐年的合格剖面数与峰剖面数。
 
-    (a) 读取 `summarize_meta_association_sensitivity` 在 META 覆盖期合格剖面口径下的各半径倍数结果，画全部剖面与
-    各阈值峰剖面的关联比例，并以底色标出正文所用的 meta_radius_factor；(b)(c) 读取 `build_argo_do_occurrence_table`
-    的年份 × 区域汇总，合并为 KE 框与框外两组，画逐年合格剖面数（对数轴）与 yearly_threshold 峰剖面数。只画
-    有剖面的年份。全图 7 in 宽，按期刊版式绘制。
+    读取 `build_argo_do_occurrence_table` 的年份 × 区域汇总，合并为 KE 框与框外两组：(a) 画逐年合格剖面数（对数轴），
+    (b) 画 yearly_threshold 峰剖面数。只画有剖面的年份。全图 7 in 宽，按期刊版式绘制。
 
     参数:
-        - meta_radius_factor (float): (a) 标出的正文半径倍数，默认 circle_enlargement_factor。
-        - yearly_threshold (float): (c) 的 ΔDO 阈值，默认 50。
-        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_meta_radius_and_sampling_sensitivity` 目录。
+        - yearly_threshold (float): (b) 的 ΔDO 阈值，默认 50。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_ke_sampling_by_year` 目录。
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存 PNG，默认 True。
-        - save_data (bool): 是否写出各面板的来源数据 CSV，默认 True。
+        - save_data (bool): 是否写出来源数据 CSV，默认 True。
 
     返回:
-        - dict: 含各面板来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+        - dict: 含来源数据表 sources、figure_path（save_fig 时）与 output_dir。
 
     输出:
-        - `meta_radius_and_sampling_sensitivity.png`（save_fig 时）。
-        - `a_meta_radius_sensitivity.csv`、`bc_yearly_sampling_ke.csv`：各面板来源数据（save_data 时）。
+        - `argo_ke_sampling_by_year.png`（save_fig 时）。
+        - `ab_yearly_sampling_ke.csv`：来源数据（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
     colors = _JOURNAL_COLORS
-    meta = pd.read_parquet(_meta_association_sensitivity_path(region_slug))
-    meta = meta[meta['denominator_mode'].eq('qualified_meta_period')]
-    thresholds = sorted(meta['threshold_umol_kg'].unique())
-    radius = meta[meta['threshold_umol_kg'] == thresholds[0]][
-        ['radius_factor', 'baseline_n', 'baseline_meta_n', 'baseline_membership_rate']
-    ].sort_values('radius_factor').reset_index(drop=True)
-    for threshold in thresholds:
-        tag = _format_detection_value(float(threshold))
-        sub = meta[meta['threshold_umol_kg'] == threshold].sort_values('radius_factor')
-        radius[f'anomaly_n_{tag}'] = sub['anomaly_n'].to_numpy()
-        radius[f'anomaly_meta_n_{tag}'] = sub['anomaly_meta_n'].to_numpy()
-        radius[f'anomaly_membership_rate_{tag}'] = sub['anomaly_membership_rate'].to_numpy()
-
     region_year = pd.read_parquet(cfg.output_dir('argo_do_occurrence', region_slug) / 'argo_do_occurrence_by_region_year.parquet')
     region_year = region_year.assign(ke=np.where(region_year['region'].eq('KE'), 'KE box', 'Outside KE'))
+    thresholds = sorted(region_year['threshold_umol_kg'].unique())
     yearly = region_year[region_year['threshold_umol_kg'] == thresholds[0]].groupby(['year', 'ke'])[
         'eligible_profiles'
     ].sum().rename('eligible').to_frame()
@@ -33353,28 +33359,10 @@ def plot_meta_radius_and_sampling_sensitivity(
 
     with plt.rc_context(_journal_rc()):
         fig = plt.figure(figsize=(_JOURNAL_FULL_WIDTH_IN, 2.6))
-        cells = fig.subfigures(1, 3, width_ratios=[2.4, 2.3, 2.3], wspace=0)
-        ax = _inch_axes(cells[0], 0.55, 0.45, 0.1, 0.22)
-        x = radius['radius_factor'].to_numpy(float)
-        ax.axvspan(meta_radius_factor - 0.04, meta_radius_factor + 0.04, color=colors['band'], lw=0, zorder=0)
-        ax.plot(x, 100 * radius['baseline_membership_rate'], color=colors['ink'], lw=1.0, ls=(0, (4, 2)), marker='o',
-                ms=4, mfc='white', mec=colors['ink'], zorder=2, label='All eligible profiles, P(E)')
-        for threshold in thresholds:
-            tag = _format_detection_value(float(threshold))
-            color, marker = _journal_threshold_style(threshold)
-            ax.plot(x, 100 * radius[f'anomaly_membership_rate_{tag}'], color=color, lw=1.2, marker=marker, ms=4,
-                    mec='white', mew=0.4, zorder=3, label=f'Profiles with ΔDO{tag}')
-        ax.set_xticks(x, [f'{v:g}' for v in x])
-        ax.set_xlabel('Association radius (META effective radii)')
-        ax.set_ylabel('Associated with a META eddy (%)')
-        ax.set_ylim(30, 100)
-        ax.legend(loc='upper left', fontsize=6.2, handletextpad=0.3, labelspacing=0.3)
-        _journal_light_grid(ax, 'y')
-        _journal_panel_label(cells[0], '(a)')
-
-        for cell, col, ylabel, label in ((cells[1], 'eligible', 'Eligible profiles per year', '(b)'),
-                                         (cells[2], f'do{yearly_tag}', f'ΔDO{yearly_tag} profiles per year', '(c)')):
-            ax = _inch_axes(cell, 0.55, 0.45, 0.1, 0.22)
+        cells = fig.subfigures(1, 2, wspace=0)
+        for cell, col, ylabel, label in ((cells[0], 'eligible', 'Eligible profiles per year', '(a)'),
+                                         (cells[1], f'do{yearly_tag}', f'ΔDO{yearly_tag} profiles per year', '(b)')):
+            ax = _inch_axes(cell, 0.6, 0.45, 0.12, 0.22)
             for region, color, marker in (('KE box', colors['ink'], 'o'), ('Outside KE', colors['neutral'], 's')):
                 sub = yearly[yearly['region'] == region]
                 ax.plot(sub['year'], sub[col], color=color, lw=1.1, marker=marker, ms=3, mec='white', mew=0.3,
@@ -33391,11 +33379,11 @@ def plot_meta_radius_and_sampling_sensitivity(
             _journal_light_grid(ax, 'y')
             _journal_panel_label(cell, label)
         out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir(
-            'plot_meta_radius_and_sampling_sensitivity', region_slug
+            'plot_argo_ke_sampling_by_year', region_slug
         )
-        figure_path = _journal_save(fig, out_dir, 'meta_radius_and_sampling_sensitivity', show_fig, save_fig)
+        figure_path = _journal_save(fig, out_dir, 'argo_ke_sampling_by_year', show_fig, save_fig)
 
-    sources = {'a_meta_radius_sensitivity': radius, 'bc_yearly_sampling_ke': yearly}
+    sources = {'ab_yearly_sampling_ke': yearly}
     if save_data:
         _journal_write_sources(out_dir, sources)
     return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
