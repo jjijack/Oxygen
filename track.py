@@ -42437,34 +42437,49 @@ def _ofes_unique_density_depth(depth, sigma0, target):
     return (float(roots[0]) if len(roots) == 1 else np.nan), int(len(roots))
 
 
+def _ofes_density_depth_samples(profiles, reference_sigma, reference_depth, crossing_policy='nearest'):
+    """从已插值水柱定位固定密度面；nearest 沿用来源回溯，unique 沿用 E239 唯一交点口径。"""
+    if crossing_policy not in ('nearest', 'unique'):
+        raise ValueError('crossing_policy must be nearest or unique.')
+    depth = np.asarray(profiles['depth'], dtype=float)
+    density = np.asarray(profiles['sigma0'], dtype=float)
+    targets = np.asarray(reference_sigma, dtype=float)
+    reference_depth = np.asarray(reference_depth, dtype=float)
+    if density.shape != (len(targets), len(depth)) or reference_depth.shape != targets.shape:
+        raise ValueError('Density profiles and member references do not match.')
+    rows = []
+    for profile, target, near in zip(density, targets, reference_depth):
+        unique_depth, count = _ofes_unique_density_depth(depth, profile, target)
+        value = unique_depth if crossing_policy == 'unique' else _ofes_density_crossing_near_depth(
+            depth, profile, float(target), float(near), {},
+        )['depth']
+        rows.append({
+            'reference_sigma0': float(target), 'isopycnal_depth_m': value,
+            'crossing_count': count, 'valid_profile_levels': int(np.isfinite(profile).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
 def _ofes_depth_profile_samples(snapshot, positions, reference_sigma):
     """对各真实位置采样原生水柱，并定位各成员固定初始密度面。"""
     depth = np.asarray(snapshot['depth'], float)
     positions = positions.reset_index(drop=True)
-    points = np.column_stack((
-        np.tile(depth, len(positions)),
-        np.repeat(positions['lat'].to_numpy(), len(depth)),
-        np.repeat(positions['lon'].to_numpy(), len(depth)),
-    ))
-    fields = {
-        key: _ofes_interp3d(snapshot[key], depth, snapshot['lat'], snapshot['lon'], points)
-        .reshape(len(positions), len(depth))
-        for key in ('temp', 'salinity', 'do2')
-    }
-    rows, profiles = [], []
+    fields = _ofes_ventilation_profile_samples(
+        snapshot, positions['lon'].to_numpy(), positions['lat'].to_numpy(),
+    )
+    rows = _ofes_density_depth_samples(
+        fields, reference_sigma.loc[positions['particle_index']].to_numpy(),
+        np.full(len(positions), np.nan), crossing_policy='unique',
+    )
+    rows.insert(0, 'particle_index', positions['particle_index'].to_numpy())
+    profiles = []
     for i, row in positions.iterrows():
-        sigma = _ofes_sigma0_profile(depth, fields['salinity'][i], fields['temp'][i], row.lon, row.lat)
-        target = float(reference_sigma.loc[row.particle_index])
-        iso, count = _ofes_unique_density_depth(depth, sigma, target)
-        rows.append({'particle_index': row.particle_index, 'reference_sigma0': target,
-                     'isopycnal_depth_m': iso, 'crossing_count': count,
-                     'valid_profile_levels': int(np.isfinite(sigma).sum())})
         profiles.append(pd.DataFrame({
             'particle_index': row.particle_index, 'depth_m': depth,
-            'theta': fields['temp'][i], 'salinity': fields['salinity'][i],
-            'do2': fields['do2'][i], 'sigma0': sigma,
+            'theta': fields['theta'][i], 'salinity': fields['salinity'][i],
+            'do2': fields['do2'][i], 'sigma0': fields['sigma0'][i],
         }))
-    return pd.DataFrame(rows), pd.concat(profiles, ignore_index=True)
+    return rows, pd.concat(profiles, ignore_index=True)
 
 
 def _ofes_depth_scene(snapshot, target_sigma, reference_depth):
@@ -87479,17 +87494,10 @@ def _ofes_grid_lens_path_properties(
     )
     result = pd.DataFrame(_ofes_point_tracers(snapshot, positions))[list(_OFES_GRID_LENS_BACKTRACK_PROPERTIES)]
     if isopycnal_sigma0 is not None:
-        levels = np.asarray(snapshot['depth'], dtype=float)
-        columns = np.column_stack([
-            np.tile(levels, len(positions)),
-            np.repeat(positions[:, 1], levels.size),
-            np.repeat(positions[:, 2], levels.size),
-        ])
-        profiles = _ofes_point_tracers(snapshot, columns)['sigma0'].reshape(len(positions), levels.size)
-        result['isopycnal_depth_m'] = [
-            _ofes_density_crossing_near_depth(levels, profile, float(target), float(depth), {})['depth']
-            for profile, target, depth in zip(profiles, isopycnal_sigma0, positions[:, 0])
-        ]
+        profiles = _ofes_ventilation_profile_samples(snapshot, positions[:, 2], positions[:, 1])
+        result['isopycnal_depth_m'] = _ofes_density_depth_samples(
+            profiles, isopycnal_sigma0, positions[:, 0],
+        )['isopycnal_depth_m'].to_numpy()
     return result
 
 
@@ -87766,17 +87774,22 @@ def _ofes_grid_lens_backtrack_contrast(
     weights: pd.DataFrame,
     population: str,
     settings: Mapping[str, Any],
+    *,
+    metrics: Sequence[str] | None = None,
+    spice_scopes: Sequence[str] | None = None,
+    eligibility_fraction: str = 'tracked_to_horizon_share',
 ) -> pd.DataFrame:
     """以单位等权、季节加权比较携氧与从未携氧透镜的材料历史，区间按结构组整组重抽。
 
     `unit_scope='all'` 为主比较；`'mostly_tracked'` 是截断敏感性，只取追满该时长的粒子比例不低于通风分析完整成员门槛
     （`minimum_active_fraction`）的单位。
+    metrics、spice_scopes 和 eligibility_fraction 可显式指定指标、类型与完整支持比例，默认使用来源回溯口径。
     """
     ventilation = settings['ventilation']
     replicates = int(ventilation['bootstrap_replicates'])
     lens = unit_horizons.loc[unit_horizons['particle_group'].eq('lens')]
     rows = []
-    for spice in _OFES_GRID_LENS_SPICE_SCOPES:
+    for spice in (_OFES_GRID_LENS_SPICE_SCOPES if spice_scopes is None else spice_scopes):
         for horizon in ventilation['reporting_horizons_days']:
             season = weights.loc[
                 weights['population'].eq(population) & weights['horizon_days'].eq(horizon) & weights['spice_scope'].eq(spice)
@@ -87786,7 +87799,7 @@ def _ofes_grid_lens_backtrack_contrast(
                 subset = subset.loc[subset['spice_sign'].eq(spice)]
             for unit_scope in ('all', 'mostly_tracked'):
                 part = subset if unit_scope == 'all' else subset.loc[
-                    subset['tracked_to_horizon_share'] >= ventilation['minimum_active_fraction']
+                    subset[eligibility_fraction] >= ventilation['minimum_active_fraction']
                 ]
                 part = part.assign(season_weight=part['track_id'].map(season).fillna(0.0).to_numpy())
                 part = part.loc[part['season_weight'] > 0].reset_index(drop=True)
@@ -87796,7 +87809,7 @@ def _ofes_grid_lens_backtrack_contrast(
                 draws = rng.integers(0, len(uniques), size=(replicates, len(uniques)))
                 counts = np.zeros((replicates, len(uniques)), dtype=float)
                 np.add.at(counts, (np.arange(replicates)[:, None], draws), 1.0)
-                for metric in _OFES_GRID_LENS_BACKTRACK_METRICS:
+                for metric in (_OFES_GRID_LENS_BACKTRACK_METRICS if metrics is None else metrics):
                     values = pd.to_numeric(part[metric], errors='coerce').to_numpy(dtype=float)
                     row = {
                         'population': population, 'spice': spice, 'horizon_days': int(horizon),
@@ -87970,6 +87983,374 @@ def load_ofes_grid_lens_backtrack(output_dir: str | Path | None = None) -> dict:
         'contrast': pd.read_csv(root / 'group_contrast.csv'),
         'jet_crossings': pd.read_csv(root / 'jet_crossings.csv'),
     }
+
+
+_OFES_GRID_LENS_DEPTH_COMPONENTS = ('descent', 'spatial', 'temporal', 'relative')
+
+
+def _ofes_grid_lens_depth_requests(daily: pd.DataFrame, particles: pd.DataFrame) -> pd.DataFrame:
+    """构造相邻日四角取样请求；同一场日期的自身及前后一天位置合并读取。"""
+    active = daily.loc[daily['status'].eq('active'), [
+        'particle_id', 'track_id', 'release_date', 'date', 'lookback_days', 'depth_m', 'lat', 'lon',
+    ]].copy()
+    keys = pd.MultiIndex.from_frame(active[['particle_id', 'date']])
+    requests = []
+    for offset in (-1, 0, 1):
+        frame = active.rename(columns={'date': 'position_date'}).assign(
+            field_date=active['date'] + pd.Timedelta(days=offset),
+        )
+        field_keys = pd.MultiIndex.from_arrays([frame['particle_id'], frame['field_date']])
+        requests.append(frame.loc[field_keys.isin(keys)])
+    return pd.concat(requests, ignore_index=True).merge(
+        particles[['particle_id', 'release_sigma0']], on='particle_id', validate='many_to_one',
+    ).sort_values(['field_date', 'position_date', 'particle_id']).reset_index(drop=True)
+
+
+def _ofes_grid_lens_depth_day(args: tuple) -> pd.DataFrame:
+    """按场日期共享读取 T/S，取相邻日期真实位置处的固定释放密度面及交点数。"""
+    date, requests, output_root, overwrite = args
+    path = Path(output_root) / 'density_fragments' / f'{pd.Timestamp(date):%Y%m%d}.parquet'
+    identity = ['particle_id', 'track_id', 'release_date', 'position_date', 'field_date',
+                'depth_m', 'lat', 'lon', 'release_sigma0']
+    if path.is_file() and not overwrite:
+        saved = pd.read_parquet(path)
+        if saved[identity].equals(requests[identity].reset_index(drop=True)):
+            return saved
+        raise ValueError(f'Density fragment identity differs from the requested positions: {path}')
+    margin = 0.1
+    snapshot = load_ofes_snapshot(
+        date, variables=['temp', 'salinity'],
+        lon_bounds=(float(requests['lon'].min()) - margin, float(requests['lon'].max()) + margin),
+        lat_bounds=(float(requests['lat'].min()) - margin, float(requests['lat'].max()) + margin),
+    )
+    profiles = _ofes_ventilation_profile_samples(
+        snapshot, requests['lon'].to_numpy(), requests['lat'].to_numpy(),
+    )
+    depths = _ofes_density_depth_samples(
+        profiles, requests['release_sigma0'].to_numpy(), requests['depth_m'].to_numpy(),
+    )
+    result = pd.concat([requests.reset_index(drop=True), depths], axis=1)
+    _atomic_write_parquet(result, path)
+    print(f'[lens depth] {pd.Timestamp(date):%Y-%m-%d}: {len(result)} water columns', flush=True)
+    return result
+
+
+def _ofes_grid_lens_depth_steps(samples: pd.DataFrame) -> pd.DataFrame:
+    """沿日历正向计算四角对称项；参考密度始终是各成员的释放密度。"""
+    own = samples.loc[samples['position_date'].eq(samples['field_date'])].copy()
+    first = own.rename(columns={'position_date': 'start_date'}).drop(columns='field_date')
+    first['end_date'] = first['start_date'] + pd.Timedelta(days=1)
+    second = own[['particle_id', 'position_date', 'depth_m']].rename(
+        columns={'position_date': 'end_date', 'depth_m': 'end_depth_m'},
+    )
+    steps = first.merge(second, on=['particle_id', 'end_date'], validate='one_to_one')
+    lookup = samples.set_index(['particle_id', 'field_date', 'position_date'])
+    for label, field, position in (
+        ('00', 'start_date', 'start_date'), ('01', 'start_date', 'end_date'),
+        ('10', 'end_date', 'start_date'), ('11', 'end_date', 'end_date'),
+    ):
+        keys = pd.MultiIndex.from_arrays([steps['particle_id'], steps[field], steps[position]])
+        corner = lookup.reindex(keys)
+        steps[f'surface_depth_{label}_m'] = corner['isopycnal_depth_m'].to_numpy()
+        steps[f'crossing_count_{label}'] = corner['crossing_count'].to_numpy()
+    corners = steps[[f'surface_depth_{label}_m' for label in ('00', '01', '10', '11')]].to_numpy()
+    counts = steps[[f'crossing_count_{label}' for label in ('00', '01', '10', '11')]].to_numpy()
+    dz = steps['end_depth_m'] - steps['depth_m']
+    spatial, temporal, relative = _ofes_depth_symmetric_terms(*corners.T, dz)
+    steps['descent_m'] = dz
+    steps['spatial_m'], steps['temporal_m'], steps['relative_m'] = spatial, temporal, relative
+    steps['finite_four_corners'] = np.isfinite(corners).all(axis=1)
+    steps['unique_four_corners'] = steps['finite_four_corners'] & (counts == 1).all(axis=1)
+    steps['closure_error_m'] = dz - spatial - temporal - relative
+    return steps.drop(columns=['isopycnal_depth_m', 'reference_sigma0', 'crossing_count', 'valid_profile_levels'])
+
+
+def _ofes_grid_lens_depth_horizons(
+    steps: pd.DataFrame, particles: pd.DataFrame, units: pd.DataFrame, horizons: Sequence[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """累计完整日历窗口的成员分解，并给出唯一交点与最近交点两种支持下的单位均值和中位数。"""
+    unit_index = units.set_index('track_id')
+    grouped = {key: group for key, group in steps.groupby('particle_id', sort=False)}
+    rows = []
+    for member in particles.itertuples(index=False):
+        unit = unit_index.loc[member.track_id]
+        release_date = pd.Timestamp(member.release_date)
+        member_steps = grouped.get(member.particle_id, steps.iloc[:0])
+        for horizon in horizons:
+            if unit['available_backtrack_days'] < horizon:
+                continue
+            window = member_steps.loc[
+                member_steps['start_date'].ge(release_date - pd.Timedelta(days=int(horizon)))
+                & member_steps['end_date'].le(release_date)
+            ]
+            tracked = len(window) == horizon
+            complete = tracked and bool(window['finite_four_corners'].all())
+            unique = complete and bool(window['unique_four_corners'].all())
+            row = {
+                'particle_id': member.particle_id, 'track_id': member.track_id,
+                'particle_group': member.particle_group, 'horizon_days': int(horizon),
+                'tracked_to_horizon': tracked, 'complete_density_support': complete,
+                'unique_density_support': unique, 'observed_steps': len(window),
+                'unresolved_steps': int((~window['finite_four_corners']).sum()),
+                'multiple_crossing_steps': int((window['finite_four_corners'] & ~window['unique_four_corners']).sum()),
+            }
+            for component in _OFES_GRID_LENS_DEPTH_COMPONENTS:
+                row[f'{component}_m'] = float(window[f'{component}_m'].sum()) if complete else np.nan
+            row['closure_error_m'] = row['descent_m'] - row['spatial_m'] - row['temporal_m'] - row['relative_m']
+            rows.append(row)
+    members = pd.DataFrame(rows)
+    rows = []
+    for (track_id, horizon), part in members.groupby(['track_id', 'horizon_days'], sort=True):
+        for group in ('lens', 'core', 'lens_only'):
+            subset = part if group == 'lens' else part.loc[part['particle_group'].eq(group)]
+            if subset.empty:
+                continue
+            for support, flag in (('unique', 'unique_density_support'), ('nearest', 'complete_density_support')):
+                valid = subset.loc[subset[flag]]
+                row = {
+                    'track_id': track_id, 'horizon_days': int(horizon), 'particle_group': group,
+                    'density_support': support, 'particles': len(subset),
+                    'decomposed_particles': len(valid),
+                    'tracked_to_horizon_share': float(subset['tracked_to_horizon'].mean()),
+                    'decomposed_particle_share': float(subset[flag].mean()),
+                }
+                for component in _OFES_GRID_LENS_DEPTH_COMPONENTS:
+                    row[f'mean_{component}_m'] = float(valid[f'{component}_m'].mean())
+                    row[f'median_{component}_m'] = float(valid[f'{component}_m'].median())
+                rows.append(row)
+    summaries = pd.DataFrame(rows).merge(
+        units[['track_id', 'structure_group', 'spice_sign', 'carrying_group', 'release_date']],
+        on='track_id', validate='many_to_one',
+    )
+    return members, summaries
+
+
+def build_ofes_grid_lens_depth_changes(
+    *,
+    backtrack_dir: str | Path | None = None,
+    units_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    spice_scope: str = 'minty',
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """沿既有透镜材料逐日轨迹拆分密度面加深的空间倾斜与局地时间起伏。
+
+    从正式来源回溯读取真实位置和各粒子的释放 σ0，在每个相邻日的两处位置分别取两天温盐水柱。复用 E239 的双次序平均，将向下位移拆为空间项、时间项和相对参考密度面的位移，逐成员累计至 30/60/90 天。主比较只采用每步四角均有唯一交点的完整路径，最近交点结果另列为支持敏感性。
+
+    单位内均值的三项保持可加性，单位内中位数供对照既有来源结果；单位等权、季节权重、结构组重抽复用来源回溯，其完整成员门槛应用于可完成整段分解的成员比例。
+
+    参数:
+        - backtrack_dir (str | pathlib.Path | None): 来源回溯目录；默认正式 `grid_lens_backtrack`。
+        - units_dir (str | pathlib.Path | None): 实验单位目录；默认沿用来源回溯 manifest 中的目录。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_depth_changes`。
+        - spice_scope (str): `minty`、`spicy` 或 `all`；默认重点分析 minty。
+        - workers (int): 按场日期并行的进程数；默认 1。
+        - overwrite (bool): 是否重取已存水柱片段；默认 False，复用相同请求的结果。
+
+    返回:
+        - dict: `load_ofes_grid_lens_depth_changes` 的结果。
+
+    输出:
+        - `output_dir/density_fragments/<日期>.parquet`：逐场日期四角取样片段。
+        - `output_dir/density_samples.parquet`、`daily_steps.parquet`：真实位置水柱交点与逐日三项分解。
+        - `output_dir/particle_horizon_summary.parquet`、`unit_horizon_summary.parquet`：完整窗口累计及单位支持数量。
+        - `output_dir/group_contrast.csv`：三项加深的携氧减从未携氧季节加权差和区间。
+        - `output_dir/manifest.json`：请求、支持统计与数值闭合检查。
+
+    说明:
+        - 深度向下为正，按日历正向累计后向积分保存的材料位置；不重新积分粒子。
+        - 四角交互项在空间和时间项之间各分一半；时间项不自动归因于透镜或涡旋。
+        - 缺少任一日四角支持的成员不以剩余日期补成完整窗口，退出粒子仍保留在支持分母中。
+    """
+    if spice_scope not in _OFES_GRID_LENS_SPICE_SCOPES:
+        raise ValueError(f'Unknown spice_scope: {spice_scope}')
+    backtrack = load_ofes_grid_lens_backtrack(backtrack_dir)
+    original = backtrack['manifest']['request']
+    units = load_ofes_grid_lens_units(units_dir or original['units_dir'])
+    settings = dict(_OFES_CFG.get('grid_lens_depth_changes', {}) or {})
+    root = _ofes_grid_lens_output_root(output_dir, settings)
+    if root.resolve() in (Path(backtrack['output_dir']).resolve(), Path(units['output_dir']).resolve()):
+        raise ValueError('Depth changes must write to a separate output directory.')
+    request = {
+        'backtrack_dir': str(Path(backtrack['output_dir']).resolve()),
+        'backtrack_request': original, 'units_dir': str(Path(units['output_dir']).resolve()),
+        'spice_scope': spice_scope, 'settings': settings,
+    }
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        saved = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if not _ofes_requests_equal(saved.get('request'), request):
+            raise ValueError('Depth-change output belongs to a different request; use another directory.')
+        if saved.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_depth_changes(root)
+    root.mkdir(parents=True, exist_ok=True)
+    _ofes_atomic_write_json({'analysis': 'ofes_grid_lens_depth_changes', 'status': 'running', 'request': request}, manifest_path)
+    unit_table = units['units']
+    selected = unit_table if spice_scope == 'all' else unit_table.loc[unit_table['spice_sign'].eq(spice_scope)]
+    particles = backtrack['particles'].loc[backtrack['particles']['track_id'].isin(selected['track_id'])].copy()
+    if particles.empty:
+        raise ValueError('The selected spice scope contains no saved lens particles.')
+    daily = backtrack['daily'].loc[backtrack['daily']['particle_id'].isin(particles['particle_id'])]
+    requests = _ofes_grid_lens_depth_requests(daily, particles)
+    tasks = [(date, group.reset_index(drop=True), root, overwrite) for date, group in requests.groupby('field_date', sort=True)]
+    if int(workers) > 1:
+        with ProcessPoolExecutor(max_workers=int(workers)) as executor:
+            frames = list(executor.map(_ofes_grid_lens_depth_day, tasks))
+    else:
+        frames = [_ofes_grid_lens_depth_day(task) for task in tasks]
+    samples = pd.concat(frames, ignore_index=True)
+    steps = _ofes_grid_lens_depth_steps(samples)
+    params = original['settings']
+    horizons = params['ventilation']['reporting_horizons_days']
+    member_summary, unit_summary = _ofes_grid_lens_depth_horizons(steps, particles, unit_table, horizons)
+    metrics = [f'{stat}_{component}_m' for stat in ('mean', 'median') for component in _OFES_GRID_LENS_DEPTH_COMPONENTS]
+    metrics.extend(('tracked_to_horizon_share', 'decomposed_particle_share'))
+    contrasts = []
+    for support, part in unit_summary.groupby('density_support', sort=False):
+        contrast = _ofes_grid_lens_backtrack_contrast(
+            part, units['season_weights'], original['population'], params, metrics=metrics,
+            spice_scopes=_OFES_GRID_LENS_SPICE_SCOPES if spice_scope == 'all' else (spice_scope,),
+            eligibility_fraction='decomposed_particle_share',
+        )
+        contrasts.append(contrast.assign(density_support=support).replace({'unit_scope': {'mostly_tracked': 'mostly_decomposed'}}))
+    contrast = pd.concat(contrasts, ignore_index=True)
+    for name, frame in (
+        ('density_samples', samples), ('daily_steps', steps),
+        ('particle_horizon_summary', member_summary), ('unit_horizon_summary', unit_summary),
+    ):
+        _atomic_write_parquet(frame, root / f'{name}.parquet')
+    contrast.to_csv(root / 'group_contrast.csv', index=False)
+    manifest = {
+        'analysis': 'ofes_grid_lens_depth_changes', 'status': 'complete', 'request': request,
+        'reference_density': 'individual release sigma0',
+        'decomposition': 'daily symmetric two-order mean; interaction divided equally',
+        'primary_density_support': 'unique', 'bootstrap_unit': 'structure_group',
+        'sensitivity_eligibility_fraction': 'decomposed_particle_share',
+        'aggregation': 'season-weighted unit means preserve additivity; unit medians also reported',
+        'support_by_horizon': [
+            {'horizon_days': int(horizon), 'particles': len(part),
+             'tracked_particles': int(part['tracked_to_horizon'].sum()),
+             'complete_density_particles': int(part['complete_density_support'].sum()),
+             'unique_density_particles': int(part['unique_density_support'].sum())}
+            for horizon, part in member_summary.groupby('horizon_days', sort=True)
+        ],
+        'counts': {'particles': len(particles), 'units': particles['track_id'].nunique(),
+                   'field_dates': len(tasks), 'daily_steps': len(steps),
+                   'finite_four_corner_steps': int(steps['finite_four_corners'].sum()),
+                   'unique_four_corner_steps': int(steps['unique_four_corners'].sum())},
+        'validation': {'max_step_closure_error_m': float(steps['closure_error_m'].abs().max()),
+                       'max_horizon_closure_error_m': float(member_summary['closure_error_m'].abs().max())},
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_depth_changes(root)
+
+
+def load_ofes_grid_lens_depth_changes(output_dir: str | Path | None = None) -> dict:
+    """读取透镜材料沿路径四角分解结果。
+
+    本入口只读已保存的汇总、逐日分解和 manifest，不读取原始模式场。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认正式 `grid_lens_depth_changes`。
+
+    返回:
+        - dict: output_dir、manifest、density_samples、steps、particle_horizons、unit_horizons 和 contrast。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _OFES_CFG['grid_lens_depth_changes'])
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_depth_changes' or manifest.get('status') != 'complete':
+        raise ValueError(f'Incomplete grid-lens depth-change output: {root}')
+    result = {'output_dir': root, 'manifest': manifest}
+    for key, name in (
+        ('density_samples', 'density_samples'), ('steps', 'daily_steps'),
+        ('particle_horizons', 'particle_horizon_summary'), ('unit_horizons', 'unit_horizon_summary'),
+    ):
+        result[key] = pd.read_parquet(root / f'{name}.parquet')
+    result['contrast'] = pd.read_csv(root / 'group_contrast.csv')
+    return result
+
+
+def plot_ofes_grid_lens_depth_changes(
+    output_dir: str | Path | None = None,
+    *,
+    density_support: str = 'unique',
+    show_fig: bool = True,
+    dpi: int = 320,
+) -> dict:
+    """绘制携氧透镜下沉的三项贡献。
+
+    只读四角分解的正式汇总。森林图使用单位内均值、季节加权组间差及结构组重抽区间，另列达到来源回溯完整成员门槛的敏感性；均值三项可加。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 已完成的四角分解目录；默认正式 `grid_lens_depth_changes`。
+        - density_support (str): `unique` 或 `nearest`；默认主比较的唯一交点支持。
+        - show_fig (bool): 是否显示图形；默认 True。
+        - dpi (int): PNG 分辨率；默认 320。
+
+    返回:
+        - dict: figures 路径列表与 contrast_plot_data 绘图输入表。
+
+    输出:
+        - `output_dir/isopycnal_descent_components.png`：携氧减从未携氧的总加深及三项贡献。
+        - `output_dir/depth_component_plot_data.csv`：森林图的输入表。
+    """
+    import matplotlib.pyplot as plt
+
+    if density_support not in ('unique', 'nearest'):
+        raise ValueError('density_support must be unique or nearest.')
+    result = load_ofes_grid_lens_depth_changes(output_dir)
+    root = Path(result['output_dir'])
+    contrast = result['contrast']
+    scope = result['manifest']['request']['spice_scope']
+    population = result['manifest']['request']['backtrack_request']['population'].replace('_', ' ')
+    fraction = result['manifest']['request']['backtrack_request']['settings']['ventilation']['minimum_active_fraction']
+    plot_data = contrast.loc[
+        contrast['density_support'].eq(density_support) & contrast['spice'].eq(scope)
+        & contrast['metric'].isin([f'mean_{component}_m' for component in _OFES_GRID_LENS_DEPTH_COMPONENTS])
+    ].copy()
+    horizons = sorted(plot_data['horizon_days'].unique())
+    labels = ('Total descent', 'Spatial tilt', 'Temporal change', 'Relative displacement')
+    figures = []
+    with plt.rc_context({'font.size': 9, 'axes.spines.top': False, 'axes.spines.right': False,
+                         'savefig.facecolor': 'white'}):
+        fig, axes = plt.subplots(1, len(horizons), figsize=(4.0 * len(horizons), 3.4), sharex=True, sharey=True, squeeze=False)
+        for ax, horizon in zip(axes[0], horizons):
+            part = plot_data.loc[plot_data['horizon_days'].eq(horizon)]
+            for unit_scope, offset, color, marker, label in (
+                ('all', 0.10, _JOURNAL_COLORS['minty_dark'], 'o', 'All eligible units'),
+                ('mostly_decomposed', -0.10, _JOURNAL_COLORS['accent'], 's', f'At least {fraction:.0%} decomposed'),
+            ):
+                ordered = part.loc[part['unit_scope'].eq(unit_scope)].set_index('metric').reindex(
+                    [f'mean_{component}_m' for component in _OFES_GRID_LENS_DEPTH_COMPONENTS],
+                )
+                for index, row in enumerate(ordered.itertuples()):
+                    y = 3 - index + offset
+                    if np.isfinite(row.difference):
+                        ax.plot([row.ci_low, row.ci_high], [y, y], color=color, linewidth=1.5)
+                        ax.plot(row.difference, y, marker=marker, color=color, markersize=5,
+                                label=label if index == 0 else None)
+            ax.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+            ax.set_yticks(range(4), labels[::-1])
+            ax.set_ylim(-0.5, 3.5)
+            primary = part.loc[part['unit_scope'].eq('all')].iloc[0]
+            ax.set_title(f'{horizon} days · {int(primary.units_carrying)}/{int(primary.units_never)} units')
+            ax.set_xlabel('Carrying − never (m; downward positive)')
+            ax.grid(axis='x', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
+            ax.set_axisbelow(True)
+        axes[0, -1].legend(frameon=False, fontsize=8, loc='lower right')
+        fig.suptitle(f'{scope.capitalize()} · {population} · daily four-corner decomposition', fontsize=11)
+        fig.tight_layout()
+        path = root / 'isopycnal_descent_components.png'
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        figures.append(str(path))
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+
+    plot_data.to_csv(root / 'depth_component_plot_data.csv', index=False)
+    return {'figures': figures, 'contrast_plot_data': plot_data}
 
 
 def _ofes_dualtrack_read_table(path: str | Path, columns: Sequence[str] | None = None) -> pd.DataFrame:
