@@ -33669,34 +33669,66 @@ def _core_oxygen_contrast_table(summary: pd.DataFrame) -> pd.DataFrame:
     } for group, label in labels.items()])
 
 
+def _positive_anchor_lens_table(queue: pd.DataFrame, sets: pd.DataFrame, threshold: float,
+                                window_m: float) -> pd.DataFrame:
+    """有峰锚点逐行表：目录透镜范围与核心、最强保留峰的深度与是否在透镜内、核心氧差，以及同组对照有无相近深度的峰。"""
+    tag = _format_detection_value(float(threshold))
+    peak = f'delta_do_peak_depth_m_{tag}'
+    anchors = queue[queue['is_scv'].astype(bool) & queue[f'has_delta_do_{tag}'].astype(bool)]
+    lens = _scv_anchor_lens_records(anchors['profile_number'].astype(int)).set_index('anchor_profile_number')
+    controls = queue[~queue['is_scv'].astype(bool) & queue[f'has_delta_do_{tag}'].astype(bool)]
+    contrast = sets.set_index('match_set_id')['do_contrast_isopycnal']
+    rows = []
+    for _, anchor in anchors.iterrows():
+        record = lens.loc[int(anchor['profile_number'])]
+        depth = float(anchor[peak])
+        nearby = controls.loc[controls['match_set_id'].eq(anchor['match_set_id']), peak].sub(depth).abs() <= window_m
+        rows.append({
+            'float': int(anchor['platform_number']), 'date': f"{pd.Timestamp(anchor['date']):%Y-%m-%d}",
+            'region': 'KE' if anchor['region'] == 'KE box' else 'Outside KE', 'type': anchor['type'],
+            'lens_m': f"{record['lens_top_depth_m']:.0f}–{record['lens_bottom_depth_m']:.0f}",
+            'core_m': round(float(anchor['anchor_core_depth_m'])), 'maximum_m': round(depth),
+            'delta_do_umol_kg': round(float(anchor[f'delta_do_value_{tag}'])),
+            'maximum_in_lens': 'yes' if record['lens_top_depth_m'] <= depth <= record['lens_bottom_depth_m'] else 'no',
+            'core_oxygen_contrast_umol_kg': _unicode_signed(float(contrast.loc[anchor['match_set_id']]), 1),
+            f'control_maximum_within_{window_m:g}_m': 'yes' if nearby.any() else 'no',
+        })
+    return (pd.DataFrame(rows).sort_values(['type', 'region', 'date'], ascending=[True, True, True])
+            .reset_index(drop=True))
+
+
 def export_scv_matched_effect_tables(
     matched_queue: str = 'primary_metadata_supported',
     level_operator: str = 'cell',
+    peak_window_m: float = 100.0,
     output_dir: str | Path | None = None,
     save_data: bool = True,
 ) -> dict:
-    """把 SCV 匹配比较的正式结果整理成论文表格：主结果、KE 内结果、核心对准置换摘要、共同垂向网格敏感性与核心氧差。
+    """把 SCV 匹配比较的正式结果整理成论文表格：主结果、KE 内结果、核心对准置换摘要、共同垂向网格敏感性、核心氧差与有峰锚点。
 
     主结果取 `run_scv_matched_effects.py` 匹配效应表中 matched_queue 队列的 Global 与 Global excluding KE 整剖面结局，
     以及 Global 的核心附近峰结局；KE 内结果取同一队列 KE 范围的两种结局；置换摘要原样取
     `calculate_scv_core_alignment` 的输出；共同网格敏感性取 `calculate_scv_matched_level_sensitivity` 中
     level_operator 算子的 Global 与 Global excluding KE 结果；核心氧差取 `calculate_scv_core_oxygen_contrast` 的
-    分组汇总。匹配表给出锚点与对照的阳性数/总数（%）、Mantel–Haenszel OR 与锚点浮标、依赖分量两种聚类
-    bootstrap 区间；核心氧差表给出核心等密面上氧与位温之差的中位数和锚点浮标区间。各表按论文 SI 编号汇总成
-    一份 Markdown。
+    分组汇总；有峰锚点表逐行列出主匹配队列中有 ΔDO20 峰的锚点，给出目录透镜范围（目录上下界压力换算为深度）、
+    核心与最强保留峰的深度、峰是否在透镜内、该组的核心氧差，以及同组对照中有无保留峰落在锚点峰深
+    ±peak_window_m 内。匹配表给出锚点与对照的阳性数/总数（%）、Mantel–Haenszel OR 与锚点浮标、依赖分量两种
+    聚类 bootstrap 区间；核心氧差表给出核心等密面上氧与位温之差的中位数和锚点浮标区间。各表按论文 SI 编号
+    汇总成一份 Markdown。
 
     参数:
         - matched_queue (str): 匹配队列名，默认 'primary_metadata_supported'。
         - level_operator (str): 共同垂向网格的降采样算子（'point' 或 'cell'），默认 'cell'。
+        - peak_window_m (float): 有峰锚点表中对照峰与锚点峰的深度窗口（m），默认 100。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `export_scv_matched_effect_tables` 目录。
         - save_data (bool): 是否写出 CSV 与 Markdown，默认 True。
 
     返回:
-        - dict: 含 matched_results、ke_matched_results、core_alignment_permutation_summary、common_grid_matched_results、core_oxygen_contrast 五张表、markdown 文本与 output_dir。
+        - dict: 含 matched_results、ke_matched_results、core_alignment_permutation_summary、common_grid_matched_results、core_oxygen_contrast、positive_anchors 六张表、markdown 文本与 output_dir。
 
     输出:
-        - `matched_results.csv`、`ke_matched_results.csv`、`core_alignment_permutation_summary.csv`、`common_grid_matched_results.csv`、`core_oxygen_contrast.csv`：五张表（save_data 时）。
-        - `matched_effect_tables.md`：五张表的 Markdown 汇总，标题按论文 SI 表编号（save_data 时）。
+        - `matched_results.csv`、`ke_matched_results.csv`、`core_alignment_permutation_summary.csv`、`common_grid_matched_results.csv`、`core_oxygen_contrast.csv`、`positive_anchors.csv`：六张表（save_data 时）。
+        - `matched_effect_tables.md`：六张表的 Markdown 汇总，标题按论文 SI 表编号（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
@@ -33706,9 +33738,11 @@ def export_scv_matched_effect_tables(
     level_dir = cfg.output_dir('scv_matched_level_sensitivity', region_slug)
     levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_effects.parquet')
     ofes_levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_grid.parquet')['level_depth_m'].to_numpy(float)
-    contrast = _core_oxygen_contrast_table(pd.read_parquet(
-        cfg.output_dir('scv_core_oxygen_contrast', region_slug) / 'scv_core_oxygen_contrast_summary.parquet'
-    ))
+    contrast_dir = cfg.output_dir('scv_core_oxygen_contrast', region_slug)
+    contrast = _core_oxygen_contrast_table(pd.read_parquet(contrast_dir / 'scv_core_oxygen_contrast_summary.parquet'))
+    queue = _scv_matched_queue_display(pd.read_parquet(_scv_matched_queue_path(region_slug)))
+    sets = pd.read_parquet(contrast_dir / 'scv_core_oxygen_contrast_sets.parquet')
+    positive = _positive_anchor_lens_table(queue, sets, 20.0, float(peak_window_m))
 
     def select(frame: pd.DataFrame, outcome: str, scope: str) -> pd.DataFrame:
         return frame[frame['outcome'].eq(outcome) & frame['scope'].eq(scope)]
@@ -33729,19 +33763,23 @@ def export_scv_matched_effect_tables(
         + _matched_effect_rows(select(levels, level_operator, 'Global excluding KE'), 'sample', 'Excluding KE',
                                valid_draws=False)
     )
-    tolerance = float(pd.read_parquet(_scv_matched_queue_path(region_slug), columns=['core_anomaly_tolerance_m'])
-                      ['core_anomaly_tolerance_m'].iloc[0])
+    tolerance = float(queue['core_anomaly_tolerance_m'].iloc[0])
     in_search_layer = int(((ofes_levels >= cfg.anomaly_min_depth) & (ofes_levels <= cfg.anomaly_max_depth)).sum())
     contrast_header = ['Group', 'Sets (anchor floats)', 'Oxygen contrast (μmol kg⁻¹)', 'Anchors above controls (%)',
                        'Potential-temperature contrast (°C)']
-    contrast_markdown = '\n'.join(
-        ['| ' + ' | '.join(contrast_header) + ' |', '|' + '|'.join(['---'] * len(contrast_header)) + '|']
-        + ['| ' + ' | '.join(str(v) for v in row) + ' |' for row in contrast.itertuples(index=False)]
-    )
+    positive_header = ['Float', 'Date', 'Region', 'Type', 'Lens (m)', 'Core (m)', 'Maximum (m)',
+                       'ΔDO (μmol kg⁻¹)', 'Maximum in lens', 'Core oxygen contrast (μmol kg⁻¹)',
+                       f'Control maximum within {peak_window_m:g} m']
+
+    def markdown_table(header: list[str], frame: pd.DataFrame) -> str:
+        return '\n'.join(['| ' + ' | '.join(header) + ' |', '|' + '|'.join(['---'] * len(header)) + '|']
+                         + ['| ' + ' | '.join(str(v) for v in row) + ' |' for row in frame.itertuples(index=False)])
+
+    counts = positive.groupby(['type', 'maximum_in_lens']).size()
     markdown = '\n'.join([
         '# SI 表',
         '',
-        '由 `export_scv_matched_effect_tables` 从匹配效应、核心对准置换、共同垂向网格敏感性与核心氧差的正式输出生成。',
+        '由 `export_scv_matched_effect_tables` 从匹配效应、核心对准置换、共同垂向网格敏感性、核心氧差与主匹配队列的正式输出生成。',
         '',
         '## Table S1（匹配主结果）',
         '',
@@ -33767,14 +33805,22 @@ def export_scv_matched_effect_tables(
         '',
         '锚点减同组对照均值，在目录核心的 σ0 上比较；中位数与锚点浮标重抽 95% 区间，类型差在同一套重抽中计算。',
         '',
-        contrast_markdown,
+        markdown_table(contrast_header, contrast),
+        '',
+        '## Table S6（有 ΔDO20 峰的锚点）',
+        '',
+        f"峰在目录透镜内：minty {counts.get(('minty', 'yes'), 0)}/{counts.xs('minty').sum()}，"
+        f"spicy {counts.get(('spicy', 'yes'), 0)}/{counts.xs('spicy').sum()}。透镜范围由目录上下界压力换算为深度；"
+        f'对照峰一栏只比较保留峰的深度（±{peak_window_m:g} m）。',
+        '',
+        markdown_table(positive_header, positive),
         '',
     ])
     out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('export_scv_matched_effect_tables',
                                                                              region_slug)
     tables = {
         'matched_results': main, 'ke_matched_results': ke, 'core_alignment_permutation_summary': null,
-        'common_grid_matched_results': common, 'core_oxygen_contrast': contrast,
+        'common_grid_matched_results': common, 'core_oxygen_contrast': contrast, 'positive_anchors': positive,
     }
     if save_data:
         _journal_write_sources(out_dir, tables)
