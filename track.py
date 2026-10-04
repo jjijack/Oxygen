@@ -41,6 +41,7 @@ import h5py
 import time as tm
 import shutil
 from dataclasses import dataclass, field
+from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse, Patch
 from matplotlib.text import Text
@@ -32309,6 +32310,54 @@ def _scv_matched_queue_display(queue: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _scv_queue_profile_columns(queue: pd.DataFrame, argo_data_dir: str | Path | None = None) -> dict[int, dict]:
+    """读取队列剖面，按 DO 检测器共用预处理清洗后返回逐剖面的深度、氧、盐度、位温与 σ0 数组。"""
+    cfg = make_detection_config('do')
+    raw = pd.concat(
+        [load_argo_data(int(year), argo_data_dir, profile_ids=set(ids.astype(int)))
+         for year, ids in queue.groupby('year')['profile_number']],
+        ignore_index=True,
+    )
+    columns = {}
+    for profile_number, profile in raw.groupby('Profile_number', sort=False):
+        cleaned, _ = _prepare_do_profile_for_detection(profile, cfg)
+        if cleaned is None:
+            raise ValueError(f'Queue profile {profile_number} fails the shared DO preprocessing.')
+        lon, lat = float(profile['Longitude'].iloc[0]), float(profile['Latitude'].iloc[0])
+        depth = cleaned['Depth'].to_numpy(float)
+        pressure = gsw.p_from_z(-depth, lat)
+        temperature = cleaned['Temperature'].to_numpy(float)
+        salinity = cleaned['Salinity'].to_numpy(float)
+        absolute_salinity = gsw.SA_from_SP(salinity, pressure, lon, lat)
+        columns[int(profile_number)] = {
+            'depth': depth, 'do': cleaned['DO'].to_numpy(float), 'salinity': salinity,
+            'theta': gsw.pt0_from_t(absolute_salinity, temperature, pressure),
+            'sigma0': gsw.sigma0(absolute_salinity, gsw.CT_from_t(absolute_salinity, temperature, pressure)),
+        }
+    return columns
+
+
+def _scv_anchor_lens_records(anchor_profiles) -> pd.DataFrame:
+    """按身份审计裁决回溯锚点的 McCoy 目录记录，给出目录类型、核心与垂向范围（压力换算为深度）。"""
+    adjudication = load_scv_profile_identity()['adjudication']
+    supported = adjudication.loc[adjudication['current_date_position_status'].eq('metadata-supported')]
+    row_ids = supported.set_index('current_profile_number')['original_catalog_row_id']
+    catalog = _read_scv_identity_catalog(_mccoy_scv_csv).set_index('catalog_row_id')
+    records = catalog.loc[row_ids.loc[[int(pn) for pn in anchor_profiles]].astype(int).to_numpy()]
+    lat = records['Latitude'].astype(float).to_numpy()
+    return pd.DataFrame({
+        'anchor_profile_number': [int(pn) for pn in anchor_profiles],
+        'mccoy_platform': records['Platform'].astype(int).to_numpy(),
+        'mccoy_cycle': records['Cycle'].astype(int).to_numpy(),
+        'mccoy_scv_type': records['SCV_Type'].astype(str).to_numpy(),
+        'lens_top_depth_m': -gsw.z_from_p(records['Shallow_Pressure'].astype(float).to_numpy(), lat),
+        'lens_bottom_depth_m': -gsw.z_from_p(records['Deep_Pressure'].astype(float).to_numpy(), lat),
+        'mccoy_core_density': records['Core_Density'].astype(float).to_numpy(),
+        'mccoy_shallow_density': records['Shallow_Density'].astype(float).to_numpy(),
+        'mccoy_deep_density': records['Deep_Density'].astype(float).to_numpy(),
+    })
+
+
 def _draw_scv_anchor_map_panel(fig, queue: pd.DataFrame, ke_box: tuple[float, float, float, float],
                                zoom_extent: tuple[float, float, float, float], threshold: float) -> None:
     """画 SCV 锚点（按类型与有无峰区分）与匹配对照的全球位置，并放大 KE 框。"""
@@ -32555,22 +32604,27 @@ def _count_word(n: int) -> str:
     return _NUMBER_WORDS[n] if 0 <= n < len(_NUMBER_WORDS) else f'{n:,}'
 
 
-def _journal_ts_axes(ax, lon: float, lat: float) -> None:
-    """画 T–S 图底：按给定位置换算的 σ0 等值线（0.4 间隔），标注排成盐度约 34.68 附近的一列。"""
-    s_grid, t_grid = np.meshgrid(np.linspace(33.55, 34.95, 120), np.linspace(2.5, 20.5, 120))
+def _journal_ts_axes(ax, lon: float, lat: float, s_lim: tuple[float, float] = (33.6, 34.9),
+                     t_lim: tuple[float, float] = (3.0, 19.0), sigma_lim: tuple[float, float] = (24.8, 27.4)) -> None:
+    """画 T–S 图底：按给定位置换算的 σ0 等值线（sigma_lim 内 0.4 间隔），标注排成盐度轴约 83% 处的一列。"""
+    s_span = s_lim[1] - s_lim[0]
+    s_grid, t_grid = np.meshgrid(np.linspace(s_lim[0] - 0.05, s_lim[1] + 0.05, 120),
+                                 np.linspace(t_lim[0] - 0.5, t_lim[1] + 1.5, 120))
     sa = gsw.SA_from_SP(s_grid, 0.0, lon, lat)
     sigma = gsw.sigma0(sa, gsw.CT_from_pt(sa, t_grid))
-    cs = ax.contour(s_grid, t_grid, sigma, levels=np.arange(24.8, 27.41, 0.4), colors=_JOURNAL_COLORS['light'],
-                    linewidths=0.5, zorder=0)
+    cs = ax.contour(s_grid, t_grid, sigma, levels=np.round(np.arange(sigma_lim[0], sigma_lim[1] + 0.01, 0.4), 1),
+                    colors=_JOURNAL_COLORS['light'], linewidths=0.5, zorder=0)
+    label_s = s_lim[0] + 0.83 * s_span
     positions = []
     for segments in cs.allsegs:
         points = np.vstack(segments) if segments else np.empty((0, 2))
-        points = points[(points[:, 0] > 34.55) & (points[:, 0] < 34.8) & (points[:, 1] > 3.5) & (points[:, 1] < 18.5)]
+        points = points[(np.abs(points[:, 0] - label_s) < 0.1 * s_span)
+                        & (points[:, 1] > t_lim[0] + 0.5) & (points[:, 1] < t_lim[1] - 0.5)]
         if len(points):
-            positions.append(tuple(points[np.argmin(np.abs(points[:, 0] - 34.68))]))
+            positions.append(tuple(points[np.argmin(np.abs(points[:, 0] - label_s))]))
     ax.clabel(cs, fmt='%.1f', fontsize=6, inline_spacing=1, manual=positions)
-    ax.set_xlim(33.6, 34.9)
-    ax.set_ylim(3, 19)
+    ax.set_xlim(*s_lim)
+    ax.set_ylim(*t_lim)
     ax.xaxis.set_major_locator(MultipleLocator(0.5))
     ax.set_xlabel('Salinity')
     ax.set_ylabel('Potential temperature (°C)')
@@ -32900,6 +32954,286 @@ def plot_argo_lens_case(
         'd_scv_set': scv_set,
         'd_scv_core': scv_core,
     }
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
+def _unicode_signed(value: float, digits: int) -> str:
+    """带正负号的数值，负号用 Unicode 减号。"""
+    return f'{value:+.{digits}f}'.replace('-', '−')
+
+
+def _draw_scv_case_oxygen_panel(fig, case: pd.Series, members: pd.DataFrame, columns: dict, ylim: tuple,
+                                xlim: tuple) -> None:
+    """画一个 SCV 个例的氧–σ0 剖面：锚点与同组对照、目录透镜与核心、ΔDO 峰，以及核心等密面上的锚点值与对照均值。"""
+    colors = _JOURNAL_COLORS
+    kind = str(case['type'])
+    color = colors[kind]
+    w, h = _inch_size(fig)
+    fig.text(0.36 / w, 1 - 0.05 / h, f"{kind.capitalize()} SCV anchor, float {int(case['platform_number'])}, "
+             f"{pd.Timestamp(case['date']):%-d %b %Y}", ha='left', va='top', fontsize=7.5, color=color,
+             fontweight='bold')
+    fig.text(0.36 / w, 1 - 0.21 / h, f"Lens {case['lens_top_depth_m']:.0f}–{case['lens_bottom_depth_m']:.0f} m, "
+             f"core {case['core_depth_m']:.0f} m, maximum {case['peak_depth_m']:.0f} m",
+             ha='left', va='top', fontsize=6.6, color=colors['muted'])
+    ax = _inch_axes(fig, 0.55, 0.42, 0.5, 0.42)
+    ax.axhspan(case['lens_top_sigma0'], case['lens_bottom_sigma0'],
+               color=colors['minty_light' if kind == 'minty' else 'lens'], lw=0, zorder=0)
+    ax.axhline(case['sigma0_core'], color=color, lw=0.7, ls=(0, (4, 2)), zorder=1)
+    for _, row in members[members['role'] == 'control'].iterrows():
+        col = columns[int(row['profile_number'])]
+        ax.plot(col['do'], col['sigma0'], color=colors['neutral'], lw=0.7, zorder=2)
+    anchor = columns[int(case['anchor_profile_number'])]
+    ax.plot(anchor['do'], anchor['sigma0'], color=color, lw=1.2, zorder=4)
+    ax.plot(case['do_controls_isopycnal'], case['sigma0_core'], 'D', ms=3.4, mfc=colors['neutral'], mec='white',
+            mew=0.4, zorder=5)
+    ax.plot(case['do_anchor_isopycnal'], case['sigma0_core'], 'D', ms=3.4, mfc='white', mec=color, mew=0.9, zorder=6)
+    ax.plot(case['peak_do'], case['peak_sigma0'], 'o', ms=3.5, mfc=colors['accent'], mec='white', mew=0.4, zorder=7)
+    peaks = members[(members['role'] == 'control') & members['has_peak']]
+    ax.plot(peaks['peak_do'], peaks['peak_sigma0'], 'o', ls='none', ms=6.2, mfc='none', mec=colors['ink'],
+            mew=0.6, zorder=8)
+    ax.text(0.97, 0.04, f"Core O$_2$ contrast\n{_unicode_signed(case['do_contrast_isopycnal'], 1)} {_JOURNAL_UNIT}",
+            transform=ax.transAxes, ha='right', va='bottom', fontsize=6.6, linespacing=1.2)
+    ax.set_ylim(ylim[1], ylim[0])
+    ax.set_xlim(*xlim)
+    ax.xaxis.set_major_locator(MultipleLocator(50))
+    ax.yaxis.set_major_locator(MultipleLocator(0.5))
+    ax.set_xlabel(f'Dissolved oxygen ({_JOURNAL_UNIT})')
+    ax.set_ylabel('σ$_0$ (kg m$^{-3}$)')
+    depth_axis = ax.twinx()
+    depth_axis.spines['right'].set_visible(True)
+    depth_axis.set_ylim(ax.get_ylim())
+    order = np.argsort(anchor['depth'])
+    ticks = []
+    for depth in range(200, 1201, 200):
+        sigma = float(np.interp(depth, anchor['depth'][order], anchor['sigma0'][order]))
+        # 弱层结处相邻深度刻度在 σ0 轴上挤在一起，只留较浅的一个
+        if ylim[0] <= sigma <= ylim[1] and (not ticks or sigma - ticks[-1][1] >= 0.12):
+            ticks.append((depth, sigma))
+    depth_axis.set_yticks([sigma for _, sigma in ticks])
+    depth_axis.set_yticklabels([f'{depth:,}' for depth, _ in ticks])
+    depth_axis.set_ylabel('Anchor depth (m)')
+
+
+def _draw_scv_case_ts_panel(fig, case: pd.Series, members: pd.DataFrame, columns: dict, ylim: tuple,
+                            s_lim: tuple, t_lim: tuple) -> None:
+    """画一个 SCV 个例的 T–S：锚点（透镜段加宽）与同组对照，标出锚点核心、ΔDO 峰与各对照在核心等密面上的位置。"""
+    colors = _JOURNAL_COLORS
+    kind = str(case['type'])
+    color = colors[kind]
+    ax = _inch_axes(fig, 0.55, 0.42, 0.5, 0.22)
+    _journal_ts_axes(ax, float(case['lon']), float(case['lat']), s_lim, t_lim,
+                     (np.floor(ylim[0] / 0.4) * 0.4 - 0.4, np.ceil(ylim[1] / 0.4) * 0.4 + 0.4))
+
+    def segment(profile_number: int, low: float, high: float) -> dict:
+        col = columns[int(profile_number)]
+        keep = (col['sigma0'] >= low) & (col['sigma0'] <= high)
+        return {var: col[var][keep] for var in ('salinity', 'theta')}
+
+    controls = members[members['role'] == 'control']
+    for _, row in controls.iterrows():
+        seg = segment(row['profile_number'], *ylim)
+        ax.plot(seg['salinity'], seg['theta'], color=colors['neutral'], lw=0.7, zorder=2)
+    seg = segment(case['anchor_profile_number'], *ylim)
+    ax.plot(seg['salinity'], seg['theta'], color=color, lw=1.1, zorder=3)
+    lens = segment(case['anchor_profile_number'], case['lens_top_sigma0'], case['lens_bottom_sigma0'])
+    ax.plot(lens['salinity'], lens['theta'], color=color, lw=2.6, alpha=0.35, zorder=2.5, solid_capstyle='round')
+    ax.plot(controls['salinity_on_core_isopycnal'], controls['theta_on_core_isopycnal'], 'D', ls='none', ms=3.0,
+            mfc=colors['neutral'], mec='white', mew=0.4, zorder=4)
+    ax.plot(case['salinity_anchor_core'], case['theta_anchor_core'], 'D', ms=3.4, mfc='white', mec=color, mew=0.9,
+            zorder=5)
+    ax.plot(case['peak_salinity'], case['peak_theta'], 'o', ms=3.5, mfc=colors['accent'], mec='white', mew=0.4,
+            zorder=6)
+    ax.text(0.04, 0.96, f"Core θ contrast {_unicode_signed(case['theta_contrast_isopycnal'], 2)} °C",
+            transform=ax.transAxes, ha='left', va='top', fontsize=6.6)
+
+
+def plot_scv_case_profiles(
+    name: str,
+    anchor_profiles: list[int],
+    peak_threshold: float = 20.0,
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制若干 SCV 锚点个例与各自正式匹配对照的氧–σ0 剖面和 T–S 关系。
+
+    每个个例取主匹配队列中锚点所在的匹配集，按 DO 检测器共用预处理读取锚点与全部对照剖面。氧–σ0 面板画
+    锚点（按目录类型着色）与对照（灰），浅色带为目录垂向范围（目录上下界压力换算为深度后，映射到锚点剖面的
+    σ0），虚线为锚点在目录核心深度处的 σ0；核心等密面上标出锚点值与对照均值，并注明正式核心氧差；实心点为
+    锚点的 ΔDO 峰，空心环为对照的 ΔDO 峰（与锚点峰重合时环套在点外）。右轴给出锚点剖面的深度刻度。T–S
+    面板画同一 σ0 范围内的同组剖面，锚点透镜段加宽，标出锚点核心、峰与各对照在核心等密面上的温盐。核心
+    氧差与位温差直接取 `calculate_scv_core_oxygen_contrast` 的正式结果。一个个例时氧与 T–S 两面板并排；
+    多个个例时每列一个个例，上排氧、下排 T–S，σ0、氧与温盐坐标范围各列共用。全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - name (str): 输出子目录名。
+        - anchor_profiles (list[int]): 锚点剖面编号，按列顺序；须为主匹配队列中的 SCV 锚点。
+        - peak_threshold (float): 标注 ΔDO 峰所用阈值（μmol/kg），默认 20。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_scv_case_profiles/<name>` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `scv_case_profiles.png`（save_fig 时）。
+        - `case_summary.csv`、`set_members.csv`、`profile_levels.csv`：逐个例的目录范围、峰与核心差，逐剖面的角色、峰与核心等密面温盐氧，以及逐层剖面（save_data 时）。
+
+    说明:
+        - 透镜内外按深度判断：锚点峰深落在目录上下界深度之间即为透镜内；σ0 色带只是同一范围在锚点剖面上的显示。
+        - 个例在群体结果之后选出，用于展示结构，不估计任何排列的出现频率。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    tag = _format_detection_value(float(peak_threshold))
+    queue = _scv_matched_queue_display(pd.read_parquet(_scv_matched_queue_path(region_slug)))
+    anchor_rows = queue[queue['is_scv'].astype(bool)].set_index('profile_number')
+    missing = sorted(set(int(pn) for pn in anchor_profiles) - set(anchor_rows.index.astype(int)))
+    if missing:
+        raise ValueError(f'Profiles {missing} are not SCV anchors of the matched queue.')
+    set_ids = [anchor_rows.loc[int(pn), 'match_set_id'] for pn in anchor_profiles]
+    sets_queue = queue[queue['match_set_id'].isin(set_ids)]
+    columns = _scv_queue_profile_columns(sets_queue)
+    contrast = pd.read_parquet(cfg.output_dir('scv_core_oxygen_contrast', region_slug)
+                               / 'scv_core_oxygen_contrast_sets.parquet').set_index('match_set_id')
+    lens = _scv_anchor_lens_records(anchor_profiles).set_index('anchor_profile_number')
+
+    def at_depth(profile_number: int, var: str, depth: float) -> float:
+        col = columns[int(profile_number)]
+        return float(np.interp(depth, col['depth'], col[var], left=np.nan, right=np.nan))
+
+    cases, member_rows = [], []
+    for anchor_pn, set_id in zip(anchor_profiles, set_ids):
+        anchor = anchor_rows.loc[int(anchor_pn)]
+        formal = contrast.loc[set_id]
+        record = lens.loc[int(anchor_pn)]
+        sigma_core = float(formal['sigma0_core'])
+        peak_depth = float(anchor[f'delta_do_peak_depth_m_{tag}'])
+        for _, row in sets_queue[sets_queue['match_set_id'] == set_id].iterrows():
+            pn = int(row['profile_number'])
+            col = columns[pn]
+            has_peak = bool(row[f'has_delta_do_{tag}'])
+            depth = float(row[f'delta_do_peak_depth_m_{tag}']) if has_peak else np.nan
+            member_rows.append({
+                'anchor_profile_number': int(anchor_pn), 'match_set_id': set_id, 'role': row['role'],
+                'profile_number': pn, 'platform_number': int(row['platform_number']), 'date': row['date'],
+                'lon': float(row['lon']), 'lat': float(row['lat']), 'has_peak': has_peak,
+                'peak_delta_do': float(row[f'delta_do_value_{tag}']) if has_peak else np.nan,
+                'peak_depth_m': depth,
+                'peak_sigma0': at_depth(pn, 'sigma0', depth) if has_peak else np.nan,
+                'peak_do': at_depth(pn, 'do', depth) if has_peak else np.nan,
+                **{f'{var}_on_core_isopycnal': _profile_value_on_isopycnal(col['sigma0'], col[var], sigma_core)
+                   for var in ('do', 'theta', 'salinity')},
+            })
+        cases.append({
+            'anchor_profile_number': int(anchor_pn), 'match_set_id': set_id,
+            'platform_number': int(anchor['platform_number']), 'date': anchor['date'], 'lon': float(anchor['lon']),
+            'lat': float(anchor['lat']), 'type': anchor['type'], 'region': anchor['region'],
+            'n_controls': int(formal['n_controls']), 'core_depth_m': float(formal['core_depth_m']),
+            'sigma0_core': sigma_core, 'mccoy_core_density': float(record['mccoy_core_density']),
+            'lens_top_depth_m': float(record['lens_top_depth_m']),
+            'lens_bottom_depth_m': float(record['lens_bottom_depth_m']),
+            'lens_top_sigma0': at_depth(anchor_pn, 'sigma0', float(record['lens_top_depth_m'])),
+            'lens_bottom_sigma0': at_depth(anchor_pn, 'sigma0', float(record['lens_bottom_depth_m'])),
+            'mccoy_shallow_density': float(record['mccoy_shallow_density']),
+            'mccoy_deep_density': float(record['mccoy_deep_density']),
+            'peak_delta_do': float(anchor[f'delta_do_value_{tag}']), 'peak_depth_m': peak_depth,
+            'peak_in_lens': bool(record['lens_top_depth_m'] <= peak_depth <= record['lens_bottom_depth_m']),
+            'peak_sigma0': at_depth(anchor_pn, 'sigma0', peak_depth),
+            'peak_do': at_depth(anchor_pn, 'do', peak_depth),
+            'peak_salinity': at_depth(anchor_pn, 'salinity', peak_depth),
+            'peak_theta': at_depth(anchor_pn, 'theta', peak_depth),
+            'salinity_anchor_core': at_depth(anchor_pn, 'salinity', float(formal['core_depth_m'])),
+            'theta_anchor_core': at_depth(anchor_pn, 'theta', float(formal['core_depth_m'])),
+            **{key: float(formal[key]) for key in ('do_anchor_isopycnal', 'do_controls_isopycnal',
+                                                   'do_contrast_isopycnal', 'theta_anchor_isopycnal',
+                                                   'theta_controls_isopycnal', 'theta_contrast_isopycnal')},
+        })
+    case_summary = pd.DataFrame(cases)
+    set_members = pd.DataFrame(member_rows)
+
+    def anchor_sigma(case: dict, depth: float) -> float:
+        return at_depth(case['anchor_profile_number'], 'sigma0', depth)
+
+    peak_sigma = set_members['peak_sigma0'].dropna()
+    ylim = (
+        min([anchor_sigma(c, max(min(300.0, c['lens_top_depth_m']) - 100.0, 0.0)) for c in cases]
+            + list(peak_sigma - 0.1)),
+        max([anchor_sigma(c, min(max(1000.0, c['lens_bottom_depth_m']),
+                                 float(columns[c['anchor_profile_number']]['depth'].max()))) for c in cases]
+            + list(peak_sigma + 0.1)),
+    )
+    shown = {var: np.concatenate([columns[pn][var][(columns[pn]['sigma0'] >= ylim[0])
+                                                   & (columns[pn]['sigma0'] <= ylim[1])]
+                                  for pn in set_members['profile_number']]) for var in ('do', 'salinity', 'theta')}
+    xlim = (np.floor(np.nanmin(shown['do']) / 10) * 10 - 10, np.ceil(np.nanmax(shown['do']) / 10) * 10 + 10)
+    s_lim = (np.floor(np.nanmin(shown['salinity']) * 10) / 10 - 0.05,
+             np.ceil(np.nanmax(shown['salinity']) * 10) / 10 + 0.05)
+    t_lim = (np.floor(np.nanmin(shown['theta'])) - 0.5, np.ceil(np.nanmax(shown['theta'])) + 0.5)
+
+    colors = _JOURNAL_COLORS
+    kinds = list(dict.fromkeys(case_summary['type']))
+    lens_patches = tuple(Patch(facecolor=colors['minty_light' if kind == 'minty' else 'lens'], edgecolor='none')
+                         for kind in kinds)
+    core_marks = tuple(Line2D([], [], ls='none', marker='D', ms=3.4, mfc='white', mec=colors[kind], mew=0.9)
+                       for kind in kinds)
+    n_controls = set(case_summary['n_controls'])
+    control_label = ('Its matched control' if n_controls == {1}
+                     else f'Its {_count_word(n_controls.pop())} matched controls' if len(n_controls) == 1
+                     else 'Its matched controls')
+    handles = [
+        *[Line2D([], [], color=colors[kind], lw=1.2) for kind in kinds],
+        Line2D([], [], color=colors['neutral'], lw=0.7),
+        lens_patches,
+        (Line2D([], [], color=colors['muted'], lw=0.7, ls=(0, (4, 2))), *core_marks),
+        Line2D([], [], ls='none', marker='D', ms=3.4, mfc=colors['neutral'], mec='white'),
+        Line2D([], [], ls='none', marker='o', ms=3.5, mfc=colors['accent'], mec='white'),
+        Line2D([], [], ls='none', marker='o', ms=6.2, mfc='none', mec=colors['ink'], mew=0.6),
+    ]
+    labels = [
+        *[f'{kind.capitalize()} SCV anchor' for kind in kinds],
+        control_label,
+        'Catalogue vertical extent of the lens',
+        'Catalogue core (σ$_0$ and anchor value)',
+        'Control mean on the core σ$_0$',
+        f'ΔDO{tag} maximum of the anchor',
+        f'ΔDO{tag} maxima of controls',
+    ]
+    if not set_members.loc[set_members['role'] == 'control', 'has_peak'].any():
+        handles, labels = handles[:-1], labels[:-1]
+    n = len(cases)
+    with plt.rc_context(_journal_rc()):
+        if n == 1:
+            fig, cells = _journal_panel_grid([(2.75, 2), (0.5, 1)])
+            oxygen_cells, ts_cells, legend_cell = [cells[0]], [cells[1]], cells[2]
+        else:
+            fig, cells = _journal_panel_grid([(2.75, n), (2.45, n), (0.5, 1)])
+            oxygen_cells, ts_cells, legend_cell = cells[:n], cells[n:2 * n], cells[2 * n]
+        for k, case in case_summary.iterrows():
+            members = set_members[set_members['anchor_profile_number'] == case['anchor_profile_number']]
+            _draw_scv_case_oxygen_panel(oxygen_cells[k], case, members, columns, ylim, xlim)
+            _draw_scv_case_ts_panel(ts_cells[k], case, members, columns, ylim, s_lim, t_lim)
+        for cell, label in zip(oxygen_cells + ts_cells, 'abcdefgh'):
+            _journal_panel_label(cell, f'({label})')
+        legend_cell.legend(handles=handles, labels=labels, loc='center', ncol=4, fontsize=6.4,
+                           handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)}, handlelength=2.2,
+                           handletextpad=0.5, columnspacing=1.2, labelspacing=0.35)
+        out_dir = (Path(output_dir) if output_dir is not None
+                   else cfg.output_dir('plot_scv_case_profiles', region_slug) / name)
+        figure_path = _journal_save(fig, out_dir, 'scv_case_profiles', show_fig, save_fig)
+
+    profile_levels = pd.concat([
+        pd.DataFrame({'anchor_profile_number': row['anchor_profile_number'], 'role': row['role'],
+                      'profile_number': row['profile_number'], 'depth_m': columns[row['profile_number']]['depth'],
+                      **{var: columns[row['profile_number']][var] for var in ('do', 'salinity', 'theta', 'sigma0')}})
+        for _, row in set_members.iterrows()
+    ], ignore_index=True).rename(columns={'do': 'do_umol_kg'})
+    sources = {'case_summary': case_summary, 'set_members': set_members, 'profile_levels': profile_levels}
     if save_data:
         _journal_write_sources(out_dir, sources)
     return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
@@ -35207,28 +35541,7 @@ def calculate_scv_core_oxygen_contrast(
         pd.read_parquet(Path(queue_path) if queue_path is not None else _scv_matched_queue_path(region_slug))
     )
     cfg = make_detection_config('do')
-    raw = pd.concat(
-        [load_argo_data(int(year), argo_data_dir, profile_ids=set(ids.astype(int)))
-         for year, ids in queue.groupby('year')['profile_number']],
-        ignore_index=True,
-    )
-    raw['Profile_number'] = raw['Profile_number'].astype(int)
-
-    columns = {}
-    for profile_number, profile in raw.groupby('Profile_number', sort=False):
-        cleaned, _ = _prepare_do_profile_for_detection(profile, cfg)
-        if cleaned is None:
-            raise ValueError(f'Queue profile {profile_number} fails the shared DO preprocessing.')
-        lon, lat = float(profile['Longitude'].iloc[0]), float(profile['Latitude'].iloc[0])
-        depth = cleaned['Depth'].to_numpy(float)
-        pressure = gsw.p_from_z(-depth, lat)
-        temperature = cleaned['Temperature'].to_numpy(float)
-        absolute_salinity = gsw.SA_from_SP(cleaned['Salinity'].to_numpy(float), pressure, lon, lat)
-        columns[int(profile_number)] = {
-            'depth': depth, 'do': cleaned['DO'].to_numpy(float),
-            'theta': gsw.pt0_from_t(absolute_salinity, temperature, pressure),
-            'sigma0': gsw.sigma0(absolute_salinity, gsw.CT_from_t(absolute_salinity, temperature, pressure)),
-        }
+    columns = _scv_queue_profile_columns(queue, argo_data_dir)
 
     def at_depth(profile_number: int, var: str, depth: float) -> float:
         col = columns[profile_number]
