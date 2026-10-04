@@ -43,10 +43,11 @@ EXTRA_SOURCES = {
 }
 TABLES_DIR = 'export_scv_matched_effect_tables'
 TABLES = {
-    'table1_matched_results.csv': 'matched_results.csv',
-    'tableS1_ke_only_matched_results.csv': 'ke_matched_results.csv',
-    'tableS2_core_alignment_permutation_summary.csv': 'core_alignment_permutation_summary.csv',
-    'tableS3_common_grid_matched_results.csv': 'common_grid_matched_results.csv',
+    'tableS1_matched_results.csv': 'matched_results.csv',
+    'tableS2_ke_only_matched_results.csv': 'ke_matched_results.csv',
+    'tableS3_core_alignment_permutation_summary.csv': 'core_alignment_permutation_summary.csv',
+    'tableS4_common_grid_matched_results.csv': 'common_grid_matched_results.csv',
+    'tableS5_core_oxygen_contrast.csv': 'core_oxygen_contrast.csv',
 }
 TABLES_MARKDOWN = 'matched_effect_tables.md'
 

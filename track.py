@@ -33463,19 +33463,45 @@ def _matched_effect_markdown(frame: pd.DataFrame, label_col: str, label_header: 
     return '\n'.join(lines)
 
 
+def _core_oxygen_contrast_table(summary: pd.DataFrame) -> pd.DataFrame:
+    """把核心等密面氧差汇总整理成论文表格行：组别、组数（锚点浮标数）、氧差与位温差的中位数（区间）、锚点高于对照的比例。"""
+    labels = {
+        'all': 'All anchors', 'minty': 'Minty', 'minty | KE box': 'Minty, KE', 'minty | Outside KE': 'Minty, outside KE',
+        'spicy': 'Spicy', 'spicy | KE box': 'Spicy, KE', 'spicy | Outside KE': 'Spicy, outside KE',
+        'minty − spicy': 'Minty − spicy', 'minty − spicy | Outside KE': 'Minty − spicy, outside KE',
+    }
+
+    def interval(row: pd.Series, digits: int) -> str:
+        text = f"{row['median']:.{digits}f} ({row['ci_low']:.{digits}f} to {row['ci_high']:.{digits}f})"
+        return text.replace('-', '−')
+
+    oxygen = summary[summary['quantity'] == 'do_contrast_isopycnal'].set_index('group')
+    theta = summary[summary['quantity'] == 'theta_contrast_isopycnal'].set_index('group')
+    return pd.DataFrame([{
+        'group': label,
+        'sets': f"{int(oxygen.loc[group, 'n_sets'])} ({int(oxygen.loc[group, 'n_anchor_platforms'])})",
+        'oxygen_contrast_umol_kg': interval(oxygen.loc[group], 1),
+        'anchors_above_controls_pct': ('' if pd.isna(oxygen.loc[group, 'fraction_positive'])
+                                       else f"{100 * oxygen.loc[group, 'fraction_positive']:.0f}"),
+        'potential_temperature_contrast_degc': interval(theta.loc[group], 2),
+    } for group, label in labels.items()])
+
+
 def export_scv_matched_effect_tables(
     matched_queue: str = 'primary_metadata_supported',
     level_operator: str = 'cell',
     output_dir: str | Path | None = None,
     save_data: bool = True,
 ) -> dict:
-    """把 SCV 匹配比较的正式结果整理成论文表格：主结果、KE 内结果、核心对准置换摘要与共同垂向网格敏感性。
+    """把 SCV 匹配比较的正式结果整理成论文表格：主结果、KE 内结果、核心对准置换摘要、共同垂向网格敏感性与核心氧差。
 
     主结果取 `run_scv_matched_effects.py` 匹配效应表中 matched_queue 队列的 Global 与 Global excluding KE 整剖面结局，
     以及 Global 的核心附近峰结局；KE 内结果取同一队列 KE 范围的两种结局；置换摘要原样取
     `calculate_scv_core_alignment` 的输出；共同网格敏感性取 `calculate_scv_matched_level_sensitivity` 中
-    level_operator 算子的 Global 与 Global excluding KE 结果。各表给出锚点与对照的阳性数/总数（%）、
-    Mantel–Haenszel OR 与锚点浮标、依赖分量两种聚类 bootstrap 区间，并汇总成一份 Markdown。
+    level_operator 算子的 Global 与 Global excluding KE 结果；核心氧差取 `calculate_scv_core_oxygen_contrast` 的
+    分组汇总。匹配表给出锚点与对照的阳性数/总数（%）、Mantel–Haenszel OR 与锚点浮标、依赖分量两种聚类
+    bootstrap 区间；核心氧差表给出核心等密面上氧与位温之差的中位数和锚点浮标区间。各表按论文 SI 编号汇总成
+    一份 Markdown。
 
     参数:
         - matched_queue (str): 匹配队列名，默认 'primary_metadata_supported'。
@@ -33484,11 +33510,11 @@ def export_scv_matched_effect_tables(
         - save_data (bool): 是否写出 CSV 与 Markdown，默认 True。
 
     返回:
-        - dict: 含 matched_results、ke_matched_results、core_alignment_permutation_summary、common_grid_matched_results 四张表、markdown 文本与 output_dir。
+        - dict: 含 matched_results、ke_matched_results、core_alignment_permutation_summary、common_grid_matched_results、core_oxygen_contrast 五张表、markdown 文本与 output_dir。
 
     输出:
-        - `matched_results.csv`、`ke_matched_results.csv`、`core_alignment_permutation_summary.csv`、`common_grid_matched_results.csv`：四张表（save_data 时）。
-        - `matched_effect_tables.md`：四张表的 Markdown 汇总（save_data 时）。
+        - `matched_results.csv`、`ke_matched_results.csv`、`core_alignment_permutation_summary.csv`、`common_grid_matched_results.csv`、`core_oxygen_contrast.csv`：五张表（save_data 时）。
+        - `matched_effect_tables.md`：五张表的 Markdown 汇总，标题按论文 SI 表编号（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
@@ -33498,6 +33524,9 @@ def export_scv_matched_effect_tables(
     level_dir = cfg.output_dir('scv_matched_level_sensitivity', region_slug)
     levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_effects.parquet')
     ofes_levels = pd.read_parquet(level_dir / 'scv_matched_level_sensitivity_grid.parquet')['level_depth_m'].to_numpy(float)
+    contrast = _core_oxygen_contrast_table(pd.read_parquet(
+        cfg.output_dir('scv_core_oxygen_contrast', region_slug) / 'scv_core_oxygen_contrast_summary.parquet'
+    ))
 
     def select(frame: pd.DataFrame, outcome: str, scope: str) -> pd.DataFrame:
         return frame[frame['outcome'].eq(outcome) & frame['scope'].eq(scope)]
@@ -33521,24 +33550,30 @@ def export_scv_matched_effect_tables(
     tolerance = float(pd.read_parquet(_scv_matched_queue_path(region_slug), columns=['core_anomaly_tolerance_m'])
                       ['core_anomaly_tolerance_m'].iloc[0])
     in_search_layer = int(((ofes_levels >= cfg.anomaly_min_depth) & (ofes_levels <= cfg.anomaly_max_depth)).sum())
+    contrast_header = ['Group', 'Sets (anchor floats)', 'Oxygen contrast (μmol kg⁻¹)', 'Anchors above controls (%)',
+                       'Potential-temperature contrast (°C)']
+    contrast_markdown = '\n'.join(
+        ['| ' + ' | '.join(contrast_header) + ' |', '|' + '|'.join(['---'] * len(contrast_header)) + '|']
+        + ['| ' + ' | '.join(str(v) for v in row) + ' |' for row in contrast.itertuples(index=False)]
+    )
     markdown = '\n'.join([
-        '# Table 1 与 SI 表',
+        '# SI 表',
         '',
-        '由 `export_scv_matched_effect_tables` 从匹配效应、核心对准置换与共同垂向网格敏感性的正式输出生成。',
+        '由 `export_scv_matched_effect_tables` 从匹配效应、核心对准置换、共同垂向网格敏感性与核心氧差的正式输出生成。',
         '',
-        '## Table 1',
+        '## Table S1（匹配主结果）',
         '',
         _matched_effect_markdown(main, 'sample', 'Sample'),
         '',
-        '## Table S1（仅 KE）',
+        '## Table S2（仅 KE）',
         '',
         _matched_effect_markdown(ke, 'outcome', 'Outcome'),
         '',
-        '## Table S2（核心对准置换摘要）',
+        '## Table S3（核心对准置换摘要）',
         '',
         f'逐阈值、逐指标的置换摘要见本表 CSV：锚点核心在同区域内置换，±{tolerance:g} m 容差，项目约定种子。',
         '',
-        f'## Table S3（共同垂向网格，{level_operator} 算子）',
+        f'## Table S4（共同垂向网格，{level_operator} 算子）',
         '',
         f'锚点与对照都降到共同的 OFES {len(ofes_levels)} 层网格（{cfg.anomaly_min_depth:,.0f}–{cfg.anomaly_max_depth:,.0f} m '
         f'内 {in_search_layer} 层），用原检测器重检，沿用原匹配集和统计；其他算子的结果在 '
@@ -33546,12 +33581,18 @@ def export_scv_matched_effect_tables(
         '',
         _matched_effect_markdown(common, 'sample', 'Sample'),
         '',
+        '## Table S5（核心等密面氧差）',
+        '',
+        '锚点减同组对照均值，在目录核心的 σ0 上比较；中位数与锚点浮标重抽 95% 区间，类型差在同一套重抽中计算。',
+        '',
+        contrast_markdown,
+        '',
     ])
     out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('export_scv_matched_effect_tables',
                                                                              region_slug)
     tables = {
         'matched_results': main, 'ke_matched_results': ke, 'core_alignment_permutation_summary': null,
-        'common_grid_matched_results': common,
+        'common_grid_matched_results': common, 'core_oxygen_contrast': contrast,
     }
     if save_data:
         _journal_write_sources(out_dir, tables)
