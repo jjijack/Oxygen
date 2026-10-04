@@ -31417,7 +31417,6 @@ def build_argo_lens_case(
     period: tuple[str, str],
     event_period: tuple[str, str],
     sigma0: float,
-    scv_match_set: str,
     event_threshold: float = 50.0,
     peak_threshold: float = 20.0,
     box_margin_deg: float = 0.5,
@@ -31427,14 +31426,12 @@ def build_argo_lens_case(
     output_dir: str | Path | None = None,
     save_data: bool = True,
 ) -> dict:
-    """为一个高频采样浮标阵列整理氧透镜个例：冷事件、同期背景、目标等密面氧序列与一个 SCV 匹配组。
+    """为一个高频采样浮标阵列整理氧透镜个例：冷事件、同期背景与目标等密面氧序列。
 
     阵列取 platforms 编号区间内、period 期间的全部剖面，逐层经 DO detector 共用预处理后补算压力、位温与 σ0。
     冷事件为 event_period 内达到 event_threshold 的剖面，峰深与 ΔDO 取检测器异常表中该剖面的最强峰；
     背景为同期、位于事件包围矩形（四边外扩 box_margin_deg）内、属于全局氧剖面总体且没有 peak_threshold
-    峰的剖面，给出逐深度 10/50/90 百分位氧。每条剖面在 σ0 单调包络上插值目标等密面的氧与深度。SCV 匹配组
-    取 `run_scv_matched_effects.py` 主队列中的 scv_match_set，锚点经 `audit_scv_profile_identity` 裁决回溯
-    McCoy 目录记录，比较锚点 ΔDO 峰与目录核心和垂向范围的深度与密度。
+    峰的剖面，给出逐深度 10/50/90 百分位氧。每条剖面在 σ0 单调包络上插值目标等密面的氧与深度。
 
     参数:
         - name (str): 个例名，作为输出子目录名。
@@ -31442,25 +31439,22 @@ def build_argo_lens_case(
         - period (tuple[str, str]): 阵列剖面的起止日期（含）。
         - event_period (tuple[str, str]): 冷事件与背景的起止日期（含）。
         - sigma0 (float): 目标等密面 σ0（kg/m³ − 1000）。
-        - scv_match_set (str): 主匹配队列中的 match_set_id。
         - event_threshold (float): 冷事件的 ΔDO 阈值（μmol/kg），默认 50。
-        - peak_threshold (float): 背景排除与 SCV 匹配组峰的 ΔDO 阈值（μmol/kg），默认 20。
+        - peak_threshold (float): 背景排除的 ΔDO 阈值（μmol/kg），默认 20。
         - box_margin_deg (float): 事件包围矩形四边外扩（°），默认 0.5。
         - grid_step_m (float): 背景百分位的深度网格间距（m），网格从海表到检测器搜索层底，默认 5。
         - baseline_start_year (int): 全局剖面资格表与异常表的起始年，默认 2002。
         - baseline_end_year (int): 全局剖面资格表与异常表的结束年，默认 2023。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `argo_lens_case/<name>` 目录。
-        - save_data (bool): 是否写出五张表与个例参数，默认 True。
+        - save_data (bool): 是否写出三张表与个例参数，默认 True。
 
     返回:
-        - dict: 含 levels、profiles、background_do、scv_set、scv_core 五张表，个例参数 spec（含事件包围矩形 box）与 output_dir。
+        - dict: 含 levels、profiles、background_do 三张表，个例参数 spec（含事件包围矩形 box）与 output_dir。
 
     输出:
         - `lens_case_levels.parquet`：阵列剖面逐层的深度、压力、温盐、氧、位温与 σ0（save_data 时）。
-        - `lens_case_profiles.parquet`：逐剖面位置、日期、冷事件与背景标记、事件峰、SCV 匹配组角色与目标等密面上的氧和深度（save_data 时）。
+        - `lens_case_profiles.parquet`：逐剖面位置、日期、冷事件与背景标记、事件峰与目标等密面上的氧和深度（save_data 时）。
         - `lens_case_background_do.parquet`：背景剖面逐深度氧百分位（save_data 时）。
-        - `lens_case_scv_set.parquet`：SCV 匹配组成员及其 ΔDO 峰（save_data 时）。
-        - `lens_case_scv_core.parquet`：锚点 ΔDO 峰与 McCoy 目录核心、垂向范围的深度和密度对照（save_data 时）。
         - `lens_case_spec.json`：个例参数与事件包围矩形，供 `plot_argo_lens_case` 读取（save_data 时）。
     """
     region_slug = _current_region_key()
@@ -31537,19 +31531,6 @@ def build_argo_lens_case(
         profiles['cold_event']
     )
 
-    queue = pd.read_parquet(_scv_matched_queue_path(region_slug))
-    peak_tag = _format_detection_value(float(peak_threshold))
-    scv_set = queue.loc[queue['match_set_id'].eq(scv_match_set)].assign(
-        role=lambda frame: np.where(frame['is_scv'], 'anchor', 'control')
-    )[['match_set_id', 'role', 'profile_number', 'platform_number', 'date', 'lon', 'lat', 'match_distance_km',
-       f'has_delta_do_{peak_tag}', f'delta_do_value_{peak_tag}', f'delta_do_peak_depth_m_{peak_tag}']]
-    missing = set(scv_set['profile_number'].astype(int)) - set(profiles['profile_number'])
-    if scv_set.empty or missing:
-        raise ValueError(f'Match set {scv_match_set} is empty or has profiles outside the array: {sorted(missing)}')
-    profiles['scv_set_role'] = profiles['profile_number'].map(
-        scv_set.set_index('profile_number')['role']
-    ).fillna('')
-
     by_profile = dict(tuple(levels.groupby('profile_number')))
     on_isopycnal = [
         (
@@ -31576,44 +31557,9 @@ def build_argo_lens_case(
         'background_do_p90': percentiles[2],
     })
 
-    anchor = scv_set.loc[scv_set['role'].eq('anchor')].iloc[0]
-    anchor_row = queue.loc[queue['match_set_id'].eq(scv_match_set) & queue['is_scv']].iloc[0]
-    adjudication = load_scv_profile_identity()['adjudication']
-    row_id = int(adjudication.loc[
-        adjudication['current_profile_number'].eq(int(anchor['profile_number']))
-        & adjudication['current_date_position_status'].eq('metadata-supported'),
-        'original_catalog_row_id',
-    ].iloc[0])
-    catalog = _read_scv_identity_catalog(_mccoy_scv_csv)
-    record = catalog.loc[catalog['catalog_row_id'].eq(row_id)].iloc[0]
-    anchor_levels = by_profile[int(anchor['profile_number'])]
-    peak_depth = float(anchor[f'delta_do_peak_depth_m_{peak_tag}'])
-    core_depth = float(anchor_row['anchor_core_depth_m'])
-    shallow_depth = -float(gsw.z_from_p(float(record['Shallow_Pressure']), float(anchor['lat'])))
-    deep_depth = -float(gsw.z_from_p(float(record['Deep_Pressure']), float(anchor['lat'])))
-    scv_core = pd.DataFrame([{
-        'anchor_profile': int(anchor['profile_number']),
-        'mccoy_platform': int(record['Platform']),
-        'mccoy_cycle': int(record['Cycle']),
-        'mccoy_scv_type': str(record['SCV_Type']),
-        'peak_depth_m': peak_depth,
-        'peak_delta_do': float(anchor[f'delta_do_value_{peak_tag}']),
-        'sigma0_at_peak': float(np.interp(peak_depth, anchor_levels['depth_m'], anchor_levels['sigma0'])),
-        'core_depth_m': core_depth,
-        'sigma0_at_core_from_profile': float(np.interp(core_depth, anchor_levels['depth_m'], anchor_levels['sigma0'])),
-        'mccoy_core_density': float(record['Core_Density']),
-        'mccoy_shallow_pressure_dbar': float(record['Shallow_Pressure']),
-        'mccoy_deep_pressure_dbar': float(record['Deep_Pressure']),
-        'mccoy_shallow_depth_m': shallow_depth,
-        'mccoy_deep_depth_m': deep_depth,
-        'mccoy_shallow_density': float(record['Shallow_Density']),
-        'mccoy_deep_density': float(record['Deep_Density']),
-        'peak_above_mccoy_extent_m': shallow_depth - peak_depth,
-    }])
-
     spec = {
         'name': name, 'platforms': [int(v) for v in platforms], 'period': [str(v) for v in period],
-        'event_period': [str(v) for v in event_period], 'sigma0': float(sigma0), 'scv_match_set': scv_match_set,
+        'event_period': [str(v) for v in event_period], 'sigma0': float(sigma0),
         'event_threshold': float(event_threshold), 'peak_threshold': float(peak_threshold),
         'box_margin_deg': float(box_margin_deg), 'grid_step_m': float(grid_step_m), 'box': list(box),
     }
@@ -31625,13 +31571,9 @@ def build_argo_lens_case(
         levels.to_parquet(out_dir / 'lens_case_levels.parquet', index=False)
         profiles.to_parquet(out_dir / 'lens_case_profiles.parquet', index=False)
         background.to_parquet(out_dir / 'lens_case_background_do.parquet', index=False)
-        scv_set.to_parquet(out_dir / 'lens_case_scv_set.parquet', index=False)
-        scv_core.to_parquet(out_dir / 'lens_case_scv_core.parquet', index=False)
         print(f'[*] Argo lens case {name} saved to {out_dir}')
-    return {
-        'levels': levels, 'profiles': profiles, 'background_do': background, 'scv_set': scv_set,
-        'scv_core': scv_core, 'spec': spec, 'output_dir': str(out_dir),
-    }
+    return {'levels': levels, 'profiles': profiles, 'background_do': background, 'spec': spec,
+            'output_dir': str(out_dir)}
 
 
 _JOURNAL_UNIT = 'μmol kg$^{-1}$'
@@ -32631,9 +32573,9 @@ def _journal_ts_axes(ax, lon: float, lat: float, s_lim: tuple[float, float] = (3
 
 
 def _journal_lens_axes(fig):
-    """个例透镜面板的氧–深度轴与 T–S 轴（两个透镜面板几何一致）。"""
-    ax_do = _inch_axes(fig, 0.5, 1.32, width=1.02, top=0.22)
-    ax_ts = _inch_axes(fig, 2.02, 1.32, 0.08, 0.22)
+    """冷透镜面板的氧–深度轴与 T–S 轴，右侧留出图例。"""
+    ax_do = _inch_axes(fig, 0.55, 0.6, width=1.45, top=0.25)
+    ax_ts = _inch_axes(fig, 2.55, 0.6, width=2.05, top=0.25)
     ax_do.set_ylim(1000, 0)
     ax_do.set_xlim(80, 300)
     ax_do.set_xlabel(f'Dissolved oxygen\n({_JOURNAL_UNIT})')
@@ -32649,9 +32591,9 @@ def _lens_levels(levels: pd.DataFrame, profile_number: int, depth_range: tuple[f
     return prof if depth_range is None else prof[prof['depth_m'].between(*depth_range)]
 
 
-def _draw_lens_map_panel(fig, profiles: pd.DataFrame, scv_set: pd.DataFrame, spec: dict, warm_color: str,
-                         map_extent: tuple[float, float, float, float], event_labels: dict, scv_labels: dict) -> None:
-    """画阵列剖面位置、按日期着色的冷事件、SCV 锚点与其对照，并标注浮标与日期。"""
+def _draw_lens_map_panel(fig, profiles: pd.DataFrame, spec: dict, map_extent: tuple[float, float, float, float],
+                         event_labels: dict) -> None:
+    """画阵列剖面位置与按日期着色的冷事件，并标注事件浮标与日期。"""
     colors = _JOURNAL_COLORS
     pc = ccrs.PlateCarree()
     ax = _inch_axes(fig, 0.42, 0.66, 0.1, 0.5, projection=pc)
@@ -32663,12 +32605,6 @@ def _draw_lens_map_panel(fig, profiles: pd.DataFrame, scv_set: pd.DataFrame, spe
     cmap = LinearSegmentedColormap.from_list('cold', [colors['minty_light'], colors['minty'], colors['minty_dark']])
     sc = ax.scatter(cold['lon'], cold['lat'], c=days, cmap=cmap, s=16, edgecolors='white', linewidths=0.4,
                     transform=pc, zorder=5)
-    anchor = scv_set[scv_set['role'] == 'anchor'].iloc[0]
-    controls = scv_set[scv_set['role'] == 'control']
-    ax.scatter(controls['lon'], controls['lat'], marker='D', s=14, color='white', edgecolors=colors['ink'],
-               linewidths=0.7, transform=pc, zorder=5)
-    ax.scatter([anchor['lon']], [anchor['lat']], marker='*', s=70, color=warm_color, edgecolors='white',
-               linewidths=0.4, transform=pc, zorder=6)
     tr = pc._as_mpl_transform(ax)
     for platform, grp in cold.groupby('platform_number'):
         cx, cy = grp['lon'].mean(), grp['lat'].mean()
@@ -32677,17 +32613,6 @@ def _draw_lens_map_panel(fig, profiles: pd.DataFrame, scv_set: pd.DataFrame, spe
                     xycoords=tr, textcoords=tr, fontsize=6, color=colors['ink'], ha='center', va='center', zorder=7,
                     linespacing=1.05, arrowprops=dict(arrowstyle='-', color=colors['muted'], lw=0.4, shrinkA=1,
                                                       shrinkB=3))
-    lx, ly = scv_labels.get(int(anchor['profile_number']), (anchor['lon'], anchor['lat'] + 0.4))
-    ax.annotate(f"{int(anchor['platform_number'])}\n{pd.Timestamp(anchor['date']):%-d %b}",
-                xy=(anchor['lon'], anchor['lat']), xytext=(lx, ly), xycoords=tr, textcoords=tr, fontsize=6,
-                color=warm_color, ha='center', va='center', zorder=7, linespacing=1.05,
-                arrowprops=dict(arrowstyle='-', color=warm_color, lw=0.4, shrinkA=1, shrinkB=4))
-    for _, row in controls.iterrows():
-        lx, ly = scv_labels.get(int(row['profile_number']), (row['lon'], row['lat'] + 0.4))
-        ax.annotate(f"{int(row['platform_number'])}\n{pd.Timestamp(row['date']):%-d %b}",
-                    xy=(row['lon'], row['lat']), xytext=(lx, ly), xycoords=tr, textcoords=tr, fontsize=6,
-                    color=colors['muted'], ha='center', va='center', zorder=7, linespacing=1.05,
-                    arrowprops=dict(arrowstyle='-', color=colors['muted'], lw=0.4, shrinkA=1, shrinkB=3))
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, color=colors['grid'],
                       xlocs=range(int(np.ceil(map_extent[0])), int(np.floor(map_extent[1])) + 1),
                       ylocs=range(int(np.ceil(map_extent[2])), int(np.floor(map_extent[3])) + 1))
@@ -32703,15 +32628,10 @@ def _draw_lens_map_panel(fig, profiles: pd.DataFrame, scv_set: pd.DataFrame, spe
     cb.set_label(f'Selected cold-event ΔDO{event_tag} profiles, day of {first:%B %Y}', fontsize=6.4, labelpad=2)
     cb.ax.xaxis.set_label_position('top')
     period = [pd.Timestamp(v) for v in spec['period']]
-    handles = [
-        Line2D([], [], ls='none', marker='*', ms=7, mfc=warm_color, mec='white', label='Warm-lens SCV anchor'),
-        Line2D([], [], ls='none', marker='D', ms=3.5, mfc='white', mec=colors['ink'],
-               label=f'Its {_count_word(len(controls))} matched controls'),
-        Line2D([], [], ls='none', marker='o', ms=2, mfc=colors['light'], mec='none',
-               label=f'All array profiles, {period[0]:%b}–{period[1]:%b %Y}'),
-    ]
-    fig.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.3, 0.36), ncol=2, fontsize=6.4,
-               handletextpad=0.3, labelspacing=0.3, columnspacing=1.0)
+    handles = [Line2D([], [], ls='none', marker='o', ms=2, mfc=colors['light'], mec='none',
+                      label=f'All array profiles, {period[0]:%b}–{period[1]:%b %Y}')]
+    fig.legend(handles=handles, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.3, 0.3), fontsize=6.4,
+               handletextpad=0.3)
 
 
 def _draw_lens_isopycnal_panel(fig, series: pd.DataFrame, window: tuple, sigma0: float, event_tag: str,
@@ -32800,68 +32720,8 @@ def _draw_cold_lens_panel(fig, levels: pd.DataFrame, profiles: pd.DataFrame, bac
         'O$_2$ 10–90th percentiles and median',
         'Same background: T–S at 100–1,000 m levels',
     ]
-    fig.legend(handles=handles, labels=labels, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.12, 0.84),
-               fontsize=6.4, handlelength=1.8, handletextpad=0.5, labelspacing=0.35)
-
-
-def _draw_warm_lens_panel(fig, levels: pd.DataFrame, scv_set: pd.DataFrame, scv_core: pd.Series, warm_color: str,
-                          warm_type: str, spec: dict) -> None:
-    """画暖透镜：SCV 锚点剖面及其峰，对照其匹配对照，并标出目录核心深度与垂向范围。"""
-    colors = _JOURNAL_COLORS
-    peak_tag = _format_detection_value(float(spec['peak_threshold']))
-    anchor = scv_set[scv_set['role'] == 'anchor'].iloc[0]
-    controls = scv_set[scv_set['role'] == 'control']
-    ap = _lens_levels(levels, anchor['profile_number'])
-    peak_depth = float(scv_core['peak_depth_m'])
-    core_depth = float(scv_core['core_depth_m'])
-    shallow_depth, deep_depth = float(scv_core['mccoy_shallow_depth_m']), float(scv_core['mccoy_deep_depth_m'])
-    ax_do, ax_ts = _journal_lens_axes(fig)
-    ax_do.axhspan(shallow_depth, deep_depth, color=colors['lens'], lw=0, zorder=0)
-    ax_do.axhline(core_depth, color=warm_color, lw=0.7, ls=(0, (4, 2)), zorder=1)
-    for _, row in controls.iterrows():
-        prof = _lens_levels(levels, row['profile_number'])
-        ax_do.plot(prof['do_umol_kg'], prof['depth_m'], color=colors['neutral'], lw=0.7, zorder=2)
-        if row[f'has_delta_do_{peak_tag}']:
-            depth = float(row[f'delta_do_peak_depth_m_{peak_tag}'])
-            ax_do.plot(np.interp(depth, prof['depth_m'], prof['do_umol_kg']), depth, 'o', ms=2.8,
-                       mfc=colors['neutral'], mec='white', mew=0.3, zorder=3)
-    ax_do.plot(ap['do_umol_kg'], ap['depth_m'], color=warm_color, lw=1.2, zorder=4)
-    ax_do.plot(np.interp(peak_depth, ap['depth_m'], ap['do_umol_kg']), peak_depth, 'o', ms=3.5, mfc=colors['accent'],
-               mec='white', mew=0.4, zorder=5)
-
-    _journal_ts_axes(ax_ts, float(anchor['lon']), float(anchor['lat']))
-    for _, row in controls.iterrows():
-        prof = _lens_levels(levels, row['profile_number'], (100, 1000))
-        ax_ts.plot(prof['salinity'], prof['theta'], color=colors['neutral'], lw=0.7, zorder=2)
-    segment = ap[ap['depth_m'].between(100, 1000)]
-    ax_ts.plot(segment['salinity'], segment['theta'], color=warm_color, lw=1.1, zorder=3)
-    lens = ap[ap['depth_m'].between(shallow_depth, deep_depth)]
-    ax_ts.plot(lens['salinity'], lens['theta'], color=warm_color, lw=2.6, alpha=0.35, zorder=2.5,
-               solid_capstyle='round')
-    at_peak = ap.iloc[(ap['depth_m'] - peak_depth).abs().argmin()]
-    at_core = ap.iloc[(ap['depth_m'] - core_depth).abs().argmin()]
-    ax_ts.plot(at_peak['salinity'], at_peak['theta'], 'o', ms=3.5, mfc=colors['accent'], mec='white', mew=0.4,
-               zorder=5)
-    ax_ts.plot(at_core['salinity'], at_core['theta'], 'D', ms=3.2, mfc='white', mec=warm_color, mew=0.9, zorder=5)
-    handles = [
-        Line2D([], [], color=warm_color, lw=1.2),
-        Line2D([], [], color=colors['neutral'], lw=0.7),
-        Line2D([], [], ls='none', marker='o', ms=3.5, mfc=colors['accent'], mec='white'),
-        Line2D([], [], ls='none', marker='o', ms=2.8, mfc=colors['neutral'], mec='white'),
-        (Patch(facecolor=colors['lens'], edgecolor='none'), Line2D([], [], color=warm_color, lw=2.6, alpha=0.35)),
-        (Line2D([], [], color=warm_color, lw=0.7, ls=(0, (4, 2))),
-         Line2D([], [], ls='none', marker='D', ms=3.2, mfc='white', mec=warm_color, mew=0.9)),
-    ]
-    control_dates = pd.to_datetime(controls['date'])
-    labels = [
-        f"{int(anchor['platform_number'])}, {pd.Timestamp(anchor['date']):%-d %b} ({warm_type} SCV anchor)",
-        f'Its {_count_word(len(controls))} matched controls, {control_dates.min():%-d}–{control_dates.max():%-d %b}',
-        f'ΔDO{peak_tag} peak of the anchor',
-        f'ΔDO{peak_tag} peaks of controls',
-        'Catalogue vertical extent of the lens',
-        'Catalogue core',
-    ]
-    fig.legend(handles=handles, labels=labels, loc='upper left', bbox_to_anchor=_inch_point(fig, 0.12, 0.84),
+    fig.legend(handles=handles, labels=labels, loc='upper left',
+               bbox_to_anchor=_inch_point(fig, 4.8, _inch_size(fig)[1] - 0.25),
                fontsize=6.4, handlelength=1.8, handletextpad=0.5, labelspacing=0.35)
 
 
@@ -32871,19 +32731,17 @@ def plot_argo_lens_case(
     series_period: tuple[str, str],
     map_extent: tuple[float, float, float, float],
     event_label_positions: dict[int, tuple[float, float]] | None = None,
-    scv_label_positions: dict[int, tuple[float, float]] | None = None,
     output_dir: str | Path | None = None,
     show_fig: bool = True,
     save_fig: bool = True,
     save_data: bool = True,
 ) -> dict:
-    """组合绘制一个浮标阵列氧透镜个例：位置、目标等密面氧序列、冷透镜与暖透镜 SCV 对照。
+    """组合绘制一个浮标阵列冷透镜个例：位置、目标等密面氧序列与冷事件剖面对照同期背景。
 
-    读取 `build_argo_lens_case` 为 name 写出的五张表与个例参数。(a) 画阵列剖面位置、按日期着色的冷事件、SCV
-    锚点与其匹配对照；(b) 画冷事件所在浮标在 series_period 内目标等密面上的氧，事件剖面着色、事件窗口加底；
-    (c) 画冷事件剖面（highlight_profile 加粗并标峰）对照同期无峰背景的氧百分位与 T–S 分布；(d) 画 SCV 锚点
-    剖面、其峰与匹配对照，并标出 McCoy 目录核心深度与垂向范围。暖透镜颜色取 McCoy 目录类型。标注位置等
-    版式细节由调用处按个例给出，track.py 不保存个例默认值。全图 7 in 宽，按期刊版式绘制。
+    读取 `build_argo_lens_case` 为 name 写出的三张表与个例参数。(a) 画阵列剖面位置与按日期着色的冷事件；
+    (b) 画冷事件所在浮标在 series_period 内目标等密面上的氧，事件剖面着色、事件窗口加底；(c) 画冷事件剖面
+    （highlight_profile 加粗并标峰）对照同期无峰背景的氧百分位与 T–S 分布。标注位置等版式细节由调用处按个例
+    给出，track.py 不保存个例默认值。全图 7 in 宽，按期刊版式绘制。
 
     参数:
         - name (str): 个例名，即 `build_argo_lens_case` 的输出子目录名。
@@ -32891,7 +32749,6 @@ def plot_argo_lens_case(
         - series_period (tuple[str, str]): (b) 等密面氧序列的起止日期（含）；横轴两端各留 3 天。
         - map_extent (tuple[float, float, float, float]): (a) 地图范围 (lon0, lon1, lat0, lat1)。
         - event_label_positions (dict[int, tuple[float, float]] | None): (a) 冷事件浮标标注位置，按浮标编号；缺省时标在浮标事件均位下方 0.5°。
-        - scv_label_positions (dict[int, tuple[float, float]] | None): (a) SCV 锚点与对照标注位置，按剖面编号；缺省时标在点上方 0.4°。
         - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_argo_lens_case/<name>` 目录。
         - show_fig (bool): 是否显示图，默认 True。
         - save_fig (bool): 是否保存 PNG，默认 True。
@@ -32902,7 +32759,7 @@ def plot_argo_lens_case(
 
     输出:
         - `argo_lens_case.png`（save_fig 时）。
-        - `a_positions.csv`、`b_isopycnal_series.csv`、`c_background_do.csv`、`c_profile_roles.csv`、`d_scv_set.csv`、`d_scv_core.csv`：各面板来源数据（save_data 时）。
+        - `a_positions.csv`、`b_isopycnal_series.csv`、`c_background_do.csv`、`c_profile_roles.csv`：各面板来源数据（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
@@ -32911,10 +32768,6 @@ def plot_argo_lens_case(
     levels = pd.read_parquet(case_dir / 'lens_case_levels.parquet')
     profiles = pd.read_parquet(case_dir / 'lens_case_profiles.parquet')
     background = pd.read_parquet(case_dir / 'lens_case_background_do.parquet')
-    scv_set = pd.read_parquet(case_dir / 'lens_case_scv_set.parquet')
-    scv_core = pd.read_parquet(case_dir / 'lens_case_scv_core.parquet')
-    warm_type = {'M': 'minty', 'S': 'spicy'}[str(scv_core['mccoy_scv_type'].iloc[0])]
-    warm_color = _JOURNAL_COLORS[warm_type]
     event_tag = _format_detection_value(float(spec['event_threshold']))
 
     cold = profiles[profiles['cold_event']]
@@ -32929,13 +32782,11 @@ def plot_argo_lens_case(
     xlim = (series_start - pd.Timedelta(days=3), series_end + pd.Timedelta(days=3))
 
     with plt.rc_context(_journal_rc()):
-        fig, cells = _journal_panel_grid([(2.9, 2), (3.5, 2)])
-        _draw_lens_map_panel(cells[0], profiles, scv_set, spec, warm_color, map_extent,
-                             event_label_positions or {}, scv_label_positions or {})
+        fig, cells = _journal_panel_grid([(2.9, 2), (2.7, 1)])
+        _draw_lens_map_panel(cells[0], profiles, spec, map_extent, event_label_positions or {})
         _draw_lens_isopycnal_panel(cells[1], series, window, float(spec['sigma0']), event_tag, len(floats), xlim)
         _draw_cold_lens_panel(cells[2], levels, profiles, background, int(highlight_profile), spec)
-        _draw_warm_lens_panel(cells[3], levels, scv_set, scv_core.iloc[0], warm_color, warm_type, spec)
-        for cell, label in zip(cells, 'abcd'):
+        for cell, label in zip(cells, 'abc'):
             _journal_panel_label(cell, f'({label})')
         out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_argo_lens_case', region_slug) / name
         figure_path = _journal_save(fig, out_dir, 'argo_lens_case', show_fig, save_fig)
@@ -32946,13 +32797,10 @@ def plot_argo_lens_case(
         pd.DataFrame({'profile_number': cold.sort_values('date')['profile_number'], 'role': 'cold_event'}),
     ], ignore_index=True).assign(box_lon_min=box[0], box_lon_max=box[1], box_lat_min=box[2], box_lat_max=box[3])
     sources = {
-        'a_positions': profiles[['profile_number', 'platform_number', 'date', 'lon', 'lat', 'cold_event',
-                                 'scv_set_role']],
+        'a_positions': profiles[['profile_number', 'platform_number', 'date', 'lon', 'lat', 'cold_event']],
         'b_isopycnal_series': series,
         'c_background_do': background,
         'c_profile_roles': roles,
-        'd_scv_set': scv_set,
-        'd_scv_core': scv_core,
     }
     if save_data:
         _journal_write_sources(out_dir, sources)
