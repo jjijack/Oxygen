@@ -27,14 +27,15 @@ FIGURES = {
     'Fig1': ('plot_argo_do_occurrence_overview', 'argo_do_occurrence_overview'),
     'Fig2': ('plot_argo_do_occurrence_by_eddy_setting', 'argo_do_occurrence_by_eddy_setting'),
     'Fig3': ('plot_scv_matched_anchors', 'scv_matched_anchors'),
-    'Fig4': ('plot_scv_case_profiles/ke_minty_spicy', 'scv_case_profiles'),
+    'Fig4': ('plot_scv_case_local_context/ke_minty_spicy', 'scv_case_local_context'),
     'FigS1': ('plot_argo_do_occurrence_maps', 'argo_do_occurrence_maps'),
     'FigS2': ('do_density_coordinate_sensitivity', 'do_density_coordinate_sensitivity_do50_depth300m'),
     'FigS3': ('plot_scv_matching_diagnostics', 'scv_matching_diagnostics'),
     'FigS4': ('plot_scv_glorys_representation', 'scv_glorys_representation'),
     'FigS5': ('plot_argo_ke_sampling_by_year', 'argo_ke_sampling_by_year'),
     'FigS6': ('plot_argo_lens_case/pmove_2014', 'argo_lens_case'),
-    'FigS7': ('plot_scv_case_profiles/atlantic_spicy', 'scv_case_profiles'),
+    'FigS7': ('plot_scv_case_profiles/ke_minty_spicy', 'scv_case_profiles'),
+    'FigS8': ('plot_scv_case_profiles/atlantic_spicy', 'scv_case_profiles'),
 }
 # Source data written by producers other than the figure's plotter.
 EXTRA_SOURCES = {
