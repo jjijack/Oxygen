@@ -32415,42 +32415,62 @@ def _draw_peak_core_offset_panel(fig, table: pd.DataFrame, tolerance_m: float, r
                fontsize=6.4, handletextpad=0.3, columnspacing=1.0)
 
 
-def _draw_type_region_panel(fig, table: pd.DataFrame, threshold: float) -> None:
-    """按锚点区域与 SCV 类型分组，画锚点及其对照中有峰剖面的比例；KE 框内 spicy 组样本少，淡化显示。"""
+def _anchor_markers(ax, frame: pd.DataFrame, x, y: str, filled: pd.Series, size: float = 13) -> None:
+    """按 SCV 类型着色、KE 框内外分三角与圆、有无峰分实心与空心画锚点。"""
+    colors = _JOURNAL_COLORS
+    for kind in ('minty', 'spicy'):
+        for region, marker in (('Outside KE', 'o'), ('KE box', '^')):
+            mask = ((frame['type'] == kind) & (frame['region'] == region)).to_numpy()
+            for solid in (True, False):
+                sub = mask & (filled.to_numpy() == solid)
+                ax.scatter(np.asarray(x)[sub], frame[y].to_numpy()[sub], s=size, marker=marker,
+                           facecolors=colors[kind] if solid else 'white', edgecolors='white' if solid else colors[kind],
+                           linewidths=0.3 if solid else 0.7, zorder=4 if solid else 3)
+
+
+def _draw_core_oxygen_contrast_panel(fig, sets: pd.DataFrame, summary: pd.DataFrame, threshold: float,
+                                     rng: np.random.Generator) -> None:
+    """按 SCV 类型画全部匹配集锚点核心等密面上的氧差，标中位数与按锚点浮标重抽的区间及两类之差。"""
     colors = _JOURNAL_COLORS
     tag = _format_detection_value(float(threshold))
-    groups = [('KE box', 'minty'), ('KE box', 'spicy'), ('Outside KE', 'minty'), ('Outside KE', 'spicy')]
-    ax = _inch_axes(fig, 0.55, 0.8, 0.08, 0.2)
-    width = 0.36
-    centres = {}
-    for g, (region, kind) in enumerate(groups):
-        x0 = g + (0.35 if region == 'Outside KE' else 0.0)
-        centres[(region, kind)] = x0
-        faded = region == 'KE box' and kind == 'spicy'
-        for role, dx in (('anchor', -width / 2), ('control', width / 2)):
-            row = table[(table['region'] == region) & (table['type'] == kind) & (table['role'] == role)].iloc[0]
-            rate = 100 * row[f'do{tag}'] / row['n']
-            ax.bar(x0 + dx, rate, width=width * 0.92, color=colors[kind] if role == 'anchor' else colors['neutral'],
-                   alpha=0.35 if faded else 1.0, lw=0, zorder=2)
-            ax.text(x0 + dx, rate + 1.2, f"{int(row[f'do{tag}'])}/{int(row['n'])}", ha='center', va='bottom',
-                    fontsize=6.3, color=colors['ink'], alpha=0.6 if faded else 1.0)
-        ax.annotate(kind.capitalize(), xy=(x0, 0), xycoords=('data', 'axes fraction'), xytext=(0, -4),
-                    textcoords='offset points', ha='center', va='top', fontsize=7)
-    for region in ('KE box', 'Outside KE'):
-        xc = np.mean([centres[(region, kind)] for kind in ('minty', 'spicy')])
-        ax.annotate(region, xy=(xc, 0), xycoords=('data', 'axes fraction'), xytext=(0, -15),
-                    textcoords='offset points', ha='center', va='top', fontsize=7.5, fontweight='bold')
-    ax.set_xticks([])
-    ax.set_xlim(-0.55, 3.9)
-    ax.set_ylim(0, 75)
-    ax.set_ylabel(f'Profiles with ΔDO{tag} (%)')
+    col = 'do_contrast_isopycnal'
+    ax = _inch_axes(fig, 0.66, 0.8, 0.08, 0.3)
+    ax.axhline(0, color=colors['muted'], lw=0.6, zorder=1)
+    stats = summary[summary['quantity'] == col].set_index('group')
+    x = np.empty(len(sets))
+    for k, kind in enumerate(('minty', 'spicy')):
+        mask = (sets['type'] == kind).to_numpy()
+        x[mask] = k + rng.uniform(-0.17, 0.17, mask.sum())
+        row = stats.loc[kind]
+        ax.plot([k - 0.24, k + 0.24], [row['median']] * 2, color=colors['ink'], lw=1.3, zorder=5)
+        ax.errorbar(k + 0.33, row['median'], yerr=[[row['median'] - row['ci_low']], [row['ci_high'] - row['median']]],
+                    fmt='none', ecolor=colors['ink'], elinewidth=0.9, capsize=2.2, capthick=0.9, zorder=5)
+    ax.set_xlim(-0.5, 1.5)
+    ax.set_ylim(-120, 130)
+    ax.yaxis.set_major_locator(MultipleLocator(50))
+    _anchor_markers(ax, sets, x, col, sets[f'has_delta_do_{tag}'].astype(bool))
+
+    def interval(row: pd.Series) -> str:
+        return f"{row['median']:+.1f} ({row['ci_low']:+.1f} to {row['ci_high']:+.1f})".replace('-', '−')
+
+    ax.text(0.02, 0.98, f"Minty − spicy: {interval(stats.loc['minty − spicy'])}", transform=ax.transAxes,
+            ha='left', va='top', fontsize=6.3, color=colors['ink'])
+    ax.set_xticks([0, 1], [f"{kind.capitalize()} (n = {int(stats.loc[kind, 'n_sets'])})\n{interval(stats.loc[kind])}"
+                           for kind in ('minty', 'spicy')], linespacing=1.3)
+    ax.tick_params(axis='x', length=0)
+    ax.set_ylabel(f'Core O$_2$, anchor − controls\n({_JOURNAL_UNIT}, on core σ$_0$)')
     _journal_light_grid(ax, 'y')
     handles = [
-        Patch(facecolor=colors['minty'], label='Minty anchors'),
-        Patch(facecolor=colors['spicy'], label='Spicy anchors'),
-        Patch(facecolor=colors['neutral'], label='Controls matched to them'),
+        Line2D([], [], ls='none', marker='o', ms=4, mfc=colors['neutral'], mec='white', mew=0.3,
+               label='Anchor outside KE'),
+        Line2D([], [], ls='none', marker='^', ms=4.4, mfc=colors['neutral'], mec='white', mew=0.3,
+               label='Anchor in KE box'),
+        Line2D([], [], ls='none', marker='o', ms=4, mfc='white', mec=colors['neutral'], mew=0.7,
+               label=f'Open: no ΔDO{tag} maximum'),
+        Line2D([], [], color=colors['ink'], lw=1.3, label='Median and anchor-float 95% interval'),
     ]
-    ax.legend(handles=handles, loc='upper right', fontsize=6.4, handlelength=1.0, handletextpad=0.4)
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=_inch_point(fig, 1.85, 0.36), ncol=2,
+               fontsize=6.2, handletextpad=0.3, columnspacing=1.0)
 
 
 def plot_scv_matched_anchors(
@@ -32463,12 +32483,13 @@ def plot_scv_matched_anchors(
     save_fig: bool = True,
     save_data: bool = True,
 ) -> dict:
-    """组合绘制 SCV 匹配比较的锚点与对照：位置、峰相对核心的深度偏移，以及类型 × 区域的峰比例。
+    """组合绘制 SCV 匹配比较的锚点与对照：位置、峰相对核心的深度偏移，以及锚点核心水团相对对照的氧差。
 
-    读取 `run_scv_matched_effects.py` 写出的主匹配队列。(a) 全球图上画锚点（minty/spicy，有无最低阈值峰）与
-    匹配对照，右侧放大 KE 框；(b) 对 thresholds 各阈值，画有峰剖面的峰深减锚点目录核心深度，标出落在队列
-    core_anomaly_tolerance_m 内的比例，横向抖动由项目种子派生；(c) 按锚点区域（KE 框内外）与 SCV 类型分组，
-    画锚点及其对照中带最低阈值峰的比例。全图 7 in 宽，按期刊版式绘制。
+    读取 `run_scv_matched_effects.py` 写出的主匹配队列与 `calculate_scv_core_oxygen_contrast` 的结果。(a) 全球图
+    上画锚点（minty/spicy，有无最低阈值峰）与匹配对照，右侧放大 KE 框；(b) 对 thresholds 各阈值，画有峰剖面的
+    峰深减锚点目录核心深度，标出落在队列 core_anomaly_tolerance_m 内的比例，横向抖动由项目种子派生；(c) 按
+    类型画全部匹配集锚点核心等密面上的氧减对照均值，KE 框内外分符号、有无最低阈值峰分实空，标中位数、锚点
+    浮标重抽区间与两类之差。全图 7 in 宽，按期刊版式绘制。
 
     参数:
         - thresholds (tuple[float, ...]): ΔDO 阈值；(a)(c) 用最低一档，默认 (20, 35, 50)。
@@ -32485,7 +32506,7 @@ def plot_scv_matched_anchors(
 
     输出:
         - `scv_matched_anchors.png`（save_fig 时）。
-        - `a_positions.csv`、`b_peak_core_offsets.csv`、`c_type_region.csv`：各面板来源数据（save_data 时）。
+        - `a_positions.csv`、`b_peak_core_offsets.csv`、`c_core_oxygen_contrast.csv`、`c_core_oxygen_contrast_summary.csv`：各面板来源数据（save_data 时）。
     """
     region_slug = _current_region_key()
     cfg = make_detection_config('do')
@@ -32493,20 +32514,22 @@ def plot_scv_matched_anchors(
     low_tag = _format_detection_value(float(thresholds[0]))
     offsets = _scv_peak_core_offsets(queue, thresholds)
     tolerance = float(queue['core_anomaly_tolerance_m'].iloc[0])
-    counts = {'n': ('is_scv', 'size')}
-    for threshold in thresholds:
-        tag = _format_detection_value(float(threshold))
-        counts[f'do{tag}'] = (f'has_delta_do_{tag}', 'sum')
-    type_region = queue.groupby(['region', 'type', 'role']).agg(**counts).reset_index()
-    rng = np.random.default_rng(
-        _stable_analysis_seed(int(_scv_matched_control_config()['random_seed']), 'scv_peak_core_offset_jitter')
+    contrast_dir = cfg.output_dir('scv_core_oxygen_contrast', region_slug)
+    anchor_peaks = queue.loc[queue['role'] == 'anchor', ['profile_number', f'has_delta_do_{low_tag}']]
+    contrast = pd.read_parquet(contrast_dir / 'scv_core_oxygen_contrast_sets.parquet').merge(
+        anchor_peaks.rename(columns={'profile_number': 'anchor_profile_number'}), on='anchor_profile_number',
+        how='left', validate='one_to_one',
     )
+    contrast_summary = pd.read_parquet(contrast_dir / 'scv_core_oxygen_contrast_summary.parquet')
+    seed = int(_scv_matched_control_config()['random_seed'])
+    rng = np.random.default_rng(_stable_analysis_seed(seed, 'scv_peak_core_offset_jitter'))
+    contrast_rng = np.random.default_rng(_stable_analysis_seed(seed, 'scv_core_oxygen_contrast_jitter'))
 
     with plt.rc_context(_journal_rc()):
         fig, cells = _journal_panel_grid([(2.75, 1), (2.95, 2)])
         _draw_scv_anchor_map_panel(cells[0], queue, (*ke_lon_bounds, *ke_lat_bounds), zoom_extent, thresholds[0])
         _draw_peak_core_offset_panel(cells[1], offsets, tolerance, rng)
-        _draw_type_region_panel(cells[2], type_region, thresholds[0])
+        _draw_core_oxygen_contrast_panel(cells[2], contrast, contrast_summary, thresholds[0], contrast_rng)
         for cell, label in zip(cells, 'abc'):
             _journal_panel_label(cell, f'({label})')
         out_dir = Path(output_dir) if output_dir is not None else cfg.output_dir('plot_scv_matched_anchors', region_slug)
@@ -32516,7 +32539,8 @@ def plot_scv_matched_anchors(
         'a_positions': queue[['match_set_id', 'role', 'profile_number', 'platform_number', 'date', 'lon', 'lat',
                               'type', 'region', f'has_delta_do_{low_tag}']],
         'b_peak_core_offsets': offsets,
-        'c_type_region': type_region,
+        'c_core_oxygen_contrast': contrast,
+        'c_core_oxygen_contrast_summary': contrast_summary,
     }
     if save_data:
         _journal_write_sources(out_dir, sources)
@@ -35101,6 +35125,152 @@ def calculate_scv_core_alignment(
         result.to_parquet(out_dir / 'scv_core_alignment_null.parquet', index=False)
         print(f'[*] SCV core-alignment null saved: {out_dir / "scv_core_alignment_null.parquet"}')
     return result
+
+
+def calculate_scv_core_oxygen_contrast(
+    queue_path: str | Path | None = None,
+    argo_data_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    save_data: bool = True,
+) -> dict:
+    """比较主匹配队列中每个锚点目录核心处的氧与位温和同组对照的差，按 SCV 类型与区域汇总。
+
+    队列中每条剖面按共同预处理清洗后补算位温与 σ0。每个匹配集取锚点剖面在目录核心深度处的 σ0 作为核心
+    等密面，锚点与各对照在该等密面上插值氧与位温（单调 σ0 包络，剖面不跨该密度时记缺测），对照取有效值的
+    平均，锚点减对照即核心等密面差；锚点核心深度处的同类差一并给出。汇总按全部、SCV 类型及类型 × 区域
+    （KE 框内外）分组，给出中位数、按锚点浮标重抽的 95% 区间与正值比例；minty 与 spicy 的中位数之差在
+    同一套浮标重抽中计算，两类都有的浮标同时进出。
+
+    参数:
+        - queue_path (str | Path | None): 主匹配队列 parquet；None 时取 `scv_matched_effects` 目录下的 qualified_analysis_queue.parquet。
+        - argo_data_dir (str | Path | None): 年度 Argo parquet 目录；None 时使用配置中的 argo_parquet。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `scv_core_oxygen_contrast` 目录。
+        - save_data (bool): 是否写出两张表，默认 True。
+
+    返回:
+        - dict: 含 sets（逐匹配集的核心 σ0、锚点与对照均值及其差）、summary（各组与类型差值的中位数、区间与正值比例）与 output_dir。
+
+    输出:
+        - `scv_core_oxygen_contrast_sets.parquet`：逐匹配集结果（save_data 时）。
+        - `scv_core_oxygen_contrast_summary.parquet`：分组汇总与类型差值（save_data 时）。
+
+    说明:
+        - 重抽次数与基础种子取 processing.yml:processing.scv_matched_control 的 bootstrap_iterations 与 random_seed；每个量 × 组的种子为 _stable_analysis_seed(random_seed, 'scv_core_oxygen_contrast', 量, 组)。
+        - 核心等密面差比较的是同一密度上的不同剖面，与剖面内相邻深度比较的 ΔDO 不是同一个量。
+    """
+    match_cfg = _scv_matched_control_config()
+    draws = int(match_cfg['bootstrap_iterations'])
+    base_seed = int(match_cfg['random_seed'])
+    region_slug = _current_region_key()
+    queue = _scv_matched_queue_display(
+        pd.read_parquet(Path(queue_path) if queue_path is not None else _scv_matched_queue_path(region_slug))
+    )
+    cfg = make_detection_config('do')
+    raw = pd.concat(
+        [load_argo_data(int(year), argo_data_dir, profile_ids=set(ids.astype(int)))
+         for year, ids in queue.groupby('year')['profile_number']],
+        ignore_index=True,
+    )
+    raw['Profile_number'] = raw['Profile_number'].astype(int)
+
+    columns = {}
+    for profile_number, profile in raw.groupby('Profile_number', sort=False):
+        cleaned, _ = _prepare_do_profile_for_detection(profile, cfg)
+        if cleaned is None:
+            raise ValueError(f'Queue profile {profile_number} fails the shared DO preprocessing.')
+        lon, lat = float(profile['Longitude'].iloc[0]), float(profile['Latitude'].iloc[0])
+        depth = cleaned['Depth'].to_numpy(float)
+        pressure = gsw.p_from_z(-depth, lat)
+        temperature = cleaned['Temperature'].to_numpy(float)
+        absolute_salinity = gsw.SA_from_SP(cleaned['Salinity'].to_numpy(float), pressure, lon, lat)
+        columns[int(profile_number)] = {
+            'depth': depth, 'do': cleaned['DO'].to_numpy(float),
+            'theta': gsw.pt0_from_t(absolute_salinity, temperature, pressure),
+            'sigma0': gsw.sigma0(absolute_salinity, gsw.CT_from_t(absolute_salinity, temperature, pressure)),
+        }
+
+    def at_depth(profile_number: int, var: str, depth: float) -> float:
+        col = columns[profile_number]
+        return float(np.interp(depth, col['depth'], col[var], left=np.nan, right=np.nan))
+
+    def on_isopycnal(profile_number: int, var: str, sigma: float) -> float:
+        col = columns[profile_number]
+        return _profile_value_on_isopycnal(col['sigma0'], col[var], sigma)
+
+    rows = []
+    for set_id, group in queue.groupby('match_set_id', sort=True):
+        anchor = group.loc[group['is_scv'].astype(bool)].iloc[0]
+        controls = group.loc[~group['is_scv'].astype(bool), 'profile_number'].astype(int).tolist()
+        anchor_pn, core = int(anchor['profile_number']), float(anchor['anchor_core_depth_m'])
+        sigma_core = at_depth(anchor_pn, 'sigma0', core)
+        row = {'match_set_id': set_id, 'anchor_profile_number': anchor_pn,
+               'anchor_platform_number': int(anchor['platform_number']), 'type': anchor['type'],
+               'region': anchor['region'], 'core_depth_m': core, 'sigma0_core': sigma_core,
+               'n_controls': len(controls)}
+        control_do_iso = [on_isopycnal(pn, 'do', sigma_core) for pn in controls]
+        row['n_controls_on_isopycnal'] = int(np.isfinite(control_do_iso).sum())
+        for var in ('do', 'theta'):
+            for coordinate, value in (('isopycnal', lambda pn: on_isopycnal(pn, var, sigma_core)),
+                                      ('depth', lambda pn: at_depth(pn, var, core))):
+                control_values = np.array([value(pn) for pn in controls])
+                anchor_value = value(anchor_pn)
+                control_mean = np.nanmean(control_values) if np.isfinite(control_values).any() else np.nan
+                row[f'{var}_anchor_{coordinate}'] = anchor_value
+                row[f'{var}_controls_{coordinate}'] = control_mean
+                row[f'{var}_contrast_{coordinate}'] = anchor_value - control_mean
+        rows.append(row)
+    sets = pd.DataFrame(rows)
+
+    def platform_draws(frame: pd.DataFrame, statistic, seed_parts: tuple) -> np.ndarray:
+        by_platform = [part for _, part in frame.groupby('anchor_platform_number', sort=True)]
+        rng = np.random.default_rng(_stable_analysis_seed(base_seed, 'scv_core_oxygen_contrast', *seed_parts))
+        values = [statistic(pd.concat([by_platform[i] for i in rng.integers(0, len(by_platform), len(by_platform))]))
+                  for _ in range(draws)]
+        return np.asarray([v for v in values if np.isfinite(v)])
+
+    def type_difference(col: str):
+        def statistic(frame: pd.DataFrame) -> float:
+            minty = frame.loc[frame['type'] == 'minty', col].dropna()
+            spicy = frame.loc[frame['type'] == 'spicy', col].dropna()
+            return np.median(minty) - np.median(spicy) if len(minty) and len(spicy) else np.nan
+        return statistic
+
+    groups = [('all', np.ones(len(sets), dtype=bool))]
+    groups += [(kind, (sets['type'] == kind).to_numpy()) for kind in ('minty', 'spicy')]
+    groups += [(f'{kind} | {region}', ((sets['type'] == kind) & (sets['region'] == region)).to_numpy())
+               for kind in ('minty', 'spicy') for region in ('KE box', 'Outside KE')]
+    summary_rows = []
+    for col in ('do_contrast_isopycnal', 'do_contrast_depth', 'theta_contrast_isopycnal', 'theta_contrast_depth'):
+        for label, mask in groups:
+            frame = sets.loc[mask & sets[col].notna().to_numpy()]
+            boot = platform_draws(frame, lambda f: np.median(f[col]), (col, label))
+            summary_rows.append({
+                'quantity': col, 'group': label, 'n_sets': len(frame),
+                'n_anchor_platforms': frame['anchor_platform_number'].nunique(), 'median': frame[col].median(),
+                'ci_low': np.percentile(boot, 2.5), 'ci_high': np.percentile(boot, 97.5),
+                'fraction_positive': (frame[col] > 0).mean(),
+            })
+        for label, mask in (('minty − spicy', np.ones(len(sets), dtype=bool)),
+                            ('minty − spicy | Outside KE', (sets['region'] == 'Outside KE').to_numpy())):
+            frame = sets.loc[mask & sets[col].notna().to_numpy()]
+            statistic = type_difference(col)
+            boot = platform_draws(frame, statistic, (col, label))
+            summary_rows.append({
+                'quantity': col, 'group': label, 'n_sets': len(frame),
+                'n_anchor_platforms': frame['anchor_platform_number'].nunique(), 'median': statistic(frame),
+                'ci_low': np.percentile(boot, 2.5), 'ci_high': np.percentile(boot, 97.5),
+                'fraction_positive': np.nan,
+            })
+    summary = pd.DataFrame(summary_rows)
+
+    out_dir = (Path(output_dir) if output_dir is not None
+               else cfg.output_dir('scv_core_oxygen_contrast', region_slug))
+    if save_data:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sets.to_parquet(out_dir / 'scv_core_oxygen_contrast_sets.parquet', index=False)
+        summary.to_parquet(out_dir / 'scv_core_oxygen_contrast_summary.parquet', index=False)
+        print(f'[*] SCV core oxygen contrast saved to {out_dir}')
+    return {'sets': sets, 'summary': summary, 'output_dir': str(out_dir)}
 
 
 def _ofes_tracer_level_cells() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
