@@ -33087,6 +33087,331 @@ def plot_scv_case_profiles(
     return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
 
 
+def _scv_case_local_profiles(anchor_profile: int, anchor: pd.Series, radius_km: float,
+                             days: int) -> tuple[pd.DataFrame, dict[int, dict]]:
+    """取锚点 radius_km 内、前后 days 天的全部合格剖面（不按有无峰筛选，不含锚点），返回逐剖面的位置、距离、日期差与数组。"""
+    date = pd.Timestamp(anchor['date']).normalize()
+    start, end = date - pd.Timedelta(days=int(days)), date + pd.Timedelta(days=int(days))
+    eligibility = build_argo_profile_eligibility_table(
+        anomaly_min_depth=float(make_detection_config('do').anomaly_min_depth)
+    )
+    qualified = set(eligibility.loc[_argo_qualified_profile_mask(eligibility), 'Profile_number'].astype(int))
+    parts = []
+    for year in range(start.year, end.year + 1):
+        heads = load_argo_data(year).drop_duplicates('Profile_number').reset_index(drop=True)
+        dates = pd.to_datetime(dict(year=heads['Year'], month=heads['Month'], day=heads['Day']))
+        distance_km = great_circle_distance_m(heads['Longitude'].to_numpy(float), heads['Latitude'].to_numpy(float),
+                                              float(anchor['lon']), float(anchor['lat'])) / 1e3
+        numbers = heads['Profile_number'].astype(int)
+        keep = (dates.between(start, end).to_numpy() & (distance_km <= float(radius_km))
+                & numbers.isin(qualified).to_numpy() & (numbers != int(anchor_profile)).to_numpy())
+        parts.append(pd.DataFrame({
+            'year': year, 'profile_number': numbers[keep].to_numpy(),
+            'platform_number': heads.loc[keep, 'Platform_number'].astype(int).to_numpy(),
+            'date': dates[keep].to_numpy(), 'lon': heads.loc[keep, 'Longitude'].to_numpy(float),
+            'lat': heads.loc[keep, 'Latitude'].to_numpy(float), 'distance_km': distance_km[keep],
+        }))
+    local = pd.concat(parts, ignore_index=True)
+    local['days_from_anchor'] = (local['date'] - date).dt.days
+    return local, _scv_queue_profile_columns(local)
+
+
+def _depth_oxygen_band(profiles: dict[int, dict], grid: np.ndarray, min_profiles: int = 5) -> pd.DataFrame:
+    """把一组剖面的氧插到深度网格上，给出每层 10/50/90 百分位与参与剖面数（不足 min_profiles 的层记缺测）。"""
+    stack = np.vstack([np.interp(grid, col['depth'], col['do'], left=np.nan, right=np.nan)
+                       for col in profiles.values()])
+    count = np.isfinite(stack).sum(axis=0)
+    percentiles = np.full((3, grid.size), np.nan)
+    enough = count >= min_profiles
+    percentiles[:, enough] = np.nanpercentile(stack[:, enough], [10, 50, 90], axis=0)
+    return pd.DataFrame({'depth_m': grid, 'do_p10': percentiles[0], 'do_median': percentiles[1],
+                         'do_p90': percentiles[2], 'n_profiles': count})
+
+
+def _draw_scv_case_local_oxygen_panel(fig, case: pd.Series, anchor: dict, local: pd.DataFrame,
+                                      columns: dict, band: pd.DataFrame, xlim: tuple) -> None:
+    """画一个 SCV 个例的氧–深度剖面：锚点、突出显示的附近有峰剖面、全部附近剖面的氧百分位带，以及目录透镜、核心与峰。"""
+    colors = _JOURNAL_COLORS
+    kind = str(case['type'])
+    color = colors[kind]
+    w, h = _inch_size(fig)
+    fig.text(0.36 / w, 1 - 0.05 / h, f"{kind.capitalize()} SCV: maximum {case['peak_position']} the lens",
+             ha='left', va='top', fontsize=7.5, color=color, fontweight='bold')
+    fig.text(0.36 / w, 1 - 0.21 / h, f"Float {int(case['platform_number'])}, {pd.Timestamp(case['date']):%-d %b %Y}; "
+             f"lens {case['lens_top_depth_m']:.0f}–{case['lens_bottom_depth_m']:.0f} m, "
+             f"core {case['core_depth_m']:.0f} m", ha='left', va='top', fontsize=6.6, color=colors['muted'])
+    ax = _inch_axes(fig, 0.55, 0.42, 0.15, 0.42)
+    ax.axhspan(case['lens_top_depth_m'], case['lens_bottom_depth_m'],
+               color=colors['minty_light' if kind == 'minty' else 'lens'], alpha=0.7, lw=0, zorder=0)
+    ax.fill_betweenx(band['depth_m'], band['do_p10'], band['do_p90'], color=colors['grid'], alpha=0.9, lw=0,
+                     zorder=0.5)
+    ax.plot(band['do_median'], band['depth_m'], color=colors['neutral'], lw=0.9, zorder=1)
+    for pn in local.loc[local['highlighted'], 'profile_number']:
+        col = columns[int(pn)]
+        ax.plot(col['do'], col['depth'], color=color, lw=0.5, alpha=0.3, zorder=2)
+    ax.plot(anchor['do'], anchor['depth'], color=color, lw=1.5, zorder=4)
+    ax.axhline(case['core_depth_m'], color=color, lw=0.7, ls=(0, (4, 2)), zorder=3)
+    ax.plot(case['do_anchor_core_depth'], case['core_depth_m'], 'D', ms=3.4, mfc='white', mec=color, mew=0.9,
+            zorder=5)
+    ax.plot(case['peak_do'], case['peak_depth_m'], 'o', ms=3.6, mfc=colors['accent'], mec='white', mew=0.4, zorder=6)
+    ax.text(0.97, 0.04, f"{int(case['n_local'])} nearby profiles,\n{int(case['n_highlighted'])} highlighted",
+            transform=ax.transAxes, ha='right', va='bottom', fontsize=6.4, color=colors['muted'], linespacing=1.2)
+    ax.set_ylim(1000, 0)
+    ax.set_xlim(*xlim)
+    ax.xaxis.set_major_locator(MultipleLocator(50))
+    ax.yaxis.set_major_locator(MultipleLocator(200))
+    ax.set_xlabel(f'Dissolved oxygen ({_JOURNAL_UNIT})')
+    ax.set_ylabel('Depth (m)')
+
+
+def _draw_scv_case_local_ts_panel(fig, case: pd.Series, anchor: dict, local: pd.DataFrame, columns: dict,
+                                  depth_range: tuple, s_lim: tuple, t_lim: tuple) -> None:
+    """画一个 SCV 个例的 T–S：全部附近剖面的温盐点、突出显示的附近有峰剖面、锚点（透镜段加宽）及其核心与峰。"""
+    colors = _JOURNAL_COLORS
+    kind = str(case['type'])
+    color = colors[kind]
+    ax = _inch_axes(fig, 0.55, 0.42, 0.15, 0.22)
+    _journal_ts_axes(ax, float(case['lon']), float(case['lat']), s_lim, t_lim, (22.0, 28.0))
+
+    def within(col: dict, low: float, high: float) -> dict:
+        keep = (col['depth'] >= low) & (col['depth'] <= high)
+        return {var: col[var][keep] for var in ('salinity', 'theta')}
+
+    for pn in local['profile_number']:
+        seg = within(columns[int(pn)], *depth_range)
+        ax.scatter(seg['salinity'], seg['theta'], s=0.6, color=colors['neutral'], alpha=0.35, linewidths=0,
+                   zorder=1)
+    for pn in local.loc[local['highlighted'], 'profile_number']:
+        seg = within(columns[int(pn)], *depth_range)
+        ax.plot(seg['salinity'], seg['theta'], color=color, lw=0.5, alpha=0.3, zorder=2)
+    seg = within(anchor, *depth_range)
+    ax.plot(seg['salinity'], seg['theta'], color=color, lw=1.2, zorder=4)
+    seg = within(anchor, case['lens_top_depth_m'], case['lens_bottom_depth_m'])
+    ax.plot(seg['salinity'], seg['theta'], color=color, lw=2.6, alpha=0.35, zorder=3, solid_capstyle='round')
+    ax.plot(case['salinity_anchor_core_depth'], case['theta_anchor_core_depth'], 'D', ms=3.4, mfc='white', mec=color,
+            mew=0.9, zorder=5)
+    ax.plot(case['peak_salinity'], case['peak_theta'], 'o', ms=3.6, mfc=colors['accent'], mec='white', mew=0.4,
+            zorder=6)
+
+
+def _draw_scv_case_core_series_panel(fig, case: pd.Series, local: pd.DataFrame) -> None:
+    """画附近剖面在锚点核心等密面上的氧随日期的分布：全部附近剖面、其中突出显示的有峰剖面、锚点与正式对照均值。"""
+    colors = _JOURNAL_COLORS
+    kind = str(case['type'])
+    color = colors[kind]
+    ax = _inch_axes(fig, 0.55, 0.42, 0.15, 0.22)
+    date = pd.Timestamp(case['date'])
+    values = local.dropna(subset=['do_on_core_isopycnal'])
+    other = values[~values['highlighted']]
+    peaks = values[values['highlighted']]
+    ax.axhline(case['do_controls_isopycnal'], color=colors['muted'], lw=0.8, ls=(0, (4, 2)), zorder=1)
+    ax.scatter(other['date'], other['do_on_core_isopycnal'], s=7, facecolors='white', edgecolors=colors['neutral'],
+               linewidths=0.5, zorder=2)
+    ax.scatter(peaks['date'], peaks['do_on_core_isopycnal'], s=10, color=color, alpha=0.55, linewidths=0, zorder=3)
+    ax.plot(date, case['do_anchor_isopycnal'], 'D', ms=5, mfc='white', mec=color, mew=1.1, zorder=4)
+    ax.text(0.02, 0.96, f"O$_2$ on σ$_0$ = {case['sigma0_core']:.2f} kg m$^{{-3}}$", transform=ax.transAxes,
+            ha='left', va='top', fontsize=6.4, color=colors['ink'])
+    dates = pd.to_datetime(values['date'])
+    ax.set_xlim(min(dates.min(), date) - pd.Timedelta(days=2), max(dates.max(), date) + pd.Timedelta(days=2))
+    ax.xaxis.set_major_locator(mdates.DayLocator(bymonthday=[1, 10, 20]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%-d %b'))
+    shown = np.r_[values['do_on_core_isopycnal'].to_numpy(float), case['do_anchor_isopycnal'],
+                  case['do_controls_isopycnal']]
+    span = np.nanmax(shown) - np.nanmin(shown)
+    ax.set_ylim(np.nanmin(shown) - 0.08 * span, np.nanmax(shown) + 0.15 * span)
+    ax.set_ylabel(f'Core-density O$_2$ ({_JOURNAL_UNIT})')
+    _journal_light_grid(ax, 'y')
+
+
+def plot_scv_case_local_context(
+    name: str,
+    anchor_profiles: list[int],
+    local_radius_km: float = 150.0,
+    local_days: int = 30,
+    highlight_radius_km: float = 100.0,
+    highlight_days: int = 15,
+    highlight_threshold: float = 35.0,
+    peak_threshold: float = 20.0,
+    ts_depth_range: tuple[float, float] = (100.0, 1000.0),
+    output_dir: str | Path | None = None,
+    show_fig: bool = True,
+    save_fig: bool = True,
+    save_data: bool = True,
+) -> dict:
+    """组合绘制若干 SCV 锚点个例在附近观测中的氧–深度剖面与 T–S 关系。
+
+    每个锚点取 local_radius_km 内、前后 local_days 天的全部合格剖面作为当地参照（不按有无峰筛选，不含锚点），
+    按 DO 检测器共用预处理读取。氧–深度面板画锚点（按目录类型着色）、全部当地剖面逐深度的 10–90 百分位带与中位线，
+    以及其中被突出显示的附近有峰剖面（细线）：距锚点 highlight_radius_km 内、日期差不超过 highlight_days 天、
+    保存的最强局地峰达到 highlight_threshold 且峰深在锚点目录核深 ± 主匹配队列的核心容差内。突出显示的剖面仍计入
+    灰带。浅色带为锚点的目录垂向范围（目录上下界压力换算为深度），虚线与空心菱形为目录核心，橙点为锚点的 ΔDO 峰。
+    T–S 面板在 ts_depth_range 内画同一批剖面。第三排把全部当地剖面插值到锚点核心等密面（正式核心氧差所用的 σ0）上，
+    按日期画出其氧，突出显示的剖面实心着色，锚点为空心菱形，虚线为正式匹配对照在该等密面上的均值，二者之差即 Fig. 3c
+    的核心氧差。每列一个个例，氧–深度与温盐坐标各列共用；当地剖面在核心等密面上的汇总与正式对照结果一并写入来源表。
+    全图 7 in 宽，按期刊版式绘制。
+
+    参数:
+        - name (str): 输出子目录名。
+        - anchor_profiles (list[int]): 锚点剖面编号，按列顺序；须为主匹配队列中的 SCV 锚点。
+        - local_radius_km (float): 当地参照的距离上限（km），默认 150。
+        - local_days (int): 当地参照的日期差上限（天），默认 30。
+        - highlight_radius_km (float): 突出显示剖面的距离上限（km），默认 100。
+        - highlight_days (int): 突出显示剖面的日期差上限（天），默认 15。
+        - highlight_threshold (float): 突出显示剖面的 ΔDO 阈值（μmol/kg），默认 35。
+        - peak_threshold (float): 锚点 ΔDO 峰所用阈值（μmol/kg），默认 20。
+        - ts_depth_range (tuple[float, float]): T–S 面板显示的深度范围（m），默认 (100, 1000)。
+        - output_dir (str | Path | None): 输出目录；None 时为 DO 主线 `plot_scv_case_local_context/<name>` 目录。
+        - show_fig (bool): 是否显示图，默认 True。
+        - save_fig (bool): 是否保存 PNG，默认 True。
+        - save_data (bool): 是否写出来源数据 CSV，默认 True。
+
+    返回:
+        - dict: 含来源数据表 sources、figure_path（save_fig 时）与 output_dir。
+
+    输出:
+        - `scv_case_local_context.png`（save_fig 时）。
+        - `case_summary.csv`、`local_profiles.csv`、`local_oxygen_band.csv`：逐个例的目录范围、峰、当地剖面数与核心等密面上当地参照和正式对照的氧，逐条当地剖面的距离、日期差、峰与是否突出显示，以及逐深度的氧百分位与有效剖面数（save_data 时）。
+
+    说明:
+        - 当地参照只用于描述个例周围的垂向结构，与 Fig. 3c 所用的正式匹配对照不同；核心氧差仍按正式对照计算。
+        - 突出显示只是显示规则，不是事件或 SCV 识别；个例在群体结果之后选出，不估计任何排列的出现频率。
+    """
+    region_slug = _current_region_key()
+    cfg = make_detection_config('do')
+    tag = _format_detection_value(float(peak_threshold))
+    queue = _scv_matched_queue_display(pd.read_parquet(_scv_matched_queue_path(region_slug)))
+    anchor_rows = queue[queue['is_scv'].astype(bool)].set_index('profile_number')
+    missing = sorted(set(int(pn) for pn in anchor_profiles) - set(anchor_rows.index.astype(int)))
+    if missing:
+        raise ValueError(f'Profiles {missing} are not SCV anchors of the matched queue.')
+    tolerance = float(queue['core_anomaly_tolerance_m'].iloc[0])
+    anchors = _scv_queue_profile_columns(queue[queue['profile_number'].isin([int(pn) for pn in anchor_profiles])])
+    lens = _scv_anchor_lens_records(anchor_profiles).set_index('anchor_profile_number')
+    contrast = pd.read_parquet(cfg.output_dir('scv_core_oxygen_contrast', region_slug)
+                               / 'scv_core_oxygen_contrast_sets.parquet').set_index('anchor_profile_number')
+    lookups, _ = _do_threshold_anomaly_lookup(
+        [float(highlight_threshold)], start_year=2002, end_year=2023,
+        anomaly_min_depth=float(cfg.anomaly_min_depth), region_slug=region_slug,
+    )
+    strong = lookups[float(highlight_threshold)]
+    grid = np.arange(0.0, float(cfg.anomaly_max_depth) + 2.5, 5.0)
+
+    def at_depth(col: dict, var: str, depth: float) -> float:
+        return float(np.interp(depth, col['depth'], col[var], left=np.nan, right=np.nan))
+
+    cases, locals_, bands, columns = [], [], [], {}
+    for anchor_pn in anchor_profiles:
+        row = anchor_rows.loc[int(anchor_pn)]
+        col = anchors[int(anchor_pn)]
+        record = lens.loc[int(anchor_pn)]
+        formal = contrast.loc[int(anchor_pn)]
+        core = float(row['anchor_core_depth_m'])
+        peak = float(row[f'delta_do_peak_depth_m_{tag}'])
+        local, local_columns = _scv_case_local_profiles(int(anchor_pn), row, float(local_radius_km), int(local_days))
+        columns.update(local_columns)
+        local['strong_peak_depth_m'] = local['profile_number'].map(strong['depth'])
+        local['highlighted'] = (local['strong_peak_depth_m'].sub(core).abs() <= tolerance) \
+            & (local['distance_km'] <= float(highlight_radius_km)) \
+            & (local['days_from_anchor'].abs() <= int(highlight_days))
+        local['do_on_core_isopycnal'] = [
+            _profile_value_on_isopycnal(local_columns[int(pn)]['sigma0'], local_columns[int(pn)]['do'],
+                                        float(formal['sigma0_core']))
+            for pn in local['profile_number']
+        ]
+        band = _depth_oxygen_band(local_columns, grid)
+        on_core = local['do_on_core_isopycnal'].dropna()
+        position = ('within' if record['lens_top_depth_m'] <= peak <= record['lens_bottom_depth_m']
+                    else 'above' if peak < record['lens_top_depth_m'] else 'below')
+        cases.append({
+            'anchor_profile_number': int(anchor_pn), 'platform_number': int(row['platform_number']),
+            'date': row['date'], 'lon': float(row['lon']), 'lat': float(row['lat']), 'type': row['type'],
+            'region': row['region'], 'core_depth_m': core,
+            'lens_top_depth_m': float(record['lens_top_depth_m']),
+            'lens_bottom_depth_m': float(record['lens_bottom_depth_m']),
+            'peak_depth_m': peak, 'peak_delta_do': float(row[f'delta_do_value_{tag}']), 'peak_position': position,
+            'peak_do': at_depth(col, 'do', peak), 'peak_salinity': at_depth(col, 'salinity', peak),
+            'peak_theta': at_depth(col, 'theta', peak), 'do_anchor_core_depth': at_depth(col, 'do', core),
+            'salinity_anchor_core_depth': at_depth(col, 'salinity', core),
+            'theta_anchor_core_depth': at_depth(col, 'theta', core),
+            'n_local': len(local), 'n_local_floats': local['platform_number'].nunique(),
+            'n_highlighted': int(local['highlighted'].sum()),
+            'n_highlighted_floats': local.loc[local['highlighted'], 'platform_number'].nunique(),
+            'sigma0_core': float(formal['sigma0_core']), 'do_anchor_isopycnal': float(formal['do_anchor_isopycnal']),
+            'do_controls_isopycnal': float(formal['do_controls_isopycnal']),
+            'do_contrast_isopycnal': float(formal['do_contrast_isopycnal']),
+            'n_local_on_core_isopycnal': len(on_core), 'do_local_median_isopycnal': on_core.median(),
+            'do_local_p10_isopycnal': np.percentile(on_core, 10), 'do_local_p90_isopycnal': np.percentile(on_core, 90),
+        })
+        locals_.append(local.assign(anchor_profile_number=int(anchor_pn)))
+        bands.append(band.assign(anchor_profile_number=int(anchor_pn)))
+    case_summary = pd.DataFrame(cases)
+    local_profiles = pd.concat(locals_, ignore_index=True)
+    local_band = pd.concat(bands, ignore_index=True)
+
+    shown = [local_band[['do_p10', 'do_p90']].to_numpy().ravel()]
+    shown += [anchors[int(pn)]['do'][anchors[int(pn)]['depth'] <= 1000.0] for pn in anchor_profiles]
+    shown += [columns[int(pn)]['do'][columns[int(pn)]['depth'] <= 1000.0]
+              for pn in local_profiles.loc[local_profiles['highlighted'], 'profile_number']]
+    shown = np.concatenate(shown)
+    xlim = (max(0.0, np.floor(np.nanmin(shown) / 10) * 10 - 10), np.ceil(np.nanmax(shown) / 10) * 10 + 10)
+    ts = {var: np.concatenate([col[var][(col['depth'] >= ts_depth_range[0]) & (col['depth'] <= ts_depth_range[1])]
+                               for col in list(columns.values()) + list(anchors.values())])
+          for var in ('salinity', 'theta')}
+    s_lim = (np.floor(np.nanpercentile(ts['salinity'], 0.5) * 10) / 10 - 0.05,
+             np.ceil(np.nanpercentile(ts['salinity'], 99.5) * 10) / 10 + 0.05)
+    t_lim = (np.floor(np.nanmin(ts['theta'])) - 0.5, np.ceil(np.nanmax(ts['theta'])) + 0.5)
+
+    colors = _JOURNAL_COLORS
+    kinds = list(dict.fromkeys(case_summary['type']))
+    handles = [
+        *[Line2D([], [], color=colors[kind], lw=1.5) for kind in kinds],
+        (*[Line2D([], [], color=colors[kind], lw=0.6, alpha=0.5) for kind in kinds],
+         *[Line2D([], [], ls='none', marker='o', ms=3, mfc=colors[kind], mec='none', alpha=0.55) for kind in kinds]),
+        (Patch(facecolor=colors['grid'], edgecolor='none'), Line2D([], [], color=colors['neutral'], lw=0.9),
+         Line2D([], [], ls='none', marker='o', ms=1.8, mfc=colors['neutral'], mec='none', alpha=0.6),
+         Line2D([], [], ls='none', marker='o', ms=2.8, mfc='white', mec=colors['neutral'], mew=0.5)),
+        tuple(Patch(facecolor=colors['minty_light' if kind == 'minty' else 'lens'], alpha=0.7, edgecolor='none')
+              for kind in kinds),
+        (Line2D([], [], color=colors['muted'], lw=0.7, ls=(0, (4, 2))),
+         *[Line2D([], [], ls='none', marker='D', ms=3.4, mfc='white', mec=colors[kind], mew=0.9) for kind in kinds]),
+        Line2D([], [], ls='none', marker='o', ms=3.6, mfc=colors['accent'], mec='white'),
+    ]
+    labels = [
+        *[f'{kind.capitalize()} SCV anchor' for kind in kinds],
+        'Nearby peak-bearing profiles',
+        'All nearby profiles',
+        'Anchor lens extent',
+        'Anchor core',
+        f'Anchor ΔDO{tag} maximum',
+    ]
+    handles.append(Line2D([], [], color=colors['muted'], lw=0.8, ls=(0, (4, 2))))
+    labels.append('Matched-control mean')
+    n = len(cases)
+    with plt.rc_context(_journal_rc()):
+        fig, cells = _journal_panel_grid([(2.75, n), (2.45, n), (1.85, n), (0.42, 1)])
+        for k, case in case_summary.iterrows():
+            anchor_pn = int(case['anchor_profile_number'])
+            local = local_profiles[local_profiles['anchor_profile_number'] == anchor_pn]
+            band = local_band[local_band['anchor_profile_number'] == anchor_pn]
+            _draw_scv_case_local_oxygen_panel(cells[k], case, anchors[anchor_pn], local, columns, band, xlim)
+            _draw_scv_case_local_ts_panel(cells[n + k], case, anchors[anchor_pn], local, columns, ts_depth_range,
+                                          s_lim, t_lim)
+            _draw_scv_case_core_series_panel(cells[2 * n + k], case, local)
+        for cell, label in zip(cells[:3 * n], 'abcdefghi'):
+            _journal_panel_label(cell, f'({label})')
+        cells[3 * n].legend(handles=handles, labels=labels, loc='center', ncol=4, fontsize=6.4,
+                            handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)}, handlelength=3.4,
+                            handletextpad=0.5, columnspacing=1.2, labelspacing=0.35)
+        out_dir = (Path(output_dir) if output_dir is not None
+                   else cfg.output_dir('plot_scv_case_local_context', region_slug) / name)
+        figure_path = _journal_save(fig, out_dir, 'scv_case_local_context', show_fig, save_fig)
+
+    sources = {'case_summary': case_summary, 'local_profiles': local_profiles, 'local_oxygen_band': local_band}
+    if save_data:
+        _journal_write_sources(out_dir, sources)
+    return {'sources': sources, 'figure_path': figure_path, 'output_dir': str(out_dir)}
+
+
 def plot_argo_do_occurrence_maps(
     thresholds: tuple[float, ...] = (20.0, 35.0, 50.0),
     grid_step_deg: float = 3.0,
