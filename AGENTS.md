@@ -72,7 +72,7 @@ GLORYS NetCDF is not truly local. It is mounted from SJTU HPC through `sshfs`. I
 - **Hotspot maps**: `plot_argo_hotspots(...)` writes to `plot_outputs/<method>/<region>/plot_argo_hotspots/`.
 - **Argo 3D reconstruction**: `collect_argo_pool(...)` -> `_build_argo_3d_field(...)` -> slice and overview plotting helpers.
 - **OFES**: expensive public producers create fixed semantic outputs; lightweight loaders, reducers, and plotters consume them. `OFES.ipynb` keeps producer cells visible but unexecuted and retains executed lightweight summaries and figures.
-- **Argo Letter**: producers (`build_argo_do_occurrence_table`, `audit_scv_profile_identity`, the root-level `run_scv_matched_effects.py`, `calculate_scv_core_alignment`, `calculate_scv_matched_level_sensitivity`, `build_argo_lens_case`) write fixed outputs under `plot_outputs/`; the journal-format `plot_*` figure functions and `export_scv_matched_effect_tables` consume them; `assemble_argo_paper_package.py` copies figures and tables into the untracked `argo_paper_package/`. The `GLORYS.ipynb` section keeps producers unexecuted and figures executed.
+- **Argo Letter**: producers (`build_argo_do_occurrence_table`, `audit_scv_profile_identity`, the root-level `run_scv_matched_effects.py`, `calculate_scv_core_alignment`, `calculate_scv_matched_level_sensitivity`, `calculate_scv_core_oxygen_contrast`, `build_argo_lens_case`) write fixed outputs under `plot_outputs/`; the journal-format `plot_*` figure functions and `export_scv_matched_effect_tables` consume them; `assemble_argo_paper_package.py` copies figures and tables into the untracked `argo_paper_package/`. The `GLORYS.ipynb` section keeps producers unexecuted and figures executed.
 
 ## Running And Validation
 
