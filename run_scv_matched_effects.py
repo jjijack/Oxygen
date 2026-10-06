@@ -4,11 +4,12 @@
 The runner lives at the repository root and imports the adjacent track module;
 inputs and outputs resolve through the configured data paths, relative to the
 launch directory, as in track.py.
-It re-qualifies the original matched sets with the shared DO preprocessing,
-keeps anchors whose catalogue association is metadata-supported according to
+It keeps the original matched sets, re-qualifies their members and recomputes
+their ΔDO outcomes with the shared DO preprocessing, keeps anchors whose
+catalogue association is metadata-supported according to
 ``track.audit_scv_profile_identity``, and writes the qualified queue, matched
 Mantel-Haenszel ORs with cluster-bootstrap intervals (whole-profile and
-core-near maxima, globally, outside and inside the KE), and the near-zero and
+core-near maxima, globally, outside and inside the KE), and the cleaning and
 caliper sensitivities to ``plot_outputs/do/global_ocean/scv_matched_effects``.
 """
 from __future__ import annotations
@@ -164,10 +165,39 @@ def profile_audit(profile_data: pd.DataFrame, profile_ids: set[int]) -> tuple[pd
     return pd.DataFrame(rows), cleaned_profiles
 
 
+def recompute_outcomes(active: pd.DataFrame, profile_data: pd.DataFrame) -> pd.DataFrame:
+    """Recompute each member's ΔDO outcomes with the current shared preprocessing; the matched sets stay as built."""
+    frame = active.copy()
+    number = frame["profile_number"].astype(int)
+    rows = profile_data.loc[profile_data["Profile_number"].astype("Int64").isin(set(number))]
+    default_cfg = track.make_detection_config("do", anomaly_min_depth=300.0)
+    core_offset_limit = pd.to_numeric(frame["core_anomaly_tolerance_m"], errors="coerce")
+    core_depth = pd.to_numeric(frame["anchor_core_depth_m"], errors="coerce")
+    for threshold in THRESHOLDS:
+        tag = track._format_detection_value(float(threshold))
+        detected = track.calculate_delta_do(
+            rows, detection_config=track.make_detection_config(default_cfg, do_threshold=float(threshold)),
+            include_aou=False, verbose=False,
+        )
+        if detected.empty:
+            best = pd.DataFrame(columns=["delta_do", "depth"], dtype=float)
+        else:
+            best = detected.loc[detected.groupby("Profile_number")["delta_do"].idxmax()].set_index("Profile_number")
+            best.index = best.index.astype(int)
+        frame[f"has_delta_do_{tag}"] = number.isin(best.index)
+        frame[f"delta_do_value_{tag}"] = number.map(best["delta_do"])
+        frame[f"delta_do_peak_depth_m_{tag}"] = number.map(best["depth"])
+        frame[f"has_core_aligned_delta_do_{tag}"] = (
+            frame[f"has_delta_do_{tag}"]
+            & (frame[f"delta_do_peak_depth_m_{tag}"] - core_depth).abs().le(core_offset_limit)
+        )
+    return frame
+
+
 def build_participant_flags(active: pd.DataFrame, audit: pd.DataFrame) -> pd.DataFrame:
     fields = [
-        "Profile_number", "detector_preprocessed", "near_zero_triggered",
-        "near_zero_count", "clean_do_min_depth_m", "clean_do_max_depth_m",
+        "Profile_number", "detector_preprocessed", "collision_levels",
+        "spike_levels", "clean_do_min_depth_m", "clean_do_max_depth_m",
         "clean_ts_min_depth_m", "clean_ts_max_depth_m",
         "n_clean_common_levels_300_1000", "n_clean_do_levels_300_1000",
         "n_clean_ts_levels_300_1000",
@@ -277,11 +307,20 @@ def edge_case_tests(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def near_zero_sensitivity(profile_data: pd.DataFrame, audit: pd.DataFrame, roles: dict[int, str]) -> pd.DataFrame:
-    """Rerun the profiles skipped by the whole-profile near-zero rule with the rule disabled."""
-    ids = audit.loc[audit["near_zero_triggered"].fillna(False).astype(bool), "Profile_number"].astype(int).tolist()
+CLEANING_SENSITIVITY_COLUMNS = [
+    "Profile_number", "role", "threshold_umol_kg", "collision_levels", "spike_levels",
+    "default_preprocessed", "sensitivity_preprocessed", "default_has_delta_do", "sensitivity_has_delta_do",
+    "default_delta_do", "sensitivity_delta_do", "default_peak_depth_m", "sensitivity_peak_depth_m",
+    "newly_evaluable", "new_positive",
+]
+
+
+def cleaning_sensitivity(profile_data: pd.DataFrame, audit: pd.DataFrame, roles: dict[int, str]) -> pd.DataFrame:
+    """Rerun the profiles whose oxygen was masked by the level-wise cleaning with the cleaning disabled."""
+    touched = audit["collision_levels"].fillna(0).gt(0) | audit["spike_levels"].fillna(0).gt(0)
+    ids = audit.loc[touched, "Profile_number"].astype(int).tolist()
     default_cfg = track.make_detection_config("do", anomaly_min_depth=300.0)
-    sensitivity_cfg = track.make_detection_config(default_cfg, do_near_zero_max_count=None)
+    sensitivity_cfg = track.make_detection_config(default_cfg, argo_do_cleaning=False)
 
     def detect(profile: pd.DataFrame, cfg) -> tuple[bool, pd.Series | None]:
         _, diagnostics = track._prepare_do_profile_for_detection(profile, cfg)
@@ -301,8 +340,8 @@ def near_zero_sensitivity(profile_data: pd.DataFrame, audit: pd.DataFrame, roles
                 "Profile_number": profile_number,
                 "role": roles.get(profile_number, ""),
                 "threshold_umol_kg": float(threshold),
-                "default_near_zero_max_count": int(default_cfg.do_near_zero_max_count),
-                "sensitivity_near_zero_max_count": None,
+                "collision_levels": int(audit.loc[audit["Profile_number"].eq(profile_number), "collision_levels"].iloc[0]),
+                "spike_levels": int(audit.loc[audit["Profile_number"].eq(profile_number), "spike_levels"].iloc[0]),
                 "default_preprocessed": default_prep,
                 "sensitivity_preprocessed": sens_prep,
                 "default_has_delta_do": default_row is not None,
@@ -314,7 +353,7 @@ def near_zero_sensitivity(profile_data: pd.DataFrame, audit: pd.DataFrame, roles
                 "newly_evaluable": bool(not default_prep and sens_prep),
                 "new_positive": bool(default_row is None and sens_row is not None),
             })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=CLEANING_SENSITIVITY_COLUMNS)
 
 
 def existing_caliper_readout() -> pd.DataFrame:
@@ -463,6 +502,7 @@ def run(output_dir: Path, overwrite: bool, log_file: Path | None) -> None:
         profile_years = profile_year_map(active, anchored, candidates)
         profile_data, loader_provenance = load_profile_data(profile_years, ARGO_DATA)
         audit, cleaned = profile_audit(profile_data, set(union_years))
+        active = recompute_outcomes(active, profile_data)
         participants = build_participant_flags(active, audit)
         status_map = dict(zip(identity.current_profile_number.astype(int), identity.current_date_position_status.astype(str)))
         old_unique = dict(zip(
@@ -497,7 +537,7 @@ def run(output_dir: Path, overwrite: bool, log_file: Path | None) -> None:
         for row in anchored.itertuples(index=False):
             roles.setdefault(int(row.profile_number), set()).add("scv_association")
         roles_text = {key: ";".join(sorted(value)) for key, value in roles.items()}
-        near_zero = near_zero_sensitivity(profile_data, audit, roles_text)
+        cleaning = cleaning_sensitivity(profile_data, audit, roles_text)
         calipers = existing_caliper_readout()
         qual_global = summary.loc[summary.queue.eq("qualification_all") & summary.scope.eq("Global")]
         primary_global = summary.loc[summary.queue.eq(PRIMARY_QUEUE) & summary.scope.eq("Global")]
@@ -509,14 +549,14 @@ def run(output_dir: Path, overwrite: bool, log_file: Path | None) -> None:
             "qualification_controls": int(qual_global.n_control_profiles.max()),
             "primary_sets": int(primary_global.n_matched_sets.max()),
             "primary_controls": int(primary_global.n_control_profiles.max()),
-            "near_zero_profiles": int(audit.near_zero_triggered.fillna(False).sum()),
+            "cleaned_profiles": int((audit.collision_levels.fillna(0).gt(0) | audit.spike_levels.fillna(0).gt(0)).sum()),
         }
         paths = {}
         paths["profile_qualification_audit"] = save_frame(audit.sort_values("Profile_number"), "profile_qualification_audit", output_dir, overwrite)
         paths["qualified_analysis_queue"] = save_frame(queues[PRIMARY_QUEUE].sort_values(["match_set_id", "is_scv"], ascending=[True, False]), "qualified_analysis_queue", output_dir, overwrite)
         paths["confirmed_mismatch_recheck"] = save_frame(correction.sort_values("association_row"), "confirmed_mismatch_recheck", output_dir, overwrite)
         paths["scv_matched_effects"] = save_frame(summary.sort_values(["queue", "outcome", "scope", "threshold_umol_kg"]), "scv_matched_effects", output_dir, overwrite)
-        paths["near_zero_sensitivity"] = save_frame(near_zero.sort_values(["Profile_number", "threshold_umol_kg"]), "near_zero_sensitivity", output_dir, overwrite)
+        paths["cleaning_sensitivity"] = save_frame(cleaning.sort_values(["Profile_number", "threshold_umol_kg"]), "cleaning_sensitivity", output_dir, overwrite)
         paths["bootstrap_edge_case_tests"] = save_frame(edge, "bootstrap_edge_case_tests", output_dir, overwrite)
         paths["caliper_sensitivity_readout"] = save_frame(calipers.sort_values(["spatial_caliper_km", "scope", "threshold_umol_kg"]), "caliper_sensitivity_readout", output_dir, overwrite)
         manifest = {

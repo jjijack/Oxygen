@@ -179,6 +179,27 @@ _cfg_do_near_zero_threshold = float(
 _cfg_do_near_zero_max_count = int(
     _PROC_CFG.get('processing', {}).get('do_near_zero_max_count', 7)
 )
+
+# Argo DO 层级清洗与氧数据排除（从 processing.yml:processing.argo_do_cleaning 读取）
+_ARGO_DO_CLEANING_CFG = _PROC_CFG.get('processing', {}).get('argo_do_cleaning', {})
+_ARGO_DO_EXCLUDED_PLATFORMS = frozenset(int(v) for v in _ARGO_DO_CLEANING_CFG.get('excluded_platforms') or [])
+_ARGO_DO_EXCLUDED_PROFILES = frozenset(int(v) for v in _ARGO_DO_CLEANING_CFG.get('excluded_profiles') or [])
+_ARGO_DO_COLLISION_CFG = {
+    key: float(_ARGO_DO_CLEANING_CFG.get('collision', {}).get(key, default))
+    for key, default in {
+        'pair_max_dz_m': 1.0, 'pair_relative_dz': 0.5, 'fit_half_window_m': 25.0, 'fit_min_levels': 5,
+        'min_levels': 12, 'temperature_noise': 0.02, 'do_noise': 1.0, 'ratio_threshold': 5.0, 'min_pairs': 2,
+        'link_m': 40.0, 'pad_m': 1.5,
+    }.items()
+}
+_ARGO_DO_SPIKE_CFG = {
+    key: float(_ARGO_DO_CLEANING_CFG.get('spike', {}).get(key, default))
+    for key, default in {
+        'max_levels': 2, 'max_span_m': 12.0, 'scale_half_window_m': 50.0, 'do_k': 4.0, 'do_floor': 2.0,
+        'neighbor_ratio': 2.5, 'temperature_k': 3.0, 'temperature_floor': 0.01, 'salinity_k': 3.0,
+        'salinity_floor': 0.004,
+    }.items()
+}
 _default_subduction_detection_method = str(
     _PROC_CFG.get('processing', {}).get('subduction_detection_method', 'do')
 ).strip().lower()
@@ -488,8 +509,10 @@ class DetectionConfig:
     anomaly_max_depth: float = field(default_factory=lambda: _cfg_anomaly_max_depth)
     depth_merge_tolerance: float = field(default_factory=lambda: _default_depth_merge_tolerance)
     duplicate_depth_strategy: str = field(default_factory=lambda: _default_duplicate_depth_strategy)
+    # 近零 DO 规则只用于 OFES 格点检测；Argo 剖面由 argo_do_cleaning 做层级清洗
     do_near_zero_threshold: float = field(default_factory=lambda: _cfg_do_near_zero_threshold)
     do_near_zero_max_count: int = field(default_factory=lambda: _cfg_do_near_zero_max_count)
+    argo_do_cleaning: bool = True
 
     # 绘图显示
     cbar_min: float | None = None
@@ -3759,7 +3782,7 @@ def plot_track_variable_timeseries(
         - end_date (str | int | float | pd.Timestamp | None): 横轴结束日期，编码同 start_date。
         - platform_number (int | str | list | tuple | set | None): 仅绘制指定 Argo 浮标（单个或列表/集合），先于异常筛选过滤。
         - detection_config (DetectionConfig | None): 异常识别配置；None 时使用 processing.yml 默认值。
-        - remove_outliers (bool): 是否执行基础 QC（Flag 过滤 + DO<=1 过滤），默认 True。
+        - remove_outliers (bool): 是否执行基础 QC（Flag 过滤），默认 True。
         - save_fig (bool): 是否保存图像，默认 False。
         - show_fig (bool): 是否显示图像，默认 True。
     输出:
@@ -4243,15 +4266,13 @@ def _has_plottable_profile_variable(profile_rows: pd.DataFrame, value_col: str) 
 
 
 def _apply_basic_argo_qc(profile_rows: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    """对单个变量执行基础 Argo 质控（Flag 过滤 + DO 规则过滤）。"""
+    """对单个变量执行基础 Argo 质控（只按 Flag 过滤）。"""
     rows_qc = profile_rows.copy()
     qc_column_name = f"{value_col}_Flag"
     if qc_column_name in rows_qc.columns:
         good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
         bad_qc_mask = ~rows_qc[qc_column_name].isin(good_qc_flags)
         rows_qc.loc[bad_qc_mask, value_col] = np.nan
-    if value_col == 'DO':
-        rows_qc.loc[rows_qc[value_col] <= 1.0, value_col] = np.nan
     return rows_qc
 
 
@@ -4263,10 +4284,6 @@ def _basic_argo_qc_bad_mask(profile_rows: pd.DataFrame, value_col: str) -> pd.Se
     if qc_column_name in profile_rows.columns:
         good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
         bad_mask = bad_mask | (~profile_rows[qc_column_name].isin(good_qc_flags))
-
-    if value_col == 'DO' and value_col in profile_rows.columns:
-        do_vals = pd.to_numeric(profile_rows[value_col], errors='coerce')
-        bad_mask = bad_mask | (do_vals <= 1.0)
 
     return bad_mask.fillna(False)
 
@@ -4717,7 +4734,7 @@ def plot_vertical(
 
         质量控制:
 
-            - remove_outliers=True 时执行基础 QC（仅保留 Flag {1,2,5,8}，DO<=1 置 NaN）。
+            - remove_outliers=True 时执行基础 QC（仅保留 Flag {1,2,5,8}）。
             - remove_outliers=False 时不剔除点：QC 通过段保持原色，应断开的跨段连接用红线显示，QC 不通过的观测用红色圆点标记。
             - DO 子图绘制 AOU 时，AOU 复用 DO/Temp/Sal 的同等 QC 逻辑（True 同样剔除，False 同样以红色桥接线+红点标注）。
     '''
@@ -24884,6 +24901,165 @@ def run_euler_grid_analysis(
     }
 
 
+def _argo_do_collision_bands(
+    depth: np.ndarray,
+    temperature: np.ndarray,
+    oxygen: np.ndarray,
+) -> tuple[list[tuple[float, float]], int]:
+    """识别同一剖面内两套错位采样序列交错的深度带，返回 [(上界, 下界), ...] 与超标对数。
+
+    近重复深度对（相邻层深度差小于 pair_max_dz_m，且小于上下相邻层距较小者的 pair_relative_dz 倍；均匀的
+    高分辨率采样本身不是两套序列交错的证据）上，温度或氧之差与“局地梯度 × 深度差 + 噪声”之比
+    超过 ratio_threshold 记为超标对；局地梯度取中点 ±fit_half_window_m 内其余层的线性拟合。盐度不参与：
+    该拟合在陡盐跃层上严重低估梯度，只会带来误判。单个超标对不足以说明存在两套序列，同剖面少于
+    min_pairs 对时不判碰撞；相距不超过 link_m 的超标对并成一带，上下各外扩 pad_m。输入须按深度升序。
+    """
+    cfg = _ARGO_DO_COLLISION_CFG
+    if depth.size < cfg['min_levels']:
+        return [], 0
+    step = np.diff(depth)
+    neighbor_step = np.minimum(np.r_[np.inf, step[:-1]], np.r_[step[1:], np.inf])
+    pair = np.flatnonzero((step < cfg['pair_max_dz_m']) & (step < cfg['pair_relative_dz'] * neighbor_step))
+    if pair.size == 0:
+        return [], 0
+    center = 0.5 * (depth[pair] + depth[pair + 1])
+    spacing = depth[pair + 1] - depth[pair]
+    # 去均值后再累加，深度平方和不丢精度
+    z = depth - depth.mean()
+    zc = center - depth.mean()
+    lo = np.searchsorted(z, zc - cfg['fit_half_window_m'], 'left')
+    hi = np.searchsorted(z, zc + cfg['fit_half_window_m'], 'right')
+    count = (hi - lo - 2).astype(float)
+
+    def windowed_slope(values: np.ndarray) -> np.ndarray:
+        sums = {}
+        for name, series in (('z', z), ('v', values), ('zz', z * z), ('zv', z * values)):
+            cumulative = np.concatenate([[0.0], np.cumsum(series)])
+            # 被检验的两层本身不参与拟合
+            sums[name] = cumulative[hi] - cumulative[lo] - series[pair] - series[pair + 1]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return (count * sums['zv'] - sums['z'] * sums['v']) / (count * sums['zz'] - sums['z'] ** 2)
+
+    hit = np.zeros(pair.size, dtype=bool)
+    for values, noise in ((temperature, cfg['temperature_noise']), (oxygen, cfg['do_noise'])):
+        ratio = np.abs(values[pair + 1] - values[pair]) / (np.abs(windowed_slope(values)) * spacing + noise)
+        hit |= ratio > cfg['ratio_threshold']
+    hit &= count >= cfg['fit_min_levels']
+    n_hit = int(hit.sum())
+    if n_hit < cfg['min_pairs']:
+        return [], n_hit
+    hit_center = np.sort(center[hit])
+    breaks = np.flatnonzero(np.diff(hit_center) > cfg['link_m'])
+    tops = np.r_[hit_center[0], hit_center[breaks + 1]]
+    bottoms = np.r_[hit_center[breaks], hit_center[-1]]
+    return [(float(top) - cfg['pad_m'], float(bottom) + cfg['pad_m']) for top, bottom in zip(tops, bottoms)], n_hit
+
+
+def _argo_do_spike_mask(
+    depth: np.ndarray,
+    oxygen: np.ndarray,
+    temperature: np.ndarray,
+    salinity: np.ndarray,
+) -> np.ndarray:
+    """标记 1–max_levels 层的孤立 DO 毛刺，高值与低值对称处理，返回布尔数组。
+
+    候选（连续 1 或 2 层）连同上下邻层的总跨度不超过 max_span_m；各层相对上下邻层连线同号偏离，平均偏离
+    超过周围三个台阶（上下邻层之差、两侧邻层各自到再外一层的台阶）中最大者的 neighbor_ratio 倍，即一步跳出、
+    一步跳回且两侧落在背景上，平滑鼓包的顶不满足；且超过 do_k × max(局地变化尺度, do_floor)。局地
+    变化尺度取 ±scale_half_window_m 内相邻层差分绝对值的中位数 ×1.4826，度量剖面局地起伏而非测量误差。
+    候选内任一层温度或盐度有同步偏离即保留；双层候选逐层取最大偏离，平均会让反向响应相互抵消。采样
+    稀疏处跨度条件不满足，不作判断。输入须按深度升序且四个变量均有效。
+    """
+    cfg = _ARGO_DO_SPIKE_CFG
+    n = depth.size
+    spike = np.zeros(n, dtype=bool)
+    if n < 4:
+        return spike
+    mid = 0.5 * (depth[:-1] + depth[1:])
+    scale_lo = np.searchsorted(mid, depth - cfg['scale_half_window_m'], 'left')
+    scale_hi = np.searchsorted(mid, depth + cfg['scale_half_window_m'], 'right')
+    steps = {
+        'do': np.abs(np.diff(oxygen)),
+        'temperature': np.abs(np.diff(temperature)),
+        'salinity': np.abs(np.diff(salinity)),
+    }
+
+    def local_scale(name: str, levels: np.ndarray) -> float:
+        scales = [
+            np.median(steps[name][scale_lo[j]:scale_hi[j]]) * 1.4826
+            for j in levels if scale_hi[j] > scale_lo[j]
+        ]
+        return float(np.mean(scales)) if scales else np.nan
+
+    for width in range(1, int(cfg['max_levels']) + 1):
+        start = np.arange(1, n - width)
+        if start.size == 0:
+            continue
+        upper, lower = start - 1, start + width
+        span = depth[lower] - depth[upper]
+        surrounding = np.maximum.reduce([
+            np.abs(oxygen[lower] - oxygen[upper]),
+            np.where(upper >= 1, steps['do'][np.maximum(upper - 1, 0)], 0.0),
+            np.where(lower <= n - 2, steps['do'][np.minimum(lower, n - 2)], 0.0),
+        ])
+        run = start[:, None] + np.arange(width)[None, :]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            frac = (depth[run] - depth[upper][:, None]) / span[:, None]
+
+        def deviation(values: np.ndarray) -> np.ndarray:
+            return values[run] - (values[upper][:, None] + (values[lower] - values[upper])[:, None] * frac)
+
+        do_dev = deviation(oxygen)
+        mean_dev = np.abs(do_dev.mean(axis=1))
+        candidate = (
+            (span > 0) & (span <= cfg['max_span_m'])
+            & (np.all(do_dev > 0, axis=1) | np.all(do_dev < 0, axis=1))
+            & (mean_dev > cfg['neighbor_ratio'] * surrounding)
+            & (mean_dev > cfg['do_k'] * cfg['do_floor'])
+        )
+        if not candidate.any():
+            continue
+        temperature_dev = np.abs(deviation(temperature)).max(axis=1)
+        salinity_dev = np.abs(deviation(salinity)).max(axis=1)
+        for c in np.flatnonzero(candidate):
+            levels = run[c]
+            if spike[upper[c]] or spike[lower[c]] or spike[levels].any():
+                continue
+            if mean_dev[c] <= cfg['do_k'] * np.fmax(local_scale('do', levels), cfg['do_floor']):
+                continue
+            if temperature_dev[c] > cfg['temperature_k'] * np.fmax(
+                local_scale('temperature', levels), cfg['temperature_floor']
+            ):
+                continue
+            if salinity_dev[c] > cfg['salinity_k'] * np.fmax(
+                local_scale('salinity', levels), cfg['salinity_floor']
+            ):
+                continue
+            spike[levels] = True
+    return spike
+
+
+def _argo_do_source_excluded(profile: pd.DataFrame, do_col: str) -> bool:
+    """带 QC 旗标的 Argo 剖面是否属于配置里排除氧数据的浮标或剖面；缺编号列时报错，避免漏排。
+
+    没有 DO 旗标列的表（如 OFES 模式剖面，编号是本地序号）不做这项检查。
+    """
+    if f'{do_col}_Flag' not in profile.columns:
+        return False
+    for column, excluded in (
+        ('Platform_number', _ARGO_DO_EXCLUDED_PLATFORMS),
+        ('Profile_number', _ARGO_DO_EXCLUDED_PROFILES),
+    ):
+        if not excluded:
+            continue
+        if column not in profile.columns:
+            raise ValueError(f'Argo DO exclusion needs the {column} column.')
+        values = pd.to_numeric(profile[column], errors='coerce').dropna()
+        if not values.empty and int(values.iloc[0]) in excluded:
+            return True
+    return False
+
+
 def _prepare_do_profile_for_detection(
     profile_data: pd.DataFrame,
     detection_config: DetectionConfig,
@@ -24894,12 +25070,18 @@ def _prepare_do_profile_for_detection(
     temperature_col: str = 'Temperature',
     remove_outliers: bool = True,
 ) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    """按 DO detector 的正式规则清洗一个剖面并返回资格诊断。"""
+    """按 DO detector 的正式规则清洗一个剖面并返回资格诊断。
+
+    QC 旗标之外，配置里排除氧数据的浮标与剖面直接不通过；启用 argo_do_cleaning 时再先屏蔽深度碰撞带、
+    后去孤立毛刺，两步都只把可疑层的 DO 置缺。碰撞证据取氧 QC 通过的全部层：Argo 质控常只把两套序列之一
+    的温盐标坏，这些层只作证据、不作数据。
+    """
     work = profile_data.copy()
     diagnostics: dict[str, Any] = {
         'raw_rows': int(len(work)),
-        'near_zero_count': 0,
-        'near_zero_triggered': False,
+        'collision_pairs': 0,
+        'collision_levels': 0,
+        'spike_levels': 0,
         'clean_rows_before_depth_dedup': 0,
         'clean_rows_after_depth_dedup': 0,
         'duplicate_depth_groups': 0,
@@ -24911,30 +25093,55 @@ def _prepare_do_profile_for_detection(
         if column in work.columns:
             work[column] = pd.to_numeric(work[column], errors='coerce')
 
+    if remove_outliers and _argo_do_source_excluded(work, do_col):
+        diagnostics['preprocess_reason'] = 'excluded_do_source'
+        return None, diagnostics
+
+    drop_subset = [depth_col, do_col, salinity_col, temperature_col]
+    cleaning = bool(remove_outliers and detection_config.argo_do_cleaning) and all(
+        column in work.columns for column in drop_subset
+    )
     if remove_outliers:
         good_qc_flags = ['1', '2', '5', '8', 1, 2, 5, 8]
+        bands: list[tuple[float, float]] = []
+        if cleaning:
+            evidence = work[[depth_col, temperature_col, do_col]]
+            do_qc_column = f'{do_col}_Flag'
+            if do_qc_column in work.columns:
+                evidence = evidence.loc[work[do_qc_column].isin(good_qc_flags)]
+            evidence = evidence.dropna().sort_values(depth_col, kind='mergesort')
+            bands, diagnostics['collision_pairs'] = _argo_do_collision_bands(
+                evidence[depth_col].to_numpy(dtype=float),
+                evidence[temperature_col].to_numpy(dtype=float),
+                evidence[do_col].to_numpy(dtype=float),
+            )
         for variable in [do_col, salinity_col, temperature_col]:
             qc_column = f'{variable}_Flag'
             if qc_column in work.columns:
                 bad_qc = ~work[qc_column].isin(good_qc_flags)
                 work.loc[bad_qc, variable] = np.nan
-        if do_col in work.columns:
-            do_numeric = pd.to_numeric(work[do_col], errors='coerce')
-            bad_do = do_numeric <= float(detection_config.do_near_zero_threshold)
-            diagnostics['near_zero_count'] = int(np.count_nonzero(bad_do.to_numpy()))
-            max_count = detection_config.do_near_zero_max_count
-            if max_count is not None and int(max_count) >= 0:
-                diagnostics['near_zero_triggered'] = bool(
-                    diagnostics['near_zero_count'] > int(max_count)
-                )
-            work.loc[bad_do, do_col] = np.nan
+        if bands:
+            depth_values = work[depth_col].to_numpy(dtype=float)
+            in_band = np.zeros(len(work), dtype=bool)
+            for top, bottom in bands:
+                in_band |= (depth_values >= top) & (depth_values <= bottom)
+            diagnostics['collision_levels'] = int(
+                (in_band & work[drop_subset].notna().all(axis=1).to_numpy()).sum()
+            )
+            work.loc[in_band, do_col] = np.nan
 
-    drop_subset = [depth_col, do_col, salinity_col, temperature_col]
     cleaned = work.dropna(subset=drop_subset).copy()
+    if cleaning and len(cleaned) >= 4:
+        cleaned = cleaned.sort_values(depth_col, kind='mergesort')
+        spike = _argo_do_spike_mask(
+            cleaned[depth_col].to_numpy(dtype=float),
+            cleaned[do_col].to_numpy(dtype=float),
+            cleaned[temperature_col].to_numpy(dtype=float),
+            cleaned[salinity_col].to_numpy(dtype=float),
+        )
+        diagnostics['spike_levels'] = int(spike.sum())
+        cleaned = cleaned.loc[~spike]
     diagnostics['clean_rows_before_depth_dedup'] = int(len(cleaned))
-    if diagnostics['near_zero_triggered']:
-        diagnostics['preprocess_reason'] = 'near_zero_count_exceeds_max'
-        return None, diagnostics
     if len(cleaned) < 5:
         diagnostics['preprocess_reason'] = 'clean_rows_before_depth_dedup_below_five'
         return None, diagnostics
@@ -25070,11 +25277,11 @@ def calculate_delta_do(
         - temperature_col (str): 温度列名，默认 'Temperature'。
         - pi_col (str): aou 模式下优先使用的 π 列名；缺失时现场由 T/S/P 计算 surface-referenced potential spiciness，默认 'PI'。
         - include_aou (bool): 是否返回 AOU 相关结果（delta_aou），默认 True；do 模式中 delta_aou 是在 delta_do 对应深度上按同一参考线计算，并非“基于 AOU 自身阈值先定深度”得到。
-        - remove_outliers (bool): 基础 QC 与规则过滤，默认 True。
+        - remove_outliers (bool): QC 旗标过滤与 Argo DO 层级清洗（深度碰撞带与孤立毛刺，argo_do_cleaning 控制），默认 True。
         - verbose (bool): 是否打印进度信息，默认 False。
 
     返回:
-        - pd.DataFrame: 每个满足条件的候选一行，始终含 Profile_number、depth、detection_method、primary_metric、primary_value、anomaly_score；do 模式额外含 delta_do/delta_salinity/delta_temperature/do_value 等，aou/trim 模式额外含 delta_aou/delta_pi/aou_value/pi_value/trim_* 等，并带 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）；无满足记录时返回空表。
+        - pd.DataFrame: 每个满足条件的候选一行，始终含 Profile_number、depth、detection_method、primary_metric、primary_value、anomaly_score；do 模式额外含 delta_do/delta_salinity/delta_temperature/do_value 与参考线两端点深度 upper_endpoint_depth_m/lower_endpoint_depth_m 等，aou/trim 模式额外含 delta_aou/delta_pi/aou_value/pi_value/trim_* 等，并带 Year/Month/Day/Longitude/Latitude/Platform_number（若存在）；无满足记录时返回空表。
 
     说明:
         识别模式:
@@ -25418,8 +25625,10 @@ def calculate_delta_do(
         aou_values = None
         if need_aou:
             try:
-                aou_series, _ = _compute_aou_for_plot(profile_data_clean.copy(), remove_outliers=remove_outliers)
-                aou_values = pd.to_numeric(aou_series, errors='coerce').to_numpy(dtype=float)
+                # profile_data_clean 已过共用预处理，直接计算，不再套绘图用的 QC
+                aou_values = pd.to_numeric(
+                    _compute_profile_aou(profile_data_clean), errors='coerce'
+                ).to_numpy(dtype=float)
             except Exception:
                 aou_values = None
 
@@ -25445,7 +25654,9 @@ def calculate_delta_do(
                 if anomaly_max_depth is not None and anomaly_max_depth > 0 and target_depth > anomaly_max_depth:
                     continue
 
-                delta_do, do_obs, _, _, _ = _endpoint_delta(depth_values, do_values, target_depth, depth_interval)
+                delta_do, do_obs, _, upper_endpoint, lower_endpoint = _endpoint_delta(
+                    depth_values, do_values, target_depth, depth_interval
+                )
                 if not np.isfinite(delta_do):
                     continue
 
@@ -25478,6 +25689,8 @@ def calculate_delta_do(
                     'do_value': float(do_obs),
                     'salinity_value': float(sal_obs),
                     'temperature_value': float(temp_obs),
+                    'upper_endpoint_depth_m': float(upper_endpoint),
+                    'lower_endpoint_depth_m': float(lower_endpoint),
                     'detection_method': method_norm,
                     'primary_metric': 'delta_do',
                     'primary_value': float(delta_do),
@@ -27883,69 +28096,13 @@ def _prepare_do_density_profile(
     profile: pd.DataFrame,
     cfg: DetectionConfig,
 ) -> tuple[pd.DataFrame, str]:
-    """复刻 DO detector 的 profile QC 与重复深度处理。"""
-    work = profile.copy()
-    value_columns = ['Depth', 'DO', 'Salinity', 'Temperature']
-    for column in value_columns:
-        work[column] = pd.to_numeric(work[column], errors='coerce')
-    if work.empty:
-        return work, 'empty_profile'
-
-    good_flags = {'1', '2', '5', '8', 1, 2, 5, 8}
-    for variable in ('DO', 'Salinity', 'Temperature'):
-        flag_column = f'{variable}_Flag'
-        if flag_column in work.columns:
-            bad = ~work[flag_column].isin(good_flags)
-            work.loc[bad, variable] = np.nan
-    bad_do = work['DO'].le(float(cfg.do_near_zero_threshold))
-    max_bad = cfg.do_near_zero_max_count
-    if max_bad is not None and int(bad_do.sum()) > int(max_bad):
-        return work.iloc[0:0].copy(), 'too_many_near_zero_do_values'
-    work.loc[bad_do, 'DO'] = np.nan
-    work = work.dropna(subset=value_columns).copy()
-    if len(work) < 5:
-        return work, 'fewer_than_five_valid_levels'
-
-    if work['Depth'].duplicated().any():
-        strategy = str(cfg.duplicate_depth_strategy or 'best_qc').lower()
-        if strategy not in {'best_qc', 'first', 'mean', 'max', 'min'}:
-            strategy = 'best_qc'
-        priority = {1: 0, 2: 1, 5: 2, 8: 3}
-        picked_rows = []
-        for _, group in work.groupby('Depth', sort=False):
-            if len(group) == 1 or strategy == 'first':
-                picked_rows.append(group.iloc[0])
-            elif strategy == 'mean':
-                row = group.iloc[0].copy()
-                for column in ('DO', 'Salinity', 'Temperature'):
-                    row[column] = pd.to_numeric(
-                        group[column], errors='coerce'
-                    ).mean()
-                picked_rows.append(row)
-            elif strategy in {'max', 'min'}:
-                values = pd.to_numeric(group['DO'], errors='coerce')
-                index = values.idxmax() if strategy == 'max' else values.idxmin()
-                picked_rows.append(group.loc[index])
-            else:
-                if 'DO_Flag' not in group.columns:
-                    picked_rows.append(group.iloc[0])
-                    continue
-                ranks = group['DO_Flag'].map(
-                    lambda value: priority.get(
-                        int(value) if pd.notna(value) else -1, 999
-                    )
-                )
-                picked_rows.append(group.loc[ranks.idxmin()])
-        work = pd.DataFrame(picked_rows)
-
-    work = work.sort_values('Depth').reset_index(drop=True)
-    depth = work['Depth'].to_numpy(dtype=float)
-    if len(depth) < 5 or np.any(np.diff(depth) <= 0):
-        keep = np.r_[True, np.diff(depth) > 0]
-        work = work.loc[keep].reset_index(drop=True)
-    if len(work) < 5:
-        return work, 'fewer_than_five_unique_levels'
-    return work, 'ok'
+    """沿用 DO detector 的共用预处理，返回清洗后的剖面与状态（'ok' 或预处理未通过的原因）。"""
+    if profile.empty:
+        return profile.copy(), 'empty_profile'
+    cleaned, diagnostics = _prepare_do_profile_for_detection(profile, cfg)
+    if cleaned is None:
+        return profile.iloc[0:0].copy(), diagnostics['preprocess_reason']
+    return cleaned, 'ok'
 
 
 def calculate_do_density_coordinate_sensitivity(
@@ -30466,7 +30623,8 @@ def _argo_profile_eligibility_path(
 
 
 _ARGO_ELIGIBILITY_DETECTOR_COLUMNS = (
-    'detector_preprocessed', 'preprocess_reason', 'near_zero_count', 'near_zero_triggered', 'n_search_layer_levels',
+    'detector_preprocessed', 'preprocess_reason', 'collision_pairs', 'collision_levels', 'spike_levels',
+    'n_search_layer_levels',
 )
 
 
@@ -30500,7 +30658,7 @@ def build_argo_profile_eligibility_table(
     `all_region_argo` shared baseline。输出记录 DO/T/S 垂向覆盖、platform、日期、海盆和 KE 标记；
     `mccoy_eligible_proxy` 表示该 profile 同时具备 depth gate 以下的 DO 与 T/S，而不是声称它已经通过
     McCoy detector。每条剖面另经 DO detector 的共用预处理 `_prepare_do_profile_for_detection`，记录是否
-    通过（detector_preprocessed、preprocess_reason、近零计数与是否触发），以及清洗后检测器搜索层
+    通过（detector_preprocessed、preprocess_reason、深度碰撞与毛刺屏蔽的层数），以及清洗后检测器搜索层
     [anomaly_min_depth, anomaly_max_depth] 内的有效层数 n_search_layer_levels。
 
     参数:
@@ -30665,6 +30823,7 @@ def build_argo_profile_eligibility_table(
         )
         qualification_input['Depth'] = raw_frame[depth_col]
         qualification_input['Profile_number'] = raw_frame['Profile_number']
+        qualification_input['Platform_number'] = raw_frame['Platform_number']
         frame = raw_frame[list(base_cols | {column for column in required_map.values() if column})].rename(
             columns={column: name for name, column in required_map.items()}
         )
@@ -30737,8 +30896,9 @@ def build_argo_profile_eligibility_table(
                 'Profile_number': int(number),
                 'detector_preprocessed': bool(diagnostics['detector_preprocessed']),
                 'preprocess_reason': diagnostics['preprocess_reason'],
-                'near_zero_count': int(diagnostics['near_zero_count']),
-                'near_zero_triggered': bool(diagnostics['near_zero_triggered']),
+                'collision_pairs': int(diagnostics['collision_pairs']),
+                'collision_levels': int(diagnostics['collision_levels']),
+                'spike_levels': int(diagnostics['spike_levels']),
                 'n_search_layer_levels': int(depth.between(search_min_depth, search_max_depth).sum()),
             })
         profile = profile.merge(
@@ -41029,6 +41189,9 @@ def detect_ofes_delta_do(
     说明:
         - DetectionConfig 的 `anomaly_*_depth` 字段在本入口直接按深度米解释。
         - 返回的 delta_temperature 基于转换后的原位温度；快照中的 `temp` 本身仍保留 OFES 原生位温。
+        - 模式剖面与 Argo 共用 `calculate_delta_do` 的层级清洗（深度碰撞屏蔽与去毛刺）；向量化 OFES detector
+          仍用近零 DO 规则，两者口径不同。要不经任何清洗的模式剖面，传
+          `make_detection_config(..., argo_do_cleaning=False)`（模式场没有 QC 旗标列，关掉后即完全不清洗）。
     """
     extract_fn = extract_ofes_profile_interp if interp else extract_ofes_profile
     prof = extract_fn(snapshot, lon, lat, variables=['do2', 'temp', 'salinity'])

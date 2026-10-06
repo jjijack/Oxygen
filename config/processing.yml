@@ -1,4 +1,17 @@
 # 处理与算法参数配置
+# version 1.37 变更：
+#   - 新增 processing.argo_do_cleaning：Argo DO 检测与资格统计共用的层级清洗，只把可疑层的 DO 置缺，
+#     不因氧值整条排除剖面。先屏蔽深度碰撞带：近重复深度对（Δz < pair_max_dz_m，且小于上下相邻层距
+#     较小者的 pair_relative_dz 倍，即两套序列交错而非均匀高分辨率采样）上，温度或氧之差超过局地梯度
+#     所能解释的 ratio_threshold 倍记为超标；同剖面不少于 min_pairs 对才判碰撞，相距不超过 link_m 的
+#     并成一带。再去 1–2 层孤立 DO 毛刺：连同上下邻层跨度不超过 max_span_m，偏离超过 do_k 倍局地变化
+#     尺度，并超过周围三个台阶（上下邻层之差、两侧邻层到再外一层的台阶）中最大者的 neighbor_ratio 倍，
+#     即“小-大-小”且两侧落在背景上，平滑鼓包的顶不删；温盐有同步响应也不删。
+#   - excluded_platforms / excluded_profiles：氧数据持续异常、QC 仍为通过的来源，其氧数据整体不用，
+#     温盐与原始文件保留。2903010：2012–2014 年多个循环反复掉到近零又恢复，非零值也异常偏高。
+#     50213（2902836，2021-11-05，0.1 m 层距的单条剖面）与 247531（6901578，2018-11-04）：氧在均匀
+#     采样上自身乱跳。61008（2903396，2019-09-19）：最底层 DO 掉到近零，使倒数第二层成峰。
+#   - do_near_zero_threshold / do_near_zero_max_count 不再用于 Argo 剖面，仅保留给 OFES 格点检测。
 # version 1.36 变更：
 #   - plot.journal_colors.sparse 改为浅蓝灰 #e6edf3：发生比例地图上剖面不足门槛（含无剖面）的海洋格子
 #     统一用它，与陆地灰色区分。
@@ -148,7 +161,7 @@
 # version 1.1 变更：
 #   - 移除 distance_earth_deg_per_meter（统一使用 approximate_degree_length 动态纬度尺度）
 #   - 新增 adaptive_lat_threshold / adaptive_distance_threshold_km 自适应距离切换阈值（高纬 & 大尺度触发大圆）
-version: 1.36
+version: 1.37
 processing:
   circle_enlargement_factor: 1.2   # 匹配涡旋与Argo剖面时半径放大倍数
   default_delta_do_threshold: 50.0
@@ -159,8 +172,8 @@ processing:
   duplicate_depth_strategy: best_qc
   anomaly_min_depth: 300.0          # ΔDO 异常最小深度（m）；设为 0 表示不限制
   anomaly_max_depth: 1000.0         # ΔDO 峰值最大深度（m）；设为 0 表示不限制
-  do_near_zero_threshold: 1.0       # 近零 DO 判定阈值（DO <= 该值）
-  do_near_zero_max_count: 7         # 单剖面近零 DO 超过该数量时，整剖面跳过
+  do_near_zero_threshold: 1.0       # OFES 格点检测：近零 DO 判定阈值（DO <= 该值）；Argo 剖面不用
+  do_near_zero_max_count: 7         # OFES 格点检测：单列近零 DO 超过该数量时整列跳过；Argo 剖面不用
   subduction_detection_method: do   # 默认异常识别方法：do | aou | trim
   aou_threshold: -10.0              # aou 模式：ΔAOU 阈值（越负越强）
   pi_threshold: 0.05                # aou 模式：|ΔPI| 阈值
@@ -185,6 +198,21 @@ processing:
   adaptive_distance_threshold_km: 300.0 # 平面最大距离超出触发大圆
   vertical_profile_spacing_km: 2.0      # 垂向剖面横向采样步长（km）
   vertical_profile_depth_spacing_m: 5.0 # 垂向剖面 z 轴采样步长（m）
+
+  # Argo DO 层级清洗与氧数据排除（_prepare_do_profile_for_detection）
+  argo_do_cleaning:
+    excluded_platforms: [2903010]
+    excluded_profiles: [50213, 247531, 61008]
+    collision:
+      pair_max_dz_m: 1.0
+      pair_relative_dz: 0.5
+      ratio_threshold: 5.0
+      min_pairs: 2
+      link_m: 40.0
+    spike:
+      max_span_m: 12.0
+      do_k: 4.0
+      neighbor_ratio: 2.5
 
   # Heave + Ventilation 等密面出露诊断参数
   heave:
