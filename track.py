@@ -34081,7 +34081,13 @@ def plot_argo_ke_sampling_by_year(
 
 
 def _format_or_interval(low: float, high: float) -> str:
-    """把 OR 区间写成 `low–high`；无穷写 ∞，零写 0，其余保留两位小数。"""
+    """把 OR 区间写成 `low–high`；无穷写 ∞，零写 0，其余保留两位小数。
+
+    两端同为 0、同为 ∞ 或缺失时写 NE：区间退化成一个边界值，不表示估计精确。
+    """
+    if np.isnan(low) or np.isnan(high) or (low == high and (low == 0 or np.isinf(low))):
+        return 'NE'
+
     def one(value: float) -> str:
         if not np.isfinite(value):
             return '∞'
@@ -34111,7 +34117,7 @@ def _matched_effect_rows(effects: pd.DataFrame, label_col: str, label: str, *, v
 
 
 def _matched_effect_markdown(frame: pd.DataFrame, label_col: str, label_header: str) -> str:
-    """把论文表格行写成 Markdown 表：同组标签只写一次，OR 小于 10 保留两位、否则一位。"""
+    """把论文表格行写成 Markdown 表：同组标签只写一次，OR 小于 10 保留两位、否则一位；有 NE 区间时表后加一行说明。"""
     header = [label_header, 'ΔDO threshold (μmol kg⁻¹)', 'Anchors positive/total (%)', 'Controls positive/total (%)',
               'Matched OR', 'Anchor-float 95% interval', 'Dependency-component 95% interval']
     columns = [label_col, 'threshold', 'anchors', 'controls', 'matched_or', 'anchor_float_ci', 'dependency_component_ci']
@@ -34127,6 +34133,8 @@ def _matched_effect_markdown(frame: pd.DataFrame, label_col: str, label_header: 
                 value = '∞' if not np.isfinite(value) else (f'{value:.2f}' if value < 10 else f'{value:.1f}')
             cells.append(str(value))
         lines.append('| ' + ' | '.join(cells) + ' |')
+    if frame[['anchor_float_ci', 'dependency_component_ci']].eq('NE').any(axis=None):
+        lines += ['', 'NE：区间两端同为 0 或同为 ∞，不可估计。']
     return '\n'.join(lines)
 
 
