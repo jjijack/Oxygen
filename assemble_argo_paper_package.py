@@ -33,9 +33,7 @@ FIGURES = {
     'FigS3': ('plot_scv_matching_diagnostics', 'scv_matching_diagnostics'),
     'FigS4': ('plot_scv_glorys_representation', 'scv_glorys_representation'),
     'FigS5': ('plot_argo_ke_sampling_by_year', 'argo_ke_sampling_by_year'),
-    'FigS6': ('plot_argo_lens_case/pmove_2014', 'argo_lens_case'),
-    'FigS7': ('plot_scv_case_profiles/ke_minty_spicy', 'scv_case_profiles'),
-    'FigS8': ('plot_scv_case_profiles/atlantic_spicy', 'scv_case_profiles'),
+    'FigS6': ('plot_scv_case_profiles/atlantic_spicy', 'scv_case_profiles'),
 }
 # Source data written by producers other than the figure's plotter.
 EXTRA_SOURCES = {
