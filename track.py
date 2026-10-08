@@ -86789,19 +86789,18 @@ def _ofes_grid_lens_surface_ridges(date: Any, lons: Any, settings: Mapping[str, 
     return pd.DataFrame(rows)
 
 
-def _ofes_grid_lens_release_jet_side(units: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
-    """判定释放日透镜中心位于表层急流脊哪一侧。"""
+def _ofes_grid_lens_jet_side(dates: Any, lons: Any, lats: Any, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """判定各点位于当日表层急流脊哪一侧，结果与输入逐行对齐。"""
+    points = pd.DataFrame({'date': pd.to_datetime(dates), 'lon': np.asarray(lons, dtype=float), 'lat': np.asarray(lats, dtype=float)})
     rows = []
-    for date, group in units.groupby('release_date', sort=True):
-        ridges = _ofes_grid_lens_surface_ridges(date, group['release_lon'], settings)
-        rows.append(ridges.add_prefix('release_').assign(track_id=group['track_id'].to_numpy()))
-    side = pd.concat(rows, ignore_index=True)
-    side = units[['track_id', 'release_lat']].merge(side, on='track_id', validate='one_to_one')
-    side['release_lat_minus_ridge'] = side['release_lat'] - side['release_surface_ridge_lat']
+    for date, group in points.groupby('date', sort=True):
+        rows.append(_ofes_grid_lens_surface_ridges(date, group['lon'], settings).set_axis(group.index))
+    side = pd.concat(rows).reindex(points.index)
+    side['lat_minus_ridge'] = points['lat'] - side['surface_ridge_lat']
     side['jet_side'] = np.select(
-        [side['release_lat_minus_ridge'] > 0, side['release_lat_minus_ridge'] <= 0], ['north', 'south'], default='unknown'
+        [side['lat_minus_ridge'] > 0, side['lat_minus_ridge'] <= 0], ['north', 'south'], default='unknown'
     )
-    return side.drop(columns='release_lat')
+    return side
 
 
 def _ofes_grid_lens_population_mask(units: pd.DataFrame, population: str) -> pd.Series:
@@ -86924,7 +86923,8 @@ def build_ofes_grid_lens_units(
     objects = _ofes_grid_lens_link(_ofes_grid_lens_objects(cache_root, params), params)
     objects['structure_group'] = _ofes_grid_lens_structure_groups(objects)
     units = _ofes_grid_lens_unit_table(objects, params)
-    units = units.merge(_ofes_grid_lens_release_jet_side(units, params), on='track_id', validate='one_to_one')
+    side = _ofes_grid_lens_jet_side(units['release_date'], units['release_lon'], units['release_lat'], params)
+    units = units.join(side.add_prefix('release_').rename(columns={'release_jet_side': 'jet_side'}))
     weights = _ofes_grid_lens_season_weights(units, params)
     summary = _ofes_grid_lens_unit_summary(units, weights)
     root.mkdir(parents=True, exist_ok=True)
@@ -88351,6 +88351,384 @@ def plot_ofes_grid_lens_depth_changes(
 
     plot_data.to_csv(root / 'depth_component_plot_data.csv', index=False)
     return {'figures': figures, 'contrast_plot_data': plot_data}
+
+
+_OFES_GRID_LENS_CORE_SAMPLES = (
+    'do_isopycnal', 'salinity_isopycnal', 'pv_isopycnal', 'oyashio_isopycnal',
+    'do_depth', 'theta_isopycnal', 'theta_depth', 'do_isopycnal_footprint',
+)
+_OFES_GRID_LENS_CORE_CONTRAST_QUANTITIES = (
+    'do_contrast_isopycnal', 'do_contrast_isopycnal_same_side', 'do_contrast_depth',
+    'theta_contrast_isopycnal', 'theta_contrast_depth', 'do_contrast_isopycnal_footprint',
+    'salinity_contrast_isopycnal', 'pv_log_ratio_isopycnal',
+    'oyashio_contrast_isopycnal', 'do_residual_isopycnal',
+)
+# Hiroe 2002 的纯水站位：房总半岛以南的黑潮、北海道南岸 41°40′N 以北的亲潮；(经度范围, 纬度范围)
+_OFES_NPIW_END_MEMBER_BOXES = {
+    'kuroshio': ((140.0, 141.5), (33.0, 35.2)),
+    'oyashio': ((144.0, 147.5), (41.67, 43.6)),
+}
+_OFES_NPIW_END_MEMBER_LEVELS = np.round(np.arange(25.0, 27.45, 0.1), 1)
+
+
+def _ofes_grid_lens_core_contrast_settings() -> dict:
+    """解析透镜核心氧差设置；重抽次数与种子沿用 reverse enrichment，急流脊判据沿用实验单位。"""
+    raw = dict(_OFES_CFG.get('grid_lens_core_oxygen_contrast', {}) or {})
+    reverse = _OFES_CFG.get('scv_reverse_enrichment', {}) or {}
+    units = _ofes_grid_lens_unit_settings()
+    return {
+        'bootstrap_replicates': int(reverse.get('bootstrap_replicates', 10000)),
+        'bootstrap_seed': int(reverse.get('control_random_seed', 20260831)),
+        'jet_search_lat_bounds': units['jet_search_lat_bounds'],
+        'jet_competing_peak_ratio': units['jet_competing_peak_ratio'],
+        'output_subdir': str(raw.get('output_subdir', 'grid_lens_core_oxygen_contrast')),
+    }
+
+
+def _ofes_grid_lens_core_contrast_day(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """取一个 S5 日期各透镜中心柱与其每个对照平移中心柱在核心 σ0 面和核心深度上的 DO、θ，另取 footprint 平均的核心等密面 DO，以及两个 NPIW 端元框内各海洋柱在固定 σ0 层上的 θ、S、DO。"""
+    date, lenses, controls, footprints = args
+    snapshot = load_ofes_snapshot(date, variables=['do2', 'temp', 'salinity'])
+    depth, lat, lon = (np.asarray(snapshot[name], dtype=float) for name in ('depth', 'lat', 'lon'))
+    columns: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+
+    def column(row: int, col: int) -> dict[str, np.ndarray]:
+        if (row, col) not in columns:
+            theta = np.asarray(snapshot['temp'][:, row, col], dtype=float)
+            salinity = np.asarray(snapshot['salinity'][:, row, col], dtype=float)
+            sigma = _ofes_sigma0_profile(depth, salinity, theta, lon[col], lat[row])
+            gradient = np.full(sigma.shape, np.nan)
+            valid = np.isfinite(sigma)
+            if valid.sum() >= 2:
+                gradient[valid] = np.gradient(sigma[valid], depth[valid])
+            columns[(row, col)] = {
+                'sigma0': sigma, 'dsigma_dz': gradient, 'salinity': salinity, 'theta': theta,
+                'do': np.asarray(snapshot['do2'][:, row, col], dtype=float),
+            }
+        return columns[(row, col)]
+
+    def on_isopycnal(row: int, col: int, var: str, sigma: float) -> float:
+        profile = column(row, col)
+        # 交付层以下与陆地为缺测，去掉后沿用 Argo 核心氧差的单调包络插值
+        valid = np.isfinite(profile['sigma0']) & np.isfinite(profile[var])
+        if valid.sum() < 2:
+            return np.nan
+        return _profile_value_on_isopycnal(profile['sigma0'][valid], profile[var][valid], sigma)
+
+    def at_depth(row: int, col: int, var: str, target: float) -> float:
+        return _ofes_profile_value_at_depth(depth, column(row, col)[var], target)
+
+    def mean_finite(values: Sequence[float]) -> float:
+        values = np.asarray(values, dtype=float)
+        return float(np.nanmean(values)) if np.isfinite(values).any() else np.nan
+
+    def sample(row: int, col: int, offset: tuple[int, int], sigma: float, core: float, cells: np.ndarray) -> dict:
+        return {
+            'do_isopycnal': on_isopycnal(row, col, 'do', sigma),
+            'salinity_isopycnal': on_isopycnal(row, col, 'salinity', sigma),
+            'pv_isopycnal': float(gsw.f(lat[row])) / (1000.0 + sigma) * on_isopycnal(row, col, 'dsigma_dz', sigma),
+            'do_depth': at_depth(row, col, 'do', core),
+            'theta_isopycnal': on_isopycnal(row, col, 'theta', sigma),
+            'theta_depth': at_depth(row, col, 'theta', core),
+            'do_isopycnal_footprint': mean_finite([
+                on_isopycnal(r + offset[0], c + offset[1], 'do', sigma) for r, c in cells
+            ]),
+        }
+
+    lens_rows, control_rows = [], []
+    for lens in lenses.itertuples(index=False):
+        row, col = _ofes_grid_nearest_index(lon, lat, float(lens.center_lon), float(lens.center_lat))
+        core = float(lens.centroid_depth_m)
+        sigma_core = _ofes_scv_reverse_candidate_density(snapshot, row, col, core)
+        cells = footprints.loc[
+            footprints['object_id'].eq(lens.object_id), ['global_lat_index', 'global_lon_index']
+        ].drop_duplicates().to_numpy(dtype=int)
+        lens_rows.append({
+            'object_id': lens.object_id, 'sigma0_core': sigma_core, 'footprint_columns': len(cells),
+            **sample(row, col, (0, 0), sigma_core, core, cells),
+        })
+        for control in controls.loc[controls['object_id'].eq(lens.object_id)].itertuples(index=False):
+            control_rows.append({
+                'object_id': lens.object_id, 'candidate_id': control.candidate_id,
+                'source_lat': control.source_lat, 'source_lon': control.source_lon,
+                **sample(int(control.source_lat_index), int(control.source_lon_index),
+                         (int(control.offset_row), int(control.offset_col)), sigma_core, core, cells),
+            })
+    end_member_rows = []
+    for water, (lon_bounds, lat_bounds) in _OFES_NPIW_END_MEMBER_BOXES.items():
+        box_rows = np.flatnonzero((lat >= lat_bounds[0]) & (lat <= lat_bounds[1]))
+        box_cols = np.flatnonzero((lon >= lon_bounds[0]) & (lon <= lon_bounds[1]))
+        for row in box_rows:
+            for col in box_cols:
+                if np.isfinite(column(row, col)['sigma0']).sum() < 2:
+                    continue
+                for level in _OFES_NPIW_END_MEMBER_LEVELS:
+                    end_member_rows.append((water, level, *(on_isopycnal(row, col, var, level) for var in ('theta', 'salinity', 'do'))))
+    end_members = pd.DataFrame(end_member_rows, columns=['water', 'sigma0', 'theta', 'salinity', 'do'])
+    end_members[['sigma0', 'theta', 'salinity', 'do']] = end_members[['sigma0', 'theta', 'salinity', 'do']].astype('float32')
+    return pd.DataFrame(lens_rows), pd.DataFrame(control_rows), end_members
+
+
+def _replicated_sample_median(values: np.ndarray, multiplicity: np.ndarray) -> np.ndarray:
+    """逐行返回把各值按整数重数复制后的样本中位数，与对复制样本调用 np.median 相同；总重数为 0 时为 NaN。"""
+    order = np.argsort(values)
+    ordered = np.asarray(values, dtype=float)[order]
+    cumulative = np.cumsum(np.asarray(multiplicity)[:, order], axis=1)
+    total = cumulative[:, -1].astype(int)
+    low = np.argmax(cumulative > ((total - 1) // 2)[:, None], axis=1)
+    high = np.argmax(cumulative > (total // 2)[:, None], axis=1)
+    median = (ordered[low] + ordered[high]) / 2.0
+    median[total == 0] = np.nan
+    return median
+
+
+def _ofes_npiw_end_members(samples: pd.DataFrame) -> pd.DataFrame:
+    """把端元框各海洋柱-日在固定 σ0 层上的取值汇总为逐层中位数；该层在过半柱-日中不存在（露头或柱太浅）时端元记缺测。"""
+    grouped = samples.groupby(['water', 'sigma0'], sort=True)
+    table = grouped[['theta', 'salinity', 'do']].median().astype(float)
+    table['n_column_days'] = grouped.size()
+    table['coverage'] = grouped['theta'].count() / table['n_column_days']
+    table.loc[table['coverage'] <= 0.5, ['theta', 'salinity', 'do']] = np.nan
+    return table.reset_index()
+
+
+def _ofes_npiw_end_members_at(end_members: pd.DataFrame, sigma: Any) -> dict[tuple[str, str], np.ndarray]:
+    """把两端元逐层中位数在 σ0 上线性插值到给定密度，键为 (变量, 水)；σ0 不在两端元共同有效层内时为 NaN。"""
+    wide = end_members.pivot(index='sigma0', columns='water', values=['theta', 'salinity', 'do']).dropna()
+    sigma = np.asarray(sigma, dtype=float)
+    inside = (sigma >= wide.index.min()) & (sigma <= wide.index.max())
+    return {key: np.where(inside, np.interp(sigma, wide.index, wide[key]), np.nan) for key in wide.columns}
+
+
+def _ofes_oyashio_ratio(theta: Any, salinity: Any, members: Mapping[tuple[str, str], np.ndarray]) -> np.ndarray:
+    """Hiroe 2002、Shimizu 2004 的等密面亲潮混合比 R = (Rθ + RS)/2，纯黑潮为 0、纯亲潮为 1。"""
+    ratios = [
+        (np.asarray(values, dtype=float) - members[(var, 'kuroshio')]) / (members[(var, 'oyashio')] - members[(var, 'kuroshio')])
+        for var, values in (('theta', theta), ('salinity', salinity))
+    ]
+    return (ratios[0] + ratios[1]) / 2.0
+
+
+def _ofes_grid_lens_core_contrast_summary(sets: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """按全部、类型与类型 × 急流侧汇总核心差的中位数、结构组整组重抽区间与正值比例；类型差在同一套重抽中计算。"""
+    replicates = settings['bootstrap_replicates']
+
+    def multiplicity(frame: pd.DataFrame, seed_parts: tuple) -> np.ndarray:
+        codes, uniques = pd.factorize(frame['structure_group'])
+        rng = np.random.default_rng(_stable_analysis_seed(
+            settings['bootstrap_seed'], 'grid_lens_core_oxygen_contrast', *seed_parts,
+        ))
+        counts = np.zeros((replicates, len(uniques)), dtype=float)
+        np.add.at(counts, (np.arange(replicates)[:, None], rng.integers(0, len(uniques), (replicates, len(uniques)))), 1.0)
+        return counts[:, codes]
+
+    everything = pd.Series(True, index=sets.index)
+    minty = sets['spice_sign'].eq('minty')
+    groups = [('all', everything)] + [(kind, sets['spice_sign'].eq(kind)) for kind in ('minty', 'spicy')]
+    groups += [
+        (f'{kind} | {side} of jet', sets['spice_sign'].eq(kind) & sets['jet_side'].eq(side))
+        for kind in ('minty', 'spicy') for side in ('south', 'north')
+    ]
+    rows = []
+    for quantity in _OFES_GRID_LENS_CORE_CONTRAST_QUANTITIES:
+        for label, mask in groups:
+            frame = sets.loc[mask & sets[quantity].notna()]
+            values = frame[quantity].to_numpy(dtype=float)
+            boot = _replicated_sample_median(values, multiplicity(frame, (quantity, label)))
+            rows.append({
+                'quantity': quantity, 'group': label, 'n_lens_days': len(frame),
+                'n_tracks': frame['track_id'].nunique(), 'n_structure_groups': frame['structure_group'].nunique(),
+                'median': float(np.median(values)), 'ci_low': np.nanquantile(boot, 0.025),
+                'ci_high': np.nanquantile(boot, 0.975), 'fraction_positive': float((values > 0).mean()),
+            })
+        for label, mask in (('minty − spicy', everything), ('minty − spicy | south of jet', sets['jet_side'].eq('south'))):
+            frame = sets.loc[mask & sets[quantity].notna()]
+            values = frame[quantity].to_numpy(dtype=float)
+            weights = multiplicity(frame, (quantity, label))
+            is_minty = minty.loc[frame.index].to_numpy()
+            boot = (_replicated_sample_median(values[is_minty], weights[:, is_minty])
+                    - _replicated_sample_median(values[~is_minty], weights[:, ~is_minty]))
+            rows.append({
+                'quantity': quantity, 'group': label, 'n_lens_days': len(frame),
+                'n_tracks': frame['track_id'].nunique(), 'n_structure_groups': frame['structure_group'].nunique(),
+                'median': float(np.median(values[is_minty]) - np.median(values[~is_minty])),
+                'ci_low': np.nanquantile(boot, 0.025), 'ci_high': np.nanquantile(boot, 0.975),
+                'fraction_positive': np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def build_ofes_grid_lens_core_oxygen_contrast(
+    reverse_cache_dir: str | Path,
+    *,
+    units_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """比较 Tier-1 透镜核心等密面上的氧与同日同密度外部对照，对应第一篇 Argo 的 SCV 核心氧差。
+
+    取 reverse enrichment Analysis 2 中有固定对照的全部透镜-日，不按是否携氧筛选。每个透镜以中心最近网格柱在体积质心深度处的 σ0 为核心等密面（即 Analysis 2 配对用的参照密度），透镜中心柱与各对照的平移中心柱在该等密面上插值 DO 与位温（`_profile_value_on_isopycnal`，柱不跨该密度时记缺测），对照取有效值平均，透镜减对照即核心等密面差；核心深度处的同类差、整个 footprint 平均的等密面 DO 差，以及只用与透镜同在当日表层急流脊一侧的对照的等密面 DO 差一并给出。核心等密面上另取盐度与层结 PV（f/ρ·∂σ0/∂z，透镜核心 |Ro| 小，略去相对涡度），PV 以透镜与对照均值之比的 log10 表示。水团组成用 Hiroe 2002、Shimizu 2004 的黑潮–亲潮等密面两端元混合比 R = (Rθ + RS)/2（纯黑潮 0、纯亲潮 1）：端元取房总半岛以南与北海道南岸两个框内全部海洋柱在同一批场日期、每 0.1 σ0 层上的中位数，再在 σ0 上插值到核心密度；混合比之差乘同密度两端元的氧差即只由组成差别预期的氧差，氧差减去它记为超出两端元混合的残差。汇总按全部、minty/spicy 及类型 × 急流脊一侧分组，给出中位数、按结构组整组重抽的 95% 区间与正值比例；minty 与 spicy 中位数之差在同一套重抽中计算。
+
+    参数:
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/analysis2_controls.parquet` 与 `<日期>/analysis2_footprints.parquet`。
+        - units_dir (str | pathlib.Path | None): 透镜实验单位目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_core_oxygen_contrast`。
+        - workers (int): 按 S5 日期并行的进程数；默认 1。
+        - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
+
+    返回:
+        - dict: `load_ofes_grid_lens_core_oxygen_contrast` 的结果。
+
+    输出:
+        - `output_dir/core_oxygen_contrast_sets.parquet`：逐透镜-日的核心 σ0、透镜与对照均值及其差（`oyashio_*` 为混合比）、端元氧差与残差、急流侧与携氧标志。
+        - `output_dir/core_oxygen_contrast_controls.parquet`：逐对照的取值、急流侧及是否与透镜同侧。
+        - `output_dir/core_oxygen_contrast_summary.csv`：分组中位数、区间、正值比例与类型差。
+        - `output_dir/npiw_end_members.csv`：两端元逐 0.1 σ0 层的 θ、S、DO 中位数、柱-日数与该层存在比例。
+        - `output_dir/manifest.json`：请求与计数。
+
+    说明:
+        - 重抽次数与种子沿用 reverse enrichment；每个量 × 组的种子为 `_stable_analysis_seed(种子, 'grid_lens_core_oxygen_contrast', 量, 组)`，组内只重抽本组的结构组。
+        - Argo 锚点是穿过 SCV 的单条剖面，这里对应透镜中心柱；footprint 平均是不依赖中心柱的变体。
+        - 核心等密面差比较同一密度上的不同水柱，与剖面内相邻深度比较的 ΔDO 不是同一个量。
+        - 某层在端元框过半柱-日中不存在（亲潮框轻层露头）时该端元缺测，混合比只在两端元共同有效的密度范围内给出，核心较轻的南侧 spicy 透镜多数没有混合比。
+        - 氧不进混合模型：混合水区还有津轻等第三来源且氧不守恒（Talley 1995），残差只说明透镜比两端元组成所预期的更富氧或更贫氧，不区分来源。
+    """
+    settings = _ofes_grid_lens_core_contrast_settings()
+    scope_root = Path(reverse_cache_dir).expanduser().resolve() / 'primary_300_1000'
+    units = load_ofes_grid_lens_units(units_dir)
+    root = _ofes_grid_lens_output_root(output_dir, settings)
+    request = {
+        'reverse_cache_dir': str(scope_root.parent),
+        'units_dir': str(Path(units['output_dir']).resolve()),
+        'settings': settings,
+    }
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        same_request = _ofes_requests_equal(existing.get('request'), request)
+        if not same_request and not overwrite:
+            raise RuntimeError(
+                'Existing grid-lens core-contrast output was built from a different request; '
+                'use another output_dir or overwrite=True.'
+            )
+        if same_request and existing.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_core_oxygen_contrast(root)
+    lenses = units['objects'].loc[units['objects']['matched_object_evaluable'].astype(bool)].reset_index(drop=True)
+    controls = pd.read_parquet(scope_root / 'analysis2_controls.parquet')
+    controls = controls.loc[controls['object_id'].isin(lenses['object_id'])]
+    tasks = []
+    for date, part in lenses.groupby('date', sort=True):
+        footprints = pd.read_parquet(
+            scope_root / f'{pd.Timestamp(date):%Y%m%d}' / 'analysis2_footprints.parquet',
+            columns=['object_id', 'global_lat_index', 'global_lon_index'],
+        )
+        tasks.append((
+            pd.Timestamp(date), part[['object_id', 'center_lon', 'center_lat', 'centroid_depth_m']],
+            controls.loc[controls['object_id'].isin(part['object_id'])],
+            footprints.loc[footprints['object_id'].isin(part['object_id'])],
+        ))
+    if int(workers) > 1:
+        with ProcessPoolExecutor(max_workers=int(workers)) as executor:
+            frames = list(executor.map(_ofes_grid_lens_core_contrast_day, tasks))
+    else:
+        frames = [_ofes_grid_lens_core_contrast_day(task) for task in tasks]
+    side = _ofes_grid_lens_jet_side(lenses['date'], lenses['center_lon'], lenses['center_lat'], settings)
+    sets = lenses[[
+        'object_id', 'date', 'track_id', 'structure_group', 'spice_sign', 'center_lat', 'center_lon',
+        'centroid_depth_m', 'radius_km', 'object_density', 'weak_native', 'strong_native',
+        'carry_do20', 'carry_do35', 'carry_do50',
+    ]].join(side[['surface_ridge_lat', 'surface_ridge_ambiguous', 'lat_minus_ridge', 'jet_side']])
+    end_members = _ofes_npiw_end_members(pd.concat([frame for *_, frame in frames], ignore_index=True))
+    lens_values = pd.concat([frame for frame, *_ in frames], ignore_index=True)
+    lens_values['oyashio_isopycnal'] = _ofes_oyashio_ratio(
+        lens_values['theta_isopycnal'], lens_values['salinity_isopycnal'],
+        _ofes_npiw_end_members_at(end_members, lens_values['sigma0_core']),
+    )
+    sets = sets.merge(lens_values, on='object_id', validate='one_to_one')
+    control_values = pd.concat([frame for _, frame, _ in frames], ignore_index=True)
+    control_values['oyashio_isopycnal'] = _ofes_oyashio_ratio(
+        control_values['theta_isopycnal'], control_values['salinity_isopycnal'],
+        _ofes_npiw_end_members_at(end_members, control_values['object_id'].map(sets.set_index('object_id')['sigma0_core'])),
+    )
+    lens_side = control_values['object_id'].map(sets.set_index('object_id')['jet_side'])
+    control_values['jet_side'] = _ofes_grid_lens_jet_side(
+        control_values['object_id'].map(sets.set_index('object_id')['date']),
+        control_values['source_lon'], control_values['source_lat'], settings,
+    )['jet_side'].to_numpy()
+    control_values['same_jet_side'] = control_values['jet_side'].eq(lens_side) & lens_side.ne('unknown')
+    by_lens = control_values.groupby('object_id')
+    sets = sets.join(by_lens.agg(
+        n_controls=('candidate_id', 'size'), n_controls_on_isopycnal=('do_isopycnal', 'count'),
+        n_controls_same_side=('same_jet_side', 'sum'),
+    ), on='object_id')
+    means = by_lens[list(_OFES_GRID_LENS_CORE_SAMPLES)].mean()
+    for sample in _OFES_GRID_LENS_CORE_SAMPLES:
+        var, coordinate = sample.split('_', 1)
+        sets = sets.rename(columns={sample: f'{var}_lens_{coordinate}'})
+        sets[f'{var}_controls_{coordinate}'] = sets['object_id'].map(means[sample])
+        sets[f'{var}_contrast_{coordinate}'] = sets[f'{var}_lens_{coordinate}'] - sets[f'{var}_controls_{coordinate}']
+    same_side = control_values.loc[control_values['same_jet_side']].groupby('object_id')['do_isopycnal'].mean()
+    sets['do_controls_isopycnal_same_side'] = sets['object_id'].map(same_side)
+    sets['do_contrast_isopycnal_same_side'] = sets['do_lens_isopycnal'] - sets['do_controls_isopycnal_same_side']
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sets['pv_log_ratio_isopycnal'] = np.log10(sets['pv_lens_isopycnal'] / sets['pv_controls_isopycnal'])
+    members = _ofes_npiw_end_members_at(end_members, sets['sigma0_core'])
+    sets['do_end_member_gap_isopycnal'] = members[('do', 'oyashio')] - members[('do', 'kuroshio')]
+    sets['do_residual_isopycnal'] = (
+        sets['do_contrast_isopycnal'] - sets['oyashio_contrast_isopycnal'] * sets['do_end_member_gap_isopycnal']
+    )
+    summary = _ofes_grid_lens_core_contrast_summary(sets, settings)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(sets, root / 'core_oxygen_contrast_sets.parquet')
+    _atomic_write_parquet(control_values, root / 'core_oxygen_contrast_controls.parquet')
+    summary.to_csv(root / 'core_oxygen_contrast_summary.csv', index=False)
+    end_members.to_csv(root / 'npiw_end_members.csv', index=False)
+    manifest = {
+        'analysis': 'ofes_grid_lens_core_oxygen_contrast',
+        'status': 'complete',
+        'request': request,
+        'counts': {
+            'lens_days': len(sets), 'tracks': int(sets['track_id'].nunique()),
+            'structure_groups': int(sets['structure_group'].nunique()), 'field_dates': len(tasks),
+            'controls': int(sets['n_controls'].sum()),
+            'controls_on_isopycnal': int(sets['n_controls_on_isopycnal'].sum()),
+            'controls_same_jet_side': int(sets['n_controls_same_side'].sum()),
+            'lens_days_by_spice': {str(k): int(v) for k, v in sets['spice_sign'].value_counts().items()},
+            'lens_days_by_jet_side': {str(k): int(v) for k, v in sets['jet_side'].value_counts().items()},
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_core_oxygen_contrast(root)
+
+
+def load_ofes_grid_lens_core_oxygen_contrast(output_dir: str | Path | None = None) -> dict:
+    """读取已保存的透镜核心氧差结果。
+
+    只读取 `build_ofes_grid_lens_core_oxygen_contrast` 写出的表格和 manifest，不读取 OFES 原始场，也不修改结果目录。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_core_oxygen_contrast`。
+
+    返回:
+        - dict: output_dir、manifest，以及 sets（逐透镜-日）、controls（逐对照）、summary（分组汇总）与 end_members（NPIW 两端元）四张表。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _ofes_grid_lens_core_contrast_settings())
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Grid-lens core-contrast manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_core_oxygen_contrast' or manifest.get('status') != 'complete':
+        raise ValueError(f'Grid-lens core-contrast output is incomplete or belongs to another analysis: {root}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'sets': pd.read_parquet(root / 'core_oxygen_contrast_sets.parquet'),
+        'controls': pd.read_parquet(root / 'core_oxygen_contrast_controls.parquet'),
+        'summary': pd.read_csv(root / 'core_oxygen_contrast_summary.csv'),
+        'end_members': pd.read_csv(root / 'npiw_end_members.csv'),
+    }
 
 
 def _ofes_dualtrack_read_table(path: str | Path, columns: Sequence[str] | None = None) -> pd.DataFrame:

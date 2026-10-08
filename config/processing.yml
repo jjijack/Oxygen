@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.40 变更：
+#   - 新增 ofes.grid_lens_core_oxygen_contrast：透镜核心等密面氧与 Analysis 2 对照之差的输出目录；
+#     重抽次数与种子沿用 scv_reverse_enrichment，急流脊判据沿用 grid_lens_units。
 # version 1.39 变更：
 #   - 新增 ofes.grid_lens_depth_changes：既有透镜材料逐日轨迹四角分解的输出目录；
 #     固定密度面、季节权重、结构组重抽与截断门槛沿用来源回溯，急流脊沿用 E239。
@@ -506,6 +509,8 @@ ofes:
     output_subdir: grid_lens_backtrack
   grid_lens_depth_changes:
     output_subdir: grid_lens_depth_changes
+  grid_lens_core_oxygen_contrast:
+    output_subdir: grid_lens_core_oxygen_contrast
 
   event_diagnostics:
     candidate_threshold: 50.0
