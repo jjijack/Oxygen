@@ -88527,13 +88527,19 @@ def _ofes_npiw_end_members_at(end_members: pd.DataFrame, sigma: Any) -> dict[tup
     return {key: np.where(inside, np.interp(sigma, wide.index, wide[key]), np.nan) for key in wide.columns}
 
 
-def _ofes_oyashio_ratio(theta: Any, salinity: Any, members: Mapping[tuple[str, str], np.ndarray]) -> np.ndarray:
-    """Hiroe 2002、Shimizu 2004 的等密面亲潮混合比 R = (Rθ + RS)/2，纯黑潮为 0、纯亲潮为 1。"""
-    ratios = [
+def _ofes_oyashio_fractions(theta: Any, salinity: Any, members: Mapping[tuple[str, str], np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """分别由位温与盐度得到的等密面亲潮比例 Rθ、RS，纯黑潮为 0、纯亲潮为 1，不裁剪越界值。"""
+    r_theta, r_salinity = (
         (np.asarray(values, dtype=float) - members[(var, 'kuroshio')]) / (members[(var, 'oyashio')] - members[(var, 'kuroshio')])
         for var, values in (('theta', theta), ('salinity', salinity))
-    ]
-    return (ratios[0] + ratios[1]) / 2.0
+    )
+    return r_theta, r_salinity
+
+
+def _ofes_oyashio_ratio(theta: Any, salinity: Any, members: Mapping[tuple[str, str], np.ndarray]) -> np.ndarray:
+    """Hiroe 2002、Shimizu 2004 的等密面亲潮混合比 R = (Rθ + RS)/2，纯黑潮为 0、纯亲潮为 1。"""
+    r_theta, r_salinity = _ofes_oyashio_fractions(theta, salinity, members)
+    return (r_theta + r_salinity) / 2.0
 
 
 def _ofes_grid_lens_cluster_counts(structure_groups: pd.Series, settings: Mapping[str, Any], *seed_parts: Any) -> np.ndarray:
@@ -88895,6 +88901,394 @@ def plot_ofes_grid_lens_core_oxygen_contrast(
         fig.tight_layout(rect=(0, 0.07, 1, 1))
         fig.legend(handles=handles, frameon=False, fontsize=8, loc='lower right', ncol=2, bbox_to_anchor=(0.98, 0.0))
         path = root / f'core_oxygen_contrast_overview_do{int(threshold)}.png'
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        figures.append(str(path))
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+    return {'figures': figures, 'plot_data': plot_data}
+
+
+_OFES_GRID_LENS_CENSUS_AREAS = (
+    'area_domain', 'area_lens', 'area_oyashio', 'area_lens_oyashio', 'area_kuroshio', 'area_lens_kuroshio',
+    'ratio_area_domain', 'ratio_area_lens',
+)
+# 急流南侧看亲潮成分占优（R > 0.5）的水，北侧看黑潮成分占优（R < 0.5）的水
+_OFES_GRID_LENS_CENSUS_FOREIGN_WATER = {'south': 'oyashio', 'north': 'kuroshio'}
+
+
+def _ofes_grid_lens_census_settings() -> dict:
+    """解析等密面普查设置：分析层沿用 reverse enrichment 主范围，日历块取其最长块长，急流脊判据沿用实验单位。"""
+    raw = dict(_OFES_CFG.get('grid_lens_isopycnal_census', {}) or {})
+    reverse = _OFES_CFG.get('scv_reverse_enrichment', {}) or {}
+    units = _ofes_grid_lens_unit_settings()
+    return {
+        'analysis_layer_m': _ofes_scv_reverse_scope('primary_300_1000'),
+        'block_days': max(_ofes_scv_reverse_block_lengths()),
+        'bootstrap_replicates': int(reverse.get('bootstrap_replicates', 10000)),
+        'bootstrap_seed': int(reverse.get('control_random_seed', 20260831)),
+        'jet_search_lat_bounds': units['jet_search_lat_bounds'],
+        'jet_competing_peak_ratio': units['jet_competing_peak_ratio'],
+        'output_subdir': str(raw.get('output_subdir', 'grid_lens_isopycnal_census')),
+    }
+
+
+def _ofes_grid_lens_census_day(args: tuple) -> dict[str, pd.DataFrame]:
+    """普查一个 S5 日期：各目标等密面上按网格面积统计分析域、透镜与两类主导水的分层面积，另给覆盖、混合比与氧的面积分布和逐透镜面积。"""
+    date, footprint_path, profile_path, end_members, sigma_levels, settings = args
+    snapshot = load_ofes_snapshot(date, variables=['temp', 'salinity', 'do2'])
+    depth, lat, lon = (np.asarray(snapshot[name], dtype=float) for name in ('depth', 'lat', 'lon'))
+    sigma = _ofes_sigma0_volume(snapshot)
+    area = _ofes_tracer_cell_area_m2(lat, lon)
+    profile = pd.read_parquet(profile_path, columns=['global_lat_index', 'global_lon_index', 'classifier_assessable'])
+    assessable = np.zeros(area.shape, dtype=bool)
+    assessable[profile['global_lat_index'], profile['global_lon_index']] = profile['classifier_assessable'].to_numpy(dtype=bool)
+    ridges = _ofes_grid_lens_surface_ridges(date, lon, settings)
+    relative = lat[:, None] - ridges['surface_ridge_lat'].to_numpy()[None, :]
+    # 有竞争峰的经度上脊会在分支间跳动（KE 下游尤甚），这些经度不判急流侧
+    relative[:, ridges['surface_ridge_ambiguous'].to_numpy(dtype=bool)] = np.nan
+    side = np.select([relative > 0, relative <= 0], ['north', 'south'], default='unknown')
+    lon_bin = np.broadcast_to(np.floor(lon)[None, :], area.shape)
+    footprints = pd.read_parquet(footprint_path, columns=['object_id', 'global_lat_index', 'global_lon_index', 'depth_low_m', 'depth_high_m'])
+    fp_rows, fp_cols = footprints['global_lat_index'].to_numpy(dtype=int), footprints['global_lon_index'].to_numpy(dtype=int)
+    layer_low, layer_high = settings['analysis_layer_m']
+    ratio_edges = np.r_[-np.inf, np.round(np.arange(-0.5, 1.51, 0.05), 2), np.inf]
+    do_edges = np.r_[np.arange(0.0, 300.1, 5.0), np.inf]
+    tables: dict[str, list[pd.DataFrame]] = {'strata': [], 'coverage': [], 'histograms': [], 'objects': []}
+
+    def add(key: str, frame: pd.DataFrame, level: float) -> None:
+        tables[key].append(frame.assign(sigma0=float(level)))
+
+    for level in sigma_levels:
+        mapped = _ofes_fields_on_sigma0(
+            depth, sigma, float(level), 0.0,
+            {'theta': snapshot['temp'], 'salinity': snapshot['salinity'], 'do': snapshot['do2']},
+        )
+        r_theta, r_salinity = _ofes_oyashio_fractions(mapped['theta'], mapped['salinity'], _ofes_npiw_end_members_at(end_members, [level]))
+        ratio = (r_theta + r_salinity) / 2.0
+        crossings = mapped['crossing_count']
+        located = (crossings == 1) & np.isfinite(ratio)
+        in_layer = located & (mapped['depth'] >= layer_low) & (mapped['depth'] <= layer_high)
+        domain = assessable & in_layer & (side != 'unknown')
+        footprint_depth = mapped['depth'][fp_rows, fp_cols]
+        hit = (footprints['depth_low_m'].to_numpy() <= footprint_depth) & (footprint_depth <= footprints['depth_high_m'].to_numpy())
+        lens = np.zeros(area.shape, dtype=bool)
+        lens[fp_rows[hit], fp_cols[hit]] = True
+        lens &= domain
+        water = {'oyashio': domain & (ratio > 0.5), 'kuroshio': domain & (ratio < 0.5)}
+        for name in ('south', 'north', 'unknown'):
+            on_side = assessable & (side == name)
+            in_domain = domain & on_side
+            weight = area[in_domain]
+            gap = (r_theta - r_salinity)[in_domain]
+            gap_mean = np.average(gap, weights=weight) if weight.sum() else np.nan
+            add('coverage', pd.DataFrame([{
+                'side': name, 'area_assessable': area[on_side].sum(),
+                'area_no_crossing': area[on_side & (crossings == 0)].sum(),
+                'area_multiple_crossings': area[on_side & (crossings > 1)].sum(),
+                'area_located': area[on_side & located].sum(), 'area_in_layer': area[on_side & in_layer].sum(),
+                'area_domain': weight.sum(), 'area_lens': area[lens & on_side].sum(),
+                'ratio_below_zero_fraction': weight[ratio[in_domain] < 0].sum() / weight.sum() if weight.sum() else np.nan,
+                'ratio_above_one_fraction': weight[ratio[in_domain] > 1].sum() / weight.sum() if weight.sum() else np.nan,
+                'r_theta_minus_r_salinity_mean': gap_mean,
+                'r_theta_minus_r_salinity_sd': np.sqrt(np.average((gap - gap_mean) ** 2, weights=weight)) if weight.sum() else np.nan,
+            }]), level)
+            if name == 'unknown' or not in_domain.any():
+                continue
+            frame = pd.DataFrame({
+                'lon_bin': lon_bin[in_domain].astype(int), 'relative_lat_bin': np.floor(relative[in_domain]).astype(int),
+                'area_domain': weight, 'area_lens': np.where(lens[in_domain], weight, 0.0),
+                **{f'area_{kind}': np.where(mask[in_domain], weight, 0.0) for kind, mask in water.items()},
+                **{f'area_lens_{kind}': np.where((mask & lens)[in_domain], weight, 0.0) for kind, mask in water.items()},
+                'ratio_area_domain': weight * ratio[in_domain], 'ratio_area_lens': np.where(lens[in_domain], weight * ratio[in_domain], 0.0),
+            })
+            add('strata', frame.groupby(['lon_bin', 'relative_lat_bin'], as_index=False).sum().assign(side=name), level)
+            foreign = water[_OFES_GRID_LENS_CENSUS_FOREIGN_WATER[name]]
+            for in_lens in (True, False):
+                region = in_domain & (lens == in_lens)
+                for variable, values, edges, mask in (
+                    ('oyashio_ratio', ratio, ratio_edges, region),
+                    ('do_foreign_water', mapped['do'], do_edges, region & foreign),
+                ):
+                    counts, _ = np.histogram(values[mask], bins=edges, weights=area[mask])
+                    add('histograms', pd.DataFrame({
+                        'side': name, 'in_lens': in_lens, 'variable': variable,
+                        'bin_low': edges[:-1], 'bin_high': edges[1:], 'area': counts,
+                    }), level)
+        hits = footprints.loc[hit, ['object_id', 'global_lat_index', 'global_lon_index']].drop_duplicates()
+        hit_rows, hit_cols = hits['global_lat_index'].to_numpy(dtype=int), hits['global_lon_index'].to_numpy(dtype=int)
+        inside = domain[hit_rows, hit_cols]
+        cell = pd.DataFrame({
+            'object_id': hits['object_id'].to_numpy()[inside], 'side': side[hit_rows, hit_cols][inside],
+            'area': area[hit_rows, hit_cols][inside],
+            'oyashio': water['oyashio'][hit_rows, hit_cols][inside], 'kuroshio': water['kuroshio'][hit_rows, hit_cols][inside],
+        })
+        cell['area_foreign'] = np.where(cell['side'].map(_OFES_GRID_LENS_CENSUS_FOREIGN_WATER).eq('oyashio'), cell['oyashio'], cell['kuroshio']) * cell['area']
+        add('objects', cell.groupby(['object_id', 'side'], as_index=False)[['area', 'area_foreign']].sum(), level)
+    return {key: pd.concat(frames, ignore_index=True).assign(date=pd.Timestamp(date)) if frames else pd.DataFrame()
+            for key, frames in tables.items()}
+
+
+def _ofes_grid_lens_census_summary(strata: pd.DataFrame, objects: pd.DataFrame, calendar: Sequence[pd.Timestamp], settings: Mapping[str, Any]) -> pd.DataFrame:
+    """逐等密面 × 急流侧汇总占据率、外来水份额、富集倍数、分层标准化富集与混合比差；区间为日历块重抽，所有日期共用同一套块。"""
+    calendar = pd.DatetimeIndex(sorted(pd.to_datetime(list(calendar))))
+    block_ids, block_weights = _ofes_scv_reverse_block_weights(
+        calendar, settings['block_days'], settings['bootstrap_replicates'],
+        _stable_analysis_seed(settings['bootstrap_seed'], 'grid_lens_isopycnal_census'),
+    )
+    date_blocks = _ofes_scv_reverse_calendar_blocks(calendar, settings['block_days'])
+    replicate_weights = block_weights[:, np.searchsorted(block_ids, date_blocks)]
+    weights = np.vstack([np.ones(len(calendar)), replicate_weights])
+
+    def quantities(sums: Mapping[str, np.ndarray], foreign: str) -> dict[str, np.ndarray]:
+        total = {key: value.sum(axis=-1) for key, value in sums.items()}
+        domain, lens = total['area_domain'], total['area_lens']
+        water, lens_water = total[f'area_{foreign}'], total[f'area_lens_{foreign}']
+        with np.errstate(invalid='ignore', divide='ignore'):
+            stratum_share = np.where(sums['area_domain'] > 0, sums[f'area_{foreign}'] / sums['area_domain'], 0.0)
+            stratum_ratio = np.where(sums['area_domain'] > 0, sums['ratio_area_domain'] / sums['area_domain'], 0.0)
+            occupancy = lens / domain
+            lens_share = lens_water / water
+            return {
+                'lens_occupancy': occupancy, 'lens_share_of_foreign_water': lens_share,
+                'enrichment': lens_share / occupancy,
+                'enrichment_standardized': lens_water / (sums['area_lens'] * stratum_share).sum(axis=-1),
+                'foreign_fraction_in_lens': lens_water / lens,
+                'foreign_fraction_outside': (water - lens_water) / (domain - lens),
+                'ratio_mean_in_lens': total['ratio_area_lens'] / lens,
+                'ratio_mean_outside': (total['ratio_area_domain'] - total['ratio_area_lens']) / (domain - lens),
+                'ratio_difference_standardized': (total['ratio_area_lens'] - (sums['area_lens'] * stratum_ratio).sum(axis=-1)) / lens,
+            }
+
+    rows = []
+    for (level, side), part in strata.groupby(['sigma0', 'side'], sort=True):
+        foreign = _OFES_GRID_LENS_CENSUS_FOREIGN_WATER[side]
+        cube = {
+            key: part.pivot_table(index='date', columns=['lon_bin', 'relative_lat_bin'], values=key, aggfunc='sum', fill_value=0.0)
+            .reindex(calendar, fill_value=0.0).to_numpy()
+            for key in _OFES_GRID_LENS_CENSUS_AREAS
+        }
+        values = quantities({key: weights @ matrix for key, matrix in cube.items()}, foreign)
+        in_lens = cube[f'area_lens_{foreign}'].sum(axis=1) > 0
+        same = cube[f'area_lens_{foreign}'].sum(axis=0) > 0
+        lens_objects = objects.loc[objects['sigma0'].eq(level) & objects['side'].eq(side) & objects['area'].gt(0)]
+        row = {
+            'sigma0': level, 'side': side, 'foreign_water': foreign,
+            'n_dates': int((cube['area_domain'].sum(axis=1) > 0).sum()), 'n_dates_with_lens': int((cube['area_lens'].sum(axis=1) > 0).sum()),
+            'n_dates_lens_foreign_water': int(in_lens.sum()),
+            'n_lens_days': len(lens_objects), 'n_structure_groups': int(lens_objects['structure_group'].nunique()),
+            'minty_share_of_lens_foreign_area': lens_objects.loc[lens_objects['spice_sign'].eq('minty'), 'area_foreign'].sum() / lens_objects['area_foreign'].sum()
+            if lens_objects['area_foreign'].sum() else np.nan,
+            'area_domain_km2': cube['area_domain'].sum() / 1e6, 'area_lens_km2': cube['area_lens'].sum() / 1e6,
+            'area_foreign_km2': cube[f'area_{foreign}'].sum() / 1e6, 'area_lens_foreign_km2': cube[f'area_lens_{foreign}'].sum() / 1e6,
+            'outside_to_lens_foreign_same_strata': (cube[f'area_{foreign}'] - cube[f'area_lens_{foreign}'])[:, same].sum()
+            / cube[f'area_lens_{foreign}'].sum() if same.any() else np.nan,
+        }
+        for name, estimate in values.items():
+            row[name] = float(estimate[0])
+            row[f'{name}_ci_low'] = np.nanquantile(estimate[1:], 0.025)
+            row[f'{name}_ci_high'] = np.nanquantile(estimate[1:], 0.975)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_ofes_grid_lens_isopycnal_census(
+    reverse_cache_dir: str | Path,
+    *,
+    core_contrast_dir: str | Path | None = None,
+    units_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    sigma_levels: Sequence[float] = (26.6, 26.7, 26.8),
+    dates: Sequence[str | pd.Timestamp] | None = None,
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """在目标等密面上普查外来主导水有多少落在透镜内，回答透镜是否相对其面积优先容纳外来水。
+
+    仿 Hosoda 2021 的等密面普查。每个 S5 日期、每张目标等密面上，逐网格列取唯一交点处的位温、盐度与 DO（`_ofes_fields_on_sigma0`），用核心氧差输出的 NPIW 两端元算混合比 R；分析域为 S5 分类可评估、等密面唯一交点、交点深度在全项目统一的 300–1000 m 分析层内、急流侧可判定的列。透镜区域取当日全部 Tier-1 透镜（reverse enrichment 的 footprint，不只是有对照的 188 个）在该列的垂向区间包含交点深度的列；footprint 只在 300 m 以上被截断，所以在分析层内就是透镜的完整掩码。急流南侧的外来水定义为亲潮成分占优（R > 0.5），北侧为黑潮成分占优（R < 0.5）。按真实网格面积汇总：透镜占据率 a、外来水落在透镜内的份额 b、富集倍数 E = b/a，以及按 1° 经度 × 距急流脊 1° 纬度分层的标准化富集（透镜外来水面积除以各层“透镜面积 × 该层外来水比例”之和）；另给透镜内外 R 均值和同分层标准化的 R 差。区间为日历块重抽。
+
+    参数:
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/<日期>/analysis2_footprints.parquet` 与 `profile_frame.parquet`。
+        - core_contrast_dir (str | pathlib.Path | None): 核心氧差目录，读取其 NPIW 端元；默认正式 `grid_lens_core_oxygen_contrast`。
+        - units_dir (str | pathlib.Path | None): 透镜实验单位目录，用于给透镜补结构组与类型；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_isopycnal_census`。
+        - sigma_levels (Sequence[float]): 目标等密面 σ0；默认 (26.6, 26.7, 26.8)，即 NPIW 层、Hosoda 2021 的 26.7 及其两侧。
+        - dates (Sequence[str | pandas.Timestamp] | None): 只普查这些日期（试点用）；默认全部 S5 日期。
+        - workers (int): 按日期并行的进程数；默认 1。
+        - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
+
+    返回:
+        - dict: `load_ofes_grid_lens_isopycnal_census` 的结果。
+
+    输出:
+        - `output_dir/census_strata.parquet`：逐日期 × 等密面 × 急流侧 × 分层的分析域、透镜、两类主导水及其交集面积和 R 面积积分。
+        - `output_dir/census_coverage.csv`：逐日期 × 等密面 × 急流侧（含未判定）的可评估、无交点、多交点、唯一交点、分析层内与分析域面积，R 越界比例与 Rθ − RS 的面积加权均值和标准差。
+        - `output_dir/census_histograms.parquet`：透镜内外 R 与外来水 DO 的面积分布（两端开放箱，不裁剪越界值）。
+        - `output_dir/census_lens_objects.parquet`：逐透镜-日 × 等密面 × 急流侧的分析域内透镜面积与外来水面积，附结构组与类型。
+        - `output_dir/census_summary.csv`：逐等密面 × 急流侧的汇总量、区间与支持计数。
+        - `output_dir/manifest.json`：请求与计数。
+
+    说明:
+        - 300–1000 m 是普查选定的分析层，与第一篇和 reverse enrichment 的层位一致；它不是透镜检测充分的保证：S5 只识别体积质心不浅于 200 m 的透镜，北侧这些等密面常浅于 300 m 或露头，北侧结果只代表剩下的近急流海带。
+        - 急流脊有竞争峰（`_ofes_grid_lens_surface_ridges` 的 ambiguous 标记）的经度不判急流侧，面积计入未判定。
+        - R > 0.5 只是“该两端元模型下亲潮成分占优”的操作定义，不等于全部北方来源水；连续 R 的透镜内外差另行给出。
+        - 面积份额不是体积、库存或跨急流通量；三张等密面分别报告，不相加。
+    """
+    settings = _ofes_grid_lens_census_settings()
+    scope_root = Path(reverse_cache_dir).expanduser().resolve() / 'primary_300_1000'
+    core = load_ofes_grid_lens_core_oxygen_contrast(core_contrast_dir)
+    units = load_ofes_grid_lens_units(units_dir)
+    root = _ofes_grid_lens_output_root(output_dir, settings)
+    calendar = sorted(pd.Timestamp(path.name) for path in scope_root.glob('2003????') if path.is_dir())
+    if dates is not None:
+        calendar = sorted(pd.Timestamp(value).normalize() for value in dates)
+    levels = tuple(float(value) for value in sigma_levels)
+    request = {
+        'reverse_cache_dir': str(scope_root.parent),
+        'core_contrast_dir': str(Path(core['output_dir']).resolve()),
+        'units_dir': str(Path(units['output_dir']).resolve()),
+        'sigma_levels': list(levels),
+        'dates': [f'{date:%Y-%m-%d}' for date in calendar],
+        'settings': settings,
+    }
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        same_request = _ofes_requests_equal(existing.get('request'), request)
+        if not same_request and not overwrite:
+            raise RuntimeError(
+                'Existing grid-lens isopycnal census was built from a different request; '
+                'use another output_dir or overwrite=True.'
+            )
+        if same_request and existing.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_isopycnal_census(root)
+    tasks = [
+        (date, scope_root / f'{date:%Y%m%d}' / 'analysis2_footprints.parquet', scope_root / f'{date:%Y%m%d}' / 'profile_frame.parquet',
+         core['end_members'], levels, settings)
+        for date in calendar
+    ]
+    if int(workers) > 1:
+        with ProcessPoolExecutor(max_workers=int(workers)) as executor:
+            frames = list(executor.map(_ofes_grid_lens_census_day, tasks))
+    else:
+        frames = [_ofes_grid_lens_census_day(task) for task in tasks]
+    tables = {key: pd.concat([frame[key] for frame in frames], ignore_index=True) for key in ('strata', 'coverage', 'histograms', 'objects')}
+    tables['objects'] = tables['objects'].merge(
+        units['objects'][['object_id', 'structure_group', 'spice_sign']], on='object_id', how='left', validate='many_to_one',
+    )
+    summary = _ofes_grid_lens_census_summary(tables['strata'], tables['objects'], calendar, settings)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(tables['strata'], root / 'census_strata.parquet')
+    tables['coverage'].to_csv(root / 'census_coverage.csv', index=False)
+    _atomic_write_parquet(tables['histograms'], root / 'census_histograms.parquet')
+    _atomic_write_parquet(tables['objects'], root / 'census_lens_objects.parquet')
+    summary.to_csv(root / 'census_summary.csv', index=False)
+    manifest = {
+        'analysis': 'ofes_grid_lens_isopycnal_census',
+        'status': 'complete',
+        'request': request,
+        'counts': {
+            'dates': len(calendar), 'sigma_levels': len(levels),
+            'lens_objects': int(tables['objects']['object_id'].nunique()),
+            'structure_groups': int(tables['objects']['structure_group'].nunique()),
+        },
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_isopycnal_census(root)
+
+
+def load_ofes_grid_lens_isopycnal_census(output_dir: str | Path | None = None) -> dict:
+    """读取已保存的透镜等密面普查结果。
+
+    只读取 `build_ofes_grid_lens_isopycnal_census` 写出的表格和 manifest，不读取 OFES 原始场，也不修改结果目录。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_isopycnal_census`。
+
+    返回:
+        - dict: output_dir、manifest，以及 strata（分层面积）、coverage（覆盖）、histograms（面积分布）、objects（逐透镜面积）与 summary（汇总）五张表。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _ofes_grid_lens_census_settings())
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Grid-lens isopycnal census manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_isopycnal_census' or manifest.get('status') != 'complete':
+        raise ValueError(f'Grid-lens isopycnal census output is incomplete or belongs to another analysis: {root}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'strata': pd.read_parquet(root / 'census_strata.parquet'),
+        'coverage': pd.read_csv(root / 'census_coverage.csv', parse_dates=['date']),
+        'histograms': pd.read_parquet(root / 'census_histograms.parquet'),
+        'objects': pd.read_parquet(root / 'census_lens_objects.parquet'),
+        'summary': pd.read_csv(root / 'census_summary.csv'),
+    }
+
+
+def plot_ofes_grid_lens_isopycnal_census(
+    output_dir: str | Path | None = None,
+    *,
+    show_fig: bool = True,
+    dpi: int = 320,
+) -> dict:
+    """绘制透镜对外来主导水的富集与透镜内外混合比差。
+
+    只读等密面普查的正式汇总。左栏为各等密面 × 急流侧的富集倍数（实心为经度 × 距急流分层标准化，空心为未分层），对数轴，1 为无富集；右栏为同分层标准化的透镜内外 R 均值差。区间为日历块重抽。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 已完成的普查目录；默认正式 `grid_lens_isopycnal_census`。
+        - show_fig (bool): 是否显示图形；默认 True。
+        - dpi (int): PNG 分辨率；默认 320。
+
+    返回:
+        - dict: figures 路径列表与 plot_data 绘图输入表。
+
+    输出:
+        - `output_dir/isopycnal_census_overview.png`：两栏概览图。
+    """
+    import matplotlib.pyplot as plt
+
+    result = load_ofes_grid_lens_isopycnal_census(output_dir)
+    root = Path(result['output_dir'])
+    plot_data = result['summary'].sort_values(['side', 'sigma0'], ascending=[False, True]).reset_index(drop=True)
+    colors = {'south': _JOURNAL_COLORS['DO35'], 'north': _JOURNAL_COLORS['accent']}
+    labels = {'south': 'south of jet · Oyashio-dominant', 'north': 'north of jet · Kuroshio-dominant'}
+    figures = []
+    with plt.rc_context({'font.size': 9, 'axes.spines.top': False, 'axes.spines.right': False,
+                         'savefig.facecolor': 'white'}):
+        fig, (left, right) = plt.subplots(1, 2, figsize=(8.4, 3.4), sharey=True)
+        y = np.arange(len(plot_data))[::-1]
+        for position, row in zip(y, plot_data.itertuples()):
+            color = colors[row.side]
+            for name, offset, face in (('enrichment_standardized', 0.12, color), ('enrichment', -0.12, 'white')):
+                left.plot([getattr(row, f'{name}_ci_low'), getattr(row, f'{name}_ci_high')], [position + offset] * 2, color=color, linewidth=1.5)
+                left.plot(getattr(row, name), position + offset, marker='o', markersize=5, color=color, markerfacecolor=face, linestyle='none')
+            right.plot([row.ratio_difference_standardized_ci_low, row.ratio_difference_standardized_ci_high], [position] * 2, color=color, linewidth=1.5)
+            right.plot(row.ratio_difference_standardized, position, marker='o', markersize=5, color=color, linestyle='none')
+        left.set_xscale('log')
+        ticks = [0.5, 1, 2, 5, 10, 20]
+        left.set_xticks(ticks, [f'{tick:g}' for tick in ticks])
+        left.minorticks_off()
+        left.axvline(1, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+        right.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+        for ax in (left, right):
+            ax.grid(axis='x', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
+            ax.set_axisbelow(True)
+        left.set_yticks(y, [f'σ0 {row.sigma0:.1f} · {row.side} ({int(row.n_structure_groups)})' for row in plot_data.itertuples()])
+        left.set_xlabel('Foreign-water enrichment in lenses (share / occupancy)')
+        left.set_title('Enrichment')
+        right.set_xlabel('Oyashio ratio R, lens − same-stratum background')
+        right.set_title('Composition shift')
+        handles = [
+            plt.Line2D([], [], marker='o', color=_JOURNAL_COLORS['ink'], linestyle='none', markersize=5, label='Stratified (longitude × distance to jet)'),
+            plt.Line2D([], [], marker='o', color=_JOURNAL_COLORS['ink'], markerfacecolor='white', linestyle='none', markersize=5, label='Unstratified'),
+            *[plt.Line2D([], [], color=colors[side], linewidth=1.5, label=labels[side]) for side in ('south', 'north')],
+        ]
+        fig.tight_layout(rect=(0, 0.1, 1, 1))
+        fig.legend(handles=handles, frameon=False, fontsize=8, loc='lower center', ncol=2, bbox_to_anchor=(0.5, 0.0))
+        path = root / 'isopycnal_census_overview.png'
         fig.savefig(path, dpi=dpi, bbox_inches='tight')
         figures.append(str(path))
         if show_fig:

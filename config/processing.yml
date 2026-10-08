@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.41 变更：
+#   - 新增 ofes.grid_lens_isopycnal_census：透镜等密面普查的输出目录；分析层沿用
+#     scv_reverse_enrichment 主范围 300–1000 m，日历块取其最长块长，急流脊判据沿用 grid_lens_units。
 # version 1.40 变更：
 #   - 新增 ofes.grid_lens_core_oxygen_contrast：透镜核心等密面氧与 Analysis 2 对照之差的输出目录；
 #     重抽次数与种子沿用 scv_reverse_enrichment，急流脊判据沿用 grid_lens_units。
@@ -511,6 +514,9 @@ ofes:
     output_subdir: grid_lens_depth_changes
   grid_lens_core_oxygen_contrast:
     output_subdir: grid_lens_core_oxygen_contrast
+
+  grid_lens_isopycnal_census:
+    output_subdir: grid_lens_isopycnal_census
 
   event_diagnostics:
     candidate_threshold: 50.0
