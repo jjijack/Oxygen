@@ -1,4 +1,7 @@
 # 处理与算法参数配置
+# version 1.42 变更：
+#   - 新增 ofes.grid_lens_source_comparison：南侧 minty 透镜内外来源对照的输出目录；
+#     种子、积分、混合层判据与重抽全部沿用 grid_lens_backtrack。
 # version 1.41 变更：
 #   - 新增 ofes.grid_lens_isopycnal_census：透镜等密面普查的输出目录；分析层沿用
 #     scv_reverse_enrichment 主范围 300–1000 m，日历块取其最长块长，急流脊判据沿用 grid_lens_units。
@@ -517,6 +520,9 @@ ofes:
 
   grid_lens_isopycnal_census:
     output_subdir: grid_lens_isopycnal_census
+
+  grid_lens_source_comparison:
+    output_subdir: grid_lens_source_comparison
 
   event_diagnostics:
     candidate_threshold: 50.0
