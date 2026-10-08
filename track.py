@@ -88363,6 +88363,13 @@ _OFES_GRID_LENS_CORE_CONTRAST_QUANTITIES = (
     'salinity_contrast_isopycnal', 'pv_log_ratio_isopycnal',
     'oyashio_contrast_isopycnal', 'do_residual_isopycnal',
 )
+# 第一篇“SCV 处氧峰更多”在透镜上的四个层次：footprint 任一柱有峰、峰在透镜体内、中心柱有峰、中心柱的峰在该柱透镜区间内
+_OFES_GRID_LENS_PEAK_LEVELS = {
+    'footprint_column': 'do{t}_profile_carriage',
+    'lens_volume': 'do{t}_3d_carriage',
+    'centre_column': 'do{t}_centre_peak',
+    'centre_in_lens': 'do{t}_centre_lens_peak',
+}
 # Hiroe 2002 的纯水站位：房总半岛以南的黑潮、北海道南岸 41°40′N 以北的亲潮；(经度范围, 纬度范围)
 _OFES_NPIW_END_MEMBER_BOXES = {
     'kuroshio': ((140.0, 141.5), (33.0, 35.2)),
@@ -88386,8 +88393,12 @@ def _ofes_grid_lens_core_contrast_settings() -> dict:
 
 
 def _ofes_grid_lens_core_contrast_day(args: tuple) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """取一个 S5 日期各透镜中心柱与其每个对照平移中心柱在核心 σ0 面和核心深度上的 DO、θ，另取 footprint 平均的核心等密面 DO，以及两个 NPIW 端元框内各海洋柱在固定 σ0 层上的 θ、S、DO。"""
-    date, lenses, controls, footprints = args
+    """取一个 S5 日期各透镜中心柱与其每个对照平移中心柱在核心 σ0 面和核心深度上的 DO、θ 与中心柱氧峰，另取 footprint 平均的核心等密面 DO，以及两个 NPIW 端元框内各海洋柱在固定 σ0 层上的 θ、S、DO。"""
+    date, lenses, controls, footprints, profile_path = args
+    thresholds = _ofes_scv_reverse_thresholds()
+    peaks = pd.read_parquet(
+        profile_path, columns=['global_lat_index', 'global_lon_index', 'peak_depth', *(f'do{t}' for t in thresholds)],
+    ).set_index(['global_lat_index', 'global_lon_index'])
     snapshot = load_ofes_snapshot(date, variables=['do2', 'temp', 'salinity'])
     depth, lat, lon = (np.asarray(snapshot[name], dtype=float) for name in ('depth', 'lat', 'lon'))
     columns: dict[tuple[int, int], dict[str, np.ndarray]] = {}
@@ -88435,24 +88446,40 @@ def _ofes_grid_lens_core_contrast_day(args: tuple) -> tuple[pd.DataFrame, pd.Dat
             ]),
         }
 
+    def centre_peaks(row: int, col: int, intervals: np.ndarray) -> dict:
+        # 峰表每柱只存最强峰；透镜中心柱不在 footprint 内时没有透镜区间，配准层记缺测
+        peak = peaks.loc[(row, col)] if (row, col) in peaks.index else None
+        record = {}
+        for t in thresholds:
+            hit = peak is not None and bool(peak[f'do{t}'])
+            inside = hit and bool(((intervals[:, 0] <= peak['peak_depth']) & (intervals[:, 1] >= peak['peak_depth'])).any())
+            record[f'do{t}_centre_peak'] = hit
+            record[f'do{t}_centre_lens_peak'] = float(inside) if len(intervals) else np.nan
+        return record
+
     lens_rows, control_rows = [], []
     for lens in lenses.itertuples(index=False):
         row, col = _ofes_grid_nearest_index(lon, lat, float(lens.center_lon), float(lens.center_lat))
         core = float(lens.centroid_depth_m)
         sigma_core = _ofes_scv_reverse_candidate_density(snapshot, row, col, core)
-        cells = footprints.loc[
-            footprints['object_id'].eq(lens.object_id), ['global_lat_index', 'global_lon_index']
-        ].drop_duplicates().to_numpy(dtype=int)
+        mask = footprints.loc[footprints['object_id'].eq(lens.object_id)]
+        cells = mask[['global_lat_index', 'global_lon_index']].drop_duplicates().to_numpy(dtype=int)
+        intervals = mask.loc[
+            mask['global_lat_index'].eq(row) & mask['global_lon_index'].eq(col), ['depth_low_m', 'depth_high_m']
+        ].to_numpy(dtype=float)
         lens_rows.append({
             'object_id': lens.object_id, 'sigma0_core': sigma_core, 'footprint_columns': len(cells),
-            **sample(row, col, (0, 0), sigma_core, core, cells),
+            'centre_in_footprint': len(intervals) > 0,
+            **sample(row, col, (0, 0), sigma_core, core, cells), **centre_peaks(row, col, intervals),
         })
         for control in controls.loc[controls['object_id'].eq(lens.object_id)].itertuples(index=False):
+            # 对照中心 = 透镜中心 + 平移量，所以对照中心柱的透镜区间就是透镜中心柱的区间
+            control_row, control_col = int(control.source_lat_index), int(control.source_lon_index)
             control_rows.append({
                 'object_id': lens.object_id, 'candidate_id': control.candidate_id,
                 'source_lat': control.source_lat, 'source_lon': control.source_lon,
-                **sample(int(control.source_lat_index), int(control.source_lon_index),
-                         (int(control.offset_row), int(control.offset_col)), sigma_core, core, cells),
+                **sample(control_row, control_col, (int(control.offset_row), int(control.offset_col)), sigma_core, core, cells),
+                **centre_peaks(control_row, control_col, intervals),
             })
     end_member_rows = []
     for water, (lon_bounds, lat_bounds) in _OFES_NPIW_END_MEMBER_BOXES.items():
@@ -88509,52 +88536,106 @@ def _ofes_oyashio_ratio(theta: Any, salinity: Any, members: Mapping[tuple[str, s
     return (ratios[0] + ratios[1]) / 2.0
 
 
-def _ofes_grid_lens_core_contrast_summary(sets: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
-    """按全部、类型与类型 × 急流侧汇总核心差的中位数、结构组整组重抽区间与正值比例；类型差在同一套重抽中计算。"""
+def _ofes_grid_lens_cluster_counts(structure_groups: pd.Series, settings: Mapping[str, Any], *seed_parts: Any) -> np.ndarray:
+    """按结构组整组有放回重抽，返回重抽次数 × 行的重数；种子为 `_stable_analysis_seed(种子, 'grid_lens_core_oxygen_contrast', *seed_parts)`。"""
     replicates = settings['bootstrap_replicates']
+    codes, uniques = pd.factorize(structure_groups)
+    rng = np.random.default_rng(_stable_analysis_seed(settings['bootstrap_seed'], 'grid_lens_core_oxygen_contrast', *seed_parts))
+    counts = np.zeros((replicates, len(uniques)), dtype=float)
+    np.add.at(counts, (np.arange(replicates)[:, None], rng.integers(0, len(uniques), (replicates, len(uniques)))), 1.0)
+    return counts[:, codes]
 
-    def multiplicity(frame: pd.DataFrame, seed_parts: tuple) -> np.ndarray:
-        codes, uniques = pd.factorize(frame['structure_group'])
-        rng = np.random.default_rng(_stable_analysis_seed(
-            settings['bootstrap_seed'], 'grid_lens_core_oxygen_contrast', *seed_parts,
-        ))
-        counts = np.zeros((replicates, len(uniques)), dtype=float)
-        np.add.at(counts, (np.arange(replicates)[:, None], rng.integers(0, len(uniques), (replicates, len(uniques)))), 1.0)
-        return counts[:, codes]
 
+def _ofes_grid_lens_core_groups(sets: pd.DataFrame) -> tuple[list, list]:
+    """核心对比的分组（全部、类型、类型 × 急流侧）与组间差（标签、范围、前组、后组，前组减后组）。"""
     everything = pd.Series(True, index=sets.index)
-    minty = sets['spice_sign'].eq('minty')
-    groups = [('all', everything)] + [(kind, sets['spice_sign'].eq(kind)) for kind in ('minty', 'spicy')]
-    groups += [
-        (f'{kind} | {side} of jet', sets['spice_sign'].eq(kind) & sets['jet_side'].eq(side))
-        for kind in ('minty', 'spicy') for side in ('south', 'north')
+    kind = {name: sets['spice_sign'].eq(name) for name in ('minty', 'spicy')}
+    side = {name: sets['jet_side'].eq(name) for name in ('south', 'north')}
+    groups = [('all', everything), *kind.items()]
+    groups += [(f'{k} | {s} of jet', kind[k] & side[s]) for k in kind for s in side]
+    differences = [
+        ('minty − spicy', everything, kind['minty'], kind['spicy']),
+        ('minty − spicy | south of jet', side['south'], kind['minty'], kind['spicy']),
+        ('minty: south − north of jet', kind['minty'], side['south'], side['north']),
+        ('spicy: north − south of jet', kind['spicy'], side['north'], side['south']),
     ]
+    return groups, differences
+
+
+def _ofes_grid_lens_core_contrast_summary(sets: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """按全部、类型与类型 × 急流侧汇总核心差的中位数、结构组整组重抽区间与正值比例；组间中位数差在同一套重抽中计算。"""
+    groups, differences = _ofes_grid_lens_core_groups(sets)
     rows = []
     for quantity in _OFES_GRID_LENS_CORE_CONTRAST_QUANTITIES:
         for label, mask in groups:
             frame = sets.loc[mask & sets[quantity].notna()]
             values = frame[quantity].to_numpy(dtype=float)
-            boot = _replicated_sample_median(values, multiplicity(frame, (quantity, label)))
+            boot = _replicated_sample_median(values, _ofes_grid_lens_cluster_counts(frame['structure_group'], settings, quantity, label))
             rows.append({
                 'quantity': quantity, 'group': label, 'n_lens_days': len(frame),
                 'n_tracks': frame['track_id'].nunique(), 'n_structure_groups': frame['structure_group'].nunique(),
                 'median': float(np.median(values)), 'ci_low': np.nanquantile(boot, 0.025),
                 'ci_high': np.nanquantile(boot, 0.975), 'fraction_positive': float((values > 0).mean()),
             })
-        for label, mask in (('minty − spicy', everything), ('minty − spicy | south of jet', sets['jet_side'].eq('south'))):
-            frame = sets.loc[mask & sets[quantity].notna()]
+        for label, scope, first, second in differences:
+            frame = sets.loc[scope & (first | second) & sets[quantity].notna()]
             values = frame[quantity].to_numpy(dtype=float)
-            weights = multiplicity(frame, (quantity, label))
-            is_minty = minty.loc[frame.index].to_numpy()
-            boot = (_replicated_sample_median(values[is_minty], weights[:, is_minty])
-                    - _replicated_sample_median(values[~is_minty], weights[:, ~is_minty]))
+            weights = _ofes_grid_lens_cluster_counts(frame['structure_group'], settings, quantity, label)
+            is_first = first.loc[frame.index].to_numpy()
+            boot = (_replicated_sample_median(values[is_first], weights[:, is_first])
+                    - _replicated_sample_median(values[~is_first], weights[:, ~is_first]))
             rows.append({
                 'quantity': quantity, 'group': label, 'n_lens_days': len(frame),
                 'n_tracks': frame['track_id'].nunique(), 'n_structure_groups': frame['structure_group'].nunique(),
-                'median': float(np.median(values[is_minty]) - np.median(values[~is_minty])),
+                'median': float(np.median(values[is_first]) - np.median(values[~is_first])),
                 'ci_low': np.nanquantile(boot, 0.025), 'ci_high': np.nanquantile(boot, 0.975),
                 'fraction_positive': np.nan,
             })
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_peak_carriage_summary(sets: pd.DataFrame, controls: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """按核心对比的分组汇总四个层次的携峰率：透镜率、各自对照的平均率与逐透镜配对差的均值（每个透镜-日等权），区间为结构组整组重抽；组间差在同一套重抽中计算。"""
+    groups, differences = _ofes_grid_lens_core_groups(sets)
+
+    def weighted_mean(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return weights @ values / weights.sum(axis=1)
+
+    rows = []
+    for threshold in _ofes_scv_reverse_thresholds():
+        for level, pattern in _OFES_GRID_LENS_PEAK_LEVELS.items():
+            column = pattern.format(t=threshold)
+            lens = sets[column].astype(float)
+            control = sets['object_id'].map(controls.assign(_flag=controls[column].astype(float)).groupby('object_id')['_flag'].mean())
+            valid = lens.notna() & control.notna()
+
+            def paired(mask: pd.Series, label: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+                frame = sets.loc[mask & valid]
+                weights = _ofes_grid_lens_cluster_counts(frame['structure_group'], settings, 'peak_carriage', column, label)
+                return frame, (lens - control).loc[frame.index].to_numpy(), weights
+
+            for label, mask in groups:
+                frame, difference, weights = paired(mask, label)
+                boot = weighted_mean(difference, weights)
+                rows.append({
+                    'threshold': threshold, 'level': level, 'group': label, 'n_lens_days': len(frame),
+                    'n_structure_groups': frame['structure_group'].nunique(),
+                    'lens_rate': float(lens.loc[frame.index].mean()), 'control_rate': float(control.loc[frame.index].mean()),
+                    'rate_difference': float(difference.mean()),
+                    'ci_low': np.nanquantile(boot, 0.025), 'ci_high': np.nanquantile(boot, 0.975),
+                })
+            for label, scope, first, second in differences:
+                frame, difference, weights = paired(scope & (first | second), label)
+                is_first = first.loc[frame.index].to_numpy()
+                boot = (weighted_mean(difference[is_first], weights[:, is_first])
+                        - weighted_mean(difference[~is_first], weights[:, ~is_first]))
+                rows.append({
+                    'threshold': threshold, 'level': level, 'group': label, 'n_lens_days': len(frame),
+                    'n_structure_groups': frame['structure_group'].nunique(), 'lens_rate': np.nan, 'control_rate': np.nan,
+                    'rate_difference': float(difference[is_first].mean() - difference[~is_first].mean()),
+                    'ci_low': np.nanquantile(boot, 0.025), 'ci_high': np.nanquantile(boot, 0.975),
+                })
     return pd.DataFrame(rows)
 
 
@@ -88568,10 +88649,10 @@ def build_ofes_grid_lens_core_oxygen_contrast(
 ) -> dict:
     """比较 Tier-1 透镜核心等密面上的氧与同日同密度外部对照，对应第一篇 Argo 的 SCV 核心氧差。
 
-    取 reverse enrichment Analysis 2 中有固定对照的全部透镜-日，不按是否携氧筛选。每个透镜以中心最近网格柱在体积质心深度处的 σ0 为核心等密面（即 Analysis 2 配对用的参照密度），透镜中心柱与各对照的平移中心柱在该等密面上插值 DO 与位温（`_profile_value_on_isopycnal`，柱不跨该密度时记缺测），对照取有效值平均，透镜减对照即核心等密面差；核心深度处的同类差、整个 footprint 平均的等密面 DO 差，以及只用与透镜同在当日表层急流脊一侧的对照的等密面 DO 差一并给出。核心等密面上另取盐度与层结 PV（f/ρ·∂σ0/∂z，透镜核心 |Ro| 小，略去相对涡度），PV 以透镜与对照均值之比的 log10 表示。水团组成用 Hiroe 2002、Shimizu 2004 的黑潮–亲潮等密面两端元混合比 R = (Rθ + RS)/2（纯黑潮 0、纯亲潮 1）：端元取房总半岛以南与北海道南岸两个框内全部海洋柱在同一批场日期、每 0.1 σ0 层上的中位数，再在 σ0 上插值到核心密度；混合比之差乘同密度两端元的氧差即只由组成差别预期的氧差，氧差减去它记为超出两端元混合的残差。汇总按全部、minty/spicy 及类型 × 急流脊一侧分组，给出中位数、按结构组整组重抽的 95% 区间与正值比例；minty 与 spicy 中位数之差在同一套重抽中计算。
+    取 reverse enrichment Analysis 2 中有固定对照的全部透镜-日，不按是否携氧筛选。每个透镜以中心最近网格柱在体积质心深度处的 σ0 为核心等密面（即 Analysis 2 配对用的参照密度），透镜中心柱与各对照的平移中心柱在该等密面上插值 DO 与位温（`_profile_value_on_isopycnal`，柱不跨该密度时记缺测），对照取有效值平均，透镜减对照即核心等密面差；核心深度处的同类差、整个 footprint 平均的等密面 DO 差，以及只用与透镜同在当日表层急流脊一侧的对照的等密面 DO 差一并给出。核心等密面上另取盐度与层结 PV（f/ρ·∂σ0/∂z，透镜核心 |Ro| 小，略去相对涡度），PV 以透镜与对照均值之比的 log10 表示。水团组成用 Hiroe 2002、Shimizu 2004 的黑潮–亲潮等密面两端元混合比 R = (Rθ + RS)/2（纯黑潮 0、纯亲潮 1）：端元取房总半岛以南与北海道南岸两个框内全部海洋柱在同一批场日期、每 0.1 σ0 层上的中位数，再在 σ0 上插值到核心密度；混合比之差乘同密度两端元的氧差即只由组成差别预期的氧差，氧差减去它记为超出两端元混合的残差。同一批配对上另给第一篇“SCV 处氧峰更多”的对应量：透镜与各对照在四个层次上是否带 ΔDO 峰（footprint 任一柱有峰、峰在透镜体内、中心柱有峰、中心柱的峰在该柱透镜区间内），前两层沿用 Analysis 2 的标志，后两层取自当日峰表；对照中心等于透镜中心加平移量，所以对照中心柱沿用透镜中心柱的透镜区间。汇总按全部、minty/spicy 及类型 × 急流脊一侧分组：核心差给出中位数、按结构组整组重抽的 95% 区间与正值比例；携峰率给出透镜率、对照平均率与逐透镜配对差的均值及区间；类型之差与同一类型南北两侧之差在同一套重抽中计算。
 
     参数:
-        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/analysis2_controls.parquet` 与 `<日期>/analysis2_footprints.parquet`。
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/analysis2_controls.parquet` 与 `<日期>/analysis2_footprints.parquet`、`<日期>/profile_frame.parquet`。
         - units_dir (str | pathlib.Path | None): 透镜实验单位目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
         - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_core_oxygen_contrast`。
         - workers (int): 按 S5 日期并行的进程数；默认 1。
@@ -88581,9 +88662,10 @@ def build_ofes_grid_lens_core_oxygen_contrast(
         - dict: `load_ofes_grid_lens_core_oxygen_contrast` 的结果。
 
     输出:
-        - `output_dir/core_oxygen_contrast_sets.parquet`：逐透镜-日的核心 σ0、透镜与对照均值及其差（`oyashio_*` 为混合比）、端元氧差与残差、急流侧与携氧标志。
-        - `output_dir/core_oxygen_contrast_controls.parquet`：逐对照的取值、急流侧及是否与透镜同侧。
-        - `output_dir/core_oxygen_contrast_summary.csv`：分组中位数、区间、正值比例与类型差。
+        - `output_dir/core_oxygen_contrast_sets.parquet`：逐透镜-日的核心 σ0、透镜与对照均值及其差（`oyashio_*` 为混合比）、端元氧差与残差、急流侧、中心柱是否在 footprint 内与四个层次的携峰标志。
+        - `output_dir/core_oxygen_contrast_controls.parquet`：逐对照的取值、携峰标志、急流侧及是否与透镜同侧。
+        - `output_dir/core_oxygen_contrast_summary.csv`：核心差的分组中位数、区间、正值比例与组间差。
+        - `output_dir/core_peak_carriage_summary.csv`：逐阈值 × 层次 × 分组的透镜携峰率、对照率、配对差及组间差。
         - `output_dir/npiw_end_members.csv`：两端元逐 0.1 σ0 层的 θ、S、DO 中位数、柱-日数与该层存在比例。
         - `output_dir/manifest.json`：请求与计数。
 
@@ -88593,6 +88675,8 @@ def build_ofes_grid_lens_core_oxygen_contrast(
         - 核心等密面差比较同一密度上的不同水柱，与剖面内相邻深度比较的 ΔDO 不是同一个量。
         - 某层在端元框过半柱-日中不存在（亲潮框轻层露头）时该端元缺测，混合比只在两端元共同有效的密度范围内给出，核心较轻的南侧 spicy 透镜多数没有混合比。
         - 氧不进混合模型：混合水区还有津轻等第三来源且氧不守恒（Talley 1995），残差只说明透镜比两端元组成所预期的更富氧或更贫氧，不区分来源。
+        - 峰表每柱只存最强峰：中心柱层次是“最强峰在透镜区间内”，较弱的峰落在区间内不计；透镜中心柱不在自身 footprint 内（约两成）时这一层记缺测。
+        - 携峰率差与核心氧差都含 DO，两者对应只说明两类氧诊断相容，不是独立的机制检验。
     """
     settings = _ofes_grid_lens_core_contrast_settings()
     scope_root = Path(reverse_cache_dir).expanduser().resolve() / 'primary_300_1000'
@@ -88621,12 +88705,13 @@ def build_ofes_grid_lens_core_oxygen_contrast(
     for date, part in lenses.groupby('date', sort=True):
         footprints = pd.read_parquet(
             scope_root / f'{pd.Timestamp(date):%Y%m%d}' / 'analysis2_footprints.parquet',
-            columns=['object_id', 'global_lat_index', 'global_lon_index'],
+            columns=['object_id', 'global_lat_index', 'global_lon_index', 'depth_low_m', 'depth_high_m'],
         )
         tasks.append((
             pd.Timestamp(date), part[['object_id', 'center_lon', 'center_lat', 'centroid_depth_m']],
             controls.loc[controls['object_id'].isin(part['object_id'])],
             footprints.loc[footprints['object_id'].isin(part['object_id'])],
+            scope_root / f'{pd.Timestamp(date):%Y%m%d}' / 'profile_frame.parquet',
         ))
     if int(workers) > 1:
         with ProcessPoolExecutor(max_workers=int(workers)) as executor:
@@ -88634,10 +88719,13 @@ def build_ofes_grid_lens_core_oxygen_contrast(
     else:
         frames = [_ofes_grid_lens_core_contrast_day(task) for task in tasks]
     side = _ofes_grid_lens_jet_side(lenses['date'], lenses['center_lon'], lenses['center_lat'], settings)
+    carriage_columns = [
+        _OFES_GRID_LENS_PEAK_LEVELS[level].format(t=t)
+        for t in _ofes_scv_reverse_thresholds() for level in ('footprint_column', 'lens_volume')
+    ]
     sets = lenses[[
         'object_id', 'date', 'track_id', 'structure_group', 'spice_sign', 'center_lat', 'center_lon',
-        'centroid_depth_m', 'radius_km', 'object_density', 'weak_native', 'strong_native',
-        'carry_do20', 'carry_do35', 'carry_do50',
+        'centroid_depth_m', 'radius_km', 'object_density', 'weak_native', 'strong_native', *carriage_columns,
     ]].join(side[['surface_ridge_lat', 'surface_ridge_ambiguous', 'lat_minus_ridge', 'jet_side']])
     end_members = _ofes_npiw_end_members(pd.concat([frame for *_, frame in frames], ignore_index=True))
     lens_values = pd.concat([frame for frame, *_ in frames], ignore_index=True)
@@ -88646,7 +88734,9 @@ def build_ofes_grid_lens_core_oxygen_contrast(
         _ofes_npiw_end_members_at(end_members, lens_values['sigma0_core']),
     )
     sets = sets.merge(lens_values, on='object_id', validate='one_to_one')
-    control_values = pd.concat([frame for _, frame, _ in frames], ignore_index=True)
+    control_values = pd.concat([frame for _, frame, _ in frames], ignore_index=True).merge(
+        controls[['object_id', 'candidate_id', *carriage_columns]], on=['object_id', 'candidate_id'], validate='one_to_one',
+    )
     control_values['oyashio_isopycnal'] = _ofes_oyashio_ratio(
         control_values['theta_isopycnal'], control_values['salinity_isopycnal'],
         _ofes_npiw_end_members_at(end_members, control_values['object_id'].map(sets.set_index('object_id')['sigma0_core'])),
@@ -88679,10 +88769,12 @@ def build_ofes_grid_lens_core_oxygen_contrast(
         sets['do_contrast_isopycnal'] - sets['oyashio_contrast_isopycnal'] * sets['do_end_member_gap_isopycnal']
     )
     summary = _ofes_grid_lens_core_contrast_summary(sets, settings)
+    carriage = _ofes_grid_lens_peak_carriage_summary(sets, control_values, settings)
     root.mkdir(parents=True, exist_ok=True)
     _atomic_write_parquet(sets, root / 'core_oxygen_contrast_sets.parquet')
     _atomic_write_parquet(control_values, root / 'core_oxygen_contrast_controls.parquet')
     summary.to_csv(root / 'core_oxygen_contrast_summary.csv', index=False)
+    carriage.to_csv(root / 'core_peak_carriage_summary.csv', index=False)
     end_members.to_csv(root / 'npiw_end_members.csv', index=False)
     manifest = {
         'analysis': 'ofes_grid_lens_core_oxygen_contrast',
@@ -88728,7 +88820,87 @@ def load_ofes_grid_lens_core_oxygen_contrast(output_dir: str | Path | None = Non
         'controls': pd.read_parquet(root / 'core_oxygen_contrast_controls.parquet'),
         'summary': pd.read_csv(root / 'core_oxygen_contrast_summary.csv'),
         'end_members': pd.read_csv(root / 'npiw_end_members.csv'),
+        'carriage_summary': pd.read_csv(root / 'core_peak_carriage_summary.csv'),
     }
+
+
+def plot_ofes_grid_lens_core_oxygen_contrast(
+    output_dir: str | Path | None = None,
+    *,
+    threshold: int = 20,
+    show_fig: bool = True,
+    dpi: int = 320,
+) -> dict:
+    """绘制透镜核心氧差与透镜相对对照的携峰率差，对照第一篇的两类氧结果。
+
+    只读核心氧差的正式汇总。左栏为类型 × 急流侧四组的核心等密面氧差中位数及结构组重抽区间；右栏为同四组透镜减各自对照的携峰率差（峰在透镜体内、中心柱的峰在该柱透镜区间内两个层次），区间同样按结构组重抽。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 已完成的核心氧差目录；默认正式 `grid_lens_core_oxygen_contrast`。
+        - threshold (int): 携峰率使用的 ΔDO 阈值（20、35 或 50）；默认 20。
+        - show_fig (bool): 是否显示图形；默认 True。
+        - dpi (int): PNG 分辨率；默认 320。
+
+    返回:
+        - dict: figures 路径列表与 plot_data 绘图输入表。
+
+    输出:
+        - `output_dir/core_oxygen_contrast_overview_do<threshold>.png`：两栏概览图。
+    """
+    import matplotlib.pyplot as plt
+
+    result = load_ofes_grid_lens_core_oxygen_contrast(output_dir)
+    root = Path(result['output_dir'])
+    groups = ['minty | south of jet', 'minty | north of jet', 'spicy | south of jet', 'spicy | north of jet']
+    core = result['summary'].loc[result['summary']['quantity'].eq('do_contrast_isopycnal')].set_index('group').reindex(groups)
+    carriage = result['carriage_summary']
+    carriage = carriage.loc[carriage['threshold'].eq(int(threshold)) & carriage['group'].isin(groups)]
+    levels = (('lens_volume', 'o', 'Peak inside lens volume'), ('centre_in_lens', 's', 'Centre-column peak inside lens'))
+    plot_data = pd.concat([
+        core.reset_index().assign(panel='core_do_contrast'),
+        carriage.assign(panel='peak_rate_difference'),
+    ], ignore_index=True)
+    figures = []
+    with plt.rc_context({'font.size': 9, 'axes.spines.top': False, 'axes.spines.right': False,
+                         'savefig.facecolor': 'white'}):
+        fig, (left, right) = plt.subplots(1, 2, figsize=(8.4, 3.2), sharey=True)
+        y = np.arange(len(groups))[::-1]
+        for position, group in zip(y, groups):
+            color = _JOURNAL_COLORS[group.split(' ')[0]]
+            row = core.loc[group]
+            left.plot([row.ci_low, row.ci_high], [position, position], color=color, linewidth=1.5)
+            left.plot(row['median'], position, marker='o', color=color, markersize=5)
+            for offset, (level, marker, label) in zip((0.12, -0.12), levels):
+                part = carriage.loc[carriage['group'].eq(group) & carriage['level'].eq(level)]
+                if part.empty:
+                    continue
+                part = part.iloc[0]
+                right.plot([part.ci_low, part.ci_high], [position + offset] * 2, color=color, linewidth=1.5)
+                right.plot(part.rate_difference, position + offset, marker=marker, markersize=5, color=color,
+                           markerfacecolor=color if marker == 'o' else 'white', linestyle='none')
+        for ax in (left, right):
+            ax.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+            ax.grid(axis='x', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
+            ax.set_axisbelow(True)
+        left.set_yticks(y, [f"{group} ({int(core.loc[group, 'n_lens_days'])})" for group in groups])
+        left.set_xlabel('Core isopycnal DO, lens − controls (μmol kg$^{-1}$)')
+        left.set_title('Core oxygen contrast')
+        right.set_xlabel(f'ΔDO{int(threshold)} peak rate, lens − controls')
+        right.set_title('Peak enrichment')
+        handles = [
+            plt.Line2D([], [], marker=marker, color=_JOURNAL_COLORS['ink'], markerfacecolor=_JOURNAL_COLORS['ink'] if marker == 'o' else 'white',
+                       linestyle='none', markersize=5, label=label)
+            for _, marker, label in levels
+        ]
+        fig.tight_layout(rect=(0, 0.07, 1, 1))
+        fig.legend(handles=handles, frameon=False, fontsize=8, loc='lower right', ncol=2, bbox_to_anchor=(0.98, 0.0))
+        path = root / f'core_oxygen_contrast_overview_do{int(threshold)}.png'
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        figures.append(str(path))
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+    return {'figures': figures, 'plot_data': plot_data}
 
 
 def _ofes_dualtrack_read_table(path: str | Path, columns: Sequence[str] | None = None) -> pd.DataFrame:
