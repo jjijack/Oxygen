@@ -85470,6 +85470,7 @@ def load_ofes_scv_reverse_analysis2_masks(
     *,
     scope: str = 'primary_300_1000',
     s5_root: str | Path | None = None,
+    depth_bounds: tuple[float, float] | None = None,
 ) -> dict:
     """读取单日 Tier-1 object mask 并合并重复源列 slab。
 
@@ -85477,6 +85478,7 @@ def load_ofes_scv_reverse_analysis2_masks(
         - date (str | pd.Timestamp): OFES 日期。
         - scope (str): `primary_300_1000` 或 `deep_500_1000`。
         - s5_root (str | Path | None): S5 日片根目录；省略时读取 YAML。
+        - depth_bounds (tuple[float, float] | None): 代替 scope 的垂向裁剪范围（m），例如检测器有效深度范围；此时 scope 列记为该范围。
 
     返回:
         - dict: 含 objects、footprints、scope 与输入路径的 mask 结果。
@@ -85489,7 +85491,9 @@ def load_ofes_scv_reverse_analysis2_masks(
         - slab 使用闭合边界；同一 object/source column 的重复或相接区间先取并集。
     """
     d = pd.Timestamp(date).normalize()
-    zmin, zmax = _ofes_scv_reverse_scope(scope)
+    zmin, zmax = _ofes_scv_reverse_scope(scope) if depth_bounds is None else (float(depth_bounds[0]), float(depth_bounds[1]))
+    if depth_bounds is not None:
+        scope = f'{zmin:g}_{zmax:g}_m'
     root = Path(s5_root) if s5_root is not None else _ofes_scv_reverse_paths()['s5']
     days_root = root / 'days' if (root / 'days').is_dir() else root
     day_dirs = sorted(days_root.glob(f'{d:%Y%m%d}_t*'))
@@ -89402,6 +89406,7 @@ _OFES_GRID_LENS_SOURCE_METRICS = (
     'source_depth_m', 'source_sigma0', 'source_spiciness0', 'source_theta', 'source_salinity', 'source_do2',
     'median_do2_change', 'median_sigma0_change', 'median_spiciness0_change', 'median_descent_m', 'median_isopycnal_descent_m',
     'horizontal_spread_ratio', 'depth_spread_change_m',
+    'mld_contact_lookback_days', 'mld_contact_north_share', 'mld_contact_lat_minus_ridge_deg',
 )
 
 
@@ -89413,13 +89418,34 @@ def _ofes_grid_lens_source_settings() -> dict:
     return settings
 
 
+def _ofes_grid_lens_day_footprints(date: pd.Timestamp, scope_root: Path, s5_root: str | Path | None = None) -> pd.DataFrame:
+    """当日已识别透镜的逐柱支撑：默认读 reverse enrichment 缓存（裁到 300–1000 m）；给出 S5 根目录时按检测器有效深度范围重读未裁剪的 object mask。"""
+    if s5_root is None:
+        return pd.read_parquet(Path(scope_root) / f'{date:%Y%m%d}' / 'analysis2_footprints.parquet')
+    detector = _ofes_grid_scv_v2_settings()
+    return load_ofes_scv_reverse_analysis2_masks(
+        date, s5_root=s5_root, depth_bounds=(detector['valid_depth_min_m'], detector['valid_depth_max_m']),
+    )['footprints']
+
+
+def _ofes_grid_lens_mld_contacts(daily: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
+    """逐粒子最近一次（离释放最近）直接接触混合层的回溯天数、位置与混合层深度，以及当时相对表层急流脊的位置；从未接触的粒子不出现。"""
+    contact = daily.loc[daily['status'].eq('active') & daily['direct_mld_contact'].astype(bool)]
+    columns = ['particle_id', 'track_id', 'lookback_days', 'date', 'depth_m', 'lat', 'lon', 'mld_m']
+    if contact.empty:
+        return pd.DataFrame(columns=[*columns, 'lat_minus_ridge', 'surface_ridge_ambiguous'])
+    latest = contact.loc[contact.groupby('particle_id')['lookback_days'].idxmin(), columns].reset_index(drop=True)
+    side = _ofes_grid_lens_jet_side(latest['date'], latest['lon'], latest['lat'], settings)
+    return latest.join(side[['lat_minus_ridge', 'surface_ridge_ambiguous']])
+
+
 def _ofes_grid_lens_source_day(args: tuple) -> dict:
-    """在一个释放日为各透镜放透镜内种子，并把同一批种子平移到其每个同侧对照、在对照水柱中移到同一 σ0，剔除落在任何已识别透镜内者，一起后向积分。"""
-    date, lenses, controls, objects, scope_root, backtrack_days, settings = args
+    """在一个释放日为各透镜放透镜内种子，并把同一批种子平移到其每个同侧对照、在对照水柱中移到同一 σ0，剔除落在任何已识别透镜内者，一起后向积分，并记各粒子最近一次混合层接触。"""
+    date, lenses, controls, objects, scope_root, s5_root, backtrack_days, settings = args
     date = pd.Timestamp(date).normalize()
     grid = _ofes_grid_lens_grid(date)
     lon_step = float(np.median(np.diff(grid['lon'])))
-    footprints = pd.read_parquet(Path(scope_root) / f'{date:%Y%m%d}' / 'analysis2_footprints.parquet')
+    footprints = _ofes_grid_lens_day_footprints(date, scope_root, s5_root)
     all_lenses = _ofes_grid_lens_footprint_support(footprints, grid)
     positions, metadata, registry = [], [], []
     for lens in lenses.itertuples(index=False):
@@ -89466,9 +89492,10 @@ def _ofes_grid_lens_source_day(args: tuple) -> dict:
             positions.append(moved[keep])
             metadata.append(control_meta)
     if not metadata:
-        return {'particles': pd.DataFrame(), 'daily': pd.DataFrame(), 'samples': pd.DataFrame(), 'registry': pd.DataFrame(registry)}
+        return {'particles': pd.DataFrame(), 'daily': pd.DataFrame(), 'samples': pd.DataFrame(), 'contacts': pd.DataFrame(),
+                'registry': pd.DataFrame(registry)}
     result = _ofes_grid_lens_integrate(date, np.vstack(positions), pd.concat(metadata, ignore_index=True), backtrack_days, settings)
-    return {**result, 'registry': pd.DataFrame(registry)}
+    return {**result, 'contacts': _ofes_grid_lens_mld_contacts(result['daily'], settings), 'registry': pd.DataFrame(registry)}
 
 
 def _ofes_grid_lens_source_unit_metrics(
@@ -89478,16 +89505,19 @@ def _ofes_grid_lens_source_unit_metrics(
     history: pd.DataFrame,
     unit_horizons: pd.DataFrame,
     units: pd.DataFrame,
+    contacts: pd.DataFrame,
     settings: Mapping[str, Any],
 ) -> pd.DataFrame:
     """逐材料单位（透镜或单个对照）、粒子组与回溯时长计算来源读数。
 
     来源位置、急流史与浅层史只用追满该时长的粒子（提前出域或失效者不当作该时长的来源）；急流脊有竞争峰的取样不判侧。
-    混合层接触与沿途变化取 `_ofes_grid_lens_unit_horizons`（混合层接触沿用通风分析的完整成员门槛）。
+    混合层接触比例与沿途变化取 `_ofes_grid_lens_unit_horizons`（混合层接触沿用通风分析的完整成员门槛）；
+    接触时间与位置取追满该时长、且在窗内直接接触过混合层的粒子最近一次接触（`_ofes_grid_lens_mld_contacts`），急流脊有竞争峰时不判侧。
     聚散用同一批种子：只取该时长仍被追踪者，比较它们在该时长与释放时的水平均方根半径与深度标准差。
     """
     horizons = settings['ventilation']['reporting_horizons_days']
     groups = {'all': None, 'core': 'core'}
+    contacts = contacts.set_index('particle_id')
     rows = []
     for unit, unit_particles in particles.groupby('track_id', sort=True):
         available = int(units.loc[unit, 'available_backtrack_days'])
@@ -89520,6 +89550,9 @@ def _ofes_grid_lens_source_unit_metrics(
                     & unit_horizons['particle_group'].eq('lens' if particle_group is None else particle_group)
                 ]
                 summary = summary.iloc[0] if len(summary) else pd.Series(dtype=float)
+                touched = contacts.loc[contacts.index.intersection(complete)]
+                touched = touched.loc[touched['lookback_days'].le(horizon)]
+                sided = touched.loc[touched['lat_minus_ridge'].notna() & ~touched['surface_ridge_ambiguous'].astype(bool)]
                 rows.append({
                     'unit_id': unit, 'particle_group': group, 'horizon_days': int(horizon), 'particles': len(members),
                     'tracked_to_horizon_share': len(complete) / len(members),
@@ -89542,6 +89575,9 @@ def _ofes_grid_lens_source_unit_metrics(
                     'horizontal_spread_km': spread.get('end', (np.nan, np.nan))[0],
                     'horizontal_spread_ratio': spread['end'][0] / spread['start'][0] if spread and spread['start'][0] > 0 else np.nan,
                     'depth_spread_change_m': spread['end'][1] - spread['start'][1] if spread else np.nan,
+                    'mld_contact_lookback_days': float(touched['lookback_days'].median()) if len(touched) else np.nan,
+                    'mld_contact_north_share': float((sided['lat_minus_ridge'] > 0).mean()) if len(sided) else np.nan,
+                    'mld_contact_lat_minus_ridge_deg': float(sided['lat_minus_ridge'].median()) if len(sided) else np.nan,
                 })
     return pd.DataFrame(rows)
 
@@ -89589,21 +89625,29 @@ def build_ofes_grid_lens_source_comparison(
     core_contrast_dir: str | Path | None = None,
     units_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
+    spice_sign: str = 'minty',
+    jet_side: str = 'south',
+    full_lens_support: bool = False,
     dates: Sequence[str | pd.Timestamp] | None = None,
     workers: int = 1,
     overwrite: bool = False,
 ) -> dict:
-    """比较急流南侧 minty 透镜内的材料与同日同密度非透镜对照水的来源位置、混合层接触与进入当前深度的经历。
+    """比较某类透镜（默认急流南侧 minty）内的材料与同日同密度非透镜对照水的来源位置、混合层接触与进入当前深度的经历。
 
-    样本取核心氧差中位于当日表层急流脊以南的 minty 透镜-日，每条轨迹只取第一个能回溯至少 30 天的配对日作释放日（不看是否携氧）。透镜内种子沿用来源回溯的规则：项目三维 ensemble 几何中落在该透镜逐柱支撑内的种子，另登记氧核成员。对照取该透镜在核心氧差中用过、与透镜同在急流一侧的全部 Analysis 2 平移对照：同一批种子按对照的网格平移量移过去，并在对照水柱中移到透镜种子自身 σ0 离原深度最近的交点；没有交点或落在当日任一已识别透镜内的种子剔除。透镜与对照种子一起用通风分析的三维后向积分追踪，沿途取样、混合层诊断与来源回溯完全相同。
+    样本取核心氧差中该类型、位于当日表层急流脊该侧的透镜-日，每条轨迹只取第一个能回溯至少 30 天的配对日作释放日（不看是否携氧）。透镜内种子沿用来源回溯的规则：项目三维 ensemble 几何中落在该透镜逐柱支撑内的种子，另登记氧核成员。对照取该透镜在核心氧差中用过、与透镜同在急流一侧的全部 Analysis 2 平移对照：同一批种子按对照的网格平移量移过去，并在对照水柱中移到透镜种子自身 σ0 离原深度最近的交点；没有交点或落在当日任一已识别透镜内的种子剔除。透镜与对照种子一起用通风分析的三维后向积分追踪，沿途取样、混合层诊断与来源回溯完全相同。
 
-    逐材料单位（透镜或单个对照）计算 30、60、90 天的来源读数：来源位置（相对表层急流脊、深度、σ0、spiciness0、θ、S、原生 DO）、回溯窗内是否到过急流北侧与无歧义的北→南区间、是否浅于 300 m、直接与近混合层接触、沿途变化，以及同一批种子的水平与垂向聚散。透镜值减其各对照的平均为配对差，以透镜等权汇总，区间按结构组整组重抽。
+    逐材料单位（透镜或单个对照）计算 30、60、90 天的来源读数：来源位置（相对表层急流脊、深度、σ0、spiciness0、θ、S、原生 DO）、回溯窗内是否到过急流北侧与无歧义的北→南区间、是否浅于 300 m、直接与近混合层接触及最近一次接触的时间与相对急流脊的位置、沿途变化，以及同一批种子的水平与垂向聚散。透镜值减其各对照的平均为配对差，以透镜等权汇总，区间按结构组整组重抽。
+
+    reverse enrichment 缓存的透镜掩码裁到 300–1000 m；`full_lens_support=True` 时改按 S5 检测器有效深度范围（100–1000 m）从缓存所用的同一批 S5 片段重读未裁剪的 object mask，透镜内种子登记与对照种子的“在已识别透镜内”剔除都用这套完整支撑，用于核心浅于或接近 300 m 的透镜。
 
     参数:
         - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/analysis2_controls.parquet` 与 `<日期>/analysis2_footprints.parquet`。
         - core_contrast_dir (str | pathlib.Path | None): 核心氧差目录，提供透镜-日、急流侧与对照；默认正式 `grid_lens_core_oxygen_contrast`。
         - units_dir (str | pathlib.Path | None): 透镜实验单位目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
-        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_source_comparison`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_source_comparison`，其他类型或急流侧为 `grid_lens_source_comparison_<jet_side>_<spice_sign>`。
+        - spice_sign (str): 透镜温盐类型，`'minty'` 或 `'spicy'`；默认 'minty'。
+        - jet_side (str): 释放日相对表层急流脊的一侧，`'south'` 或 `'north'`；默认 'south'。
+        - full_lens_support (bool): 是否改用未裁剪的检测器全深度透镜掩码；默认 False，沿用缓存的 300–1000 m 掩码。
         - dates (Sequence[str | pandas.Timestamp] | None): 只运行这些释放日（试点用）；默认全部释放日。
         - workers (int): 按释放日并行的进程数；默认 1。
         - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
@@ -89615,6 +89659,7 @@ def build_ofes_grid_lens_source_comparison(
         - `output_dir/lens_sample.csv`：透镜样本（轨迹、释放透镜-日、结构组、可回溯天数、释放日是否带 ΔDO20 峰）。
         - `output_dir/control_registry.csv`：逐透镜与对照的种子数、剔除原因、半径、方位与对照种子的深度偏移。
         - `output_dir/particles.parquet`、`daily_diagnostics.parquet`、`path_samples.parquet`、`particle_history.parquet`：与来源回溯同结构的粒子、逐日诊断、沿途取样与粒子史。
+        - `output_dir/mld_contacts.parquet`：逐粒子最近一次直接接触混合层的回溯天数、位置与相对表层急流脊的位置。
         - `output_dir/unit_metrics.parquet`：逐材料单位、粒子组与回溯时长的来源读数与支持。
         - `output_dir/pair_differences.parquet`：逐透镜的透镜值、对照平均与差。
         - `output_dir/source_summary.csv`：配对差的透镜等权均值与结构组重抽区间。
@@ -89624,14 +89669,21 @@ def build_ofes_grid_lens_source_comparison(
         - 主样本只按类型、急流侧与回溯可用性选，不按是否携氧、未来是否保持或最大下沉选；`carry_do20_at_release` 只作辅助分层。
         - 来源位置、急流史与浅层史只用追满该时长的粒子，提前出域者不当作该时长的来源；急流脊有竞争峰的取样不判侧，记入 `ridge_known_share`。
         - 浅于 300 m 只是深度诊断，混合层接触另看 `ever_direct_mld_contact_fraction`；后向紧凑不说明透镜一直存在，后向散开也不说明多源混合。
-        - 对照是“既定检测下的非透镜环境水”，距透镜 130–230 km，不是紧邻核边界的控制；已识别透镜的掩码只覆盖 300–1000 m。
+        - 对照是“既定检测下的非透镜环境水”，距透镜 130–230 km，不是紧邻核边界的控制；默认的已识别透镜掩码只覆盖 300–1000 m。
+        - 混合层接触不单独区分本地形成与跨急流携带：远处或对侧接触后再输送、或 90 天内无接触的更早通风都可能；透镜形成地需另有结构证据。
     """
     settings = _ofes_grid_lens_source_settings()
     unit_settings = _ofes_grid_lens_unit_settings()
-    scope_root = Path(reverse_cache_dir).expanduser().resolve() / 'primary_300_1000'
+    reverse_root = Path(reverse_cache_dir).expanduser().resolve()
+    scope_root = reverse_root / 'primary_300_1000'
+    # 完整掩码从缓存当初所用的同一批 S5 片段重读
+    s5_root = json.loads((reverse_root / 'producer_manifest.json').read_text(encoding='utf-8'))['input_identity']['sources']['s5']['path'] if full_lens_support else None
     core = load_ofes_grid_lens_core_oxygen_contrast(core_contrast_dir)
     unit_result = load_ofes_grid_lens_units(units_dir)
-    root = _ofes_grid_lens_output_root(output_dir, settings)
+    population = (spice_sign, jet_side)
+    root = _ofes_grid_lens_output_root(output_dir, settings if population == ('minty', 'south') else {
+        **settings, 'output_subdir': f"{settings['output_subdir']}_{jet_side}_{spice_sign}",
+    })
     anchor = pd.Timestamp(unit_settings['s5_start_date'])
     horizon = min(settings['ventilation']['reporting_horizons_days'])
     sets = core['sets'].assign(date=lambda frame: pd.to_datetime(frame['date']).dt.normalize())
@@ -89639,7 +89691,7 @@ def build_ofes_grid_lens_source_comparison(
         settings['ventilation']['maximum_backtrack_days'], (sets['date'] - anchor).dt.days,
     ).astype(int)
     lenses = sets.loc[
-        sets['spice_sign'].eq('minty') & sets['jet_side'].eq('south') & sets['available_backtrack_days'].ge(horizon)
+        sets['spice_sign'].eq(spice_sign) & sets['jet_side'].eq(jet_side) & sets['available_backtrack_days'].ge(horizon)
     ].sort_values(['date', 'object_id']).groupby('track_id', sort=False).head(1)
     lenses = lenses.rename(columns={'do20_3d_carriage': 'carry_do20_at_release'})[[
         'track_id', 'object_id', 'date', 'structure_group', 'available_backtrack_days', 'carry_do20_at_release',
@@ -89651,6 +89703,7 @@ def build_ofes_grid_lens_source_comparison(
         'reverse_cache_dir': str(scope_root.parent),
         'core_contrast_dir': str(Path(core['output_dir']).resolve()),
         'units_dir': str(Path(unit_result['output_dir']).resolve()),
+        'spice_sign': spice_sign, 'jet_side': jet_side, 'full_lens_support': bool(full_lens_support),
         'dates': None if dates is None else sorted({f'{date:%Y-%m-%d}' for date in lenses['date']}),
         'settings': settings,
     }
@@ -89676,7 +89729,7 @@ def build_ofes_grid_lens_source_comparison(
     objects = unit_result['objects'].set_index('object_id')
     tasks = [
         (date, part, controls.loc[controls['object_id'].isin(part['object_id'])], objects.loc[part['object_id']],
-         scope_root, int(part['available_backtrack_days'].min()), settings)
+         scope_root, s5_root, int(part['available_backtrack_days'].min()), settings)
         for date, part in lenses.groupby('date', sort=True)
     ]
     if int(workers) > 1:
@@ -89684,8 +89737,9 @@ def build_ofes_grid_lens_source_comparison(
             results = list(executor.map(_ofes_grid_lens_source_day, tasks))
     else:
         results = [_ofes_grid_lens_source_day(task) for task in tasks]
-    particles, daily, samples, registry = (
-        pd.concat([result[key] for result in results], ignore_index=True) for key in ('particles', 'daily', 'samples', 'registry')
+    particles, daily, samples, contacts, registry = (
+        pd.concat([result[key] for result in results], ignore_index=True)
+        for key in ('particles', 'daily', 'samples', 'contacts', 'registry')
     )
     history = _ofes_grid_lens_particle_history(daily, samples, settings['shallow_boundary_m'])
     track_units = unit_result['units'].set_index('track_id')
@@ -89693,13 +89747,13 @@ def build_ofes_grid_lens_source_comparison(
         lenses.rename(columns={'track_id': 'lens_track_id', 'date': 'release_date'}), on='lens_track_id', validate='many_to_one',
     )
     units = units.assign(
-        spice_sign='minty',
+        spice_sign=spice_sign,
         carrying_group=units['lens_track_id'].map(track_units['carrying_group']),
         max_threshold_carried=units['lens_track_id'].map(track_units['max_threshold_carried']),
     )
     unit_horizons = _ofes_grid_lens_unit_horizons(particles, daily, samples, history, units, settings)
     metrics = _ofes_grid_lens_source_unit_metrics(
-        particles, daily, samples, history, unit_horizons, units.set_index('track_id'), settings,
+        particles, daily, samples, history, unit_horizons, units.set_index('track_id'), contacts, settings,
     )
     pairs = _ofes_grid_lens_pairs(metrics, units.set_index('track_id'), _OFES_GRID_LENS_SOURCE_METRICS, 'horizon_days')
     summary = _ofes_grid_lens_pair_summary(pairs, settings, 'source_comparison', 'horizon_days')
@@ -89710,6 +89764,7 @@ def build_ofes_grid_lens_source_comparison(
     _atomic_write_parquet(daily, root / 'daily_diagnostics.parquet')
     _atomic_write_parquet(samples, root / 'path_samples.parquet')
     _atomic_write_parquet(history, root / 'particle_history.parquet')
+    _atomic_write_parquet(contacts, root / 'mld_contacts.parquet')
     _atomic_write_parquet(metrics, root / 'unit_metrics.parquet')
     _atomic_write_parquet(pairs, root / 'pair_differences.parquet')
     summary.to_csv(root / 'source_summary.csv', index=False)
@@ -89762,15 +89817,18 @@ def load_ofes_grid_lens_source_comparison(output_dir: str | Path | None = None) 
 def plot_ofes_grid_lens_source_comparison(
     output_dir: str | Path | None = None,
     *,
+    particle_group: str = 'all',
     show_fig: bool = True,
     dpi: int = 320,
 ) -> dict:
-    """绘制南侧 minty 透镜内外材料来源读数的配对差。
+    """绘制透镜内外材料来源读数的配对差。
 
-    只读来源对照的正式汇总。每个小图一项读数，纵轴为回溯时长，点为透镜减其对照平均的透镜等权均值，线为结构组重抽区间；实心为全部透镜材料，空心为氧核成员（辅助）。
+    只读来源对照的正式汇总。每个小图一项读数，各行为回溯时长（右侧为该读数在该时长的透镜数），点为透镜减其对照平均的透镜等权均值，
+    线为结构组重抽 95% 区间；图题注明透镜类型与急流侧，颜色随类型。
 
     参数:
         - output_dir (str | pathlib.Path | None): 已完成的来源对照目录；默认正式 `grid_lens_source_comparison`。
+        - particle_group (str): `'all'` 为全部透镜材料，`'core'` 为氧核成员（辅助）；默认 'all'。
         - show_fig (bool): 是否显示图形；默认 True。
         - dpi (int): PNG 分辨率；默认 320。
 
@@ -89778,54 +89836,62 @@ def plot_ofes_grid_lens_source_comparison(
         - dict: figures 路径列表与 plot_data 绘图输入表。
 
     输出:
-        - `output_dir/source_comparison_overview.png`：读数小图组。
+        - `output_dir/source_comparison_overview.png`：全部透镜材料的读数小图组；`particle_group='core'` 时为 `source_comparison_overview_core.png`。
     """
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     result = load_ofes_grid_lens_source_comparison(output_dir)
     root = Path(result['output_dir'])
+    request = result['manifest']['request']
+    spice_sign, jet_side = request.get('spice_sign', 'minty'), request.get('jet_side', 'south')
     panels = (
-        ('source_north_share', 'Source north of jet (fraction)'),
-        ('ever_north_share', 'Ever north of jet (fraction)'),
-        ('above_shallow_boundary_share', 'Ever above 300 m (fraction)'),
-        ('ever_direct_mld_contact_fraction', 'Direct mixed-layer contact (fraction)'),
-        ('source_depth_m', 'Source depth (m)'),
-        ('source_do2', 'Source DO (μmol kg$^{-1}$)'),
-        ('median_do2_change', 'DO change, source → release'),
-        ('horizontal_spread_ratio', 'Backward horizontal spread ratio'),
+        ('source_north_share', 'Source north of jet', 'fraction'),
+        ('ever_direct_mld_contact_fraction', 'Direct mixed-layer contact', 'fraction'),
+        ('source_depth_m', 'Source depth', 'm'),
+        ('source_theta', 'Source θ', '°C'),
+        ('source_salinity', 'Source salinity', 'PSS-78'),
+        ('source_do2', 'Source DO', 'μmol kg$^{-1}$'),
+        ('median_do2_change', 'DO change en route', 'μmol kg$^{-1}$'),
+        ('horizontal_spread_ratio', 'Backward spread ratio', 'ratio'),
     )
     summary = result['summary']
-    plot_data = summary.loc[summary['metric'].isin([metric for metric, _ in panels])]
+    plot_data = summary.loc[summary['particle_group'].eq(particle_group) & summary['metric'].isin([metric for metric, _, _ in panels])]
     horizons = sorted(plot_data['horizon_days'].unique())
-    color = _JOURNAL_COLORS['minty']
+    color = _JOURNAL_COLORS[spice_sign]
     figures = []
-    with plt.rc_context({'font.size': 8, 'axes.spines.top': False, 'axes.spines.right': False,
-                         'savefig.facecolor': 'white'}):
-        fig, axes = plt.subplots(2, 4, figsize=(10.0, 4.6), sharey=True)
-        for ax, (metric, label) in zip(axes.ravel(), panels):
-            for group, offset, face in (('all', 0.12, color), ('core', -0.12, 'white')):
-                part = plot_data.loc[plot_data['metric'].eq(metric) & plot_data['particle_group'].eq(group)].set_index('horizon_days')
-                for horizon in horizons:
-                    if horizon not in part.index:
-                        continue
-                    row = part.loc[horizon]
-                    y = horizons.index(horizon) + offset
-                    ax.plot([row.ci_low, row.ci_high], [y, y], color=color, linewidth=1.3)
-                    ax.plot(row.mean_difference, y, marker='o', markersize=4.5, color=color, markerfacecolor=face, linestyle='none')
-            ax.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+    with plt.rc_context({'font.size': 8, 'axes.spines.top': False, 'axes.spines.right': False, 'axes.spines.left': False,
+                         'axes.edgecolor': _JOURNAL_COLORS['neutral'], 'xtick.color': _JOURNAL_COLORS['muted'],
+                         'ytick.color': _JOURNAL_COLORS['ink'], 'savefig.facecolor': 'white'}):
+        fig, axes = plt.subplots(2, 4, figsize=(10.0, 4.4), sharey=True)
+        for ax, (metric, label, unit) in zip(axes.ravel(), panels):
+            part = plot_data.loc[plot_data['metric'].eq(metric)].set_index('horizon_days')
+            ax.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.9, zorder=1)
+            for horizon in part.index:
+                row, y = part.loc[horizon], horizons.index(horizon)
+                ax.plot([row.ci_low, row.ci_high], [y, y], color=color, linewidth=1.8, solid_capstyle='round', zorder=2)
+                ax.plot(row.mean_difference, y, marker='o', markersize=5, color=color, markeredgecolor='white',
+                        markeredgewidth=0.8, linestyle='none', zorder=3)
+                ax.annotate(f'{int(row.n_lenses)}', xy=(1.0, y), xycoords=('axes fraction', 'data'), xytext=(3, 0),
+                            textcoords='offset points', ha='left', va='center', fontsize=6.5, color=_JOURNAL_COLORS['muted'])
+            span = [0.0, *part['ci_low'], *part['ci_high']]
+            pad = 0.08 * (max(span) - min(span) or 1.0)
+            ax.set_xlim(min(span) - pad, max(span) + pad)
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
             ax.grid(axis='x', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
             ax.set_axisbelow(True)
-            ax.set_title(label, fontsize=8)
-        for ax in axes[:, 0]:
-            ax.set_yticks(range(len(horizons)), [f'{int(horizon)} d' for horizon in horizons])
-        handles = [
-            plt.Line2D([], [], marker='o', color=color, linestyle='none', markersize=4.5, label='All lens material'),
-            plt.Line2D([], [], marker='o', color=color, markerfacecolor='white', linestyle='none', markersize=4.5, label='Oxygen-core members'),
-        ]
-        fig.supxlabel('Lens − non-lens controls (lens-weighted mean)', fontsize=9)
-        fig.tight_layout(rect=(0, 0.06, 1, 1))
-        fig.legend(handles=handles, frameon=False, fontsize=8, loc='lower right', ncol=2, bbox_to_anchor=(0.98, 0.0))
-        path = root / 'source_comparison_overview.png'
+            ax.tick_params(axis='y', length=0)
+            ax.set_title(label, fontsize=8.5, color=_JOURNAL_COLORS['ink'], loc='left')
+            ax.set_xlabel(unit, fontsize=7, color=_JOURNAL_COLORS['muted'], labelpad=2)
+        axes[0, 0].set_yticks(range(len(horizons)), [f'{int(horizon)} d' for horizon in horizons])
+        axes[0, 0].set_ylim(len(horizons) - 0.5, -0.5)
+        group_label = 'all lens material' if particle_group == 'all' else 'oxygen-core members'
+        fig.suptitle(f'{jet_side.capitalize()}-of-jet {spice_sign} lenses ({group_label}): lens − same-density non-lens controls',
+                     fontsize=9, x=0.01, ha='left', color=_JOURNAL_COLORS['ink'])
+        fig.supxlabel('Lens-weighted mean difference with structure-group bootstrap 95% interval; right-hand numbers are lenses',
+                      fontsize=7.5, color=_JOURNAL_COLORS['muted'])
+        fig.tight_layout(w_pad=2.2, h_pad=1.2)
+        path = root / ('source_comparison_overview.png' if particle_group == 'all' else f'source_comparison_overview_{particle_group}.png')
         fig.savefig(path, dpi=dpi, bbox_inches='tight')
         figures.append(str(path))
         if show_fig:
