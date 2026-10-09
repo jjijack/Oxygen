@@ -67077,23 +67077,25 @@ def _ofes_ventilation_fragment_reusable(
     )
 
 
-def _ofes_ventilation_backtrack(
+def _ofes_ventilation_integrate(
     run_id: str,
     release_date: str | pd.Timestamp,
-    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
     positions: np.ndarray,
     particle_metadata: pd.DataFrame,
     settings: dict,
     io_gate=None,
 ) -> pd.DataFrame:
-    """从释放日逐日三维后向积分任意种子到 start_date，返回含释放日的逐日位置与 MLD 接触诊断。"""
+    """从释放日逐日三维积分任意种子到 end_date（早于释放日为后向、晚于为前向），返回含释放日的逐日位置与 MLD 接触诊断。"""
     positions = np.array(positions, dtype=float, copy=True)
     status = np.full(len(positions), 'active', dtype='<U8')
     lon_bounds, lat_bounds = _ofes_trajectory_fixed_bounds(
         positions, settings['domain_margin_km']
     )
     release_date = pd.Timestamp(release_date).normalize()
-    start_date = pd.Timestamp(start_date).normalize()
+    end_date = pd.Timestamp(end_date).normalize()
+    backward = end_date < release_date
+    step = pd.Timedelta(days=-1 if backward else 1)
     daily_frames = [
         _ofes_ventilation_sample_day(
             run_id,
@@ -67112,20 +67114,22 @@ def _ofes_ventilation_backtrack(
         io_gate,
     )
     current_date = release_date
-    while current_date > start_date:
-        previous_date = current_date - pd.Timedelta(days=1)
-        previous_snapshot = _ofes_ventilation_velocity_snapshot(
-            previous_date,
+    while current_date != end_date:
+        next_date = current_date + step
+        next_snapshot = _ofes_ventilation_velocity_snapshot(
+            next_date,
             lon_bounds,
             lat_bounds,
             io_gate,
         )
         active_index = np.flatnonzero(status == 'active')
         if active_index.size:
+            # advect_ofes_particles 的快照按时间正序给出，后向时从末尾积分到开头
+            pair = [next_snapshot, current_snapshot] if backward else [current_snapshot, next_snapshot]
             result = advect_ofes_particles(
-                [previous_snapshot, current_snapshot],
+                pair,
                 positions[active_index],
-                backward=True,
+                backward=backward,
                 dt_seconds=settings['integration_dt_seconds'],
                 temporal_interpolation='linear',
                 vertical_mode='three_dimensional',
@@ -67139,7 +67143,7 @@ def _ofes_ventilation_backtrack(
         daily_frames.append(
             _ofes_ventilation_sample_day(
                 run_id,
-                previous_date,
+                next_date,
                 positions,
                 status,
                 particle_metadata,
@@ -67147,8 +67151,8 @@ def _ofes_ventilation_backtrack(
                 io_gate,
             )
         )
-        current_snapshot = previous_snapshot
-        current_date = previous_date
+        current_snapshot = next_snapshot
+        current_date = next_date
     return pd.concat(daily_frames, ignore_index=True)
 
 
@@ -67208,7 +67212,7 @@ def _ofes_run_ventilation_event_worker(payload: dict) -> dict:
     )
     start_date = max(data_start, requested_start)
     available_days = int((peak_date - start_date).days)
-    daily = _ofes_ventilation_backtrack(
+    daily = _ofes_ventilation_integrate(
         event_id,
         peak_date,
         start_date,
@@ -87427,32 +87431,55 @@ def _ofes_grid_lens_backtrack_settings(overrides: Mapping[str, Any] | None = Non
     }
 
 
-def _ofes_grid_lens_register(label: str, seeds: np.ndarray, target: pd.DataFrame) -> np.ndarray:
-    """按逐像元三维支撑登记种子：落在某像元自身网格单元内，且深度在该像元自己的区间内。"""
-    if target.empty:
-        return np.zeros(len(seeds), dtype=bool)
-    result = {'positions': seeds[None, :, :], 'final_status': np.full(len(seeds), 'active')}
-    return _ofes_dual_endpoint_register_arrival('seed', label, seeds, result, target)['arrived'].to_numpy(dtype=bool)
+def _ofes_grid_lens_register(seeds: np.ndarray, target: pd.DataFrame, grid: Mapping[str, Any]) -> np.ndarray:
+    """按逐像元三维支撑登记种子，返回命中的支撑行位置（未命中为 -1）。
+
+    判据同 `_ofes_dual_endpoint_register_arrival`：水平落在某像元自身网格单元内，深度落在该像元自己的区间内（共享容差）；
+    多个像元同时满足时取 (lat_index, lon_index) 字典序第一个。只比较种子最近网格柱及其相邻柱上的像元，不逐种子扫描全部像元。
+    """
+    seeds = np.asarray(seeds, dtype=float).reshape(-1, 3)
+    matched = np.full(len(seeds), -1, dtype=int)
+    finite = np.flatnonzero(np.isfinite(seeds).all(axis=1))
+    if target.empty or not finite.size:
+        return matched
+    rows = np.abs(grid['lat'][None, :] - seeds[finite, 1:2]).argmin(axis=1)
+    columns = np.abs(_minimal_lon_diff_deg(grid['lon'][None, :], seeds[finite, 2:3])).argmin(axis=1)
+    near = pd.DataFrame({
+        'seed': np.repeat(finite, 9),
+        'lat_index': (rows[:, None] + np.repeat([-1, 0, 1], 3)[None, :]).ravel(),
+        'lon_index': (columns[:, None] + np.tile([-1, 0, 1], 3)[None, :]).ravel(),
+    })
+    pixels = target[['lat_index', 'lon_index', 'cell_lat_min', 'cell_lat_max', 'cell_lon_min', 'cell_lon_max',
+                     'core_shallow_edge_m', 'core_deep_edge_m']].assign(position=np.arange(len(target)))
+    pairs = near.merge(pixels, on=['lat_index', 'lon_index'])
+    depth, lat, lon = (seeds[pairs['seed'].to_numpy(), axis] for axis in range(3))
+    tolerance = _OFES_ENDPOINT_REGISTRATION_DEPTH_TOLERANCE_M
+    hit = pairs.loc[
+        (lat >= pairs['cell_lat_min'].to_numpy()) & (lat <= pairs['cell_lat_max'].to_numpy())
+        & (lon >= pairs['cell_lon_min'].to_numpy()) & (lon <= pairs['cell_lon_max'].to_numpy())
+        & (depth >= pairs['core_shallow_edge_m'].to_numpy() - tolerance) & (depth <= pairs['core_deep_edge_m'].to_numpy() + tolerance)
+    ].sort_values(['seed', 'lat_index', 'lon_index', 'position']).drop_duplicates('seed')
+    matched[hit['seed'].to_numpy()] = hit['position'].to_numpy()
+    return matched
 
 
 def _ofes_grid_lens_oxygen_support(
     date: pd.Timestamp,
-    label: str,
     object_id: str,
     seeds: np.ndarray,
     grid: Mapping[str, Any],
     threshold: float,
 ) -> pd.DataFrame:
-    """取种子所在网格柱中 ΔDO 达到携氧阈值者，按 E225 端点配准口径恢复逐像元半振幅核作氧核支撑。"""
+    """取种子所在网格柱中 ΔDO 达到携氧阈值者，按 E225 端点配准口径恢复逐像元半振幅核作氧核支撑。
+
+    原生剖面按区域一次读入后逐柱恢复（与 `_ofes_ha_recover_native_profiles` 同一恢复函数与复现要求），支撑表另带各柱的 ΔDO 与半振幅核厚度。
+    """
     rows = np.abs(grid['lat'][None, :] - seeds[:, 1:2]).argmin(axis=1)
     columns = np.abs(_minimal_lon_diff_deg(grid['lon'][None, :], seeds[:, 2:3])).argmin(axis=1)
     step = grid['step']
-    scan = scan_ofes_delta_do_day(
-        date, thresholds=[threshold],
-        lon_bounds=(float(grid['lon'][columns].min()) - step, float(grid['lon'][columns].max()) + step),
-        lat_bounds=(float(grid['lat'][rows].min()) - step, float(grid['lat'][rows].max()) + step),
-    )
-    pixels = scan['pixels']
+    lon_bounds = (float(grid['lon'][columns].min()) - step, float(grid['lon'][columns].max()) + step)
+    lat_bounds = (float(grid['lat'][rows].min()) - step, float(grid['lat'][rows].max()) + step)
+    pixels = scan_ofes_delta_do_day(date, thresholds=[threshold], lon_bounds=lon_bounds, lat_bounds=lat_bounds)['pixels']
     keys = set(zip(rows.tolist(), columns.tolist()))
     selected = np.array([
         (int(row), int(column)) in keys
@@ -87466,13 +87493,31 @@ def _ofes_grid_lens_oxygen_support(
         make_detection_config('do'), do_threshold=threshold,
         anomaly_min_depth=catalog['candidate_depth_min_m'], anomaly_max_depth=catalog['candidate_depth_max_m'],
     )
-    members = members.assign(case_label=label, actual_event_id=label, daily_object_key=object_id)
-    native = _ofes_ha_recover_native_profiles(members, config)
+    snapshot = load_ofes_snapshot(date, variables=['do2'], lon_bounds=lon_bounds, lat_bounds=lat_bounds)
+    local_rows = np.abs(snapshot['lat'][None, :] - members['lat'].to_numpy(dtype=float)[:, None]).argmin(axis=1)
+    local_columns = np.abs(snapshot['lon'][None, :] - members['lon'].to_numpy(dtype=float)[:, None]).argmin(axis=1)
+    if max(np.abs(snapshot['lat'][local_rows] - members['lat'].to_numpy(dtype=float)).max(),
+           np.abs(snapshot['lon'][local_columns] - members['lon'].to_numpy(dtype=float)).max()) > 3e-5:
+        raise ValueError('Oxygen-support pixels do not align with the DO snapshot grid.')
+    recovered = pd.DataFrame([
+        _ofes_recover_half_amplitude_core(
+            snapshot['do2'][:, row, column], snapshot['depth'], int(member.peak_level_index), detection_config=config,
+            saved_delta_do=float(member.delta_do), saved_peak_depth=float(member.peak_depth),
+            saved_half_amplitude_thickness_m=float(member.half_amplitude_thickness_m),
+        )
+        for member, row, column in zip(members.itertuples(index=False), local_rows, local_columns)
+    ])
+    if not recovered['recovery_status'].eq('recovered_producer_discrete_half_amplitude_core').all():
+        raise ValueError('At least one oxygen-support pixel could not recover its half-amplitude core.')
+    if not recovered['reproduction_status'].eq('saved_peak_and_thickness_reproduced_within_float32_storage_tolerance').all():
+        raise ValueError('At least one oxygen-support pixel failed producer-value reproduction.')
     # 扫描像元的 lat_index/lon_index 是窗口内编号，合并用全局编号
-    members = members.drop(columns=['lat_index', 'lon_index']).rename(
-        columns={'source_lat_index': 'lat_index', 'source_lon_index': 'lon_index'}
-    )
-    target = _ofes_half_amplitude_target_support(members[['daily_object_key', 'lat_index', 'lon_index', 'lat', 'lon']], native)
+    target = pd.DataFrame({
+        'daily_object_key': object_id,
+        'lat_index': members['source_lat_index'].to_numpy(dtype=int), 'lon_index': members['source_lon_index'].to_numpy(dtype=int),
+        'lat': members['lat'].to_numpy(), 'lon': members['lon'].to_numpy(), 'delta_do': members['delta_do'].to_numpy(),
+        **recovered[['core_shallow_edge_m', 'core_deep_edge_m', 'core_thickness_m']].to_dict('series'),
+    })
     return _ofes_dual_endpoint_attach_cell_bounds(target, step)
 
 
@@ -87480,18 +87525,21 @@ def _ofes_grid_lens_path_properties(
     date: pd.Timestamp,
     positions: np.ndarray,
     isopycnal_sigma0: np.ndarray | None = None,
+    snapshot: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """在某日粒子位置取 DO、θ、S、σ0 与 spiciness0（与轨迹示踪剂采样同一插值）。
 
     给定各粒子的参考 σ0 时，另在粒子所在原生水柱上取该等密面离粒子最近的线性交点深度（E239 下沉分解的同一交点口径）。
+    已读入覆盖这些位置的当日 DO/T/S 快照时可直接传入，避免重复读取。
     """
-    margin = 0.1
-    snapshot = load_ofes_snapshot(
-        date, variables=['do2', 'temp', 'salinity'],
-        lon_bounds=(float(positions[:, 2].min()) - margin, float(positions[:, 2].max()) + margin),
-        lat_bounds=(float(positions[:, 1].min()) - margin, float(positions[:, 1].max()) + margin),
-        depth_bounds=None,
-    )
+    if snapshot is None:
+        margin = 0.1
+        snapshot = load_ofes_snapshot(
+            date, variables=['do2', 'temp', 'salinity'],
+            lon_bounds=(float(positions[:, 2].min()) - margin, float(positions[:, 2].max()) + margin),
+            lat_bounds=(float(positions[:, 1].min()) - margin, float(positions[:, 1].max()) + margin),
+            depth_bounds=None,
+        )
     result = pd.DataFrame(_ofes_point_tracers(snapshot, positions))[list(_OFES_GRID_LENS_BACKTRACK_PROPERTIES)]
     if isopycnal_sigma0 is not None:
         profiles = _ofes_ventilation_profile_samples(snapshot, positions[:, 2], positions[:, 1])
@@ -87505,26 +87553,33 @@ def _ofes_grid_lens_sample_paths(
     date: pd.Timestamp,
     daily: pd.DataFrame,
     particles: pd.DataFrame,
-    backtrack_days: int,
+    days: int,
     settings: Mapping[str, Any],
+    *,
+    forward: bool = False,
+    stride_days: int | None = None,
+    ridges: bool = True,
 ) -> pd.DataFrame:
-    """每个 S5 步长在仍被追踪的粒子位置取沿途水团性质、释放时 σ0 等密面的深度与表层急流脊。"""
+    """每个取样步长（默认 S5 步长）在仍被追踪的粒子位置取沿途水团性质、释放时 σ0 等密面的深度，以及（可选）表层急流脊。
+
+    后向按 `lookback_days`、前向按 `forward_days` 计时。
+    """
     release_sigma0 = particles.set_index('particle_id')['release_sigma0']
+    column = 'forward_days' if forward else 'lookback_days'
     samples = []
-    for lookback in range(0, backtrack_days + 1, settings['sample_stride_days']):
-        day = daily.loc[daily['lookback_days'].eq(lookback) & daily['status'].eq('active')]
+    for offset in range(0, days + 1, stride_days or settings['sample_stride_days']):
+        day = daily.loc[daily[column].eq(offset) & daily['status'].eq('active')]
         if day.empty:
             continue
-        sample_date = date - pd.Timedelta(days=lookback)
+        sample_date = date + pd.Timedelta(days=offset if forward else -offset)
         properties = _ofes_grid_lens_path_properties(
             sample_date, day[['depth_m', 'lat', 'lon']].to_numpy(dtype=float),
             release_sigma0.reindex(day['particle_id']).to_numpy(dtype=float),
         ).rename(columns={'isopycnal_depth_m': 'release_isopycnal_depth_m'})
-        ridges = _ofes_grid_lens_surface_ridges(sample_date, day['lon'], settings)
-        samples.append(pd.concat([
-            day[['particle_id', 'track_id', 'date', 'lookback_days', 'depth_m', 'lat', 'lon']].reset_index(drop=True),
-            properties, ridges,
-        ], axis=1))
+        parts = [day[['particle_id', 'track_id', 'date', column, 'depth_m', 'lat', 'lon']].reset_index(drop=True), properties]
+        if ridges:
+            parts.append(_ofes_grid_lens_surface_ridges(sample_date, day['lon'], settings))
+        samples.append(pd.concat(parts, axis=1))
     return pd.concat(samples, ignore_index=True).assign(release_date=date)
 
 
@@ -87542,12 +87597,12 @@ def _ofes_grid_lens_lens_seeds(
         date, float(lens['center_lon']), float(lens['center_lat']), float(lens['centroid_depth_m']),
         float(lens['radius_km']), settings['seed_geometry'],
     )
-    inside = _ofes_grid_lens_register(track_id, seeds, _ofes_grid_lens_footprint_support(footprint, grid))
+    inside = _ofes_grid_lens_register(seeds, _ofes_grid_lens_footprint_support(footprint, grid), grid) >= 0
     if not inside.any():
         return None
     seeds = seeds[inside]
-    oxygen_support = _ofes_grid_lens_oxygen_support(date, track_id, object_id, seeds, grid, settings['carrying_threshold'])
-    in_core = _ofes_grid_lens_register(track_id, seeds, oxygen_support)
+    oxygen_support = _ofes_grid_lens_oxygen_support(date, object_id, seeds, grid, settings['carrying_threshold'])
+    in_core = _ofes_grid_lens_register(seeds, oxygen_support, grid) >= 0
     seed_metadata = seed_metadata.loc[inside].reset_index(drop=True)
     metadata = seed_metadata.drop(columns='particle_index').rename(columns={'particle_id': 'ensemble_particle_id'}).assign(
         track_id=track_id,
@@ -87573,21 +87628,28 @@ def _ofes_grid_lens_integrate(
     date: pd.Timestamp,
     positions: np.ndarray,
     particles: pd.DataFrame,
-    backtrack_days: int,
+    days: int,
     settings: Mapping[str, Any],
+    *,
+    forward: bool = False,
+    stride_days: int | None = None,
+    ridges: bool = True,
 ) -> dict:
-    """取种子释放时水团性质，用通风分析的三维后向积分追到 backtrack_days 天前，并每个 S5 步长沿途取样。"""
+    """取种子释放时水团性质，用通风分析的三维积分后向（或前向）追 days 天，并按取样步长沿途取样。"""
     particles = particles.reset_index(drop=True)
     particles['particle_index'] = np.arange(len(particles))
     particles['pair_id'] = particles['particle_id']
     release = _ofes_grid_lens_path_properties(date, positions)
     particles['seed_sigma0'] = release['sigma0'].to_numpy()
     particles = particles.join(release.add_prefix('release_'))
-    start = date - pd.Timedelta(days=backtrack_days)
-    daily = _ofes_ventilation_backtrack(f'{date:%Y%m%d}', date, start, positions, particles, settings['ventilation'])
+    end = date + pd.Timedelta(days=days if forward else -days)
+    daily = _ofes_ventilation_integrate(f'{date:%Y%m%d}', date, end, positions, particles, settings['ventilation'])
     daily['track_id'] = particles['track_id'].to_numpy()[daily['particle_index'].to_numpy(dtype=int)]
-    daily['lookback_days'] = (date - pd.to_datetime(daily['date'])).dt.days.astype(int)
-    samples = _ofes_grid_lens_sample_paths(date, daily, particles, backtrack_days, settings)
+    offset = (pd.to_datetime(daily['date']) - date).dt.days.astype(int)
+    daily['forward_days' if forward else 'lookback_days'] = offset if forward else -offset
+    samples = _ofes_grid_lens_sample_paths(
+        date, daily, particles, days, settings, forward=forward, stride_days=stride_days, ridges=ridges,
+    )
     for frame in (particles, daily):
         frame['release_date'] = date
     return {'particles': particles, 'daily': daily, 'samples': samples}
@@ -87884,7 +87946,7 @@ def build_ofes_grid_lens_backtrack(
 ) -> dict:
     """从透镜实验单位的释放日后向追踪透镜材料，比较携氧与从未携氧透镜的来源与下沉历史。
 
-    每个单位在释放日按项目三维 ensemble 几何（`_ofes_trajectory_seed_ensemble`，以透镜中心、体积质心深度与半径定位）放种子，只保留落在该透镜逐柱支撑内的粒子作为透镜材料；其中落在携氧阈值像元半振幅核内的另记为氧核成员。粒子沿用通风分析的三维后向积分与逐日混合层诊断（`_ofes_ventilation_backtrack`），积分窗口放大到 `domain_margin_km`，每个 S5 步长沿途取原生 DO、θ、S、σ0、spiciness0，并用 E239 急流脊函数判定位于表层急流脊哪一侧。
+    每个单位在释放日按项目三维 ensemble 几何（`_ofes_trajectory_seed_ensemble`，以透镜中心、体积质心深度与半径定位）放种子，只保留落在该透镜逐柱支撑内的粒子作为透镜材料；其中落在携氧阈值像元半振幅核内的另记为氧核成员。粒子沿用通风分析的三维后向积分与逐日混合层诊断（`_ofes_ventilation_integrate`），积分窗口放大到 `domain_margin_km`，每个 S5 步长沿途取原生 DO、θ、S、σ0、spiciness0，并用 E239 急流脊函数判定位于表层急流脊哪一侧。
 
     逐单位汇总各回溯时长的来源位置（急流北侧比例、出界方向）、浅于 ΔDO 搜索窗上沿的比例、混合层接触、源头到释放的 DO、σ0、spiciness0 变化，以及下沉中沿等密面与跨等密面的部分（每个取样点另取粒子释放时 σ0 面在该水柱中的深度）。来源位置取每个粒子在回溯窗内最早仍被追踪的位置，提前越出交付域或失效的粒子取截止前最后一次取样，因此位置类指标覆盖全部粒子；固定时长的性质变化与下沉分解只用追满该时长的粒子。携氧与从未携氧的比较以单位等权，从未携氧组用实验单位表的季节权重标准化，区间按结构组整组重抽，并附只取多数粒子追满的单位的截断敏感性。
 
@@ -89383,7 +89445,7 @@ def _ofes_grid_lens_source_day(args: tuple) -> dict:
             located = np.isfinite(moved[:, 0])
             in_lens = np.zeros(len(moved), dtype=bool)
             if located.any():
-                in_lens[located] = _ofes_grid_lens_register(lens.track_id, moved[located], all_lenses)
+                in_lens[located] = _ofes_grid_lens_register(moved[located], all_lenses, grid) >= 0
             keep = located & ~in_lens
             unit = f'{lens.track_id}|{control.candidate_id}'
             registry.append({
@@ -89484,34 +89546,34 @@ def _ofes_grid_lens_source_unit_metrics(
     return pd.DataFrame(rows)
 
 
-def _ofes_grid_lens_source_pairs(metrics: pd.DataFrame, units: pd.DataFrame) -> pd.DataFrame:
-    """逐透镜、粒子组、回溯时长与读数配对：透镜值减其各对照的平均（对照等权，只用该读数有值的对照）；透镜氧核组与全部透镜材料共用同一批对照。"""
+def _ofes_grid_lens_pairs(metrics: pd.DataFrame, units: pd.DataFrame, metric_names: Sequence[str], time_column: str) -> pd.DataFrame:
+    """逐透镜、粒子组、时长与读数配对：透镜值减其各对照的平均（对照等权，只用该读数有值的对照）；透镜的各粒子组共用同一批对照。"""
     long = metrics.melt(
-        id_vars=['unit_id', 'particle_group', 'horizon_days'], value_vars=list(_OFES_GRID_LENS_SOURCE_METRICS),
+        id_vars=['unit_id', 'particle_group', time_column], value_vars=list(metric_names),
         var_name='metric', value_name='value',
     ).join(units[['lens_track_id', 'material']], on='unit_id')
     lens = long.loc[long['material'].eq('lens')].drop(columns=['material', 'unit_id']).rename(columns={'value': 'lens_value'})
     control = long.loc[long['material'].eq('control') & long['value'].notna()].groupby(
-        ['lens_track_id', 'horizon_days', 'metric'],
+        ['lens_track_id', time_column, 'metric'],
     )['value'].agg(control_value='mean', controls_used='size').reset_index()
-    pairs = lens.merge(control, on=['lens_track_id', 'horizon_days', 'metric'], how='left')
+    pairs = lens.merge(control, on=['lens_track_id', time_column, 'metric'], how='left')
     pairs['difference'] = pairs['lens_value'] - pairs['control_value']
     lens_info = units.loc[units['material'].eq('lens')].drop_duplicates('lens_track_id').set_index('lens_track_id')
     return pairs.join(lens_info[['structure_group', 'release_date', 'carry_do20_at_release']], on='lens_track_id')
 
 
-def _ofes_grid_lens_source_summary(pairs: pd.DataFrame, settings: Mapping[str, Any]) -> pd.DataFrame:
-    """逐粒子组、回溯时长与读数汇总透镜与对照的均值和配对差（每个透镜等权），区间按结构组整组重抽。"""
+def _ofes_grid_lens_pair_summary(pairs: pd.DataFrame, settings: Mapping[str, Any], label: str, time_column: str) -> pd.DataFrame:
+    """逐粒子组、时长与读数汇总透镜与对照的均值和配对差（每个透镜等权），区间按结构组整组重抽。"""
     ventilation = settings['ventilation']
     boot = {'bootstrap_replicates': int(ventilation['bootstrap_replicates']), 'bootstrap_seed': int(ventilation['random_seed'])}
     rows = []
-    for (group, horizon, metric), part in pairs.loc[pairs['difference'].notna()].groupby(['particle_group', 'horizon_days', 'metric'], sort=True):
-        weights = _ofes_grid_lens_cluster_counts(part['structure_group'], boot, 'source_comparison', group, horizon, metric)
+    for (group, horizon, metric), part in pairs.loc[pairs['difference'].notna()].groupby(['particle_group', time_column, 'metric'], sort=True):
+        weights = _ofes_grid_lens_cluster_counts(part['structure_group'], boot, label, group, horizon, metric)
         values = part['difference'].to_numpy(dtype=float)
         with np.errstate(invalid='ignore', divide='ignore'):
             replicate = weights @ values / weights.sum(axis=1)
         rows.append({
-            'particle_group': group, 'horizon_days': int(horizon), 'metric': metric,
+            'particle_group': group, time_column: int(horizon), 'metric': metric,
             'n_lenses': len(part), 'n_structure_groups': part['structure_group'].nunique(),
             'median_controls_used': float(part['controls_used'].median()),
             'mean_lens': float(part['lens_value'].mean()), 'mean_control': float(part['control_value'].mean()),
@@ -89639,8 +89701,8 @@ def build_ofes_grid_lens_source_comparison(
     metrics = _ofes_grid_lens_source_unit_metrics(
         particles, daily, samples, history, unit_horizons, units.set_index('track_id'), settings,
     )
-    pairs = _ofes_grid_lens_source_pairs(metrics, units.set_index('track_id'))
-    summary = _ofes_grid_lens_source_summary(pairs, settings)
+    pairs = _ofes_grid_lens_pairs(metrics, units.set_index('track_id'), _OFES_GRID_LENS_SOURCE_METRICS, 'horizon_days')
+    summary = _ofes_grid_lens_pair_summary(pairs, settings, 'source_comparison', 'horizon_days')
     root.mkdir(parents=True, exist_ok=True)
     lenses.to_csv(root / 'lens_sample.csv', index=False)
     registry.to_csv(root / 'control_registry.csv', index=False)
@@ -89764,6 +89826,709 @@ def plot_ofes_grid_lens_source_comparison(
         fig.tight_layout(rect=(0, 0.06, 1, 1))
         fig.legend(handles=handles, frameon=False, fontsize=8, loc='lower right', ncol=2, bbox_to_anchor=(0.98, 0.0))
         path = root / 'source_comparison_overview.png'
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        figures.append(str(path))
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+    return {'figures': figures, 'plot_data': plot_data}
+
+
+_OFES_GRID_LENS_RETENTION_MATCH = (
+    'depth_m', 'oyashio_ratio', 'do2', 'delta_do', 'core_thickness_m', 'log_seeds', 'horizontal_q90_km',
+)
+_OFES_GRID_LENS_RETENTION_BALANCE = (
+    *_OFES_GRID_LENS_RETENTION_MATCH, 'sigma0', 'theta', 'salinity', 'log10_pv', 'vertical_range_m', 'lat_minus_ridge',
+)
+_OFES_GRID_LENS_RETENTION_METRICS = (
+    'active_share', 'do2_change', 'theta_change', 'salinity_change', 'sigma0_change', 'depth_change_m',
+    'horizontal_q90_start_km', 'horizontal_q90_km', 'horizontal_spread_ratio', 'vertical_range_start_m', 'vertical_range_change_m',
+    'positive_core_share', 'do20_core_share', 'core_delta_do', 'core_thickness_m', 'same_lens_share', 'any_lens_share',
+)
+
+
+def _ofes_grid_lens_retention_settings() -> dict:
+    """解析透镜条件保持设置：积分、种子几何、取样与重抽沿用透镜后向溯源；候选对照的最大半径与格距取 Analysis 2 对照环的最大半径与环距。"""
+    raw = dict(_OFES_CFG.get('grid_lens_conditional_retention', {}) or {})
+    radii = sorted(float(value) for value in (_OFES_CFG.get('scv_reverse_enrichment', {}) or {}).get('control_radii_km', ()))
+    settings = _ofes_grid_lens_backtrack_settings()
+    settings.update({
+        'control_max_radius_km': radii[-1],
+        'control_spacing_km': float(np.median(np.diff(radii))),
+        'data_end_date': f"{_ofes_grid_scv_v2_s5_config()['end_date']:%Y-%m-%d}",
+        'output_subdir': str(raw.get('output_subdir', 'grid_lens_conditional_retention')),
+    })
+    return settings
+
+
+def _ofes_grid_lens_footprint_voxels(footprint: pd.DataFrame, grid: Mapping[str, Any], depth: np.ndarray) -> np.ndarray:
+    """透镜逐柱 footprint 区间内的全部原生层中心，按（深度、纬度、经度）排列。"""
+    inside = (depth[None, :] >= footprint['depth_low_m'].to_numpy(dtype=float)[:, None]) & (
+        depth[None, :] <= footprint['depth_high_m'].to_numpy(dtype=float)[:, None]
+    )
+    column, level = np.nonzero(inside)
+    rows = footprint['global_lat_index'].to_numpy(dtype=int)[column]
+    columns = footprint['global_lon_index'].to_numpy(dtype=int)[column]
+    return np.column_stack([depth[level], grid['lat'][rows], grid['lon'][columns]])
+
+
+def _ofes_grid_lens_patch_scale(lat: Any, lon: Any, depth: Any) -> dict:
+    """材料斑块相对自身质心的水平 q90 半径（km）与垂向 q10–q90 深度范围（m）。"""
+    lat, lon, depth = (np.asarray(values, dtype=float) for values in (lat, lon, depth))
+    if not len(lat):
+        return {'horizontal_q90_km': np.nan, 'vertical_range_m': np.nan}
+    centre_lat = float(lat.mean())
+    centre_lon = float(lon[0] + _minimal_lon_diff_deg(lon, lon[0]).mean())
+    scale = approximate_degree_length(centre_lat)
+    x = _minimal_lon_diff_deg(lon, centre_lon) * float(scale['meters_per_degree_lon'])
+    y = (lat - centre_lat) * float(scale['meters_per_degree_lat'])
+    return {
+        'horizontal_q90_km': float(np.quantile(np.hypot(x, y), 0.9)) / 1000.0,
+        'vertical_range_m': float(np.quantile(depth, 0.9) - np.quantile(depth, 0.1)),
+    }
+
+
+def _ofes_grid_lens_seed_state(
+    date: pd.Timestamp,
+    seeds: np.ndarray,
+    snapshot: Mapping[str, Any],
+    end_members: pd.DataFrame,
+) -> pd.DataFrame:
+    """种子初态：原生 DO、θ、S、σ0、spiciness0，等密面亲潮混合比 R，以及所在水柱的 log10 层结 PV（f/ρ·∂σ0/∂z，同核心氧差口径）。"""
+    state = _ofes_grid_lens_path_properties(date, seeds, snapshot=snapshot)
+    state['oyashio_ratio'] = _ofes_oyashio_ratio(
+        state['theta'], state['salinity'], _ofes_npiw_end_members_at(end_members, state['sigma0']),
+    )
+    depth = np.asarray(snapshot['depth'], dtype=float)
+    rows = np.abs(np.asarray(snapshot['lat'])[None, :] - seeds[:, 1:2]).argmin(axis=1)
+    columns = np.abs(_minimal_lon_diff_deg(np.asarray(snapshot['lon'])[None, :], seeds[:, 2:3])).argmin(axis=1)
+    sigma = snapshot['sigma0_volume'][:, rows, columns].T
+    gradient = np.full(len(seeds), np.nan)
+    for index, profile in enumerate(sigma):
+        valid = np.isfinite(profile)
+        if valid.sum() >= 2:
+            gradient[index] = np.interp(seeds[index, 0], depth[valid], np.gradient(profile[valid], depth[valid]))
+    pv = gsw.f(seeds[:, 1]) / (1000.0 + state['sigma0'].to_numpy()) * gradient
+    with np.errstate(invalid='ignore', divide='ignore'):
+        state['log10_pv'] = np.where(pv > 0, np.log10(pv), np.nan)
+    return state
+
+
+def _ofes_grid_lens_patch_state(seeds: pd.DataFrame) -> dict:
+    """把一个材料斑块的逐种子初态汇总为斑块初态：种子数、各性质平均、水平 q90 半径与垂向范围。"""
+    return {
+        'seeds': len(seeds), 'log_seeds': float(np.log(len(seeds))),
+        **{name: float(seeds[name].mean()) for name in (
+            'depth_m', 'sigma0', 'theta', 'salinity', 'do2', 'oyashio_ratio', 'delta_do', 'core_thickness_m', 'log10_pv',
+        )},
+        'centre_lat': float(seeds['lat'].mean()), 'centre_lon': float(seeds['lon'].mean()),
+        **_ofes_grid_lens_patch_scale(seeds['lat'], seeds['lon'], seeds['depth_m']),
+    }
+
+
+def _ofes_grid_lens_retention_candidate_day(args: tuple) -> dict:
+    """一个释放日：为各透镜取氧核种子（透镜逐柱支撑 ∩ DO20 半振幅核内的全部原生层中心）与来源回溯的 ensemble 种子，并评估候选对照斑块。
+
+    候选斑块：把透镜氧核种子按网格平移到格点候选位置（格距与最大半径取 Analysis 2 对照环），在候选水柱中移到各种子自身 σ0 离原深度最近的交点；
+    保留不在当日任一已识别透镜内、且落在当日 DO20 半振幅核内的种子。`with_candidates=False` 时只取透镜种子与初态（匹配尺度用）。
+    """
+    date, lenses, objects, scope_root, end_members, with_candidates, settings = args
+    date = pd.Timestamp(date).normalize()
+    grid = _ofes_grid_lens_grid(date)
+    depth = np.asarray(_ofes_tracer_coordinates(date)[2], dtype=float)
+    lon_step = float(np.median(np.diff(grid['lon'])))
+    footprints = pd.read_parquet(Path(scope_root) / f'{date:%Y%m%d}' / 'analysis2_footprints.parquet')
+    all_lenses = _ofes_grid_lens_footprint_support(footprints, grid)
+    threshold = settings['carrying_threshold']
+    seed_frames, patch_rows = [], []
+    for lens in lenses.itertuples(index=False):
+        footprint = footprints.loc[footprints['object_id'].eq(lens.object_id)]
+        ensemble = _ofes_grid_lens_lens_seeds(date, lens.track_id, lens.object_id, objects.loc[lens.object_id], footprint, grid, settings)
+        if ensemble is not None:
+            seed_frames.append(pd.DataFrame(ensemble[0], columns=['depth_m', 'lat', 'lon']).assign(
+                unit_id=f'{lens.track_id}|ensemble', lens_track_id=lens.track_id, material='lens', particle_group='lens_material',
+                candidate_id='', ensemble_particle_id=ensemble[1]['ensemble_particle_id'].to_numpy(),
+            ))
+        voxels = _ofes_grid_lens_footprint_voxels(footprint, grid, depth)
+        support = _ofes_grid_lens_oxygen_support(date, lens.object_id, voxels, grid, threshold)
+        core_row = _ofes_grid_lens_register(voxels, support, grid)
+        core = voxels[core_row >= 0]
+        base = {'lens_track_id': lens.track_id, 'object_id': lens.object_id, 'release_date': date, 'lens_voxels': len(voxels)}
+        if not len(core):
+            patch_rows.append({**base, 'unit_id': lens.track_id, 'material': 'lens', 'candidate_id': '', 'seeds': 0})
+            continue
+        scale = approximate_degree_length(float(lens.center_lat))
+        # 平移后的种子离透镜中心至多为最大对照半径加种子自身离中心的距离，另留两格余量
+        extent_km = float(np.max(np.hypot(
+            (core[:, 1] - float(lens.center_lat)) * float(scale['meters_per_degree_lat']),
+            _minimal_lon_diff_deg(core[:, 2], float(lens.center_lon)) * float(scale['meters_per_degree_lon']),
+        ))) / 1000.0
+        reach_km = settings['control_max_radius_km'] + extent_km + 2.0 * grid['step'] * float(scale['meters_per_degree_lat']) / 1000.0
+        half_lat = reach_km * 1000.0 / float(scale['meters_per_degree_lat'])
+        half_lon = reach_km * 1000.0 / float(scale['meters_per_degree_lon'])
+        snapshot = load_ofes_snapshot(
+            date, variables=['do2', 'temp', 'salinity'],
+            lon_bounds=(max(float(grid['lon'][0]), float(lens.center_lon) - half_lon), min(float(grid['lon'][-1]), float(lens.center_lon) + half_lon)),
+            lat_bounds=(max(float(grid['lat'][0]), float(lens.center_lat) - half_lat), min(float(grid['lat'][-1]), float(lens.center_lat) + half_lat)),
+        )
+        snapshot['sigma0_volume'] = _ofes_sigma0_volume(snapshot)
+        lens_state = _ofes_grid_lens_seed_state(date, core, snapshot, end_members).assign(
+            depth_m=core[:, 0], lat=core[:, 1], lon=core[:, 2], seed_index=np.arange(len(core)),
+            delta_do=support['delta_do'].to_numpy(dtype=float)[core_row[core_row >= 0]],
+            core_thickness_m=support['core_thickness_m'].to_numpy(dtype=float)[core_row[core_row >= 0]],
+            source_lat_index=support['lat_index'].to_numpy()[core_row[core_row >= 0]],
+            source_lon_index=support['lon_index'].to_numpy()[core_row[core_row >= 0]],
+        )
+        seed_frames.append(lens_state.assign(
+            unit_id=lens.track_id, lens_track_id=lens.track_id, material='lens', particle_group='core', candidate_id='',
+        ))
+        patch_rows.append({**base, 'unit_id': lens.track_id, 'material': 'lens', 'candidate_id': '', **_ofes_grid_lens_patch_state(lens_state)})
+        if not with_candidates:
+            continue
+        # 候选区内全部网格柱的 DO20 半振幅核（每柱只有最强峰）
+        region_rows = np.flatnonzero((grid['lat'] >= snapshot['lat'].min()) & (grid['lat'] <= snapshot['lat'].max()))
+        region_columns = np.flatnonzero((grid['lon'] >= snapshot['lon'].min()) & (grid['lon'] <= snapshot['lon'].max()))
+        region_grid = np.array(np.meshgrid(region_rows, region_columns, indexing='ij')).reshape(2, -1)
+        region_support = _ofes_grid_lens_oxygen_support(
+            date, lens.object_id, np.column_stack([np.full(region_grid.shape[1], depth[0]), grid['lat'][region_grid[0]], grid['lon'][region_grid[1]]]),
+            grid, threshold,
+        )
+        if region_support.empty:
+            continue
+        core_columns = set(zip(region_support['lat_index'], region_support['lon_index']))
+        seed_rows = np.abs(grid['lat'][None, :] - core[:, 1:2]).argmin(axis=1)
+        seed_columns = np.abs(_minimal_lon_diff_deg(grid['lon'][None, :], core[:, 2:3])).argmin(axis=1)
+        cell_km = (grid['step'] * float(scale['meters_per_degree_lat']) / 1000.0, lon_step * float(scale['meters_per_degree_lon']) / 1000.0)
+        spacing = [max(1, int(round(settings['control_spacing_km'] / size))) for size in cell_km]
+        reach = [int(settings['control_max_radius_km'] // (size * step)) for size, step in zip(cell_km, spacing)]
+        sigma = lens_state['sigma0'].to_numpy()
+        for i in range(-reach[0], reach[0] + 1):
+            for j in range(-reach[1], reach[1] + 1):
+                offset_row, offset_col = i * spacing[0], j * spacing[1]
+                offset_km = float(np.hypot(offset_row * cell_km[0], offset_col * cell_km[1]))
+                if offset_km == 0.0 or offset_km > settings['control_max_radius_km']:
+                    continue
+                if not any((row + offset_row, column + offset_col) in core_columns for row, column in zip(seed_rows, seed_columns)):
+                    continue
+                moved = core.copy()
+                moved[:, 1] += offset_row * grid['step']
+                moved[:, 2] += offset_col * lon_step
+                moved[:, 0] = _ofes_grid_lens_path_properties(date, moved, sigma, snapshot)['isopycnal_depth_m'].to_numpy()
+                located = np.isfinite(moved[:, 0])
+                matched = np.full(len(moved), -1, dtype=int)
+                in_lens = np.zeros(len(moved), dtype=bool)
+                if located.any():
+                    matched[located] = _ofes_grid_lens_register(moved[located], region_support, grid)
+                    in_lens[located] = _ofes_grid_lens_register(moved[located], all_lenses, grid) >= 0
+                keep = (matched >= 0) & ~in_lens
+                candidate = f'{lens.track_id}|r{offset_row:+04d}c{offset_col:+04d}'
+                row = {
+                    **base, 'unit_id': candidate, 'material': 'control', 'candidate_id': candidate,
+                    'offset_row': offset_row, 'offset_col': offset_col, 'offset_km': offset_km,
+                    'translated_seeds': len(moved), 'no_isopycnal_seeds': int((~located).sum()),
+                    'in_identified_lens_seeds': int(in_lens.sum()), 'seeds': int(keep.sum()),
+                }
+                if keep.any():
+                    state = _ofes_grid_lens_seed_state(date, moved[keep], snapshot, end_members).assign(
+                        depth_m=moved[keep, 0], lat=moved[keep, 1], lon=moved[keep, 2], seed_index=np.flatnonzero(keep),
+                        delta_do=region_support['delta_do'].to_numpy(dtype=float)[matched[keep]],
+                        core_thickness_m=region_support['core_thickness_m'].to_numpy(dtype=float)[matched[keep]],
+                        source_lat_index=region_support['lat_index'].to_numpy()[matched[keep]],
+                        source_lon_index=region_support['lon_index'].to_numpy()[matched[keep]],
+                    )
+                    seed_frames.append(state.assign(
+                        unit_id=candidate, lens_track_id=lens.track_id, material='control', particle_group='core', candidate_id=candidate,
+                    ))
+                    row.update(_ofes_grid_lens_patch_state(state))
+                patch_rows.append(row)
+    patches = pd.DataFrame(patch_rows)
+    if 'centre_lon' in patches and patches['centre_lon'].notna().any():
+        located = patches['centre_lon'].notna()
+        side = _ofes_grid_lens_jet_side(
+            np.full(int(located.sum()), date), patches.loc[located, 'centre_lon'], patches.loc[located, 'centre_lat'], settings,
+        )
+        for name in ('lat_minus_ridge', 'jet_side', 'surface_ridge_ambiguous'):
+            patches.loc[located, name] = side[name].to_numpy()
+    seeds = pd.concat(seed_frames, ignore_index=True) if seed_frames else pd.DataFrame()
+    return {'patches': patches, 'seeds': seeds}
+
+
+def _ofes_grid_lens_retention_match(
+    patches: pd.DataFrame,
+    seeds: pd.DataFrame,
+    controls_per_lens: int,
+    caliper_sd: float,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """为每个有氧核种子的透镜斑块按初态挑选固定的少量非透镜对照斑块，返回选中对照（含名次与标准化残差）与各匹配量的尺度。
+
+    候选须与透镜同在急流脊南侧；各匹配量以透镜斑块间标准差标准化，任一量的绝对标准化差超过 `caliper_sd` 即不合格；
+    合格者按标准化差的均方根从小到大依次选入，与已选对照共用任何网格柱者跳过，至多 `controls_per_lens` 个。
+    """
+    lenses = patches.loc[patches['material'].eq('lens') & patches['seeds'].gt(0)].set_index('lens_track_id')
+    scales = lenses[list(_OFES_GRID_LENS_RETENTION_MATCH)].astype(float).std()
+    candidates = patches.loc[patches['material'].eq('control') & patches['seeds'].gt(0) & patches['jet_side'].eq('south')]
+    columns = seeds.loc[seeds['material'].eq('control')].groupby('unit_id')[['source_lat_index', 'source_lon_index']].apply(
+        lambda frame: set(zip(frame['source_lat_index'], frame['source_lon_index']))
+    )
+    selected = []
+    for lens_id, part in candidates.groupby('lens_track_id', sort=True):
+        z = (part[list(_OFES_GRID_LENS_RETENTION_MATCH)].astype(float) - lenses.loc[lens_id, list(_OFES_GRID_LENS_RETENTION_MATCH)].astype(float)) / scales
+        eligible = part.assign(match_distance=np.sqrt((z ** 2).mean(axis=1)), **{f'z_{name}': z[name] for name in z.columns}).loc[
+            z.abs().le(caliper_sd).all(axis=1)
+        ].sort_values(['match_distance', 'unit_id'])
+        used, rank = set(), 0
+        for candidate in eligible.to_dict('records'):
+            if rank >= controls_per_lens:
+                break
+            if columns[candidate['unit_id']] & used:
+                continue
+            used |= columns[candidate['unit_id']]
+            rank += 1
+            selected.append({**candidate, 'control_rank': rank})
+    return pd.DataFrame(selected), scales
+
+
+def _ofes_grid_lens_retention_balance(patches: pd.DataFrame, selected: pd.DataFrame, scales: pd.Series) -> pd.DataFrame:
+    """初态平衡：透镜斑块、同侧全部合格候选与选中对照的均值，匹配前后的标准化均值差（以透镜斑块间标准差为尺度），以及逐透镜配对残差。"""
+    lenses = patches.loc[patches['material'].eq('lens') & patches['seeds'].gt(0)]
+    matched = lenses.loc[lenses['lens_track_id'].isin(selected['lens_track_id'])].set_index('lens_track_id')
+    pool = patches.loc[
+        patches['material'].eq('control') & patches['seeds'].gt(0) & patches['jet_side'].eq('south')
+        & patches['lens_track_id'].isin(matched.index)
+    ]
+    rows = []
+    for name in _OFES_GRID_LENS_RETENTION_BALANCE:
+        scale = float(lenses[name].std())
+        control = selected.groupby('lens_track_id')[name].mean()
+        residual = (matched[name] - control.reindex(matched.index)) / scale
+        rows.append({
+            'variable': name, 'matching_variable': name in _OFES_GRID_LENS_RETENTION_MATCH, 'lens_sd': scale,
+            'mean_lens_all': float(lenses[name].mean()), 'mean_lens_matched': float(matched[name].mean()),
+            'mean_candidate_pool': float(pool[name].mean()), 'mean_selected_control': float(control.mean()),
+            'smd_before': float((matched[name].mean() - pool[name].mean()) / scale),
+            'smd_after': float(residual.mean()), 'median_abs_pair_residual_sd': float(residual.abs().median()),
+        })
+    return pd.DataFrame(rows)
+
+
+def _ofes_grid_lens_retention_day(args: tuple) -> dict:
+    """一个释放日：透镜氧核、选中对照与 ensemble 种子一起前向积分并逐日取样，再在报告日登记正异常/DO20 核，在 S5 日登记透镜成员关系。"""
+    date, seeds, objects, scope_root, forward_days, report_days, settings = args
+    date = pd.Timestamp(date).normalize()
+    grid = _ofes_grid_lens_grid(date)
+    seeds = seeds.reset_index(drop=True)
+    # 释放时的 DO/θ/S/σ0 由积分函数统一取为 release_*，这里只带标签与种子所在核、混合比和 PV
+    particles = seeds[[name for name in (
+        'unit_id', 'lens_track_id', 'material', 'particle_group', 'candidate_id', 'ensemble_particle_id',
+        'delta_do', 'core_thickness_m', 'oyashio_ratio', 'log10_pv',
+    ) if name in seeds]].assign(
+        track_id=seeds['unit_id'], particle_id=seeds['unit_id'] + '_' + seeds.groupby('unit_id').cumcount().astype(str),
+    )
+    result = _ofes_grid_lens_integrate(
+        date, seeds[['depth_m', 'lat', 'lon']].to_numpy(dtype=float), particles, forward_days, settings,
+        forward=True, stride_days=1, ridges=False,
+    )
+    daily = result['daily']
+    expression, membership = [], []
+    for offset in report_days:
+        day = daily.loc[daily['forward_days'].eq(offset) & daily['status'].eq('active')]
+        if day.empty:
+            continue
+        positions = day[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+        record = day[['particle_id', 'track_id', 'forward_days']].reset_index(drop=True)
+        for label, threshold in (('positive_core', 0.0), ('do20_core', settings['carrying_threshold'])):
+            support = _ofes_grid_lens_oxygen_support(date + pd.Timedelta(days=offset), 'expression', positions, grid, threshold)
+            matched = _ofes_grid_lens_register(positions, support, grid)
+            record[f'in_{label}'] = matched >= 0
+            if label == 'positive_core':
+                for name in ('delta_do', 'core_thickness_m'):
+                    values = support[name].to_numpy(dtype=float) if len(support) else np.array([np.nan])
+                    record[name] = np.where(matched >= 0, values[np.maximum(matched, 0)], np.nan)
+        expression.append(record)
+    units = seeds.drop_duplicates('unit_id').set_index('unit_id')
+    for offset in range(0, forward_days + 1, settings['sample_stride_days']):
+        footprint_path = Path(scope_root) / f'{date + pd.Timedelta(days=offset):%Y%m%d}' / 'analysis2_footprints.parquet'
+        day = daily.loc[daily['forward_days'].eq(offset) & daily['status'].eq('active')]
+        if day.empty or not footprint_path.is_file():
+            continue
+        footprints = pd.read_parquet(footprint_path)
+        positions = day[['depth_m', 'lat', 'lon']].to_numpy(dtype=float)
+        record = day[['particle_id', 'track_id', 'forward_days']].reset_index(drop=True)
+        record['in_any_lens'] = _ofes_grid_lens_register(positions, _ofes_grid_lens_footprint_support(footprints, grid), grid) >= 0
+        record['in_same_lens'] = np.nan
+        for lens_id, index in record.groupby(units['lens_track_id'].reindex(record['track_id']).to_numpy()).groups.items():
+            index = np.asarray(index)
+            lens_units = units['material'].reindex(record.loc[index, 'track_id']).eq('lens').to_numpy()
+            own = footprints.loc[footprints['object_id'].isin(objects.index[objects['track_id'].eq(lens_id)])]
+            hit = _ofes_grid_lens_register(positions[index[lens_units]], _ofes_grid_lens_footprint_support(own, grid), grid) >= 0 if len(own) else np.zeros(int(lens_units.sum()), dtype=bool)
+            record.loc[index[lens_units], 'in_same_lens'] = hit.astype(float)
+        membership.append(record)
+    return {
+        **result,
+        'expression': pd.concat(expression, ignore_index=True) if expression else pd.DataFrame(),
+        'membership': pd.concat(membership, ignore_index=True) if membership else pd.DataFrame(),
+    }
+
+
+def _ofes_grid_lens_retention_unit_metrics(
+    particles: pd.DataFrame,
+    daily: pd.DataFrame,
+    samples: pd.DataFrame,
+    expression: pd.DataFrame,
+    membership: pd.DataFrame,
+    report_days: Sequence[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """逐材料斑块与前向天数计算保持读数，另给逐斑块成员状态支持表。
+
+    性质变化取该日仍被追踪且有取样的成员，各自减去释放时的值后平均；展开只取该日仍被追踪者，比较其在该日与释放日相对自身质心的 q90 半径和垂向范围。
+    正异常/DO20 核在报告日登记，透镜成员关系在 S5 日登记；失效或出域的成员不当作零氧或已离开。
+    """
+    release = particles.set_index('particle_id')
+    start = daily.loc[daily['forward_days'].eq(0)].set_index('particle_id')
+    days = sorted(set(report_days) | set(membership['forward_days'].unique() if len(membership) else ()))
+    by_unit = {
+        name: {unit: frame for unit, frame in table.groupby('track_id', sort=False)}
+        for name, table in (('daily', daily), ('samples', samples), ('expression', expression), ('membership', membership)) if len(table)
+    }
+    empty = pd.DataFrame(columns=['forward_days'])
+    rows, support = [], []
+    for unit, members in particles.groupby('track_id', sort=True):
+        ids = members['particle_id']
+        unit_daily, unit_samples, unit_expression, unit_membership = (
+            by_unit.get(name, {}).get(unit, empty) for name in ('daily', 'samples', 'expression', 'membership')
+        )
+        for offset in days:
+            day = unit_daily.loc[unit_daily['forward_days'].eq(offset)].set_index('particle_id')
+            if day.empty:
+                continue
+            active = day.index[day['status'].eq('active')]
+            sampled = unit_samples.loc[unit_samples['forward_days'].eq(offset)].set_index('particle_id')
+            sampled = sampled.loc[sampled['do2'].notna()]
+            for status, count in day['status'].value_counts().items():
+                support.append({'unit_id': unit, 'forward_days': int(offset), 'status': status, 'members': int(count)})
+            support.append({'unit_id': unit, 'forward_days': int(offset), 'status': 'active_without_properties',
+                            'members': int(len(active) - len(sampled))})
+            row = {'unit_id': unit, 'particle_group': members['particle_group'].iloc[0], 'forward_days': int(offset),
+                   'members': len(ids), 'active_share': len(active) / len(ids)}
+            if offset in report_days and len(sampled):
+                for name in ('do2', 'theta', 'salinity', 'sigma0'):
+                    row[f'{name}_change'] = float((sampled[name] - release.loc[sampled.index, f'release_{name}']).mean())
+                row['depth_change_m'] = float((sampled['depth_m'] - start.loc[sampled.index, 'depth_m']).mean())
+                if len(active) >= 2:
+                    now = _ofes_grid_lens_patch_scale(day.loc[active, 'lat'], day.loc[active, 'lon'], day.loc[active, 'depth_m'])
+                    then = _ofes_grid_lens_patch_scale(start.loc[active, 'lat'], start.loc[active, 'lon'], start.loc[active, 'depth_m'])
+                    row.update({
+                        'horizontal_q90_start_km': then['horizontal_q90_km'], 'horizontal_q90_km': now['horizontal_q90_km'],
+                        'horizontal_spread_ratio': now['horizontal_q90_km'] / then['horizontal_q90_km'] if then['horizontal_q90_km'] > 0 else np.nan,
+                        'vertical_range_start_m': then['vertical_range_m'],
+                        'vertical_range_change_m': now['vertical_range_m'] - then['vertical_range_m'],
+                    })
+                cores = unit_expression.loc[unit_expression['forward_days'].eq(offset)]
+                if len(cores):
+                    inside = cores.loc[cores['in_positive_core']]
+                    row.update({
+                        'positive_core_share': float(cores['in_positive_core'].mean()),
+                        'do20_core_share': float(cores['in_do20_core'].mean()),
+                        'core_delta_do': float(inside['delta_do'].mean()) if len(inside) else np.nan,
+                        'core_thickness_m': float(inside['core_thickness_m'].mean()) if len(inside) else np.nan,
+                    })
+            relation = unit_membership.loc[unit_membership['forward_days'].eq(offset)]
+            if len(relation):
+                row['any_lens_share'] = float(relation['in_any_lens'].mean())
+                row['same_lens_share'] = float(relation['in_same_lens'].mean())
+            rows.append(row)
+    return pd.DataFrame(rows), pd.DataFrame(support)
+
+
+def build_ofes_grid_lens_conditional_retention(
+    reverse_cache_dir: str | Path,
+    *,
+    source_dir: str | Path | None = None,
+    core_contrast_dir: str | Path | None = None,
+    units_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    forward_days: int = 30,
+    report_days: Sequence[int] = (0, 7, 14, 30),
+    controls_per_lens: int = 3,
+    caliper_sd: float = 1.0,
+    dates: Sequence[str | pd.Timestamp] | None = None,
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """比较急流南侧 minty 透镜氧核内的富氧材料与初态相近的透镜外富氧材料在随后 30 天的性质变化与空间展开。
+
+    透镜沿用来源对照的样本（每条轨迹第一个可回溯至少 30 天的配对透镜-日），只保留释放后资料满 `forward_days` 天者（按 S5 日历终点，年末不足的不计作失去保持）。
+    氧核种子取透镜逐柱 footprint 区间内、同时落在 DO20 半振幅核内的全部原生层中心；另放来源回溯的 ensemble 种子作全部透镜材料的描述组（不配对照）。
+
+    对照候选：把透镜氧核种子平移到格点候选位置（格距与最大半径取 Analysis 2 对照环的环距与最大半径），在候选水柱中移到各种子自身 σ0 离原深度最近的交点，
+    保留不在当日任一已识别透镜内、且落在 DO20 半振幅核内的种子；候选中心须在急流脊南侧。按初态（深度、混合比 R、raw DO、ΔDO、半振幅核厚度、种子数、水平 q90 半径）
+    以透镜斑块间标准差标准化，逐量卡 `caliper_sd`，按均方根距离依次选入、互不共用网格柱，至多 `controls_per_lens` 个；规则与选中对照在积分前固定。
+
+    透镜氧核、选中对照与 ensemble 种子一起用通风分析的三维积分前向 `forward_days` 天，逐日取原生 DO、θ、S、σ0。报告日（`report_days`）登记正异常核（任一检出 ΔDO 峰的半振幅核）与 DO20 核，
+    S5 日登记是否仍在原透镜轨迹或任一已识别透镜内。逐斑块计算性质变化、相对自身质心的展开与核表达；透镜值减其对照的等权平均为配对差，透镜等权、结构组整组重抽。
+
+    参数:
+        - reverse_cache_dir (str | pathlib.Path): reverse enrichment 逐日片段根目录，读取 `primary_300_1000/<日期>/analysis2_footprints.parquet`。
+        - source_dir (str | pathlib.Path | None): 来源对照目录，提供透镜样本；默认正式 `grid_lens_source_comparison`。
+        - core_contrast_dir (str | pathlib.Path | None): 核心氧差目录，提供 NPIW 端元；默认正式 `grid_lens_core_oxygen_contrast`。
+        - units_dir (str | pathlib.Path | None): 透镜实验单位目录，提供透镜对象与轨迹；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_units`。
+        - output_dir (str | pathlib.Path | None): 输出目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_conditional_retention`。
+        - forward_days (int): 前向积分天数；默认 30。
+        - report_days (Sequence[int]): 报告性质变化、展开与核表达的前向天数；默认 (0, 7, 14, 30)。
+        - controls_per_lens (int): 每个透镜至多选入的对照斑块数；默认 3。
+        - caliper_sd (float): 各匹配量的标准化差上限（透镜斑块间标准差的倍数）；默认 1.0。
+        - dates (Sequence[str | pandas.Timestamp] | None): 只评估候选与积分这些释放日（试点用）；匹配尺度仍取全部透镜。默认全部释放日。
+        - workers (int): 按释放日并行的进程数；默认 1。
+        - overwrite (bool): 已有同请求的完整结果时是否重算；默认 False，直接读取。
+
+    返回:
+        - dict: `load_ofes_grid_lens_conditional_retention` 的结果。
+
+    输出:
+        - `output_dir/lens_sample.csv`：透镜样本、前向资格、氧核种子数与匹配状态。
+        - `output_dir/candidate_patches.parquet`：全部透镜与候选斑块的初态与剔除计数。
+        - `output_dir/control_selection.csv`：选中对照、名次、匹配距离与逐量标准化差。
+        - `output_dir/initial_balance.csv`：匹配前后的初态平衡。
+        - `output_dir/particles.parquet`、`daily_positions.parquet`、`path_samples.parquet`：粒子初态、逐日位置与状态、逐日 DO/θ/S/σ0。
+        - `output_dir/core_expression.parquet`、`lens_membership.parquet`：逐粒子的报告日核登记与 S5 日透镜成员关系。
+        - `output_dir/unit_metrics.parquet`、`member_support.parquet`：逐斑块读数与成员状态支持。
+        - `output_dir/pair_differences.parquet`、`retention_summary.csv`、`lens_material_summary.csv`：配对差、配对汇总与全部透镜材料的描述汇总。
+        - `output_dir/manifest.json`：请求与计数。
+
+    说明:
+        - 估计对象是“释放时的透镜成员身份与随后 30 天命运的条件关联”，不是移除涡旋的干预效应，也不是氧库存或通量；离线取样的 DO 差不是氧收支。
+        - 对照是“既定检测下的非透镜富氧水”，与透镜相距至多 Analysis 2 的最大对照半径，不是紧邻核边界的控制；层结 PV 只记录、不参与匹配。
+        - 成员不按未来是否在透镜内、是否仍有氧峰删除；出域、数值失效与物性缺测分开计数，不当作零氧。
+    """
+    settings = _ofes_grid_lens_retention_settings()
+    scope_root = Path(reverse_cache_dir).expanduser().resolve() / 'primary_300_1000'
+    source = load_ofes_grid_lens_source_comparison(source_dir)
+    core = load_ofes_grid_lens_core_oxygen_contrast(core_contrast_dir)
+    unit_result = load_ofes_grid_lens_units(units_dir)
+    root = _ofes_grid_lens_output_root(output_dir, settings)
+    report_days = tuple(sorted(int(day) for day in report_days))
+    lenses = source['lens_sample'].copy()
+    lenses['forward_available_days'] = (pd.Timestamp(settings['data_end_date']) - lenses['date']).dt.days.astype(int)
+    eligible = lenses.loc[lenses['forward_available_days'].ge(forward_days)]
+    run_dates = sorted(pd.to_datetime(eligible['date'].unique() if dates is None else list(dates)).normalize())
+    request = {
+        'reverse_cache_dir': str(scope_root.parent),
+        'source_dir': str(Path(source['output_dir']).resolve()),
+        'core_contrast_dir': str(Path(core['output_dir']).resolve()),
+        'units_dir': str(Path(unit_result['output_dir']).resolve()),
+        'forward_days': int(forward_days), 'report_days': list(report_days),
+        'controls_per_lens': int(controls_per_lens), 'caliper_sd': float(caliper_sd),
+        'dates': None if dates is None else [f'{pd.Timestamp(date):%Y-%m-%d}' for date in run_dates],
+        'settings': settings,
+    }
+    manifest_path = root / 'manifest.json'
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+        same_request = _ofes_requests_equal(existing.get('request'), request)
+        if not same_request and not overwrite:
+            raise RuntimeError(
+                'Existing grid-lens conditional retention was built from a different request; '
+                'use another output_dir or overwrite=True.'
+            )
+        if same_request and existing.get('status') == 'complete' and not overwrite:
+            return load_ofes_grid_lens_conditional_retention(root)
+    objects = unit_result['objects'].set_index('object_id')
+
+    def run(function, tasks):
+        if int(workers) > 1:
+            with ProcessPoolExecutor(max_workers=int(workers)) as executor:
+                return list(executor.map(function, tasks))
+        return [function(task) for task in tasks]
+
+    # 匹配尺度取全部透镜，候选只在要运行的释放日上评估
+    stage = run(_ofes_grid_lens_retention_candidate_day, [
+        (date, part, objects.loc[part['object_id']], scope_root, core['end_members'], date in run_dates, settings)
+        for date, part in eligible.groupby('date', sort=True)
+    ])
+    patches = pd.concat([result['patches'] for result in stage], ignore_index=True)
+    seeds = pd.concat([result['seeds'] for result in stage], ignore_index=True)
+    selected, scales = _ofes_grid_lens_retention_match(patches, seeds, controls_per_lens, caliper_sd)
+    balance = _ofes_grid_lens_retention_balance(patches, selected, scales)
+    lens_patches = patches.loc[patches['material'].eq('lens')].set_index('lens_track_id')
+    lenses['oxygen_core_seeds'] = lenses['track_id'].map(lens_patches['seeds']).fillna(0).astype(int)
+    lenses['controls_selected'] = lenses['track_id'].map(selected.groupby('lens_track_id').size()).fillna(0).astype(int)
+    lenses['status'] = np.select(
+        [lenses['forward_available_days'].lt(forward_days), lenses['oxygen_core_seeds'].eq(0),
+         ~lenses['date'].isin(run_dates), lenses['controls_selected'].eq(0)],
+        ['insufficient_forward_window', 'no_oxygen_core_seed', 'not_run', 'no_control_within_caliper'], default='matched',
+    )
+    matched = set(lenses.loc[lenses['status'].eq('matched'), 'track_id'])
+    keep = seeds.loc[
+        seeds['particle_group'].eq('lens_material') & seeds['lens_track_id'].isin(lenses.loc[lenses['date'].isin(run_dates), 'track_id'])
+        | (seeds['material'].eq('lens') & seeds['particle_group'].eq('core') & seeds['lens_track_id'].isin(matched))
+        | seeds['unit_id'].isin(selected['unit_id'])
+    ]
+    release_dates = lenses.set_index('track_id')['date']
+    results = run(_ofes_grid_lens_retention_day, [
+        (date, part, objects, scope_root, int(forward_days), report_days, settings)
+        for date, part in keep.groupby(keep['lens_track_id'].map(release_dates), sort=True)
+    ])
+    particles, daily, samples, expression, membership = (
+        pd.concat([result[key] for result in results], ignore_index=True)
+        for key in ('particles', 'daily', 'samples', 'expression', 'membership')
+    )
+    metrics, support = _ofes_grid_lens_retention_unit_metrics(particles, daily, samples, expression, membership, report_days)
+    units = particles[['track_id', 'lens_track_id', 'material']].drop_duplicates().merge(
+        lenses.rename(columns={'track_id': 'lens_track_id', 'date': 'release_date'})[
+            ['lens_track_id', 'release_date', 'structure_group', 'carry_do20_at_release']
+        ], on='lens_track_id', validate='many_to_one',
+    ).set_index('track_id')
+    pairs = _ofes_grid_lens_pairs(
+        metrics.loc[metrics['particle_group'].eq('core')], units, _OFES_GRID_LENS_RETENTION_METRICS, 'forward_days',
+    )
+    summary = _ofes_grid_lens_pair_summary(pairs, settings, 'conditional_retention', 'forward_days')
+    descriptive = metrics.loc[metrics['particle_group'].eq('lens_material')].groupby('forward_days')[
+        [name for name in _OFES_GRID_LENS_RETENTION_METRICS if name in metrics]
+    ].agg(['mean', 'median', 'count'])
+    descriptive.columns = [f'{name}_{stat}' for name, stat in descriptive.columns]
+    root.mkdir(parents=True, exist_ok=True)
+    lenses.to_csv(root / 'lens_sample.csv', index=False)
+    _atomic_write_parquet(patches, root / 'candidate_patches.parquet')
+    selected.to_csv(root / 'control_selection.csv', index=False)
+    balance.to_csv(root / 'initial_balance.csv', index=False)
+    _atomic_write_parquet(particles, root / 'particles.parquet')
+    _atomic_write_parquet(daily, root / 'daily_positions.parquet')
+    _atomic_write_parquet(samples, root / 'path_samples.parquet')
+    _atomic_write_parquet(expression, root / 'core_expression.parquet')
+    _atomic_write_parquet(membership, root / 'lens_membership.parquet')
+    _atomic_write_parquet(metrics, root / 'unit_metrics.parquet')
+    _atomic_write_parquet(support, root / 'member_support.parquet')
+    _atomic_write_parquet(pairs, root / 'pair_differences.parquet')
+    summary.to_csv(root / 'retention_summary.csv', index=False)
+    descriptive.reset_index().to_csv(root / 'lens_material_summary.csv', index=False)
+    matched_lenses = lenses.loc[lenses['status'].eq('matched')]
+    manifest = {
+        'analysis': 'ofes_grid_lens_conditional_retention',
+        'status': 'complete',
+        'request': request,
+        'counts': {
+            'lenses': int(len(lenses)), 'forward_eligible': int(len(eligible)),
+            'with_oxygen_core': int(lenses['oxygen_core_seeds'].gt(0).sum()), 'matched': int(len(matched_lenses)),
+            'matched_structure_groups': int(matched_lenses['structure_group'].nunique()), 'release_dates': int(len(results)),
+            'candidates_evaluated': int(patches['material'].eq('control').sum()), 'controls_selected': int(len(selected)),
+            'particles': {f'{material}_{group}': int(count) for (material, group), count in particles.groupby(['material', 'particle_group']).size().items()},
+        },
+        'matching_scales': {name: float(value) for name, value in scales.items()},
+        'updated_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    _ofes_atomic_write_json(manifest, manifest_path)
+    return load_ofes_grid_lens_conditional_retention(root)
+
+
+def load_ofes_grid_lens_conditional_retention(output_dir: str | Path | None = None) -> dict:
+    """读取已保存的透镜条件保持结果。
+
+    只读取 `build_ofes_grid_lens_conditional_retention` 写出的表格和 manifest，不读取 OFES 原始场，也不修改结果目录；逐日粒子表较大，只在需要时另行读取。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 结果目录；默认 `plot_outputs/do/ofes_np30_ke/grid_lens_conditional_retention`。
+
+    返回:
+        - dict: output_dir、manifest，以及 lens_sample、control_selection、balance、unit_metrics、support、pairs、summary 与 lens_material 八张表。
+    """
+    root = _ofes_grid_lens_output_root(output_dir, _ofes_grid_lens_retention_settings())
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f'Grid-lens conditional retention manifest not found: {root}')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('analysis') != 'ofes_grid_lens_conditional_retention' or manifest.get('status') != 'complete':
+        raise ValueError(f'Grid-lens conditional retention output is incomplete or belongs to another analysis: {root}')
+    return {
+        'output_dir': root,
+        'manifest': manifest,
+        'lens_sample': pd.read_csv(root / 'lens_sample.csv', parse_dates=['date']),
+        'control_selection': pd.read_csv(root / 'control_selection.csv'),
+        'balance': pd.read_csv(root / 'initial_balance.csv'),
+        'unit_metrics': pd.read_parquet(root / 'unit_metrics.parquet'),
+        'support': pd.read_parquet(root / 'member_support.parquet'),
+        'pairs': pd.read_parquet(root / 'pair_differences.parquet'),
+        'summary': pd.read_csv(root / 'retention_summary.csv'),
+        'lens_material': pd.read_csv(root / 'lens_material_summary.csv'),
+    }
+
+
+def plot_ofes_grid_lens_conditional_retention(
+    output_dir: str | Path | None = None,
+    *,
+    show_fig: bool = True,
+    dpi: int = 320,
+) -> dict:
+    """绘制南侧 minty 透镜氧核材料与初态匹配的透镜外富氧材料的前向配对差和初态平衡。
+
+    只读条件保持的正式汇总。第一张图每个小图一项读数，横轴为前向天数，点为透镜减其对照平均的透镜等权均值，线为结构组重抽区间；
+    第二张图为各初态量在匹配前（同侧全部合格候选）与匹配后（选中对照）的标准化均值差。
+
+    参数:
+        - output_dir (str | pathlib.Path | None): 已完成的条件保持目录；默认正式 `grid_lens_conditional_retention`。
+        - show_fig (bool): 是否显示图形；默认 True。
+        - dpi (int): PNG 分辨率；默认 320。
+
+    返回:
+        - dict: figures 路径列表与 plot_data 绘图输入表。
+
+    输出:
+        - `output_dir/conditional_retention_overview.png`：配对差小图组。
+        - `output_dir/conditional_retention_balance.png`：初态平衡。
+    """
+    import matplotlib.pyplot as plt
+
+    result = load_ofes_grid_lens_conditional_retention(output_dir)
+    root = Path(result['output_dir'])
+    panels = (
+        ('do2_change', 'DO change (μmol kg$^{-1}$)'),
+        ('theta_change', 'θ change (°C)'),
+        ('salinity_change', 'Salinity change'),
+        ('sigma0_change', 'σ$_0$ change (kg m$^{-3}$)'),
+        ('horizontal_spread_ratio', 'Horizontal q90 spread ratio'),
+        ('vertical_range_change_m', 'Vertical range change (m)'),
+        ('positive_core_share', 'Share in a positive ΔDO core'),
+        ('any_lens_share', 'Share in an identified lens'),
+    )
+    summary = result['summary']
+    plot_data = summary.loc[summary['particle_group'].eq('core') & summary['metric'].isin([metric for metric, _ in panels])]
+    color = _JOURNAL_COLORS['minty']
+    figures = []
+    with plt.rc_context({'font.size': 8, 'axes.spines.top': False, 'axes.spines.right': False,
+                         'savefig.facecolor': 'white'}):
+        fig, axes = plt.subplots(2, 4, figsize=(10.0, 4.6), sharex=True)
+        for ax, (metric, label) in zip(axes.ravel(), panels):
+            part = plot_data.loc[plot_data['metric'].eq(metric)].sort_values('forward_days')
+            ax.vlines(part['forward_days'], part['ci_low'], part['ci_high'], color=color, linewidth=1.3)
+            ax.plot(part['forward_days'], part['mean_difference'], marker='o', markersize=4.5, color=color, linewidth=0.8)
+            ax.axhline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+            ax.grid(axis='y', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
+            ax.set_axisbelow(True)
+            ax.set_title(label, fontsize=8)
+        for ax in axes[-1]:
+            ax.set_xticks(result['manifest']['request']['report_days'])
+        fig.supxlabel('Days after release', fontsize=9)
+        fig.supylabel('Lens core − matched non-lens controls', fontsize=9)
+        fig.tight_layout()
+        path = root / 'conditional_retention_overview.png'
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        figures.append(str(path))
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+
+        balance = result['balance'].iloc[::-1].reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(4.6, 4.2))
+        y = np.arange(len(balance))
+        ax.plot(balance['smd_before'], y, marker='o', markersize=4.5, color=color, markerfacecolor='white', linestyle='none', label='Before matching')
+        ax.plot(balance['smd_after'], y, marker='o', markersize=4.5, color=color, linestyle='none', label='Matched controls')
+        ax.axvline(0, color=_JOURNAL_COLORS['neutral'], linewidth=0.8)
+        ax.set_yticks(y, [f"{name}{'' if matching else ' (recorded)'}" for name, matching in zip(balance['variable'], balance['matching_variable'])])
+        ax.grid(axis='x', color=_JOURNAL_COLORS['grid'], linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.set_xlabel('Lens − controls (lens SD)')
+        ax.legend(frameon=False, fontsize=8, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=2)
+        fig.tight_layout()
+        path = root / 'conditional_retention_balance.png'
         fig.savefig(path, dpi=dpi, bbox_inches='tight')
         figures.append(str(path))
         if show_fig:

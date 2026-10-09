@@ -1,4 +1,8 @@
 # 处理与算法参数配置
+# version 1.43 变更：
+#   - 新增 ofes.grid_lens_conditional_retention：南侧 minty 透镜氧核材料与初态匹配的透镜外富氧材料
+#     前向条件保持的输出目录；积分、种子几何与重抽沿用 grid_lens_backtrack，候选对照的最大半径与
+#     格距取 scv_reverse_enrichment 对照环的最大半径与环距。
 # version 1.42 变更：
 #   - 新增 ofes.grid_lens_source_comparison：南侧 minty 透镜内外来源对照的输出目录；
 #     种子、积分、混合层判据与重抽全部沿用 grid_lens_backtrack。
@@ -523,6 +527,8 @@ ofes:
 
   grid_lens_source_comparison:
     output_subdir: grid_lens_source_comparison
+  grid_lens_conditional_retention:
+    output_subdir: grid_lens_conditional_retention
 
   event_diagnostics:
     candidate_threshold: 50.0
